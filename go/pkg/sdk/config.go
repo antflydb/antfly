@@ -18,6 +18,9 @@ package sdk
 
 import (
 	"fmt"
+
+	"github.com/antflydb/antfly/go/pkg/libaf/json"
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 func NewEmbedderConfig(config any) (*EmbedderConfig, error) {
@@ -152,12 +155,135 @@ func NewIndexConfig(name string, config any) (*IndexConfig, error) {
 		if err := idxConfig.FromGraphIndexConfig(v); err != nil {
 			return nil, fmt.Errorf("from graph index config: %w", err)
 		}
+	case AlgebraicIndexConfig:
+		t = IndexTypeAlgebraic
+		if err := idxConfig.FromAlgebraicIndexConfig(v); err != nil {
+			return nil, fmt.Errorf("from algebraic index config: %w", err)
+		}
 	default:
 		return nil, fmt.Errorf("unsupported index config type: %T", config)
 	}
 	idxConfig.Type = t
 
 	return idxConfig, nil
+}
+
+// NewCreateIndexRequest builds the path-identified request body for CreateIndex.
+// The index name is deliberately absent so it cannot disagree with the URL.
+func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
+	request := &CreateIndexRequest{}
+	data, err := json.Marshal(config)
+	if err != nil {
+		return nil, fmt.Errorf("marshal index config: %w", err)
+	}
+	switch typed := config.(type) {
+	case IndexConfig:
+		return newCreateIndexRequestFromIndexConfig(data, typed.Type)
+	case *IndexConfig:
+		if typed == nil {
+			return nil, fmt.Errorf("index config must not be nil")
+		}
+		return newCreateIndexRequestFromIndexConfig(data, typed.Type)
+	case EmbeddingsIndexConfig, CreateEmbeddingsIndexRequest:
+		var variant oapi.CreateEmbeddingsIndexRequest
+		if err := json.Unmarshal(data, &variant); err != nil {
+			return nil, fmt.Errorf("build embeddings create index request: %w", err)
+		}
+		variant.Type = oapi.CreateEmbeddingsIndexRequestTypeEmbeddings
+		if err := request.FromCreateEmbeddingsIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set embeddings create index request: %w", err)
+		}
+	case *CreateEmbeddingsIndexRequest:
+		if typed == nil {
+			return nil, fmt.Errorf("embeddings create index request must not be nil")
+		}
+		variant := *typed
+		variant.Type = oapi.CreateEmbeddingsIndexRequestTypeEmbeddings
+		if err := request.FromCreateEmbeddingsIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set embeddings create index request: %w", err)
+		}
+	case FullTextIndexConfig, CreateFullTextIndexRequest:
+		var variant oapi.CreateFullTextIndexRequest
+		if err := json.Unmarshal(data, &variant); err != nil {
+			return nil, fmt.Errorf("build full-text create index request: %w", err)
+		}
+		variant.Type = oapi.CreateFullTextIndexRequestTypeFullText
+		if err := request.FromCreateFullTextIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set full-text create index request: %w", err)
+		}
+	case *CreateFullTextIndexRequest:
+		if typed == nil {
+			return nil, fmt.Errorf("full-text create index request must not be nil")
+		}
+		variant := *typed
+		variant.Type = oapi.CreateFullTextIndexRequestTypeFullText
+		if err := request.FromCreateFullTextIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set full-text create index request: %w", err)
+		}
+	case GraphIndexConfig, CreateGraphIndexRequest:
+		var variant oapi.CreateGraphIndexRequest
+		if err := json.Unmarshal(data, &variant); err != nil {
+			return nil, fmt.Errorf("build graph create index request: %w", err)
+		}
+		variant.Type = oapi.CreateGraphIndexRequestTypeGraph
+		if err := request.FromCreateGraphIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set graph create index request: %w", err)
+		}
+	case *CreateGraphIndexRequest:
+		if typed == nil {
+			return nil, fmt.Errorf("graph create index request must not be nil")
+		}
+		variant := *typed
+		variant.Type = oapi.CreateGraphIndexRequestTypeGraph
+		if err := request.FromCreateGraphIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set graph create index request: %w", err)
+		}
+	case AlgebraicIndexConfig, CreateAlgebraicIndexRequest:
+		var variant oapi.CreateAlgebraicIndexRequest
+		if err := json.Unmarshal(data, &variant); err != nil {
+			return nil, fmt.Errorf("build algebraic create index request: %w", err)
+		}
+		variant.Type = oapi.CreateAlgebraicIndexRequestTypeAlgebraic
+		if err := request.FromCreateAlgebraicIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set algebraic create index request: %w", err)
+		}
+	case *CreateAlgebraicIndexRequest:
+		if typed == nil {
+			return nil, fmt.Errorf("algebraic create index request must not be nil")
+		}
+		variant := *typed
+		variant.Type = oapi.CreateAlgebraicIndexRequestTypeAlgebraic
+		if err := request.FromCreateAlgebraicIndexRequest(variant); err != nil {
+			return nil, fmt.Errorf("set algebraic create index request: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported index config type: %T", config)
+	}
+	return request, nil
+}
+
+func newCreateIndexRequestFromIndexConfig(data []byte, indexType IndexType) (*CreateIndexRequest, error) {
+	switch indexType {
+	case IndexTypeEmbeddings, IndexTypeFullText, IndexTypeGraph, IndexTypeAlgebraic:
+	default:
+		return nil, fmt.Errorf("unsupported index config type: %q", indexType)
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(data, &body); err != nil {
+		return nil, fmt.Errorf("decode index config: %w", err)
+	}
+	delete(body, "name")
+
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal create index request: %w", err)
+	}
+	request := &CreateIndexRequest{}
+	if err := json.Unmarshal(data, request); err != nil {
+		return nil, fmt.Errorf("build create index request: %w", err)
+	}
+	return request, nil
 }
 
 // ArtifactEmbeddingIndexConfig describes a managed vector index whose vectors

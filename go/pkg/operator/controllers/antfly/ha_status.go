@@ -133,19 +133,6 @@ type haProcessIncarnationGraceKey struct {
 	candidate      string
 }
 
-func haFencingLeaseRenewalRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
-	graceSeconds := int32(10)
-	if cluster != nil && cluster.Spec.HighAvailability != nil && cluster.Spec.HighAvailability.Runtime != nil &&
-		cluster.Spec.HighAvailability.Runtime.FencingLease != nil &&
-		cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds > 0 {
-		graceSeconds = cluster.Spec.HighAvailability.Runtime.FencingLease.WatchdogGraceSeconds
-	}
-	// A healthy controller must create several strictly newer Lease renewals
-	// inside the runtime's local authority window. This leaves margin for API
-	// latency, reconcile queue jitter, and controller leader handoff.
-	return time.Duration(graceSeconds) * time.Second / 3
-}
-
 func haKubernetesLeaseRenewalEnabled(cluster *antflyv1.AntflyCluster) bool {
 	// Every promotion candidate must observe the exact Lease and publish a
 	// process-bound watchdog capability proof, but only the declarative primary

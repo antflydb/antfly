@@ -126,6 +126,8 @@ Then create an index with a template that processes the image:
 ```bash
 antfly index create --table product_catalog \
   --index visual_search \
+  --type embeddings \
+  --coverage-policy partial \
   --template '{{name}} {{description}} {{remoteMedia url=image_url}}' \
   --dimension 384 \
   --embedder '{
@@ -138,6 +140,16 @@ antfly index create --table product_catalog \
     "model": "llava",
     "url": "http://localhost:11434"
   }'
+```
+
+Because image fields are commonly optional, `partial` treats missing images as
+intentional skips while still waiting for every product to settle. Before
+running semantic image searches, wait for the index explicitly:
+
+```bash
+antfly index wait --table product_catalog \
+  --index visual_search \
+  --timeout 20m
 ```
 
 In this configuration:
@@ -170,6 +182,7 @@ antfly table create --table documents \
 
 antfly index create --table documents \
   --index pdf_content \
+  --type embeddings \
   --template '{{title}} {{remotePDF url=pdf_url}}' \
   --dimension 384 \
   --embedder '{
@@ -186,6 +199,7 @@ Some models like Gemini support native multimodal embeddings. The template still
 ```bash
 antfly index create --table product_catalog \
   --index gemini_visual \
+  --type embeddings \
   --template '{{name}} {{remoteMedia url=image_url}}' \
   --dimension 768 \
   --embedder '{
@@ -237,6 +251,7 @@ antfly table create --table product_catalog \
 ```bash
 antfly index create --table product_catalog \
   --index visual_search \
+  --type embeddings \
   --template '{{name}} {{description}} {{remoteMedia url=image_url}}' \
   --dimension 384 \
   --embedder '{
@@ -412,6 +427,7 @@ For native multimodal embedding without summarization, use Google Vertex AI's mu
 ```bash
 antfly index create --table product_catalog \
   --index vertex_multimodal \
+  --type embeddings \
   --template '{{name}} {{media url=image_url}}' \
   --dimension 1408 \
   --embedder '{

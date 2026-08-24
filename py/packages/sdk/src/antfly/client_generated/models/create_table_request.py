@@ -55,8 +55,10 @@ class CreateTableRequest:
         description (str | Unset): Optional human-readable description of the table and its purpose.
             Useful for documentation and team collaboration.
              Example: User profiles with embeddings for semantic search.
-        indexes (CreateTableRequestIndexes | Unset): Map of index name to index configuration. Indexes enable different
-            query capabilities:
+        indexes (CreateTableRequestIndexes | Unset): Map of index name to create-index configuration. The map key owns
+            the
+            index name; do not repeat `name` inside the configuration. Indexes enable
+            different query capabilities:
             - Full-text indexes for BM25 search
             - Vector indexes for semantic similarity
             - Multimodal indexes for images/audio/video

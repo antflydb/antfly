@@ -19,6 +19,7 @@
 /// Each handler method extracts wire parameters from the httpx Context, calls
 /// a typed operation, and adapts its owned result to an httpx.Response.
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
 const runtime_http_bridge = @import("../runtime_http_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
@@ -222,7 +223,7 @@ pub const AntflyApiHandler = struct {
         try ctx.setHeader("content-type", "application/json");
         try ctx.setHeader("Retry-After", "1");
         try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
-        _ = ctx.response.body("{\"error\":\"metadata leader unavailable\"}");
+        _ = ctx.response.body("{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata leader unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}");
         return ctx.response.build();
     }
 
@@ -603,12 +604,7 @@ pub const AntflyApiHandler = struct {
             if (metadata_authority.isRetryableError(err) and
                 ApiHttpServer.extensionRouteMutatesMetadata(method, path))
             {
-                _ = ctx.status(503);
-                try ctx.setHeader("content-type", "application/json");
-                try ctx.setHeader("Retry-After", "1");
-                try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
-                _ = ctx.response.body("{\"error\":\"metadata leader unavailable\"}");
-                return ctx.response.build();
+                return metadataNotLeaderResponse(ctx);
             }
             return err;
         } orelse return jsonResponse(ctx, 404, "{\"error\":\"not found\"}");
@@ -3402,7 +3398,7 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         const body_data = (try ctx.body()) orelse "";
-        var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
+        var resp = try cluster_api_http.handleClusterBackup(ctx.allocator, body_data, self.api_server.clusterApi(), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo(), operationContext(ctx, authenticated_identity));
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -4176,7 +4172,19 @@ pub const AntflyApiHandler = struct {
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer ctx.allocator.free(decoded_table_name);
         const body_data = (try ctx.body()) orelse "";
-        var resp = try public_table_http.handleTableBackup(ctx.allocator, decoded_table_name, body_data, self.api_server.tableApi(operationContext(ctx, authenticated_identity)), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
+        const expected_fence = backups_api.parseTableBackupFenceHeaderValuesWithDeadline(
+            ctx.header(backups_api.backup_fence_metadata_group_id_header),
+            ctx.header(backups_api.backup_fence_metadata_incarnation_header),
+            ctx.header(backups_api.backup_fence_table_id_header),
+            ctx.header(backups_api.backup_fence_definition_header),
+            ctx.header(backups_api.backup_fence_topology_count_header),
+            ctx.header(backups_api.backup_fence_topology_header),
+            ctx.header(backups_api.backup_writer_not_after_header),
+        ) catch {
+            _ = ctx.status(400);
+            return ctx.text("invalid backup fence");
+        };
+        var resp = try public_table_http.handleTableBackupExpectedFence(ctx.allocator, decoded_table_name, body_data, expected_fence, self.api_server.tableApi(operationContext(ctx, authenticated_identity)), self.api_server.cfg.secret_store, self.api_server.cfg.node_config, self.api_server.sharedApiIo());
         return respondOwnedApiResponse(ctx, &resp);
     }
 
@@ -7264,18 +7272,42 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
         "Content-Type: application/json\r\n" ++
         "Content-Length: 11\r\n\r\n" ++
         "{\"limit\":1}";
-    for (&clients) |*slot| {
-        var client = try httpx.Socket.connect(address, client_io);
-        errdefer client.close();
-        try client.sendAll(request);
-        slot.* = client;
-    }
+    const clients_per_wave = 32;
+    const wave_count = clients.len / clients_per_wave;
+    const wave_convergence_poll_attempts = @max(convergence_poll_attempts / wave_count, 1);
+    try std.testing.expectEqual(@as(usize, 0), clients.len % clients_per_wave);
+    for (0..wave_count) |wave| {
+        const rejected_before_wave = api_server.queryAdmissionStats().rejected_total;
+        const wave_start = wave * clients_per_wave;
+        for (clients[wave_start .. wave_start + clients_per_wave]) |*slot| {
+            var client = try httpx.Socket.connect(address, client_io);
+            errdefer client.close();
+            try client.sendAll(request);
+            slot.* = client;
+        }
 
-    for (0..convergence_poll_attempts) |_| {
-        const admission = api_server.queryAdmissionStats();
-        if (admission.in_flight == 8 and admission.rejected_total >= 24) break;
-        var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = std.posix.system.nanosleep(&delay, &delay);
+        // The kernel accept backlog decides how many sockets reach request
+        // admission before a snapshot. Require one saturated wave's worth of
+        // load shedding and bounded connection residency, without assuming
+        // an exact ordering for all sockets in this wave.
+        const minimum_rejected = rejected_before_wave + clients_per_wave - 8;
+        const maximum_rejected: u64 = @intCast((wave + 1) * clients_per_wave - 8);
+        for (0..wave_convergence_poll_attempts) |_| {
+            const admission = api_server.queryAdmissionStats();
+            if (admission.in_flight == 8 and
+                admission.rejected_total >= minimum_rejected and
+                e2e_server.server.runtimeStats().active_connections <= 8)
+            {
+                break;
+            }
+            var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = std.posix.system.nanosleep(&delay, &delay);
+        }
+        const wave_stats = api_server.queryAdmissionStats();
+        try std.testing.expectEqual(@as(usize, 8), wave_stats.in_flight);
+        try std.testing.expect(wave_stats.rejected_total >= minimum_rejected);
+        try std.testing.expect(wave_stats.rejected_total <= maximum_rejected);
+        try std.testing.expect(e2e_server.server.runtimeStats().active_connections <= 8);
     }
     const saturated = api_server.queryAdmissionStats();
     try std.testing.expectEqual(@as(usize, 8), saturated.in_flight);
@@ -7331,13 +7363,25 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     for (0..convergence_poll_attempts) |_| {
         const admission = api_server.queryAdmissionStats();
         const runtime = e2e_server.server.httpRuntimeStats();
-        if (admission.in_flight == 0 and runtime.active_h1_cancellation_observers == 0 and reads.cancelled.load(.acquire) == 8) break;
+        const started = reads.started.load(.acquire);
+        const cancelled = reads.cancelled.load(.acquire);
+        if (admission.in_flight == 0 and
+            runtime.active_h1_cancellation_observers == 0 and
+            started >= 8 and
+            cancelled == started) break;
         var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
         _ = std.posix.system.nanosleep(&delay, &delay);
     }
     try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
     try std.testing.expectEqual(@as(usize, 0), e2e_server.server.httpRuntimeStats().active_h1_cancellation_observers);
-    try std.testing.expectEqual(@as(u32, 8), reads.cancelled.load(.acquire));
+    const started = reads.started.load(.acquire);
+    const cancelled = reads.cancelled.load(.acquire);
+    // Once cancellation releases one of the original eight admission slots,
+    // a request already waiting in the kernel backlog may legitimately enter
+    // and immediately observe its reset. Require complete accounting instead
+    // of assuming that no queued request can cross that concurrency boundary.
+    try std.testing.expect(started >= 8);
+    try std.testing.expectEqual(started, cancelled);
 
     reads.release.store(true, .release);
     const query_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/query", .{base_url});
@@ -7854,12 +7898,17 @@ test "httpx antfly cluster restore preserves backup location validation" {
     defer alloc.free(base_url);
     const restore_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/restore", .{base_url});
     defer alloc.free(restore_url);
-    const restore_body = "{\"backup_id\":\"snap1\",\"location\":\"ftp://bad\"}";
+    const restore_body =
+        "{\"backup_id\":\"snap1\",\"location\":\"ftp://bad\",\"connection\":\"backups\"}";
     const headers = [_][2][]const u8{.{ "content-type", "application/json" }};
 
     var resp = try requestWithRetry(&client, client_io.io(), .POST, restore_url, restore_body, &headers, 20);
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 400), resp.status.code);
-    try std.testing.expectEqualStrings("text/plain; charset=utf-8", resp.contentType().?);
-    try std.testing.expectEqualStrings("unsupported backup location", resp.body.?);
+    try std.testing.expectEqualStrings("application/json", resp.contentType().?);
+    try ant_json.testing.expectEqualJsonText(
+        alloc,
+        "{\"error\":\"unsupported backup location\"}",
+        resp.body.?,
+    );
 }

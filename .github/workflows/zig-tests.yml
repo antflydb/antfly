@@ -11,6 +11,15 @@ on:
     - cron: "0 8 * * *"
     - cron: "0 3 * * 0"
   workflow_dispatch:
+    inputs:
+      validation_scope:
+        description: "Full validation scope"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - inference-e2e
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -30,6 +39,7 @@ jobs:
       model_check: ${{ steps.detect.outputs.model_check }}
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
       backup_s3: ${{ steps.detect.outputs.backup_s3 }}
+      release_tooling: ${{ steps.detect.outputs.release_tooling }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -42,12 +52,23 @@ jobs:
           set -euo pipefail
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.validation_scope }}" == "inference-e2e" ]]; then
+              {
+                echo "zig_tests=false"
+                echo "e2e=true"
+                echo "model_check=false"
+                echo "trace_validate=false"
+                echo "backup_s3=false"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             {
               echo "zig_tests=true"
               echo "e2e=true"
               echo "model_check=true"
               echo "trace_validate=true"
               echo "backup_s3=true"
+              echo "release_tooling=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -60,6 +81,7 @@ jobs:
                 echo "model_check=true"
                 echo "trace_validate=true"
                 echo "backup_s3=false"
+                echo "release_tooling=false"
               } >> "$GITHUB_OUTPUT"
             else
               {
@@ -67,6 +89,7 @@ jobs:
                 echo "model_check=false"
                 echo "trace_validate=false"
                 echo "backup_s3=true"
+                echo "release_tooling=false"
               } >> "$GITHUB_OUTPUT"
             fi
             exit 0
@@ -83,6 +106,7 @@ jobs:
               echo "model_check=true"
               echo "trace_validate=true"
               echo "backup_s3=true"
+              echo "release_tooling=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -158,6 +182,34 @@ jobs:
             echo "trace_validate=true" >> "$GITHUB_OUTPUT"
           fi
 
+          if git diff --quiet "$base" "${{ github.sha }}" -- \
+            scripts/install.sh \
+            scripts/test_install_download_markers.sh \
+            .github/workflows/cli-publish.yml \
+            .github/workflows/zig-tests.yml
+          then
+            echo "release_tooling=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_tooling=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release-tooling:
+    name: release-tooling
+    needs: changes
+    if: needs.changes.outputs.release_tooling == 'true'
+    runs-on: arc-antfly-standard
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Test release download markers
+        run: |
+          scripts/test_install_download_markers.sh
+          sh -n scripts/install.sh
+          bash -n scripts/test_install_download_markers.sh
+
   backup-s3-integration:
     name: backup-s3-integration
     needs: changes
@@ -197,7 +249,7 @@ jobs:
       ) ||
       github.event_name == 'merge_group' ||
       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
       github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-publish-arm64
     timeout-minutes: 20
@@ -519,7 +571,7 @@ jobs:
   zig-full-tests:
     name: zig-full / x86_64
     needs: changes
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') || github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
     timeout-minutes: 120
     env:
@@ -691,7 +743,7 @@ jobs:
       (
         github.event_name == 'merge_group' ||
         (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-        github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'all') ||
         github.event.schedule == '0 8 * * *'
       )
     runs-on: arc-antfly-standard
@@ -754,9 +806,10 @@ jobs:
       - name: Upload E2E executable
         uses: actions/upload-artifact@v6
         with:
-          name: antfly-e2e-base-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base.tar.gz
           compression-level: 0
+          overwrite: true
           retention-days: 1
 
   e2e-base-tests:
@@ -778,6 +831,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
+      ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
       ANTFLY_CI_TRACE: "1"
     steps:
       - uses: actions/checkout@v6
@@ -799,7 +853,7 @@ jobs:
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME"
+          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
           ln -s "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" ~/.cache
@@ -818,7 +872,7 @@ jobs:
       - name: Download E2E executable
         uses: actions/download-artifact@v6
         with:
-          name: antfly-e2e-base-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
 
       - name: Install E2E executable
@@ -868,8 +922,8 @@ jobs:
           test "$BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"
 
-  e2e-full-tests:
-    name: e2e-full / ${{ matrix.suite }}
+  e2e-full-build:
+    name: e2e-full / build
     needs: changes
     if: |
       github.event_name == 'merge_group' ||
@@ -877,16 +931,10 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.schedule == '0 8 * * *'
     runs-on: arc-antfly-heavy
-    timeout-minutes: 150
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: [inference, antfly]
+    timeout-minutes: 90
     env:
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}-${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
-      UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
-      HF_HOME: /mnt/cache/antfly/zig/hf
       # Keep production optimization while preserving runtime-safety checks and
       # std.debug.assert invariants exercised by the full E2E suite.
       ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
@@ -909,11 +957,58 @@ jobs:
 
       - name: Restore ARC cache dirs
         run: |
-          local_cache="/mnt/cache/antfly/zig/${{ github.job }}-${{ matrix.suite }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME"
+          mkdir -p "$local_cache" "$global_cache"
+
+      - name: Build E2E executable once
+        run: scripts/ci/zig-build-e2e-binaries.sh
+
+      - name: Package E2E executable
+        run: tar -C zig -czf "${RUNNER_TEMP}/antfly-e2e-full.tar.gz" zig-out/bin/antfly
+
+      - name: Upload E2E executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: antfly-e2e-full-${{ github.run_id }}
+          path: ${{ runner.temp }}/antfly-e2e-full.tar.gz
+          compression-level: 0
+          overwrite: true
+          retention-days: 1
+
+  e2e-full-tests:
+    name: e2e-full / ${{ matrix.suite }}
+    needs: [changes, e2e-full-build]
+    if: |
+      always() &&
+      needs.e2e-full-build.result == 'success' &&
+      (github.event_name == 'merge_group' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.schedule == '0 8 * * *')
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.validation_scope == 'inference-e2e' && '["inference"]' || '["inference","antfly"]') }}
+    env:
+      UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
+      HF_HOME: /mnt/cache/antfly/zig/hf
+      ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils gdb
+
+      - name: Prepare ARC test cache dirs
+        run: |
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
           ln -s "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" ~/.cache
@@ -939,8 +1034,23 @@ jobs:
         if: matrix.suite == 'antfly'
         run: cargo build --manifest-path extensions/memoryaf/Cargo.toml --release --target wasm32-wasip2
 
-      - name: Build E2E binaries
-        run: scripts/ci/zig-build-e2e-binaries.sh
+      - name: Download E2E executable
+        uses: actions/download-artifact@v6
+        with:
+          name: antfly-e2e-full-${{ github.run_id }}
+          path: ${{ runner.temp }}/antfly-e2e-full
+
+      - name: Install E2E executable
+        run: tar -xzf "${RUNNER_TEMP}/antfly-e2e-full/antfly-e2e-full.tar.gz" -C zig
+
+      - name: Report inference memory baseline
+        if: matrix.suite == 'inference'
+        run: |
+          echo "memory.current=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo unavailable)"
+          echo "memory.max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo unavailable)"
+          if [ -r /sys/fs/cgroup/memory.stat ]; then
+            awk '$1 == "anon" || $1 == "file" || $1 == "inactive_file" { print "memory.stat." $1 "=" $2 }' /sys/fs/cgroup/memory.stat
+          fi
 
       - name: Install Wasmtime C API
         if: matrix.suite == 'antfly'
@@ -975,7 +1085,19 @@ jobs:
           ANTFLY_INFERENCE_DEFAULT_GENERATOR_MODEL: ggml-org/gemma-4-e2b-it-gguf
           ANTFLY_INFERENCE_FLORENCE_MODEL: antflydb/florence-2-base
           ANTFLY_INFERENCE_REQUEST_TIMEOUT: "300"
+          # Cold native model and projector initialization can exceed the
+          # steady request deadline on CPU-only release runners. Only tests
+          # explicitly covering first-use paths opt into this hard bound.
+          ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
           ANTFLY_INFERENCE_MAX_LOADED_MODELS: "1"
+          # This Burstable pod has a 15000Mi request but no finite memory.max.
+          # Bound leaf-cgroup working set at 14000Mi so admission retains its
+          # emergency reserve and leaves another 1000Mi of pod-request margin.
+          ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB: "14000"
+          # Bound the native hot set while allowing the measured 11173MiB 2B
+          # decoder working set plus its scoped projector to complete. Keep
+          # 2000MiB inside the process envelope for harness and process overhead.
+          ANTFLY_INFERENCE_HOST_BUDGET_MB: "12000"
           # This is a release contract, not an optional capability probe. Keep
           # it targeted so unrelated large-model suites do not inflate this job.
           RUN_MULTIMODAL_GENERATOR_TESTS: "1"
@@ -983,6 +1105,24 @@ jobs:
         run: |
           chmod +x ./zig-out/bin/antfly
           taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/inference pytest -q --continue-on-collection-errors e2e/inference
+
+      - name: Validate standalone inference resource composition
+        if: matrix.suite == 'inference'
+        working-directory: zig
+        env:
+          ANTFLY_BIN: ./zig-out/bin/antfly
+          ANTFLY_INFERENCE_STANDALONE_TESTS: "1"
+          ANTFLY_INFERENCE_STANDALONE_MODELS_DIR: ~/.antfly/inference/models
+          ANTFLY_INFERENCE_STANDALONE_MODEL_NAME: ggml-org/gemma-4-e2b-it-gguf
+          # Match the cold-start contract used by the full inference suite.
+          # Standalone exercises the same CPU-only model initialization path.
+          ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT: "1800"
+          ANTFLY_INFERENCE_STANDALONE_PROCESS_MEMORY_BUDGET_MB: "14000"
+          ANTFLY_INFERENCE_STANDALONE_HOST_BUDGET_MB: "12000"
+          ANTFLY_INFERENCE_STANDALONE_COMBINED_BUDGET_MB: "12000"
+        run: |
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q \
+            e2e/antfly/test_standalone.py::test_standalone_inference_process_envelope_composition
 
       - name: Run Antfly full E2E
         if: matrix.suite == 'antfly'
@@ -992,11 +1132,11 @@ jobs:
           ANTFLY_LSM_OPEN_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
-          taskset -c ${{ steps.e2e_cpus.outputs.list }} uv run --project e2e/antfly pytest -q --continue-on-collection-errors e2e/antfly
+          taskset -c ${{ steps.e2e_cpus.outputs.list }} ../scripts/ci/zig-antfly-e2e-pytest.sh e2e/antfly
 
   e2e-full:
     name: e2e-full
-    needs: [changes, e2e-full-tests]
+    needs: [changes, e2e-full-build, e2e-full-tests]
     if: |
       always() &&
       (github.event_name == 'merge_group' ||
@@ -1007,6 +1147,8 @@ jobs:
     steps:
       - name: Verify full E2E suites
         env:
+          BUILD_RESULT: ${{ needs.e2e-full-build.result }}
           TEST_RESULT: ${{ needs.e2e-full-tests.result }}
         run: |
+          test "$BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"

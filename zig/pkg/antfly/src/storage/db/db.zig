@@ -55,6 +55,7 @@ const algebraic_mod = @import("algebraic/mod.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
+const index_repair_status = @import("../../common/index_repair_status.zig");
 const index_generation_manifest = @import("derived/index_generation_manifest.zig");
 const root_identity = @import("root_identity.zig");
 const runtime_error_abi = @import("../../runtime_error_abi.zig");
@@ -886,6 +887,7 @@ const dense_catch_up_default_maintenance_steps: usize = 8;
 const dense_catch_up_default_maintenance_cooldown_ns: u64 = 250 * std.time.ns_per_ms;
 const dense_catch_up_default_maintenance_urgent_score: u64 = 1_000_000;
 const artifact_repair_summary_dirty_marker = "dirty";
+const artifact_repair_summary_invalidation_page_size: usize = 256;
 const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
@@ -4342,6 +4344,14 @@ pub const DB = struct {
         }
         self.async_context.promotion_runtime = null;
         if (self.resolution_append_context) |ctx| self.runtime_alloc.destroy(ctx);
+        // Derived full-text publishers may be asleep in merge backpressure
+        // admission. Close that admission before joining their executor: the
+        // merge runtime is the owner of the wakeup predicate, so joining the
+        // publishers first can otherwise strand shutdown behind a predicate
+        // that is not closed until later in this function. Drain the merge
+        // worker too because its tasks borrow inline index generations.
+        if (executor_ready) self.executor.beginShutdown();
+        if (self.text_merge_runtime) |runtime| _ = runtime.stop();
         if (executor_ready) self.executor.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.executor);
         if (self.text_merge_runtime) |runtime| {
@@ -7232,6 +7242,13 @@ pub const DB = struct {
         if (!ctx.index_artifact_finalization_mutex.tryLock()) return .busy;
         defer ctx.index_artifact_finalization_mutex.unlock();
 
+        // Repair issues describe one concrete consumer generation. A
+        // same-name replacement has different artifact identities and cannot
+        // resolve diagnoses left by the retired generation. Keep the durable
+        // cleanup tombstone authoritative until every issue and its terminal
+        // failure history have drained in bounded, crash-idempotent pages.
+        if (try drainRetiredIndexArtifactRepairIssuesPageContext(ctx, index_name)) return .progressed;
+
         // The durable tombstone remains visible while finalization runs, so
         // namespace admission stays fenced. Release page arbitration before
         // checkpoint and filesystem I/O; other indexes can continue draining.
@@ -7273,6 +7290,239 @@ pub const DB = struct {
             ctx.index_manager.artifact_cleanup_state.store(0, .release);
             std.log.warn("generated-artifact cleanup was not scheduled err={s}", .{@errorName(err)});
         };
+    }
+
+    const retired_index_artifact_repair_cleanup_page_size: usize = 64;
+
+    const RetiredArtifactRepairIssueKeyParse = union(enum) {
+        valid: internal_keys.ArtifactRepairIssueKeyParts,
+        malformed: anyerror,
+    };
+
+    fn parseRetiredArtifactRepairIssueKeyAlloc(
+        alloc: Allocator,
+        key: []const u8,
+    ) !RetiredArtifactRepairIssueKeyParse {
+        const parts = internal_keys.artifactRepairIssueKeyPartsAlloc(alloc, key) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.InvalidInternalUserKey => return .{ .malformed = err },
+        };
+        return .{ .valid = parts };
+    }
+
+    const RetiredArtifactRepairIssueValueDecode = union(enum) {
+        valid: types.ArtifactRepairIssue,
+        malformed: anyerror,
+    };
+
+    fn decodeRetiredArtifactRepairIssueAlloc(
+        alloc: Allocator,
+        raw: []const u8,
+    ) !RetiredArtifactRepairIssueValueDecode {
+        const issue = decodeArtifactRepairIssueValueAlloc(alloc, raw) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return .{ .malformed = err },
+        };
+        return .{ .valid = issue };
+    }
+
+    fn drainRetiredIndexArtifactRepairIssuesPageContext(
+        ctx: *AsyncContext,
+        index_name: []const u8,
+    ) !bool {
+        // Summary rebuilds own the apply lock, while issue publication and
+        // terminal-marker transitions own the repair mutex. This ordering is
+        // shared by derived apply paths and prevents a cleanup batch from
+        // racing either authority.
+        ctx.apply_mutex.lockExclusive();
+        defer ctx.apply_mutex.unlockExclusive();
+        lockAtomicWithBackoff(&ctx.artifact_repair_issue_mutex);
+        defer ctx.artifact_repair_issue_mutex.unlock();
+
+        const prefix = try internal_keys.artifactRepairIssueIndexPrefixAlloc(ctx.alloc, index_name);
+        defer ctx.alloc.free(prefix);
+        const rows = try ctx.store.scanPrefixPage(
+            ctx.alloc,
+            prefix,
+            null,
+            retired_index_artifact_repair_cleanup_page_size,
+        );
+        defer docstore_mod.DocStore.freeResults(ctx.alloc, rows);
+        if (rows.len == 0) {
+            // Primary records are authoritative. Sweep legacy orphaned
+            // kind-index rows in bounded pages before releasing admission.
+            for (std.meta.tags(types.ArtifactRepairKind)) |kind| {
+                const kind_prefix = try internal_keys.artifactRepairIssueKindIndexPrefixAlloc(
+                    ctx.alloc,
+                    @tagName(kind),
+                    index_name,
+                );
+                defer ctx.alloc.free(kind_prefix);
+                const secondary_rows = try ctx.store.scanPrefixPage(
+                    ctx.alloc,
+                    kind_prefix,
+                    null,
+                    retired_index_artifact_repair_cleanup_page_size,
+                );
+                defer docstore_mod.DocStore.freeResults(ctx.alloc, secondary_rows);
+                if (secondary_rows.len == 0) continue;
+                const secondary_deletes = try ctx.alloc.alloc([]const u8, secondary_rows.len);
+                defer ctx.alloc.free(secondary_deletes);
+                for (secondary_rows, 0..) |row, i| secondary_deletes[i] = row.key;
+                try ctx.store.putBatch(&.{}, secondary_deletes);
+                return true;
+            }
+            return false;
+        }
+
+        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+        defer {
+            for (writes.items) |write| ctx.alloc.free(@constCast(write.value));
+            writes.deinit(ctx.alloc);
+        }
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(ctx.alloc);
+        var owned_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer {
+            for (owned_keys.items) |key| ctx.alloc.free(@constCast(key));
+            owned_keys.deinit(ctx.alloc);
+        }
+        const Batch = struct {
+            fn appendOwnedDelete(
+                alloc: Allocator,
+                out_deletes: *std.ArrayListUnmanaged([]const u8),
+                out_owned_keys: *std.ArrayListUnmanaged([]const u8),
+                key: []u8,
+            ) !void {
+                errdefer alloc.free(key);
+                const owned_len = out_owned_keys.items.len;
+                try out_owned_keys.append(alloc, key);
+                errdefer out_owned_keys.shrinkRetainingCapacity(owned_len);
+                try out_deletes.append(alloc, key);
+            }
+        };
+
+        var removed_issue_count: usize = 0;
+        for (rows) |row| {
+            // A coalesced issue can own arbitrarily many historical failure
+            // markers. Drain exactly one marker page and leave the primary
+            // issue present until a later pass observes the reverse namespace
+            // empty; this is the durable cursor across crashes and reopen.
+            const marker_count = try appendEnrichmentTerminalFailureMarkerDeletePageForIssue(
+                ctx.alloc,
+                ctx.store,
+                row.key,
+                &deletes,
+                &owned_keys,
+            );
+            if (marker_count != 0) {
+                if (removed_issue_count != 0) {
+                    try appendArtifactRepairSummaryDirtyMarkerForStore(ctx.alloc, &writes, &deletes, &owned_keys);
+                }
+                try ctx.store.putBatch(writes.items, deletes.items);
+                return true;
+            }
+
+            try deletes.append(ctx.alloc, row.key);
+            removed_issue_count += 1;
+
+            // The marker generation is keyed by the authoritative primary
+            // key, so it is safe to retire even when the value is malformed.
+            const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(ctx.alloc, row.key);
+            try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, generation_key);
+
+            var parts = switch (try parseRetiredArtifactRepairIssueKeyAlloc(ctx.alloc, row.key)) {
+                .valid => |value| value,
+                .malformed => |err| {
+                    std.log.warn("retired index cleanup removed malformed artifact repair key index={s} err={s}", .{
+                        index_name,
+                        @errorName(err),
+                    });
+                    continue;
+                },
+            };
+            defer parts.deinit(ctx.alloc);
+            if (!std.mem.eql(u8, parts.index_name, index_name)) return error.InvalidInternalUserKey;
+
+            const kind_key = try internal_keys.artifactRepairIssueKindKeyAlloc(
+                ctx.alloc,
+                parts.repair_artifact_kind,
+                parts.index_name,
+                parts.issue_id,
+            );
+            try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, kind_key);
+
+            var issue_valid = true;
+            var issue = switch (try decodeRetiredArtifactRepairIssueAlloc(ctx.alloc, row.value)) {
+                .valid => |value| value,
+                .malformed => |err| issue: {
+                    issue_valid = false;
+                    std.log.warn("retired index cleanup removed malformed artifact repair issue index={s} err={s}", .{
+                        index_name,
+                        @errorName(err),
+                    });
+                    break :issue types.ArtifactRepairIssue{};
+                },
+            };
+            defer if (issue_valid) issue.deinit(ctx.alloc);
+            if (issue_valid) {
+                const expected_issue_key = try artifactRepairIssueKeyForIssueAlloc(ctx.alloc, issue);
+                defer ctx.alloc.free(expected_issue_key);
+                issue_valid = std.mem.eql(u8, issue.index_name, index_name) and
+                    std.mem.eql(u8, expected_issue_key, row.key);
+                if (!issue_valid) {
+                    issue.deinit(ctx.alloc);
+                    std.log.warn("retired index cleanup removed mismatched artifact repair issue index={s}", .{index_name});
+                }
+            }
+
+            const completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(
+                ctx.alloc,
+                parts.repair_artifact_kind,
+                parts.issue_id,
+            );
+            var completion_key_local = true;
+            defer if (completion_key_local) ctx.alloc.free(completion_key);
+            if (!issue_valid) {
+                // Completion fences are only a single-flight optimization. A
+                // corrupt consumer value cannot safely contribute to their
+                // shared count, so discard the fence rather than let stale
+                // completed state suppress future repair.
+                try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, completion_key);
+                completion_key_local = false;
+                continue;
+            }
+            if (issue.reason != .enrichment_failed) {
+                continue;
+            }
+
+            const completion = (try loadArtifactRepairCompletionStateFromStore(
+                ctx.alloc,
+                ctx.store,
+                completion_key,
+            )) orelse continue;
+            var updated_completion = completion;
+            updated_completion.pending_issues -|= 1;
+            if (updated_completion.pending_issues == 0) {
+                try Batch.appendOwnedDelete(ctx.alloc, &deletes, &owned_keys, completion_key);
+                completion_key_local = false;
+            } else {
+                const owned_len = owned_keys.items.len;
+                owned_keys.append(ctx.alloc, completion_key) catch |err| {
+                    return err;
+                };
+                errdefer owned_keys.shrinkRetainingCapacity(owned_len);
+                const encoded = try ctx.alloc.create([artifact_repair_completion_state_len]u8);
+                errdefer ctx.alloc.destroy(encoded);
+                encodeArtifactRepairCompletionState(encoded, updated_completion);
+                try writes.append(ctx.alloc, .{ .key = completion_key, .value = encoded });
+                completion_key_local = false;
+            }
+        }
+
+        try appendArtifactRepairSummaryDirtyMarkerForStore(ctx.alloc, &writes, &deletes, &owned_keys);
+        try ctx.store.putBatch(writes.items, deletes.items);
+        return true;
     }
 
     fn finalizeRetiredIndexCleanupContext(ctx: *AsyncContext, index_name: []const u8, cleanup_key: []const u8) !void {
@@ -8836,7 +9086,15 @@ pub const DB = struct {
         };
         defer if (raw_progress) |value| alloc.free(value);
 
-        if (raw_progress == null and (try self.loadArtifactRepairSummaryCountByKey(alloc, root_summary_key)) != null) {
+        const invalidation_pending = if (raw_progress) |progress|
+            std.mem.eql(u8, progress, artifact_repair_summary_dirty_marker)
+        else
+            false;
+        if (invalidation_pending and try self.drainArtifactRepairSummaryRebuildInvalidationPage(alloc)) {
+            return true;
+        }
+
+        if (!invalidation_pending and raw_progress == null and (try self.loadArtifactRepairSummaryCountByKey(alloc, root_summary_key)) != null) {
             const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
             defer alloc.free(ready_key);
             var deletes = std.ArrayListUnmanaged([]const u8).empty;
@@ -8851,7 +9109,7 @@ pub const DB = struct {
             try self.core.store.putBatchWithReplayWithOptions(null, writes[0..], deletes.items, null, .{ .defer_commit_flush = true });
             return false;
         }
-        if (raw_progress == null) {
+        if (!invalidation_pending and raw_progress == null) {
             var deletes = std.ArrayListUnmanaged([]const u8).empty;
             defer deletes.deinit(alloc);
             var owned_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -8871,6 +9129,7 @@ pub const DB = struct {
         defer if (upper) |buf| alloc.free(buf);
 
         const lower = lower: {
+            if (invalidation_pending) break :lower try alloc.dupe(u8, prefix);
             const progress = raw_progress orelse break :lower try alloc.dupe(u8, prefix);
             if (!std.mem.startsWith(u8, progress, prefix)) break :lower try alloc.dupe(u8, prefix);
             var lower = try alloc.alloc(u8, progress.len + 1);
@@ -9034,6 +9293,31 @@ pub const DB = struct {
         }
         try self.core.store.putBatchWithReplayWithOptions(null, writes.items, deletes.items, null, .{ .defer_commit_flush = true });
         return false;
+    }
+
+    fn drainArtifactRepairSummaryRebuildInvalidationPage(self: *DB, alloc: Allocator) !bool {
+        const prefix = try internal_keys.artifactRepairSummaryRebuildRootKeyAlloc(alloc);
+        defer alloc.free(prefix);
+        const rows = try self.core.store.scanPrefixPage(
+            alloc,
+            prefix,
+            null,
+            artifact_repair_summary_invalidation_page_size,
+        );
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        if (rows.len == 0) return false;
+
+        const deletes = try alloc.alloc([]const u8, rows.len);
+        defer alloc.free(deletes);
+        for (rows, 0..) |row, i| deletes[i] = row.key;
+        try self.core.store.putBatchWithReplayWithOptions(
+            null,
+            &.{},
+            deletes,
+            null,
+            .{ .defer_commit_flush = true },
+        );
+        return true;
     }
 
     fn artifactRepairKindIndexReady(self: *DB, alloc: Allocator) !bool {
@@ -9864,9 +10148,10 @@ pub const DB = struct {
     /// Writable DBs recheck only rejected indexes, keeping healthy queries free
     /// of checkpoint I/O.
     fn refreshIndexRepairAvailabilityForIndex(self: *DB, alloc: Allocator, index_name: []const u8) !void {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
+        const pinned_read_generation = openModeRequiresReadOnlyBackends(self.open_mode);
         var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
             error.FileNotFound => {
+                if (pinned_read_generation) return;
                 try self.clearRepairGateIfAdmissionCompleted(alloc, index_name);
                 return;
             },
@@ -9885,16 +10170,124 @@ pub const DB = struct {
         if (state.identity.root_generation != self.core.root_generation) return;
 
         const entry_index = state.findIndex(index_name) orelse {
+            if (pinned_read_generation) return;
             try self.clearRepairGateIfAdmissionCompleted(alloc, index_name);
             return;
         };
         const intent = state.entries.items[entry_index].intent;
         var unavailable = indexRepairIntentBlocksService(intent);
+        const pinned_generation_proved_serviceable = unavailable and
+            try self.managedAdmissionDenseGenerationIsServiceable(alloc, intent);
+        if (pinned_generation_proved_serviceable) {
+            unavailable = false;
+        }
+        // Durable phase/checkpoint transitions can describe a newer root than
+        // the query-only DB has open. Only the proof above inspected this
+        // pinned in-memory generation, so it is the sole read-only exception.
+        if (pinned_read_generation) {
+            if (pinned_generation_proved_serviceable) {
+                self.core.index_manager.clearRepairUnavailable(index_name);
+            }
+            return;
+        }
         if (!unavailable and intent.trigger == .incomplete_bulk_publish) {
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, index_name);
             unavailable = checkpoint.status != .clean or checkpoint.config_hash != intent.config_hash;
         }
         if (!unavailable) self.core.index_manager.clearRepairUnavailable(index_name);
+    }
+
+    /// Managed admission deliberately installs an empty, gated generation and
+    /// delegates corpus reconstruction. The ordinary enrichment/replay workers
+    /// can finish that same generation before the shadow-repair owner runs. In
+    /// that case, this bounded proof avoids both an unnecessary replacement
+    /// build and a user-visible `index_rebuilding` interval after coverage is
+    /// already complete.
+    ///
+    /// Every input is generation-scoped and O(1): the admission marker binds
+    /// the catalog hash, the checkpoint binds replay and projection identity,
+    /// the maintained outcome tuple proves terminal source coverage, and the
+    /// active HBC cardinality proves that every produced artifact is present.
+    fn managedAdmissionDenseGenerationIsServiceable(
+        self: *DB,
+        alloc: Allocator,
+        intent: index_repair_state.IndexRepairIntent,
+    ) !bool {
+        if (intent.kind != .dense_vector or
+            intent.trigger != .projection_generation_invalid or
+            intent.candidate_relative_path != null or
+            intent.phase != .detected)
+        {
+            return false;
+        }
+
+        const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, intent.index_name);
+        defer alloc.free(admission_key);
+        const admission_raw = self.core.store.get(alloc, admission_key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        defer alloc.free(admission_raw);
+        const marker = try decodeManagedIndexAdmissionMarker(admission_raw);
+        if (marker.disposition != .managed_rebuild or marker.config_hash != intent.config_hash) return false;
+
+        const cfg = self.core.index_manager.get(intent.index_name) orelse return false;
+        if (cfg.kind != .dense_vector or types.indexConfigHash(cfg.*) != intent.config_hash) return false;
+        const dense = self.core.index_manager.denseIndex(intent.index_name) orelse return false;
+
+        const checkpoint = try self.core.loadProjectionCheckpoint(alloc, intent.index_name);
+        if (checkpoint.status != .clean or checkpoint.config_hash != intent.config_hash) return false;
+        const applied_sequence = try self.managedIndexAppliedSequence(alloc, intent.index_name);
+        const target_sequence = try self.projectionStatsTargetSequence(alloc, cfg.*, applied_sequence);
+        if (applied_sequence < marker.replay_target_sequence or
+            applied_sequence < target_sequence or
+            checkpoint.applied_sequence < target_sequence)
+        {
+            return false;
+        }
+
+        const ownership = indexDerivedCoverageOwnership(alloc, cfg.*) orelse return false;
+        const policy = switch (ownership) {
+            .external => return false,
+            .managed => |value| value,
+        };
+        const generation = self.core.index_manager.coverageGenerationForIndex(intent.index_name) orelse return false;
+        const produced = (try loadDerivedCoverageOutcomeCounterFromStore(
+            alloc,
+            self.core.store,
+            intent.index_name,
+            generation,
+            "produced",
+        )) orelse return false;
+        const skipped = (try loadDerivedCoverageOutcomeCounterFromStore(
+            alloc,
+            self.core.store,
+            intent.index_name,
+            generation,
+            "skipped",
+        )) orelse return false;
+        const terminal_failed = (try loadDerivedCoverageOutcomeCounterFromStore(
+            alloc,
+            self.core.store,
+            intent.index_name,
+            generation,
+            "terminal_failed",
+        )) orelse return false;
+        // Do not fall back to a primary-store scan on query admission. Modern
+        // managed writes maintain this counter atomically; a missing legacy
+        // counter simply leaves the durable repair owner in charge.
+        const source_total = (try range_cardinality.load(alloc, self.core.store)) orelse return false;
+        const assessment = types.evaluateDerivedCoverageAssessment(
+            policy,
+            source_total,
+            produced,
+            skipped,
+            terminal_failed,
+            true,
+            true,
+        );
+        return assessment.health.counters_valid and assessment.complete and
+            denseCoverageMatchesTarget(dense.index.stats().active_count, produced);
     }
 
     fn clearRepairGateIfAdmissionCompleted(self: *DB, alloc: Allocator, index_name: []const u8) !void {
@@ -11706,6 +12099,21 @@ pub const DB = struct {
         if (cfg_ptr.kind != entry.intent.kind or types.indexConfigHash(cfg_ptr.*) != entry.intent.config_hash) {
             try self.recordIndexRepairAttemptFailure(alloc, repair_id, "index_configuration_changed", true);
             result.terminal = true;
+            return result;
+        }
+
+        // The admitted active generation may have converged through the
+        // normal enrichment/replay workers while this durable repair waited
+        // for its scheduler turn. Retire the now-obsolete debt before counter
+        // bootstrap, capacity admission, or shadow allocation. This proof is
+        // restricted to managed-admission intents whose active generation is
+        // already the durable result; there is no candidate activation to
+        // record, so remove the detected intent directly instead of inventing
+        // illegal intermediate shadow-build transitions.
+        if (try self.managedAdmissionDenseGenerationIsServiceable(alloc, entry.intent)) {
+            try self.removeIndexRepairIntentAndPin(alloc, repair_id);
+            result.attempted = true;
+            result.repaired = true;
             return result;
         }
 
@@ -19804,13 +20212,18 @@ pub const DB = struct {
         };
     }
 
+    pub const GeneratedEnrichmentReplayAppendResult = struct {
+        generated_ref_count: usize = 0,
+        target_sequence: u64 = 0,
+    };
+
     fn appendGeneratedEnrichmentsFromStoredDocs(
         self: *DB,
         alloc: Allocator,
         force_generated_artifact_names: []const []const u8,
         skip_terminally_covered: bool,
-    ) !usize {
-        if (self.enrichment_runtime == null) return 0;
+    ) !GeneratedEnrichmentReplayAppendResult {
+        if (self.enrichment_runtime == null) return .{};
 
         const chunk_size: usize = 128;
         const initial_lower = try self.core.documentRangeLowerAlloc("");
@@ -19849,11 +20262,14 @@ pub const DB = struct {
             if (self.enrichment_runtime) |runtime| runtime.notifySequence(latest_sequence);
             self.notifyResolverReplayRuntimes(latest_sequence);
         }
-        return generated_ref_count;
+        return .{
+            .generated_ref_count = generated_ref_count,
+            .target_sequence = latest_sequence,
+        };
     }
 
     pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
-        return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, true);
+        return (try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &.{}, true)).generated_ref_count;
     }
 
     pub fn reprocessGeneratedEnrichmentFromStoredDocs(
@@ -19861,6 +20277,14 @@ pub const DB = struct {
         alloc: Allocator,
         artifact_name: ?[]const u8,
     ) !usize {
+        return (try self.reprocessGeneratedEnrichmentFromStoredDocsWithProgress(alloc, artifact_name)).generated_ref_count;
+    }
+
+    pub fn reprocessGeneratedEnrichmentFromStoredDocsWithProgress(
+        self: *DB,
+        alloc: Allocator,
+        artifact_name: ?[]const u8,
+    ) !GeneratedEnrichmentReplayAppendResult {
         if (artifact_name) |name| {
             const force_artifacts = [_][]const u8{name};
             return try self.appendGeneratedEnrichmentsFromStoredDocs(alloc, &force_artifacts, false);
@@ -19982,6 +20406,7 @@ pub const DB = struct {
     }
 
     fn applyDurableIndexRepairStats(
+        self: *DB,
         alloc: Allocator,
         state: ?*const index_repair_state.State,
         repair_state_corrupt: bool,
@@ -19991,6 +20416,7 @@ pub const DB = struct {
             item.index_repair_trigger = "corrupt_local_repair_state";
             item.index_repair_phase = "terminal";
             item.index_repair_wait_reason = "terminal";
+            item.index_repair_status = .failed;
             item.repair_degraded = true;
             return;
         }
@@ -20019,6 +20445,16 @@ pub const DB = struct {
             "convergence"
         else
             "none";
+        item.index_repair_status = index_repair_status.summarize(
+            true,
+            item.index_repair_automation,
+            item.index_repair_phase,
+            item.index_repair_wait_reason,
+        );
+        // Keep status available when the optional bounded proof cannot be
+        // read; query admission independently retries it and remains closed.
+        item.index_repair_active_generation_serviceable =
+            self.managedAdmissionDenseGenerationIsServiceable(alloc, intent) catch false;
         switch (intent.trigger) {
             .incomplete_bulk_publish,
             .root_generation_rebuild,
@@ -20997,7 +21433,7 @@ pub const DB = struct {
             errdefer freeDBIndexStatsItem(alloc, item);
             initializeDerivedCoverageIdentity(cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
-            try applyDurableIndexRepairStats(
+            try self.applyDurableIndexRepairStats(
                 alloc,
                 if (durable_index_repairs) |*state| state else null,
                 self.async_context.index_repair_state_corrupt.load(.acquire),
@@ -21186,7 +21622,7 @@ pub const DB = struct {
                 break;
             }
             applyProjectionCheckpointStats(&item, try self.core.loadProjectionCheckpoint(alloc, cfg.name), item.replay_target_sequence);
-            try applyDurableIndexRepairStats(
+            try self.applyDurableIndexRepairStats(
                 alloc,
                 if (durable_index_repairs) |*state| state else null,
                 self.async_context.index_repair_state_corrupt.load(.acquire),
@@ -21425,7 +21861,7 @@ pub const DB = struct {
             initializeDerivedCoverageIdentity(cfg, &item);
             try self.applyStatusOnlyRebuildStateStats(alloc, cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
-            try applyDurableIndexRepairStats(
+            try self.applyDurableIndexRepairStats(
                 alloc,
                 if (durable_index_repairs) |*state| state else null,
                 self.async_context.index_repair_state_corrupt.load(.acquire),
@@ -35888,6 +36324,30 @@ fn appendEnrichmentTerminalFailureMarkerDeletesForIssue(
     owned_delete_keys: *std.ArrayListUnmanaged([]const u8),
     retire_generation: bool,
 ) !void {
+    _ = try appendEnrichmentTerminalFailureMarkerDeletePageForIssue(
+        alloc,
+        store,
+        repair_issue_key,
+        deletes,
+        owned_delete_keys,
+    );
+    if (retire_generation) {
+        const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, repair_issue_key);
+        errdefer alloc.free(generation_key);
+        const owned_len = owned_delete_keys.items.len;
+        try owned_delete_keys.append(alloc, generation_key);
+        errdefer owned_delete_keys.shrinkRetainingCapacity(owned_len);
+        try deletes.append(alloc, generation_key);
+    }
+}
+
+fn appendEnrichmentTerminalFailureMarkerDeletePageForIssue(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    repair_issue_key: []const u8,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]const u8),
+) !usize {
     const prefix = try internal_keys.enrichmentTerminalFailureIssuePrefixAlloc(alloc, repair_issue_key);
     defer alloc.free(prefix);
     const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
@@ -35903,7 +36363,9 @@ fn appendEnrichmentTerminalFailureMarkerDeletesForIssue(
         fn appendOwned(self: *@This(), value: []const u8) !void {
             const owned = try self.alloc.dupe(u8, value);
             errdefer self.alloc.free(owned);
+            const owned_len = self.owned_delete_keys.items.len;
             try self.owned_delete_keys.append(self.alloc, owned);
+            errdefer self.owned_delete_keys.shrinkRetainingCapacity(owned_len);
             try self.deletes.append(self.alloc, owned);
         }
 
@@ -35941,12 +36403,7 @@ fn appendEnrichmentTerminalFailureMarkerDeletesForIssue(
         .owned_delete_keys = owned_delete_keys,
     };
     try store.scanWithContext(prefix, if (upper) |value| value else "", .{}, &state, ScanState.scanEntry);
-    if (retire_generation) {
-        const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, repair_issue_key);
-        errdefer alloc.free(generation_key);
-        try owned_delete_keys.append(alloc, generation_key);
-        try deletes.append(alloc, generation_key);
-    }
+    return state.entries_examined;
 }
 
 fn lockEnrichmentFailurePendingFence(ctx_ptr: *anyopaque) void {
@@ -36971,27 +37428,29 @@ fn decodeArtifactRepairIssueValueAlloc(alloc: Allocator, raw: []const u8) !types
     const kind = std.meta.stringToEnum(types.ArtifactRepairKind, Fields.string(obj, "artifact_kind")) orelse .embedding;
     const reason = std.meta.stringToEnum(types.ArtifactRepairReason, Fields.string(obj, "reason")) orelse .missing_artifact;
     const default_repairable = artifactRepairKindHasAutomatedReprocessor(kind);
-    return .{
+    var issue = types.ArtifactRepairIssue{
         .artifact_kind = kind,
-        .index_name = try alloc.dupe(u8, Fields.string(obj, "index_name")),
-        .doc_key = try alloc.dupe(u8, Fields.string(obj, "doc_key")),
-        .parent_doc_key = try alloc.dupe(u8, Fields.string(obj, "parent_doc_key")),
-        .unit_id = try alloc.dupe(u8, Fields.string(obj, "unit_id")),
-        .source_artifact_name = try alloc.dupe(u8, Fields.string(obj, "source_artifact_name")),
-        .artifact_name = try alloc.dupe(u8, Fields.string(obj, "artifact_name")),
-        .artifact_key = try alloc.dupe(u8, Fields.string(obj, "artifact_key")),
         .chunk_id = Fields.optionalU32(obj, "chunk_id"),
         .repairable = Fields.boolValue(obj, "repairable", default_repairable),
-        .unsupported_reason = try alloc.dupe(u8, Fields.string(obj, "unsupported_reason")),
         .sequence = Fields.u64Value(obj, "sequence"),
         .reason = reason,
         .generation_attempts = Fields.u64Value(obj, "generation_attempts"),
-        .generation_error = try alloc.dupe(u8, Fields.string(obj, "generation_error")),
         .attempts = Fields.u64Value(obj, "attempts"),
         .first_seen_ns = Fields.u64Value(obj, "first_seen_ns"),
         .last_seen_ns = Fields.u64Value(obj, "last_seen_ns"),
-        .last_error = try alloc.dupe(u8, Fields.string(obj, "last_error")),
     };
+    errdefer issue.deinit(alloc);
+    issue.index_name = try alloc.dupe(u8, Fields.string(obj, "index_name"));
+    issue.doc_key = try alloc.dupe(u8, Fields.string(obj, "doc_key"));
+    issue.parent_doc_key = try alloc.dupe(u8, Fields.string(obj, "parent_doc_key"));
+    issue.unit_id = try alloc.dupe(u8, Fields.string(obj, "unit_id"));
+    issue.source_artifact_name = try alloc.dupe(u8, Fields.string(obj, "source_artifact_name"));
+    issue.artifact_name = try alloc.dupe(u8, Fields.string(obj, "artifact_name"));
+    issue.artifact_key = try alloc.dupe(u8, Fields.string(obj, "artifact_key"));
+    issue.unsupported_reason = try alloc.dupe(u8, Fields.string(obj, "unsupported_reason"));
+    issue.generation_error = try alloc.dupe(u8, Fields.string(obj, "generation_error"));
+    issue.last_error = try alloc.dupe(u8, Fields.string(obj, "last_error"));
+    return issue;
 }
 
 fn loadArtifactRepairIssueFromStoreByKey(
@@ -37125,6 +37584,33 @@ fn appendArtifactRepairSummaryDirtyForStore(
     errdefer owned_delete_keys.shrinkRetainingCapacity(owned_len);
     try deletes.append(alloc, ready_key);
     try appendArtifactRepairSummaryRebuildInvalidationForStore(alloc, store, writes, deletes, owned_delete_keys);
+}
+
+/// Invalidate summary publication in constant space. Retired-index cleanup
+/// already owns the global apply lock, so a rebuild cannot commit over this
+/// marker; maintenance drains any shadow state in bounded pages before it
+/// starts a fresh summary pass.
+fn appendArtifactRepairSummaryDirtyMarkerForStore(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    owned_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
+    errdefer alloc.free(ready_key);
+    const ready_owned_len = owned_keys.items.len;
+    try owned_keys.append(alloc, ready_key);
+    errdefer owned_keys.shrinkRetainingCapacity(ready_owned_len);
+    try deletes.append(alloc, ready_key);
+
+    const progress_key = try internal_keys.artifactRepairSummaryProgressKeyAlloc(alloc);
+    errdefer alloc.free(progress_key);
+    const progress_owned_len = owned_keys.items.len;
+    try owned_keys.append(alloc, progress_key);
+    errdefer owned_keys.shrinkRetainingCapacity(progress_owned_len);
+    const dirty_value = try alloc.dupe(u8, artifact_repair_summary_dirty_marker);
+    errdefer alloc.free(dirty_value);
+    try writes.append(alloc, .{ .key = progress_key, .value = dirty_value });
 }
 
 const artifact_repair_completion_state_len = 24;
@@ -50358,7 +50844,7 @@ test "db starts resolver replay workers only while resolver catalog is configure
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -50421,7 +50907,7 @@ test "db backfills a mention name embedding so ann/cosine resolution links end-t
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
         \\    "format":"extraction_relation","mention_edge_type":"mentions"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -50502,7 +50988,7 @@ test "db runUntilIdle catches resolution up to the committed tail after a missed
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -50570,7 +51056,7 @@ test "db re-resolves the corpus when upsertResolver bumps the config generation"
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -50634,7 +51120,7 @@ test "db re-resolves existing corpus when upsertResolver inserts a new resolver"
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -50700,7 +51186,7 @@ test "db drains pending resolver backfill when retrying a no-op upsertResolver" 
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -50764,7 +51250,7 @@ test "db refuses resolver removal while resolution or promotion replay is pendin
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -50864,7 +51350,7 @@ test "db promotes resolved entities into entity-document upserts end-to-end" {
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -50928,7 +51414,7 @@ test "db graph index materializes relation asset artifacts into graph edge artif
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51030,7 +51516,7 @@ test "db graph replay blocks resolution artifact without resolver contract" {
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
         \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51106,7 +51592,7 @@ test "db graph replay ignores resolution artifacts bound to another source contr
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_a","mention_edge_type":"mentions",
         \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_a","kind":"asset","field":"relations_a","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_a","kind":"asset","source":{"type":"field","value":"relations_a"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51117,7 +51603,7 @@ test "db graph replay ignores resolution artifacts bound to another source contr
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_b","mention_edge_type":"mentions",
         \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_b","kind":"asset","field":"relations_b","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_b","kind":"asset","source":{"type":"field","value":"relations_b"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51168,7 +51654,7 @@ test "db materializes doc->entity mention edges as provenance and clears them on
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
         \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51291,7 +51777,7 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
         \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51426,7 +51912,7 @@ test "db does not materialize review-band resolution as canonical mention edges"
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
         \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51523,7 +52009,7 @@ test "db mention edge weight is fused from extractor trust and mention confidenc
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
         \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51608,7 +52094,7 @@ test "db rewriteEntityEdges repoints provenance edges to a merge survivor" {
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
         \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51674,7 +52160,7 @@ test "db graph hydration fails closed for a not-yet-promoted entity node" {
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
         \\    "format":"extraction_relation","path":"$.relations[*]"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51832,7 +52318,7 @@ test "db graph relation artifact materializer uses mapping templates" {
         \\  "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.to }}"},
         \\  "edge":{"type":"{{ _item.rel }}","weight":"{{ default _item.score 1.0 }}","metadata":{"evidence":"{{ _item.evidence }}","ordinal":"{{ _item_index }}","tenant":"{{ _doc.value.tenant_id }}"}},
         \\  "context":{"doc_fields":["tenant_id"]},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51878,7 +52364,7 @@ test "db graph relation artifact materializer resolves entity refs and artifact 
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_graph"},
         \\  "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.target.doc_ref.key }}"},
         \\  "edge":{"type":"{{ _item.type }}","metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}","source_text":"{{ _item.source.text }}","target_text":"{{ _item.target.text }}"}},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51922,7 +52408,7 @@ test "db graph relation artifact materializer replaces stale document edges" {
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -51968,7 +52454,7 @@ test "db graph relation artifact materializer deletes edges when asset source di
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -52018,7 +52504,7 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -52037,7 +52523,7 @@ test "db graph artifact source lifecycle reuses and protects asset enrichments" 
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -52176,7 +52662,7 @@ test "db graph artifact source reuses user enrichment and rejects incompatible s
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json"}
         \\}
         ,
     }));
@@ -52198,7 +52684,7 @@ test "db graph source artifact deletion clears materialized graph edges" {
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -52248,7 +52734,7 @@ test "db graph artifact edges are visible to graph search queries" {
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -52302,7 +52788,7 @@ test "db graph artifact external node targets return ids without document hydrat
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\  "nodes":{"model":"external","target":"{{ _item.target.entity_id }}"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -52404,7 +52890,7 @@ test "db async asset producer graph source materializes through replay" {
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\  "edge":{"metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}"}},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"target_doc","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"target_doc"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
         \\}
         ,
     });
@@ -52456,7 +52942,7 @@ test "db async asset producer mention edges come from resolution artifacts" {
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
         \\    "format":"extraction_relation","mention_edge_type":"mentions"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
         \\}
         ,
     });
@@ -52547,7 +53033,7 @@ test "db graph artifact source replay catches up after reopen" {
             .config_json =
             \\{
             \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-            \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
             \\}
             ,
         });
@@ -52968,7 +53454,7 @@ test "db derived target advance does not skip unseen matching replay records" {
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -52978,7 +53464,7 @@ test "db derived target advance does not skip unseen matching replay records" {
         .config_json =
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
         ,
     });
@@ -56359,6 +56845,77 @@ test "db artifact repair summary rebuild invalidates partial counters on mutatio
     }
 }
 
+test "db artifact repair dirty marker drains shadow summaries in bounded pages" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var encoded_count: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_count, 1, .little);
+    for (0..artifact_repair_summary_invalidation_page_size + 1) |i| {
+        const index_name = try std.fmt.allocPrint(alloc, "index-{d:0>4}", .{i});
+        defer alloc.free(index_name);
+        const key = try internal_keys.artifactRepairSummaryRebuildIndexKeyAlloc(alloc, index_name);
+        defer alloc.free(key);
+        try db.core.store.put(key, &encoded_count);
+    }
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (writes.items) |write| alloc.free(@constCast(write.value));
+        writes.deinit(alloc);
+    }
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (owned_keys.items) |key| alloc.free(@constCast(key));
+        owned_keys.deinit(alloc);
+    }
+    try appendArtifactRepairSummaryDirtyMarkerForStore(alloc, &writes, &deletes, &owned_keys);
+    try db.core.store.putBatch(writes.items, deletes.items);
+
+    try std.testing.expect(try db.rebuildArtifactRepairSummaryIfMissing(alloc));
+    const rebuild_prefix = try internal_keys.artifactRepairSummaryRebuildRootKeyAlloc(alloc);
+    defer alloc.free(rebuild_prefix);
+    {
+        const rows = try db.core.store.scanPrefixPage(
+            alloc,
+            rebuild_prefix,
+            null,
+            artifact_repair_summary_invalidation_page_size + 1,
+        );
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        try std.testing.expectEqual(@as(usize, 1), rows.len);
+    }
+    const progress_key = try internal_keys.artifactRepairSummaryProgressKeyAlloc(alloc);
+    defer alloc.free(progress_key);
+    {
+        const progress = try db.core.store.get(alloc, progress_key);
+        defer alloc.free(progress);
+        try std.testing.expectEqualStrings(artifact_repair_summary_dirty_marker, progress);
+    }
+
+    try std.testing.expect(try db.rebuildArtifactRepairSummaryIfMissing(alloc));
+    {
+        const rows = try db.core.store.scanPrefixPage(alloc, rebuild_prefix, null, 1);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        try std.testing.expectEqual(@as(usize, 0), rows.len);
+    }
+    try std.testing.expect(!try db.rebuildArtifactRepairSummaryIfMissing(alloc));
+    try std.testing.expect(try db.artifactRepairSummaryReady(alloc));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, progress_key));
+}
+
 test "db artifact repair summary store writer invalidates partial rebuild" {
     const alloc = std.testing.allocator;
 
@@ -57788,7 +58345,7 @@ test "db artifact repair records corrupt graph edge artifacts during replay" {
             .config_json =
             \\{
             \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-            \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
             \\}
             ,
         });
@@ -57848,7 +58405,7 @@ test "db artifact repair records corrupt graph source asset artifacts during rep
             .config_json =
             \\{
             \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
-            \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+            \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
             \\}
             ,
         });
@@ -59393,12 +59950,53 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
     }
     try std.testing.expect(gated.snapshot().blocked_requests > 0);
 
+    // One coalesced issue may accumulate more terminal-failure history than a
+    // single retirement page during a prolonged provider outage. Admission
+    // must remain fenced until all of it is gone, rather than shifting cleanup
+    // and fail-closed retries onto the replacement generation's first writes.
+    const retired_issue: types.ArtifactRepairIssue = .{
+        .artifact_kind = .embedding,
+        .index_name = cfg.name,
+        .doc_key = "doc:retired",
+        .artifact_name = cfg.name,
+        .artifact_key = "retired-generation-artifact",
+        .reason = .enrichment_failed,
+    };
+    for (0..enrichment_terminal_failure_retirement_page_size + 7) |i| {
+        var sequenced = retired_issue;
+        sequenced.sequence = 10_000 + @as(u64, @intCast(i));
+        try db.recordArtifactRepairIssue(alloc, sequenced);
+    }
+    const retired_issue_key = try artifactRepairIssueKeyForIssueAlloc(alloc, retired_issue);
+    defer alloc.free(retired_issue_key);
+    const retired_marker_prefix = try internal_keys.enrichmentTerminalFailureIssuePrefixAlloc(alloc, retired_issue_key);
+    defer alloc.free(retired_marker_prefix);
+    {
+        const marker_rows = try db.core.store.scanPrefixPage(alloc, retired_marker_prefix, null, 1);
+        defer docstore_mod.DocStore.freeResults(alloc, marker_rows);
+        try std.testing.expectEqual(@as(usize, 1), marker_rows.len);
+    }
+    const retired_generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, retired_issue_key);
+    defer alloc.free(retired_generation_key);
+    const retired_completion_key = try db.artifactRepairCompletionKeyForIssueAlloc(alloc, retired_issue);
+    defer alloc.free(retired_completion_key);
+
     const delete_started_ns = monotonicTimeNs();
     try std.testing.expect(try db.deleteIndex("semantic_idx"));
     try std.testing.expect(monotonicTimeNs() - delete_started_ns < 2 * std.time.ns_per_s);
 
     gated.allowAll();
     db.backend_runtime.durable_jobs.drainOwner(db.repair_cleanup_owner_id);
+    {
+        const issues = try db.listArtifactRepairIssues(alloc, .embedding, cfg.name, 0);
+        defer types.freeArtifactRepairIssues(alloc, issues);
+        try std.testing.expectEqual(@as(usize, 0), issues.len);
+        const marker_rows = try db.core.store.scanPrefixPage(alloc, retired_marker_prefix, null, 1);
+        defer docstore_mod.DocStore.freeResults(alloc, marker_rows);
+        try std.testing.expectEqual(@as(usize, 0), marker_rows.len);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, retired_generation_key));
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, retired_completion_key));
+    }
     try db.addIndex(cfg);
     try db.runUntilIdle();
 
@@ -59408,6 +60006,166 @@ test "db managed dense delete quiesces rate-limited enrichment and recreates cle
     try std.testing.expect(!stats.enrichment.worker_failed);
     try std.testing.expectEqual(@as(u64, 3), stats.indexes[0].doc_count);
     try std.testing.expect(stats.indexes[0].replay_applied_sequence >= stats.indexes[0].replay_target_sequence);
+    try std.testing.expect(stats.indexes[0].repair_summary_ready);
+    try std.testing.expect(!stats.indexes[0].repair_degraded);
+    try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].repair_issue_count);
+}
+
+test "retired repair cleanup propagates allocation failures from durable metadata parsing" {
+    const alloc = std.testing.allocator;
+    const issue: types.ArtifactRepairIssue = .{
+        .artifact_kind = .embedding,
+        .index_name = "retired_index",
+        .doc_key = "doc:retired",
+        .artifact_name = "retired_index",
+        .artifact_key = "retired-physical-artifact",
+        .reason = .enrichment_failed,
+    };
+    const issue_key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
+    defer alloc.free(issue_key);
+    const encoded_issue = try encodeArtifactRepairIssueValueAlloc(alloc, issue);
+    defer alloc.free(encoded_issue);
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, key: []const u8) !void {
+                var parsed = try DB.parseRetiredArtifactRepairIssueKeyAlloc(failing_alloc, key);
+                switch (parsed) {
+                    .valid => |*parts| parts.deinit(failing_alloc),
+                    .malformed => return error.UnexpectedMalformedRepairIssueKey,
+                }
+            }
+        }.run,
+        .{issue_key},
+    );
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, raw: []const u8) !void {
+                var decoded = try DB.decodeRetiredArtifactRepairIssueAlloc(failing_alloc, raw);
+                switch (decoded) {
+                    .valid => |*value| value.deinit(failing_alloc),
+                    .malformed => return error.UnexpectedMalformedRepairIssueValue,
+                }
+            }
+        }.run,
+        .{encoded_issue},
+    );
+
+    const malformed_key = try DB.parseRetiredArtifactRepairIssueKeyAlloc(alloc, "not-an-internal-key");
+    switch (malformed_key) {
+        .valid => |value| {
+            var owned = value;
+            owned.deinit(alloc);
+            return error.ExpectedMalformedRepairIssueKey;
+        },
+        .malformed => {},
+    }
+    const malformed_value = try DB.decodeRetiredArtifactRepairIssueAlloc(alloc, "{");
+    switch (malformed_value) {
+        .valid => |value| {
+            var owned = value;
+            owned.deinit(alloc);
+            return error.ExpectedMalformedRepairIssueValue;
+        },
+        .malformed => {},
+    }
+}
+
+test "retired repair cleanup resumes marker retirement and removes corrupt sidecars after reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const issue: types.ArtifactRepairIssue = .{
+        .artifact_kind = .embedding,
+        .index_name = "retired_index",
+        .doc_key = "doc:retired",
+        .artifact_name = "retired_index",
+        .artifact_key = "retired-physical-artifact",
+        .reason = .enrichment_failed,
+    };
+    const issue_key = try artifactRepairIssueKeyForIssueAlloc(alloc, issue);
+    defer alloc.free(issue_key);
+    const marker_prefix = try internal_keys.enrichmentTerminalFailureIssuePrefixAlloc(alloc, issue_key);
+    defer alloc.free(marker_prefix);
+    const generation_key = try internal_keys.enrichmentTerminalFailureGenerationKeyAlloc(alloc, issue_key);
+    defer alloc.free(generation_key);
+    const completion_key = try internal_keys.artifactRepairCompletionKeyAlloc(
+        alloc,
+        @tagName(issue.artifact_kind),
+        issue.artifact_key,
+    );
+    defer alloc.free(completion_key);
+    const kind_key = try artifactRepairIssueKindKeyForIssueAlloc(alloc, issue);
+    defer alloc.free(kind_key);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        for (0..enrichment_terminal_failure_retirement_page_size + 7) |i| {
+            var sequenced = issue;
+            sequenced.sequence = 20_000 + @as(u64, @intCast(i));
+            try db.recordArtifactRepairIssue(alloc, sequenced);
+        }
+        try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+        // The primary key remains trustworthy even when the payload does not.
+        // Cleanup must use it to drain marker, generation, secondary, and
+        // single-flight sidecars without following corrupt value fields.
+        try db.core.store.put(issue_key, "malformed-repair-issue");
+
+        try std.testing.expect(try DB.drainRetiredIndexArtifactRepairIssuesPageContext(
+            db.async_context,
+            issue.index_name,
+        ));
+        const primary = try db.core.store.get(alloc, issue_key);
+        alloc.free(primary);
+        const remaining_markers = try db.core.store.scanPrefixPage(
+            alloc,
+            marker_prefix,
+            null,
+            enrichment_terminal_failure_retirement_page_size,
+        );
+        defer docstore_mod.DocStore.freeResults(alloc, remaining_markers);
+        try std.testing.expectEqual(@as(usize, 7), remaining_markers.len);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    var drained = false;
+    for (0..8) |_| {
+        if (!try DB.drainRetiredIndexArtifactRepairIssuesPageContext(
+            reopened.async_context,
+            issue.index_name,
+        )) {
+            drained = true;
+            break;
+        }
+    }
+    try std.testing.expect(drained);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, issue_key));
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, kind_key));
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, generation_key));
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, completion_key));
+    const remaining_markers = try reopened.core.store.scanPrefixPage(alloc, marker_prefix, null, 1);
+    defer docstore_mod.DocStore.freeResults(alloc, remaining_markers);
+    try std.testing.expectEqual(@as(usize, 0), remaining_markers.len);
+
+    try reopened.runArtifactRepairMetadataMaintenanceUntilIdle();
+    try std.testing.expect(try reopened.artifactRepairSummaryReady(alloc));
 }
 
 test "db dense checkpoint persistence serializes with index apply" {
@@ -61940,7 +62698,7 @@ test "db foreign inference provider failure releases enrichment waiter as termin
         \\{
         \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\  "edge":{},
-        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
         \\}
         ,
     });
@@ -72680,6 +73438,70 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
     try std.testing.expect(db.core.index_manager.repairUnavailable("semantic_idx"));
 }
 
+test "db completed partial managed admission serves and retires redundant repair" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "thumbnail",
+        .kind = .embedding,
+        .field = "body",
+        .expected_dims = 3,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:covered", .value = "{\"body\":\"alpha\"}" },
+            .{ .key = "doc:skipped", .value = "{\"title\":\"no embedding source\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const cfg = types.IndexConfig{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"body","dims":3,"metric":"cosine","embedding_name":"thumbnail","coverage_policy":"partial","generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"thumbnail"}}
+        ,
+        .coverage_generation = 42,
+    };
+    const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+    try db.runUntilIdle();
+
+    const active = db.core.index_manager.denseIndex(cfg.name) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), active.index.stats().active_count);
+    var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer repair.deinit(alloc);
+    try std.testing.expect(try db.managedAdmissionDenseGenerationIsServiceable(alloc, repair.intent));
+    const runtime_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, runtime_stats);
+    var saw_serviceable_generation = false;
+    for (runtime_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        saw_serviceable_generation = index_stats.index_repair_active_generation_serviceable;
+    }
+    try std.testing.expect(saw_serviceable_generation);
+
+    // Query admission may prove the pinned active generation independently of
+    // the background scheduler, while the next scheduler quantum durably
+    // removes the obsolete intent and admission marker without a shadow build.
+    try db.failIfIndexQuarantined(cfg.name);
+    try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
+    const completed = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expect(completed.attempted);
+    try std.testing.expect(completed.repaired);
+    try std.testing.expect(!try db.hasPendingIndexRepairIntents(alloc));
+}
+
 test "db managed algebraic admission builds and reopens requires generation marker" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -79765,6 +80587,59 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
     pool.releaseDescriptorsForTest(io, 2);
     held_descriptors = false;
     try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+}
+
+test "db close stops text admission before joining derived publishers" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        // If close joins the derived executor first, the injected producer
+        // wait expires at this ordinary deadline. A correct ownership order
+        // wakes it through text-runtime shutdown instead.
+        .text_merge = .{ .enabled = true, .backpressure_max_wait_ms = 5_000 },
+    });
+    var db_open = true;
+    defer if (db_open) db.close();
+    const io = db.backend_runtime.io() orelse return error.SkipZigTest;
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    text_merge_runtime_mod.test_wait_for_producer_shutdown.store(true, .release);
+    text_merge_runtime_mod.test_producer_shutdown_wait_entered.store(false, .release);
+    text_merge_runtime_mod.test_producer_shutdown_wait_outcome.store(0, .release);
+    defer {
+        text_merge_runtime_mod.test_wait_for_producer_shutdown.store(false, .release);
+        text_merge_runtime_mod.test_producer_shutdown_wait_entered.store(false, .release);
+        text_merge_runtime_mod.test_producer_shutdown_wait_outcome.store(0, .release);
+    }
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:1", .value = "{\"title\":\"shutdown ordering\"}" }},
+        .sync_level = .write,
+    });
+
+    const wait_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (!text_merge_runtime_mod.test_producer_shutdown_wait_entered.load(.acquire) and
+        monotonicTimeNs() < wait_deadline)
+    {
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    if (!text_merge_runtime_mod.test_producer_shutdown_wait_entered.load(.acquire))
+        return error.TestTimeout;
+
+    db.close();
+    db_open = false;
+    try std.testing.expectEqual(
+        @as(u8, 1),
+        text_merge_runtime_mod.test_producer_shutdown_wait_outcome.load(.acquire),
+    );
 }
 
 test "db text merge backpressure drains sustained segment debt to low watermark" {

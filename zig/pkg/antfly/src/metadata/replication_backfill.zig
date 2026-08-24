@@ -6587,6 +6587,16 @@ test "metadata http service live snapshot and later streaming insert through hos
     });
     try server.svc.campaignMetadataGroup();
     try server.runRound();
+    try server.svc.upsertNode(.{ .node_id = 1, .role = "data" });
+    try server.svc.upsertStore(.{
+        .store_id = 1,
+        .node_id = 1,
+        .role = "data",
+        .live = true,
+        .capacity_bytes = 1024,
+        .available_bytes = 1024,
+    });
+    try server.runRound();
 
     const suffix = blk: {
         var prng = std.Random.DefaultPrng.init(nowMillis());
@@ -6646,7 +6656,6 @@ test "metadata http service live snapshot and later streaming insert through hos
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
-    try workflow.setPlacementCandidates(&.{1});
     _ = try workflow.createTableWithRanges(server.svc, table, ranges);
 
     const group_id = ranges[0].group_id;

@@ -2089,7 +2089,7 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, api_http_runtime_test_mod, true, true);
 
-    const metadata_unit_test_root_paths = [_][]const u8{
+    const metadata_unit_baseline_root_paths = [_][]const u8{
         "pkg/antfly/src/metadata_reconciler_test_root.zig",
         "pkg/antfly/src/metadata_service_http_test_root.zig",
         "pkg/antfly/src/metadata_core_test_root.zig",
@@ -2099,6 +2099,20 @@ pub fn build(b: *std.Build) void {
         "pkg/antfly/src/metadata_table_provisioner_test_root.zig",
         "pkg/antfly/src/metadata_replication_backfill_test_root.zig",
         "pkg/antfly/src/metadata_storage_test_root.zig",
+    };
+    var metadata_unit_baseline_mods: [metadata_unit_baseline_root_paths.len]*std.Build.Module = undefined;
+    for (metadata_unit_baseline_root_paths, &metadata_unit_baseline_mods) |root_path, *test_mod| {
+        test_mod.* = b.createModule(.{
+            .root_source_file = b.path(root_path),
+            .target = target,
+            .optimize = optimize,
+        });
+        antfly_imports.configure(b, test_mod.*, true, true);
+    }
+
+    const metadata_unit_test_root_paths = [_][]const u8{
+        "pkg/antfly/src/metadata_unit_lane_a_test_root.zig",
+        "pkg/antfly/src/metadata_unit_lane_b_test_root.zig",
     };
     var metadata_unit_test_mods: [metadata_unit_test_root_paths.len]*std.Build.Module = undefined;
     for (metadata_unit_test_root_paths, &metadata_unit_test_mods) |root_path, *test_mod| {
@@ -3466,7 +3480,11 @@ pub fn build(b: *std.Build) void {
 
     const antfly_client_pkg_tests = b.addTest(.{
         .root_module = antfly_client_pkg_mod,
-        .filters = &.{"antfly client pkg compiles"},
+        .filters = &.{
+            "antfly client pkg compiles",
+            "get index response timeout bounds the complete HTTP request",
+            "list indexes response timeout bounds readiness preflight",
+        },
     });
     const run_antfly_client_pkg_tests = addFilteredTestRunArtifact(b, antfly_client_pkg_tests);
     const antfly_client_pkg_test_step = b.step("antfly-client-test", "Run the standalone antfly-client package compile test");
@@ -3533,7 +3551,9 @@ pub fn build(b: *std.Build) void {
         "query embedding cache owns results and coalesces misses",
         "query embedding cache keys isolate security domains",
         "managed embedder deadlines bound provider pacing and transport",
+        "managed embedder dimension probe validation modes",
         "managed embedder rejects malformed provider vectors",
+        "managed embedder preserves coverage policy in storage config",
         "semantic query planning reuses equivalent embeddings",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
@@ -3541,7 +3561,16 @@ pub fn build(b: *std.Build) void {
         "linear merge request parser accepts raw payload value under public request cap",
         "http response uses its owning allocator",
         "public index contract exposes runtime status metadata",
+        "public index config encoders redact coverage incarnation",
+        "created nested response allowlists cover generated schemas",
+        "public index config encoders redact nested credentials",
+        "public index config encoders retain credential-free provider urls",
+        "public index config encoders omit root write-only producer documents",
+        "created graph index response projects closed nested schemas",
         "enrichment index status encodes worker lifecycle diagnostics",
+        "compact index repair status keeps corrupt terminal state actionable",
+        "data runtime report preserves compact managed repair admission state",
+        "metadata status JSON preserves compact managed repair admission state",
         "remote runtime status reports replay debt separately from active catch-up",
         "table storage status sums complete fresh shard disk usage",
         "metadata.table status encoder honors storage status overrides",
@@ -3562,18 +3591,26 @@ pub fn build(b: *std.Build) void {
         "backend runtime inference lane has an isolated bounded executor",
         "backend runtime rejects control lane leases after shutdown begins",
         "provisioned table write cache retires stale db when index metadata changes",
+        "table runtime snapshot cache preserves active managed admission proof",
         "managed startup catch-up advances counterless incomplete dense repair",
+        "db completed partial managed admission serves and retires redundant repair",
         "provisioned leader admission rejects uncommitted writes under dense repair pressure",
         "api maintenance resumes recovered durable named index cancellation without client advance",
         "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
-        "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
+        "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
         "managed embedder sends antfly media parts when local provider is configured",
         "managed embedder normalizes local admission overload across embedding modes",
         "partial coverage embeddings readiness counts skipped source units",
         "partial coverage embeddings readiness does not mask pending enrichment",
+        "complete partial embeddings coverage is ready after active generation proof",
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
         "table contract rejects unsupported index kinds before admission",
+        "table contract rejects graph configs the runtime cannot materialize",
+        "table graph validation rejects runtime-invalid configs before catalog admission",
+        "table contract preserves typed artifact-backed graph configuration",
+        "table contract rejects unknown fields in closed nested index objects",
+        "table contract treats nullable nested index fields as omitted",
         "table contract preserves artifact-backed public full text indexes",
         "table contract rejects invalid inline artifact enrichments before admission",
         "public enrichment validation rejects invalid execution and producer config",
@@ -3582,6 +3619,7 @@ pub fn build(b: *std.Build) void {
         "inference run recognizes help before server startup",
         "inference pull classifies order independent value flags",
         "inference pull rejects flags from the other model domain",
+        "inference runtime preserves effective process envelope provenance",
         "metadata.table generated field capabilities include schema dynamic templates",
         "metadata.table status exposes stable field capabilities",
         "metadata.table status promotes schema capability when runtime coverage is complete",
@@ -3769,6 +3807,9 @@ pub fn build(b: *std.Build) void {
         "api http public sort gate accepts synthetic hierarchy child positions",
         "api http public sort capability gate validates mapped sortable fields",
         "api http public sort capability gate fails closed for uncovered observed dynamic fields",
+        "api http server create table with local writes waits for projected presence without lifecycle",
+        "api http server create index installs exact visible config and defers lagging projection",
+        "status source reports an absent linearizable read capability without failing",
         "table read source distinguishes unavailable physical capability observation",
         "generated route policy inventory is unique and describes wire modes",
         "linked API dispatch preserves kernel-owned ingress policy",
@@ -3866,7 +3907,18 @@ pub fn build(b: *std.Build) void {
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.serverless", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
+        .filters = &.{
+            "cmd.lite",
+            "cmd.serverless",
+            "cmd.cli.backup",
+            "cmd.cli.index",
+            "cmd.cli.query",
+            "cmd.cli.table",
+            "cmd.cli.mod",
+            "cmd.cli.data.test.mutation parser",
+            "cmd.cli.data.test.load parser",
+            "cmd.cli.data.test.checkpoint validation rejects changed source and load config",
+        },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3897,7 +3949,7 @@ pub fn build(b: *std.Build) void {
     lite_cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const lite_cmd_tests = b.addTest(.{
         .root_module = lite_cmd_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.mod" },
+        .filters = &.{ "cmd.lite", "cmd.cli.backup", "cmd.cli.index", "cmd.cli.query", "cmd.cli.table", "cmd.cli.mod" },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4199,6 +4251,22 @@ pub fn build(b: *std.Build) void {
     const serverless_manifest_test_step = b.step("lib-serverless-manifest-test", "Run focused serverless manifest object-store tests");
     serverless_manifest_test_step.dependOn(&run_serverless_manifest_tests.step);
 
+    const lake_scaffold_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, lake_scaffold_test_mod, true, true);
+    const lake_scaffold_tests = b.addTest(.{
+        .root_module = lake_scaffold_test_mod,
+        .filters = &.{ "lake", "parquet", "iceberg", "external source", "row fragment", "sidecar" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
+    const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
+    lake_test_step.dependOn(&run_lake_scaffold_tests.step);
+    unit_test_step.dependOn(&run_lake_scaffold_tests.step);
+
     const lib_data_runtime_default_filters = [_][]const u8{
         "failed full index enrichment does not make resident reads unavailable",
         "enrichment runtime status reports worker lifecycle diagnostics",
@@ -4257,10 +4325,14 @@ pub fn build(b: *std.Build) void {
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "remote metadata source pins one cluster incarnation across cache invalidation",
         "remote metadata source retains mutation authority across cache invalidation",
-        "remote metadata cache orders heads monotonically within an incarnation",
+        "remote metadata source installs fenced snapshot without comparing epoch domains",
+        "remote metadata source rejects fenced snapshot across mutation invalidation",
+        "remote metadata source treats superseded concurrent fenced snapshot as success",
+        "remote metadata source bounds unsupported linearizable snapshot probes",
         "remote metadata source shares backend runtime io across a bounded executor pool",
         "data runtime treats metadata leadership churn as retryable bootstrap failure",
         "data runtime metadata bootstrap retry delay is bounded and jittered",
+        "data runtime heartbeat cache cannot regress to an older full report",
         "idle cached runtime status stays fresh only for the published root generation",
         "runtime status disk usage cache is scoped to one root generation",
         "runtime status disk scan retries across a reallocation fence and group invalidation remains scoped",
@@ -4273,6 +4345,7 @@ pub fn build(b: *std.Build) void {
         "data runtime split apply store seeding reuses cached source writer",
         "data runtime local merge fallback uses its durable table contract",
         "data runtime resolves extension package store env before local default",
+        "data runtime parses optional split store registration flags",
         "data runtime cli accepts ARD identity flags",
         "data runtime parses experimental flag",
         "data public API listener uses public API request body limit",
@@ -5023,6 +5096,7 @@ pub fn build(b: *std.Build) void {
         "api http server join planner uses complete fresh local stats before metadata publication",
         "api http server serves provisioned index runtime backfill status across shards",
         "table contract rejects unsupported index kinds before catalog admission",
+        "table contract ignores create-table full text entries and preserves non-full-text indexes",
         "table contract keeps operational create request failures on the internal error path",
         "api http server rejects unsupported table index before metadata publication",
         "api http server serves table create and drop",
@@ -5030,8 +5104,11 @@ pub fn build(b: *std.Build) void {
         "api http server create table with replication sources returns encoded table detail",
         "api http server lists cluster backups through public route",
         "api http server returns retryable not leader when cluster backup read barrier times out",
+        "api http server fails closed when backup fences are unsupported",
         "api http server cluster backup succeeds after load balanced metadata timeout retry",
         "api http server does not advertise a retry after cluster backup side effects begin",
+        "cluster backup retains its fenced attempt after an ambiguous table outcome",
+        "table backup retry preserves the retained ambiguous generation",
         "public metadata mutation retries transient authority loss only within its deadline",
         "api http server rejects restore before persistence without an asynchronous worker",
         "configured api http server attaches durable restore job persistence",
@@ -5185,8 +5262,11 @@ pub fn build(b: *std.Build) void {
         "api http server returns retryable not leader when metadata proposal is dropped",
         "api http server returns retryable not leader through public table adapter mutation",
         "api http server returns retryable not leader when cluster backup read barrier times out",
+        "api http server fails closed when backup fences are unsupported",
         "api http server cluster backup succeeds after load balanced metadata timeout retry",
         "api http server does not advertise a retry after cluster backup side effects begin",
+        "cluster backup retains its fenced attempt after an ambiguous table outcome",
+        "table backup retry preserves the retained ambiguous generation",
         "typed HA route operation dispatches admin and internal executors",
         "typed HA route operation requires exact bearer token for internal replication routes",
         "api http server forbids non-admin secret access when auth is enabled",
@@ -5333,7 +5413,11 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "public table backup and restore require named connections",
             "public table backup handler rejects an existing backup id",
+            "public table backup handler exposes non-retryable fenced outcomes",
+            "backup fence headers require a complete canonical fence",
+            "fenced backup forwarding treats post-send transport failure as ambiguous",
             "cluster backup APIs require named connections",
+            "cluster backup vtable preserves request context and canceled ingress stops before parsing",
             "cluster backup format defaults portable and preserves explicit native",
             "cluster backup and restore reject duplicate table selectors",
             "backup API requests reject unknown operational fields",
@@ -5363,8 +5447,17 @@ pub fn build(b: *std.Build) void {
             "attempt head generation detects publication and retirement ABA",
             "newest attempt exact verification detects corruption and receipts revalidate identity",
             "unpublished remote cleanup preserves a conflicting manifest",
+            "forwarded backup envelope retirement preserves canonical payload",
+            "table backup reservation durably binds logical and artifact ids",
+            "table backup writer lease fences cleanup until the storage owner expires",
+            "standalone table backup stale reclamation fences delayed writers",
+            "standalone table backup stale reclamation preserves committed manifests and legacy missing leases",
+            "cluster writer lease reclamation persists bounded scan progress",
+            "table backup cleanup removes the forwarded artifact envelope before payload",
+            "cluster backup retains its fenced attempt after an ambiguous table outcome",
+            "table backup retry preserves the retained ambiguous generation",
             "cluster backup attempt markers reject overlapping cleanup identities",
-            "stale owned cluster backup attempt releases fences and retires authoritative head",
+            "stale owned cluster backup attempt retains generation fences and retires authoritative head",
             "expired recovery preserves an oversized remote commit record",
             "cluster backup reservation heartbeat fences premature and stale recovery",
             "filesystem cluster backup lease supports the maximum owner identity",
@@ -5372,8 +5465,11 @@ pub fn build(b: *std.Build) void {
             "filesystem completed attempt tickets are deleted instead of durably rotated",
             "filesystem attempt publication tolerates concurrent bounded maintenance",
             "filesystem attempt maintenance removes only stale staged tickets",
+            "filesystem reclaim removes invalid POSIX tickets containing backslashes",
+            "local reclaim stays bound to its opened repository after a root swap",
             "filesystem stale attempt reclamation recovers an abandoned claim",
             "remote stale attempt reclamation cursor prevents prefix starvation",
+            "legacy quarantine equivalence rejects a borrowed marker digest",
             "stale cluster backup attempt preserves aggregate referenced artifacts",
             "filesystem backup listing is bounded and cursor stable",
             "native backup directory copy preserves nested files",
@@ -5884,6 +5980,7 @@ pub fn build(b: *std.Build) void {
             "public table batch handler returns concise dense repair backpressure",
             "public table api carries borrowed cancellation into batch execution",
             "public create index exposes retryable storage descriptor exhaustion",
+            "public create index returns normalized created resource",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler preserves retryable failure status",
             "public table query handler maps HA read gate errors",
@@ -5892,6 +5989,7 @@ pub fn build(b: *std.Build) void {
             "public table query handler surfaces exact sort rejection diagnostics",
             "public table query view handler maps doc identity unavailable errors",
             "public table backup handler accepts portable format",
+            "public table backup handler exposes non-retryable fenced outcomes",
             "public table restore handler maps unsupported multi-range error",
             "public table restore handler reports artifact integrity failures",
             "public table restore handler reports committed durability pending",
@@ -5956,9 +6054,13 @@ pub fn build(b: *std.Build) void {
             "coverage policy assigns persistent private incarnations only to embeddings",
             "restore manifest preserves trusted coverage incarnation metadata",
             "public index config encoders redact coverage incarnation",
+            "public index config encoders redact nested credentials",
+            "public index config encoders omit root write-only producer documents",
+            "table contract rejects unknown fields for every public index variant",
             "identical index mutation retries preserve coverage incarnation",
             "derived coverage evaluation is policy exact and observation gated",
             "settled terminal enrichment debt is degraded rather than rebuilding",
+            "derived coverage source totals ignore derived index fan out",
             "derived coverage aggregation rejects mixed config observations",
             "index status exposes compact repair state without internal diagnostics",
             "rebuild quarantine remains an explicit failed public index status",
@@ -5976,9 +6078,12 @@ pub fn build(b: *std.Build) void {
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
             "derived coverage reasons deduplicate overlapping freshness signals",
-            "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
+            "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
             "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
             "managed embeddings skipped terminal sources complete backfill without fabricating replay debt",
+            "repair-free embeddings aggregate retains live dense catch-up",
+            "serviceable repair preserves sibling shard dense catch-up fallback",
+            "index encoders preserve sibling replay debt during serviceable repair",
             "enrichment aggregation preserves telemetry and fences mixed checkpoint identity",
             "table storage status indexes one distributed snapshot by table and owner",
             "distributed join uses row estimates when byte statistics are unavailable",
@@ -5990,7 +6095,8 @@ pub fn build(b: *std.Build) void {
             "api http missing index classification requires active rebuild evidence",
             "api http lifecycle classification preserves catching-up writer beside fresh read snapshot",
             "remote rebuild quarantine preserves its source and index failure",
-            "api http server create index waits for exact target config projection",
+            "api http server create index installs exact visible config and defers lagging projection",
+            "api http server create index expands schema-derived algebraic config",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -6022,7 +6128,13 @@ pub fn build(b: *std.Build) void {
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned create succeeds when post-commit runtime status is fenced",
             "provisioned create reuses a generation opened by startup reconciliation",
+            "provisioned create installs managed enrichment despite a matching stale fingerprint",
+            "runtime status refreshes aged live writer publications",
+            "provisioned table write source runtime status serves cached snapshot during active same-table work",
+            "provisioned table write source runtime status still serves unrelated table snapshot while source mutex is busy",
+            "provisioned table write source best effort publish does not advertise lock contention as an empty table",
             "hosted backup forwarding preserves external io authority",
+            "backup storage resolution rejects a reused table name from another incarnation",
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
             "provisioned table restore preparation blocks writes and competing structural mutation",
             "provisioned table restore preparation blocks writes while allowing reads",
@@ -6032,6 +6144,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source read request permits replicated apply activity",
             "provisioned table group operation waiter queues ahead of later readers",
             "provisioned table write source drop table cancels index repair before structural admission",
+            "provisioned table write source drop table retires old publication authority",
             "provisioned table write request queues structural reconcile ahead of later writes",
             "structural reconcile reservation defers metadata group refresh without blocking admitted work",
             "queued structural reconcile reserves write admission before its worker starts",
@@ -6042,6 +6155,10 @@ pub fn build(b: *std.Build) void {
             "structural reconcile retries a transient worker failure",
             "structural reconcile returns a bounded pending quantum while a group is busy",
             "structural reconcile publishes durable index repair debt once per group",
+            "structural repair handoff keeps status fenced through final shard visibility",
+            "repair handoff status settles after authoritative cached publication",
+            "managed create publication handoff releases on converged owner publication",
+            "managed dense publication handoff releases when its incarnation is superseded",
             "resident DB retry preparation waits outside admission for writer publication",
             "admitted resident DB lease never waits for an in-flight writer publication",
             "write cache local mutation preempts stale startup writer",
@@ -6059,6 +6176,8 @@ pub fn build(b: *std.Build) void {
             "standby HA replay reconciles managed indexes without opening the public write gate",
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed structural catch-up leaves pending enrichment with the asynchronous owner",
+            "managed structural catch-up does not delegate an empty producer handoff",
+            "managed create publication handoff ignores unrelated index debt",
             "db managed vector admission captures writes while durable repair is pending",
             "db managed algebraic admission builds and reopens",
             "db algebraic generation build yields and resumes from its durable source cursor",
@@ -6299,6 +6418,12 @@ pub fn build(b: *std.Build) void {
         "table provisioner runtime schema progress requires authoritative O(1) identity coverage",
         "catalog table topology is order independent and detects range mutation",
         "metadata http server serves status and filtered admin routes",
+        "metadata admin linearizable snapshot propagates request context",
+        "metadata linearizable snapshot fences and frees one owned response",
+        "metadata linearizable snapshot detects concurrent projection changes",
+        "coherent linearizable snapshot retries a torn capture and preserves request context",
+        "metadata http client fetches one bounded linearizable snapshot",
+        "metadata http client treats missing linearizable snapshot route as unsupported",
         "metadata http server accepts internal reallocate and split merge routes",
         "metadata http server returns 400 for invalid internal restore backup locations",
         "metadata http server returns retryable authority response when reconcile lease is not held",
@@ -6392,9 +6517,17 @@ pub fn build(b: *std.Build) void {
 
     const resource_budget_runtime_filters = [_][]const u8{
         "default tokenizer cache budget is aligned with its resource slice",
+        "identity allocation failure rolls back every memory ledger",
+        "manager teardown retires live observer snapshots",
         "batch reservation is atomic across inference resource slices",
         "classified batch reservation distinguishes size from contention",
+        "aggregate host memory admission is atomic across slices",
+        "logical inference slices can charge only physical host memory",
+        "batch release accounting errors fail closed",
+        "single release and observer mismatch cannot debit unrelated memory",
+        "bounded oversized progress cannot bypass aggregate host memory",
         "resource manager observes over-budget external usage",
+        "identity-aware cache admission rejects growth and always permits shrink",
         "resource manager evaluates projected admission with configured action",
         "resource manager bounds soft write throttling without waiting for compaction publication",
         "resource manager records index repair activation pause separately from cleanup",
@@ -6411,6 +6544,7 @@ pub fn build(b: *std.Build) void {
         "hbc cache shrinks to resource budget under pressure",
         "resource-managed mapped residency evicts cold segments and preserves hot mappings",
         "provisioned group storage derives all resource budgets",
+        "effective process memory limit preserves source and clamps explicit requests",
         "resource manager capacity source is immutable after composition",
         "capacity reservation revalidation fails closed when available space falls",
         "resource manager background deferral follows slice policy",
@@ -6741,6 +6875,7 @@ pub fn build(b: *std.Build) void {
             "standalone HA runtime rejects ambiguous role flags",
             "standalone continuous HA mutation guard follows role lifecycle",
             "antfly config uses cli override before common config",
+            "standalone memory budget conversion rejects overflow",
             "standalone public api caps keep alive request reuse",
             "standalone public api body limit matches common http listener",
             "standalone public ready endpoint fails closed before API initialization",
@@ -6752,12 +6887,15 @@ pub fn build(b: *std.Build) void {
             "common config rejects removed top-level storage backend fields",
             "common config parses bounded transaction session policy",
             "parse cli accepts inference budget overrides",
+            "standalone preserves effective process envelope provenance for inference",
             "standalone kernel JIT mode precedence is CLI then environment then config",
             "inference config falls back to common config",
             "standalone prompt cache detaches resource observer before owner teardown",
             "inference admission bridge charges combined native residency to resource manager",
+            "standalone tokenizer bridge enforces growth and permits exact teardown",
             "standalone inference keep alive parses compound durations and zero",
             "standalone linked inference ABI validates the supported function-table prefix",
+            "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
             "standalone runtime resolves paths from common storage base dir",
             "standalone runtime resolves extension package store env before local default",
@@ -6765,6 +6903,7 @@ pub fn build(b: *std.Build) void {
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
+            "standalone metadata advertises a linearizable owned snapshot",
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
             "standalone unified server lifecycle propagates startup failure",
@@ -7517,6 +7656,7 @@ pub fn build(b: *std.Build) void {
             "storage.persistent.",
             "storage.portable_backup.",
             "storage.resource_manager.",
+            "storage.rowsource.",
             "storage.schema.",
             "storage.shard.",
             "storage.sim_runtime.",
@@ -7844,7 +7984,62 @@ pub fn build(b: *std.Build) void {
         "unit-metadata-test",
         "Run the production metadata portion of the default unit-test target in bounded shards",
     );
-    const unit_metadata_shard_names = [_][]const u8{
+    const metadata_runtime_filter_is_default =
+        lib_metadata_runtime_filters.len == 1 and
+        std.mem.eql(u8, lib_metadata_runtime_filters[0], "metadata.");
+    // Preserve the former two compile lanes while compiling each lane's
+    // production metadata ownership groups into one executable. This removes
+    // seven repeated semantic-analysis/code-generation passes without
+    // constructing the public metadata barrel that also owns simulations.
+    const unit_metadata_artifact_shard_indices = [_][]const usize{
+        &.{ 0, 2, 4, 6, 8 },
+        &.{ 1, 3, 5, 7 },
+    };
+    const unit_metadata_artifact_names = [_][]const u8{
+        "metadata-unit-lane-a-tests",
+        "metadata-unit-lane-b-tests",
+    };
+    var unit_metadata_compile_filters: [unit_metadata_artifact_shard_indices.len][]const []const u8 = .{
+        &.{},
+        &.{},
+    };
+    for (unit_metadata_artifact_shard_indices, &unit_metadata_compile_filters) |shard_indices, *compile_filters| {
+        for (shard_indices) |shard_index| {
+            compile_filters.* = compileFiltersWithAnchors(
+                b,
+                compile_filters.*,
+                unit_metadata_shard_filters[shard_index],
+            );
+        }
+    }
+
+    var unit_metadata_tests: [metadata_unit_test_mods.len]*std.Build.Step.Compile = undefined;
+    for (
+        unit_metadata_artifact_names,
+        metadata_unit_test_mods,
+        unit_metadata_compile_filters,
+        &unit_metadata_tests,
+    ) |artifact_name, test_mod, compile_filters, *tests| {
+        tests.* = b.addTest(.{
+            .name = artifact_name,
+            .root_module = test_mod,
+            .filters = compile_filters,
+            .test_runner = .{
+                .path = b.path("pkg/antfly/src/test_runner.zig"),
+                .mode = .simple,
+            },
+            .max_rss = 8 * 1024 * 1024 * 1024,
+        });
+    }
+    const unit_metadata_compile_step = b.step(
+        "unit-metadata-compile",
+        "Compile the two consolidated metadata unit-test artifacts without running them",
+    );
+    for (unit_metadata_tests) |tests| unit_metadata_compile_step.dependOn(&tests.step);
+
+    // Keep the prior nine-artifact layout as an opt-in coverage oracle. It is
+    // deliberately absent from unit-test and unit-metadata-test.
+    const unit_metadata_baseline_names = [_][]const u8{
         "metadata-reconciler-tests",
         "metadata-service-http-tests",
         "metadata-core-tests",
@@ -7855,105 +8050,157 @@ pub fn build(b: *std.Build) void {
         "metadata-replication-backfill-tests",
         "metadata-storage-tests",
     };
-    const unit_metadata_shard_max_rss = [_]usize{
+    const unit_metadata_baseline_max_rss = [_]usize{
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
-        // The core shard now compiles the contextual public router and its
-        // compatibility manifest; Debug codegen peaks above 5 GiB on macOS.
-        6 * 1024 * 1024 * 1024,
+        7 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
-        // The server shard compiles the public API kernel and listener stack;
-        // Debug codegen currently peaks around 6.4 GB on aarch64 macOS.
         7 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
         5 * 1024 * 1024 * 1024,
         7 * 1024 * 1024 * 1024,
         6 * 1024 * 1024 * 1024,
     };
-    const metadata_runtime_filter_is_default =
-        lib_metadata_runtime_filters.len == 1 and
-        std.mem.eql(u8, lib_metadata_runtime_filters[0], "metadata.");
-    const unit_metadata_shard_lanes = [_]usize{ 0, 1, 0, 1, 0, 1, 0, 1, 0 };
-    var unit_metadata_compile_tails = [_]?*std.Build.Step{ null, null };
-    var unit_metadata_aggregate_run_tails = [_]?*std.Build.Step{ null, null };
-    var unit_metadata_focused_run_tails = [_]?*std.Build.Step{ null, null };
+    const unit_metadata_baseline_lanes = [_]usize{ 0, 1, 0, 1, 0, 1, 0, 1, 0 };
+    var unit_metadata_baseline_compile_tails = [_]?*std.Build.Step{ null, null };
+    var unit_metadata_baseline_tests: [metadata_unit_baseline_mods.len]*std.Build.Step.Compile = undefined;
     for (
         unit_metadata_shard_filters,
-        unit_metadata_shard_names,
-        metadata_unit_test_mods,
-        unit_metadata_shard_max_rss,
-        unit_metadata_shard_lanes,
-    ) |shard_filters, shard_name, test_mod, shard_max_rss, lane| {
-        const is_runtime_exclusive = std.mem.eql(u8, shard_name, "metadata-replication-backfill-tests");
-        const unit_metadata_tests = b.addTest(.{
-            .name = shard_name,
+        unit_metadata_baseline_names,
+        metadata_unit_baseline_mods,
+        unit_metadata_baseline_max_rss,
+        unit_metadata_baseline_lanes,
+        &unit_metadata_baseline_tests,
+    ) |shard_filters, artifact_name, test_mod, max_rss, lane, *tests| {
+        tests.* = b.addTest(.{
+            .name = artifact_name,
             .root_module = test_mod,
             .filters = shard_filters,
             .test_runner = .{
                 .path = b.path("pkg/antfly/src/test_runner.zig"),
                 .mode = .simple,
             },
-            .max_rss = shard_max_rss,
+            .max_rss = max_rss,
         });
-        if (unit_metadata_compile_tails[lane]) |previous| unit_metadata_tests.step.dependOn(previous);
-        unit_metadata_compile_tails[lane] = &unit_metadata_tests.step;
-        const run_unit_metadata_tests = b.addRunArtifact(unit_metadata_tests);
+        if (unit_metadata_baseline_compile_tails[lane]) |previous| {
+            tests.*.step.dependOn(previous);
+        } else {
+            for (unit_metadata_tests) |candidate| tests.*.step.dependOn(&candidate.step);
+        }
+        unit_metadata_baseline_compile_tails[lane] = &tests.*.step;
+    }
+    const compare_unit_metadata_inventory = b.addSystemCommand(&.{"python3"});
+    compare_unit_metadata_inventory.setName("compare consolidated metadata test inventory");
+    compare_unit_metadata_inventory.addFileArg(b.path("tools/compare_test_inventories.py"));
+    compare_unit_metadata_inventory.addArg("--baseline");
+    for (unit_metadata_baseline_tests) |tests| compare_unit_metadata_inventory.addArtifactArg(tests);
+    compare_unit_metadata_inventory.addArg("--candidate");
+    for (unit_metadata_tests) |tests| compare_unit_metadata_inventory.addArtifactArg(tests);
+    compare_unit_metadata_inventory.addArgs(&.{ "--label", "metadata consolidation" });
+    const unit_metadata_inventory_step = b.step(
+        "unit-metadata-test-inventory",
+        "Verify the two consolidated artifacts preserve the nine-shard named test inventory",
+    );
+    unit_metadata_inventory_step.dependOn(&compare_unit_metadata_inventory.step);
+
+    var unit_metadata_lane_a_pre_filters: []const []const u8 = &.{};
+    for ([_]usize{ 0, 2, 4, 6 }) |shard_index| {
+        unit_metadata_lane_a_pre_filters = compileFiltersWithAnchors(
+            b,
+            unit_metadata_lane_a_pre_filters,
+            unit_metadata_shard_filters[shard_index],
+        );
+    }
+    var unit_metadata_lane_b_pre_filters: []const []const u8 = &.{};
+    for ([_]usize{ 1, 3, 5 }) |shard_index| {
+        unit_metadata_lane_b_pre_filters = compileFiltersWithAnchors(
+            b,
+            unit_metadata_lane_b_pre_filters,
+            unit_metadata_shard_filters[shard_index],
+        );
+    }
+    const MetadataRuntimePartition = struct {
+        name: []const u8,
+        artifact_index: usize,
+        filters: []const []const u8,
+        other_filters: []const []const u8,
+    };
+    const unit_metadata_runtime_partitions = [_]MetadataRuntimePartition{
+        .{
+            .name = "metadata-unit-lane-a-pre-tests",
+            .artifact_index = 0,
+            .filters = unit_metadata_lane_a_pre_filters,
+            .other_filters = unit_metadata_shard_filters[8],
+        },
+        .{
+            .name = "metadata-unit-lane-b-pre-tests",
+            .artifact_index = 1,
+            .filters = unit_metadata_lane_b_pre_filters,
+            .other_filters = unit_metadata_shard_filters[7],
+        },
+        .{
+            .name = "metadata-replication-backfill-tests",
+            .artifact_index = 1,
+            .filters = unit_metadata_shard_filters[7],
+            .other_filters = unit_metadata_lane_b_pre_filters,
+        },
+        .{
+            .name = "metadata-storage-tests",
+            .artifact_index = 0,
+            .filters = unit_metadata_shard_filters[8],
+            .other_filters = unit_metadata_lane_a_pre_filters,
+        },
+    };
+    var unit_metadata_aggregate_runs: [unit_metadata_runtime_partitions.len]*std.Build.Step.Run = undefined;
+    var unit_metadata_focused_runs: [unit_metadata_runtime_partitions.len]*std.Build.Step.Run = undefined;
+    for (
+        unit_metadata_runtime_partitions,
+        &unit_metadata_aggregate_runs,
+        &unit_metadata_focused_runs,
+    ) |partition, *aggregate_run, *focused_run| {
         const runtime_filters = if (metadata_runtime_filter_is_default)
-            shard_filters
+            partition.filters
         else
             lib_metadata_runtime_filters;
-        addRuntimeTestFilters(b, run_unit_metadata_tests, runtime_filters);
-        // A focused caller filter generally belongs to only one aggregate
-        // artifact. Permit the other metadata shards to be empty, while
-        // keeping the default CI selection strict so a stale shard filter
-        // cannot silently remove coverage.
-        if (!metadata_runtime_filter_is_default) {
-            run_unit_metadata_tests.addArg("--allow-empty-test-filter");
-        }
-        addRuntimeSkipTestFilters(run_unit_metadata_tests, lib_unit_filters);
+
+        aggregate_run.* = b.addRunArtifact(unit_metadata_tests[partition.artifact_index]);
+        aggregate_run.*.setName(b.fmt("run test {s}", .{partition.name}));
+        addRuntimeTestFilters(b, aggregate_run.*, runtime_filters);
+        addRuntimeSkipTestFilters(aggregate_run.*, lib_unit_filters);
         for (root_test_skip_filters) |filter| {
-            run_unit_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
+            aggregate_run.*.addArgs(&.{ "--skip-test-filter", filter });
         }
-        if (is_runtime_exclusive) {
-            for (unit_metadata_aggregate_run_tails) |previous| {
-                if (previous) |previous_step| run_unit_metadata_tests.step.dependOn(previous_step);
-            }
-        } else if (unit_metadata_aggregate_run_tails[lane]) |previous| {
-            run_unit_metadata_tests.step.dependOn(previous);
+        if (!metadata_runtime_filter_is_default) {
+            aggregate_run.*.addArg("--allow-empty-test-filter");
+            addRuntimeSkipTestFilters(aggregate_run.*, partition.other_filters);
         }
-        unit_test_step.dependOn(&run_unit_metadata_tests.step);
-        if (is_runtime_exclusive) {
-            unit_metadata_aggregate_run_tails = .{ &run_unit_metadata_tests.step, &run_unit_metadata_tests.step };
-        } else {
-            unit_metadata_aggregate_run_tails[lane] = &run_unit_metadata_tests.step;
-        }
+        unit_test_step.dependOn(&aggregate_run.*.step);
 
         // The standalone metadata step owns its selected metadata tests. Use a
         // separate run policy so a caller filter is not mistaken for the root
         // aggregate's overlap exclusion and skipped everywhere.
-        const run_focused_metadata_tests = b.addRunArtifact(unit_metadata_tests);
-        addRuntimeTestFilters(b, run_focused_metadata_tests, runtime_filters);
+        focused_run.* = b.addRunArtifact(unit_metadata_tests[partition.artifact_index]);
+        focused_run.*.setName(b.fmt("run focused test {s}", .{partition.name}));
+        addRuntimeTestFilters(b, focused_run.*, runtime_filters);
         if (!metadata_runtime_filter_is_default) {
-            run_focused_metadata_tests.addArg("--allow-empty-test-filter");
+            focused_run.*.addArg("--allow-empty-test-filter");
+            addRuntimeSkipTestFilters(focused_run.*, partition.other_filters);
         }
         for (root_test_skip_filters) |filter| {
-            run_focused_metadata_tests.addArgs(&.{ "--skip-test-filter", filter });
+            focused_run.*.addArgs(&.{ "--skip-test-filter", filter });
         }
-        if (is_runtime_exclusive) {
-            for (unit_metadata_focused_run_tails) |previous| {
-                if (previous) |previous_step| run_focused_metadata_tests.step.dependOn(previous_step);
-            }
-        } else if (unit_metadata_focused_run_tails[lane]) |previous| {
-            run_focused_metadata_tests.step.dependOn(previous);
-        }
-        unit_metadata_sharded_test_step.dependOn(&run_focused_metadata_tests.step);
-        lib_metadata_test_step.dependOn(&run_focused_metadata_tests.step);
-        if (is_runtime_exclusive) {
-            unit_metadata_focused_run_tails = .{ &run_focused_metadata_tests.step, &run_focused_metadata_tests.step };
-        } else {
-            unit_metadata_focused_run_tails[lane] = &run_focused_metadata_tests.step;
-        }
+        unit_metadata_sharded_test_step.dependOn(&focused_run.*.step);
+        lib_metadata_test_step.dependOn(&focused_run.*.step);
     }
+
+    // Preserve the existing runtime isolation: ordinary lane work overlaps,
+    // replication backfill runs alone, and metadata storage follows it.
+    unit_metadata_aggregate_runs[2].step.dependOn(&unit_metadata_aggregate_runs[0].step);
+    unit_metadata_aggregate_runs[2].step.dependOn(&unit_metadata_aggregate_runs[1].step);
+    unit_metadata_aggregate_runs[3].step.dependOn(&unit_metadata_aggregate_runs[2].step);
+    unit_metadata_focused_runs[2].step.dependOn(&unit_metadata_focused_runs[0].step);
+    unit_metadata_focused_runs[2].step.dependOn(&unit_metadata_focused_runs[1].step);
+    unit_metadata_focused_runs[3].step.dependOn(&unit_metadata_focused_runs[2].step);
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
@@ -9819,10 +10066,11 @@ pub fn build(b: *std.Build) void {
                 // budget can overlap all four units while a smaller cgroup
                 // automatically schedules only the subset that fits.
                 // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
-                // platform frameworks. Clean aarch64-linux-musl ReleaseFast
-                // API-kernel codegen reached 8.10 GB; reserve 10 GiB so the
-                // scheduler serializes competing roots instead of rejecting
-                // an otherwise successful production artifact build.
+                // platform frameworks. Linux ARM64 reached 4.99 GB in the
+                // v0.2.1-rc0 release build, while the integrated HA API kernel
+                // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
+                // build. Reserve 10 GiB so the scheduler serializes competing
+                // roots instead of discarding a successful production build.
                 .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
                 // Clean aarch64-macOS ReleaseFast storage codegen reached
                 // 17.42 GB (16.23 GiB) with the platform frameworks enabled.

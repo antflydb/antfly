@@ -26,6 +26,22 @@ require() {
     fi
 }
 
+download_archive() {
+    case "${ANTFLY_DOWNLOAD_CLASS:-}" in
+        employee|ci)
+            curl -A "antfly-installer/1" -H "X-Antfly-Audience: ${ANTFLY_DOWNLOAD_CLASS}" \
+                --max-redirs 0 "$@"
+            ;;
+        ""|external)
+            curl -A "antfly-installer/1" "$@"
+            ;;
+        *)
+            warning "Ignoring invalid ANTFLY_DOWNLOAD_CLASS; expected external, employee, or ci"
+            curl -A "antfly-installer/1" "$@"
+            ;;
+    esac
+}
+
 # Detect OS and architecture
 detect_platform() {
     OS=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -88,7 +104,7 @@ EOF
     DOWNLOAD_URL="https://releases.antfly.io/antfly/${TAG}/${ARCHIVE_NAME}"
 
     status "Downloading from $DOWNLOAD_URL..."
-    if ! curl -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME"; then
+    if ! download_archive -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME"; then
         error "Failed to download Antfly. Please check your internet connection and the version number."
     fi
 
@@ -204,6 +220,14 @@ Options:
 Environment:
   This script will automatically detect your OS and architecture,
   download the appropriate binaries, and install them.
+
+  ANTFLY_DOWNLOAD_CLASS supplies a best-effort analytics label for archive
+  requests. Set it to employee for staff downloads or ci for automated jobs;
+  unset, external, and invalid values are measured as external traffic. Values
+  are caller-asserted and can be omitted or forged. They are not authentication
+  credentials and must not be treated as proof of employee or CI identity.
+  Labeled requests reject redirects so their metric headers stay on the
+  versioned releases.antfly.io request.
 
   By default, it installs to:
     - /usr/local/bin (if running as root)

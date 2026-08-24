@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-from helpers import wait_until
+from helpers import assert_created_index, wait_until
 
 DOCUMENT_UNITS_ARTIFACT = "document_units_v1"
 
@@ -55,7 +55,31 @@ def _first_query_hit_id(result: dict) -> str | None:
     return ids[0] if ids else None
 
 
+def _document_units_asset_enrichment() -> dict:
+    """Return the table artifact-enrichment request shape."""
+
+    return {
+        "kind": "asset",
+        "field": "url",
+        "content_type": "application/json",
+        "producer_json": {
+            "type": "document_extraction",
+            "config": {
+                "source": {
+                    "filename_field": "filename",
+                    "content_type_field": "mime_type",
+                    "version_field": "version",
+                }
+            },
+        },
+    }
+
+
 def _document_units_index_config() -> dict:
+    artifact = _document_units_asset_enrichment()
+    source_field = artifact.pop("field")
+    artifact["name"] = DOCUMENT_UNITS_ARTIFACT
+    artifact["source"] = {"type": "field", "value": source_field}
     return {
         "type": "graph",
         "source": {
@@ -64,22 +88,7 @@ def _document_units_index_config() -> dict:
             "path": "$.edges[*]",
             "format": "extraction_relation",
         },
-        "artifact": {
-            "name": DOCUMENT_UNITS_ARTIFACT,
-            "kind": "asset",
-            "field": "url",
-            "content_type": "application/json",
-            "producer_json": {
-                "type": "document_extraction",
-                "config": {
-                    "source": {
-                        "filename_field": "filename",
-                        "content_type_field": "mime_type",
-                        "version_field": "version",
-                    }
-                },
-            },
-        },
+        "artifact": artifact,
         "edge_types": [{"name": "mentions"}],
     }
 
@@ -170,7 +179,9 @@ def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
         f"{_artifact_list_path(table_name, first_doc)}?detail=raw"
     )
     assert artifact_list["document_id"] == first_doc
-    artifact_names = {artifact["artifact_name"] for artifact in artifact_list["artifacts"]}
+    artifact_names = {
+        artifact["artifact_name"] for artifact in artifact_list["artifacts"]
+    }
     assert DOCUMENT_UNITS_ARTIFACT in artifact_names
 
     lookup = stateful_api.lookup_key(table_name, first_doc)
@@ -187,7 +198,8 @@ def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
         lambda: (
             current
             if (
-                (current := _manifest_ready(stateful_api, table_name, first_doc)) is not None
+                (current := _manifest_ready(stateful_api, table_name, first_doc))
+                is not None
                 and current.get("generation", 0) > first_manifest["generation"]
             )
             else None
@@ -250,8 +262,8 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
     """Raw inline/URL PDFs render every page, OCR, chunk, and index server-side."""
 
     table_name = f"document_pdf_ocr_{time.time_ns()}"
-    index_config = _document_units_index_config()
-    extraction_config = index_config["artifact"]["producer_json"]["config"]
+    asset_enrichment = _document_units_asset_enrichment()
+    extraction_config = asset_enrichment["producer_json"]["config"]
     extraction_config["ocr"] = {
         "enabled": True,
         "mode": "always",
@@ -264,7 +276,6 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
             "api_url": pdf_ocr_e2e_server.reader_api_url,
         },
     }
-    asset_enrichment = dict(index_config["artifact"])
     asset_enrichment["producer_json"] = json.dumps(asset_enrichment["producer_json"])
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created.get("name") == table_name or created.get("table_name") == table_name
@@ -372,9 +383,7 @@ def test_pdf_ocr_inline_url_paged_chunks_and_inline_jpeg_e2e(
                     >= (
                         4
                         if doc_key in {"pdf-inline", "pdf-url"}
-                        else 2
-                        if doc_key == "pdf-scanned-table"
-                        else 1
+                        else 2 if doc_key == "pdf-scanned-table" else 1
                     )
                 )
                 else None
@@ -507,8 +516,8 @@ def test_pdf_auto_ocr_only_renders_pages_without_usable_embedded_text_e2e(
     """Auto OCR keeps Form-XObject text and renders only the scanned page."""
 
     table_name = f"document_pdf_auto_ocr_{time.time_ns()}"
-    index_config = _document_units_index_config()
-    extraction_config = index_config["artifact"]["producer_json"]["config"]
+    asset_enrichment = _document_units_asset_enrichment()
+    extraction_config = asset_enrichment["producer_json"]["config"]
     extraction_config["ocr"] = {
         "enabled": True,
         "mode": "auto",
@@ -521,7 +530,6 @@ def test_pdf_auto_ocr_only_renders_pages_without_usable_embedded_text_e2e(
             "api_url": pdf_ocr_e2e_server.reader_api_url,
         },
     }
-    asset_enrichment = dict(index_config["artifact"])
     asset_enrichment["producer_json"] = json.dumps(asset_enrichment["producer_json"])
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created.get("name") == table_name or created.get("table_name") == table_name
@@ -690,7 +698,6 @@ def test_artifact_backed_embedding_table_provisions_atomically(
                     ],
                 },
                 "document_vectors": {
-                    "name": "document_vectors",
                     "type": "embeddings",
                     "field": "embedding",
                     "dimension": 3,
@@ -813,8 +820,7 @@ def test_artifact_backed_embedding_table_provisions_atomically(
                 == 2
                 and status["status"]["coverage"].get("produced") == 2
                 and status["status"]["coverage"].get("covered") == 2
-                and status["status"]["coverage"].get("observation_complete")
-                is True
+                and status["status"]["coverage"].get("observation_complete") is True
                 and status["status"]["coverage"].get("complete") is True
                 and status["status"]["coverage"].get("healthy") is True
             )
@@ -876,8 +882,7 @@ def test_artifact_backed_embedding_table_provisions_atomically(
                 == 2
                 and status["status"]["coverage"].get("produced") == 2
                 and status["status"]["coverage"].get("covered") == 2
-                and status["status"]["coverage"].get("observation_complete")
-                is True
+                and status["status"]["coverage"].get("observation_complete") is True
                 and status["status"]["coverage"].get("complete") is True
                 and status["status"]["coverage"].get("healthy") is True
             )
@@ -926,7 +931,6 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
                 ],
             },
             "document_vectors": {
-                "name": "document_vectors",
                 "type": "embeddings",
                 "coverage_policy": policy,
                 "field": "embedding",
@@ -1013,7 +1017,9 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
             f"/tables/{table_name}",
             {"num_shards": 1, "indexes": indexes_for_policy(policy)},
         )
-        assert created.get("name") == table_name or created.get("table_name") == table_name
+        assert (
+            created.get("name") == table_name or created.get("table_name") == table_name
+        )
         merged = stateful_api.linear_merge(
             table_name, records=records, sync_level="full_index"
         )
@@ -1039,7 +1045,10 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         f"{_document_artifact_path(tables['strict'], 'failed', DOCUMENT_UNITS_ARTIFACT)}?detail=raw"
     )
     assert failed_manifest["merge_status"] == "failed"
-    assert json.loads(failed_manifest["manifest_json"])["last_error"]["stage"] == "pdf_structure"
+    assert (
+        json.loads(failed_manifest["manifest_json"])["last_error"]["stage"]
+        == "pdf_structure"
+    )
     skipped_manifest = stateful_api.get(
         f"{_document_artifact_path(tables['strict'], 'skipped', DOCUMENT_UNITS_ARTIFACT)}?detail=raw"
     )
@@ -1059,7 +1068,9 @@ def test_artifact_coverage_terminal_outcomes_by_policy_after_restart(
         )
 
 
-def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, openai_embedder):
+def test_artifact_backed_chunk_embeddings_are_semantic_searchable(
+    stateful_api, openai_embedder
+):
     table_name = f"artifact_backed_chunk_embeddings_{time.time_ns()}"
     created = stateful_api.create_table(table_name, num_shards=1)
     assert created.get("name") == table_name or created.get("table_name") == table_name
@@ -1143,7 +1154,7 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
         )
         is not None
     )
-    assert (
+    assert_created_index(
         stateful_api.create_index(
             table_name,
             "document_vectors",
@@ -1160,8 +1171,9 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
                     "url": openai_embedder,
                 },
             },
-        )
-        == {}
+        ),
+        "document_vectors",
+        "embeddings",
     )
     index_detail = stateful_api.get_index(table_name, "document_vectors")
     assert index_detail["config"]["name"] == "document_vectors"
@@ -1278,7 +1290,8 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
         lambda: (
             current
             if (
-                (current := _manifest_ready(stateful_api, table_name, doc_key)) is not None
+                (current := _manifest_ready(stateful_api, table_name, doc_key))
+                is not None
                 and current.get("generation", 0) > manifest.get("generation", 0)
             )
             else None
@@ -1377,18 +1390,14 @@ def test_artifact_backed_chunk_embeddings_are_semantic_searchable(stateful_api, 
                 .get("total_indexed")
                 == 2
                 and index.get("status", {}).get("query_visible_doc_count") == 2
-                and index.get("status", {}).get("coverage", {}).get("source_total")
-                == 2
-                and index.get("status", {}).get("coverage", {}).get("produced")
-                == 2
+                and index.get("status", {}).get("coverage", {}).get("source_total") == 2
+                and index.get("status", {}).get("coverage", {}).get("produced") == 2
                 and index.get("status", {})
                 .get("coverage", {})
                 .get("observation_complete")
                 is True
-                and index.get("status", {}).get("coverage", {}).get("complete")
-                is True
-                and index.get("status", {}).get("coverage", {}).get("healthy")
-                is True
+                and index.get("status", {}).get("coverage", {}).get("complete") is True
+                and index.get("status", {}).get("coverage", {}).get("healthy") is True
                 and index.get("status", {})
                 .get("enrichment_runtime", {})
                 .get("embed_batches_completed", 0)

@@ -13,9 +13,13 @@
 // limitations.
 
 const std = @import("std");
+const ant_json = @import("antfly-json");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const tables_api = @import("tables.zig");
 const indexes_api = @import("indexes.zig");
+const coverage_policy = @import("coverage_policy.zig");
+const public_index_contract = @import("public_index_contract.zig");
+const table_index_config = @import("table_index_config.zig");
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
@@ -83,11 +87,11 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     var parsed = metadata_openapi.server.parseCreateTableBody(alloc, body) catch {
         var fallback = try tables_api.parseCreateTableRequest(alloc, body);
         errdefer fallback.deinit(alloc);
-        try validateSupportedPublicIndexesJson(
-            alloc,
-            fallback.indexes_json orelse tables_api.default_indexes_json,
-        );
-        try validateCreateTableArtifactEnrichments(
+        // Raw public fields were validated above. The compatibility parser
+        // adds private coverage incarnations, so re-running the public
+        // allow-list against its normalized output would reject trusted
+        // metadata that the caller never supplied.
+        try validateCreateTableIndexSemantics(
             alloc,
             fallback.indexes_json orelse tables_api.default_indexes_json,
         );
@@ -113,7 +117,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     } else {
         req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
     }
-    try validateCreateTableArtifactEnrichments(alloc, req.indexes_json.?);
+    try validateCreateTableIndexSemantics(alloc, req.indexes_json.?);
 
     if (raw_root.get("schema")) |schema_value| {
         if (schema_value != .null) {
@@ -299,8 +303,12 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8,
     return normalized;
 }
 
-fn validateCreateTableArtifactEnrichments(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
+fn validateCreateTableIndexSemantics(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
     indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidCreateTableRequest,
+    };
+    table_index_config.validateGraphIndexesJson(alloc, indexes_json) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidCreateTableRequest,
     };
@@ -389,20 +397,106 @@ fn validatePublicIndexObject(object: anytype) !void {
     if (explicit_type) |value| {
         if (value != .string) return error.InvalidCreateIndexRequest;
     }
-    const index_type = extractPublicIndexType(object) orelse "full_text";
-    if (!isSupportedPublicIndexType(index_type)) return error.InvalidCreateIndexRequest;
+    const index_type = public_index_contract.parseKind(extractPublicIndexType(object) orelse "full_text") orelse
+        return error.InvalidCreateIndexRequest;
     try validatePublicInlineArtifactEnrichments(object);
-    if (std.mem.eql(u8, index_type, "full_text")) {
-        try validatePublicFullTextIndexObject(object);
+    try validatePublicIndexFields(object, index_type);
+    try validatePublicNestedIndexFields(object, index_type);
+}
+
+fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_contract.Kind) !void {
+    const Object = @TypeOf(object);
+    if (index_type == .embeddings) {
+        const chunker = if (@hasField(Object, "map")) object.map.get("chunker") else object.get("chunker");
+        if (chunker) |value| {
+            if (value != .null) try validatePublicCreatedShape(value, .chunker);
+        }
+        const execution = if (@hasField(Object, "map")) object.map.get("execution") else object.get("execution");
+        if (execution) |value| {
+            if (value != .null) try validatePublicCreatedShape(value, .index_execution);
+        }
         return;
     }
-    if (std.mem.eql(u8, index_type, "embeddings") or
-        std.mem.eql(u8, index_type, "graph") or
-        std.mem.eql(u8, index_type, "algebraic"))
-    {
-        return;
+    if (index_type != .graph) return;
+
+    const source = if (@hasField(Object, "map")) object.map.get("source") else object.get("source");
+    if (source) |value| {
+        if (value != .null) try validatePublicCreatedShape(value, .graph_source);
     }
-    return error.InvalidCreateIndexRequest;
+
+    const artifact = if (@hasField(Object, "map")) object.map.get("artifact") else object.get("artifact");
+    if (artifact) |value| {
+        if (value != .null) try validatePublicGraphArtifact(value);
+    }
+
+    const graph_shapes = .{
+        .{ "nodes", public_index_contract.CreatedObjectShape.graph_nodes },
+        .{ "edge", public_index_contract.CreatedObjectShape.graph_edge },
+        .{ "context", public_index_contract.CreatedObjectShape.graph_context },
+        .{ "algebraic_planning", public_index_contract.CreatedObjectShape.graph_algebraic_planning },
+    };
+    inline for (graph_shapes) |field_shape| {
+        const value = if (@hasField(Object, "map")) object.map.get(field_shape[0]) else object.get(field_shape[0]);
+        if (value) |nested| {
+            if (nested != .null) try validatePublicCreatedShape(nested, field_shape[1]);
+        }
+    }
+
+    const edge_types = if (@hasField(Object, "map")) object.map.get("edge_types") else object.get("edge_types");
+    if (edge_types) |value| {
+        if (value != .null) try validatePublicCreatedShape(value, .edge_types);
+    }
+
+    const resolvers = if (@hasField(Object, "map")) object.map.get("resolvers") else object.get("resolvers");
+    if (resolvers) |value| {
+        if (value != .null) try validatePublicCreatedShape(value, .graph_resolvers);
+    }
+}
+
+fn validatePublicCreatedShape(value: std.json.Value, shape: public_index_contract.CreatedObjectShape) !void {
+    if (!public_index_contract.createdValueMatchesShape(shape, value)) return error.InvalidCreateIndexRequest;
+    switch (value) {
+        .object => |object| {
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (!public_index_contract.isAllowedCreatedObjectField(shape, entry.key_ptr.*))
+                    return error.InvalidCreateIndexRequest;
+                // Generated SDKs use null for absent optional members. The
+                // canonicalizer drops them, so admission must treat them as
+                // omission before applying the non-null wire type contract.
+                if (entry.value_ptr.* == .null) continue;
+                if (!public_index_contract.createdFieldValueMatches(shape, entry.key_ptr.*, entry.value_ptr.*))
+                    return error.InvalidCreateIndexRequest;
+                if (shape == .execution_policy and entry.value_ptr.integer <= 0)
+                    return error.InvalidCreateIndexRequest;
+                const child_shape = public_index_contract.createdObjectShapeForChild(shape, entry.key_ptr.*);
+                if (child_shape != .unrestricted) try validatePublicCreatedShape(entry.value_ptr.*, child_shape);
+            }
+        },
+        .array => |array| {
+            const item_shape = public_index_contract.createdObjectShapeForArrayItem(shape);
+            for (array.items) |item| try validatePublicCreatedShape(item, item_shape);
+        },
+        else => unreachable,
+    }
+}
+
+fn validatePublicGraphArtifact(value: std.json.Value) !void {
+    if (!public_index_contract.createdValueMatchesShape(.graph_artifact, value))
+        return error.InvalidCreateIndexRequest;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (!public_index_contract.isAllowedGraphArtifactRequestField(entry.key_ptr.*))
+            return error.InvalidCreateIndexRequest;
+        if (entry.value_ptr.* == .null) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "producer_json")) {
+            if (entry.value_ptr.* != .object) return error.InvalidCreateIndexRequest;
+        } else if (!public_index_contract.createdFieldValueMatches(.graph_artifact, entry.key_ptr.*, entry.value_ptr.*)) {
+            return error.InvalidCreateIndexRequest;
+        }
+        const child_shape = public_index_contract.createdObjectShapeForChild(.graph_artifact, entry.key_ptr.*);
+        if (child_shape != .unrestricted) try validatePublicCreatedShape(entry.value_ptr.*, child_shape);
+    }
 }
 
 fn validatePublicInlineArtifactEnrichments(object: anytype) !void {
@@ -412,8 +506,11 @@ fn validatePublicInlineArtifactEnrichments(object: anytype) !void {
     else
         object.get("enrichments");
     const value = enrichments orelse return;
+    if (value == .null) return;
     if (value != .array) return error.InvalidCreateIndexRequest;
     for (value.array.items) |item| {
+        if (!public_index_contract.createdValueMatchesShape(.enrichment, item))
+            return error.InvalidCreateIndexRequest;
         if (item != .object) return error.InvalidCreateIndexRequest;
         validatePublicArtifactEnrichmentObject(item.object) catch
             return error.InvalidCreateIndexRequest;
@@ -430,21 +527,6 @@ fn validateCreateTableIndexesValue(value: std.json.Value) !void {
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
         try validateCreateTableIndexName(entry.key_ptr.*);
-        validatePublicIndexObject(entry.value_ptr.object) catch return error.InvalidCreateTableRequest;
-    }
-}
-
-fn validateSupportedPublicIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{}) catch
-        return error.InvalidCreateTableRequest;
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.InvalidCreateTableRequest,
-    };
-    var it = object.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
         validatePublicIndexObject(entry.value_ptr.object) catch return error.InvalidCreateTableRequest;
     }
 }
@@ -483,50 +565,28 @@ fn validatePublicArtifactEnrichmentObject(object: anytype) !void {
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
         while (it.next()) |entry| {
-            if (!isAllowedPublicArtifactEnrichmentField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
+            try validatePublicArtifactEnrichmentField(entry.key_ptr.*, entry.value_ptr.*);
         }
     } else {
         var it = object.iterator();
         while (it.next()) |entry| {
-            if (!isAllowedPublicArtifactEnrichmentField(entry.key_ptr.*)) return error.InvalidArtifactEnrichmentRequest;
+            try validatePublicArtifactEnrichmentField(entry.key_ptr.*, entry.value_ptr.*);
         }
-    }
-
-    const execution = if (@hasField(Object, "map"))
-        object.map.get("execution")
-    else
-        object.get("execution");
-    if (execution) |value| try validatePublicEnrichmentExecution(value);
-}
-
-fn validatePublicEnrichmentExecution(value: std.json.Value) !void {
-    if (value != .object) return error.InvalidArtifactEnrichmentRequest;
-    var it = value.object.iterator();
-    while (it.next()) |entry| {
-        if (!std.mem.eql(u8, entry.key_ptr.*, "batch_items") and
-            !std.mem.eql(u8, entry.key_ptr.*, "batch_bytes"))
-        {
-            return error.InvalidArtifactEnrichmentRequest;
-        }
-        if (entry.value_ptr.* != .integer or entry.value_ptr.integer <= 0)
-            return error.InvalidArtifactEnrichmentRequest;
     }
 }
 
-fn isAllowedPublicArtifactEnrichmentField(field_name: []const u8) bool {
-    return std.mem.eql(u8, field_name, "name") or
-        std.mem.eql(u8, field_name, "kind") or
-        std.mem.eql(u8, field_name, "field") or
-        std.mem.eql(u8, field_name, "template") or
-        std.mem.eql(u8, field_name, "source_artifact_name") or
-        std.mem.eql(u8, field_name, "expected_dims") or
-        std.mem.eql(u8, field_name, "chunk_size") or
-        std.mem.eql(u8, field_name, "chunk_overlap") or
-        std.mem.eql(u8, field_name, "chunker_json") or
-        std.mem.eql(u8, field_name, "full_text_index") or
-        std.mem.eql(u8, field_name, "content_type") or
-        std.mem.eql(u8, field_name, "producer_json") or
-        std.mem.eql(u8, field_name, "execution");
+fn validatePublicArtifactEnrichmentField(field: []const u8, value: std.json.Value) !void {
+    if (!public_index_contract.isAllowedEnrichmentRequestField(field)) return error.InvalidArtifactEnrichmentRequest;
+    if (value == .null) return;
+    if (std.mem.eql(u8, field, "producer_json")) {
+        if (value != .string) return error.InvalidArtifactEnrichmentRequest;
+        return;
+    }
+    if (!public_index_contract.createdFieldValueMatches(.enrichment, field, value))
+        return error.InvalidArtifactEnrichmentRequest;
+    if (std.mem.eql(u8, field, "execution")) {
+        validatePublicCreatedShape(value, .execution_policy) catch return error.InvalidArtifactEnrichmentRequest;
+    }
 }
 
 fn extractPublicIndexType(object: anytype) ?[]const u8 {
@@ -545,19 +605,25 @@ fn extractPublicIndexType(object: anytype) ?[]const u8 {
     };
 }
 
-fn validatePublicFullTextIndexObject(object: anytype) !void {
+fn validatePublicIndexFields(object: anytype, index_type: public_index_contract.Kind) !void {
     const Object = @TypeOf(object);
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
         while (it.next()) |entry| {
-            if (!isAllowedPublicFullTextField(entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
+            if (!public_index_contract.isAllowedConfigField(index_type, entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
+            if (entry.value_ptr.* != .null and
+                !public_index_contract.rootFieldValueMatches(index_type, entry.key_ptr.*, entry.value_ptr.*))
+                return error.InvalidCreateIndexRequest;
         }
         return;
     }
 
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (!isAllowedPublicFullTextField(entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
+        if (!public_index_contract.isAllowedConfigField(index_type, entry.key_ptr.*)) return error.InvalidCreateIndexRequest;
+        if (entry.value_ptr.* != .null and
+            !public_index_contract.rootFieldValueMatches(index_type, entry.key_ptr.*, entry.value_ptr.*))
+            return error.InvalidCreateIndexRequest;
     }
 }
 
@@ -567,16 +633,6 @@ fn isArtifactBackedFullTextIndex(object: anytype) bool {
         return object.map.contains("artifact_name") or object.map.contains("enrichments");
     }
     return object.contains("artifact_name") or object.contains("enrichments");
-}
-
-fn isAllowedPublicFullTextField(field_name: []const u8) bool {
-    return std.mem.eql(u8, field_name, "name") or
-        std.mem.eql(u8, field_name, "type") or
-        std.mem.eql(u8, field_name, "description") or
-        std.mem.eql(u8, field_name, "mem_only") or
-        std.mem.eql(u8, field_name, "field") or
-        std.mem.eql(u8, field_name, "artifact_name") or
-        std.mem.eql(u8, field_name, "enrichments");
 }
 
 fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -611,7 +667,14 @@ fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.jso
         try out.appendSlice(alloc, normalized);
     }
     try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
+    const normalized = try out.toOwnedSlice(alloc);
+    defer alloc.free(normalized);
+    // The typed OpenAPI path must establish the same durable incarnation
+    // contract as the compatibility parser in tables.zig. Without it, inline
+    // embedding indexes are provisioned with a derived runtime identity while
+    // the catalog retains an identity-less config; readiness then correctly
+    // rejects every otherwise healthy shard as a config mismatch.
+    return try coverage_policy.withMissingIncarnationsAlloc(alloc, normalized);
 }
 
 fn appendDefaultFullTextIndexEntry(
@@ -646,13 +709,6 @@ fn isPublicFullTextType(index_type: []const u8) bool {
     return std.mem.eql(u8, index_type, "full_text");
 }
 
-fn isSupportedPublicIndexType(index_type: []const u8) bool {
-    return isPublicFullTextType(index_type) or
-        std.mem.eql(u8, index_type, "embeddings") or
-        std.mem.eql(u8, index_type, "graph") or
-        std.mem.eql(u8, index_type, "algebraic");
-}
-
 fn appendField(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -660,15 +716,64 @@ fn appendField(
     value: std.json.Value,
     first: *bool,
 ) !void {
+    // Generated SDKs encode absent optional fields as JSON null. Treat those
+    // exactly like omission so typed and raw callers converge on one stored
+    // configuration.
+    if (value == .null) return;
     if (!first.*) try out.append(alloc, ',');
     first.* = false;
     const encoded_key = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(key, .{})});
     defer alloc.free(encoded_key);
     try out.appendSlice(alloc, encoded_key);
     try out.append(alloc, ':');
-    const encoded_value = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded_value);
-    try out.appendSlice(alloc, encoded_value);
+    try appendCanonicalPublicValue(alloc, out, value, key);
+}
+
+fn appendCanonicalPublicValue(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: std.json.Value,
+    field_name: ?[]const u8,
+) !void {
+    // Opaque producer documents are write-only and provider-significant, so
+    // preserve their internal null values while canonicalizing public config.
+    if (field_name) |name| {
+        if (std.mem.eql(u8, name, "producer_json")) {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+            defer alloc.free(encoded);
+            return out.appendSlice(alloc, encoded);
+        }
+    }
+
+    switch (value) {
+        .object => |object| {
+            try out.append(alloc, '{');
+            var first = true;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* == .null) continue;
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                try appendJsonString(alloc, out, entry.key_ptr.*);
+                try out.append(alloc, ':');
+                try appendCanonicalPublicValue(alloc, out, entry.value_ptr.*, entry.key_ptr.*);
+            }
+            try out.append(alloc, '}');
+        },
+        .array => |array| {
+            try out.append(alloc, '[');
+            for (array.items, 0..) |item, index| {
+                if (index > 0) try out.append(alloc, ',');
+                try appendCanonicalPublicValue(alloc, out, item, null);
+            }
+            try out.append(alloc, ']');
+        },
+        else => {
+            const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+            defer alloc.free(encoded);
+            try out.appendSlice(alloc, encoded);
+        },
+    }
 }
 
 fn appendRawJsonField(
@@ -806,8 +911,11 @@ test "table contract normalizes index create request against path name" {
         "{\"type\":\"embeddings\",\"name\":\"embed_idx\",\"dimension\":3}",
     );
     defer std.testing.allocator.free(config_json);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"name\":\"embed_idx\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"type\":\"embeddings\"") != null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":3}",
+        config_json,
+    );
 }
 
 test "table contract preserves embeddings create request fields" {
@@ -817,9 +925,177 @@ test "table contract preserves embeddings create request fields" {
         "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
     );
     defer std.testing.allocator.free(config_json);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"external\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dimension\":384") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"name\":\"embed_idx\"") != null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
+        config_json,
+    );
+}
+
+test "table contract public response omits unknown nested provider fields" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "embed_idx",
+        "{\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\",\"client_value\":\"private-unknown-field\",\"settings\":{\"opaque\":\"private-nested-value\"}}}",
+    );
+    defer std.testing.allocator.free(config_json);
+
+    const response = try indexes_api.encodeCreatedIndexConfig(std.testing.allocator, "embed_idx", config_json);
+    defer std.testing.allocator.free(response);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"}}",
+        response,
+    );
+}
+
+test "table contract canonicalizes generated optional null fields" {
+    var request = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"num_shards\":1,\"description\":null,\"indexes\":{\"title_body\":{\"description\":null,\"version\":null,\"enrichments\":null,\"coverage_policy\":null,\"external\":null,\"sparse\":null,\"dimension\":3,\"field\":null,\"template\":\"{{title}} {{body}}\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antfly-embed-v1\",\"api_url\":\"http://127.0.0.1:8080/ai/v1\",\"dimensions\":null},\"summarizer\":null,\"chunker\":null,\"execution\":null,\"type\":\"embeddings\"}},\"schema\":null,\"replication_sources\":null}",
+    );
+    defer request.deinit(std.testing.allocator);
+    var indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.indexes_json.?, .{});
+    defer indexes.deinit();
+    const embedding = indexes.value.object.getPtr("title_body") orelse return error.TestUnexpectedResult;
+    switch (embedding.*) {
+        .object => |*object| _ = object.swapRemove(coverage_policy.incarnation_field),
+        else => return error.TestUnexpectedResult,
+    }
+    try ant_json.testing.expectEqualJsonValue(
+        std.testing.allocator,
+        "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"},\"title_body\":{\"name\":\"title_body\",\"type\":\"embeddings\",\"dimension\":3,\"template\":\"{{title}} {{body}}\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antfly-embed-v1\",\"api_url\":\"http://127.0.0.1:8080/ai/v1\"}}}",
+        indexes.value,
+    );
+}
+
+test "table contract preserves typed artifact-backed graph configuration" {
+    const body =
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"},"execution":{"batch_items":8,"batch_bytes":262144}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
+    ;
+    const config_json = try parseCreateIndexRequest(std.testing.allocator, "relations_graph", body);
+    defer std.testing.allocator.free(config_json);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"source\":{\"type\":\"template\",\"value\":\"{{ body }}\"},\"execution\":{\"batch_items\":8,\"batch_bytes\":262144}},\"nodes\":{\"model\":\"document\",\"target\":\"{{ _item.target.text }}\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
+        config_json,
+    );
+
+    var table_req = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"relations_graph\":" ++ body ++ "}}",
+    );
+    defer table_req.deinit(std.testing.allocator);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"nodes\":{\"model\":\"document\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\"}]}}",
+        table_req.indexes_json.?,
+    );
+}
+
+test "table contract rejects unknown fields in closed nested index objects" {
+    const invalid_requests = [_][]const u8{
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","client_value":"private"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","client_value":"private"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"chunk","source":{"type":"field","value":"relations"}}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":""}}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"document","value":"relations"}}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":42}}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations","client_value":"private"}}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":"relations"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","field":"relations"}}
+        ,
+        \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"execution":{"batch_items":0}}}
+        ,
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","format":"unsupported"}}
+        ,
+        \\{"type":"graph","source":{"kind":"document_field","artifact":"relations_v1"}}
+        ,
+        \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","client_value":"private"}]}
+        ,
+        \\{"type":"graph","edge_types":[{"name":"mentions","client_value":"private"}]}
+        ,
+        \\{"type":"graph","edge_types":[{"name":"mentions","required_metadata":{"client_value":"private"}}]}
+        ,
+        \\{"type":"graph","edge_types":[{"topology":"graph"}]}
+        ,
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":{"client_value":"private"}}}
+        ,
+        \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_limit":{"client_value":"private"}}]}
+        ,
+        \\{"type":"graph","nodes":{"model":"document","client_value":"private"}}
+        ,
+        \\{"type":"graph","nodes":{"model":"unsupported"}}
+        ,
+        \\{"type":"graph","edge":{"weight":{"client_value":"private"}}}
+        ,
+        \\{"type":"graph","context":{"doc_fields":["title",""]}}
+        ,
+        \\{"type":"graph","algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
+        ,
+        \\{"type":"graph","algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","client_value":"private"}}}
+        ,
+        \\{"type":"graph","algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":false}}}
+        ,
+        \\{"type":"embeddings","dimension":384,"chunker":{"provider":"antfly","model":"fixed","client_value":"private"}}
+        ,
+        \\{"type":"embeddings","dimension":384,"chunker":{"provider":"antfly","model":"fixed","text":{"target_tokens":500,"client_value":"private"}}}
+        ,
+        \\{"type":"embeddings","dimension":384,"chunker":{"provider":"antfly","model":{"client_value":"private"}}}
+        ,
+        \\{"type":"embeddings","dimension":384,"chunker":{"model":"fixed"}}
+        ,
+        \\{"type":"embeddings","dimension":384,"execution":{"embedding":{"batch_items":32,"client_value":"private"}}}
+        ,
+        \\{"type":"embeddings","dimension":384,"execution":{"embedding":{"batch_items":{"client_value":"private"}}}}
+        ,
+        \\{"type":"embeddings","dimension":384,"execution":{"client_value":{"batch_items":32}}}
+        ,
+        \\{"type":"embeddings","dimension":384,"template":{"client_value":"private"}}
+        ,
+    };
+    for (invalid_requests) |request| {
+        try std.testing.expectError(
+            error.InvalidCreateIndexRequest,
+            parseCreateIndexRequest(std.testing.allocator, "test_idx", request),
+        );
+    }
+}
+
+test "table contract treats nullable nested index fields as omitted" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "relations_graph",
+        "{\"type\":\"graph\",\"source\":null,\"artifact\":null,\"nodes\":null,\"edge\":null,\"context\":null,\"algebraic_planning\":null,\"edge_types\":null,\"resolvers\":null}",
+    );
+    defer std.testing.allocator.free(config_json);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"relations_graph\",\"type\":\"graph\"}",
+        config_json,
+    );
+
+    const embedding_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "semantic_chunks",
+        "{\"type\":\"embeddings\",\"dimension\":384,\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed\",\"text\":null,\"audio\":null},\"execution\":null}",
+    );
+    defer std.testing.allocator.free(embedding_json);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"semantic_chunks\",\"type\":\"embeddings\",\"dimension\":384,\"chunker\":{\"provider\":\"antfly\",\"model\":\"fixed\"}}",
+        embedding_json,
+    );
 }
 
 test "table contract rejects unsupported index kinds before admission" {
@@ -854,6 +1130,16 @@ test "table contract rejects unsupported index kinds before admission" {
         parseCreateTableRequest(
             std.testing.allocator,
             "{\"indexes\":{\"bad\":{\"type\":7}}}",
+        ),
+    );
+}
+
+test "table contract rejects graph configs the runtime cannot materialize" {
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
         ),
     );
 }
@@ -893,6 +1179,7 @@ test "table contract ignores create-table full text entries and preserves non-fu
     try std.testing.expect(embedding.get("name") == null);
     try std.testing.expectEqualStrings("embeddings", embedding.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 384), embedding.get("dimension").?.integer);
+    try std.testing.expect(coverage_policy.incarnation(.{ .object = embedding }) != null);
 }
 
 test "table contract accepts public full text create index" {
@@ -902,8 +1189,11 @@ test "table contract accepts public full text create index" {
         "{\"type\":\"full_text\"}",
     );
     defer std.testing.allocator.free(config_json);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"name\":\"search_idx\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"type\":\"full_text\"") != null);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"search_idx\",\"type\":\"full_text\"}",
+        config_json,
+    );
 
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,
@@ -1037,6 +1327,33 @@ test "table contract rejects unsupported index kinds before catalog admission" {
             std.testing.allocator,
             "{\"indexes\":{\"unsupported_idx\":{\"type\":\"unsupported\"}}}",
         ),
+    );
+}
+
+test "table contract rejects unknown fields for every public index variant" {
+    const invalid_requests = [_][]const u8{
+        "{\"type\":\"full_text\",\"unknown\":true}",
+        "{\"type\":\"embeddings\",\"external\":true,\"dimension\":384,\"producer_json\":\"{}\"}",
+        "{\"type\":\"graph\",\"unknown\":true}",
+        "{\"type\":\"algebraic\",\"unknown\":true}",
+    };
+    for (invalid_requests) |request| {
+        try std.testing.expectError(
+            error.InvalidCreateIndexRequest,
+            parseCreateIndexRequest(std.testing.allocator, "test_idx", request),
+        );
+    }
+
+    const valid_with_common_fields = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "embed_idx",
+        "{\"type\":\"embeddings\",\"description\":\"semantic search\",\"version\":1,\"external\":true,\"dimension\":384}",
+    );
+    defer std.testing.allocator.free(valid_with_common_fields);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"description\":\"semantic search\",\"version\":1,\"external\":true,\"dimension\":384}",
+        valid_with_common_fields,
     );
 }
 

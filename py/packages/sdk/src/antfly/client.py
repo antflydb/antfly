@@ -2,9 +2,9 @@
 
 import base64
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any, cast
+from typing import Any, TypeAlias, cast
 from urllib.parse import quote
 
 from httpx import Response, Timeout
@@ -17,6 +17,16 @@ from antfly.client_generated.client import AuthenticatedClient
 from antfly.client_generated.models import (
     BatchRequest,
     BatchRequestInserts,
+    CreateAlgebraicIndexRequest,
+    CreatedAlgebraicIndex,
+    CreatedEmbeddingsIndex,
+    CreatedFullTextIndex,
+    CreatedGraphIndex,
+    CreateEmbeddingsIndexRequest,
+    CreateFullTextIndexRequest,
+    CreateGraphIndexRequest,
+    EmbedderConfig,
+    EmbedderProvider,
     Error,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
@@ -25,7 +35,7 @@ from antfly.client_generated.models import (
 )
 from antfly.client_generated.types import UNSET
 
-from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError
+from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError, StorageResourceExhaustedError
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
@@ -34,6 +44,32 @@ MAX_INFERENCE_ERROR_BYTES = 1 << 20
 MAX_GENERATION_RESPONSE_BYTES = 16 << 20
 MAX_GENERATION_SSE_EVENT_BYTES = 16 << 20
 MAX_GENERATION_SSE_LINE_BYTES = 16 << 20
+
+CreateIndexRequest: TypeAlias = (
+    CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
+)
+CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
+_CREATE_INDEX_REQUEST_TYPES = (
+    CreateFullTextIndexRequest,
+    CreateEmbeddingsIndexRequest,
+    CreateGraphIndexRequest,
+    CreateAlgebraicIndexRequest,
+)
+_CREATED_INDEX_TYPES = {
+    "full_text": CreatedFullTextIndex,
+    "embeddings": CreatedEmbeddingsIndex,
+    "graph": CreatedGraphIndex,
+    "algebraic": CreatedAlgebraicIndex,
+}
+
+
+def antfly_embedder(model: str, *, api_url: str | None = None) -> EmbedderConfig:
+    """Build a typed Antfly inference embedder configuration."""
+    config = EmbedderConfig(provider=EmbedderProvider.ANTFLY)
+    config["model"] = model
+    if api_url is not None:
+        config["api_url"] = api_url
+    return config
 
 
 def _read_limited_response(response: Response, max_bytes: int) -> tuple[bytes, bool]:
@@ -179,6 +215,65 @@ def normalize_base_url(base_url: str) -> str:
     return trimmed
 
 
+class IndexOperations:
+    """Resource-oriented index operations."""
+
+    def __init__(self, client: "AntflyClient") -> None:
+        self._client = client
+
+    def create(
+        self,
+        table: str,
+        name: str,
+        config: CreateIndexRequest | Mapping[str, Any],
+    ) -> CreatedIndex:
+        """Create an index and return its typed normalized configuration.
+
+        Generated request models provide type checking and editor completion.
+        Mappings remain accepted for compatibility with existing callers.
+        """
+        payload = config.to_dict() if isinstance(config, _CREATE_INDEX_REQUEST_TYPES) else dict(config)
+        if "name" in payload:
+            raise ValueError("index name is owned by the path; pass it as the name argument")
+        if not isinstance(payload.get("type"), str) or not payload["type"]:
+            raise ValueError("index config requires a non-empty type")
+        result = self._client._request(
+            "POST",
+            f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}",
+            json=payload,
+        )
+        if not isinstance(result, dict):
+            raise AntflyException("create index returned an invalid response")
+        try:
+            discriminator = result.get("type")
+            if not isinstance(discriminator, str):
+                raise ValueError("missing string discriminator 'type'")
+            response_type = _CREATED_INDEX_TYPES.get(discriminator)
+            if response_type is None:
+                raise ValueError(f"unsupported index type {discriminator!r}")
+            return response_type.from_dict(result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AntflyException(f"create index returned an invalid response: {exc}") from exc
+
+    def list(self, table: str) -> list[dict[str, Any]]:
+        """List all indexes on a table."""
+        result = self._client._request("GET", f"/db/v1/tables/{quote(table, safe='')}/indexes")
+        if not isinstance(result, list):
+            raise AntflyException("list indexes returned an invalid response")
+        return result
+
+    def get(self, table: str, name: str) -> dict[str, Any]:
+        """Get index configuration and readiness status."""
+        result = self._client._request("GET", f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}")
+        if not isinstance(result, dict):
+            raise AntflyException("get index returned an invalid response")
+        return result
+
+    def drop(self, table: str, name: str) -> None:
+        """Drop an index."""
+        self._client._request("DELETE", f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}")
+
+
 class AntflyClient:
     """High-level client for Antfly database and inference APIs."""
 
@@ -249,6 +344,7 @@ class AntflyClient:
                 timeout=Timeout(timeout),
                 httpx_args=httpx_args,
             )
+        self.indexes = IndexOperations(self)
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         """Make an HTTP request using the underlying httpx client.
@@ -274,14 +370,45 @@ class AntflyClient:
                     )
                 else:
                     text = body.decode("utf-8", errors="replace")
+                    error_body: dict[str, Any] | None = None
                     try:
-                        error_body = json.loads(body)
+                        parsed_error = json.loads(body)
+                        error_body = parsed_error if isinstance(parsed_error, dict) else None
                         error = error_body.get("error") if isinstance(error_body, dict) else None
                         msg = error if isinstance(error, str) else text
                     except (TypeError, ValueError):
                         msg = text
                     if not msg:
                         msg = response.reason_phrase or f"HTTP {response.status_code}"
+                    if (
+                        response.status_code == 429
+                        and error_body is not None
+                        and error_body.get("code") == "storage_resource_exhausted"
+                        and error_body.get("retryable") is True
+                    ):
+                        retry_after_ms = error_body.get("retry_after_ms")
+                        retry_after_ms = (
+                            retry_after_ms
+                            if isinstance(retry_after_ms, int)
+                            and not isinstance(retry_after_ms, bool)
+                            and retry_after_ms > 0
+                            else 0
+                        )
+                        retry_after_header = response.headers.get("Retry-After")
+                        try:
+                            retry_after_seconds = int(retry_after_header) if retry_after_header else None
+                        except ValueError:
+                            retry_after_seconds = None
+                        if retry_after_seconds is not None and retry_after_seconds <= 0:
+                            retry_after_seconds = None
+                        if retry_after_ms == 0 and retry_after_seconds is not None:
+                            retry_after_ms = retry_after_seconds * 1000
+                        detail = error_body.get("message")
+                        raise StorageResourceExhaustedError(
+                            detail if isinstance(detail, str) and detail else msg,
+                            retry_after_ms,
+                            retry_after_seconds,
+                        )
                 raise AntflyException(f"Request failed ({response.status_code}): {msg}")
             if response.status_code == 204:
                 return None
