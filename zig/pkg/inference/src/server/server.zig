@@ -11732,7 +11732,7 @@ fn resolveExtractedOutput(
     const entity_batches = try allocator.alloc([]@import("../pipelines/ner.zig").Entity, input_count);
     var initialized_entity_batches: usize = 0;
     errdefer {
-        freeEntityBatches(allocator, entity_batches[0..initialized_entity_batches]);
+        freeOwnedEntityBatchContents(allocator, entity_batches[0..initialized_entity_batches]);
         allocator.free(entity_batches);
     }
 
@@ -11749,7 +11749,12 @@ fn resolveExtractedOutput(
 
         for (kg.entities) |entity| {
             if (!resolvedHasTextIndex(entity.text_indices, text_index)) continue;
-            try resolved_for_text.append(allocator, try cloneResolvedEntity(allocator, entity, text_index));
+            const cloned = try cloneResolvedEntity(allocator, entity, text_index);
+            errdefer {
+                allocator.free(cloned.text);
+                allocator.free(cloned.label);
+            }
+            try resolved_for_text.append(allocator, cloned);
         }
 
         entity_batches[text_index] = try resolved_for_text.toOwnedSlice(allocator);
@@ -11780,7 +11785,13 @@ fn resolveExtractedOutput(
 
             for (kg.relations) |relation| {
                 if (!resolvedHasTextIndex(relation.text_indices, text_index)) continue;
-                try resolved_for_text.append(allocator, try cloneResolvedRelation(allocator, kg.entities, relation, text_index));
+                var cloned = try cloneResolvedRelation(allocator, kg.entities, relation, text_index);
+                errdefer {
+                    allocator.free(cloned.head.label);
+                    allocator.free(cloned.tail.label);
+                    cloned.deinit(allocator);
+                }
+                try resolved_for_text.append(allocator, cloned);
             }
 
             batches[text_index] = try resolved_for_text.toOwnedSlice(allocator);
@@ -11914,7 +11925,7 @@ fn applyLearnedCleanupIfPresent(
     const out = try allocator.alloc([]@import("../pipelines/ner.zig").Entity, texts.len);
     var built: usize = 0;
     errdefer {
-        freeEntityBatches(allocator, out[0..built]);
+        freeOwnedEntityBatchContents(allocator, out[0..built]);
         allocator.free(out);
     }
 
@@ -11943,23 +11954,49 @@ fn applyLearnedCleanupIfPresent(
         });
         defer cleaned.deinit(allocator);
 
-        out[idx] = try allocator.alloc(@import("../pipelines/ner.zig").Entity, cleaned.resolved_entities.len);
-        for (cleaned.resolved_entities, 0..) |resolved_entity, entity_idx| {
-            out[idx][entity_idx] = .{
-                .text = try allocator.dupe(u8, resolved_entity.text),
-                .label = try allocator.dupe(u8, resolved_entity.label),
-                .start = resolved_entity.start,
-                .end = resolved_entity.end,
-                .score = resolved_entity.detect_score * resolved_entity.validity_score,
-            };
-        }
+        out[idx] = try cloneCleanedEntityBatch(allocator, cleaned.resolved_entities);
         built += 1;
     }
 
     return out;
 }
 
-fn freeEntityBatches(allocator: std.mem.Allocator, all_entities: []const []@import("../pipelines/ner.zig").Entity) void {
+fn cloneCleanedEntityBatch(
+    allocator: std.mem.Allocator,
+    resolved_entities: []const cleanup_pipeline_mod.ResolvedEntity,
+) ![]@import("../pipelines/ner.zig").Entity {
+    const out = try allocator.alloc(@import("../pipelines/ner.zig").Entity, resolved_entities.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |entity| {
+            allocator.free(entity.text);
+            allocator.free(entity.label);
+        }
+        allocator.free(out);
+    }
+
+    for (resolved_entities, 0..) |resolved_entity, idx| {
+        const text = try allocator.dupe(u8, resolved_entity.text);
+        errdefer allocator.free(text);
+        const label = try allocator.dupe(u8, resolved_entity.label);
+        errdefer allocator.free(label);
+        out[idx] = .{
+            .text = text,
+            .label = label,
+            .start = resolved_entity.start,
+            .end = resolved_entity.end,
+            .score = resolved_entity.detect_score * resolved_entity.validity_score,
+        };
+        built += 1;
+    }
+
+    return out;
+}
+
+fn freeOwnedEntityBatchContents(
+    allocator: std.mem.Allocator,
+    all_entities: []const []@import("../pipelines/ner.zig").Entity,
+) void {
     for (all_entities) |entities| {
         for (entities) |entity| {
             allocator.free(entity.text);
@@ -11967,6 +12004,10 @@ fn freeEntityBatches(allocator: std.mem.Allocator, all_entities: []const []@impo
         }
         allocator.free(entities);
     }
+}
+
+fn freeEntityBatches(allocator: std.mem.Allocator, all_entities: []const []@import("../pipelines/ner.zig").Entity) void {
+    freeOwnedEntityBatchContents(allocator, all_entities);
     allocator.free(all_entities);
 }
 
@@ -14738,6 +14779,146 @@ test "raw entity cleanup preserves borrowed labels" {
 
     freeBorrowedLabelEntityBatches(allocator, batches);
     try std.testing.expectEqualStrings("person", borrowed_label);
+}
+
+test "resolved extraction releases partial entity batches on every allocation failure" {
+    const ner = @import("../pipelines/ner.zig");
+    const first_entities = [_]ner.Entity{ .{
+        .text = "Grace Hopper",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.95,
+    }, .{
+        .text = "COBOL",
+        .label = "technology",
+        .start = 13,
+        .end = 18,
+        .score = 0.91,
+    } };
+    const second_entities = [_]ner.Entity{ .{
+        .text = "Ada Lovelace",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.94,
+    }, .{
+        .text = "Analytical Engine",
+        .label = "technology",
+        .start = 13,
+        .end = 30,
+        .score = 0.90,
+    } };
+    const batches = [_][]const ner.Entity{ &first_entities, &second_entities };
+    const relations = [_][]const gliner_mod.Relation{
+        &.{.{
+            .head = first_entities[0],
+            .tail = first_entities[1],
+            .label = "created",
+            .score = 0.89,
+        }},
+        &.{.{
+            .head = second_entities[0],
+            .tail = second_entities[1],
+            .label = "described",
+            .score = 0.88,
+        }},
+    };
+
+    const Runner = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            source: []const []const ner.Entity,
+            source_relations: []const []const gliner_mod.Relation,
+        ) !void {
+            var resolved = try resolveExtractedOutput(allocator, source, source_relations, .{});
+            defer resolved.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 2), resolved.entities.len);
+            try std.testing.expectEqual(@as(usize, 2), resolved.relations.?.len);
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &batches, &relations) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
+}
+
+test "learned entity cleanup releases partial batches on every allocation failure" {
+    const ner = @import("../pipelines/ner.zig");
+    var head = try cleanup_model_mod.CleanupHead.init(std.testing.allocator, 32, 4, 8);
+    defer head.deinit();
+
+    const texts = [_][]const u8{
+        "Grace Hopper built compilers.",
+        "COBOL influenced business computing.",
+    };
+    const first_entities = [_]ner.Entity{.{
+        .text = "Grace Hopper",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.95,
+    }};
+    const second_entities = [_]ner.Entity{.{
+        .text = "COBOL",
+        .label = "technology",
+        .start = 0,
+        .end = 5,
+        .score = 0.91,
+    }};
+    const batches = [_][]const ner.Entity{ &first_entities, &second_entities };
+
+    const Runner = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            cleanup_head: *const cleanup_model_mod.CleanupHead,
+            source_texts: []const []const u8,
+            source_entities: []const []const ner.Entity,
+        ) !void {
+            const cleaned = (try applyLearnedCleanupIfPresent(
+                allocator,
+                cleanup_head,
+                source_texts,
+                source_entities,
+            )).?;
+            defer freeEntityBatches(allocator, cleaned);
+            try std.testing.expectEqual(source_texts.len, cleaned.len);
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &head, &texts, &batches) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
 }
 
 test "REBEL rejects unsupported typed schemas before model loading" {

@@ -66,9 +66,9 @@ class LinearMergeRequest:
                 - "propose": Wait for Raft proposal acceptance (fastest, default)
                 - "write": Wait for Pebble KV write
                 - "full_text": Wait for full-text index WAL write
-                - "enrichments": Wait for synchronous enrichment generation after the document commit.
-                  A terminal producer failure retains the committed document and returns
-                  `committed_repair_required`.
+                - "enrichments": Precompute enrichments before committing the document. A synchronous
+                  producer failure rejects the write; post-commit worker failures retain the document
+                  and may return `committed_repair_required`.
                 - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     """
 
