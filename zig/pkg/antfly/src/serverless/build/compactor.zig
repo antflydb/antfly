@@ -239,6 +239,7 @@ pub const Compactor = struct {
         const published_version = try builder_mod.putManifestForPublication(
             self.manifests,
             &manifest,
+            current_head,
         );
         const published = try builder_mod.compareAndSwapHeadGuarded(
             self.progress,

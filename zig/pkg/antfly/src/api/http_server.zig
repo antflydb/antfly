@@ -3441,18 +3441,23 @@ pub const ApiHttpServer = struct {
         return (try self.source.cachedAdminSnapshot()) orelse try self.source.adminSnapshot();
     }
 
+    pub const TableDropSnapshot = struct {
+        snapshot: metadata_api.AdminSnapshot,
+        authoritative: bool,
+    };
+
     /// Prefer an authority-fenced identity for destructive name-based
-    /// mutations. A coherent cached view is a progress fallback when the
-    /// authority read itself is transiently unavailable; the conditional
-    /// table ID still prevents that fallback from deleting a newer identity.
-    pub fn tableDropSnapshot(self: *ApiHttpServer) !?metadata_api.AdminSnapshot {
+    /// mutations. A coherent cached view is a progress fallback only when it
+    /// contains an identity that can be supplied to a conditional delete.
+    pub fn tableDropSnapshot(self: *ApiHttpServer) !?TableDropSnapshot {
         const request: api_operation.RequestContext = .{};
         if (self.source.linearizableSnapshot(request)) |snapshot| {
-            if (snapshot) |value| return value;
+            if (snapshot) |value| return .{ .snapshot = value, .authoritative = true };
         } else |err| {
             if (!isTransientMetadataObservationError(err)) return err;
         }
-        return try self.statusAdminSnapshot();
+        const snapshot = (try self.statusAdminSnapshot()) orelse return null;
+        return .{ .snapshot = snapshot, .authoritative = false };
     }
 
     fn appendRemoteRuntimeStatusesFromSnapshot(
@@ -6309,14 +6314,27 @@ pub const ApiHttpServer = struct {
         }
     }
 
-    pub fn dropTableMetadata(self: *ApiHttpServer, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: ?u64) !TableIdentityRetirement {
-        if (expected_table_id) |table_id| {
-            if (self.source.supportsExpectedTableDrop()) {
+    pub fn dropTableMetadata(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        expected_table_id: ?u64,
+        identity_authoritative: bool,
+    ) !TableIdentityRetirement {
+        if (self.source.supportsExpectedTableDrop()) {
+            if (expected_table_id) |table_id| {
                 self.source.dropTableExpected(alloc, table_name, table_id) catch |err| {
                     if (err != error.TableGenerationChanged and !isAmbiguousMetadataMutationError(err)) return err;
                 };
                 return try self.waitForTableIdentityRetirement(table_name, table_id);
             }
+
+            // An authoritative absence is a stable 404. A fallback snapshot
+            // without an identity cannot safely authorize a legacy name-only
+            // delete because the missing generation may already have been
+            // replaced between the failed authority read and this request.
+            if (identity_authoritative) return error.TableNotFound;
+            return error.MetadataMutationOutcomeUnknown;
         }
 
         try self.source.dropTable(alloc, table_name);
@@ -11340,8 +11358,10 @@ pub const ApiHttpServer = struct {
         var group_ids: ?[]u64 = null;
         defer if (group_ids) |values| self.alloc.free(values);
         var expected_table_id: ?u64 = null;
+        var identity_authoritative = false;
         if (try self.tableDropSnapshot()) |snapshot_value| {
-            var snapshot = snapshot_value;
+            identity_authoritative = snapshot_value.authoritative;
+            var snapshot = snapshot_value.snapshot;
             defer self.source.freeAdminSnapshot(&snapshot);
             if (tables_api.findTableByName(&snapshot, table_name)) |table| {
                 expected_table_id = table.table_id;
@@ -11350,7 +11370,7 @@ pub const ApiHttpServer = struct {
                 group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, table_name);
             }
         }
-        _ = self.dropTableMetadata(self.alloc, table_name, expected_table_id) catch |err| return switch (err) {
+        const retirement = self.dropTableMetadata(self.alloc, table_name, expected_table_id, identity_authoritative) catch |err| return switch (err) {
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
             error.TableGenerationChanged => try contextual_operations.textAlloc(self.alloc, 409, "table changed; retry delete"),
             error.TableTransitionActive => try contextual_operations.textAlloc(self.alloc, 409, "table transition active"),
@@ -11359,6 +11379,9 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         if (self.table_writes) |writes| {
+            // Cleanup is scoped to the captured group identities, including
+            // when the old metadata identity retired by replacement.
+            _ = retirement;
             _ = writes.dropTable(self.alloc, table_name, group_ids orelse &.{}) catch |err| switch (err) {
                 error.TableNotFound => null,
                 else => return err,
@@ -33259,6 +33282,83 @@ test "api http server drop table resolves ambiguous completion without deleting 
     try std.testing.expectEqual(@as(u64, 2), source.table_id);
     try std.testing.expectEqual(@as(u32, 1), source.expected_drop_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), source.admin_snapshot_calls.load(.monotonic));
+}
+
+test "api http server drop table fails closed when fallback snapshot lacks identity" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        legacy_drop_calls: std.atomic.Value(u32) = .init(0),
+        expected_drop_calls: std.atomic.Value(u32) = .init(0),
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .cached_admin_snapshot = cachedAdminSnapshot,
+                    .linearizable_snapshot = linearizableSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .drop_table = dropTable,
+                    .drop_table_expected = dropTableExpected,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn emptySnapshot() metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return emptySnapshot();
+        }
+
+        fn cachedAdminSnapshot(_: *anyopaque) !?metadata_api.AdminSnapshot {
+            return emptySnapshot();
+        }
+
+        fn linearizableSnapshot(_: *anyopaque, _: api_operation.RequestContext) !?metadata_api.AdminSnapshot {
+            return error.Timeout;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.legacy_drop_calls.fetchAdd(1, .monotonic);
+            return error.TestUnexpectedResult;
+        }
+
+        fn dropTableExpected(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.expected_drop_calls.fetchAdd(1, .monotonic);
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    var resp = try executeHttpxTestRequest(&server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs",
+    });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqual(@as(u32, 0), source.legacy_drop_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), source.expected_drop_calls.load(.monotonic));
 }
 
 test "api http server get missing index returns 404 without runtime status lookup" {

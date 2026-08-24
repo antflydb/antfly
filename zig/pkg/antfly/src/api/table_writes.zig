@@ -6576,21 +6576,28 @@ pub const ProvisionedTableWriteSource = struct {
         };
     }
 
-    fn retireDroppedTablePublicationAuthority(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+    fn retireDroppedTablePublicationAuthorityForGroups(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_ids: []const u64,
+    ) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
 
         // The successful drop owns the table-wide structural fence, so no new
         // reconcile can install publication authority while this allocation-free
-        // cleanup retires every old group incarnation. Those deleted DBs can no
-        // longer publish the edge that would otherwise release status polling.
+        // cleanup retires the captured old group incarnations. A replacement
+        // table with the same name may already own other groups; preserve its
+        // handoffs and status authority.
         const table_index = self.findTableActivityLocked(table_name, null) orelse unreachable;
         std.debug.assert(self.active_table_activities.items[table_index].structural_active);
         var index: usize = 0;
         while (index < self.active_table_activities.items.len) {
             const entry = &self.active_table_activities.items[index];
             if (!std.mem.eql(u8, entry.table_name, table_name) or
+                entry.group_id == null or
+                std.mem.indexOfScalar(u64, group_ids, entry.group_id.?) == null or
                 (entry.repair_handoff_status_pending == 0 and entry.publication_handoffs.items.len == 0))
             {
                 index += 1;
@@ -13836,19 +13843,29 @@ pub const ProvisionedTableWriteSource = struct {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
         };
 
-        self.beginLocalStructuralMutation(table_name);
-        var structural_mutation_active = true;
-        var local_db_mutex_held = true;
-        errdefer if (structural_mutation_active) {
-            if (local_db_mutex_held) {
-                self.abortLocalStructuralMutation(table_name);
-            } else {
-                self.abortLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
-            }
+        self.beginStructuralTableActivity(table_name);
+        var structural_activity_active = true;
+        errdefer if (structural_activity_active) self.endStructuralTableActivity(table_name);
+
+        // Group IDs are immutable table-generation identities. Exclusively
+        // drain only the captured groups so a same-name replacement remains
+        // available in both read and write caches throughout old-path cleanup.
+        const read_cache_exclusives = try alloc.alloc(?table_reads.ProvisionedTableReadCache.ExclusiveGroupAccess, group_ids.len);
+        defer alloc.free(read_cache_exclusives);
+        @memset(read_cache_exclusives, null);
+        defer for (read_cache_exclusives) |*exclusive| {
+            if (exclusive.*) |*value| value.deinit();
         };
-        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
-        defer {
-            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        for (group_ids, 0..) |group_id, index| {
+            read_cache_exclusives[index] = try self.beginReadCacheGroupExclusive(group_id);
+        }
+
+        lockAtomic(&self.local_db_mutex);
+        var local_db_mutex_held = true;
+        errdefer if (local_db_mutex_held) self.local_db_mutex.unlock();
+        for (group_ids) |group_id| {
+            if (self.write_cache) |cache| try cache.invalidateGroupTable(group_id, table_name);
+            if (self.startup_write_cache) |cache| try cache.invalidateGroupTable(group_id, table_name);
         }
         self.local_db_mutex.unlock();
         local_db_mutex_held = false;
@@ -13863,9 +13880,9 @@ pub const ProvisionedTableWriteSource = struct {
                 try self.deleteDroppedGroupPath(alloc, dropped_path);
             }
         }
-        self.retireDroppedTablePublicationAuthority(table_name);
-        self.finishLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
-        structural_mutation_active = false;
+        self.retireDroppedTablePublicationAuthorityForGroups(table_name, group_ids);
+        self.endStructuralTableActivity(table_name);
+        structural_activity_active = false;
         for (group_ids) |group_id| {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
         }
@@ -40635,7 +40652,7 @@ test "provisioned table write source drop table cancels index repair before stru
     try std.testing.expect(!probe.invalid_sequence.isSet());
 }
 
-test "provisioned table write source drop table retires old publication authority" {
+test "provisioned table write source drop table preserves replacement publication authority" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -40647,8 +40664,8 @@ test "provisioned table write source drop table retires old publication authorit
     defer source.deinit();
 
     // Model both publication fences that can outlive structural reconciliation.
-    // Include an old group absent from the drop request: table deletion ends the
-    // incarnation as a whole, not merely the catalog's current group list.
+    // Group 7002 represents a same-name replacement that appeared after the
+    // deletion request captured old group 7001.
     source.reserveStructuralReconcileStatus("docs");
     source.ensureStructuralRepairHandoffStatus("docs", 7001);
     source.ensureStructuralPublicationHandoffStatus("docs", 7002, .{
@@ -40676,12 +40693,13 @@ test "provisioned table write source drop table retires old publication authorit
 
     _ = try source.source().dropTable(alloc, "docs", &.{7001});
 
-    // A same-name table with a different group incarnation must immediately be
-    // eligible for live status; no deleted group can publish another release.
+    // The dropped group can no longer publish another release, while the
+    // replacement group retains its snapshot-only handoff until its own
+    // publication becomes visible.
     const recreated_admission = source.beginStatusRequest("docs");
-    try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.live, recreated_admission);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.snapshot_only, recreated_admission);
     source.endStatusRequest("docs", recreated_admission);
-    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("other"));
 }
 

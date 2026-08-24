@@ -4027,11 +4027,13 @@ pub const AntflyApiHandler = struct {
         var local_drop_group_ids: ?[]u64 = null;
         defer if (local_drop_group_ids) |group_ids| alloc.free(group_ids);
         var expected_table_id: ?u64 = null;
+        var identity_authoritative = false;
         // Capture the identity as well as cleanup routing. Conditional
         // deletion prevents a response-less retry from deleting a table that
         // reused the same name with a new ID.
         if (try self.api_server.tableDropSnapshot()) |snapshot_value| {
-            var snapshot = snapshot_value;
+            identity_authoritative = snapshot_value.authoritative;
+            var snapshot = snapshot_value.snapshot;
             defer self.api_server.source.freeAdminSnapshot(&snapshot);
             if (tables_api.findTableByName(&snapshot, decoded_table_name)) |table| {
                 expected_table_id = table.table_id;
@@ -4040,7 +4042,7 @@ pub const AntflyApiHandler = struct {
                 local_drop_group_ids = try ApiHttpServer.tableGroupIdsFromSnapshot(alloc, &snapshot, decoded_table_name);
             }
         }
-        _ = self.api_server.dropTableMetadata(alloc, decoded_table_name, expected_table_id) catch |err| switch (err) {
+        const retirement = self.api_server.dropTableMetadata(alloc, decoded_table_name, expected_table_id, identity_authoritative) catch |err| switch (err) {
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
@@ -4064,6 +4066,9 @@ pub const AntflyApiHandler = struct {
             },
         };
         if (self.api_server.table_writes) |write_source| {
+            // Cleanup is scoped to the captured group identities, including
+            // when the old metadata identity retired by replacement.
+            _ = retirement;
             const group_ids = local_drop_group_ids orelse &.{};
             _ = write_source.dropTable(alloc, decoded_table_name, group_ids) catch |err| switch (err) {
                 error.TableNotFound => null,
