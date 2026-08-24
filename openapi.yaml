@@ -18724,6 +18724,39 @@ components:
               field: text
               source_artifact_name: document_chunks_v1
               expected_dims: 768
+    IndexReadinessState:
+      type: string
+      enum:
+        - pending
+        - ready
+        - failed
+      description: Authoritative query-readiness state for the desired index incarnation.
+    IndexReadinessStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+        - pending_reasons
+      properties:
+        state:
+          $ref: '#/components/schemas/IndexReadinessState'
+        incarnation:
+          type: string
+          description: Opaque identity for the desired index incarnation. Clients may compare it for equality
+            but must not interpret its contents.
+        target_revision:
+          type: integer
+          format: uint64
+          description: Highest captured source/replay revision required by this readiness observation.
+        published_revision:
+          type: integer
+          format: uint64
+          description: Highest revision published to the query-visible index represented by this observation.
+        pending_reasons:
+          type: array
+          items:
+            type: string
+          description: Stable, machine-readable blockers. Empty when state is ready.
     IndexRepairStatus:
       type: object
       description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available
@@ -18755,6 +18788,8 @@ components:
           enum:
             - full_text
           description: Discriminator for the index stats variant.
+        readiness:
+          $ref: '#/components/schemas/IndexReadinessStatus'
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -19225,6 +19260,8 @@ components:
           enum:
             - embeddings
           description: Discriminator for the index stats variant.
+        readiness:
+          $ref: '#/components/schemas/IndexReadinessStatus'
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -19476,6 +19513,8 @@ components:
           enum:
             - graph
           description: Discriminator for the index stats variant.
+        readiness:
+          $ref: '#/components/schemas/IndexReadinessStatus'
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -19697,6 +19736,8 @@ components:
           enum:
             - algebraic
           description: Discriminator for the index stats variant.
+        readiness:
+          $ref: '#/components/schemas/IndexReadinessStatus'
         error:
           x-go-type-skip-optional-pointer: true
           type: string

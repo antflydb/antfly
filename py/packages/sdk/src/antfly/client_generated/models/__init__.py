@@ -375,6 +375,8 @@ from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
+from .index_readiness_state import IndexReadinessState
+from .index_readiness_status import IndexReadinessStatus
 from .index_repair_status import IndexRepairStatus
 from .index_repair_status_state import IndexRepairStatusState
 from .index_status import IndexStatus
@@ -1200,6 +1202,8 @@ __all__ = (
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexExecutionConfig",
+    "IndexReadinessState",
+    "IndexReadinessStatus",
     "IndexRepairStatus",
     "IndexRepairStatusState",
     "IndexStatus",
