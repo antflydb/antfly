@@ -5437,6 +5437,7 @@ pub const GraphTraversal = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     limit: ?i64 = null,
+    /// Visit each exact table-qualified node identity at most once. Omit for the default true behavior; set false to enumerate repeated visits.
     deduplicate_nodes: ?bool = null,
     include_paths: ?bool = null,
     /// Include each result node's stored document.

@@ -75,6 +75,39 @@ func TestGraphQueryConstructors(t *testing.T) {
 	}
 }
 
+func TestGraphTraversalPreservesExplicitFalseDeduplication(t *testing.T) {
+	start, err := NewGraphKeySelector("doc:a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deduplicate := false
+	query, err := NewGraphTraverseQuery(GraphTraverseQuery{
+		Index: "graph_idx",
+		Traverse: GraphTraversal{
+			Start:            start,
+			DeduplicateNodes: &deduplicate,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	traverse, ok := decoded["traverse"].(map[string]any)
+	if !ok {
+		t.Fatalf("traverse = %T", decoded["traverse"])
+	}
+	if value, present := traverse["deduplicate_nodes"]; !present || value != false {
+		t.Fatalf("deduplicate_nodes = %#v, present = %v", value, present)
+	}
+}
+
 func TestGraphSelectorAndProjectionConstructors(t *testing.T) {
 	filter, err := NewGraphDocumentFilter(querydsl.TermQuery{Term: "beta", Field: "title"}.ToQuery())
 	if err != nil {

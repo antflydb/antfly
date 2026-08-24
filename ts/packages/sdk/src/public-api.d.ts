@@ -12053,7 +12053,10 @@ export interface components {
             max_weight?: number;
             /** @default 100 */
             limit?: number;
-            /** @default true */
+            /**
+             * @description Visit each exact table-qualified node identity at most once. Omit for the default true behavior; set false to enumerate repeated visits.
+             * @default true
+             */
             deduplicate_nodes?: boolean;
             /** @default false */
             include_paths?: boolean;

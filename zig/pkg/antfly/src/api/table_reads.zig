@@ -6769,9 +6769,12 @@ fn requiresDistributedGraphCoordinator(
     group_count: usize,
     req: db_mod.types.SearchRequest,
 ) bool {
+    if (req.graph_queries.len == 0) return false;
+    // This callback carries the authenticated caller and is deliberately not
+    // serializable. Never let a generic owner proxy silently discard it.
+    if (req.graph_table_read_authorizer != null) return true;
     return distributed_graph.supportsCrossRange(req) and
         (group_count > 1 or
-            req.graph_table_read_authorizer != null or
             distributed_graph.requiresCompleteMatchAnchors(req) or
             graphRequestHasQualifiedIdentity(req) or
             graphRequestHasResultRef(req));
@@ -6783,7 +6786,7 @@ fn requiresDistributedGraphCoordinator(
 /// on the generic shard wire and obtains only the snapshot-generation stamp.
 fn graphCoordinatorBaseRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
     var base = req;
-    base.graph_queries = &.{};
+    base.clearGraphQueries();
     base.expand_strategy = null;
     if (!graphRequestHasRetrievalLane(req)) base.query = .{ .match_none = {} };
     return base;
@@ -6812,7 +6815,10 @@ fn rejectUnsupportedCrossRangeGraphMode(
     group_count: usize,
     req: db_mod.types.SearchRequest,
 ) !void {
-    if (group_count > 1 and req.graph_queries.len > 0 and !distributed_graph.supportsCrossRange(req)) {
+    if (req.graph_queries.len > 0 and
+        !distributed_graph.supportsCrossRange(req) and
+        (group_count > 1 or req.graph_table_read_authorizer != null))
+    {
         return error.GraphCrossRangeModeUnsupported;
     }
 }
@@ -16661,6 +16667,13 @@ fn encodeScanRequest(
 
 fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
+    // Cross-table authorization is a request-local callback and has no trusted
+    // generic JSON representation. Supported graph requests execute through
+    // the coordinator; unsupported authenticated modes are rejected during
+    // routing. Keep this last-line guard so a future route cannot proxy them
+    // without their target-table authorization policy.
+    if (req.graph_queries.len > 0 and req.graph_table_read_authorizer != null)
+        return error.UnsupportedQueryRequest;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, '{');
@@ -16801,6 +16814,37 @@ test "generic shard query wire fails closed without an admitted graph fragment" 
         error.UnsupportedQueryRequest,
         encodeQueryRequest(std.testing.allocator, .{ .graph_queries = &graph_queries }),
     );
+}
+
+test "generic shard query wire never drops graph table authorization" {
+    const Authorizer = struct {
+        fn authorize(
+            _: ?*const anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) !db_mod.types.GraphTableReadAuthorization {
+            return .{ .allowed = false };
+        }
+    };
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    }};
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, encodeQueryRequest(std.testing.allocator, .{
+        .graph_queries = &graph_queries,
+        .graph_queries_wire_json =
+        \\{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}
+        ,
+        .graph_table_read_authorizer = .{
+            .ctx = null,
+            .authorize_table = Authorizer.authorize,
+        },
+    }));
 }
 
 /// Append the exact bounded graph operation map captured during admission.
@@ -26183,6 +26227,13 @@ test "authenticated single-group graph queries require distributed coordination"
     };
 
     try std.testing.expect(requiresDistributedGraphCoordinator(1, req));
+
+    var unsupported = graph_queries;
+    unsupported[0].query.params.direction = .both;
+    req.graph_queries = &unsupported;
+    try std.testing.expect(requiresDistributedGraphCoordinator(1, req));
+
+    req.graph_queries = &graph_queries;
     req.graph_table_read_authorizer = null;
     try std.testing.expect(!requiresDistributedGraphCoordinator(1, req));
     try std.testing.expect(requiresDistributedGraphCoordinator(2, req));
@@ -26201,9 +26252,11 @@ test "graph coordinator base request avoids an implicit retrieval scan" {
 
     const graph_only = graphCoordinatorBaseRequest(.{
         .graph_queries = &graph_queries,
+        .graph_queries_wire_json = "{\"links\":{}}",
         .expand_strategy = .@"union",
     });
     try std.testing.expectEqual(@as(usize, 0), graph_only.graph_queries.len);
+    try std.testing.expectEqualStrings("", graph_only.graph_queries_wire_json);
     try std.testing.expectEqual(@as(?graph_query_mod.ExpandStrategy, null), graph_only.expand_strategy);
     try std.testing.expect(graph_only.query == .match_none);
     try std.testing.expect(graph_only.full_text == null);
@@ -26216,6 +26269,15 @@ test "graph coordinator base request avoids an implicit retrieval scan" {
 }
 
 test "unsupported cross-range graph modes fail closed" {
+    const Authorizer = struct {
+        fn authorize(
+            _: ?*const anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+        ) !db_mod.types.GraphTableReadAuthorization {
+            return .{ .allowed = false };
+        }
+    };
     const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "links",
         .query = .{
@@ -26229,6 +26291,13 @@ test "unsupported cross-range graph modes fail closed" {
 
     try rejectUnsupportedCrossRangeGraphMode(1, req);
     try std.testing.expectError(error.GraphCrossRangeModeUnsupported, rejectUnsupportedCrossRangeGraphMode(2, req));
+    try std.testing.expectError(error.GraphCrossRangeModeUnsupported, rejectUnsupportedCrossRangeGraphMode(1, .{
+        .graph_queries = &graph_queries,
+        .graph_table_read_authorizer = .{
+            .ctx = null,
+            .authorize_table = Authorizer.authorize,
+        },
+    }));
     try rejectUnsupportedCrossRangeGraphMode(2, .{});
 }
 

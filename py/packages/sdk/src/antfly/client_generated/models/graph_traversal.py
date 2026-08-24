@@ -47,7 +47,8 @@ class GraphTraversal:
         min_weight (float | Unset):
         max_weight (float | Unset):
         limit (int | Unset):  Default: 100.
-        deduplicate_nodes (bool | Unset):  Default: True.
+        deduplicate_nodes (bool | Unset): Visit each exact table-qualified node identity at most once. Omit for the
+            default true behavior; set false to enumerate repeated visits. Default: True.
         include_paths (bool | Unset):  Default: False.
         include_documents (bool | Unset): Include each result node's stored document. Default: False.
         fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.

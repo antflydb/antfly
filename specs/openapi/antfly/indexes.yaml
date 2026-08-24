@@ -2927,7 +2927,11 @@ components:
           minimum: 1
           maximum: 10000
           default: 100
-        deduplicate_nodes: { type: boolean, default: true }
+        deduplicate_nodes:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+          description: Visit each exact table-qualified node identity at most once. Omit for the default true behavior; set false to enumerate repeated visits.
         include_paths: { type: boolean, default: false }
         include_documents:
           type: boolean

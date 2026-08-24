@@ -3850,6 +3850,7 @@ pub fn build(b: *std.Build) void {
         "graph table queries have one fresh-topology retry",
         "generic shard query wire preserves admitted canonical graph operations",
         "generic shard query wire fails closed without an admitted graph fragment",
+        "generic shard query wire never drops graph table authorization",
         "graph edge metadata accepts only the public object shape",
         "unsupported cross-range graph modes fail closed",
         "parseRemoteSearchResult preserves typed graph rows and hydrated documents",

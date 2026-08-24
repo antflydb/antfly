@@ -1363,6 +1363,14 @@ pub const SearchRequest = struct {
     cancellation: ?CancellationToken = null,
     require_algebraic_filter_resolution: bool = false,
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+
+    /// Remove both representations of the admitted graph plan. Keeping this
+    /// operation centralized prevents derived requests from retaining proxy
+    /// wire state after graph execution has been disabled.
+    pub fn clearGraphQueries(self: *SearchRequest) void {
+        self.graph_queries = &.{};
+        self.graph_queries_wire_json = "";
+    }
 };
 
 pub const max_canonical_hierarchy_groups: u32 = 100;
@@ -1553,7 +1561,7 @@ pub fn canonicalGroupedMatchExpansionRequest(
     match_req.search_before = &.{};
     match_req.filter_doc_ids = parent_filter;
     match_req.filter_doc_ids_positive = true;
-    match_req.graph_queries = &.{};
+    match_req.clearGraphQueries();
     match_req.expand_strategy = null;
     match_req.aggregations_json = "";
     match_req.count_only = false;
