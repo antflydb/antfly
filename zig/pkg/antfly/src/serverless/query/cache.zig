@@ -43,6 +43,12 @@ pub const QueryCacheConfig = struct {
     max_payload_bytes: u64 = 0,
 };
 
+pub const AuthenticatedSubrange = struct {
+    relative_offset: usize,
+    len: usize,
+    checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+};
+
 pub const QueryCacheStats = struct {
     hits: u64 = 0,
     misses: u64 = 0,
@@ -508,6 +514,74 @@ pub const QueryCache = struct {
         );
     }
 
+    /// Reads a bounded range whose independently authenticated subranges are
+    /// rooted in trusted manifest metadata. Cache hits are re-authenticated,
+    /// and misses are authenticated before publication so a transient bad
+    /// provider response cannot become a durable cache poison.
+    pub fn getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
+        self: *QueryCache,
+        result_alloc: Allocator,
+        artifacts: *artifacts_mod.ArtifactStore,
+        artifact_id: []const u8,
+        expected_byte_len: u64,
+        expected_checksum: []const u8,
+        offset: u64,
+        len: usize,
+        subranges: []const AuthenticatedSubrange,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        try validateExpectedRange(artifact_id, .{
+            .byte_len = expected_byte_len,
+            .checksum = expected_checksum,
+        }, offset, len);
+        try validateAuthenticatedSubrangeLayout(len, subranges);
+
+        const range_path = try rangeCachePathAlloc(self.alloc, self.root_dir, artifact_id, offset, len);
+        defer self.alloc.free(range_path);
+        const cached = readVerifiedCacheRecordAllocWithCancellation(result_alloc, range_path, len, cancellation) catch |err| switch (err) {
+            error.FileNotFound => null,
+            error.CacheEntryCorrupt => blk: {
+                try removeCorruptCacheEntry(self, range_path, cancellation);
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (cached) |value| {
+            if (authenticateSubranges(value, subranges, cancellation)) |_| {
+                touchFileNow(range_path) catch {};
+                recordRangeHit(self);
+                return value;
+            } else |err| {
+                result_alloc.free(value);
+                switch (err) {
+                    error.ArtifactIntegrityMismatch => try removeCorruptCacheEntry(self, range_path, cancellation),
+                    else => return err,
+                }
+            }
+        }
+
+        const contents = try artifacts.getRangeAllocWithCancellationUsingAllocator(
+            result_alloc,
+            artifact_id,
+            offset,
+            len,
+            cancellation,
+        );
+        errdefer result_alloc.free(contents);
+        if (contents.len != len) {
+            recordIntegrityFailure(self);
+            return error.ArtifactIntegrityMismatch;
+        }
+        authenticateSubranges(contents, subranges, cancellation) catch |err| {
+            if (err == error.ArtifactIntegrityMismatch) recordIntegrityFailure(self);
+            return err;
+        };
+        const published = try publishCacheEntry(self, range_path, contents, .range, cancellation);
+        recordRangeMiss(self, published);
+        return contents;
+    }
+
     const ExpectedArtifact = struct {
         byte_len: u64,
         checksum: []const u8,
@@ -689,6 +763,36 @@ fn validateExpectedRange(artifact_id: []const u8, expected: QueryCache.ExpectedA
     artifacts_mod.validateSha256ArtifactIdentity(artifact_id, expected.checksum) catch return error.ArtifactIntegrityMismatch;
     const end = std.math.add(u64, offset, std.math.cast(u64, len) orelse return error.InvalidRange) catch return error.InvalidRange;
     if (end > expected.byte_len) return error.InvalidRange;
+}
+
+fn validateAuthenticatedSubrangeLayout(total_len: usize, subranges: []const AuthenticatedSubrange) !void {
+    if (total_len == 0 or subranges.len == 0) return error.InvalidRange;
+    var covered: usize = 0;
+    for (subranges) |subrange| {
+        if (subrange.len == 0 or subrange.relative_offset != covered) return error.InvalidRange;
+        covered = std.math.add(usize, covered, subrange.len) catch return error.InvalidRange;
+        if (covered > total_len) return error.InvalidRange;
+    }
+    if (covered != total_len) return error.InvalidRange;
+}
+
+fn authenticateSubranges(
+    contents: []const u8,
+    subranges: []const AuthenticatedSubrange,
+    cancellation: CancellationToken,
+) !void {
+    try validateAuthenticatedSubrangeLayout(contents.len, subranges);
+    for (subranges, 0..) |subrange, subrange_index| {
+        if (subrange_index % 64 == 0) try cancellation.check();
+        var actual: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        try sha256DigestWithCancellation(
+            contents[subrange.relative_offset..][0..subrange.len],
+            &actual,
+            cancellation,
+        );
+        if (!std.mem.eql(u8, &actual, &subrange.checksum)) return error.ArtifactIntegrityMismatch;
+    }
+    try cancellation.check();
 }
 
 fn threadedIo() std.Io.Threaded {
@@ -1873,6 +1977,12 @@ fn recordBypass(self: *QueryCache) void {
     self.stats.bypasses += 1;
 }
 
+fn recordIntegrityFailure(self: *QueryCache) void {
+    lockAtomic(&self.stats_mu);
+    defer self.stats_mu.unlock();
+    self.stats.integrity_failures +|= 1;
+}
+
 fn removeCorruptCacheEntry(self: *QueryCache, path: []const u8, cancellation: CancellationToken) !void {
     try lockAtomicWithCancellation(&self.maintenance_mu, cancellation);
     defer self.maintenance_mu.unlock();
@@ -2178,6 +2288,124 @@ test "serverless query cache cancels bounded positional reads without recording 
     );
     const stats = cache.statsSnapshot();
     try std.testing.expectEqual(@as(u64, 0), stats.range_hits);
+}
+
+test "serverless query cache authenticates ranges before publication and self heals poisoned hits" {
+    const alloc = std.testing.allocator;
+    var cache_root_buf: [256]u8 = undefined;
+    const cache_root = tmpPath(&cache_root_buf, "cache-authenticated-ranges");
+    defer cleanupTmp(cache_root);
+
+    const payload = "abcdefgh";
+    var payload_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload, &payload_digest, .{});
+    const checksum = std.fmt.bytesToHex(payload_digest, .lower);
+    var artifact_id: [artifacts_mod.store.sha256_artifact_id_prefix.len + checksum.len]u8 = undefined;
+    @memcpy(artifact_id[0..artifacts_mod.store.sha256_artifact_id_prefix.len], artifacts_mod.store.sha256_artifact_id_prefix);
+    @memcpy(artifact_id[artifacts_mod.store.sha256_artifact_id_prefix.len..], &checksum);
+
+    const State = struct {
+        payload: []const u8,
+        corrupt_next: bool = false,
+        range_calls: usize = 0,
+
+        fn deinit(_: Allocator, _: *anyopaque) void {}
+        fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return error.UnexpectedPut;
+        }
+        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedFullRead;
+        }
+        fn getRangeAlloc(ptr: *anyopaque, result_alloc: Allocator, _: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.range_calls += 1;
+            const start = std.math.cast(usize, offset) orelse return error.InvalidRange;
+            if (start > self.payload.len or len > self.payload.len - start) return error.InvalidRange;
+            const result = try result_alloc.dupe(u8, self.payload[start..][0..len]);
+            if (self.corrupt_next and result.len > 0) {
+                result[0] ^= 0x01;
+                self.corrupt_next = false;
+            }
+            return result;
+        }
+        fn stat(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
+            return error.UnexpectedStat;
+        }
+        fn delete(_: *anyopaque, _: []const u8) !void {
+            return error.UnexpectedDelete;
+        }
+
+        const vtable = artifacts_mod.ArtifactStore.VTable{
+            .deinit = deinit,
+            .put = put,
+            .get_alloc = getAlloc,
+            .get_range_alloc = getRangeAlloc,
+            .stat = stat,
+            .delete = delete,
+        };
+    };
+    var state = State{ .payload = payload };
+    var artifacts = artifacts_mod.ArtifactStore{ .allocator = alloc, .ptr = &state, .vtable = &State.vtable };
+    defer artifacts.deinit();
+    var cache = try QueryCache.init(alloc, std.mem.span(cache_root));
+    defer cache.deinit();
+
+    var first_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload[0..4], &first_digest, .{});
+    const first_subranges = [_]AuthenticatedSubrange{.{ .relative_offset = 0, .len = 4, .checksum = first_digest }};
+    state.corrupt_next = true;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, cache.getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
+        alloc,
+        &artifacts,
+        &artifact_id,
+        payload.len,
+        &checksum,
+        0,
+        4,
+        &first_subranges,
+        .none,
+    ));
+    const first_path = try rangeCachePathAlloc(alloc, std.mem.span(cache_root), &artifact_id, 0, 4);
+    defer alloc.free(first_path);
+    try std.testing.expect(!fileExists(first_path));
+    try std.testing.expectEqual(@as(u64, 1), cache.statsSnapshot().integrity_failures);
+
+    const first = try cache.getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
+        alloc,
+        &artifacts,
+        &artifact_id,
+        payload.len,
+        &checksum,
+        0,
+        4,
+        &first_subranges,
+        .none,
+    );
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("abcd", first);
+    try std.testing.expect(fileExists(first_path));
+
+    state.corrupt_next = true;
+    const poisoned = try cache.getRangeOrFetchAlloc(&artifacts, &artifact_id, 4, 4);
+    alloc.free(poisoned);
+    var second_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(payload[4..8], &second_digest, .{});
+    const second_subranges = [_]AuthenticatedSubrange{.{ .relative_offset = 0, .len = 4, .checksum = second_digest }};
+    const healed = try cache.getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
+        alloc,
+        &artifacts,
+        &artifact_id,
+        payload.len,
+        &checksum,
+        4,
+        4,
+        &second_subranges,
+        .none,
+    );
+    defer alloc.free(healed);
+    try std.testing.expectEqualStrings("efgh", healed);
+    try std.testing.expectEqual(@as(usize, 4), state.range_calls);
+    try std.testing.expectEqual(@as(u64, 2), cache.statsSnapshot().integrity_failures);
 }
 
 test "serverless query cache rejects unsafe artifact ids before filesystem access" {

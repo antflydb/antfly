@@ -49,11 +49,7 @@ pub const NamespaceQueryExecutionMetrics = struct {
     }
 };
 
-pub const AuthenticatedSubrange = struct {
-    relative_offset: usize,
-    len: usize,
-    checksum: [std.crypto.hash.sha2.Sha256.digest_length]u8,
-};
+pub const AuthenticatedSubrange = cache_mod.AuthenticatedSubrange;
 
 pub const QueryRuntime = struct {
     alloc: Allocator,
@@ -380,23 +376,30 @@ pub const QuerySession = struct {
         }
         if (covered != len) return error.InvalidArtifactRange;
 
-        const result = if (self.cache) |cache|
-            try cache.getRangeOrFetchAllocWithCancellationUsingAllocator(
+        if (self.cache) |cache| {
+            const result = try cache.getAuthenticatedRangeOrFetchAllocWithCancellationUsingAllocator(
                 self.alloc,
                 self.artifacts,
                 artifact.artifact_id,
+                artifact.byte_len,
+                artifact.checksum,
                 offset,
                 len,
-                self.cancellation,
-            )
-        else
-            try self.artifacts.getRangeAllocWithCancellationUsingAllocator(
-                self.alloc,
-                artifact.artifact_id,
-                offset,
-                len,
+                subranges,
                 self.cancellation,
             );
+            errdefer self.alloc.free(result);
+            try self.checkCancellation();
+            return result;
+        }
+
+        const result = try self.artifacts.getRangeAllocWithCancellationUsingAllocator(
+            self.alloc,
+            artifact.artifact_id,
+            offset,
+            len,
+            self.cancellation,
+        );
         errdefer self.alloc.free(result);
         if (result.len != len) return error.ArtifactIntegrityMismatch;
         for (subranges, 0..) |subrange, subrange_index| {
