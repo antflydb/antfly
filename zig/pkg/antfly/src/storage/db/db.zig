@@ -892,6 +892,7 @@ const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
 var test_graph_repair_stream_flushes: std.atomic.Value(u64) = .init(0);
+var test_graph_repair_stream_scans: std.atomic.Value(u64) = .init(0);
 var test_dense_repair_rebuild_batch_size: ?usize = null;
 var test_algebraic_repair_rebuild_batch_size: ?usize = null;
 var test_index_repair_catch_up_max_records_per_window: ?usize = null;
@@ -42356,75 +42357,143 @@ fn applySplitGraphArtifactsForIndex(
     return mutation_count;
 }
 
-fn applySplitGraphArtifactsForIndexStreaming(
+fn applySplitGraphArtifactsStreaming(
     alloc: Allocator,
     dest_store: *docstore_mod.DocStore,
     dest_indexes: *index_manager_mod.IndexManager,
-    index_name: []const u8,
     lower: []const u8,
     upper: []const u8,
     batch_size: usize,
-) !usize {
-    _ = dest_indexes.graphIndex(index_name) orelse return error.IndexNotFound;
+) !void {
     const store_lower = try documentRangeLowerAlloc(alloc, lower);
     defer alloc.free(store_lower);
     const store_upper = if (upper.len > 0) try documentRangeUpperAlloc(alloc, upper) else null;
     defer if (store_upper) |buf| alloc.free(buf);
     const effective_batch_size = @max(batch_size, 1);
 
+    const IndexBuffer = struct {
+        index_name: []const u8,
+        writes: std.ArrayListUnmanaged(types.GraphEdgeWrite) = .empty,
+
+        fn freeWrites(buffer: *@This(), buffer_alloc: Allocator) void {
+            for (buffer.writes.items) |write| {
+                buffer_alloc.free(@constCast(write.index_name));
+                buffer_alloc.free(@constCast(write.source));
+                buffer_alloc.free(@constCast(write.target));
+                buffer_alloc.free(@constCast(write.edge_type));
+                if (write.metadata_json.len > 0) buffer_alloc.free(@constCast(write.metadata_json));
+            }
+            buffer.writes.clearRetainingCapacity();
+        }
+
+        fn deinit(buffer: *@This(), buffer_alloc: Allocator) void {
+            buffer.freeWrites(buffer_alloc);
+            buffer.writes.deinit(buffer_alloc);
+        }
+    };
+
     const ScanState = struct {
         alloc: Allocator,
-        dest_store: *docstore_mod.DocStore,
         dest_indexes: *index_manager_mod.IndexManager,
-        index_name: []const u8,
         batch_size: usize,
-        keys: std.ArrayListUnmanaged([]const u8) = .empty,
-        mutation_count: usize = 0,
+        buffers: []IndexBuffer = &.{},
+        initialized_buffers: usize = 0,
+        indexes_by_name: std.StringHashMapUnmanaged(usize) = .empty,
+        pending_writes: usize = 0,
 
-        fn freeKeys(state: *@This()) void {
-            for (state.keys.items) |key| state.alloc.free(@constCast(key));
-            state.keys.clearRetainingCapacity();
+        fn initBuffers(state: *@This()) !void {
+            if (state.dest_indexes.graph_indexes.items.len == 0) return;
+            state.buffers = try state.alloc.alloc(IndexBuffer, state.dest_indexes.graph_indexes.items.len);
+            for (state.dest_indexes.graph_indexes.items, 0..) |entry, i| {
+                state.buffers[i] = .{ .index_name = entry.config.name };
+                state.initialized_buffers += 1;
+                const slot = try state.indexes_by_name.getOrPut(state.alloc, entry.config.name);
+                if (slot.found_existing) return error.InvalidIndexConfig;
+                slot.value_ptr.* = i;
+            }
         }
 
         fn deinit(state: *@This()) void {
-            state.freeKeys();
-            state.keys.deinit(state.alloc);
+            for (state.buffers[0..state.initialized_buffers]) |*buffer| buffer.deinit(state.alloc);
+            if (state.buffers.len > 0) state.alloc.free(state.buffers);
+            state.indexes_by_name.deinit(state.alloc);
         }
 
         fn flush(state: *@This()) !void {
-            if (state.keys.items.len == 0) return;
+            if (state.pending_writes == 0) return;
             if (comptime builtin.is_test) {
                 _ = test_graph_repair_stream_flushes.fetchAdd(1, .monotonic);
             }
-            state.mutation_count += try applySplitGraphArtifactsForIndex(
-                state.dest_store,
-                state.dest_indexes,
-                state.keys.items,
-                state.index_name,
-            );
-            state.freeKeys();
+            for (state.buffers[0..state.initialized_buffers]) |*buffer| {
+                if (buffer.writes.items.len == 0) continue;
+                try state.dest_indexes.applyGraphMutationsByName(buffer.index_name, buffer.writes.items, &.{});
+                state.pending_writes -= buffer.writes.items.len;
+                buffer.freeWrites(state.alloc);
+            }
+            std.debug.assert(state.pending_writes == 0);
         }
 
-        fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, _: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+        fn appendDecodedWrite(
+            state: *@This(),
+            buffer_index: usize,
+            parsed: anytype,
+            decoded: *enrichment_artifact_codec.GraphEdge,
+        ) !void {
+            const buffer = &state.buffers[buffer_index];
+            try buffer.writes.ensureUnusedCapacity(state.alloc, 1);
+            const index_name = try state.alloc.dupe(u8, parsed.index_name);
+            errdefer state.alloc.free(index_name);
+            const source = try state.alloc.dupe(u8, parsed.doc_key);
+            errdefer state.alloc.free(source);
+            const target = try state.alloc.dupe(u8, parsed.target_doc_key);
+            errdefer state.alloc.free(target);
+            const edge_type = try state.alloc.dupe(u8, parsed.edge_type);
+            errdefer state.alloc.free(edge_type);
+            buffer.writes.appendAssumeCapacity(.{
+                .index_name = index_name,
+                .source = source,
+                .target = target,
+                .edge_type = edge_type,
+                .weight = decoded.weight,
+                .created_at = decoded.created_at,
+                .updated_at = decoded.updated_at,
+                .metadata_json = decoded.metadata_json,
+            });
+            decoded.metadata_json = &.{};
+            state.pending_writes += 1;
+        }
+
+        fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isGraphEdgeArtifactKey(key)) return .@"continue";
-            const owned = try state.alloc.dupe(u8, key);
-            errdefer state.alloc.free(owned);
-            try state.keys.append(state.alloc, owned);
-            if (state.keys.items.len >= state.batch_size) try state.flush();
+            const parsed = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(state.alloc, key)) orelse return .@"continue";
+            defer {
+                state.alloc.free(parsed.doc_key);
+                state.alloc.free(parsed.index_name);
+                state.alloc.free(parsed.edge_type);
+                state.alloc.free(parsed.target_doc_key);
+            }
+            const buffer_index = state.indexes_by_name.get(parsed.index_name) orelse return .@"continue";
+            var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(state.alloc, value);
+            defer decoded.deinit(state.alloc);
+            try state.appendDecodedWrite(buffer_index, parsed, &decoded);
+            if (state.pending_writes >= state.batch_size) try state.flush();
             return .@"continue";
         }
     };
 
     var state = ScanState{
         .alloc = alloc,
-        .dest_store = dest_store,
         .dest_indexes = dest_indexes,
-        .index_name = index_name,
         .batch_size = effective_batch_size,
     };
     defer state.deinit();
+    try state.initBuffers();
+    if (state.initialized_buffers == 0) return;
 
+    if (comptime builtin.is_test) {
+        _ = test_graph_repair_stream_scans.fetchAdd(1, .monotonic);
+    }
     try dest_store.scanWithContext(
         store_lower,
         if (store_upper) |buf| buf else "",
@@ -42433,7 +42502,6 @@ fn applySplitGraphArtifactsForIndexStreaming(
         ScanState.scanEntry,
     );
     try state.flush();
-    return state.mutation_count;
 }
 
 fn applySplitGraphArtifactsForIndexStreamingContext(
@@ -42553,20 +42621,18 @@ fn applySplitGraphArtifactsInRange(
     dest_store: *docstore_mod.DocStore,
     dest_indexes: *index_manager_mod.IndexManager,
 ) !void {
-    // Restore and split repair must stay bounded by the configured batch even
-    // when a table contains millions of durable graph artifacts. Scan once per
-    // graph index so mutation collection cannot scale with total graph size.
-    for (dest_indexes.graph_indexes.items) |entry| {
-        _ = try applySplitGraphArtifactsForIndexStreaming(
-            alloc,
-            dest_store,
-            dest_indexes,
-            entry.config.name,
-            lower,
-            upper,
-            graph_repair_rebuild_batch_size,
-        );
-    }
+    // Restore and split repair must stay bounded by one global mutation batch,
+    // even when a table contains millions of durable graph artifacts. Parse
+    // each artifact once and route it to its configured index so adding graph
+    // indexes does not multiply the complete document-range scan.
+    try applySplitGraphArtifactsStreaming(
+        alloc,
+        dest_store,
+        dest_indexes,
+        lower,
+        upper,
+        graph_repair_rebuild_batch_size,
+    );
 }
 
 fn indexExistingSplitDestinationDirect(
@@ -58493,6 +58559,7 @@ test "db index repair streams graph artifact rebuild in batches" {
     defer db.close();
 
     try db.addIndex(.{ .name = "graph_stream", .kind = .graph, .config_json = "{}" });
+    try db.addIndex(.{ .name = "graph_other", .kind = .graph, .config_json = "{}" });
 
     const total_edges = graph_repair_rebuild_batch_size + 3;
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
@@ -58514,13 +58581,26 @@ test "db index repair streams graph artifact rebuild in batches" {
         errdefer alloc.free(value);
         try writes.append(alloc, .{ .key = key, .value = value });
     }
+    const other_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "other:a", "graph_other", "links", "other:b");
+    errdefer alloc.free(other_key);
+    const other_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 1.0, 0, 0, "");
+    errdefer alloc.free(other_value);
+    try writes.append(alloc, .{ .key = other_key, .value = other_value });
     try db.core.store.putBatch(writes.items, &.{});
 
     // The restore/split entry point uses the same bounded streaming path as
-    // online repair; it must not materialize the complete artifact keyspace.
+    // online repair; it must neither materialize the complete artifact keyspace
+    // nor rescan it for every configured graph index.
     test_graph_repair_stream_flushes.store(0, .monotonic);
+    test_graph_repair_stream_scans.store(0, .monotonic);
     try db.rebuildGraphIndexesForTargetCoverage(alloc);
     try std.testing.expectEqual(@as(u64, 2), test_graph_repair_stream_flushes.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), test_graph_repair_stream_scans.load(.monotonic));
+
+    const other_edges = try db.getEdges(alloc, "graph_other", "other:a", "links", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, other_edges);
+    try std.testing.expectEqual(@as(usize, 1), other_edges.len);
+    try std.testing.expectEqualStrings("other:b", other_edges[0].target);
 
     test_graph_repair_stream_flushes.store(0, .monotonic);
     var repair = try db.repairArtifactIssuesWithRequest(alloc, .{

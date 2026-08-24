@@ -25,8 +25,9 @@ class LegacyGraphQueryResult:
     Attributes:
         type_ (GraphQueryType): Deprecated discriminator used by LegacyGraphQuery.
         total (int): Deprecated graph_searches result count; use stats or a named count aggregate.
-        kind (LegacyGraphQueryResultKind | Unset): Stable discriminator emitted by current servers. Optional only so
-            current SDKs can decode the pre-discriminator v0.2 response during the compatibility release.
+        kind (LegacyGraphQueryResultKind | Unset): Optional transition discriminator accepted by current SDKs. Servers
+            omit it for graph_searches during the v0.2 compatibility release so strict previously generated clients continue
+            to decode the original response shape.
         nodes (list[LegacyGraphResultNode] | Unset): Result nodes. Optional for compatibility with v0.2 responses.
         paths (list[Path] | Unset): Result paths. Optional for compatibility with v0.2 responses.
         matches (list[PatternMatch] | Unset): Deprecated graph_searches pattern results; use rows for graph_queries.

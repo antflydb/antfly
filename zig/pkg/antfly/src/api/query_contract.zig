@@ -5349,7 +5349,6 @@ fn toOpenApiGraphQueryResult(
         const response = try alloc.create(indexes_openapi.LegacyGraphQueryResult);
         errdefer alloc.destroy(response);
         response.* = .{
-            .kind = "legacy",
             .type = legacyGraphQueryType(query.query_type),
             .nodes = try toOpenApiLegacyGraphNodes(alloc, graph_result, &document_lookup),
             .paths = try toOpenApiPaths(alloc, graph_result.paths),
@@ -5660,8 +5659,63 @@ test "deprecated graph search preserves its response envelope" {
 
     try std.testing.expect(result == .legacy_graph_query_result);
     const legacy = result.legacy_graph_query_result;
+    try std.testing.expect(legacy.kind == null);
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, legacy.type);
     try std.testing.expectEqual(@as(i64, 12), legacy.total);
+
+    const named_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .legacy_response = true,
+        },
+    }};
+    const graph_results = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("neighbors"),
+        .hits = &.{},
+        .total_hits = 12,
+    }};
+    var encoded = try encodeQueryResponses(
+        alloc,
+        "docs",
+        .{ .graph_queries = &named_queries },
+        .{ .took_ms = 3 },
+        .{
+            .alloc = alloc,
+            .hits = &.{},
+            .total_hits = 0,
+            .graph_results = @constCast(graph_results[0..]),
+        },
+    );
+    defer encoded.deinit(alloc);
+
+    var parsed = try ant_json.parseFromSlice(std.json.Value, alloc, encoded.json, .{});
+    defer parsed.deinit();
+    const encoded_legacy = parsed.value.object
+        .get("responses").?.array.items[0].object
+        .get("graph_results").?.object
+        .get("neighbors").?;
+    try std.testing.expect(encoded_legacy.object.get("kind") == null);
+
+    // Model the strict v0.2 generated response type. Its decoder rejects
+    // unknown fields, so this is the compatibility direction that merely
+    // accepting pre-discriminator responses in new clients does not cover.
+    const LegacyGraphQueryResultV02 = struct {
+        type: indexes_openapi.GraphQueryType,
+        nodes: ?std.json.Value = null,
+        paths: ?std.json.Value = null,
+        matches: ?std.json.Value = null,
+        total: i64,
+        took: ?i64 = null,
+    };
+    const encoded_legacy_json = try std.json.Stringify.valueAlloc(alloc, encoded_legacy, .{});
+    defer alloc.free(encoded_legacy_json);
+    var parsed_v02 = try std.json.parseFromSlice(LegacyGraphQueryResultV02, alloc, encoded_legacy_json, .{});
+    defer parsed_v02.deinit();
+    try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, parsed_v02.value.type);
+    try std.testing.expectEqual(@as(i64, 12), parsed_v02.value.total);
 }
 
 test "canonical graph paths preserve table-qualified node identities" {

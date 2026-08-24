@@ -12430,7 +12430,7 @@ export interface components {
          */
         LegacyGraphQueryResult: {
             /**
-             * @description Stable discriminator emitted by current servers. Optional only so current SDKs can decode the pre-discriminator v0.2 response during the compatibility release.
+             * @description Optional transition discriminator accepted by current SDKs. Servers omit it for graph_searches during the v0.2 compatibility release so strict previously generated clients continue to decode the original response shape.
              * @enum {string}
              */
             kind?: "legacy";
