@@ -1416,6 +1416,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = runtime_filter_test_runner,
     });
     tests.root_module.addImport("build_options", build_options_mod);
+    tests.root_module.addImport("antfly-json", runtime_graph.json_mod);
     tests.root_module.addImport("httpx", httpx_mod);
     tests.root_module.addImport("inference_api", inference_api_mod);
     tests.root_module.addImport("antfly_generating_openapi", generating_openapi_mod);
