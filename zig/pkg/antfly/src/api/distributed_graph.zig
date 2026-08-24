@@ -879,16 +879,29 @@ pub fn executeCrossRange(
     base_result: db_mod.types.SearchResult,
     consistency: raft_mod.ReadConsistency,
 ) ![]db_mod.types.GraphSearchResult {
-    return try executeCrossRangeWithMatchAnchors(
-        alloc,
-        catalog,
-        worker,
-        table_name,
-        req,
-        base_result,
-        if (requiresCompleteMatchAnchors(req)) MatchAnchorSource{ .materialized = base_result } else null,
-        consistency,
-    );
+    // Embedded/direct callers do not have an outer table-read coordinator to
+    // refresh routing. Preserve their single bounded retry here. Production
+    // table reads use executeCrossRangeWithMatchAnchors and own the retry so a
+    // fresh attempt also refreshes the base scan and MATCH anchor snapshots.
+    var attempts: u32 = 0;
+    while (true) : (attempts += 1) {
+        return executeCrossRangeWithMatchAnchors(
+            alloc,
+            catalog,
+            worker,
+            table_name,
+            req,
+            base_result,
+            if (requiresCompleteMatchAnchors(req)) MatchAnchorSource{ .materialized = base_result } else null,
+            consistency,
+        ) catch |err| switch (err) {
+            error.TopologyChanged => {
+                if (attempts == 0) continue;
+                return err;
+            },
+            else => return err,
+        };
+    }
 }
 
 pub fn executeCrossRangeWithMatchAnchors(
@@ -920,17 +933,14 @@ pub fn executeCrossRangeWithMatchAnchors(
     request_worker.cancellation = req.cancellation;
     try request_worker.ensureActive();
 
-    var attempts: u32 = 0;
-    while (true) : (attempts += 1) {
-        try request_worker.ensureActive();
-        return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, match_anchor_source, consistency) catch |err| switch (err) {
-            error.TopologyChanged, error.UnknownGroup => {
-                if (attempts == 0) continue;
-                return err;
-            },
-            else => return err,
-        };
-    }
+    try request_worker.ensureActive();
+    return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, match_anchor_source, consistency) catch |err| switch (err) {
+        // UnknownGroup is topology churn from the coordinator's perspective.
+        // Let the outer table-read attempt refresh the complete routing and
+        // snapshot state instead of retrying expensive graph work in place.
+        error.UnknownGroup => error.TopologyChanged,
+        else => err,
+    };
 }
 
 fn executeCrossRangeOnce(

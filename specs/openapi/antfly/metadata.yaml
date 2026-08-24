@@ -1720,6 +1720,40 @@ components:
           type: boolean
           enum: [false]
           description: Retrying the same cursor cannot succeed; restart traversal instead.
+    TopologyChangedError:
+      type: object
+      additionalProperties: false
+      description: The table topology changed while a query was running after Antfly's bounded internal retry.
+      required: [status, error, message, action, retryable]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [409]
+        error:
+          type: string
+          enum: [topology_changed]
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable explanation of why the query must be retried.
+        action:
+          type: string
+          enum: [retry_query]
+          description: Stable client action for recovering from the conflict.
+        retryable:
+          type: boolean
+          enum: [true]
+          description: Retrying the complete query against fresh topology may succeed.
+    QueryConflictError:
+      oneOf:
+        - $ref: '#/components/schemas/HierarchyCursorStaleError'
+        - $ref: '#/components/schemas/TopologyChangedError'
+      discriminator:
+        propertyName: error
+        mapping:
+          hierarchy_cursor_stale: '#/components/schemas/HierarchyCursorStaleError'
+          topology_changed: '#/components/schemas/TopologyChangedError'
     ExactSortError:
       type: object
       additionalProperties: false
@@ -8847,11 +8881,17 @@ components:
           schema:
             $ref: "#/components/schemas/QueryUnprocessableError"
     HierarchyCursorStale:
-      description: The hierarchy changed after the traversal cursor was issued
+      description: Deprecated response component retained for generated-client source compatibility; query endpoints now use QueryConflict
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/HierarchyCursorStaleError"
+    QueryConflict:
+      description: The query's pinned hierarchy or table topology changed while it was running
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/QueryConflictError"
     QueryTemporarilyUnavailable:
       description: A query dependency or read path is temporarily unavailable and the request is safe to retry
       headers:
@@ -9905,7 +9945,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "409":
-          $ref: "#/components/responses/HierarchyCursorStale"
+          $ref: "#/components/responses/QueryConflict"
         "422":
           $ref: "#/components/responses/QueryUnprocessable"
         "503":
@@ -10292,7 +10332,7 @@ paths:
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":
-          $ref: "#/components/responses/HierarchyCursorStale"
+          $ref: "#/components/responses/QueryConflict"
         "422":
           $ref: "#/components/responses/QueryUnprocessable"
         "404":

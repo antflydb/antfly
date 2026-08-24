@@ -3053,12 +3053,16 @@ pub const ProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        // Graph retries re-run the base scan and every shard fanout. Keep one
+        // fresh topology retry, matching the hosted path, instead of applying
+        // the generic point-read retry multiplier to expensive graph work.
+        const attempt_limit = queryTopologyAttemptLimit(req);
         var attempt: usize = 0;
-        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+        while (attempt < attempt_limit) : (attempt += 1) {
             checkQueryDeadline(req) catch |err| return err;
             return self.queryAttempt(alloc, table_name, req, consistency) catch |err| switch (err) {
-                error.TopologyChanged => if (attempt + 1 < topology_read_attempt_limit) continue else return err,
-                error.ResidentDbRetryRequired => if (attempt + 1 < topology_read_attempt_limit) continue else return error.StorageReadTemporarilyUnavailable,
+                error.TopologyChanged => if (attempt + 1 < attempt_limit) continue else return err,
+                error.ResidentDbRetryRequired => if (attempt + 1 < attempt_limit) continue else return error.StorageReadTemporarilyUnavailable,
                 else => return err,
             };
         }
@@ -3676,6 +3680,31 @@ pub const ProvisionedTableReadSource = struct {
     }
 };
 
+fn queryTopologyAttemptLimit(req: db_mod.types.SearchRequest) usize {
+    return if (req.graph_queries.len > 0)
+        2
+    else
+        ProvisionedTableReadSource.topology_read_attempt_limit;
+}
+
+test "graph table queries have one fresh-topology retry" {
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        queryTopologyAttemptLimit(.{ .graph_queries = &.{.{
+            .name = "walk",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+            },
+        }} }),
+    );
+    try std.testing.expectEqual(
+        ProvisionedTableReadSource.topology_read_attempt_limit,
+        queryTopologyAttemptLimit(.{}),
+    );
+}
+
 fn freeObservedDynamicFieldCapabilitySets(
     alloc: std.mem.Allocator,
     sets: []ObservedDynamicFieldCapabilitySet,
@@ -4126,7 +4155,7 @@ pub const HostedProvisionedTableReadSource = struct {
         // A graph retry re-runs its base scan and every shard fanout. Keep the
         // public retry budget to one fresh topology snapshot so churn cannot
         // amplify an expensive query up to the generic point-read limit.
-        const attempt_limit: usize = if (req.graph_queries.len > 0) 2 else ProvisionedTableReadSource.topology_read_attempt_limit;
+        const attempt_limit = queryTopologyAttemptLimit(req);
         var attempt: usize = 0;
         while (attempt < attempt_limit) : (attempt += 1) {
             checkQueryDeadline(req) catch |err| return err;

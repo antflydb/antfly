@@ -583,6 +583,36 @@ func TestQueryPreservesHierarchyCursorRestartGuidance(t *testing.T) {
 	}
 }
 
+func TestQueryPreservesTopologyRetryGuidance(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"status":409,"error":"topology_changed","message":"the table topology changed while the query was running","action":"retry_query","retryable":true}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.Query(context.Background(), QueryRequest{Table: "files", Limit: 10})
+	if err == nil {
+		t.Fatal("Query error = nil, want TopologyChangedError")
+	}
+	var topology *TopologyChangedError
+	if !errors.As(err, &topology) {
+		t.Fatalf("error = %T %[1]v, want TopologyChangedError", err)
+	}
+	if topology.StatusCode != http.StatusConflict ||
+		topology.Code != "topology_changed" ||
+		topology.Action != "retry_query" ||
+		!topology.Retryable {
+		t.Fatalf("topology error = %#v, want retry-query guidance", topology)
+	}
+}
+
 func TestQueryPreservesTemporaryAvailabilityRetryGuidance(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)

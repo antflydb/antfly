@@ -2827,7 +2827,7 @@ export interface components {
              */
             status: 409;
             /**
-             * @description Stable machine-readable error code.
+             * @description Stable machine-readable error code. (enum property replaced by openapi-typescript)
              * @enum {string}
              */
             error: "hierarchy_cursor_stale";
@@ -2849,6 +2849,32 @@ export interface components {
              */
             retryable: false;
         };
+        /** @description The table topology changed while a query was running after Antfly's bounded internal retry. */
+        TopologyChangedError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 409;
+            /**
+             * @description Stable machine-readable error code. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            error: "topology_changed";
+            /** @description Human-readable explanation of why the query must be retried. */
+            message: string;
+            /**
+             * @description Stable client action for recovering from the conflict.
+             * @enum {string}
+             */
+            action: "retry_query";
+            /**
+             * @description Retrying the complete query against fresh topology may succeed.
+             * @enum {boolean}
+             */
+            retryable: true;
+        };
+        QueryConflictError: components["schemas"]["HierarchyCursorStaleError"] | components["schemas"]["TopologyChangedError"];
         ExactSortError: {
             /**
              * @description Stable error class. (enum property replaced by openapi-typescript)
@@ -14516,13 +14542,22 @@ export interface components {
                 "application/json": components["schemas"]["QueryUnprocessableError"];
             };
         };
-        /** @description The hierarchy changed after the traversal cursor was issued */
+        /** @description Deprecated response component retained for generated-client source compatibility; query endpoints now use QueryConflict */
         HierarchyCursorStale: {
             headers: {
                 [name: string]: unknown;
             };
             content: {
                 "application/json": components["schemas"]["HierarchyCursorStaleError"];
+            };
+        };
+        /** @description The query's pinned hierarchy or table topology changed while it was running */
+        QueryConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["QueryConflictError"];
             };
         };
         /** @description A query dependency or read path is temporarily unavailable and the request is safe to retry */
@@ -15540,7 +15575,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            409: components["responses"]["HierarchyCursorStale"];
+            409: components["responses"]["QueryConflict"];
             422: components["responses"]["QueryUnprocessable"];
             500: components["responses"]["QueryInternalServerError"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
@@ -15818,7 +15853,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
-            409: components["responses"]["HierarchyCursorStale"];
+            409: components["responses"]["QueryConflict"];
             422: components["responses"]["QueryUnprocessable"];
             500: components["responses"]["QueryInternalServerError"];
             503: components["responses"]["QueryTemporarilyUnavailable"];

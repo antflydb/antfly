@@ -2230,6 +2230,58 @@ pub const QueryCandidateBudgetExceededError = struct {
     status: i32,
 };
 
+pub const QueryConflictError = union(enum) {
+    hierarchy_cursor_stale_error: HierarchyCursorStaleError,
+    topology_changed_error: TopologyChangedError,
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const Probe = struct { @"error": ?[]const u8 = null };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        const disc_str = probe.@"error" orelse {
+            return error.MissingField;
+        };
+        if (std.mem.eql(u8, disc_str, "hierarchy_cursor_stale")) {
+            return .{ .hierarchy_cursor_stale_error = try std.json.parseFromSliceLeaky(HierarchyCursorStaleError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "topology_changed")) {
+            return .{ .topology_changed_error = try std.json.parseFromSliceLeaky(TopologyChangedError, allocator, input, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("error") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "hierarchy_cursor_stale")) {
+            return .{ .hierarchy_cursor_stale_error = try std.json.parseFromValueLeaky(HierarchyCursorStaleError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "topology_changed")) {
+            return .{ .topology_changed_error = try std.json.parseFromValueLeaky(TopologyChangedError, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .hierarchy_cursor_stale_error => |v| try jw.write(v),
+            .topology_changed_error => |v| try jw.write(v),
+        }
+    }
+};
+
 /// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
@@ -3642,6 +3694,19 @@ pub const TableStorageUnreadableError = struct {
     /// Human-readable summary.
     message: []const u8,
     /// Always false; recovery requires repair, restore, or table replacement.
+    retryable: bool,
+};
+
+/// The table topology changed while a query was running after Antfly's bounded internal retry.
+pub const TopologyChangedError = struct {
+    status: i32,
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable explanation of why the query must be retried.
+    message: []const u8,
+    /// Stable client action for recovering from the conflict.
+    action: []const u8,
+    /// Retrying the complete query against fresh topology may succeed.
     retryable: bool,
 };
 

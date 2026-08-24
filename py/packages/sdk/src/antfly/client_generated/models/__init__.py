@@ -855,6 +855,10 @@ from .text_content_part_type import TextContentPartType
 from .tool_call import ToolCall
 from .tool_call_function import ToolCallFunction
 from .tool_call_type import ToolCallType
+from .topology_changed_error import TopologyChangedError
+from .topology_changed_error_action import TopologyChangedErrorAction
+from .topology_changed_error_error import TopologyChangedErrorError
+from .topology_changed_error_status import TopologyChangedErrorStatus
 from .transaction_begin_request import TransactionBeginRequest
 from .transaction_begin_response import TransactionBeginResponse
 from .transaction_commit_request import TransactionCommitRequest
@@ -1758,6 +1762,10 @@ __all__ = (
     "ToolCall",
     "ToolCallFunction",
     "ToolCallType",
+    "TopologyChangedError",
+    "TopologyChangedErrorAction",
+    "TopologyChangedErrorError",
+    "TopologyChangedErrorStatus",
     "TransactionBeginRequest",
     "TransactionBeginResponse",
     "TransactionCommitRequest",

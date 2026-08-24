@@ -202,6 +202,24 @@ func (e *HierarchyCursorStaleError) Error() string {
 	return e.Code
 }
 
+// TopologyChangedError reports that Antfly exhausted its bounded internal
+// topology retry. Retrying the complete query against fresh topology may
+// succeed; callers must not retry only a graph sub-operation.
+type TopologyChangedError struct {
+	StatusCode int
+	Code       string
+	Message    string
+	Action     string
+	Retryable  bool
+}
+
+func (e *TopologyChangedError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return e.Code
+}
+
 // QueryTemporarilyUnavailableError reports a retryable query dependency or
 // read-availability failure. RetryAfterSeconds is zero when the server did not
 // provide a valid positive Retry-After value.
@@ -363,6 +381,19 @@ func readErrorResponse(resp *http.Response) error {
 				Action:         errResp.Action,
 				RestartWithout: errResp.RestartWithout,
 				Retryable:      false,
+			}
+		}
+		if resp.StatusCode == http.StatusConflict &&
+			errResp.Status == http.StatusConflict &&
+			errResp.Error == "topology_changed" &&
+			errResp.Action == "retry_query" &&
+			errResp.Retryable != nil && *errResp.Retryable {
+			return &TopologyChangedError{
+				StatusCode: resp.StatusCode,
+				Code:       errResp.Error,
+				Message:    errResp.Message,
+				Action:     errResp.Action,
+				Retryable:  true,
 			}
 		}
 		if resp.StatusCode == http.StatusServiceUnavailable &&

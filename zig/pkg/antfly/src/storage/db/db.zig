@@ -42199,35 +42199,6 @@ fn collectEmbeddingArtifactKeysInRangeAlloc(
     return try keys.toOwnedSlice(alloc);
 }
 
-fn collectGraphArtifactKeysInRangeAlloc(
-    alloc: Allocator,
-    store: *docstore_mod.DocStore,
-    lower: []const u8,
-    upper: []const u8,
-) ![][]const u8 {
-    const store_lower = try documentRangeLowerAlloc(alloc, lower);
-    defer alloc.free(store_lower);
-    const store_upper = if (upper.len > 0) try documentRangeUpperAlloc(alloc, upper) else null;
-    defer if (store_upper) |buf| alloc.free(buf);
-
-    const scanned = try store.scanRange(alloc, store_lower, if (store_upper) |buf| buf else "");
-    defer docstore_mod.DocStore.freeResults(alloc, scanned);
-
-    var keys = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (keys.items) |key| alloc.free(@constCast(key));
-        keys.deinit(alloc);
-    }
-
-    for (scanned) |entry| {
-        if (!internal_keys.isGraphEdgeArtifactKey(entry.key)) continue;
-        const owned = try alloc.dupe(u8, entry.key);
-        try keys.append(alloc, owned);
-    }
-
-    return try keys.toOwnedSlice(alloc);
-}
-
 fn freeOwnedConstStringSlice(alloc: Allocator, keys: []const []const u8) void {
     for (keys) |key| alloc.free(@constCast(key));
     if (keys.len > 0) alloc.free(keys);
@@ -42390,11 +42361,15 @@ fn applySplitGraphArtifactsForIndexStreaming(
     dest_store: *docstore_mod.DocStore,
     dest_indexes: *index_manager_mod.IndexManager,
     index_name: []const u8,
+    lower: []const u8,
+    upper: []const u8,
     batch_size: usize,
 ) !usize {
     _ = dest_indexes.graphIndex(index_name) orelse return error.IndexNotFound;
-    const store_lower = try documentRangeLowerAlloc(alloc, "");
+    const store_lower = try documentRangeLowerAlloc(alloc, lower);
     defer alloc.free(store_lower);
+    const store_upper = if (upper.len > 0) try documentRangeUpperAlloc(alloc, upper) else null;
+    defer if (store_upper) |buf| alloc.free(buf);
     const effective_batch_size = @max(batch_size, 1);
 
     const ScanState = struct {
@@ -42450,7 +42425,13 @@ fn applySplitGraphArtifactsForIndexStreaming(
     };
     defer state.deinit();
 
-    try dest_store.scanWithContext(store_lower, "", .{}, &state, ScanState.scanEntry);
+    try dest_store.scanWithContext(
+        store_lower,
+        if (store_upper) |buf| buf else "",
+        .{},
+        &state,
+        ScanState.scanEntry,
+    );
     try state.flush();
     return state.mutation_count;
 }
@@ -42572,9 +42553,20 @@ fn applySplitGraphArtifactsInRange(
     dest_store: *docstore_mod.DocStore,
     dest_indexes: *index_manager_mod.IndexManager,
 ) !void {
-    const artifact_keys = try collectGraphArtifactKeysInRangeAlloc(alloc, dest_store, lower, upper);
-    defer freeOwnedConstStringSlice(alloc, artifact_keys);
-    try applySplitGraphArtifacts(dest_store, dest_indexes, artifact_keys);
+    // Restore and split repair must stay bounded by the configured batch even
+    // when a table contains millions of durable graph artifacts. Scan once per
+    // graph index so mutation collection cannot scale with total graph size.
+    for (dest_indexes.graph_indexes.items) |entry| {
+        _ = try applySplitGraphArtifactsForIndexStreaming(
+            alloc,
+            dest_store,
+            dest_indexes,
+            entry.config.name,
+            lower,
+            upper,
+            graph_repair_rebuild_batch_size,
+        );
+    }
 }
 
 fn indexExistingSplitDestinationDirect(
@@ -58523,6 +58515,12 @@ test "db index repair streams graph artifact rebuild in batches" {
         try writes.append(alloc, .{ .key = key, .value = value });
     }
     try db.core.store.putBatch(writes.items, &.{});
+
+    // The restore/split entry point uses the same bounded streaming path as
+    // online repair; it must not materialize the complete artifact keyspace.
+    test_graph_repair_stream_flushes.store(0, .monotonic);
+    try db.rebuildGraphIndexesForTargetCoverage(alloc);
+    try std.testing.expectEqual(@as(u64, 2), test_graph_repair_stream_flushes.load(.monotonic));
 
     test_graph_repair_stream_flushes.store(0, .monotonic);
     var repair = try db.repairArtifactIssuesWithRequest(alloc, .{
