@@ -518,6 +518,63 @@ func TestCommittedTransferBindsSuccessorProcessAtCommittedBoundary(t *testing.T)
 	}
 }
 
+func TestCommittedTransferAlreadyAuthoritativeSuccessorAdoptsBoundary(t *testing.T) {
+	leaseTime := time.Date(2026, 8, 24, 17, 2, 17, 0, time.UTC)
+	parent := haClusterWithAutomaticKubernetesLeaseFailover()
+	parent.Spec.HighAvailability.Identity.ShardID = 10
+	parent.Spec.HighAvailability.Identity.TableID = 20
+	parent.Status.HAStatus = &antflyv1.HAStatus{PrimaryLSN: 868}
+	lease := haFenceLease(parent, leaseTime, haFencingLeaseDefaultDurationSeconds, 2, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+	lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+	lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(parent.UID)
+	lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
+
+	successor := parent.DeepCopy()
+	successor.Name = "antfly-standby-a"
+	successor.UID = "cluster-standby-a-uid"
+	successor.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	successor.Spec.HighAvailability.Identity.TimelineID++
+	successor.Spec.HighAvailability.Identity.Epoch++
+	successor.Spec.HighAvailability.Runtime.NodeID = "standby-a"
+	successor.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryAdminReachable: true,
+		PrimaryLSN:            867,
+		PrimaryWatchdogProof: &antflyv1.HAWatchdogProofStatus{
+			Active:                   true,
+			AuthorityGranted:         true,
+			AuthorityRemainingMS:     9_000,
+			LocalNodeID:              "standby-a",
+			ObservedHolderNodeID:     "standby-a",
+			ObservedLeaseTransitions: 2,
+			ProcessBootID:            strings.Repeat("c", 64),
+		},
+	}
+	reconciler := testHAReconciler(t, lease)
+	reconciler.Now = func() time.Time { return leaseTime.Add(time.Second) }
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
+		t.Fatalf("adopt committed boundary during first authoritative successor renewal: %v", err)
+	}
+	observed := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationTimelineID] != "5" ||
+		observed.Annotations[haFencingLeaseAnnotationEpoch] != "7" ||
+		observed.Annotations[haFencingLeaseAnnotationCurrentPrimaryID] != "standby-a" ||
+		observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "868" {
+		t.Fatalf("authoritative successor regressed the committed parent boundary: %#v", observed.Annotations)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "" ||
+		observed.Annotations[haFencingLeaseAnnotationFormerHolder] != "" ||
+		observed.Annotations[haFencingLeaseAnnotationTransferOriginUID] != "" ||
+		observed.Annotations[haFencingLeaseAnnotationCommittedTransition] != "" {
+		t.Fatalf("atomic successor adoption did not close the transfer receipt: %#v", observed.Annotations)
+	}
+}
+
 func TestCommittedTransferRejectsNonExactSuccessorScope(t *testing.T) {
 	tests := []struct {
 		name   string

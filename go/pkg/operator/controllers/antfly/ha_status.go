@@ -394,6 +394,14 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 			return nil
 		}
 	}
+	// Capture an exact parent->child handoff before the ordinary owner-renewal
+	// branch can atomically close its transfer receipt. A successor runtime may
+	// already report full watchdog authority on its first controller observation,
+	// skipping the pending-authority branch below; its standby-era status LSN is
+	// still not allowed to replace the committed promotion boundary.
+	committedSuccessorBoundary, committedSuccessor := haCommittedTransferSuccessorBoundary(
+		cluster, lease, scope, currentHolder, transitions,
+	)
 
 	// Pending authority is an explicit, terminal branch before holder changes
 	// or ordinary owner renewal. It can advance only the exact configured
@@ -403,7 +411,6 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		identity := haReplicationIdentity(ha)
 		proof := cluster.Status.HAStatus.PrimaryWatchdogProof
 		currentReceipt := haFencingLeaseBootstrapReceipt(currentHolder, transitions, proof.ProcessBootID)
-		committedBoundary, committedSuccessor := haCommittedTransferSuccessorBoundary(cluster, lease, scope, currentHolder, transitions)
 		if identity == nil || holder != currentHolder || currentHolder != localNodeID ||
 			currentHolder != strings.TrimSpace(identity.CurrentPrimaryID) ||
 			lease.Spec.RenewTime == nil || (!haLeaseFenceScopeMatches(lease, scope) && !committedSuccessor) ||
@@ -433,7 +440,7 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 			// Lease scope and bind the already fail-closed successor process in one
 			// write; publishing either half alone would let the runtime and Lease
 			// controller wait indefinitely for each other.
-			scope.primaryLSN = committedBoundary
+			scope.primaryLSN = committedSuccessorBoundary
 			for key, value := range scope.annotations() {
 				lease.Annotations[key] = value
 			}
@@ -535,6 +542,9 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	// ordinary renewal may advance that lower bound but must never regress it.
 	// Successor bootstrap still performs its exact boundary comparison above;
 	// this normalization is deliberately limited to the final renewal write.
+	if committedSuccessor && committedSuccessorBoundary > scope.primaryLSN {
+		scope.primaryLSN = committedSuccessorBoundary
+	}
 	scope = haFencingLeaseScopeWithMonotonicBoundary(lease, scope)
 	if !preserveTransferredScope {
 		for key, value := range scope.annotations() {
