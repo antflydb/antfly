@@ -68,6 +68,7 @@ pub const ManagedRuntime = struct {
     future: ?std.Io.Future(void) = null,
     stop_requested: std.atomic.Value(bool) = .init(false),
     stop_wake: std.Io.Event = .unset,
+    run_finished: std.Io.Event = .unset,
     failure_mu: std.atomic.Mutex = .unlocked,
     run_failure: ?anyerror = null,
     work_lease_provider: ?build_mod.work_lease.Provider = null,
@@ -118,6 +119,7 @@ pub const ManagedRuntime = struct {
         if (self.cfg.role == .query_only or self.cfg.role == .api_only) return;
         self.stop_requested.store(false, .monotonic);
         self.stop_wake.reset();
+        self.run_finished.reset();
         lockAtomic(&self.failure_mu);
         self.run_failure = null;
         self.failure_mu.unlock();
@@ -132,11 +134,25 @@ pub const ManagedRuntime = struct {
         self.stop_requested.store(true, .monotonic);
         self.stop_wake.set(self.io);
         if (self.future) |*future| {
-            // Wake an idle runtime immediately instead of consuming the rest
-            // of the shutdown budget in the configured tick interval. The
-            // shared process watchdog remains responsible for in-flight work.
-            _ = deadline.remainingMilliseconds();
-            _ = future.await(self.io);
+            var canceled = false;
+            const remaining_ms = deadline.remainingMilliseconds();
+            if (remaining_ms != 0) {
+                self.run_finished.waitTimeout(self.io, .{ .duration = .{
+                    .raw = .fromMilliseconds(@intCast(remaining_ms)),
+                    .clock = .awake,
+                } }) catch |err| switch (err) {
+                    error.Timeout, error.Canceled => {
+                        future.cancel(self.io);
+                        canceled = true;
+                    },
+                };
+            } else {
+                future.cancel(self.io);
+                canceled = true;
+            }
+            // Await reclaims a naturally completed future; cancel already
+            // joins a task that exceeded the caller's shared deadline.
+            if (!canceled) _ = future.await(self.io);
             self.future = null;
         }
     }
@@ -266,6 +282,10 @@ pub const ManagedRuntime = struct {
                                 stats.compact_head_conflicts += 1;
                                 continue;
                             },
+                            error.WorkLeaseLost => {
+                                stats.work_lease_conflicts += 1;
+                                continue;
+                            },
                             error.FileNotFound => continue,
                             else => return err,
                         };
@@ -349,6 +369,7 @@ pub const ManagedRuntime = struct {
     }
 
     fn runLoop(self: *ManagedRuntime) void {
+        defer self.run_finished.set(self.io);
         while (!self.stop_requested.load(.monotonic)) {
             _ = self.runOnce() catch |err| {
                 lockAtomic(&self.failure_mu);

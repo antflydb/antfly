@@ -156,6 +156,13 @@ pub const BackgroundPublisher = struct {
                     stats.head_conflicts += 1;
                     continue;
                 },
+                error.WorkLeaseLost => {
+                    // Takeover after acquisition is expected contention. The
+                    // stale worker is fenced at publication and the publisher
+                    // must remain available for later namespaces and ticks.
+                    stats.lease_conflicts += 1;
+                    continue;
+                },
                 error.FileNotFound => {
                     stats.idle_namespaces += 1;
                     continue;

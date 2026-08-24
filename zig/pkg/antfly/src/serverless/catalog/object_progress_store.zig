@@ -208,11 +208,13 @@ pub const ObjectProgressStore = struct {
         else
             head_coordination.Record{};
         proposed.head_version = version;
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, proposed, .{});
+        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{version});
         defer self.alloc.free(payload);
+        const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
+        defer self.alloc.free(content_type);
 
         var result = self.client.putObject(self.bucket, key, payload, .{
-            .content_type = "application/json",
+            .content_type = content_type,
             .if_none_match = current == null,
             .if_match_etag = if (current) |entry| entry.etag else null,
         }) catch |err| switch (err) {
@@ -386,25 +388,34 @@ pub const ObjectProgressStore = struct {
         var record: head_coordination.Record = undefined;
         var owned_owner_id: ?[]u8 = null;
         if (trimmed.len != 0 and trimmed[0] == '{') {
+            // Transitional compatibility with the short-lived JSON-body
+            // format. The next successful write migrates it back to decimal.
             var parsed = try std.json.parseFromSlice(head_coordination.Record, self.alloc, trimmed, .{
                 .ignore_unknown_fields = false,
             });
             defer parsed.deinit();
-            if (parsed.value.format_version != head_coordination.format_version)
+            if (!head_coordination.valid(parsed.value))
                 return error.InvalidHeadCoordinationRecord;
             if (parsed.value.owner_id) |owner_id| {
-                if (owner_id.len == 0 or parsed.value.fencing_token == 0)
-                    return error.InvalidHeadCoordinationRecord;
                 owned_owner_id = try self.alloc.dupe(u8, owner_id);
-            } else if (parsed.value.fencing_token != 0 or !parsed.value.released) {
-                return error.InvalidHeadCoordinationRecord;
             }
             record = parsed.value;
             record.owner_id = owned_owner_id;
         } else {
-            record = head_coordination.Record.fromLegacyHead(
-                try std.fmt.parseInt(u64, trimmed, 10),
-            );
+            const body_head = try std.fmt.parseInt(u64, trimmed, 10);
+            if (try head_coordination.parseContentTypeAlloc(self.alloc, result.metadata.content_type)) |parsed_value| {
+                var parsed = parsed_value;
+                defer parsed.deinit();
+                if (!head_coordination.valid(parsed.value) or parsed.value.head_version != body_head)
+                    return error.InvalidHeadCoordinationRecord;
+                if (parsed.value.owner_id) |owner_id| {
+                    owned_owner_id = try self.alloc.dupe(u8, owner_id);
+                }
+                record = parsed.value;
+                record.owner_id = owned_owner_id;
+            } else {
+                record = head_coordination.Record.fromLegacyHead(body_head);
+            }
         }
         errdefer if (owned_owner_id) |owner_id| self.alloc.free(owner_id);
         return .{

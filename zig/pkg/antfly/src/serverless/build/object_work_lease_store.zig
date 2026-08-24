@@ -104,11 +104,13 @@ pub const ObjectWorkLeaseStore = struct {
             .expires_at_unix_ns = expires_at,
             .released = false,
         };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, proposed, .{});
+        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{proposed.head_version});
         defer self.alloc.free(payload);
+        const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
+        defer self.alloc.free(content_type);
 
         var result = self.client.putObject(self.bucket, key, payload, .{
-            .content_type = "application/json",
+            .content_type = content_type,
             .if_none_match = current == null,
             .if_match_etag = if (current) |value| value.etag else null,
         }) catch |err| switch (err) {
@@ -183,10 +185,12 @@ pub const ObjectWorkLeaseStore = struct {
             .expires_at_unix_ns = expires_at,
             .released = false,
         };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, proposed, .{});
+        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{proposed.head_version});
         defer self.alloc.free(payload);
+        const content_type = try head_coordination.contentTypeAlloc(self.alloc, proposed);
+        defer self.alloc.free(content_type);
         var result = self.client.putObject(self.bucket, key, payload, .{
-            .content_type = "application/json",
+            .content_type = content_type,
             .if_match_etag = current.etag,
         }) catch |err| switch (err) {
             error.PreconditionFailed => return error.WorkLeaseLost,
@@ -223,10 +227,12 @@ pub const ObjectWorkLeaseStore = struct {
             .expires_at_unix_ns = 0,
             .released = true,
         };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, released_record, .{});
+        const payload = try std.fmt.allocPrint(self.alloc, "{d}", .{released_record.head_version});
         defer self.alloc.free(payload);
+        const content_type = try head_coordination.contentTypeAlloc(self.alloc, released_record);
+        defer self.alloc.free(content_type);
         var result = self.client.putObject(self.bucket, key, payload, .{
-            .content_type = "application/json",
+            .content_type = content_type,
             .if_match_etag = current.etag,
         }) catch |err| switch (err) {
             error.PreconditionFailed => return false,
@@ -250,24 +256,32 @@ pub const ObjectWorkLeaseStore = struct {
         var record: head_coordination.Record = undefined;
         var owner_id: ?[]u8 = null;
         if (trimmed.len != 0 and trimmed[0] == '{') {
+            // Read the transitional JSON-body format so it can be migrated by
+            // the next conditional write.
             var parsed = try std.json.parseFromSlice(head_coordination.Record, self.alloc, trimmed, .{
                 .ignore_unknown_fields = false,
             });
             defer parsed.deinit();
-            if (parsed.value.format_version != head_coordination.format_version)
+            if (!head_coordination.valid(parsed.value))
                 return error.InvalidWorkLeaseRecord;
             if (parsed.value.owner_id) |borrowed_owner_id| {
-                if (borrowed_owner_id.len == 0 or parsed.value.fencing_token == 0)
-                    return error.InvalidWorkLeaseRecord;
                 owner_id = try self.alloc.dupe(u8, borrowed_owner_id);
-            } else if (parsed.value.fencing_token != 0 or !parsed.value.released) {
-                return error.InvalidWorkLeaseRecord;
             }
             record = parsed.value;
         } else {
-            record = head_coordination.Record.fromLegacyHead(
-                try std.fmt.parseInt(u64, trimmed, 10),
-            );
+            const body_head = try std.fmt.parseInt(u64, trimmed, 10);
+            if (try head_coordination.parseContentTypeAlloc(self.alloc, result.metadata.content_type)) |parsed_value| {
+                var parsed = parsed_value;
+                defer parsed.deinit();
+                if (!head_coordination.valid(parsed.value) or parsed.value.head_version != body_head)
+                    return error.InvalidWorkLeaseRecord;
+                if (parsed.value.owner_id) |borrowed_owner_id| {
+                    owner_id = try self.alloc.dupe(u8, borrowed_owner_id);
+                }
+                record = parsed.value;
+            } else {
+                record = head_coordination.Record.fromLegacyHead(body_head);
+            }
         }
         errdefer if (owner_id) |owned| self.alloc.free(owned);
         const owned_etag = try self.alloc.dupe(u8, etag);
@@ -375,6 +389,11 @@ test "serverless object work lease fences stale owners and reconciles ambiguous 
     const first = (try provider.acquire("docs", "worker-a", 100, 10)).?;
     try std.testing.expectEqual(@as(u64, 1), first.fencing_token);
     try std.testing.expect(!(first.took_over));
+    var legacy_client = memory.client();
+    var legacy_head = try legacy_client.getObject("leases", "tenant/docs/HEAD", .{});
+    defer legacy_head.deinit(alloc);
+    try std.testing.expectEqualStrings("0", legacy_head.body);
+    try std.testing.expectEqual(@as(u64, 0), try std.fmt.parseInt(u64, legacy_head.body, 10));
     try std.testing.expect((try provider.acquire("docs", "worker-b", 109, 10)) == null);
     try std.testing.expectError(
         error.WorkLeaseLost,
@@ -434,4 +453,9 @@ test "serverless head publication atomically rejects a stale fencing token" {
         .fencing_token = replacement.fencing_token,
     }));
     try std.testing.expectEqual(@as(u64, 1), try progress.getHead("docs"));
+    var legacy_client = memory.client();
+    var legacy_head = try legacy_client.getObject("coordination", "tenant/docs/HEAD", .{});
+    defer legacy_head.deinit(alloc);
+    try std.testing.expectEqualStrings("1", legacy_head.body);
+    try std.testing.expectEqual(@as(u64, 1), try std.fmt.parseInt(u64, legacy_head.body, 10));
 }
