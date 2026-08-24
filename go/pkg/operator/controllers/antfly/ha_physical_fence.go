@@ -472,7 +472,18 @@ func validateCurrentPhysicalIsolationLease(lease *coordinationv1.Lease, action *
 	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != strings.TrimSpace(action.RouteTo) {
 		return fmt.Errorf("isolate former primary: fencing Lease holder does not match promotion candidate %q", action.RouteTo)
 	}
-	if !haLeaseFenceScopeMatches(lease, scope) {
+	scopeMatches := haLeaseFenceScopeMatches(lease, scope)
+	if !scopeMatches && haPhysicalIsolationSucceededStructurallyWithEvidence(*action) {
+		// Once isolation freezes the old writer, the former holder advances the
+		// same Lease incarnation from the election lower bound to the proven tail.
+		// Revalidation must accept that one-way strengthening or it would revoke
+		// the receipt immediately before promotion. No other field or boundary is
+		// allowed to drift.
+		frozenScope := scope
+		frozenScope.primaryLSN = action.PhysicalIsolationReceipt.FrozenBoundaryLSN
+		scopeMatches = haLeaseFenceScopeMatches(lease, frozenScope)
+	}
+	if !scopeMatches {
 		return fmt.Errorf("isolate former primary: fencing Lease scope does not match the planned topology")
 	}
 	expectedTopologyID := ""

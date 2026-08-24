@@ -5427,6 +5427,18 @@ func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, clus
 			}
 			continue
 		}
+		if haActionKind(action.Kind) == haActionPromoteStandby &&
+			action.FenceAuthority == antflyv1.HAFencingAuthorityKubernetesLease &&
+			haRuntimeLeaseWatchdogEnabled(cluster) {
+			ready, err := r.haCurrentLeaseAuthorizesPromotionBoundary(ctx, cluster, *action)
+			if err != nil {
+				return err
+			}
+			if !ready {
+				action.AdminJobPhase = haAdminJobPhaseWaitingDependency
+				continue
+			}
+		}
 		now := r.haNow()
 		if action.Executor != string(haActionExecutorCLIJob) && haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
 			reserved, checkpointed, err := r.reserveHADirectAdminAttempt(ctx, cluster, ha.Admin, action, now)
@@ -10658,6 +10670,49 @@ func (r *AntflyClusterReconciler) haCurrentLeaseAuthorizesRoute(ctx context.Cont
 	}
 	ready, _ := haLeaseFenceReady(lease, generation, r.haNow())
 	return ready, nil
+}
+
+func (r *AntflyClusterReconciler) haCurrentLeaseAuthorizesPromotionBoundary(
+	ctx context.Context,
+	cluster *antflyv1.AntflyCluster,
+	action antflyv1.HAPlannedActionStatus,
+) (bool, error) {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || action.TargetLSN == 0 ||
+		strings.TrimSpace(action.FenceHolder) == "" || action.FenceGeneration == 0 {
+		return false, nil
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" {
+		return false, nil
+	}
+	lease := &coordinationv1.Lease{}
+	if err := r.haBoundaryReader().Get(ctx, types.NamespacedName{
+		Name: haFencingLeaseName(cluster), Namespace: cluster.Namespace,
+	}, lease); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != strings.TrimSpace(action.FenceHolder) ||
+		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions <= 0 ||
+		uint64(*lease.Spec.LeaseTransitions) != action.FenceGeneration ||
+		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) ||
+		lease.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" ||
+		lease.Annotations[haFencingLeaseAnnotationFormerHolder] != strings.TrimSpace(identity.CurrentPrimaryID) ||
+		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] != string(cluster.UID) ||
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] != strconv.FormatUint(action.FenceGeneration, 10) {
+		return false, nil
+	}
+	ready, _ := haLeaseFenceReady(lease, action.FenceGeneration, r.haNow())
+	if !ready {
+		return false, nil
+	}
+	// Exact equality is intentional. A higher boundary is not automatically
+	// safe: the promotion receipt proves the candidate applied TargetLSN, not an
+	// unrelated later value. Identity and the frozen tail advance together.
+	scope := haFencingLeaseScopeForIdentity(identity, action.TargetLSN)
+	return haLeaseFenceScopeMatches(lease, scope), nil
 }
 
 func (r *AntflyClusterReconciler) haPromotedRuntimeWatchdogReady(ctx context.Context, cluster *antflyv1.AntflyCluster, nodeID string, fenceGeneration uint64) (bool, error) {

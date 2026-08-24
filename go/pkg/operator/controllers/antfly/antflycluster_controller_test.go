@@ -22,6 +22,7 @@ import (
 	"github.com/onsi/gomega/gstruct"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -4334,11 +4335,13 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 	s := runtime.NewScheme()
 	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
 	g.Expect(batchv1.AddToScheme(s)).To(Succeed())
+	g.Expect(coordinationv1.AddToScheme(s)).To(Succeed())
 
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-cluster",
 			Namespace: "default",
+			UID:       types.UID("cluster-uid"),
 		},
 		Spec: antflyv1.AntflyClusterSpec{
 			HighAvailability: &antflyv1.HighAvailabilitySpec{
@@ -4355,10 +4358,23 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 					Epoch:            6,
 					CurrentPrimaryID: "primary-a",
 				},
+				AutomaticFailover: &antflyv1.HAAutomaticFailoverPolicy{
+					Enabled:          true,
+					FencingAuthority: antflyv1.HAFencingAuthorityKubernetesLease,
+				},
+				Runtime: &antflyv1.HARuntimeSpec{
+					Role:   antflyv1.HARuntimeRolePrimary,
+					NodeID: "primary-a",
+					FencingLease: &antflyv1.HARuntimeFencingLeaseSpec{
+						Name:       "topology-ha-fence",
+						TopologyID: "topology-anchor-uid",
+					},
+				},
 			},
 		},
 		Status: antflyv1.AntflyClusterStatus{
 			HAStatus: &antflyv1.HAStatus{
+				PrimaryLSN: 12,
 				PlannedActions: []antflyv1.HAPlannedActionStatus{{
 					Kind:            string(haActionAcquireFence),
 					StandbyName:     "standby-a",
@@ -4377,6 +4393,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 					StandbyName:     "standby-a",
 					TargetLSN:       12,
 					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
 					FenceGeneration: 3,
 					FenceReason:     "LeaseAcquired",
 					AdminCommand:    []string{"promote", "assess", "--current-fence"},
@@ -4388,6 +4405,7 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 					StandbyName:     "standby-a",
 					TargetLSN:       12,
 					FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+					FenceHolder:     "standby-a",
 					FenceGeneration: 3,
 					FenceReason:     "LeaseAcquired",
 					AdminCommand:    []string{"promote", "--current-fence"},
@@ -4398,10 +4416,15 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 		},
 	}
 	var observed []string
-	apiClient := newHAControllerTestClient(t, s, cluster)
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	lease := haFenceLease(cluster, now, 30, 3, "standby-a")
+	authorizeHandoffRenewalForTest(lease, cluster, "primary-a", 3)
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "11"
+	apiClient := newHAControllerTestClient(t, s, cluster, lease)
 	reconciler := &AntflyClusterReconciler{
 		Client: apiClient,
 		Scheme: s,
+		Now:    func() time.Time { return now },
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			observed = append(observed, req.Method+" "+req.URL.Path)
 			switch req.URL.Path {
@@ -4448,6 +4471,17 @@ func TestReconcileHAAdminJobsExecutesFenceAndPromoteViaAdminAPI(t *testing.T) {
 		})},
 	}
 
+	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
+	g.Expect(observed).To(Equal([]string{
+		"POST /admin/v1/ha/fence",
+		"POST /admin/v1/ha/promotion/assess",
+	}), "promotion must wait while the Lease carries only a weaker boundary")
+	g.Expect(cluster.Status.HAStatus.PlannedActions[2].AdminJobPhase).To(Equal(haAdminJobPhaseWaitingDependency))
+
+	currentLease := &coordinationv1.Lease{}
+	g.Expect(apiClient.Get(context.Background(), client.ObjectKeyFromObject(lease), currentLease)).To(Succeed())
+	currentLease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "12"
+	g.Expect(apiClient.Update(context.Background(), currentLease)).To(Succeed())
 	g.Expect(reconcileHAAdminJobsUntilIdle(context.Background(), reconciler, cluster)).To(Succeed())
 	g.Expect(observed).To(Equal([]string{
 		"POST /admin/v1/ha/fence",

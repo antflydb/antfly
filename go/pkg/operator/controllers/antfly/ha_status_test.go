@@ -6140,6 +6140,121 @@ func TestReconcileHAFencingLeaseKeepsCommittedLowerBoundWhileOldPrimaryTailMoves
 	}
 }
 
+func TestReconcileHAFencingLeaseAdvancesPhysicalIsolationBoundaryBeforePromotion(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	cluster, isolation := validPhysicalIsolationReceiptFixture(now)
+	cluster.Status.HAStatus.Fencing = readyFencingStatus()
+	cluster.Status.HAStatus.Fencing.Generation = 2
+	// The transfer linearized at 12, then physical isolation proved that the old
+	// writer's actual frozen tail was 13.
+	isolation.TargetLSN = 13
+	isolation.ObservedLSN = 13
+	isolation.PhysicalIsolationReceipt.FrozenBoundaryLSN = 13
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{isolation}
+
+	lease := haFenceLease(cluster, now.Add(-time.Second), 30, 2, "standby-a")
+	authorizeHandoffRenewalForTest(lease, cluster, "primary-a", 2)
+	if got := lease.Annotations[haFencingLeaseAnnotationPrimaryLSN]; got != "12" {
+		t.Fatalf("fixture must begin at election boundary 12, got %q", got)
+	}
+	reconciler := testHAReconciler(t, cluster, lease)
+	reconciler.Now = func() time.Time { return now }
+
+	lower, ok := haCommittedFencingLeaseLowerBoundScope(cluster, "standby-a", 2)
+	if !ok || lower.primaryLSN != 12 {
+		t.Fatalf("expected physical-isolation receipt to preserve election lower bound 12, got %#v, %t", lower, ok)
+	}
+	committed, ok := haCommittedFencingLeaseScope(cluster, "standby-a", 2)
+	if !ok || committed.primaryLSN != 13 {
+		t.Fatalf("expected physical-isolation receipt to commit frozen boundary 13, got %#v, %t", committed, ok)
+	}
+
+	if err := reconciler.reconcileHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("advance transferred Lease to frozen boundary: %v", err)
+	}
+	observed := &coordinationv1.Lease{}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatalf("get advanced Lease: %v", err)
+	}
+	if got := observed.Annotations[haFencingLeaseAnnotationPrimaryLSN]; got != "13" {
+		t.Fatalf("expected Lease boundary to advance to frozen tail 13, got %q", got)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" {
+		t.Fatal("former-holder renewal must preserve the committed transfer receipt")
+	}
+}
+
+func TestPromotionRequiresExactFreshFrozenLeaseBoundary(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	cluster, _ := validPhysicalIsolationReceiptFixture(now)
+	lease := haFenceLease(cluster, now, 30, 2, "standby-a")
+	authorizeHandoffRenewalForTest(lease, cluster, "primary-a", 2)
+	reconciler := testHAReconciler(t, lease)
+	reconciler.Now = func() time.Time { return now }
+	action := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionPromoteStandby),
+		StandbyName:     "standby-a",
+		TargetLSN:       13,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 2,
+	}
+
+	ready, err := reconciler.haCurrentLeaseAuthorizesPromotionBoundary(context.Background(), cluster, action)
+	if err != nil {
+		t.Fatalf("check stale promotion Lease: %v", err)
+	}
+	if ready {
+		t.Fatal("promotion was authorized by the weaker election boundary")
+	}
+
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "13"
+	if err := reconciler.Update(context.Background(), lease); err != nil {
+		t.Fatalf("publish frozen Lease boundary: %v", err)
+	}
+	ready, err = reconciler.haCurrentLeaseAuthorizesPromotionBoundary(context.Background(), cluster, action)
+	if err != nil {
+		t.Fatalf("check frozen promotion Lease: %v", err)
+	}
+	if !ready {
+		t.Fatal("exact fresh frozen Lease boundary did not authorize promotion")
+	}
+
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "14"
+	if err := reconciler.Update(context.Background(), lease); err != nil {
+		t.Fatalf("publish unproven Lease boundary: %v", err)
+	}
+	ready, err = reconciler.haCurrentLeaseAuthorizesPromotionBoundary(context.Background(), cluster, action)
+	if err != nil {
+		t.Fatalf("check unproven promotion Lease: %v", err)
+	}
+	if ready {
+		t.Fatal("promotion accepted a Lease boundary above its applied-LSN proof")
+	}
+}
+
+func TestCompletedPhysicalIsolationRevalidationAcceptsOnlyFrozenLeaseAdvance(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	cluster, action := validPhysicalIsolationReceiptFixture(now)
+	action.TargetLSN = 13
+	action.ObservedLSN = 13
+	action.PhysicalIsolationReceipt.FrozenBoundaryLSN = 13
+	originalScope, ok := haPhysicalIsolationReceiptScope(action.PhysicalIsolationReceipt)
+	if !ok || originalScope.primaryLSN != 12 {
+		t.Fatalf("expected election scope 12, got %#v, %t", originalScope, ok)
+	}
+	lease := haFenceLease(cluster, now, 30, 2, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "13"
+
+	if err := validateCurrentPhysicalIsolationLease(lease, &action, originalScope); err != nil {
+		t.Fatalf("frozen Lease advance invalidated completed isolation receipt: %v", err)
+	}
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "14"
+	if err := validateCurrentPhysicalIsolationLease(lease, &action, originalScope); err == nil {
+		t.Fatal("unproven Lease boundary was accepted during receipt revalidation")
+	}
+}
+
 func TestFullReconcileOwnsRuntimeObservationButNotLeaseRenewalClock(t *testing.T) {
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 

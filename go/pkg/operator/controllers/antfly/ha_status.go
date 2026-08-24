@@ -1037,7 +1037,7 @@ func haCommittedFencingLeaseScope(cluster *antflyv1.AntflyCluster, holder string
 		return haFencingLeaseScope{}, false
 	}
 	ha := cluster.Spec.HighAvailability
-	action := haCommittedFormerPrimaryFenceAction(ha, cluster.Status.HAStatus, holder, generation)
+	action := haCommittedFormerPrimaryBoundaryAction(ha, cluster.Status.HAStatus, holder, generation)
 	identity := haReplicationIdentity(ha)
 	if action == nil || identity == nil {
 		return haFencingLeaseScope{}, false
@@ -1054,12 +1054,31 @@ func haCommittedFencingLeaseLowerBoundScope(cluster *antflyv1.AntflyCluster, hol
 		return haFencingLeaseScope{}, false
 	}
 	ha := cluster.Spec.HighAvailability
-	action := haCommittedFormerPrimaryFenceAction(ha, cluster.Status.HAStatus, holder, generation)
+	action := haCommittedFormerPrimaryBoundaryAction(ha, cluster.Status.HAStatus, holder, generation)
 	identity := haReplicationIdentity(ha)
 	if action == nil || identity == nil || action.TargetLSN == 0 {
 		return haFencingLeaseScope{}, false
 	}
+	// Physical isolation is initiated against the election-time Lease scope,
+	// then freezes the old writer at its actual durable tail. Preserve that
+	// original scope as the temporary lower bound so observation does not revoke
+	// an in-flight handoff before the former holder can publish the stronger
+	// frozen boundary. Promotion is separately gated on the exact frozen scope.
+	if haActionKind(action.Kind) == haActionIsolateFormerPrimary {
+		if scope, ok := haPhysicalIsolationReceiptScope(action.PhysicalIsolationReceipt); ok {
+			return scope, true
+		}
+	}
 	return haFencingLeaseScopeForIdentity(identity, action.TargetLSN), true
+}
+
+func haCommittedFormerPrimaryBoundaryAction(ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus, holder string, generation uint64) *antflyv1.HAPlannedActionStatus {
+	// A physical-isolation receipt supersedes the election-time action because
+	// its target is the only boundary proven after the old process stopped.
+	if action := haCommittedFormerPrimaryIsolationAction(ha, status, holder, generation); action != nil {
+		return action
+	}
+	return haCommittedFormerPrimaryFenceAction(ha, status, holder, generation)
 }
 
 func haFencingLeaseScopeForIdentity(identity *antflyv1.HAReplicationIdentitySpec, boundary uint64) haFencingLeaseScope {
