@@ -3436,7 +3436,7 @@ pub fn build(b: *std.Build) void {
     antfly_imports.configure(b, api_cluster_secret_status_test_mod, true, true);
     const api_cluster_secret_status_tests = b.addTest(.{
         .root_module = api_cluster_secret_status_test_mod,
-        .filters = &.{"cluster status carries non-secret"},
+        .filters = &.{ "cluster status carries non-secret", "cluster topology owns snapshot data" },
     });
     const run_api_cluster_secret_status_tests = addFilteredTestRunArtifact(b, api_cluster_secret_status_tests);
     lib_common_secrets_test_step.dependOn(&run_api_cluster_secret_status_tests.step);
