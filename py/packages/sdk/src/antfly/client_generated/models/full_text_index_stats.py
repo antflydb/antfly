@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from ..models.full_text_index_stats_promotion import FullTextIndexStatsPromotion
     from ..models.full_text_index_stats_resolution import FullTextIndexStatsResolution
     from ..models.full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
+    from ..models.index_readiness_status import IndexReadinessStatus
     from ..models.index_repair_status import IndexRepairStatus
 
 
@@ -25,6 +26,7 @@ class FullTextIndexStats:
     """
     Attributes:
         index_type (FullTextIndexStatsIndexType): Discriminator for the index stats variant.
+        readiness (IndexReadinessStatus | Unset):
         error (str | Unset): Error message if stats could not be retrieved
         total_indexed (int | Unset): Number of documents in the index
         disk_usage (int | Unset): Size of the index in bytes
@@ -78,6 +80,7 @@ class FullTextIndexStats:
     """
 
     index_type: FullTextIndexStatsIndexType
+    readiness: IndexReadinessStatus | Unset = UNSET
     error: str | Unset = UNSET
     total_indexed: int | Unset = UNSET
     disk_usage: int | Unset = UNSET
@@ -126,6 +129,10 @@ class FullTextIndexStats:
 
     def to_dict(self) -> dict[str, Any]:
         index_type = self.index_type.value
+
+        readiness: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.readiness, Unset):
+            readiness = self.readiness.to_dict()
 
         error = self.error
 
@@ -232,6 +239,8 @@ class FullTextIndexStats:
                 "index_type": index_type,
             }
         )
+        if readiness is not UNSET:
+            field_dict["readiness"] = readiness
         if error is not UNSET:
             field_dict["error"] = error
         if total_indexed is not UNSET:
@@ -329,10 +338,18 @@ class FullTextIndexStats:
         from ..models.full_text_index_stats_promotion import FullTextIndexStatsPromotion
         from ..models.full_text_index_stats_resolution import FullTextIndexStatsResolution
         from ..models.full_text_index_stats_text_merge import FullTextIndexStatsTextMerge
+        from ..models.index_readiness_status import IndexReadinessStatus
         from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
         index_type = FullTextIndexStatsIndexType(d.pop("index_type"))
+
+        _readiness = d.pop("readiness", UNSET)
+        readiness: IndexReadinessStatus | Unset
+        if isinstance(_readiness, Unset):
+            readiness = UNSET
+        else:
+            readiness = IndexReadinessStatus.from_dict(_readiness)
 
         error = d.pop("error", UNSET)
 
@@ -449,6 +466,7 @@ class FullTextIndexStats:
 
         full_text_index_stats = cls(
             index_type=index_type,
+            readiness=readiness,
             error=error,
             total_indexed=total_indexed,
             disk_usage=disk_usage,

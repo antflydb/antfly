@@ -26,12 +26,9 @@ const default_wait_poll_ms: u64 = 1000;
 // progress reporting for minutes.
 const max_wait_request_timeout_ms: u64 = 30_000;
 const max_wait_retry_delay_ms: u64 = 5000;
-// Server status now fails closed while publication is non-authoritative. A
-// second live observation covers the remaining scheduler handoff where queued
-// derived work becomes active immediately after an otherwise-ready snapshot.
-// Keep its delay independent of the requested polling interval: fast local
-// polling must not weaken correctness, while the normal 1s interval should
-// not add a full second once readiness is first observed.
+// The explicit server readiness contract covers scheduler/publication
+// handoffs. Retain one confirmation for mixed-version deployments where an
+// older server can still return the legacy derived status shape.
 const ready_confirmation_observations: u8 = 2;
 const ready_confirmation_delay_ms: u64 = 100;
 const wait_progress_report_interval_ns: u64 = 10 * std.time.ns_per_s;
@@ -465,7 +462,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
         (if (@hasField(Stats, "dense_publish_pending")) stats.dense_publish_pending orelse false else false) or
         (if (@hasField(Stats, "replay_catch_up_required")) stats.replay_catch_up_required orelse false else false) or
         (if (@hasField(Stats, "catch_up_active")) stats.catch_up_active orelse false else false);
-    const state = if (error_text != null)
+    const legacy_state = if (error_text != null)
         "failed"
     else if (config_mismatch)
         "config_mismatch"
@@ -494,9 +491,17 @@ fn summarizeStats(stats: anytype) IndexSummary {
         stats.doc_count
     else
         indexed;
-    const ready = !readiness_pending and !coverage_incomplete and (std.mem.eql(u8, state, "ready") or
-        (reported_state == null and rebuilding == false and error_text == null and !config_mismatch));
-    const failed = error_text != null or std.mem.eql(u8, state, "failed") or std.mem.eql(u8, state, "degraded");
+    const readiness = if (@hasField(Stats, "readiness")) stats.readiness else null;
+    const state = if (readiness) |value| @tagName(value.state) else legacy_state;
+    const ready = if (readiness) |value|
+        value.state == .ready
+    else
+        !readiness_pending and !coverage_incomplete and (std.mem.eql(u8, state, "ready") or
+            (reported_state == null and rebuilding == false and error_text == null and !config_mismatch));
+    const failed = if (readiness) |value|
+        value.state == .failed
+    else
+        error_text != null or std.mem.eql(u8, state, "failed") or std.mem.eql(u8, state, "degraded");
     return .{
         .state = state,
         .progress = progress,
@@ -1010,6 +1015,57 @@ test "index wait requires complete compatible coverage" {
     try std.testing.expect(!summary.ready);
 }
 
+test "index wait prefers authoritative readiness contract" {
+    var summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = false,
+        .backfill_state = "ready",
+        .readiness = .{
+            .state = .pending,
+            .incarnation = "g-000000000000002a",
+            .target_revision = 11,
+            .published_revision = 10,
+            .pending_reasons = &.{"publication"},
+        },
+    });
+    try std.testing.expectEqualStrings("pending", summary.state);
+    try std.testing.expect(!summary.ready);
+    try std.testing.expect(!summary.failed);
+
+    summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = true,
+        .backfill_state = "running",
+        .dense_publish_pending = true,
+        .readiness = .{
+            .state = .ready,
+            .incarnation = "g-000000000000002a",
+            .target_revision = 11,
+            .published_revision = 11,
+            .pending_reasons = &.{},
+        },
+    });
+    try std.testing.expectEqualStrings("ready", summary.state);
+    try std.testing.expect(summary.ready);
+
+    summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = false,
+        .backfill_state = "degraded",
+        .readiness = .{
+            .state = .failed,
+            .incarnation = "g-000000000000002a",
+            .target_revision = 11,
+            .published_revision = 11,
+            .pending_reasons = &.{},
+        },
+    });
+    try std.testing.expectEqualStrings("failed", summary.state);
+    try std.testing.expect(!summary.ready);
+    try std.testing.expect(summary.failed);
+    try std.testing.expectEqual(WaitDisposition.failed, waitDisposition(summary));
+}
+
 test "index wait progress reporting is immediate periodic and state sensitive" {
     var reporter = WaitProgressReporter{};
     try std.testing.expect(reporter.shouldReport("running", 0));
@@ -1110,7 +1166,7 @@ test "index wait retries bounded HTTP and transport failures" {
         1,
     );
     try std.testing.expect(outcome == .ready);
-    try std.testing.expectEqual(@as(usize, 5), fake.calls);
+    try std.testing.expectEqual(@as(usize, 3 + ready_confirmation_observations), fake.calls);
     try std.testing.expect(fake.smallest_timeout_ms > 0);
 }
 
@@ -1123,7 +1179,9 @@ test "index wait rejects a transient ready snapshot" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const call = self.calls;
             self.calls += 1;
-            const running = call == 1;
+            // Exercise a regression at the last sample before the continuous
+            // readiness window would otherwise complete.
+            const running = call == ready_confirmation_observations - 1;
             return fakeExternalIndexStatusResponse(
                 self.allocator,
                 200,
@@ -1141,13 +1199,12 @@ test "index wait rejects a transient ready snapshot" {
         .system(),
         "docs",
         "external_idx",
-        1000,
+        2000,
         1,
     );
     try std.testing.expect(outcome == .ready);
-    // ready -> running must reset confirmation; only the final two ready
-    // observations may complete the wait.
-    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    // The late ready -> running edge must reset the full stability window.
+    try std.testing.expectEqual(@as(usize, ready_confirmation_observations * 2), fake.calls);
 }
 
 test "index wait deadline rejects a response that arrives late" {
