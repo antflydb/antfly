@@ -10,6 +10,7 @@ package sdk
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"unicode/utf8"
 
@@ -34,6 +35,8 @@ const (
 	maxGraphCountAggregates     = 64
 	maxGraphIdentifierRunes     = 128
 	maxGraphIdentifierBytes     = maxGraphIdentifierRunes * utf8.UTFMax
+	maxGraphEdgeTypes           = 64
+	maxGraphEdgeTypeBytes       = 64 * 1024
 )
 
 // NewGraphDocumentFilter adapts the non-scoring stored-document subset of the
@@ -284,7 +287,7 @@ func NewGraphTraverseQuery(query GraphTraverseQuery) (GraphQuery, error) {
 
 // NewGraphShortestPathQuery wraps a shortest-path query in the canonical GraphQuery union.
 func NewGraphShortestPathQuery(query GraphShortestPathQuery) (GraphQuery, error) {
-	if err := validateGraphPathQuery(query.Index, query.ShortestPath.From, query.ShortestPath.To, query.ShortestPath.MaxDepth, query.ShortestPath.IncludeDocuments, query.ShortestPath.Fields); err != nil {
+	if err := validateGraphPathQuery(query.Index, query.ShortestPath.From, query.ShortestPath.To, query.ShortestPath.EdgeTypes, query.ShortestPath.MaxDepth, query.ShortestPath.MinWeight, query.ShortestPath.MaxWeight, query.ShortestPath.IncludeDocuments, query.ShortestPath.Fields); err != nil {
 		return GraphQuery{}, err
 	}
 	var result GraphQuery
@@ -297,7 +300,7 @@ func NewGraphKShortestPathsQuery(query GraphKShortestPathsQuery) (GraphQuery, er
 	if query.KShortestPaths.K < 1 || query.KShortestPaths.K > 100 {
 		return GraphQuery{}, fmt.Errorf("antfly: graph k must be between 1 and 100")
 	}
-	if err := validateGraphPathQuery(query.Index, query.KShortestPaths.From, query.KShortestPaths.To, query.KShortestPaths.MaxDepth, query.KShortestPaths.IncludeDocuments, query.KShortestPaths.Fields); err != nil {
+	if err := validateGraphPathQuery(query.Index, query.KShortestPaths.From, query.KShortestPaths.To, query.KShortestPaths.EdgeTypes, query.KShortestPaths.MaxDepth, query.KShortestPaths.MinWeight, query.KShortestPaths.MaxWeight, query.KShortestPaths.IncludeDocuments, query.KShortestPaths.Fields); err != nil {
 		return GraphQuery{}, err
 	}
 	var result GraphQuery
@@ -345,10 +348,8 @@ func NewGraphResultRefSelector(resultRef string, limit int) (GraphNodeSelector, 
 // NewGraphResultBindingSelector selects one returned alias from a prior MATCH
 // query. Selecting the alias explicitly avoids flattening unrelated bindings.
 func NewGraphResultBindingSelector(queryName, binding string, limit int) (GraphNodeSelector, error) {
-	queryName = strings.TrimSpace(queryName)
-	binding = strings.TrimSpace(binding)
-	if queryName == "" || binding == "" {
-		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result query name and binding must not be empty")
+	if !validGraphQueryName(queryName) {
+		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result query name must be a non-$ identifier of at most %d Unicode code points", maxGraphIdentifierRunes)
 	}
 	if !validGraphIdentifier(binding) {
 		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result binding must contain at most %d Unicode code points", maxGraphIdentifierRunes)
@@ -440,8 +441,7 @@ func CountGraphAlias(alias string, distinct bool) GraphCountAggregate {
 // NewGraphNotEqual rejects rows where two aliases resolve to the same exact
 // (table, key) node identity.
 func NewGraphNotEqual(left, right string) (GraphWhereExpression, error) {
-	if strings.TrimSpace(left) == "" || strings.TrimSpace(right) == "" ||
-		!validGraphIdentifier(left) || !validGraphIdentifier(right) {
+	if !validGraphIdentifier(left) || !validGraphIdentifier(right) {
 		return GraphWhereExpression{}, fmt.Errorf("antfly: graph inequality aliases must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
 	}
 	if left == right {
@@ -463,9 +463,8 @@ func NewGraphNotExists(edges []GraphMatchEdge) (GraphWhereExpression, error) {
 		return GraphWhereExpression{}, fmt.Errorf("antfly: graph not-exists edges must contain between 1 and %d entries", maxGraphMatchEdges)
 	}
 	for _, edge := range edges {
-		if strings.TrimSpace(edge.From) == "" || strings.TrimSpace(edge.To) == "" ||
-			!validGraphIdentifier(edge.From) || !validGraphIdentifier(edge.To) {
-			return GraphWhereExpression{}, fmt.Errorf("antfly: graph not-exists edge aliases must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
+		if err := validateGraphMatchEdgeShape(edge); err != nil {
+			return GraphWhereExpression{}, err
 		}
 	}
 	var result GraphWhereExpression
@@ -500,7 +499,7 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 	}
 	complexity := graphMatchComplexity{nodes: len(query.Match.Nodes), edges: len(query.Match.Edges)}
 	for alias := range query.Match.Nodes {
-		if strings.TrimSpace(alias) == "" || !validGraphIdentifier(alias) {
+		if !validGraphIdentifier(alias) {
 			return fmt.Errorf("antfly: graph alias must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
 		}
 	}
@@ -508,7 +507,7 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 	for alias := range query.Match.Nodes {
 		visible[alias] = struct{}{}
 	}
-	if strings.TrimSpace(query.Match.Anchor) == "" || !validGraphIdentifier(query.Match.Anchor) {
+	if !validGraphIdentifier(query.Match.Anchor) {
 		return fmt.Errorf("antfly: graph match anchor must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
 	}
 	if _, ok := visible[query.Match.Anchor]; !ok {
@@ -562,7 +561,7 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 		}
 		introduced := make(map[string]struct{}, len(optional.Nodes))
 		for alias := range optional.Nodes {
-			if strings.TrimSpace(alias) == "" || !validGraphIdentifier(alias) {
+			if !validGraphIdentifier(alias) {
 				return fmt.Errorf("antfly: optional graph alias must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
 			}
 			if _, exists := visible[alias]; exists {
@@ -649,8 +648,8 @@ func (c *graphMatchComplexity) addPredicate() error {
 }
 
 func validateGraphMatchEdge(edge GraphMatchEdge, aliases map[string]struct{}) error {
-	if !validGraphIdentifier(edge.From) || !validGraphIdentifier(edge.To) {
-		return fmt.Errorf("antfly: graph edge aliases must contain at most %d Unicode code points", maxGraphIdentifierRunes)
+	if err := validateGraphMatchEdgeShape(edge); err != nil {
+		return err
 	}
 	if _, ok := aliases[edge.From]; !ok {
 		return fmt.Errorf("antfly: graph edge references unknown alias %q", edge.From)
@@ -658,9 +657,28 @@ func validateGraphMatchEdge(edge GraphMatchEdge, aliases map[string]struct{}) er
 	if _, ok := aliases[edge.To]; !ok {
 		return fmt.Errorf("antfly: graph edge references unknown alias %q", edge.To)
 	}
-	if edge.MinHops < 0 || edge.MaxHops < 0 || edge.MinHops > 64 || edge.MaxHops > 64 ||
-		(edge.MinHops > 0 && edge.MaxHops > 0 && edge.MinHops > edge.MaxHops) {
+	return nil
+}
+
+func validateGraphMatchEdgeShape(edge GraphMatchEdge) error {
+	if !validGraphIdentifier(edge.From) || !validGraphIdentifier(edge.To) {
+		return fmt.Errorf("antfly: graph edge aliases must contain at most %d Unicode code points", maxGraphIdentifierRunes)
+	}
+	minHops, maxHops := edge.MinHops, edge.MaxHops
+	if minHops == 0 {
+		minHops = 1
+	}
+	if maxHops == 0 {
+		maxHops = 1
+	}
+	if minHops < 1 || maxHops < 1 || minHops > 64 || maxHops > 64 || minHops > maxHops {
 		return fmt.Errorf("antfly: invalid graph edge hop range")
+	}
+	if err := validateGraphEdgeTypes(edge.Types); err != nil {
+		return err
+	}
+	if err := validateGraphWeightBounds(edge.MinWeight, edge.MaxWeight); err != nil {
+		return err
 	}
 	return nil
 }
@@ -801,6 +819,12 @@ func validateGraphTraverseQuery(query GraphTraverseQuery) error {
 	if err := validateGraphLimit(query.Traverse.Limit); err != nil {
 		return err
 	}
+	if err := validateGraphEdgeTypes(query.Traverse.EdgeTypes); err != nil {
+		return err
+	}
+	if err := validateGraphWeightBounds(query.Traverse.MinWeight, query.Traverse.MaxWeight); err != nil {
+		return err
+	}
 	if len(query.Traverse.Fields) > 0 && !query.Traverse.IncludeDocuments {
 		return fmt.Errorf("antfly: graph traversal fields require IncludeDocuments")
 	}
@@ -812,15 +836,21 @@ func validateGraphTraverseQuery(query GraphTraverseQuery) error {
 	return nil
 }
 
-func validateGraphPathQuery(index string, from, to GraphPathEndpoint, maxDepth int, includeDocuments bool, fields []string) error {
+func validateGraphPathQuery(index string, from, to GraphPathEndpoint, edgeTypes []string, maxDepth int, minWeight, maxWeight *float64, includeDocuments bool, fields []string) error {
 	if strings.TrimSpace(index) == "" {
 		return fmt.Errorf("antfly: graph index must not be empty")
 	}
-	if strings.TrimSpace(from.Key) == "" || strings.TrimSpace(to.Key) == "" {
+	if from.Key == "" || to.Key == "" {
 		return fmt.Errorf("antfly: graph path endpoints must not be empty")
 	}
 	if maxDepth < 0 || maxDepth > 64 {
 		return fmt.Errorf("antfly: graph max depth must be 0 or between 1 and 64")
+	}
+	if err := validateGraphEdgeTypes(edgeTypes); err != nil {
+		return err
+	}
+	if err := validateGraphWeightBounds(minWeight, maxWeight); err != nil {
+		return err
 	}
 	if len(fields) > 0 && !includeDocuments {
 		return fmt.Errorf("antfly: graph path fields require IncludeDocuments")
@@ -894,7 +924,7 @@ func validateGraphIdentities(identities []GraphPathEndpoint) error {
 	}
 	seen := make(map[string]struct{}, len(identities))
 	for _, identity := range identities {
-		if strings.TrimSpace(identity.Key) == "" {
+		if identity.Key == "" {
 			return fmt.Errorf("antfly: graph identity key must not be empty")
 		}
 		identityKey := identity.Table + "\x00" + identity.Key
@@ -911,7 +941,46 @@ func validGraphResultRef(resultRef string) bool {
 		return true
 	}
 	const prefix = "$graph_results."
-	return strings.HasPrefix(resultRef, prefix) && len(resultRef) > len(prefix)
+	return strings.HasPrefix(resultRef, prefix) && validGraphQueryName(resultRef[len(prefix):])
+}
+
+func validGraphQueryName(value string) bool {
+	return validGraphIdentifier(value) && value[0] != '$'
+}
+
+func validateGraphWeightBounds(minWeight, maxWeight *float64) error {
+	if minWeight != nil && (math.IsNaN(*minWeight) || math.IsInf(*minWeight, 0)) {
+		return fmt.Errorf("antfly: graph minimum weight must be finite")
+	}
+	if maxWeight != nil && (math.IsNaN(*maxWeight) || math.IsInf(*maxWeight, 0)) {
+		return fmt.Errorf("antfly: graph maximum weight must be finite")
+	}
+	if minWeight != nil && maxWeight != nil && *minWeight > *maxWeight {
+		return fmt.Errorf("antfly: graph minimum weight must not exceed maximum weight")
+	}
+	return nil
+}
+
+func validateGraphEdgeTypes(edgeTypes []string) error {
+	if len(edgeTypes) > maxGraphEdgeTypes {
+		return fmt.Errorf("antfly: graph edge types must contain at most %d entries", maxGraphEdgeTypes)
+	}
+	seen := make(map[string]struct{}, len(edgeTypes))
+	totalBytes := 0
+	for _, edgeType := range edgeTypes {
+		if edgeType == "" {
+			return fmt.Errorf("antfly: graph edge type must not be empty")
+		}
+		if _, exists := seen[edgeType]; exists {
+			return fmt.Errorf("antfly: duplicate graph edge type %q", edgeType)
+		}
+		seen[edgeType] = struct{}{}
+		totalBytes += len(edgeType)
+		if totalBytes > maxGraphEdgeTypeBytes {
+			return fmt.Errorf("antfly: graph edge types must total at most %d bytes", maxGraphEdgeTypeBytes)
+		}
+	}
+	return nil
 }
 
 func validateGraphLimit(limit int) error {

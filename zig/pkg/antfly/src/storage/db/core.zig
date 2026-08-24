@@ -1108,8 +1108,8 @@ pub const DBCore = struct {
         direction: graph_mod.EdgeDirection,
         weight_mode: paths_mod.PathWeightMode,
         max_depth: u32,
-        min_weight: f64,
-        max_weight: f64,
+        min_weight: ?f64,
+        max_weight: ?f64,
         node_admission: ?NodeAdmission,
     ) !?paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
@@ -1135,8 +1135,8 @@ pub const DBCore = struct {
         direction: graph_mod.EdgeDirection,
         weight_mode: paths_mod.PathWeightMode,
         max_depth: u32,
-        min_weight: f64,
-        max_weight: f64,
+        min_weight: ?f64,
+        max_weight: ?f64,
         node_admission: ?NodeAdmission,
     ) ![]paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;

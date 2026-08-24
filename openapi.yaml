@@ -22538,9 +22538,11 @@ components:
         min_weight:
           type: number
           format: double
+          x-go-type-skip-optional-pointer: false
         max_weight:
           type: number
           format: double
+          x-go-type-skip-optional-pointer: false
     GraphWhereAnd:
       type: object
       additionalProperties: false
@@ -22774,8 +22776,10 @@ components:
       properties:
         key:
           type: string
+          minLength: 1
         table:
           type: string
+          minLength: 1
           description: Optional table qualifier for an exact cross-table node identity. Omit for the query
             table.
     GraphIdentityNodeSelector:
@@ -22848,9 +22852,11 @@ components:
         min_weight:
           type: number
           format: double
+          x-go-type-skip-optional-pointer: false
         max_weight:
           type: number
           format: double
+          x-go-type-skip-optional-pointer: false
         limit:
           type: integer
           minimum: 1
@@ -22930,9 +22936,11 @@ components:
         min_weight:
           type: number
           format: double
+          x-go-type-skip-optional-pointer: false
         max_weight:
           type: number
           format: double
+          x-go-type-skip-optional-pointer: false
         weight_mode:
           $ref: '#/components/schemas/PathWeightMode'
         filter:
@@ -22993,9 +23001,11 @@ components:
         min_weight:
           type: number
           format: double
+          x-go-type-skip-optional-pointer: false
         max_weight:
           type: number
           format: double
+          x-go-type-skip-optional-pointer: false
         weight_mode:
           $ref: '#/components/schemas/PathWeightMode'
         filter:

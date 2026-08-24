@@ -15713,8 +15713,8 @@ pub const DB = struct {
         direction: graph_mod.EdgeDirection,
         weight_mode: paths_mod.PathWeightMode,
         max_depth: u32,
-        min_weight: f64,
-        max_weight: f64,
+        min_weight: ?f64,
+        max_weight: ?f64,
     ) !?paths_mod.Path {
         if (source.len == 0 or target.len == 0) return null;
         if (try self.findAlgebraicShortestPath(alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
@@ -15746,8 +15746,8 @@ pub const DB = struct {
         direction: graph_mod.EdgeDirection,
         weight_mode: paths_mod.PathWeightMode,
         max_depth: u32,
-        min_weight: f64,
-        max_weight: f64,
+        min_weight: ?f64,
+        max_weight: ?f64,
     ) ![]paths_mod.Path {
         if (source.len == 0 or target.len == 0 or k == 0) return try alloc.alloc(paths_mod.Path, 0);
         if (k == 1) {
@@ -15784,8 +15784,8 @@ pub const DB = struct {
         direction: graph_mod.EdgeDirection,
         weight_mode: paths_mod.PathWeightMode,
         max_depth: u32,
-        min_weight: f64,
-        max_weight: f64,
+        min_weight: ?f64,
+        max_weight: ?f64,
     ) !?paths_mod.Path {
         const entry = self.core.index_manager.graphIndex(index_name) orelse {
             try self.failIfIndexQuarantined(index_name);
@@ -64308,14 +64308,14 @@ test "db graph methods expose edges, neighbors, and shortest path" {
     defer traversal_mod.freeOwnedResults(alloc, traversed);
     try std.testing.expectEqual(@as(usize, 3), traversed.len);
 
-    const shortest = (try db.findShortestPath(alloc, "citations", "a", "d", &.{"cites"}, .out, .min_hops, 8, 0, 0)).?;
+    const shortest = (try db.findShortestPath(alloc, "citations", "a", "d", &.{"cites"}, .out, .min_hops, 8, null, null)).?;
     defer paths_mod.freePath(alloc, shortest);
     try std.testing.expectEqual(@as(u32, 2), shortest.length);
     try std.testing.expectEqual(@as(usize, 3), shortest.nodes.len);
     try std.testing.expectEqualStrings("a", shortest.nodes[0]);
     try std.testing.expectEqualStrings("d", shortest.nodes[2]);
 
-    const algebraic_shortest = (try db.findShortestPath(alloc, "citations_alg", "a", "d", &.{"cites"}, .out, .min_hops, 8, 0, 0)).?;
+    const algebraic_shortest = (try db.findShortestPath(alloc, "citations_alg", "a", "d", &.{"cites"}, .out, .min_hops, 8, null, null)).?;
     defer paths_mod.freePath(alloc, algebraic_shortest);
     try std.testing.expectEqual(@as(u32, 2), algebraic_shortest.length);
     try std.testing.expectEqual(@as(usize, 3), algebraic_shortest.nodes.len);
@@ -64325,7 +64325,7 @@ test "db graph methods expose edges, neighbors, and shortest path" {
     try std.testing.expectEqual(@as(usize, 2), algebraic_shortest.edges.len);
     try std.testing.expectEqualStrings("cites", algebraic_shortest.edges[0].edge_type);
 
-    const algebraic_k_one = try db.findKShortestPaths(alloc, "citations_alg", "a", "d", 1, &.{"cites"}, .out, .min_hops, 8, 0, 0);
+    const algebraic_k_one = try db.findKShortestPaths(alloc, "citations_alg", "a", "d", 1, &.{"cites"}, .out, .min_hops, 8, null, null);
     defer paths_mod.freePaths(alloc, algebraic_k_one);
     try std.testing.expectEqual(@as(usize, 1), algebraic_k_one.len);
     try std.testing.expectEqual(@as(u32, 2), algebraic_k_one[0].length);

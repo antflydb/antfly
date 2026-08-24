@@ -58,8 +58,8 @@ pub const ExecutionOptions = struct {
     deduplicate: bool = true,
     max_depth: u32 = 3,
     max_results: u32 = 0,
-    min_weight: f64 = 0,
-    max_weight: f64 = 0,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
     min_hops: bool = true,
 };
 

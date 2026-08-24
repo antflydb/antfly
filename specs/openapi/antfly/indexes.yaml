@@ -2900,8 +2900,8 @@ components:
           maximum: 64
           default: 1
           description: Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
-        min_weight: { type: number, format: double }
-        max_weight: { type: number, format: double }
+        min_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
+        max_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
         limit:
           type: integer
           minimum: 1
@@ -2925,9 +2925,10 @@ components:
       additionalProperties: false
       required: [key]
       properties:
-        key: { type: string }
+        key: { type: string, minLength: 1 }
         table:
           type: string
+          minLength: 1
           description: Optional table qualifier for an exact cross-table node identity. Omit for the query table.
     GraphPath:
       type: object
@@ -2966,8 +2967,8 @@ components:
           minimum: 1
           maximum: 64
           default: 10
-        min_weight: { type: number, format: double }
-        max_weight: { type: number, format: double }
+        min_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
+        max_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
         weight_mode: { $ref: '#/components/schemas/PathWeightMode' }
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
@@ -3003,8 +3004,8 @@ components:
           minimum: 1
           maximum: 64
           default: 10
-        min_weight: { type: number, format: double }
-        max_weight: { type: number, format: double }
+        min_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
+        max_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
         weight_mode: { $ref: '#/components/schemas/PathWeightMode' }
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
@@ -3054,8 +3055,8 @@ components:
           minimum: 1
           maximum: 64
           default: 1
-        min_weight: { type: number, format: double }
-        max_weight: { type: number, format: double }
+        min_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
+        max_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
     GraphAliasOperand:
       type: object
       additionalProperties: false

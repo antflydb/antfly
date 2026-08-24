@@ -367,8 +367,53 @@ func TestGraphResultBindingSelector(t *testing.T) {
 	if _, err := NewGraphResultBindingSelector("", "post", 1); err == nil {
 		t.Fatal("expected empty graph result query name to fail")
 	}
+	preserved, err := NewGraphResultBindingSelector(" authors ", " post ", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preservedJSON, err := json.Marshal(preserved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(preservedJSON), `"result_ref":"$graph_results. authors "`) ||
+		!strings.Contains(string(preservedJSON), `"binding":" post "`) {
+		t.Fatalf("selector silently normalized identifiers: %s", preservedJSON)
+	}
+	if _, err := NewGraphResultBindingSelector("$reserved", "post", 1); err == nil {
+		t.Fatal("expected reserved graph result query name to fail")
+	}
+	if _, err := NewGraphResultRefSelector("$graph_results."+strings.Repeat("q", maxGraphIdentifierRunes+1), 1); err == nil {
+		t.Fatal("expected oversized graph result query name to fail")
+	}
 	if _, err := NewGraphResultRefSelector("$full_text_results", 1); err == nil {
 		t.Fatal("expected legacy lane-specific reference to fail in canonical helper")
+	}
+}
+
+func TestGraphMatchEdgeValidationMatchesServerDefaultsAndBudgets(t *testing.T) {
+	zero := 0.0
+	negative := -1.0
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MinHops: 2}); err == nil {
+		t.Fatal("expected omitted max_hops to default to one and reject min_hops=2")
+	}
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MinWeight: &zero, MaxWeight: &zero}); err != nil {
+		t.Fatalf("explicit zero weight range must be representable: %v", err)
+	}
+	encoded, err := json.Marshal(GraphMatchEdge{From: "a", To: "b", MinWeight: &zero, MaxWeight: &zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"min_weight":0`) || !strings.Contains(string(encoded), `"max_weight":0`) {
+		t.Fatalf("explicit zero weight range was omitted: %s", encoded)
+	}
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MinWeight: &zero, MaxWeight: &negative}); err == nil {
+		t.Fatal("expected inverted graph weight range to fail")
+	}
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Types: []string{"links", "links"}}); err == nil {
+		t.Fatal("expected duplicate graph edge types to fail")
+	}
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Types: []string{""}}); err == nil {
+		t.Fatal("expected empty graph edge type to fail")
 	}
 }
 

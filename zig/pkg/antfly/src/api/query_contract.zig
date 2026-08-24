@@ -9090,8 +9090,8 @@ fn parseLegacyPatternSteps(
                 } else .out,
                 .min_hops = if (edge.min_hops) |raw| std.math.cast(u32, raw) orelse return error.InvalidQueryRequest else 1,
                 .max_hops = if (edge.max_hops) |raw| std.math.cast(u32, raw) orelse return error.InvalidQueryRequest else 1,
-                .min_weight = edge.min_weight orelse 0,
-                .max_weight = edge.max_weight orelse 0,
+                .min_weight = legacyWeightBound(edge.min_weight),
+                .max_weight = legacyWeightBound(edge.max_weight),
                 .types = edge_types,
             } else .{ .types = edge_types },
         };
@@ -9145,8 +9145,8 @@ fn parseLegacyGraphQueryParams(
         } else .out,
         .max_depth = max_depth,
         .max_results = max_results,
-        .min_weight = value.min_weight orelse 0,
-        .max_weight = value.max_weight orelse 0,
+        .min_weight = legacyWeightBound(value.min_weight),
+        .max_weight = legacyWeightBound(value.max_weight),
         .deduplicate = value.deduplicate_nodes orelse true,
         .include_paths = value.include_paths orelse false,
         .weight_mode = if (value.weight_mode) |mode| switch (mode) {
@@ -9160,6 +9160,7 @@ fn parseLegacyGraphQueryParams(
 
 fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphTraverseQuery) !graph_query_mod.GraphQuery {
     const traversal = value.traverse;
+    try validateGraphWeightBounds(traversal.min_weight, traversal.max_weight);
     if (traversal.fields != null and traversal.include_documents != true)
         return error.InvalidQueryRequest;
     const index = try alloc.dupe(u8, value.index);
@@ -9183,8 +9184,8 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
             .direction = parseGraphDirection(traversal.direction),
             .max_depth = try parseGraphBoundedU32(traversal.max_depth, 1, 1, 64),
             .max_results = try parseGraphBoundedU32(traversal.limit, 100, 1, 10_000),
-            .min_weight = traversal.min_weight orelse 0,
-            .max_weight = traversal.max_weight orelse 0,
+            .min_weight = traversal.min_weight,
+            .max_weight = traversal.max_weight,
             .deduplicate = traversal.deduplicate_nodes orelse true,
             .include_paths = traversal.include_paths orelse false,
             .node_filter = filter,
@@ -9203,6 +9204,7 @@ fn parseGraphPathQuery(
     query_type: graph_query_mod.QueryType,
 ) !graph_query_mod.GraphQuery {
     if (k == 0 or k > 100) return error.InvalidQueryRequest;
+    try validateGraphWeightBounds(path.min_weight, path.max_weight);
     if (path.fields != null and path.include_documents != true)
         return error.InvalidQueryRequest;
     const index = try alloc.dupe(u8, index_value);
@@ -9229,8 +9231,8 @@ fn parseGraphPathQuery(
             .edge_types = edge_types,
             .direction = parseGraphDirection(path.direction),
             .max_depth = try parseGraphBoundedU32(path.max_depth, 10, 1, 64),
-            .min_weight = path.min_weight orelse 0,
-            .max_weight = path.max_weight orelse 0,
+            .min_weight = path.min_weight,
+            .max_weight = path.max_weight,
             .weight_mode = if (path.weight_mode) |mode| switch (mode) {
                 .min_hops => .min_hops,
                 .min_weight => .min_weight,
@@ -9245,6 +9247,8 @@ fn parseGraphPathQuery(
 }
 
 fn parseGraphPathEndpointSelector(alloc: std.mem.Allocator, endpoint: anytype) !graph_query_mod.NodeSelector {
+    if (endpoint.key.len == 0) return error.InvalidQueryRequest;
+    if (endpoint.table) |table| if (table.len == 0) return error.InvalidQueryRequest;
     const identities = try alloc.alloc(graph_query_mod.NodeIdentity, 1);
     errdefer alloc.free(identities);
     const key = try alloc.dupe(u8, endpoint.key);
@@ -9405,6 +9409,7 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
         alloc.free(edges);
     }
     for (value, 0..) |edge, i| {
+        try validateGraphWeightBounds(edge.min_weight, edge.max_weight);
         if (!graph_query_mod.isValidIdentifier(edge.from) or
             !graph_query_mod.isValidIdentifier(edge.to))
             return error.InvalidQueryRequest;
@@ -9424,14 +9429,47 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
                 .direction = parseGraphDirection(edge.direction),
                 .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
                 .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
-                .min_weight = edge.min_weight orelse 0,
-                .max_weight = edge.max_weight orelse 0,
+                .min_weight = edge.min_weight,
+                .max_weight = edge.max_weight,
             },
         };
         if (edges[i].step.min_hops > edges[i].step.max_hops) return error.InvalidQueryRequest;
         initialized += 1;
     }
     return edges;
+}
+
+fn legacyWeightBound(value: ?f64) ?f64 {
+    const bound = value orelse return null;
+    return if (bound > 0 and std.math.isFinite(bound)) bound else null;
+}
+
+fn validateGraphWeightBounds(min_weight: ?f64, max_weight: ?f64) !void {
+    if (min_weight) |value| if (!std.math.isFinite(value)) return error.InvalidQueryRequest;
+    if (max_weight) |value| if (!std.math.isFinite(value)) return error.InvalidQueryRequest;
+    if (min_weight != null and max_weight != null and min_weight.? > max_weight.?)
+        return error.InvalidQueryRequest;
+}
+
+test "canonical graph admission preserves and validates weight bounds" {
+    try validateGraphWeightBounds(0, 0);
+    try validateGraphWeightBounds(-2, -1);
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(1, 0));
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(std.math.nan(f64), null));
+    try std.testing.expectEqual(@as(?f64, null), legacyWeightBound(0));
+    try std.testing.expectEqual(@as(?f64, 0.5), legacyWeightBound(0.5));
+}
+
+test "canonical graph path endpoints reject empty identities before allocation" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
+        .key = "",
+        .table = @as(?[]const u8, null),
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
+        .key = "node",
+        .table = @as(?[]const u8, ""),
+    }));
 }
 
 fn parseGraphWherePredicates(alloc: std.mem.Allocator, value: ?indexes_openapi.GraphWhereExpression) ![]const graph_pattern_mod.MatchPredicate {

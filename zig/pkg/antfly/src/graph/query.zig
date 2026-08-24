@@ -175,8 +175,8 @@ pub const QueryParams = struct {
     direction: graph_mod.EdgeDirection = .out,
     max_depth: u32 = 1,
     max_results: u32 = 100,
-    min_weight: f64 = 0.0,
-    max_weight: f64 = 0.0,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
     deduplicate: bool = true,
     include_paths: bool = false,
     weight_mode: paths_mod.PathWeightMode = .min_hops,
@@ -1566,8 +1566,8 @@ fn graphEdgeTypeAllowed(allowed: []const []const u8, edge_type: []const u8) bool
 }
 
 fn graphEdgeWeightAllowed(params: QueryParams, weight: f64) bool {
-    if (params.min_weight > 0 and weight < params.min_weight) return false;
-    if (params.max_weight > 0 and weight > params.max_weight) return false;
+    if (params.min_weight) |min_weight| if (weight < min_weight) return false;
+    if (params.max_weight) |max_weight| if (weight > max_weight) return false;
     return true;
 }
 

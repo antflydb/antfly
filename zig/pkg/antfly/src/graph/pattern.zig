@@ -56,8 +56,8 @@ pub const PatternEdgeStep = struct {
     direction: graph_mod.EdgeDirection = .out,
     min_hops: u32 = 1,
     max_hops: u32 = 1,
-    min_weight: f64 = 0.0,
-    max_weight: f64 = 0.0,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
     types: []const []const u8 = &.{},
 };
 
@@ -1094,9 +1094,19 @@ fn edgeMatches(edge: graph_mod.Edge, step: PatternEdgeStep) bool {
         }
         if (!matched) return false;
     }
-    if (step.min_weight > 0 and edge.weight < step.min_weight) return false;
-    if (step.max_weight > 0 and edge.weight > step.max_weight) return false;
+    if (step.min_weight) |min_weight| if (edge.weight < min_weight) return false;
+    if (step.max_weight) |max_weight| if (edge.weight > max_weight) return false;
     return true;
+}
+
+test "pattern edge filters preserve explicit zero bounds" {
+    const zero = graph_mod.Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0, .created_at = 0, .updated_at = 0, .metadata = "" };
+    const positive = graph_mod.Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
+    const negative = graph_mod.Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = -0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
+    try std.testing.expect(edgeMatches(zero, .{ .max_weight = 0 }));
+    try std.testing.expect(!edgeMatches(positive, .{ .max_weight = 0 }));
+    try std.testing.expect(edgeMatches(negative, .{ .max_weight = 0 }));
+    try std.testing.expect(!edgeMatches(negative, .{ .min_weight = 0 }));
 }
 
 fn edgeTarget(edge: graph_mod.Edge, current_key: []const u8, direction: graph_mod.EdgeDirection) ?[]const u8 {

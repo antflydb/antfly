@@ -38,8 +38,8 @@ pub const TraversalRules = struct {
     edge_types: []const []const u8 = &.{}, // empty = all types
     direction: EdgeDirection = .out,
     max_depth: u32 = 3,
-    min_weight: f64 = 0.0,
-    max_weight: f64 = 0.0, // 0 = no upper limit
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
     max_results: u32 = 100,
     deduplicate: bool = true,
     include_paths: bool = false,
@@ -418,8 +418,8 @@ pub fn startNodeAdmittedWithEdgeReader(
 
 fn shouldTraverseEdge(rules: *const TraversalRules, edge: *const Edge) bool {
     // Weight filter
-    if (rules.min_weight > 0 and edge.weight < rules.min_weight) return false;
-    if (rules.max_weight > 0 and edge.weight > rules.max_weight) return false;
+    if (rules.min_weight) |min_weight| if (edge.weight < min_weight) return false;
+    if (rules.max_weight) |max_weight| if (edge.weight > max_weight) return false;
 
     // Edge type filter
     if (rules.edge_types.len > 0) {
@@ -429,6 +429,18 @@ fn shouldTraverseEdge(rules: *const TraversalRules, edge: *const Edge) bool {
         return false;
     }
     return true;
+}
+
+test "traversal weight filters preserve explicit zero bounds" {
+    const zero = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0, .created_at = 0, .updated_at = 0, .metadata = "" };
+    const positive = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
+    const negative = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = -0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
+    const max_zero = TraversalRules{ .max_weight = 0 };
+    const min_zero = TraversalRules{ .min_weight = 0 };
+    try std.testing.expect(shouldTraverseEdge(&max_zero, &zero));
+    try std.testing.expect(!shouldTraverseEdge(&max_zero, &positive));
+    try std.testing.expect(shouldTraverseEdge(&max_zero, &negative));
+    try std.testing.expect(!shouldTraverseEdge(&min_zero, &negative));
 }
 
 /// Free traversal results.

@@ -621,8 +621,8 @@ const GraphExpandParamsJson = struct {
     direction: []const u8 = "out",
     max_depth: u32 = 1,
     max_results: u32 = 0,
-    min_weight: f64 = 0.0,
-    max_weight: f64 = 0.0,
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
     deduplicate: bool = true,
     include_paths: bool = false,
     weight_mode: []const u8 = "min_hops",
@@ -7884,8 +7884,8 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expectEqualStrings("entities", req.frontier[0].table.?);
     try std.testing.expectEqualStrings("doc:seen", req.exclude_nodes[0].key);
     try std.testing.expectEqualStrings("entities", req.exclude_nodes[0].table.?);
-    try std.testing.expectEqual(@as(f64, 1.25), req.params.min_weight);
-    try std.testing.expectEqual(@as(f64, 9.5), req.params.max_weight);
+    try std.testing.expectEqual(@as(?f64, 1.25), req.params.min_weight);
+    try std.testing.expectEqual(@as(?f64, 9.5), req.params.max_weight);
     try std.testing.expect(req.tensor_access_path != null);
     try std.testing.expectEqual(algebraic_ir.PhysicalLayout.graph_edges, req.tensor_access_path.?.layout);
     try std.testing.expectEqualStrings("graph_idx", req.tensor_access_path.?.owner);
@@ -7916,8 +7916,8 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expect(parsed.resolved_doc_filter_owned);
     try std.testing.expect(parsed.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
     try std.testing.expect(parsed.params.algebraic_semiring);
-    try std.testing.expectEqual(@as(f64, 1.25), parsed.params.min_weight);
-    try std.testing.expectEqual(@as(f64, 9.5), parsed.params.max_weight);
+    try std.testing.expectEqual(@as(?f64, 1.25), parsed.params.min_weight);
+    try std.testing.expectEqual(@as(?f64, 9.5), parsed.params.max_weight);
     try std.testing.expect(parsed.tensor_access_path != null);
     try std.testing.expectEqual(algebraic_ir.PhysicalLayout.graph_edges, parsed.tensor_access_path.?.layout);
     try std.testing.expectEqualStrings("graph_idx", parsed.tensor_access_path.?.owner);
@@ -7938,8 +7938,8 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expect(search_req.resolved_doc_filter != null);
     try std.testing.expect(search_req.resolved_doc_filter_wire_context.?.namespace.eql(.{ .table_id = 1, .shard_id = 2, .range_id = 3 }));
     try std.testing.expect(search_req.query == .match_all);
-    try std.testing.expectEqual(@as(f64, 1.25), search_req.graph_queries[0].query.params.min_weight);
-    try std.testing.expectEqual(@as(f64, 9.5), search_req.graph_queries[0].query.params.max_weight);
+    try std.testing.expectEqual(@as(?f64, 1.25), search_req.graph_queries[0].query.params.min_weight);
+    try std.testing.expectEqual(@as(?f64, 9.5), search_req.graph_queries[0].query.params.max_weight);
     try std.testing.expect(search_req.graph_queries[0].query.params.algebraic_semiring);
 
     const generation_field = "\"identity_read_generation\":12345,";

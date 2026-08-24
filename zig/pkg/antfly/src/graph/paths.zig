@@ -58,8 +58,8 @@ pub const PathFindOptions = struct {
     edge_types: []const []const u8 = &.{},
     direction: EdgeDirection = .out,
     max_depth: u32 = 50,
-    min_weight: f64 = 0.0,
-    max_weight: f64 = 0.0, // 0 = no limit
+    min_weight: ?f64 = null,
+    max_weight: ?f64 = null,
     node_admission: ?NodeAdmission = null,
 };
 
@@ -769,8 +769,8 @@ pub fn findKShortestPathsWithEdgeReader(
 // ============================================================================
 
 fn shouldTraverseEdge(opts: PathFindOptions, edge: *const Edge) bool {
-    if (opts.min_weight > 0 and edge.weight < opts.min_weight) return false;
-    if (opts.max_weight > 0 and edge.weight > opts.max_weight) return false;
+    if (opts.min_weight) |min_weight| if (edge.weight < min_weight) return false;
+    if (opts.max_weight) |max_weight| if (edge.weight > max_weight) return false;
     if (opts.edge_types.len > 0) {
         for (opts.edge_types) |et| {
             if (std.mem.eql(u8, edge.edge_type, et)) return true;
@@ -778,6 +778,16 @@ fn shouldTraverseEdge(opts: PathFindOptions, edge: *const Edge) bool {
         return false;
     }
     return true;
+}
+
+test "path weight filters preserve explicit zero bounds" {
+    const zero = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0, .created_at = 0, .updated_at = 0, .metadata = "" };
+    const positive = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
+    const negative = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = -0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
+    try std.testing.expect(shouldTraverseEdge(.{ .max_weight = 0 }, &zero));
+    try std.testing.expect(!shouldTraverseEdge(.{ .max_weight = 0 }, &positive));
+    try std.testing.expect(shouldTraverseEdge(.{ .max_weight = 0 }, &negative));
+    try std.testing.expect(!shouldTraverseEdge(.{ .min_weight = 0 }, &negative));
 }
 
 fn reconstructPath(alloc: Allocator, end_node: *PathNode) !Path {
