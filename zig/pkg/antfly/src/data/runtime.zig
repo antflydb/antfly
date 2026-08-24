@@ -3530,17 +3530,21 @@ test "data server keeps upstream replication availability failures nonfatal" {
 }
 
 fn isRetryableMetadataBootstrapError(err: anyerror) bool {
+    // Preserve the metadata layer's shared linearizable-authority contract.
+    // In particular, cache invalidation can fence an in-flight snapshot during
+    // restore; that expected race must back off instead of killing the data
+    // control loop.
+    if (antfly.metadata.authority.isRetryableError(err)) return true;
     return switch (err) {
         error.HttpConnectionClosing,
         error.ConnectionResetByPeer,
         error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.Timeout,
         error.BrokenPipe,
         error.EndOfStream,
         error.UnexpectedHttpStatus,
         error.NotListening,
-        error.NotLeader,
-        error.ProposalDropped,
-        error.LeaderTransferInProgress,
         error.StoreRegistrationNotVisible,
         // Metadata listeners can accept connections before their first
         // authoritative incarnation has been established. Data nodes that
@@ -3597,7 +3601,12 @@ test "data runtime treats metadata leadership churn as retryable bootstrap failu
     try std.testing.expect(isRetryableMetadataBootstrapError(error.NotLeader));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ProposalDropped));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataLinearizableReadTimeout));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataSnapshotHeadMismatch));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.ReconcileLeaseNotHeld));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionTimedOut));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.Timeout));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataIncarnationUnavailable));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MissingAuthoritativeBootstrapVoters));
@@ -15433,6 +15442,7 @@ const RemoteMetadataSource = struct {
                 .replace_table_definition = remoteReplaceTableDefinition,
                 .restore_table = remoteRestoreTable,
                 .drop_table = remoteDropTable,
+                .drop_table_expected = remoteDropTableExpected,
                 .update_schema = remoteUpdateSchema,
                 .create_index = remoteCreateIndex,
                 .drop_index = remoteDropIndex,
@@ -15768,6 +15778,19 @@ const RemoteMetadataSource = struct {
             }
         }.call, table_name);
         self.invalidateCache();
+    }
+
+    fn remoteDropTableExpected(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) !void {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        // A response-less failure may have committed. Retire the cached
+        // pre-mutation view on both success and error so outcome observation
+        // cannot be pinned behind the snapshot TTL.
+        defer self.invalidateCache();
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
+                try client.dropTableExpected(base_uri, ctx.table_name, ctx.expected_table_id);
+            }
+        }.call, .{ .table_name = table_name, .expected_table_id = expected_table_id });
     }
 
     fn remoteRestoreTable(

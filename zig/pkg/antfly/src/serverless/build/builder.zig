@@ -42,6 +42,8 @@ const api_types = @import("../api/types.zig");
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
 const tables_api = @import("../../api/tables.zig");
 const shared_vector = @import("antfly_vector").vector;
+const objectstore = @import("objectstore");
+const manifest_object_store = @import("../manifest/object_store.zig");
 
 const FullTextIndexSpec = full_text_indexes.FullTextIndexSpec;
 const FullTextSourceMode = full_text_indexes.FullTextSourceMode;
@@ -375,7 +377,7 @@ pub const Builder = struct {
         try maintenance_cancellation.check(cancellation);
         const text_index_specs = try resolvePublishedTextIndexSpecsAlloc(self.alloc, plan.table_definition, plan.full_text_index_actions);
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
-        const text_refs = try buildTextArtifactRefsForMaterializedDocsAlloc(
+        const text_refs = try buildTextArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -383,10 +385,11 @@ pub const Builder = struct {
             materialized.documents,
             materialized.mutations,
             text_index_specs,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, text_refs);
         try maintenance_cancellation.check(cancellation);
-        const sparse_refs = try buildSparseArtifactRefsForMaterializedDocsAlloc(
+        const sparse_refs = try buildSparseArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -394,10 +397,11 @@ pub const Builder = struct {
             materialized.documents,
             materialized.mutations,
             targets.published_search_sources,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
         try maintenance_cancellation.check(cancellation);
-        const vector_refs = try buildVectorArtifactRefsForMaterializedDocsAlloc(
+        const vector_refs = try buildVectorArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -408,12 +412,13 @@ pub const Builder = struct {
             null,
             &.{},
             targets.published_search_sources,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
         try maintenance_cancellation.check(cancellation);
         const graph_index_names = try listGraphIndexNamesAlloc(self.alloc, plan.table_definition.indexes_json);
         defer freeOwnedStrings(self.alloc, graph_index_names);
-        const graph_refs = try buildGraphArtifactRefsForMaterializedDocsAlloc(
+        const graph_refs = try buildGraphArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current_manifest,
@@ -422,6 +427,7 @@ pub const Builder = struct {
             materialized.mutations,
             graph_index_names,
             targets.include_graph,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
         try maintenance_cancellation.check(cancellation);
@@ -488,16 +494,15 @@ pub const Builder = struct {
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
         try maintenance_cancellation.check(cancellation);
 
-        self.manifests.put(manifest) catch |err| switch (err) {
-            error.ManifestVersionAlreadyExists => return error.HeadChanged,
-            else => return err,
-        };
-        try maintenance_cancellation.check(cancellation);
+        const published_version = try putManifestForPublication(
+            self.manifests,
+            &manifest,
+        );
         const published = try compareAndSwapHeadGuarded(
             self.progress,
             namespace,
             if (current_head == 0) null else current_head,
-            next_version,
+            published_version,
             publication_guard,
         );
         if (!published) return error.HeadChanged;
@@ -505,7 +510,7 @@ pub const Builder = struct {
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
-            .version = next_version,
+            .version = published_version,
             .wal_start_lsn = if (inline_document_rebase) wal_end_lsn else start_lsn,
             .wal_end_lsn = wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
@@ -528,16 +533,15 @@ pub const Builder = struct {
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         try maintenance_cancellation.check(cancellation);
-        self.manifests.put(manifest) catch |err| switch (err) {
-            error.ManifestVersionAlreadyExists => return error.HeadChanged,
-            else => return err,
-        };
-        try maintenance_cancellation.check(cancellation);
+        const published_version = try putManifestForPublication(
+            self.manifests,
+            &manifest,
+        );
         const published = try compareAndSwapHeadGuarded(
             self.progress,
             namespace,
             if (current_head == 0) null else current_head,
-            version,
+            published_version,
             publication_guard,
         );
         if (!published) return error.HeadChanged;
@@ -545,7 +549,7 @@ pub const Builder = struct {
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
-            .version = version,
+            .version = published_version,
             .wal_start_lsn = start_lsn,
             .wal_end_lsn = start_lsn - 1,
             .artifact_count = manifest.artifacts.len,
@@ -634,6 +638,7 @@ pub const Builder = struct {
                 text_index_specs,
                 plan.full_text_index_actions,
                 effective_full_text_action,
+                cancellation,
             );
         };
         defer freeArtifactRefs(self.alloc, text_refs);
@@ -651,6 +656,7 @@ pub const Builder = struct {
             targets.published_search_sources,
             plan.sparse_index_actions,
             plan.artifact_actions.sparse_vector,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, sparse_refs);
         try maintenance_cancellation.check(cancellation);
@@ -664,6 +670,7 @@ pub const Builder = struct {
             targets.published_search_sources,
             plan.vector_index_actions,
             plan.artifact_actions.dense_vector,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, vector_refs);
         try maintenance_cancellation.check(cancellation);
@@ -682,6 +689,7 @@ pub const Builder = struct {
             graph_index_names,
             plan.artifact_actions.graph,
             targets.include_graph,
+            cancellation,
         );
         defer freeArtifactRefs(self.alloc, graph_refs);
         try maintenance_cancellation.check(cancellation);
@@ -739,16 +747,15 @@ pub const Builder = struct {
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         try maintenance_cancellation.check(cancellation);
-        self.manifests.put(manifest) catch |err| switch (err) {
-            error.ManifestVersionAlreadyExists => return error.HeadChanged,
-            else => return err,
-        };
-        try maintenance_cancellation.check(cancellation);
+        const published_version = try putManifestForPublication(
+            self.manifests,
+            &manifest,
+        );
         const published = try compareAndSwapHeadGuarded(
             self.progress,
             namespace,
             current_head,
-            next_version,
+            published_version,
             publication_guard,
         );
         if (!published) return error.HeadChanged;
@@ -756,7 +763,7 @@ pub const Builder = struct {
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
-            .version = next_version,
+            .version = published_version,
             .wal_start_lsn = current.wal_end_lsn,
             .wal_end_lsn = current.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
@@ -956,10 +963,81 @@ pub fn compareAndSwapHeadGuarded(
     publication_guard: ?work_lease.PublicationGuard,
 ) !bool {
     if (publication_guard) |guard| {
-        const fence = try guard.preparePublication(namespace);
-        return try progress.compareAndSwapHeadFenced(namespace, expected, version, fence);
+        if (try guard.preparePublication(namespace)) |fence| {
+            return try progress.compareAndSwapHeadFenced(namespace, expected, version, fence);
+        }
     }
     return try progress.compareAndSwapHead(namespace, expected, version);
+}
+
+/// Store an immutable manifest without letting an abandoned version wedge all
+/// later publications. The common path is one PUT; listing is only needed when
+/// an earlier publisher left different contents at the same version.
+pub fn putManifestForPublication(
+    manifests: *manifest_mod.ManifestStore,
+    manifest: *manifest_mod.Manifest,
+) !u64 {
+    while (true) {
+        manifests.put(manifest.*) catch |err| switch (err) {
+            error.ManifestVersionAlreadyExists => {
+                const versions = try manifests.listVersionsAlloc(manifest.namespace);
+                defer manifests.allocator.free(versions);
+                var maximum = manifest.version;
+                for (versions) |version| maximum = @max(maximum, version);
+                const replacement = std.math.add(u64, maximum, 1) catch
+                    return error.ManifestVersionExhausted;
+                if (manifest.stats.document_base_version == manifest.version) {
+                    manifest.stats.document_base_version = replacement;
+                }
+                manifest.version = replacement;
+                continue;
+            },
+            else => return err,
+        };
+        return manifest.version;
+    }
+}
+
+test "serverless publication advances past a conflicting orphan manifest" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(
+        alloc,
+        memory.client(),
+        "manifests",
+        "tenant",
+    );
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+
+    try manifests.put(.{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 100,
+        .wal_start_lsn = 1,
+        .wal_end_lsn = 1,
+        .stats = .{ .document_count = 1, .document_base_version = 1 },
+        .artifacts = &.{},
+    });
+    var candidate = manifest_mod.Manifest{
+        .namespace = "docs",
+        .version = 1,
+        .built_at_ns = 200,
+        .wal_start_lsn = 1,
+        .wal_end_lsn = 1,
+        .stats = .{ .document_count = 2, .document_base_version = 1 },
+        .artifacts = &.{},
+    };
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        try putManifestForPublication(&manifests, &candidate),
+    );
+    try std.testing.expectEqual(@as(u64, 2), candidate.version);
+    try std.testing.expectEqual(@as(u64, 2), candidate.stats.document_base_version);
+    var stored = try manifests.getAlloc("docs", 2);
+    defer stored.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 2), stored.stats.document_count);
 }
 
 fn buildManifestAlloc(
@@ -1820,8 +1898,8 @@ fn buildDocumentSegmentAlloc(
     };
 }
 
-fn buildTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec) ![]u8 {
-    var segment = try allocTextSegmentAlloc(alloc, docs, spec);
+fn buildTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec, cancellation: ?maintenance_cancellation.Token) ![]u8 {
+    var segment = try allocTextSegmentAlloc(alloc, docs, spec, cancellation);
     defer text_segment_mod.freeSegment(alloc, &segment);
     return try text_segment_mod.encodeAlloc(alloc, segment);
 }
@@ -1830,7 +1908,7 @@ fn buildSparseSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMateri
     payload: ?[]u8,
     feature_count: usize,
 } {
-    return try buildSparseSegmentAllocForSource(alloc, docs, search_sources.defaultPublishedSearchSources().findSparse());
+    return try buildSparseSegmentAllocForSource(alloc, docs, search_sources.defaultPublishedSearchSources().findSparse(), null);
 }
 
 fn walEndAsBuiltAtNs(wal_end_lsn: u64) u64 {
@@ -1841,12 +1919,13 @@ fn buildSparseSegmentAllocForSource(
     alloc: Allocator,
     docs: []const query_mod.QueryMaterializedDocument,
     sparse_source: ?search_sources.SparseSourceDescriptor,
+    cancellation: ?maintenance_cancellation.Token,
 ) !struct {
     payload: ?[]u8,
     feature_count: usize,
 } {
     if (sparse_source == null) return .{ .payload = null, .feature_count = 0 };
-    var segment = try allocSparseSegmentAlloc(alloc, docs, sparse_source.?);
+    var segment = try allocSparseSegmentAlloc(alloc, docs, sparse_source.?, cancellation);
     defer if (segment) |*value| sparse_segment_mod.freeSegment(alloc, value);
     if (segment) |value| {
         var total_features: usize = 0;
@@ -1868,18 +1947,41 @@ pub fn buildSparseArtifactRefsForMaterializedDocsAlloc(
     mutations: []const query_mod.QueryMaterializerMutation,
     published_search_sources: search_sources.PublishedSearchSources,
 ) ![]manifest_mod.ArtifactRef {
+    return try buildSparseArtifactRefsForMaterializedDocsAllocUntil(
+        alloc,
+        artifacts,
+        current,
+        before_docs,
+        docs,
+        mutations,
+        published_search_sources,
+        null,
+    );
+}
+
+pub fn buildSparseArtifactRefsForMaterializedDocsAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    published_search_sources: search_sources.PublishedSearchSources,
+    cancellation: ?maintenance_cancellation.Token,
+) ![]manifest_mod.ArtifactRef {
     const sparse_sources = try search_sources.listSparseSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeSparseSourceDescriptors(alloc, sparse_sources);
 
     var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
     errdefer freeArtifactRefs(alloc, refs.items);
     for (sparse_sources) |source| {
+        try maintenance_cancellation.check(cancellation);
         if (current) |manifest| {
             if (!try sparseProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, source)) {
                 if (try appendReusedNamedArtifactRefAlloc(alloc, &refs, manifest, .sparse_segment, source.index_name)) continue;
             }
         }
-        const built = try buildSparseSegmentAllocForSource(alloc, docs, source);
+        const built = try buildSparseSegmentAllocForSource(alloc, docs, source, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -2702,6 +2804,28 @@ pub fn buildTextArtifactRefsForMaterializedDocsAlloc(
     mutations: []const query_mod.QueryMaterializerMutation,
     text_index_specs: []const FullTextIndexSpec,
 ) ![]manifest_mod.ArtifactRef {
+    return try buildTextArtifactRefsForMaterializedDocsAllocUntil(
+        alloc,
+        artifacts,
+        current,
+        before_docs,
+        docs,
+        mutations,
+        text_index_specs,
+        null,
+    );
+}
+
+pub fn buildTextArtifactRefsForMaterializedDocsAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    text_index_specs: []const FullTextIndexSpec,
+    cancellation: ?maintenance_cancellation.Token,
+) ![]manifest_mod.ArtifactRef {
     const refs = try alloc.alloc(manifest_mod.ArtifactRef, text_index_specs.len);
     errdefer alloc.free(refs);
     var initialized: usize = 0;
@@ -2710,6 +2834,7 @@ pub fn buildTextArtifactRefsForMaterializedDocsAlloc(
     }
 
     for (text_index_specs, 0..) |spec, idx| {
+        try maintenance_cancellation.check(cancellation);
         if (current) |manifest| {
             if (!try textProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, spec)) {
                 if (try cloneNamedArtifactRefAlloc(alloc, manifest, .text_segment, spec.name)) |artifact| {
@@ -2719,7 +2844,7 @@ pub fn buildTextArtifactRefsForMaterializedDocsAlloc(
                 }
             }
         }
-        const payload = try buildTextSegmentAlloc(alloc, docs, spec);
+        const payload = try buildTextSegmentAlloc(alloc, docs, spec, cancellation);
         defer alloc.free(payload);
         var artifact = try artifacts.put(payload);
         defer artifact.deinit(alloc);
@@ -2737,6 +2862,7 @@ fn buildTextArtifactRefsForRepublishAlloc(
     text_index_specs: []const FullTextIndexSpec,
     planned_actions: []const publication_plan.FullTextIndexAction,
     fallback_action: publication_plan.ArtifactAction,
+    cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
     const refs = try alloc.alloc(manifest_mod.ArtifactRef, text_index_specs.len);
     errdefer alloc.free(refs);
@@ -2746,6 +2872,7 @@ fn buildTextArtifactRefsForRepublishAlloc(
     }
 
     for (text_index_specs, 0..) |spec, idx| {
+        try maintenance_cancellation.check(cancellation);
         const action = fullTextActionForName(planned_actions, spec.name, fallback_action);
         if (action == .reuse) {
             if (findNamedArtifactIndex(current, .text_segment, spec.name)) |artifact_index| {
@@ -2755,7 +2882,7 @@ fn buildTextArtifactRefsForRepublishAlloc(
                 continue;
             }
         }
-        const payload = try buildTextSegmentAlloc(alloc, docs, spec);
+        const payload = try buildTextSegmentAlloc(alloc, docs, spec, cancellation);
         defer alloc.free(payload);
         var artifact = try artifacts.put(payload);
         defer artifact.deinit(alloc);
@@ -2909,7 +3036,7 @@ fn freeQueryMutations(alloc: Allocator, mutations: []query_mod.QueryMaterializer
     freeMaterializerMutations(alloc, mutations);
 }
 
-fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec) !text_segment_mod.Segment {
+fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterializedDocument, spec: FullTextIndexSpec, cancellation: ?maintenance_cancellation.Token) !text_segment_mod.Segment {
     const doc_entries = try alloc.alloc(text_segment_mod.DocumentEntry, docs.len);
     errdefer alloc.free(doc_entries);
 
@@ -2925,6 +3052,7 @@ fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterial
     }
 
     for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         var projection = try document_projection.parseAlloc(alloc, doc.body);
         defer projection.deinit(alloc);
         const source_text = try selectTextSourceAlloc(alloc, doc.body, &projection, spec);
@@ -2938,6 +3066,7 @@ fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterial
 
         var token_iter = std.mem.tokenizeAny(u8, normalized_text, " ");
         while (token_iter.next()) |token| {
+            if (token_count % 256 == 0) try maintenance_cancellation.check(cancellation);
             token_count += 1;
             const gop = try per_doc.getOrPut(alloc, token);
             if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -2969,6 +3098,7 @@ fn allocTextSegmentAlloc(alloc: Allocator, docs: []const query_mod.QueryMaterial
     }
 
     for (term_map.keys(), 0..) |term, idx| {
+        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
         term_entries[idx] = .{
             .term = try alloc.dupe(u8, term),
             .postings = try term_map.values()[idx].toOwnedSlice(alloc),
@@ -3058,6 +3188,7 @@ fn buildVectorSegmentAlloc(
     docs: []const query_mod.QueryMaterializedDocument,
     policy: ?vector_index.BuildPolicy,
     vector_source: ?search_sources.VectorSourceDescriptor,
+    cancellation: ?maintenance_cancellation.Token,
 ) !struct {
     payload: ?[]u8,
     vector_count: usize,
@@ -3066,7 +3197,8 @@ fn buildVectorSegmentAlloc(
     const metric = vector_source.?.distance_metric orelse fallback_metric;
     var dims: ?usize = null;
     var count: usize = 0;
-    for (docs) |doc| {
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         var projection = try document_projection.parseAlloc(alloc, doc.body);
         defer projection.deinit(alloc);
         switch (search_sources.selectVectorSource(&projection, vector_source.?)) {
@@ -3093,7 +3225,8 @@ fn buildVectorSegmentAlloc(
         for (entries[0..initialized]) |*entry| entry.deinit(alloc);
     }
 
-    for (docs) |doc| {
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         var projection = try document_projection.parseAlloc(alloc, doc.body);
         defer projection.deinit(alloc);
         switch (search_sources.selectVectorSource(&projection, vector_source.?)) {
@@ -3117,10 +3250,14 @@ fn buildVectorSegmentAlloc(
         }
     }
 
-    var segment = if (policy) |value|
-        try vector_index.buildClusteredSegmentWithPolicyAlloc(alloc, metric, @intCast(dims.?), entries, value)
-    else
-        try vector_index.buildClusteredSegmentAlloc(alloc, metric, @intCast(dims.?), entries);
+    var segment = try vector_index.buildClusteredSegmentWithPolicyAllocUntil(
+        alloc,
+        metric,
+        @intCast(dims.?),
+        entries,
+        policy orelse .{},
+        cancellation,
+    );
     defer vector_segment_mod.freeSegment(alloc, &segment);
     return .{
         .payload = try vector_segment_mod.encodeAlloc(alloc, segment),
@@ -3140,12 +3277,41 @@ pub fn buildVectorArtifactRefsForMaterializedDocsAlloc(
     named_policies: []const NamedVectorBuildPolicy,
     published_search_sources: search_sources.PublishedSearchSources,
 ) ![]manifest_mod.ArtifactRef {
+    return try buildVectorArtifactRefsForMaterializedDocsAllocUntil(
+        alloc,
+        artifacts,
+        current,
+        metric,
+        before_docs,
+        docs,
+        mutations,
+        policy,
+        named_policies,
+        published_search_sources,
+        null,
+    );
+}
+
+pub fn buildVectorArtifactRefsForMaterializedDocsAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    metric: shared_vector.DistanceMetric,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    policy: ?vector_index.BuildPolicy,
+    named_policies: []const NamedVectorBuildPolicy,
+    published_search_sources: search_sources.PublishedSearchSources,
+    cancellation: ?maintenance_cancellation.Token,
+) ![]manifest_mod.ArtifactRef {
     const vector_sources = try search_sources.listVectorSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeVectorSourceDescriptors(alloc, vector_sources);
 
     var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
     errdefer freeArtifactRefs(alloc, refs.items);
     for (vector_sources) |source| {
+        try maintenance_cancellation.check(cancellation);
         if (current) |manifest| {
             if (!try vectorProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations, source)) {
                 if (try appendReusedNamedArtifactRefAlloc(alloc, &refs, manifest, .vector_segment, source.index_name)) continue;
@@ -3157,6 +3323,7 @@ pub fn buildVectorArtifactRefsForMaterializedDocsAlloc(
             docs,
             namedVectorBuildPolicyForName(named_policies, source.index_name, policy),
             source,
+            cancellation,
         );
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
@@ -3192,6 +3359,7 @@ fn buildSparseArtifactRefsForRepublishAlloc(
     published_search_sources: search_sources.PublishedSearchSources,
     named_actions: []const publication_plan.NamedArtifactAction,
     fallback_action: publication_plan.ArtifactAction,
+    cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
     const sparse_sources = try search_sources.listSparseSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeSparseSourceDescriptors(alloc, sparse_sources);
@@ -3202,6 +3370,7 @@ fn buildSparseArtifactRefsForRepublishAlloc(
     var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
     errdefer freeArtifactRefs(alloc, refs.items);
     for (sparse_sources) |source| {
+        try maintenance_cancellation.check(cancellation);
         const action = namedArtifactActionForName(named_actions, source.index_name, fallback_action);
         if (action == .drop) continue;
         if (action == .reuse) {
@@ -3221,7 +3390,7 @@ fn buildSparseArtifactRefsForRepublishAlloc(
                 }
             }
         }
-        const built = try buildSparseSegmentAllocForSource(alloc, docs, source);
+        const built = try buildSparseSegmentAllocForSource(alloc, docs, source, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -3246,6 +3415,7 @@ fn buildVectorArtifactRefsForRepublishAlloc(
     published_search_sources: search_sources.PublishedSearchSources,
     named_actions: []const publication_plan.NamedArtifactAction,
     fallback_action: publication_plan.ArtifactAction,
+    cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
     const vector_sources = try search_sources.listVectorSourcesAlloc(alloc, published_search_sources);
     defer search_sources.freeVectorSourceDescriptors(alloc, vector_sources);
@@ -3256,6 +3426,7 @@ fn buildVectorArtifactRefsForRepublishAlloc(
     var refs = std.ArrayListUnmanaged(manifest_mod.ArtifactRef).empty;
     errdefer freeArtifactRefs(alloc, refs.items);
     for (vector_sources) |source| {
+        try maintenance_cancellation.check(cancellation);
         const action = namedArtifactActionForName(named_actions, source.index_name, fallback_action);
         if (action == .drop) continue;
         if (action == .reuse) {
@@ -3275,7 +3446,7 @@ fn buildVectorArtifactRefsForRepublishAlloc(
                 }
             }
         }
-        const built = try buildVectorSegmentAlloc(alloc, metric, docs, null, source);
+        const built = try buildVectorSegmentAlloc(alloc, metric, docs, null, source, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -3301,6 +3472,30 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAlloc(
     graph_index_names: []const []u8,
     include_graph: bool,
 ) ![]manifest_mod.ArtifactRef {
+    return try buildGraphArtifactRefsForMaterializedDocsAllocUntil(
+        alloc,
+        artifacts,
+        current,
+        before_docs,
+        docs,
+        mutations,
+        graph_index_names,
+        include_graph,
+        null,
+    );
+}
+
+pub fn buildGraphArtifactRefsForMaterializedDocsAllocUntil(
+    alloc: Allocator,
+    artifacts: *artifacts_mod.ArtifactStore,
+    current: ?manifest_mod.Manifest,
+    before_docs: []const query_mod.QueryMaterializedDocument,
+    docs: []const query_mod.QueryMaterializedDocument,
+    mutations: []const query_mod.QueryMaterializerMutation,
+    graph_index_names: []const []u8,
+    include_graph: bool,
+    cancellation: ?maintenance_cancellation.Token,
+) ![]manifest_mod.ArtifactRef {
     if (!include_graph) return try alloc.alloc(manifest_mod.ArtifactRef, 0);
 
     const changed = try graphProjectionChangedForMutationsAlloc(alloc, before_docs, docs, mutations);
@@ -3315,7 +3510,7 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAlloc(
                 }
             }
         }
-        const built = try buildGraphSegmentAlloc(alloc, docs, true);
+        const built = try buildGraphSegmentAllocUntil(alloc, docs, true, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -3341,7 +3536,7 @@ pub fn buildGraphArtifactRefsForMaterializedDocsAlloc(
         }
     }
 
-    const built = try buildGraphSegmentAlloc(alloc, docs, true);
+    const built = try buildGraphSegmentAllocUntil(alloc, docs, true, cancellation);
     defer if (built.payload) |payload| alloc.free(payload);
     if (built.payload) |payload| {
         var artifact = try artifacts.put(payload);
@@ -3369,6 +3564,7 @@ fn buildGraphArtifactRefsForRepublishAlloc(
     graph_index_names: []const []u8,
     action: publication_plan.ArtifactAction,
     include_graph: bool,
+    cancellation: ?maintenance_cancellation.Token,
 ) ![]manifest_mod.ArtifactRef {
     if (!include_graph or action == .drop) return try alloc.alloc(manifest_mod.ArtifactRef, 0);
 
@@ -3381,7 +3577,7 @@ fn buildGraphArtifactRefsForRepublishAlloc(
                 return refs;
             }
         }
-        const built = try buildGraphSegmentAlloc(alloc, docs, true);
+        const built = try buildGraphSegmentAllocUntil(alloc, docs, true, cancellation);
         defer if (built.payload) |payload| alloc.free(payload);
         if (built.payload) |payload| {
             var artifact = try artifacts.put(payload);
@@ -3405,7 +3601,7 @@ fn buildGraphArtifactRefsForRepublishAlloc(
         freeArtifactRefs(alloc, refs.items);
     }
 
-    const built = try buildGraphSegmentAlloc(alloc, docs, true);
+    const built = try buildGraphSegmentAllocUntil(alloc, docs, true, cancellation);
     defer if (built.payload) |payload| alloc.free(payload);
     if (built.payload) |payload| {
         var artifact = try artifacts.put(payload);
@@ -3632,20 +3828,32 @@ fn predictDerivedOutputAction(
     };
 }
 
+pub const GraphSegmentBuildResult = struct {
+    payload: ?[]u8,
+    edge_count: usize,
+};
+
 pub fn buildGraphSegmentAlloc(
     alloc: Allocator,
     docs: []const query_mod.QueryMaterializedDocument,
     include_graph: bool,
-) !struct {
-    payload: ?[]u8,
-    edge_count: usize,
-} {
+) !GraphSegmentBuildResult {
+    return try buildGraphSegmentAllocUntil(alloc, docs, include_graph, null);
+}
+
+pub fn buildGraphSegmentAllocUntil(
+    alloc: Allocator,
+    docs: []const query_mod.QueryMaterializedDocument,
+    include_graph: bool,
+    cancellation: ?maintenance_cancellation.Token,
+) !GraphSegmentBuildResult {
     if (!include_graph) return .{ .payload = null, .edge_count = 0 };
     var node_map = std.StringArrayHashMapUnmanaged(NodeEdges).empty;
     defer deinitNodeMap(alloc, &node_map);
     var total_edges: usize = 0;
 
-    for (docs) |doc| {
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         _ = try ensureNode(alloc, &node_map, doc.doc_id);
         const parsed_edges = try parseGraphEdgesAlloc(alloc, doc.body);
         defer freeParsedGraphEdges(alloc, parsed_edges);
@@ -3668,7 +3876,7 @@ pub fn buildGraphSegmentAlloc(
 
     if (total_edges == 0) return .{ .payload = null, .edge_count = 0 };
 
-    var segment = try nodeMapToSegmentAlloc(alloc, &node_map);
+    var segment = try nodeMapToSegmentAlloc(alloc, &node_map, cancellation);
     defer graph_segment_mod.freeSegment(alloc, &segment);
     return .{
         .payload = try graph_segment_mod.encodeAlloc(alloc, segment),
@@ -3752,7 +3960,11 @@ fn lessParsedGraphEdge(_: void, lhs: ParsedGraphEdge, rhs: ParsedGraphEdge) bool
     return lhs.weight < rhs.weight;
 }
 
-fn nodeMapToSegmentAlloc(alloc: Allocator, node_map: *std.StringArrayHashMapUnmanaged(NodeEdges)) !graph_segment_mod.Segment {
+fn nodeMapToSegmentAlloc(
+    alloc: Allocator,
+    node_map: *std.StringArrayHashMapUnmanaged(NodeEdges),
+    cancellation: ?maintenance_cancellation.Token,
+) !graph_segment_mod.Segment {
     const adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, node_map.count());
     errdefer alloc.free(adjacencies);
     var initialized: usize = 0;
@@ -3761,6 +3973,7 @@ fn nodeMapToSegmentAlloc(alloc: Allocator, node_map: *std.StringArrayHashMapUnma
     }
 
     for (node_map.keys(), node_map.values(), 0..) |node_id, *node_edges, idx| {
+        if (idx % 64 == 0) try maintenance_cancellation.check(cancellation);
         sortGraphEdges(node_edges.out_edges.items);
         sortGraphEdges(node_edges.in_edges.items);
         adjacencies[idx] = .{
@@ -3805,9 +4018,11 @@ fn allocSparseSegmentAlloc(
     alloc: Allocator,
     docs: []const query_mod.QueryMaterializedDocument,
     sparse_source: search_sources.SparseSourceDescriptor,
+    cancellation: ?maintenance_cancellation.Token,
 ) !?sparse_segment_mod.Segment {
     var sparse_doc_count: usize = 0;
-    for (docs) |doc| {
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         var projection = try document_projection.parseAlloc(alloc, doc.body);
         defer projection.deinit(alloc);
         if (search_sources.selectSparseSource(&projection, sparse_source) != null) sparse_doc_count += 1;
@@ -3828,7 +4043,8 @@ fn allocSparseSegmentAlloc(
         term_map.deinit(alloc);
     }
 
-    for (docs) |doc| {
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index % 64 == 0) try maintenance_cancellation.check(cancellation);
         var projection = try document_projection.parseAlloc(alloc, doc.body);
         defer projection.deinit(alloc);
         const sparse_embedding = search_sources.selectSparseSource(&projection, sparse_source) orelse continue;

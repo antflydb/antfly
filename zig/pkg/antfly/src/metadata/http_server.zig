@@ -94,6 +94,7 @@ pub const AdminSource = struct {
             manifest: *const backups_api.TableBackupManifest,
         ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
+        drop_table_expected: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
@@ -193,6 +194,11 @@ pub const AdminSource = struct {
     pub fn dropTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_table orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn dropTableExpected(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) !void {
+        const fn_ptr = self.vtable.drop_table_expected orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, expected_table_id);
     }
 
     pub fn updateSchema(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -338,6 +344,7 @@ pub const AdminSource = struct {
                 .replace_table_definition = metadataServiceReplaceTableDefinition,
                 .restore_table = metadataServiceRestoreTable,
                 .drop_table = metadataServiceDropTable,
+                .drop_table_expected = metadataServiceDropTableExpected,
                 .update_schema = metadataServiceUpdateSchema,
                 .create_index = metadataServiceCreateIndex,
                 .drop_index = metadataServiceDropIndex,
@@ -383,6 +390,7 @@ pub const AdminSource = struct {
                 .replace_table_definition = metadataHttpServiceReplaceTableDefinition,
                 .restore_table = metadataHttpServiceRestoreTable,
                 .drop_table = metadataHttpServiceDropTable,
+                .drop_table_expected = metadataHttpServiceDropTableExpected,
                 .update_schema = metadataHttpServiceUpdateSchema,
                 .create_index = metadataHttpServiceCreateIndex,
                 .drop_index = metadataHttpServiceDropIndex,
@@ -539,6 +547,12 @@ pub const AdminSource = struct {
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         _ = try workflow.dropTable(svc, table.table_id);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceDropTableExpected(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try dropExpectedTableOnService(svc, alloc, table_name, expected_table_id);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -885,6 +899,12 @@ pub const AdminSource = struct {
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         _ = try workflow.dropTable(svc, table.table_id);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceDropTableExpected(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try dropExpectedTableOnService(svc, alloc, table_name, expected_table_id);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1906,8 +1926,21 @@ pub const MetadataHttpServer = struct {
 
     fn metadataDropTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
-        self.tableOperations().drop(ctx.allocator, requestContext(ctx), table_name) catch |err| switch (err) {
+        const raw_expected_table_id = ctx.queryDecoded("expected_table_id") catch
+            return ctx.status(400).text("invalid expected table id");
+        const expected_table_id: ?u64 = if (raw_expected_table_id) |value|
+            std.fmt.parseUnsigned(u64, value, 10) catch return ctx.status(400).text("invalid expected table id")
+        else
+            null;
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        const result = if (expected_table_id) |table_id|
+            self.source.dropTableExpected(ctx.allocator, table_name, table_id)
+        else
+            self.tableOperations().drop(ctx.allocator, request, table_name);
+        result catch |err| switch (err) {
             error.TableNotFound => return ctx.status(404).text("table not found"),
+            error.TableGenerationChanged => return ctx.status(409).text("table generation changed"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
@@ -2838,6 +2871,18 @@ fn findTableByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []co
         if (std.mem.eql(u8, table.name, table_name)) return table;
     }
     return null;
+}
+
+fn dropExpectedTableOnService(service_ptr: anytype, alloc: std.mem.Allocator, table_name: []const u8, expected_table_id: u64) !void {
+    var snapshot = try service_ptr.adminSnapshot();
+    defer service_ptr.freeAdminSnapshot(&snapshot);
+    const table = findTableByName(&snapshot, table_name) orelse return error.TableGenerationChanged;
+    if (table.table_id != expected_table_id) return error.TableGenerationChanged;
+    if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
+
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    _ = try workflow.dropTable(service_ptr, expected_table_id);
 }
 
 fn extensionMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {

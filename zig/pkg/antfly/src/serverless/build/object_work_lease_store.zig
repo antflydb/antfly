@@ -255,6 +255,49 @@ pub const ObjectWorkLeaseStore = struct {
         return true;
     }
 
+    pub fn renewBootstrap(
+        self: *ObjectWorkLeaseStore,
+        namespace: []const u8,
+        owner_id: []const u8,
+        fencing_token: u64,
+        now_unix_ns: u64,
+        ttl_ns: u64,
+    ) !u64 {
+        const expires_at = std.math.add(u64, now_unix_ns, ttl_ns) catch
+            return error.LeaseExpiryOverflow;
+        const key = try bootstrapKeyAlloc(self.alloc, self.prefix, namespace);
+        defer self.alloc.free(key);
+        var current = (try self.readCurrentAlloc(key)) orelse return error.WorkLeaseLost;
+        defer current.deinit(self.alloc);
+        if (current.owner_id == null or
+            !std.mem.eql(u8, current.owner_id.?, owner_id) or
+            current.fencing_token != fencing_token or
+            current.released)
+        {
+            return error.WorkLeaseLost;
+        }
+        const proposed = head_coordination.Record{
+            .owner_id = owner_id,
+            .fencing_token = fencing_token,
+            .expires_at_unix_ns = expires_at,
+            .released = false,
+        };
+        const payload = try std.json.Stringify.valueAlloc(self.alloc, proposed, .{});
+        defer self.alloc.free(payload);
+        var result = self.client.putObject(self.bucket, key, payload, .{
+            .content_type = "application/json",
+            .if_match_etag = current.etag,
+        }) catch |err| switch (err) {
+            error.PreconditionFailed => return error.WorkLeaseLost,
+            else => {
+                if (try self.recordMatches(key, proposed)) return expires_at;
+                return err;
+            },
+        };
+        defer result.deinit(self.alloc);
+        return expires_at;
+    }
+
     pub fn renew(
         self: *ObjectWorkLeaseStore,
         namespace: []const u8,
@@ -496,6 +539,7 @@ pub const ObjectWorkLeaseStore = struct {
         .release = erasedRelease,
         .acquire_bootstrap = erasedAcquireBootstrap,
         .release_bootstrap = erasedReleaseBootstrap,
+        .renew_bootstrap = erasedRenewBootstrap,
     };
 
     fn erasedAcquire(
@@ -567,6 +611,24 @@ pub const ObjectWorkLeaseStore = struct {
     ) !bool {
         const self: *ObjectWorkLeaseStore = @ptrCast(@alignCast(ptr));
         return try self.releaseBootstrap(namespace, owner_id, fencing_token);
+    }
+
+    fn erasedRenewBootstrap(
+        ptr: *anyopaque,
+        namespace: []const u8,
+        owner_id: []const u8,
+        fencing_token: u64,
+        now_unix_ns: u64,
+        ttl_ns: u64,
+    ) !u64 {
+        const self: *ObjectWorkLeaseStore = @ptrCast(@alignCast(ptr));
+        return try self.renewBootstrap(
+            namespace,
+            owner_id,
+            fencing_token,
+            now_unix_ns,
+            ttl_ns,
+        );
     }
 };
 
@@ -729,6 +791,46 @@ test "serverless work lease preserves first publication for rolling rollback" {
         "new-worker",
         bootstrap.fencing_token,
     ));
+}
+
+test "serverless bootstrap lease renewal prevents takeover past its original expiry" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var store = try ObjectWorkLeaseStore.initWithClient(
+        alloc,
+        memory.client(),
+        "coordination",
+        "tenant",
+    );
+    defer store.deinit();
+    const provider = store.provider();
+
+    const incumbent = (try provider.acquireBootstrap("docs", "worker-a", 100, 10)).?;
+    try std.testing.expectEqual(
+        @as(u64, 119),
+        try provider.renewBootstrap(
+            "docs",
+            "worker-a",
+            incumbent.fencing_token,
+            109,
+            10,
+        ),
+    );
+    try std.testing.expect((try provider.acquireBootstrap("docs", "worker-b", 111, 10)) == null);
+
+    const replacement = (try provider.acquireBootstrap("docs", "worker-b", 119, 10)).?;
+    try std.testing.expect(replacement.fencing_token > incumbent.fencing_token);
+    try std.testing.expectError(
+        error.WorkLeaseLost,
+        provider.renewBootstrap(
+            "docs",
+            "worker-a",
+            incumbent.fencing_token,
+            120,
+            10,
+        ),
+    );
 }
 
 test "serverless lease body CAS rejects a stale metadata-only renewal" {

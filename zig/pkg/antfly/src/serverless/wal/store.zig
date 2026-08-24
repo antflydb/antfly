@@ -53,6 +53,10 @@ pub const WalStore = struct {
         return try append_fn(self.ptr, namespace, timestamp_ns, payload, operation_id);
     }
 
+    pub fn supportsIdempotentAppend(self: *const WalStore) bool {
+        return self.vtable.append_idempotent != null;
+    }
+
     pub fn readFromAlloc(self: *WalStore, namespace: []const u8, start_lsn: u64) ![]wal_types.Record {
         return try self.vtable.read_from_alloc(self.ptr, self.allocator, namespace, start_lsn);
     }

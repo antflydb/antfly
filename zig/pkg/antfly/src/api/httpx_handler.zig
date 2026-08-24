@@ -4026,21 +4026,37 @@ pub const AntflyApiHandler = struct {
         defer alloc.free(decoded_table_name);
         var local_drop_group_ids: ?[]u64 = null;
         defer if (local_drop_group_ids) |group_ids| alloc.free(group_ids);
-        if (self.api_server.table_writes != null) {
-            if (try self.api_server.source.adminSnapshot()) |snapshot_value| {
-                var snapshot = snapshot_value;
-                defer self.api_server.source.freeAdminSnapshot(&snapshot);
+        var expected_table_id: ?u64 = null;
+        // Capture the identity as well as cleanup routing. Conditional
+        // deletion prevents a response-less retry from deleting a table that
+        // reused the same name with a new ID.
+        if (try self.api_server.tableDropSnapshot()) |snapshot_value| {
+            var snapshot = snapshot_value;
+            defer self.api_server.source.freeAdminSnapshot(&snapshot);
+            if (tables_api.findTableByName(&snapshot, decoded_table_name)) |table| {
+                expected_table_id = table.table_id;
+            }
+            if (self.api_server.table_writes != null) {
                 local_drop_group_ids = try ApiHttpServer.tableGroupIdsFromSnapshot(alloc, &snapshot, decoded_table_name);
             }
         }
-        self.api_server.source.dropTable(alloc, decoded_table_name) catch |err| switch (err) {
+        _ = self.api_server.dropTableMetadata(alloc, decoded_table_name, expected_table_id) catch |err| switch (err) {
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
             },
+            error.TableGenerationChanged => {
+                _ = ctx.status(409);
+                return ctx.text("table changed; retry delete");
+            },
             error.UnsupportedOperation => {
                 _ = ctx.status(405);
                 return ctx.text("method not allowed");
+            },
+            error.MetadataMutationOutcomeUnknown => {
+                try ctx.setHeader("Retry-After", "1");
+                _ = ctx.status(503);
+                return ctx.text("table delete outcome unknown");
             },
             else => {
                 std.log.err("public drop table metadata remove failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
@@ -4057,14 +4073,6 @@ pub const AntflyApiHandler = struct {
                 },
             };
         }
-        self.api_server.waitForTableVisibility(decoded_table_name, .absent) catch |err| switch (err) {
-            error.TableVisibilityTimeout => {
-                std.log.err("public drop table metadata visibility timed out table={s}", .{decoded_table_name});
-                _ = ctx.status(500);
-                return ctx.text("table delete did not converge");
-            },
-            else => return err,
-        };
         _ = ctx.status(204);
         return ctx.text("");
     }

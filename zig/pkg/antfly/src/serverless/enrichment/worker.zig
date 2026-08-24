@@ -27,6 +27,11 @@ const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const embedder_mod = @import("../../storage/db/enrichment/embedder.zig");
 const maintenance_cancellation = @import("../maintenance_cancellation.zig");
+const objectstore = @import("objectstore");
+const artifacts_object_store = @import("../artifacts/object_store.zig");
+const manifest_object_store = @import("../manifest/object_store.zig");
+const progress_object_store = @import("../catalog/object_progress_store.zig");
+const wal_object_store = @import("../wal/object_store.zig");
 
 pub const EnrichmentRunStats = struct {
     enriched_namespaces: usize = 0,
@@ -179,6 +184,8 @@ pub const SparseEnricher = struct {
 
         var stats = EnrichmentRunStats{};
         var next_offset: usize = start_offset;
+        var persisted_offset: u64 = @intCast(start_offset);
+        const idempotent_wal = self.wal.supportsIdempotentAppend();
         for (docs[start_offset..], start_offset..) |doc, doc_index| {
             try maintenance_cancellation.check(cancellation);
             next_offset = doc_index + 1;
@@ -203,7 +210,34 @@ pub const SparseEnricher = struct {
             };
             const encoded = try api_codec.encodeMutationAlloc(self.alloc, mutation);
             defer self.alloc.free(encoded);
-            _ = try self.wal.append(namespace, doc.last_timestamp_ns + 1, encoded);
+            const timestamp_ns = std.math.add(u64, doc.last_timestamp_ns, 1) catch
+                return error.EnrichmentTimestampOverflow;
+            if (idempotent_wal) {
+                var operation_id_buf: [128]u8 = undefined;
+                const operation_id = try enrichmentOperationId(
+                    &operation_id_buf,
+                    head,
+                    cfg.stage,
+                    doc_index,
+                    cfg.pipeline_version,
+                );
+                _ = try self.wal.appendIdempotent(namespace, timestamp_ns, encoded, operation_id);
+            } else {
+                // Stores without durable append identities must checkpoint the
+                // source offset in the same uninterrupted section as the
+                // append. In particular, do not observe cancellation between
+                // these two writes: a retry would otherwise append the same
+                // non-idempotent mutation again.
+                _ = try self.wal.append(namespace, timestamp_ns, encoded);
+                const durable_next: u64 = @intCast(next_offset);
+                if (!(try self.progress.compareAndSwapEnrichmentStageDocOffset(
+                    namespace,
+                    cfg.stage,
+                    persisted_offset,
+                    durable_next,
+                ))) return error.EnrichmentProgressChanged;
+                persisted_offset = durable_next;
+            }
             stats.enriched_documents += 1;
             stats.wal_appends += 1;
             if (derived.used_model) stats.model_documents += 1;
@@ -213,7 +247,12 @@ pub const SparseEnricher = struct {
 
         try maintenance_cancellation.check(cancellation);
         const previous_offset = (try self.progress.getEnrichmentStageDocOffset(namespace, cfg.stage)) orelse 0;
-        _ = try self.progress.compareAndSwapEnrichmentStageDocOffset(namespace, cfg.stage, previous_offset, @intCast(next_offset));
+        const durable_next: u64 = @intCast(next_offset);
+        if (previous_offset != durable_next and
+            !(try self.progress.compareAndSwapEnrichmentStageDocOffset(namespace, cfg.stage, previous_offset, durable_next)))
+        {
+            return error.EnrichmentProgressChanged;
+        }
         if (stats.enriched_documents == 0) {
             stats.idle_namespaces = 1;
         } else {
@@ -288,6 +327,21 @@ pub const SparseEnricher = struct {
         alloc.free(mutations);
     }
 };
+
+fn enrichmentOperationId(
+    buf: []u8,
+    head: u64,
+    stage: catalog_mod.EnrichmentStage,
+    doc_index: usize,
+    pipeline_version: u32,
+) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "enrich-v1/{d}/{d}/{d}/{d}", .{
+        head,
+        @intFromEnum(stage),
+        doc_index,
+        pipeline_version,
+    });
+}
 
 fn findArtifactIndex(manifest: manifest_mod.Manifest, kind: manifest_mod.ArtifactKind) ?usize {
     for (manifest.artifacts, 0..) |artifact, idx| {
@@ -852,6 +906,51 @@ const CancelingSparseEmbedder = struct {
     }
 };
 
+const CancelAfterAppendWal = struct {
+    inner: *wal_mod.WalStore,
+    requested: *std.atomic.Value(bool),
+
+    fn walStore(self: *@This()) wal_mod.WalStore {
+        return .{
+            .allocator = self.inner.allocator,
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    const vtable: wal_mod.WalStore.VTable = .{
+        .deinit = deinit,
+        .append = append,
+        .read_from_alloc = readFromAlloc,
+        .latest_lsn = latestLsn,
+        .truncate_prefix = truncatePrefix,
+    };
+
+    fn deinit(_: Allocator, _: *anyopaque) void {}
+
+    fn append(ptr: *anyopaque, namespace: []const u8, timestamp_ns: u64, payload: []const u8) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const lsn = try self.inner.append(namespace, timestamp_ns, payload);
+        self.requested.store(true, .release);
+        return lsn;
+    }
+
+    fn readFromAlloc(ptr: *anyopaque, alloc: Allocator, namespace: []const u8, start_lsn: u64) ![]wal_mod.Record {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.vtable.read_from_alloc(self.inner.ptr, alloc, namespace, start_lsn);
+    }
+
+    fn latestLsn(ptr: *anyopaque, namespace: []const u8) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.latestLsn(namespace);
+    }
+
+    fn truncatePrefix(ptr: *anyopaque, namespace: []const u8, keep_from_lsn: u64) !u64 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.inner.truncatePrefix(namespace, keep_from_lsn);
+    }
+};
+
 fn buildDeterministicEmbeddingAlloc(alloc: Allocator, text: []const u8, dims: usize) ![]f32 {
     const embedding = try alloc.alloc(f32, dims);
     @memset(embedding, 0);
@@ -1143,6 +1242,122 @@ test "sparse enricher appends derived sparse mutation when published docs lack s
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"sparse_embedding\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"alpha\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, mutation.body.?, "\"lexical_sparse_version\":1") != null);
+}
+
+test "serverless enrichment cancellation after non-idempotent append checkpoints its offset" {
+    const alloc = std.testing.allocator;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-cancel-after-append");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-cancel-after-append");
+    const wal_root = tmpPath(&wal_root_buf, "wal-cancel-after-append");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var builder = @import("../build/builder.zig").Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
+    const batch = [_]api_types.DocumentMutation{.{
+        .kind = .upsert,
+        .doc_id = "doc-a",
+        .body = "{\"text\":\"alpha bravo\"}",
+    }};
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
+    defer ingest.deinit(alloc);
+    var build = try builder.publishNamespace("docs");
+    defer build.deinit(alloc);
+
+    var requested = std.atomic.Value(bool).init(false);
+    var canceling_impl = CancelAfterAppendWal{ .inner = &wal_store, .requested = &requested };
+    var canceling_wal = canceling_impl.walStore();
+    defer canceling_wal.deinit();
+    var enricher = SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &canceling_wal);
+    try std.testing.expectError(
+        error.Canceled,
+        enricher.runNamespaceWithConfigUntil("docs", .{
+            .batch_size = 4,
+            .pipeline_version = lexical_sparse_enrichment_version,
+        }, .{
+            .io = std.Options.debug_io,
+            .requested = &requested,
+        }),
+    );
+    try std.testing.expectEqual(@as(?u64, 1), try progress_store.getEnrichmentDocOffset("docs"));
+    try std.testing.expectEqual(@as(u64, 2), try wal_store.latestLsn("docs"));
+
+    requested.store(false, .release);
+    const retry = try enricher.runNamespaceWithConfig("docs", .{
+        .batch_size = 4,
+        .pipeline_version = lexical_sparse_enrichment_version,
+    });
+    try std.testing.expectEqual(@as(usize, 1), retry.idle_namespaces);
+    try std.testing.expectEqual(@as(u64, 2), try wal_store.latestLsn("docs"));
+}
+
+test "serverless object enrichment writes a stable idempotent WAL identity" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var artifact_impl = try artifacts_object_store.ObjectStore.initWithClient(alloc, memory.client(), "enrichment-artifacts", "tenant");
+    var artifacts = artifact_impl.artifactStore();
+    defer artifacts.deinit();
+    var manifest_impl = try manifest_object_store.ObjectStore.initWithClient(alloc, memory.client(), "enrichment-manifests", "tenant");
+    var manifests = manifest_impl.manifestStore();
+    defer manifests.deinit();
+    var progress_impl = try progress_object_store.ObjectProgressStore.initWithClient(alloc, memory.client(), "enrichment-progress", "tenant");
+    var progress = progress_impl.progressStore();
+    defer progress.deinit();
+    var wal_impl = try wal_object_store.ObjectStore.initWithClient(alloc, memory.client(), "enrichment-wal", "tenant");
+    var wal = wal_impl.walStore();
+    defer wal.deinit();
+
+    var builder = @import("../build/builder.zig").Builder.init(alloc, &artifacts, &manifests, &progress, &wal);
+    var api = @import("../api/service.zig").Service.init(alloc, &wal, &builder);
+    const batch = [_]api_types.DocumentMutation{.{
+        .kind = .upsert,
+        .doc_id = "doc-a",
+        .body = "{\"text\":\"alpha bravo\"}",
+    }};
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
+    defer ingest.deinit(alloc);
+    var build = try builder.publishNamespace("docs");
+    defer build.deinit(alloc);
+
+    var enricher = SparseEnricher.init(alloc, &artifacts, &manifests, &progress, &wal);
+    const stats = try enricher.runNamespaceWithConfig("docs", .{
+        .batch_size = 4,
+        .pipeline_version = lexical_sparse_enrichment_version,
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats.wal_appends);
+    const tail = try wal.readFromAlloc("docs", 2);
+    defer wal_mod.freeRecords(alloc, tail);
+    try std.testing.expectEqual(@as(usize, 1), tail.len);
+    try std.testing.expectEqualStrings("enrich-v1/1/1/0/1", tail[0].operation_id.?);
+    try std.testing.expectEqual(
+        tail[0].lsn,
+        try wal.appendIdempotent(
+            "docs",
+            tail[0].timestamp_ns,
+            tail[0].payload,
+            tail[0].operation_id.?,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 2), try wal.latestLsn("docs"));
 }
 
 test "sparse enricher can append derived chunk preview mutation" {

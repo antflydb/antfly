@@ -183,11 +183,22 @@ pub const BackgroundPublisher = struct {
                 _ = lease.release() catch {};
             };
 
-            const publication_guard = if (held_lease) |*lease| lease.guard() else null;
+            const publication_guard = if (held_lease) |*lease|
+                lease.guard()
+            else if (held_bootstrap_lease) |*lease|
+                lease.guard()
+            else
+                null;
+            const build_cancellation = if (held_lease) |*lease|
+                lease.cancellation(cancellation)
+            else if (held_bootstrap_lease) |*lease|
+                lease.cancellation(cancellation)
+            else
+                cancellation;
             var result = self.catalog.buildNamespaceGuardedUntil(
                 namespace.name,
                 publication_guard,
-                cancellation,
+                build_cancellation,
             ) catch |err| switch (err) {
                 error.HeadChanged => {
                     stats.head_conflicts += 1;

@@ -132,7 +132,7 @@ pub const Compactor = struct {
             .indexes_json = current.stats.indexes_json,
         }, &.{});
         defer full_text_indexes.freeFullTextIndexSpecs(self.alloc, text_index_specs);
-        const text_refs = try builder_mod.buildTextArtifactRefsForMaterializedDocsAlloc(
+        const text_refs = try builder_mod.buildTextArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current,
@@ -140,10 +140,11 @@ pub const Compactor = struct {
             latest_docs,
             overlay_mutations,
             text_index_specs,
+            cancellation,
         );
         defer builder_mod.freeArtifactRefs(self.alloc, text_refs);
         try maintenance_cancellation.check(cancellation);
-        const sparse_refs = try builder_mod.buildSparseArtifactRefsForMaterializedDocsAlloc(
+        const sparse_refs = try builder_mod.buildSparseArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current,
@@ -151,6 +152,7 @@ pub const Compactor = struct {
             latest_docs,
             overlay_mutations,
             current.stats.published_search_sources,
+            cancellation,
         );
         defer builder_mod.freeArtifactRefs(self.alloc, sparse_refs);
         try maintenance_cancellation.check(cancellation);
@@ -163,7 +165,7 @@ pub const Compactor = struct {
             document_entries.len,
         );
         defer self.alloc.free(named_vector_policies);
-        const vector_refs = try builder_mod.buildVectorArtifactRefsForMaterializedDocsAlloc(
+        const vector_refs = try builder_mod.buildVectorArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current,
@@ -174,12 +176,13 @@ pub const Compactor = struct {
             null,
             named_vector_policies,
             current.stats.published_search_sources,
+            cancellation,
         );
         defer builder_mod.freeArtifactRefs(self.alloc, vector_refs);
         try maintenance_cancellation.check(cancellation);
         const graph_index_names = try builder_mod.listGraphIndexNamesAlloc(self.alloc, current.stats.indexes_json);
         defer builder_mod.freeOwnedStrings(self.alloc, graph_index_names);
-        const graph_refs = try builder_mod.buildGraphArtifactRefsForMaterializedDocsAlloc(
+        const graph_refs = try builder_mod.buildGraphArtifactRefsForMaterializedDocsAllocUntil(
             self.alloc,
             self.artifacts,
             current,
@@ -188,6 +191,7 @@ pub const Compactor = struct {
             overlay_mutations,
             graph_index_names,
             true,
+            cancellation,
         );
         defer builder_mod.freeArtifactRefs(self.alloc, graph_refs);
         try maintenance_cancellation.check(cancellation);
@@ -232,13 +236,15 @@ pub const Compactor = struct {
         defer manifest.deinit(self.alloc);
 
         try maintenance_cancellation.check(cancellation);
-        try self.manifests.put(manifest);
-        try maintenance_cancellation.check(cancellation);
+        const published_version = try builder_mod.putManifestForPublication(
+            self.manifests,
+            &manifest,
+        );
         const published = try builder_mod.compareAndSwapHeadGuarded(
             self.progress,
             namespace,
             current_head,
-            next_version,
+            published_version,
             publication_guard,
         );
         if (!published) return error.HeadChanged;
@@ -246,7 +252,7 @@ pub const Compactor = struct {
         return .{
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
-            .version = next_version,
+            .version = published_version,
             .artifact_count = manifest.artifacts.len,
         };
     }

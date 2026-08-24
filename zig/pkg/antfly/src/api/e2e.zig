@@ -69,28 +69,52 @@ fn runMetadataUntilIncarnationReady(svc: *metadata_service.MetadataService) !voi
     return error.MetadataIncarnationUnavailable;
 }
 
-fn metadataServiceProgressSource(svc: *metadata_service.MetadataService) raft_mod.ProgressSource {
+fn metadataServiceRaftProgressSource(svc: *metadata_service.MetadataService) raft_mod.ProgressSource {
     return .{
         .ptr = svc,
-        .run_once = runMetadataServiceProgress,
+        .run_once = runMetadataServiceRaftProgress,
     };
 }
 
-fn runMetadataServiceProgress(ptr: *anyopaque) !void {
+fn runMetadataServiceRaftProgress(ptr: *anyopaque) !void {
     const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-    try svc.runRound();
+    try svc.runRaftRoundOnly();
 }
 
-fn dataServerProgressSource(data_server: *data_runtime.DataServer) raft_mod.ProgressSource {
+fn metadataServiceControlProgressSource(svc: *metadata_service.MetadataService) raft_mod.ProgressSource {
+    return .{
+        .ptr = svc,
+        .run_once = runMetadataServiceControlProgress,
+    };
+}
+
+fn runMetadataServiceControlProgress(ptr: *anyopaque) !void {
+    const svc: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
+    try svc.runControlRoundOnly();
+}
+
+fn dataServerRaftProgressSource(data_server: *data_runtime.DataServer) raft_mod.ProgressSource {
     return .{
         .ptr = data_server,
-        .run_once = runDataServerProgress,
+        .run_once = runDataServerRaftProgress,
     };
 }
 
-fn runDataServerProgress(ptr: *anyopaque) !void {
+fn runDataServerRaftProgress(ptr: *anyopaque) !void {
     const data_server: *data_runtime.DataServer = @ptrCast(@alignCast(ptr));
-    try data_server.runRound();
+    try data_server.runRaftRoundOnly();
+}
+
+fn dataServerControlProgressSource(data_server: *data_runtime.DataServer) raft_mod.ProgressSource {
+    return .{
+        .ptr = data_server,
+        .run_once = runDataServerControlProgress,
+    };
+}
+
+fn runDataServerControlProgress(ptr: *anyopaque) !void {
+    const data_server: *data_runtime.DataServer = @ptrCast(@alignCast(ptr));
+    try data_server.runControlRoundOnly();
 }
 
 fn registerDataServerUntilVisible(
@@ -250,6 +274,19 @@ fn startMetadataAdminListener(
     );
     listener.* = try metadata_http_test_runtime.Runtime.startOwned(alloc, server);
     return try listener.baseUri(alloc);
+}
+
+fn stopMetadataAdminListener(
+    alloc: std.mem.Allocator,
+    base_uri: []u8,
+    server: *metadata_http_server.MetadataHttpServer,
+    listener: *metadata_http_test_runtime.Runtime,
+) void {
+    alloc.free(base_uri);
+    // Registered routes retain callbacks into `server`, so stop and join the
+    // listener before releasing the callback owner.
+    listener.deinit();
+    server.deinit();
 }
 
 const Factory = struct {
@@ -2451,9 +2488,7 @@ test "public api split e2e backs up drops and restores a table" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_server.deinit();
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(std.testing.allocator, .{
         .replica_root_dir = replica_root,
@@ -2612,17 +2647,22 @@ test "public api standalone-like e2e backs up drops and restores a table" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
-    defer metadata_admin_server.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
-    var metadata_progress = raft_mod.ManagedProgressDriver.init(
+    var metadata_raft_progress = raft_mod.ManagedProgressDriver.init(
         io_impl.io(),
-        metadataServiceProgressSource(&svc),
+        metadataServiceRaftProgressSource(&svc),
         std.time.ns_per_ms,
     );
-    defer metadata_progress.deinit();
-    try metadata_progress.start();
+    defer metadata_raft_progress.deinit();
+    try metadata_raft_progress.start();
+    var metadata_control_progress = raft_mod.ManagedProgressDriver.init(
+        io_impl.io(),
+        metadataServiceControlProgressSource(&svc),
+        std.time.ns_per_ms,
+    );
+    defer metadata_control_progress.deinit();
+    try metadata_control_progress.start();
 
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
         .replica_root_dir = data_replica_root,
@@ -2640,13 +2680,22 @@ test "public api standalone-like e2e backs up drops and restores a table" {
     try data_server.start();
     try registerDataServerUntilVisible(&data_server, io_impl.io());
 
-    var data_progress = raft_mod.ManagedProgressDriver.init(
+    // Match production's scheduling invariant: metadata/storage control I/O
+    // must never stall the latency-sensitive data-Raft ticker.
+    var data_raft_progress = raft_mod.ManagedProgressDriver.init(
         io_impl.io(),
-        dataServerProgressSource(&data_server),
+        dataServerRaftProgressSource(&data_server),
         std.time.ns_per_ms,
     );
-    defer data_progress.deinit();
-    try data_progress.start();
+    defer data_raft_progress.deinit();
+    try data_raft_progress.start();
+    var data_control_progress = raft_mod.ManagedProgressDriver.init(
+        io_impl.io(),
+        dataServerControlProgressSource(&data_server),
+        std.time.ns_per_ms,
+    );
+    defer data_control_progress.deinit();
+    try data_control_progress.start();
     svc.setLocalGroupStatusProvider(data_server.localGroupStatusProvider());
     defer svc.setLocalGroupStatusProvider(null);
 
@@ -2745,8 +2794,10 @@ test "public api standalone-like e2e backs up drops and restores a table" {
 
     var restore_succeeded = false;
     for (0..30_000) |_| {
-        try metadata_progress.check();
-        try data_progress.check();
+        try metadata_raft_progress.check();
+        try metadata_control_progress.checkFailure();
+        try data_raft_progress.check();
+        try data_control_progress.checkFailure();
         var job_resp = try executor.executor().execute(std.testing.allocator, .{
             .method = .GET,
             .uri = restore_job_uri,
@@ -2839,9 +2890,7 @@ test "split data runtime registers a store with metadata" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
-    defer metadata_admin_server.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(std.testing.allocator, .{
         .replica_root_dir = data_replica_root,
@@ -2965,9 +3014,7 @@ test "split data runtime serves retrieval agent pipeline queries" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
-    defer metadata_admin_server.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var data_server = try data_runtime.DataServer.initFromMetadataApiUrl(std.testing.allocator, .{
         .replica_root_dir = data_replica_root,
@@ -6751,8 +6798,7 @@ test "public api smoke e2e queries across split ranges" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
@@ -6970,9 +7016,7 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_server.deinit();
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     {
         var bootstrap_read_source = table_reads.ProvisionedTableReadSource.init(
@@ -7671,8 +7715,7 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
@@ -7867,8 +7910,7 @@ test "public api smoke e2e commits transaction across split ranges" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
@@ -8240,8 +8282,7 @@ test "public api smoke e2e queries after merge finalization" {
         &metadata_admin_server,
         &metadata_admin_listener,
     );
-    defer std.testing.allocator.free(metadata_api);
-    defer metadata_admin_listener.deinit();
+    defer stopMetadataAdminListener(std.testing.allocator, metadata_api, &metadata_admin_server, &metadata_admin_listener);
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
