@@ -29,7 +29,8 @@ class GraphMatch:
             predicates and row-level authorization filters on this alias must have native index coverage so Antfly can
             enumerate the complete relation in `_id` order; otherwise the request fails with
             `graph_anchor_filter_requires_index`.
-        nodes (GraphMatchNodes): Aliases are limited to 128 Unicode code points.
+        nodes (GraphMatchNodes): Aliases are limited to 128 Unicode code points and cannot have leading or trailing
+            whitespace.
         edges (list[GraphMatchEdge]):
         where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):
         optional (list[GraphOptionalMatch] | Unset):

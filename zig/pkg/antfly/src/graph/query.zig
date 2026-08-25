@@ -124,8 +124,13 @@ test "graph public operation names and edge filters stay unambiguous and bounded
     try std.testing.expect(!isValidQueryName("$query_results"));
     try std.testing.expect(!isValidQueryName("$graph_results.walk"));
     try std.testing.expect(isValidIdentifier("author"));
+    try std.testing.expect(isValidIdentifier("author name"));
     try std.testing.expect(!isValidIdentifier(""));
     try std.testing.expect(!isValidIdentifier("   \t"));
+    try std.testing.expect(!isValidIdentifier(" author"));
+    try std.testing.expect(!isValidIdentifier("author "));
+    try std.testing.expect(!isValidIdentifier("\u{00a0}author"));
+    try std.testing.expect(!isValidIdentifier("author\u{3000}"));
     try std.testing.expect(!isValidIdentifier("*"));
     try std.testing.expect(!isValidIdentifier("$query_results"));
     try std.testing.expect(!isValidIdentifier("a" ** (max_identifier_bytes + 1)));

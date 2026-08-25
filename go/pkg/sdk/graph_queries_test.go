@@ -416,17 +416,18 @@ func TestGraphResultBindingSelector(t *testing.T) {
 	if _, err := NewGraphResultBindingSelector("", "post", 1); err == nil {
 		t.Fatal("expected empty graph result query name to fail")
 	}
-	preserved, err := NewGraphResultBindingSelector(" authors ", " post ", 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	preservedJSON, err := json.Marshal(preserved)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(preservedJSON), `"result_ref":"$graph_results. authors "`) ||
-		!strings.Contains(string(preservedJSON), `"binding":" post "`) {
-		t.Fatalf("selector silently normalized identifiers: %s", preservedJSON)
+	for _, tc := range []struct {
+		name    string
+		binding string
+	}{
+		{name: " authors", binding: "post"},
+		{name: "authors ", binding: "post"},
+		{name: "authors", binding: " post"},
+		{name: "authors", binding: "post\u00a0"},
+	} {
+		if _, err := NewGraphResultBindingSelector(tc.name, tc.binding, 1); err == nil {
+			t.Fatalf("expected identifiers with boundary whitespace to fail: %#v", tc)
+		}
 	}
 	if _, err := NewGraphResultBindingSelector("$reserved", "post", 1); err == nil {
 		t.Fatal("expected reserved graph result query name to fail")

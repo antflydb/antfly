@@ -1992,14 +1992,14 @@ test "query parser accepts graph pattern searches" {
 
 test "query parser owns graph match anchor through its required node alias" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_queries":{"escaped":{"index":"graph_idx","match":{"anchor":"a\n","nodes":{"a\n":{}},"edges":[]},"return":{"bindings":["a\n"]}}}}
+        \\{"graph_queries":{"escaped":{"index":"graph_idx","match":{"anchor":"a\nb","nodes":{"a\nb":{}},"edges":[]},"return":{"bindings":["a\nb"]}}}}
     );
     defer owned.deinit(std.testing.allocator);
 
     const pattern = owned.req.graph_queries[0].query.match_pattern.?;
     try std.testing.expect(pattern.anchor_alias != null);
     const anchor_alias = pattern.anchor_alias.?;
-    try std.testing.expectEqualStrings("a\n", anchor_alias);
+    try std.testing.expectEqualStrings("a\nb", anchor_alias);
     try std.testing.expectEqual(@intFromPtr(pattern.nodes[0].alias.ptr), @intFromPtr(anchor_alias.ptr));
 }
 

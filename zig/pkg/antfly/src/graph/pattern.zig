@@ -335,9 +335,39 @@ pub fn isValidIdentifier(value: []const u8) bool {
     // references. Keeping both out of the alias namespace makes every parsed
     // identifier unambiguous throughout admission and execution.
     if (std.mem.eql(u8, value, "*") or value[0] == '$') return false;
-    if (std.mem.trim(u8, value, &std.ascii.whitespace).len == 0) return false;
-    const codepoints = std.unicode.utf8CountCodepoints(value) catch return false;
+    var iterator = (std.unicode.Utf8View.init(value) catch return false).iterator();
+    var codepoints: usize = 0;
+    var first: u21 = undefined;
+    var last: u21 = undefined;
+    while (iterator.nextCodepoint()) |codepoint| {
+        if (codepoints == 0) first = codepoint;
+        last = codepoint;
+        codepoints += 1;
+    }
+    // Never normalize identifiers: doing so can silently retarget aliases and
+    // named-result dependencies. Reject ambiguous boundary whitespace instead.
+    if (isGoUnicodeWhitespace(first) or isGoUnicodeWhitespace(last)) return false;
     return codepoints >= 1 and codepoints <= max_identifier_codepoints;
+}
+
+/// Keep public identifier admission byte-for-byte aligned with Go's
+/// strings.TrimSpace Unicode White_Space set without allocating a copy.
+fn isGoUnicodeWhitespace(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x0009...0x000d,
+        0x0020,
+        0x0085,
+        0x00a0,
+        0x1680,
+        0x2000...0x200a,
+        0x2028,
+        0x2029,
+        0x202f,
+        0x205f,
+        0x3000,
+        => true,
+        else => false,
+    };
 }
 
 pub const DistinctBudget = struct {

@@ -77,17 +77,16 @@ func NewGraphDocumentFilter(filter querydsl.Query) (GraphDocumentFilter, error) 
 // discriminator is decoded as the only structural variant that permits one to
 // be absent: LegacyGraphQueryResult.
 func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
-	encoded, err := json.Marshal(result)
-	if err != nil {
+	// Probe only the small control fields. Decoding into a RawMessage map would
+	// copy every top-level value, including result rows, paths, and hydrated
+	// documents, before the selected variant decodes the payload a second time.
+	var envelope graphQueryResultEnvelope
+	if err := result.DecodeInto(&envelope); err != nil {
 		return nil, err
 	}
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &envelope); err != nil {
-		return nil, err
-	}
-	if rawKind, present := envelope["kind"]; present {
+	if envelope.Kind != nil {
 		var kind *string
-		if err := json.Unmarshal(rawKind, &kind); err != nil || kind == nil {
+		if err := json.Unmarshal(envelope.Kind, &kind); err != nil || kind == nil {
 			return nil, fmt.Errorf("antfly: graph result has an invalid discriminator")
 		}
 		switch *kind {
@@ -106,14 +105,18 @@ func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
 	return decodeLegacyGraphQueryResult(result, envelope)
 }
 
-func decodeLegacyGraphQueryResult(result GraphQueryResult, envelope map[string]json.RawMessage) (LegacyGraphQueryResult, error) {
-	rawType, hasType := envelope["type"]
-	rawTotal, hasTotal := envelope["total"]
-	if !hasType || !hasTotal {
+type graphQueryResultEnvelope struct {
+	Kind  json.RawMessage `json:"kind"`
+	Type  json.RawMessage `json:"type"`
+	Total json.RawMessage `json:"total"`
+}
+
+func decodeLegacyGraphQueryResult(result GraphQueryResult, envelope graphQueryResultEnvelope) (LegacyGraphQueryResult, error) {
+	if envelope.Type == nil || envelope.Total == nil {
 		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: legacy graph result requires type and total")
 	}
 	var legacyType GraphQueryType
-	if err := json.Unmarshal(rawType, &legacyType); err != nil {
+	if err := json.Unmarshal(envelope.Type, &legacyType); err != nil {
 		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: invalid legacy graph result type: %w", err)
 	}
 	switch legacyType {
@@ -123,7 +126,7 @@ func decodeLegacyGraphQueryResult(result GraphQueryResult, envelope map[string]j
 		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: unknown legacy graph result type %q", legacyType)
 	}
 	var total *int
-	if err := json.Unmarshal(rawTotal, &total); err != nil {
+	if err := json.Unmarshal(envelope.Total, &total); err != nil {
 		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: invalid legacy graph result total: %w", err)
 	}
 	if total == nil {
@@ -403,10 +406,10 @@ func NewGraphResultRefSelector(resultRef string, limit int) (GraphNodeSelector, 
 // query. Selecting the alias explicitly avoids flattening unrelated bindings.
 func NewGraphResultBindingSelector(queryName, binding string, limit int) (GraphNodeSelector, error) {
 	if !validGraphQueryName(queryName) {
-		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result query name must be a non-$ identifier of at most %d Unicode code points", maxGraphIdentifierRunes)
+		return GraphNodeSelector{}, invalidGraphIdentifier("graph result query name")
 	}
 	if !validGraphIdentifier(binding) {
-		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result binding must contain at most %d Unicode code points", maxGraphIdentifierRunes)
+		return GraphNodeSelector{}, invalidGraphIdentifier("graph result binding")
 	}
 	if limit < 0 || limit > 10_000 {
 		return GraphNodeSelector{}, fmt.Errorf("antfly: graph result reference limit must be 0 or between 1 and 10000")
@@ -430,7 +433,7 @@ func NewGraphBindingsReturn(bindings []string, options GraphBindingsOptions) (Gr
 	}
 	for _, binding := range bindings {
 		if !validGraphIdentifier(binding) {
-			return GraphReturn{}, fmt.Errorf("antfly: graph binding %q must contain at most %d Unicode code points", binding, maxGraphIdentifierRunes)
+			return GraphReturn{}, invalidGraphIdentifier(fmt.Sprintf("graph binding %q", binding))
 		}
 	}
 	if err := validateGraphLimit(options.Limit); err != nil {
@@ -464,7 +467,7 @@ func NewGraphAggregatesReturn(aggregates map[string]GraphCountAggregate) (GraphR
 	}
 	for name, aggregate := range aggregates {
 		if strings.TrimSpace(name) == "" || !validGraphIdentifier(name) {
-			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate name must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
+			return GraphReturn{}, invalidGraphIdentifier("graph aggregate name")
 		}
 		if strings.TrimSpace(aggregate.Count) == "" {
 			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate %q must name an alias or *", name)
@@ -496,7 +499,7 @@ func CountGraphAlias(alias string, distinct bool) GraphCountAggregate {
 // (table, key) node identity.
 func NewGraphNotEqual(left, right string) (GraphWhereExpression, error) {
 	if !validGraphIdentifier(left) || !validGraphIdentifier(right) {
-		return GraphWhereExpression{}, fmt.Errorf("antfly: graph inequality aliases must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
+		return GraphWhereExpression{}, invalidGraphIdentifier("graph inequality aliases")
 	}
 	if left == right {
 		return GraphWhereExpression{}, fmt.Errorf("antfly: graph inequality aliases must differ")
@@ -554,7 +557,7 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 	complexity := graphMatchComplexity{nodes: len(query.Match.Nodes), edges: len(query.Match.Edges)}
 	for alias, node := range query.Match.Nodes {
 		if !validGraphIdentifier(alias) {
-			return fmt.Errorf("antfly: graph alias must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
+			return invalidGraphIdentifier("graph alias")
 		}
 		if node.Table != "" && strings.TrimSpace(node.Table) == "" {
 			return fmt.Errorf("antfly: graph alias %q table must not be blank", alias)
@@ -565,7 +568,7 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 		visible[alias] = struct{}{}
 	}
 	if !validGraphIdentifier(query.Match.Anchor) {
-		return fmt.Errorf("antfly: graph match anchor must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
+		return invalidGraphIdentifier("graph match anchor")
 	}
 	if _, ok := visible[query.Match.Anchor]; !ok {
 		return fmt.Errorf("antfly: graph match anchor %q is not declared in nodes", query.Match.Anchor)
@@ -619,7 +622,7 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 		introduced := make(map[string]struct{}, len(optional.Nodes))
 		for alias := range optional.Nodes {
 			if !validGraphIdentifier(alias) {
-				return fmt.Errorf("antfly: optional graph alias must be non-empty and contain at most %d Unicode code points", maxGraphIdentifierRunes)
+				return invalidGraphIdentifier("optional graph alias")
 			}
 			if _, exists := visible[alias]; exists {
 				return fmt.Errorf("antfly: duplicate optional graph alias %q", alias)
@@ -719,7 +722,7 @@ func validateGraphMatchEdge(edge GraphMatchEdge, aliases map[string]struct{}) er
 
 func validateGraphMatchEdgeShape(edge GraphMatchEdge) error {
 	if !validGraphIdentifier(edge.From) || !validGraphIdentifier(edge.To) {
-		return fmt.Errorf("antfly: graph edge aliases must contain at most %d Unicode code points", maxGraphIdentifierRunes)
+		return invalidGraphIdentifier("graph edge aliases")
 	}
 	minHops, maxHops := edge.MinHops, edge.MaxHops
 	if minHops == 0 {
@@ -1069,9 +1072,13 @@ func validGraphIdentifier(value string) bool {
 		return false
 	}
 	// Keep aliases disjoint from the count(*) sentinel and result/control refs.
-	if value == "*" || value[0] == '$' || strings.TrimSpace(value) == "" {
+	if value == "*" || value[0] == '$' || strings.TrimSpace(value) != value {
 		return false
 	}
 	count := utf8.RuneCountInString(value)
 	return count >= 1 && count <= maxGraphIdentifierRunes
+}
+
+func invalidGraphIdentifier(kind string) error {
+	return fmt.Errorf("antfly: %s must be 1-%d Unicode code points with no leading or trailing whitespace and must not begin with $ or equal *", kind, maxGraphIdentifierRunes)
 }

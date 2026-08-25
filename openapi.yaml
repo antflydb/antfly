@@ -14725,9 +14725,11 @@ components:
 
             64 named graph operations, of which at most 8 may be named `match`
 
-            operations; operation names must be 1-128 Unicode characters and
+            operations; operation names must be 1-128 Unicode characters,
 
-            must not begin with `$`, which is reserved for result namespaces.
+            cannot have leading or trailing whitespace, and must not begin with
+
+            `$`, which is reserved for result namespaces.
 
             Put multiple counts over one pattern in the same `match` return
 
@@ -22797,7 +22799,8 @@ components:
           maxProperties: 64
           additionalProperties:
             $ref: '#/components/schemas/GraphMatchNode'
-          description: Aliases are limited to 128 Unicode code points.
+          description: Aliases are limited to 128 Unicode code points and cannot have leading or trailing
+            whitespace.
         edges:
           type: array
           minItems: 1
@@ -22830,7 +22833,8 @@ components:
           maxProperties: 64
           additionalProperties:
             $ref: '#/components/schemas/GraphMatchNode'
-          description: Aliases are limited to 128 Unicode code points.
+          description: Aliases are limited to 128 Unicode code points and cannot have leading or trailing
+            whitespace.
         edges:
           type: array
           maxItems: 64
@@ -22887,8 +22891,8 @@ components:
           minLength: 1
           maxLength: 128
           description: Use the reserved token `*` to count rows, or an alias to count non-null bindings.
-            Graph aliases cannot be `*`, all-whitespace, or begin with `$`; the `$` namespace is reserved
-            for result references.
+            Graph aliases cannot be `*`, have leading or trailing whitespace, or begin with `$`; the `$`
+            namespace is reserved for result references.
         distinct:
           type: boolean
           default: false

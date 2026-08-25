@@ -15,7 +15,7 @@ T = TypeVar("T", bound="GraphOptionalMatchNodes")
 
 @_attrs_define
 class GraphOptionalMatchNodes:
-    """Aliases are limited to 128 Unicode code points."""
+    """Aliases are limited to 128 Unicode code points and cannot have leading or trailing whitespace."""
 
     additional_properties: dict[str, GraphMatchNode] = _attrs_field(init=False, factory=dict)
 

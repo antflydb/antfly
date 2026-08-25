@@ -6875,8 +6875,9 @@ export interface components {
              *     familiar scalar syntax with document queries but deliberately excludes
              *     analyzer-backed and index-only clauses. A request may contain at most
              *     64 named graph operations, of which at most 8 may be named `match`
-             *     operations; operation names must be 1-128 Unicode characters and
-             *     must not begin with `$`, which is reserved for result namespaces.
+             *     operations; operation names must be 1-128 Unicode characters,
+             *     cannot have leading or trailing whitespace, and must not begin with
+             *     `$`, which is reserved for result namespaces.
              *     Put multiple counts over one pattern in the same `match` return
              *     object so they share one complete anchor scan.
              */
@@ -12030,7 +12031,7 @@ export interface components {
         };
         GraphWhereExpression: components["schemas"]["GraphWhereAnd"] | components["schemas"]["GraphWhereNotEqual"] | components["schemas"]["GraphWhereNotExists"];
         GraphOptionalMatch: {
-            /** @description Aliases are limited to 128 Unicode code points. */
+            /** @description Aliases are limited to 128 Unicode code points and cannot have leading or trailing whitespace. */
             nodes?: {
                 [key: string]: components["schemas"]["GraphMatchNode"];
             };
@@ -12040,7 +12041,7 @@ export interface components {
         GraphMatch: {
             /** @description Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on this alias must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`. */
             anchor: string;
-            /** @description Aliases are limited to 128 Unicode code points. */
+            /** @description Aliases are limited to 128 Unicode code points and cannot have leading or trailing whitespace. */
             nodes: {
                 [key: string]: components["schemas"]["GraphMatchNode"];
             };
@@ -12061,7 +12062,7 @@ export interface components {
             fields?: string[];
         };
         GraphCountAggregate: {
-            /** @description Use the reserved token `*` to count rows, or an alias to count non-null bindings. Graph aliases cannot be `*`, all-whitespace, or begin with `$`; the `$` namespace is reserved for result references. */
+            /** @description Use the reserved token `*` to count rows, or an alias to count non-null bindings. Graph aliases cannot be `*`, have leading or trailing whitespace, or begin with `$`; the `$` namespace is reserved for result references. */
             count: string;
             /**
              * @description Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
