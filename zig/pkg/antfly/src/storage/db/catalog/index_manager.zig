@@ -11600,10 +11600,6 @@ pub const IndexManager = struct {
                 .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
             };
             errdefer result.deinit(alloc);
-            result.buildPublicationLookup(task_alloc) catch |err| {
-                if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-                return err;
-            };
             result.peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes);
             return result;
         } else |err| switch (err) {
@@ -11645,10 +11641,6 @@ pub const IndexManager = struct {
             .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
         };
         errdefer result.deinit(alloc);
-        result.buildPublicationLookup(task_alloc) catch |err| {
-            if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        };
         result.peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes);
         return result;
     }
@@ -12126,15 +12118,15 @@ pub const IndexManager = struct {
         const layout = seg.layoutStats(false);
 
         // Merge working memory is driven by doc renumbering, the largest term
-        // accumulator, compact dictionary/value builders, and the publication
-        // identity table. File-backed output streams separately; heap-backed
-        // output adds its serialized source-sized envelope at the caller.
-        // Keep generous capacity/headroom factors here and enforce the
-        // reservation with the bounded task allocator.
-        // Include the fixed-capacity publication identity table. Ordinal-backed
-        // documents use 32 bytes at the table's <= 50% load factor; retain more
-        // headroom for the less common string-identity fallback.
-        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 224 else 160;
+        // accumulator, and compact dictionary/value builders. File-backed
+        // output streams separately; heap-backed output adds its serialized
+        // source-sized envelope at the caller. The publication identity table
+        // is no longer part of the normal reservation: append-only publication
+        // does not build it, while a rare concurrent-delete publication may
+        // fail its lazy allocation and safely retry the merge. Charging that
+        // O(live documents) table here recreated a hard admission ceiling even
+        // after its eager allocation was removed from execution.
+        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 128 else 64;
         var bytes = try std.math.mul(u64, seg.reader.doc_count, per_doc_bytes);
         bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_term_dict_bytes, 3));
         bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_bloom_bytes, 3));
@@ -12164,7 +12156,7 @@ pub const IndexManager = struct {
     fn textMergePublicationDeletes(
         entry: *TextIndex,
         task: *const TextMergeTask,
-        result: *const TextMergeResult,
+        result: *TextMergeResult,
         deletion_deltas: []const TextMergeDeletionDelta,
     ) !TextMergePublicationDeletes {
         if (deletion_deltas.len != task.source.len) return error.InvalidDeletionSnapshot;
@@ -12177,6 +12169,28 @@ pub const IndexManager = struct {
                 if (maybe_deleted.*) |*deleted| deleted.deinit();
             }
             publication_alloc.free(output_deleted);
+        }
+
+        // Append-only ingestion is the dominant full-text merge workload. Do
+        // not build an O(live documents) identity table unless a delete raced
+        // the unlocked merge build and publication actually needs to transfer
+        // that tombstone into the replacement. At artifact scale the eager
+        // table could exhaust the bounded merge allocator, permanently defer
+        // later merges, and leave producers retrying merge backpressure.
+        var has_deletion_deltas = false;
+        for (deletion_deltas) |delta| {
+            if (delta.count == 0) continue;
+            has_deletion_deltas = true;
+            break;
+        }
+        if (has_deletion_deltas) {
+            var lookup_alloc_stats = PhaseAllocStats{};
+            var lookup_tracking = PhaseTrackingAllocator.init(publication_alloc, &lookup_alloc_stats);
+            try result.buildPublicationLookup(lookup_tracking.allocator());
+            result.peak_task_alloc_bytes = @max(
+                result.peak_task_alloc_bytes,
+                @as(u64, @intCast(lookup_alloc_stats.peak_bytes)),
+            );
         }
 
         const snap = entry.persistent.acquireSnapshot();
@@ -26486,6 +26500,8 @@ test "text merge task carries concurrent deletes into publication" {
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
     var merged_docs: u32 = 0;
     for (result.prepared_segments) |*prepared| {
         var reader = try segment_mod.SegmentReader.init(alloc, prepared.data.bytes());
@@ -26503,6 +26519,7 @@ test "text merge task carries concurrent deletes into publication" {
     try std.testing.expectEqual(frozen_live_docs, merged_docs);
     const applied = try manager.finishTextMergeTask(&task, &result);
     try std.testing.expect(applied);
+    try std.testing.expect(result.output_ordinals.len + result.output_ids.len > 0);
     const merge_stats = manager.textMergeStats();
     try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_merges);
     try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_segments);
@@ -26977,8 +26994,13 @@ test "text merge task records input and output bytes" {
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
+    // Append-only merges do not pay for a document-sized publication lookup.
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
     const expected_output = IndexManager.textMergeResultOutputStats(&result);
     try std.testing.expect(try manager.finishTextMergeTask(&task, &result));
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
 
     const stats = manager.textMergeStats();
     try std.testing.expectEqual(@as(u64, 1), stats.completed_merges);

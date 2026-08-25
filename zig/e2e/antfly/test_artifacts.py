@@ -18,9 +18,13 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 from pathlib import Path
 from urllib.parse import quote
+
+import pytest
+import requests
 
 from helpers import assert_created_index, wait_until
 
@@ -90,6 +94,38 @@ def _document_units_index_config() -> dict:
         },
         "artifact": artifact,
         "edge_types": [{"name": "mentions"}],
+    }
+
+
+def _artifact_full_text_indexes(*, chunk_size: int) -> dict[str, dict]:
+    units = _document_units_index_config()
+    return {
+        "document_units": units,
+        "document_text": {
+            "type": "full_text",
+            "field": "text",
+            "artifact_name": "document_chunks_v1",
+            "enrichments": [
+                {
+                    "name": DOCUMENT_UNITS_ARTIFACT,
+                    "kind": "asset",
+                    "field": "url",
+                    "content_type": "application/json",
+                    "producer_json": json.dumps(
+                        units["artifact"]["producer_json"], separators=(",", ":")
+                    ),
+                },
+                {
+                    "name": "document_chunks_v1",
+                    "kind": "chunk",
+                    "field": "text",
+                    "source_artifact_name": DOCUMENT_UNITS_ARTIFACT,
+                    "chunk_size": chunk_size,
+                    "chunk_overlap": 0,
+                    "full_text_index": True,
+                },
+            ],
+        },
     }
 
 
@@ -655,6 +691,233 @@ def test_pdf_auto_ocr_only_renders_pages_without_usable_embedded_text_e2e(
     reader_stats = pdf_ocr_e2e_server.stats()
     assert reader_stats["png_requests"] == 1, reader_stats
     assert reader_stats["jpeg_requests"] == 0, reader_stats
+
+
+def test_artifact_full_text_chunks_remain_with_parents_across_three_shards(
+    stateful_api,
+):
+    """Parent range routing, not the shared ``af1:chunk`` display prefix, owns chunks."""
+
+    table_name = f"artifact_full_text_three_shards_{time.time_ns()}"
+    created = stateful_api.create_table(
+        table_name,
+        num_shards=3,
+        indexes=_artifact_full_text_indexes(chunk_size=16),
+    )
+    assert created.get("name") == table_name or created.get("table_name") == table_name
+
+    # Three-shard tables start with lexical ranges. These parent keys
+    # deliberately land below, between, and above the two initial boundaries.
+    # Their generated artifact keys must stay in the selected parent group.
+    parent_markers = {
+        "0/parent-left": "leftartifactmarker",
+        "8/parent-middle": "middleartifactmarker",
+        "z/parent-right": "rightartifactmarker",
+    }
+    inserts = {}
+    for parent_key, marker in parent_markers.items():
+        source = ((marker + " common ") * 96).encode()
+        inserts[parent_key] = {
+            "filename": f"{marker}.txt",
+            "mime_type": "text/plain",
+            "version": "1",
+            "url": "data:text/plain;base64," + base64.b64encode(source).decode(),
+        }
+
+    written = stateful_api.batch_write(
+        table_name,
+        inserts=inserts,
+        sync_level="full_index",
+    )
+    assert written["inserted"] == len(inserts)
+
+    manifests = {}
+    for parent_key in parent_markers:
+        manifest = wait_until(
+            lambda parent_key=parent_key: (
+                current
+                if (
+                    (current := _manifest_ready(stateful_api, table_name, parent_key))
+                    is not None
+                    and current.get("chunk_count", 0) > 1
+                )
+                else None
+            ),
+            timeout_s=90.0,
+            interval_s=0.5,
+        )
+        assert manifest is not None
+        assert manifest["child_ranges"]
+        assert all(
+            child_range.get("placement") == "parent"
+            for child_range in manifest["child_ranges"]
+        )
+        manifests[parent_key] = manifest
+
+    def distributed_index_status() -> dict | None:
+        detail = stateful_api.get_index(table_name, "document_text")
+        shards = detail.get("shard_status", {})
+        counts = [
+            int(status.get("total_indexed", 0))
+            for status in shards.values()
+        ]
+        if len(counts) != 3 or not all(count > 0 for count in counts):
+            return None
+        return detail
+
+    detail = wait_until(
+        distributed_index_status,
+        timeout_s=90.0,
+        interval_s=0.5,
+    )
+    assert detail is not None, json.dumps(
+        stateful_api.get_index(table_name, "document_text"),
+        indent=2,
+        sort_keys=True,
+    )
+
+    result = stateful_api.query_table(
+        table_name,
+        {
+            "full_text_search": {"field": "text", "match": "common"},
+            "limit": 10,
+        },
+    )
+    assert set(parent_markers).issubset(_query_hit_ids(result)), {
+        "manifests": manifests,
+        "result": result,
+    }
+
+
+@pytest.mark.slow
+@pytest.mark.scale
+def test_artifact_full_text_scale_exceeds_one_million_chunks_on_three_shards(
+    stateful_api,
+):
+    """Opt-in live qualification for the artifact-specific merge/backpressure path."""
+
+    if os.environ.get("ANTFLY_ARTIFACT_FULL_TEXT_SCALE") != "1":
+        pytest.skip("set ANTFLY_ARTIFACT_FULL_TEXT_SCALE=1 to run the >1M chunk gate")
+
+    target_chunks = 1_000_001
+    table_name = f"artifact_full_text_scale_{time.time_ns()}"
+    created = stateful_api.create_table(
+        table_name,
+        num_shards=3,
+        indexes=_artifact_full_text_indexes(chunk_size=8),
+    )
+    assert created.get("name") == table_name or created.get("table_name") == table_name
+
+    # Keep each source close to the reported PG-19 reproduction's ~829 chunks
+    # per book. Giant inline sources are not representative: the source field
+    # remains part of each derived indexing input until segment publication.
+    source = ("artifactscaletoken " * 340).encode()
+    source_url = "data:text/plain;base64," + base64.b64encode(source).decode()
+    lane_prefixes = ("0/", "8/", "z/")
+    hot_shard_floor = 750_000
+    generated_chunks = 0
+    parent_number = 0
+    sample_manifests: dict[str, dict] = {}
+
+    # Keep source requests bounded and wait for each batch's generated chunks,
+    # matching the live PG-19 reproduction instead of measuring accepted rows.
+    # Five of every six parents deliberately share one range, so this gate
+    # crosses the old ~746k per-shard ceiling while still exercising all three
+    # shards. Submit one source at a time so merge backpressure throttles the
+    # producer instead of accumulating a multi-thousand-chunk HTTP burst.
+    while generated_chunks < target_chunks:
+        batch_slot = parent_number % 6
+        cycle = parent_number // 6
+        prefix = (
+            lane_prefixes[0]
+            if batch_slot < 5
+            else lane_prefixes[1 + cycle % 2]
+        )
+        parent_key = f"{prefix}scale-{parent_number:08d}"
+
+        def ready_parent() -> dict | None:
+            manifest = _manifest_ready(stateful_api, table_name, parent_key)
+            if manifest is None or manifest.get("chunk_count", 0) == 0:
+                return None
+            return manifest
+
+        manifest = None
+        for attempt in range(3):
+            try:
+                inserted = stateful_api.batch_write_with_timeout(
+                    table_name,
+                    inserts={
+                        parent_key: {
+                            "filename": f"scale-{parent_number:08d}.txt",
+                            "mime_type": "text/plain",
+                            "version": "1",
+                            "url": source_url,
+                        }
+                    },
+                    sync_level="write",
+                    timeout_s=300.0,
+                )
+                assert inserted["inserted"] == 1
+                break
+            except requests.RequestException:
+                # The write may commit before a busy shard can return its HTTP
+                # response. Confirm the deterministic parent before retrying;
+                # a dead or permanently stalled server still exhausts this
+                # strict attempt bound and fails the qualification.
+                manifest = wait_until(
+                    ready_parent,
+                    timeout_s=30.0,
+                    interval_s=1.0,
+                )
+                if manifest is not None:
+                    break
+                if attempt == 2:
+                    raise
+
+        if manifest is None:
+            manifest = wait_until(
+                ready_parent,
+                timeout_s=300.0,
+                interval_s=1.0,
+            )
+        assert manifest is not None
+        generated_chunks += manifest["chunk_count"]
+        sample_manifests.setdefault(prefix, manifest)
+        parent_number += 1
+
+    assert generated_chunks >= target_chunks
+    assert set(sample_manifests) == set(lane_prefixes)
+    assert all(
+        child_range.get("placement") == "parent"
+        for manifest in sample_manifests.values()
+        for child_range in manifest["child_ranges"]
+    )
+
+    def million_chunks_visible_on_every_shard() -> dict | None:
+        detail = stateful_api.get_index(table_name, "document_text")
+        shards = detail.get("shard_status", {})
+        counts = [
+            int(status.get("total_indexed", 0))
+            for status in shards.values()
+        ]
+        if len(counts) != 3 or not all(count > 0 for count in counts):
+            return None
+        if sum(counts) < target_chunks:
+            return None
+        if max(counts) < hot_shard_floor:
+            return None
+        return detail
+
+    detail = wait_until(
+        million_chunks_visible_on_every_shard,
+        timeout_s=600.0,
+        interval_s=2.0,
+    )
+    assert detail is not None, json.dumps(
+        stateful_api.get_index(table_name, "document_text"),
+        indent=2,
+        sort_keys=True,
+    )
 
 
 def test_artifact_backed_embedding_table_provisions_atomically(
