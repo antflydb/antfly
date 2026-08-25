@@ -168,6 +168,18 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 	if _, err := NewGraphBindingsReturn([]string{"a", "a"}, GraphBindingsOptions{}); err == nil {
 		t.Fatal("expected duplicate binding projection error")
 	}
+	if _, err := NewGraphBindingsReturn([]string{"a", "b"}, GraphBindingsOptions{
+		Limit:            5_001,
+		IncludeDocuments: true,
+	}); err == nil || !strings.Contains(err.Error(), "10000") {
+		t.Fatalf("expected actionable binding hydration budget error, got %v", err)
+	}
+	if _, err := NewGraphBindingsReturn([]string{"a", "b"}, GraphBindingsOptions{
+		Limit:            5_000,
+		IncludeDocuments: true,
+	}); err != nil {
+		t.Fatalf("expected binding hydration at the budget boundary to succeed: %v", err)
+	}
 	tooManyBindings := make([]string, maxGraphMatchNodes+1)
 	for i := range tooManyBindings {
 		tooManyBindings[i] = fmt.Sprintf("alias_%d", i)
@@ -189,6 +201,26 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 		Return: graphReturn,
 	}); err == nil {
 		t.Fatal("expected unknown return alias error")
+	}
+
+	var uncheckedHydrationReturn GraphReturn
+	if err := uncheckedHydrationReturn.FromGraphBindingsReturn(GraphBindingsReturn{
+		Bindings:         []string{"a", "b"},
+		Limit:            5_001,
+		IncludeDocuments: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewGraphMatchQuery(GraphMatchQuery{
+		Index: "graph_idx",
+		Match: GraphMatch{
+			Anchor: "a",
+			Nodes:  map[string]GraphMatchNode{"a": {}, "b": {}},
+			Edges:  []GraphMatchEdge{{From: "a", To: "b"}},
+		},
+		Return: uncheckedHydrationReturn,
+	}); err == nil || !strings.Contains(err.Error(), "10000") {
+		t.Fatalf("expected final graph return validation to enforce the hydration budget, got %v", err)
 	}
 
 	validReturn, err := NewGraphBindingsReturn([]string{"b"}, GraphBindingsOptions{})

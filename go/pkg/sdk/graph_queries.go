@@ -18,7 +18,8 @@ import (
 )
 
 // GraphBindingsOptions controls row count and optional document projection.
-// A zero Limit uses the server default. Fields require IncludeDocuments.
+// A zero Limit uses the server default. Fields require IncludeDocuments, and
+// hydrated projections are capped at 10,000 binding documents per operation.
 type GraphBindingsOptions struct {
 	Limit            int
 	IncludeDocuments bool
@@ -34,7 +35,9 @@ const (
 	maxGraphCountAggregates     = 64
 	maxGraphEdgeTypes           = 64
 	maxGraphEdgeTypeBytes       = 64 * 1024
+	maxGraphHydratedBindings    = 10_000
 	maxNamedGraphQueries        = 64
+	defaultGraphBindingsLimit   = 100
 )
 
 func validateNamedGraphQueries(queries map[string]GraphQuery) error {
@@ -435,27 +438,8 @@ func NewGraphResultBindingSelector(queryName, binding string, limit int) (GraphN
 
 // NewGraphBindingsReturn selects projected aliases and optional stored fields.
 func NewGraphBindingsReturn(bindings []string, options GraphBindingsOptions) (GraphReturn, error) {
-	if len(bindings) > maxGraphMatchNodes {
-		return GraphReturn{}, fmt.Errorf("antfly: graph bindings exceed the maximum of %d aliases", maxGraphMatchNodes)
-	}
-	if err := validateNonEmptyUnique("graph binding", bindings); err != nil {
+	if err := validateGraphBindingsProjection(bindings, options.Limit, options.IncludeDocuments, options.Fields); err != nil {
 		return GraphReturn{}, err
-	}
-	for _, binding := range bindings {
-		if !validGraphIdentifier(binding) {
-			return GraphReturn{}, invalidGraphIdentifier(fmt.Sprintf("graph binding %q", binding))
-		}
-	}
-	if err := validateGraphLimit(options.Limit); err != nil {
-		return GraphReturn{}, err
-	}
-	if len(options.Fields) > 0 && !options.IncludeDocuments {
-		return GraphReturn{}, fmt.Errorf("antfly: graph binding fields require IncludeDocuments")
-	}
-	if len(options.Fields) > 0 {
-		if err := validateNonEmptyUnique("graph field", options.Fields); err != nil {
-			return GraphReturn{}, err
-		}
 	}
 	var result GraphReturn
 	err := result.FromGraphBindingsReturn(GraphBindingsReturn{
@@ -831,8 +815,11 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 		return err
 	}
 	var value struct {
-		Bindings   []string                       `json:"bindings"`
-		Aggregates map[string]GraphCountAggregate `json:"aggregates"`
+		Bindings         []string                       `json:"bindings"`
+		Limit            int                            `json:"limit"`
+		IncludeDocuments bool                           `json:"include_documents"`
+		Fields           []string                       `json:"fields"`
+		Aggregates       map[string]GraphCountAggregate `json:"aggregates"`
 	}
 	if err := json.Unmarshal(encoded, &value); err != nil {
 		return err
@@ -849,11 +836,13 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 	if len(value.Bindings) == 0 && len(value.Aggregates) == 0 {
 		return fmt.Errorf("antfly: graph return must contain bindings or aggregates")
 	}
-	if len(value.Bindings) > maxGraphMatchNodes {
-		return fmt.Errorf("antfly: graph bindings exceed the maximum of %d aliases", maxGraphMatchNodes)
-	}
 	if len(value.Bindings) > 0 {
-		if err := validateNonEmptyUnique("graph binding", value.Bindings); err != nil {
+		if err := validateGraphBindingsProjection(
+			value.Bindings,
+			value.Limit,
+			value.IncludeDocuments,
+			value.Fields,
+		); err != nil {
 			return err
 		}
 	}
@@ -872,6 +861,49 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 		if _, ok := known[aggregate.Count]; !ok {
 			return fmt.Errorf("antfly: graph aggregate %q references unknown alias %q", name, aggregate.Count)
 		}
+	}
+	return nil
+}
+
+func validateGraphBindingsProjection(bindings []string, limit int, includeDocuments bool, fields []string) error {
+	if len(bindings) > maxGraphMatchNodes {
+		return fmt.Errorf("antfly: graph bindings exceed the maximum of %d aliases", maxGraphMatchNodes)
+	}
+	if err := validateNonEmptyUnique("graph binding", bindings); err != nil {
+		return err
+	}
+	for _, binding := range bindings {
+		if !validGraphIdentifier(binding) {
+			return invalidGraphIdentifier(fmt.Sprintf("graph binding %q", binding))
+		}
+	}
+	if err := validateGraphLimit(limit); err != nil {
+		return err
+	}
+	if len(fields) > 0 && !includeDocuments {
+		return fmt.Errorf("antfly: graph binding fields require IncludeDocuments")
+	}
+	if len(fields) > 0 {
+		if err := validateNonEmptyUnique("graph field", fields); err != nil {
+			return err
+		}
+	}
+	if !includeDocuments {
+		return nil
+	}
+	effectiveLimit := limit
+	if effectiveLimit == 0 {
+		effectiveLimit = defaultGraphBindingsLimit
+	}
+	// Use division rather than multiplication so this remains overflow-safe if
+	// either public limit grows independently in a future contract revision.
+	if len(bindings) > 0 && effectiveLimit > maxGraphHydratedBindings/len(bindings) {
+		return fmt.Errorf(
+			"antfly: graph binding document hydration requires limit times bindings to be at most %d (got %d times %d)",
+			maxGraphHydratedBindings,
+			effectiveLimit,
+			len(bindings),
+		)
 	}
 	return nil
 }

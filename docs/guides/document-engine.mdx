@@ -289,6 +289,10 @@ Aliases and aggregate names are limited to 128 Unicode code points. A binding
 projection explicitly lists between one and 64 unique aliases; list every
 declared alias when the complete row is required. These bounds keep admission
 predictable and let the matcher compile projection membership once per operation.
+Fixed single-hop relationships preserve physical self-loops, so distinct aliases
+may bind the same node unless `where.not_equal` excludes that binding. Variable-
+length relationships remain node-simple except for explicit repeated-alias cycle
+closure.
 Top-level full-text, semantic, and filter clauses shape the retrieval result only;
 they do not implicitly narrow `MATCH`. Put source constraints on the node named by
 `match.anchor`. Row-level authorization still applies to every anchor and reached

@@ -820,7 +820,6 @@ fn matchExactTwoEdgePattern(
         if (!edgeMatches(graph_edge, pattern[1].edge)) continue;
         if (traversal_mod.metadataTargetTable(graph_edge.metadata) != null) return null;
         const middle_key = edgeTarget(graph_edge, start_key, pattern[1].edge.direction) orelse continue;
-        if (std.mem.eql(u8, middle_key, start_key)) continue;
         if (edgeTargetTable(null, graph_edge, middle_key) != null) return null;
         if (!(try passesNodeFilter(.{ .table = null, .key = middle_key }, pattern[1].node_filter, opts.evaluator))) continue;
         try candidates.append(alloc, .{
@@ -888,10 +887,6 @@ fn matchExactTwoEdgePattern(
         try work_budget.consumeEdgeBytes(probed_bytes);
 
         for (batch_candidates, probed_edges) |candidate, maybe_backward_edge| {
-            // Generic expansion never traverses a self-loop. Keep the
-            // candidate in the deterministic first-hop window, but do not
-            // admit an exact second edge back to the same middle node.
-            if (std.mem.eql(u8, candidate.middle_key, target_key)) continue;
             const backward_edge = maybe_backward_edge orelse continue;
             // A physical edge whose metadata changes node-table identity cannot
             // use this table-local plan. Release already-built results before
@@ -980,6 +975,11 @@ fn findReachableNodes(
 ) ![]ReachableNode {
     const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
     const max_hops = if (edge.max_hops == 0) @as(u32, 1) else edge.max_hops;
+    // A fixed relationship is not a variable-length path: a physical
+    // self-loop may bind two distinct aliases to the same node. Multi-hop
+    // expansion remains node-simple, apart from an explicit already-bound
+    // cycle target.
+    const fixed_single_hop = min_hops == 1 and max_hops == 1;
     if (edge.reverse_from_declared_alias and max_hops > 1) {
         if (comptime @hasDecl(@TypeOf(edge_reader), "supportsReverseVariablePaths")) {
             if (!edge_reader.supportsReverseVariablePaths())
@@ -1060,10 +1060,13 @@ fn findReachableNodes(
                         target_key,
                         edge,
                     );
-                    const closes_required_target = target_required and
-                        targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, true);
-                    if (frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }) and
-                        !closes_required_target) continue;
+                    if (shouldRejectPathRevisit(
+                        frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
+                        .{ .table = target_table, .key = target_key },
+                        target_nodes,
+                        target_required,
+                        fixed_single_hop,
+                    )) continue;
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = target_key,
@@ -1102,10 +1105,13 @@ fn findReachableNodes(
                         target_key,
                         edge,
                     );
-                    const closes_required_target = target_required and
-                        targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, true);
-                    if (frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }) and
-                        !closes_required_target) continue;
+                    if (shouldRejectPathRevisit(
+                        frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
+                        .{ .table = target_table, .key = target_key },
+                        target_nodes,
+                        target_required,
+                        fixed_single_hop,
+                    )) continue;
                     const new_hops = frontier.hops + 1;
                     if (new_hops < min_hops or
                         !targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, target_required)) continue;
@@ -1136,9 +1142,13 @@ fn findReachableNodes(
                     if (!mask[edge_index]) continue;
                 } else {
                     if (!edgeMatches(graph_edge, edge)) continue;
-                    const closes_required_target = target_required and
-                        targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, true);
-                    if (revisits_path and !closes_required_target) continue;
+                    if (shouldRejectPathRevisit(
+                        revisits_path,
+                        .{ .table = target_table, .key = target_key },
+                        target_nodes,
+                        target_required,
+                        fixed_single_hop,
+                    )) continue;
                 }
                 const new_hops = frontier.hops + 1;
                 const new_path = if (include_paths)
@@ -2743,6 +2753,17 @@ fn frontierContainsNode(frontier: Frontier, node: node_identity.Ref) bool {
     return false;
 }
 
+fn shouldRejectPathRevisit(
+    revisits_path: bool,
+    node: node_identity.Ref,
+    target_nodes: []const node_identity.Ref,
+    target_required: bool,
+    fixed_single_hop: bool,
+) bool {
+    if (!revisits_path or fixed_single_hop) return false;
+    return !(target_required and targetNodeMatches(node, target_nodes, true));
+}
+
 fn initReachableNode(
     alloc: Allocator,
     key: []const u8,
@@ -2971,6 +2992,75 @@ test "reverse variable expansion fails closed when the reader cannot prove inter
             &work_budget,
         ),
     );
+}
+
+test "conjunctive fixed edges preserve self loops while variable paths remain node simple" {
+    const alloc = std.testing.allocator;
+    const Reader = struct {
+        const stored = [_]graph_mod.Edge{.{
+            .source = "same",
+            .target = "same",
+            .edge_type = "LOOP",
+            .weight = 1,
+            .created_at = 0,
+            .updated_at = 0,
+            .metadata = "",
+        }};
+
+        pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, key: []const u8, types: []const []const u8, direction: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            if (!std.mem.eql(u8, key, "same") or direction != .out) return @constCast((&[_]graph_mod.Edge{})[0..]);
+            if (types.len > 0 and !containsString(types, "LOOP")) return @constCast((&[_]graph_mod.Edge{})[0..]);
+            return @constCast(stored[0..]);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+
+    const nodes = [_]MatchNode{ .{ .alias = "a" }, .{ .alias = "b" } };
+    const fixed_edges = [_]MatchEdge{.{ .from = "a", .to = "b", .step = .{ .types = &.{"LOOP"} } }};
+    const fixed_pattern = ConjunctivePattern{ .anchor_alias = "a", .nodes = &nodes, .edges = &fixed_edges };
+
+    const matches = try matchConjunctivePatternWithEdgeReader(
+        alloc,
+        Reader{},
+        &.{"same"},
+        fixed_pattern,
+        .{ .max_results = 10 },
+    );
+    defer freeMatches(alloc, matches);
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqualStrings("same", findBinding(matches[0].bindings, "a").?.key);
+    try std.testing.expectEqualStrings("same", findBinding(matches[0].bindings, "b").?.key);
+
+    const specs = [_]CountAggregateSpec{.{}};
+    const aggregates = try aggregateConjunctivePatternWithEdgeReader(
+        alloc,
+        Reader{},
+        &.{"same"},
+        fixed_pattern,
+        &specs,
+        .{},
+    );
+    defer {
+        for (aggregates) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    }
+    try std.testing.expectEqual(@as(u128, 1), aggregates[0].value);
+
+    const variable_edges = [_]MatchEdge{.{
+        .from = "a",
+        .to = "b",
+        .step = .{ .types = &.{"LOOP"}, .min_hops = 1, .max_hops = 2 },
+    }};
+    const variable_matches = try matchConjunctivePatternWithEdgeReader(
+        alloc,
+        Reader{},
+        &.{"same"},
+        .{ .anchor_alias = "a", .nodes = &nodes, .edges = &variable_edges },
+        .{ .max_results = 10 },
+    );
+    defer freeMatches(alloc, variable_matches);
+    try std.testing.expectEqual(@as(usize, 0), variable_matches.len);
 }
 
 test "conjunctive match supports branches anti joins inequality and optional nulls" {
@@ -3900,17 +3990,37 @@ test "exact two-edge probe honors incoming final direction" {
     try std.testing.expectEqualStrings("target", matches[0].bindings[2].key);
 }
 
-test "exact two-edge probe excludes final self loops like generic expansion" {
+test "exact two-edge probe preserves fixed-edge self loops" {
     const Reader = struct {
-        const first = [_]graph_mod.Edge{.{
+        const first = [_]graph_mod.Edge{
+            .{
+                .source = "start",
+                .target = "start",
+                .edge_type = "FIRST",
+                .weight = 1,
+                .created_at = 0,
+                .updated_at = 0,
+                .metadata = "",
+            },
+            .{
+                .source = "start",
+                .target = "middle",
+                .edge_type = "FIRST",
+                .weight = 1,
+                .created_at = 0,
+                .updated_at = 0,
+                .metadata = "",
+            },
+        };
+        const cross_edge = graph_mod.Edge{
             .source = "start",
             .target = "middle",
-            .edge_type = "FIRST",
+            .edge_type = "SECOND",
             .weight = 1,
             .created_at = 0,
             .updated_at = 0,
             .metadata = "",
-        }};
+        };
         const self_loop = graph_mod.Edge{
             .source = "middle",
             .target = "middle",
@@ -3929,9 +4039,10 @@ test "exact two-edge probe excludes final self loops like generic expansion" {
         pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
 
         pub fn probeEdgesBounded(_: @This(), alloc: Allocator, _: ?[]const u8, probes: []const graph_mod.EdgeProbe, _: usize) ![]?graph_mod.Edge {
-            try std.testing.expectEqual(@as(usize, 1), probes.len);
-            const result = try alloc.alloc(?graph_mod.Edge, 1);
-            result[0] = self_loop;
+            try std.testing.expectEqual(@as(usize, 2), probes.len);
+            const result = try alloc.alloc(?graph_mod.Edge, probes.len);
+            result[0] = cross_edge;
+            result[1] = self_loop;
             return result;
         }
 
@@ -3954,7 +4065,9 @@ test "exact two-edge probe excludes final self loops like generic expansion" {
     defer freeMatches(std.testing.allocator, matches);
 
     try std.testing.expectEqual(MatchPlan.exact_two_edge_probe, stats.plan);
-    try std.testing.expectEqual(@as(usize, 0), matches.len);
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+    try std.testing.expectEqualStrings("start", matches[0].bindings[1].key);
+    try std.testing.expectEqualStrings("middle", matches[1].bindings[1].key);
 }
 
 test "exact endpoint constrains the final pattern step before limiting" {
