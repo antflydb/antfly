@@ -695,7 +695,13 @@ pub const TypeGenerator = struct {
         zig_type: []const u8,
         ref_name: []const u8,
         selector_keys: []const []const u8,
+        singleton_selectors: []const StructuralSingletonSelector,
         schema: types.Schema,
+    };
+
+    const StructuralSingletonSelector = struct {
+        property_name: []const u8,
+        value: []const u8,
     };
 
     const StructuralDiscriminator = struct {
@@ -720,10 +726,19 @@ pub const TypeGenerator = struct {
         }
 
         var selector_keys = std.ArrayListUnmanaged([]const u8).empty;
+        var singleton_selectors = std.ArrayListUnmanaged(StructuralSingletonSelector).empty;
         for (resolved.properties.keys()) |prop_name| {
             if (std.mem.eql(u8, prop_name, "boost")) continue;
             if (std.mem.eql(u8, prop_name, "field")) continue;
             try selector_keys.append(self.arena, prop_name);
+            if (!self.schemaRequiresProperty(resolved, prop_name, 0)) continue;
+            const property = resolved.properties.get(prop_name) orelse continue;
+            const property_schema = self.resolver.resolveSchema(property) catch continue;
+            if (property_schema.enum_values.len != 1 or property_schema.enum_has_null) continue;
+            try singleton_selectors.append(self.arena, .{
+                .property_name = prop_name,
+                .value = property_schema.enum_values[0],
+            });
         }
 
         return .{
@@ -731,6 +746,7 @@ pub const TypeGenerator = struct {
             .zig_type = ref_type,
             .ref_name = ref_name,
             .selector_keys = selector_keys.items,
+            .singleton_selectors = singleton_selectors.items,
             .schema = resolved,
         };
     }
@@ -790,15 +806,30 @@ pub const TypeGenerator = struct {
             try variants.append(self.arena, variant);
         }
 
-        // Sort: most-specific first (most selector keys), alphabetical tie-break.
+        // Sort: required singleton-enum selectors are strongest, followed by
+        // the number of selector keys and an alphabetical tie-break. This
+        // prevents a broad object variant from capturing a semantically
+        // distinct literal variant that shares the same property name.
         // This order is used for both field layout and jsonParseFromValue dispatch.
         std.sort.pdq(StructuralVariant, variants.items, {}, struct {
             fn lessThan(_: void, a: StructuralVariant, b: StructuralVariant) bool {
+                if (a.singleton_selectors.len != b.singleton_selectors.len)
+                    return a.singleton_selectors.len > b.singleton_selectors.len;
                 if (a.selector_keys.len != b.selector_keys.len) return a.selector_keys.len > b.selector_keys.len;
                 return std.mem.order(u8, a.ref_name, b.ref_name) == .lt;
             }
         }.lessThan);
         const inferred_discriminator = try self.inferStructuralDiscriminator(variants.items);
+        var needs_singleton_selector_helper = inferred_discriminator == null;
+        if (needs_singleton_selector_helper) {
+            needs_singleton_selector_helper = false;
+            for (variants.items) |variant| {
+                if (variant.singleton_selectors.len > 0) {
+                    needs_singleton_selector_helper = true;
+                    break;
+                }
+            }
+        }
 
         for (variants.items) |variant| {
             try self.w.line("{s}: *{s},", .{ variant.field, variant.zig_type });
@@ -821,6 +852,17 @@ pub const TypeGenerator = struct {
         try self.w.line("}}", .{});
 
         try self.w.blank();
+
+        if (needs_singleton_selector_helper) {
+            try self.w.line("fn objectStringEquals(object: std.json.ObjectMap, comptime key: []const u8, comptime expected: []const u8) bool {{", .{});
+            self.w.indent();
+            try self.w.line("const value = object.get(key) orelse return false;", .{});
+            try self.w.line("return value == .string and std.mem.eql(u8, value.string, expected);", .{});
+            self.w.dedent();
+            try self.w.line("}}", .{});
+
+            try self.w.blank();
+        }
 
         try self.w.line("fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {{", .{});
         self.w.indent();
@@ -926,7 +968,20 @@ pub const TypeGenerator = struct {
                         try self.w.line("\"{s}\",", .{selector_key});
                     }
                     self.w.dedent();
-                    try self.w.line("}})) {{", .{});
+                    if (variant.singleton_selectors.len == 0) {
+                        try self.w.line("}})) {{", .{});
+                    } else {
+                        try self.w.line("}}) and", .{});
+                        self.w.indent();
+                        for (variant.singleton_selectors, 0..) |selector, selector_index| {
+                            try self.w.line("objectStringEquals(source.object, \"{f}\", \"{f}\"){s}", .{
+                                std.zig.fmtString(selector.property_name),
+                                std.zig.fmtString(selector.value),
+                                if (selector_index + 1 == variant.singleton_selectors.len) ") {" else " and",
+                            });
+                        }
+                        self.w.dedent();
+                    }
                     self.w.indent();
                     try self.w.line("if (try parseStructuralVariant({s}, allocator, source, options)) |parsed| return .{{ .{s} = parsed }};", .{ variant.zig_type, variant.field });
                     self.w.dedent();
@@ -1654,6 +1709,60 @@ test "structural union infers allocation-light enum selector with legacy fallbac
     try std.testing.expect(std.mem.indexOf(u8, output, "disc_str, \"cur\\\"rent\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, ".legacy = try parseStructuralVariantFromSlice(Legacy") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "const disc_val = source.object.get(\"kind\")") != null);
+}
+
+test "structural union prefers required singleton enum over broader object" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var row_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try row_props.put(arena, "count", .{ .schema = .{
+        .schema_type = .{ .single = "string" },
+        .enum_values = &.{"*"},
+    } });
+    var alias_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try alias_props.put(arena, "count", .{ .schema = .{ .schema_type = .{ .single = "string" } } });
+    try alias_props.put(arena, "distinct", .{ .schema = .{ .schema_type = .{ .single = "boolean" } } });
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "RowCount", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = row_props,
+        .required = &.{"count"},
+    } });
+    try schemas.put(arena, "AliasCount", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = alias_props,
+        .required = &.{"count"},
+    } });
+    try schemas.put(arena, "Count", .{ .schema = .{
+        .one_of = &.{
+            .{ .ref = .{ .ref_string = "#/components/schemas/AliasCount" } },
+            .{ .ref = .{ .ref_string = "#/components/schemas/RowCount" } },
+        },
+    } });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.1.0",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+    const output = w.toSlice();
+
+    const row_dispatch = std.mem.indexOf(u8, output, "parseStructuralVariant(RowCount").?;
+    const alias_dispatch = std.mem.indexOf(u8, output, "parseStructuralVariant(AliasCount").?;
+    try std.testing.expect(row_dispatch < alias_dispatch);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        output,
+        "objectStringEquals(source.object, \"count\", \"*\")",
+    ) != null);
 }
 
 test "allOf flattens nested oneOf member properties into struct" {

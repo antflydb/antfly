@@ -3029,7 +3029,7 @@ export interface components {
              * @description Bounded resource exhausted by the operation.
              * @enum {string}
              */
-            dimension: "explored_nodes" | "explored_edges" | "explored_edge_bytes" | "scanned_anchors" | "intermediate_states";
+            dimension: "explored_nodes" | "explored_edges" | "explored_edge_bytes" | "scanned_anchors" | "intermediate_states" | "retained_state_bytes";
             /**
              * Format: uint64
              * @description Configured request ceiling for the exhausted resource.
@@ -12093,16 +12093,24 @@ export interface components {
             /** @description Document fields to hydrate. Requires include_documents=true; omit to include all fields. */
             fields?: string[];
         };
-        /** @description Use the reserved token `*` to count rows, or a GraphIdentifier under Antfly graph identifier policy v1 to count non-null bindings. */
-        GraphCountTarget: string;
-        GraphCountAggregate: {
-            count: components["schemas"]["GraphCountTarget"];
+        /**
+         * @description Count every complete graph binding.
+         * @enum {string}
+         */
+        GraphRowCountTarget: "*";
+        GraphRowCountAggregate: {
+            count: components["schemas"]["GraphRowCountTarget"];
+        };
+        GraphAliasCountAggregate: {
+            count: components["schemas"]["GraphIdentifier"];
             /**
              * @description Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
              * @default false
              */
             distinct?: boolean;
         };
+        /** @description Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid in every generated SDK. */
+        GraphCountAggregate: components["schemas"]["GraphRowCountAggregate"] | components["schemas"]["GraphAliasCountAggregate"];
         GraphAggregatesReturn: {
             /** @description Keys are GraphIdentifiers naming aggregate results. */
             aggregates: {
@@ -12386,49 +12394,18 @@ export interface components {
              */
             std_dev_threshold?: number;
         };
-        /** @description One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical edge keys, so identity remains unambiguous across tables and for equal keys in different tables. */
-        GraphPathEdge: {
-            from: components["schemas"]["GraphPathEndpoint"];
-            to: components["schemas"]["GraphPathEndpoint"];
-            type: string;
-            /**
-             * Format: double
-             * @description Finite durable edge weight. max_weight paths further require values in [0,1].
-             */
-            weight: number;
-            metadata?: {
-                [key: string]: unknown;
-            };
-        };
-        /** @description A node in graph query results */
-        GraphResultNode: {
-            /** @description Document key */
+        /** @description One exact node identity projected from a MATCH binding. Conjunctive bindings deliberately do not expose traversal depth, distance, or path: those values are not uniquely defined for branched patterns and may depend on execution order. */
+        GraphBindingNode: {
+            /** @description Exact document key. */
             key: string;
-            /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
+            /** @description Owning table for a cross-table binding; omitted for the queried table. */
             table?: string;
-            /** @description Distance from start node */
-            depth?: number;
-            /**
-             * Format: double
-             * @description Weighted distance
-             */
-            distance?: number;
-            /** @description Full document (if include_documents=true) */
+            /** @description Stored document when include_documents=true. */
             document?: {
                 [key: string]: unknown;
             };
-            /** @description Exact ordered node identities in the path from the start node to this node */
-            path?: components["schemas"]["GraphPathEndpoint"][];
-            /** @description Ordered typed edges in path from start to this node */
-            path_edges?: components["schemas"]["GraphPathEdge"][];
-            /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
-            provenance?: string[];
-            /** @description Parsed evidence envelope for provenance labels and edge metadata */
-            evidence?: {
-                [key: string]: unknown;
-            };
         };
-        GraphResultBinding: components["schemas"]["GraphResultNode"] | null;
+        GraphResultBinding: components["schemas"]["GraphBindingNode"] | null;
         GraphResultRow: {
             [key: string]: components["schemas"]["GraphResultBinding"];
         };
@@ -12471,6 +12448,48 @@ export interface components {
                 [key: string]: components["schemas"]["GraphAggregateValue"];
             };
             stats: components["schemas"]["GraphQueryStats"];
+        };
+        /** @description One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical edge keys, so identity remains unambiguous across tables and for equal keys in different tables. */
+        GraphPathEdge: {
+            from: components["schemas"]["GraphPathEndpoint"];
+            to: components["schemas"]["GraphPathEndpoint"];
+            type: string;
+            /**
+             * Format: double
+             * @description Finite durable edge weight. max_weight paths further require values in [0,1].
+             */
+            weight: number;
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description A node in graph query results */
+        GraphResultNode: {
+            /** @description Document key */
+            key: string;
+            /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
+            table?: string;
+            /** @description Distance from start node */
+            depth?: number;
+            /**
+             * Format: double
+             * @description Weighted distance
+             */
+            distance?: number;
+            /** @description Full document (if include_documents=true) */
+            document?: {
+                [key: string]: unknown;
+            };
+            /** @description Exact ordered node identities in the path from the start node to this node */
+            path?: components["schemas"]["GraphPathEndpoint"][];
+            /** @description Ordered typed edges in path from start to this node */
+            path_edges?: components["schemas"]["GraphPathEdge"][];
+            /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
+            provenance?: string[];
+            /** @description Parsed evidence envelope for provenance labels and edge metadata */
+            evidence?: {
+                [key: string]: unknown;
+            };
         };
         /** @description An ordered canonical graph path with table-qualified node identities and a self-describing ranking score. */
         GraphPath: {

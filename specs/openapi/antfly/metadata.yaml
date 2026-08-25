@@ -1906,7 +1906,7 @@ components:
           description: Graph operation mode, such as match or pattern.
         dimension:
           type: string
-          enum: [explored_nodes, explored_edges, explored_edge_bytes, scanned_anchors, intermediate_states]
+          enum: [explored_nodes, explored_edges, explored_edge_bytes, scanned_anchors, intermediate_states, retained_state_bytes]
           description: Bounded resource exhausted by the operation.
         maximum:
           type: integer

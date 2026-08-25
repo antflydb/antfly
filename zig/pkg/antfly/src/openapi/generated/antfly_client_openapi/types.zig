@@ -4429,6 +4429,12 @@ pub const GraphAlgebraicPlanningConfig = struct {
     bounded_traversal: ?GraphBoundedTraversalConfig = null,
 };
 
+pub const GraphAliasCountAggregate = struct {
+    count: GraphIdentifier,
+    /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
+    distinct: ?bool = null,
+};
+
 pub const GraphAliasOperand = struct {
     alias: GraphIdentifier,
 };
@@ -4486,6 +4492,16 @@ pub const GraphArtifactSourceConfig = struct {
     mention_edge_type: ?[]const u8 = null,
 };
 
+/// One exact node identity projected from a MATCH binding. Conjunctive bindings deliberately do not expose traversal depth, distance, or path: those values are not uniquely defined for branched patterns and may depend on execution order.
+pub const GraphBindingNode = struct {
+    /// Exact document key.
+    key: []const u8,
+    /// Owning table for a cross-table binding; omitted for the queried table.
+    table: ?[]const u8 = null,
+    /// Stored document when include_documents=true.
+    document: ?std.json.Value = null,
+};
+
 /// A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive.
 pub const GraphBindingsResult = struct {
     /// Stable discriminator for the graph result shape.
@@ -4508,14 +4524,63 @@ pub const GraphBoundedTraversalConfig = struct {
     law: []const u8,
 };
 
-pub const GraphCountAggregate = struct {
-    count: GraphCountTarget,
-    /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
-    distinct: ?bool = null,
-};
+/// Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid in every generated SDK.
+pub const GraphCountAggregate = union(enum) {
+    graph_row_count_aggregate: *GraphRowCountAggregate,
+    graph_alias_count_aggregate: *GraphAliasCountAggregate,
 
-/// Use the reserved token `*` to count rows, or a GraphIdentifier under Antfly graph identifier policy v1 to count non-null bindings.
-pub const GraphCountTarget = []const u8;
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectStringEquals(object: std.json.ObjectMap, comptime key: []const u8, comptime expected: []const u8) bool {
+        const value = object.get(key) orelse return false;
+        return value == .string and std.mem.eql(u8, value.string, expected);
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "count",
+        }) and
+            objectStringEquals(source.object, "count", "*"))
+        {
+            if (try parseStructuralVariant(GraphRowCountAggregate, allocator, source, options)) |parsed| return .{ .graph_row_count_aggregate = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "count",
+            "distinct",
+        })) {
+            if (try parseStructuralVariant(GraphAliasCountAggregate, allocator, source, options)) |parsed| return .{ .graph_alias_count_aggregate = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .graph_row_count_aggregate => |v| try jw.write(v.*),
+            .graph_alias_count_aggregate => |v| try jw.write(v.*),
+        }
+    }
+};
 
 pub const GraphDistinctBudgetExceededError = struct {
     status: i32,
@@ -5225,10 +5290,10 @@ pub const GraphQueryParams = struct {
 
 /// A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path results cannot be confused with the deprecated graph_searches envelope.
 pub const GraphQueryResult = union(enum) {
-    legacy_graph_query_result: *LegacyGraphQueryResult,
     graph_nodes_result: *GraphNodesResult,
     graph_aggregates_result: *GraphAggregatesResult,
     graph_bindings_result: *GraphBindingsResult,
+    legacy_graph_query_result: *LegacyGraphQueryResult,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
         const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
@@ -5268,10 +5333,10 @@ pub const GraphQueryResult = union(enum) {
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
         switch (probe.kind) {
             .value => |disc_str| {
-                if (std.mem.eql(u8, disc_str, "legacy")) return .{ .legacy_graph_query_result = try parseStructuralVariantFromSlice(LegacyGraphQueryResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "legacy")) return .{ .legacy_graph_query_result = try parseStructuralVariantFromSlice(LegacyGraphQueryResult, allocator, input, options) };
                 return error.UnexpectedToken;
             },
             .missing => {
@@ -5295,10 +5360,6 @@ pub const GraphQueryResult = union(enum) {
             .string => |value| value,
             else => return error.UnexpectedToken,
         };
-        if (std.mem.eql(u8, disc_str, "legacy")) {
-            const parsed = try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .legacy_graph_query_result = parsed };
-        }
         if (std.mem.eql(u8, disc_str, "nodes")) {
             const parsed = try parseStructuralVariant(GraphNodesResult, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .graph_nodes_result = parsed };
@@ -5311,15 +5372,19 @@ pub const GraphQueryResult = union(enum) {
             const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .graph_bindings_result = parsed };
         }
+        if (std.mem.eql(u8, disc_str, "legacy")) {
+            const parsed = try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .legacy_graph_query_result = parsed };
+        }
         return error.UnexpectedToken;
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
-            .legacy_graph_query_result => |v| try jw.write(v.*),
             .graph_nodes_result => |v| try jw.write(v.*),
             .graph_aggregates_result => |v| try jw.write(v.*),
             .graph_bindings_result => |v| try jw.write(v.*),
+            .legacy_graph_query_result => |v| try jw.write(v.*),
         }
     }
 };
@@ -5388,7 +5453,7 @@ pub const GraphResolverConfig = struct {
     config_generation: ?i64 = null,
 };
 
-pub const GraphResultBinding = ?GraphResultNode;
+pub const GraphResultBinding = ?GraphBindingNode;
 
 /// A node in graph query results
 pub const GraphResultNode = struct {
@@ -5473,6 +5538,33 @@ pub const GraphReturn = union(enum) {
             .graph_bindings_return => |v| try jw.write(v.*),
             .graph_aggregates_return => |v| try jw.write(v.*),
         }
+    }
+};
+
+pub const GraphRowCountAggregate = struct {
+    count: GraphRowCountTarget,
+};
+
+/// Count every complete graph binding.
+pub const GraphRowCountTarget = enum {
+    @"*",
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .@"*" => "*",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "*", .@"*" },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 

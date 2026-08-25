@@ -3261,13 +3261,24 @@ components:
           type: array
           maxItems: 64
           items: { $ref: '#/components/schemas/GraphOptionalMatch' }
-    GraphCountAggregate:
+    GraphRowCountTarget:
+      type: string
+      enum: ['*']
+      description: Count every complete graph binding.
+    GraphRowCountAggregate:
       type: object
       additionalProperties: false
       required: [count]
       properties:
         count:
-          $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphCountTarget'
+          $ref: '#/components/schemas/GraphRowCountTarget'
+    GraphAliasCountAggregate:
+      type: object
+      additionalProperties: false
+      required: [count]
+      properties:
+        count:
+          $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier'
         distinct:
           type: boolean
           default: false
@@ -3275,6 +3286,13 @@ components:
             Count exact table-qualified identities. Exact distinct sets share a
             request memory budget and fail with
             `graph_distinct_budget_exceeded` instead of returning a partial count.
+    GraphCountAggregate:
+      oneOf:
+        - $ref: '#/components/schemas/GraphRowCountAggregate'
+        - $ref: '#/components/schemas/GraphAliasCountAggregate'
+      description: >-
+        Exact count(*) or count(alias). The distinct option exists only for
+        alias counts, making distinct count(*) invalid in every generated SDK.
     GraphBindingsReturn:
       type: object
       additionalProperties: false
@@ -3646,10 +3664,32 @@ components:
         - $ref: '#/components/schemas/GraphAggregatesResult'
         - $ref: '#/components/schemas/GraphNodesResult'
         - $ref: '#/components/schemas/LegacyGraphQueryResult'
+    GraphBindingNode:
+      type: object
+      additionalProperties: false
+      required: [key]
+      description: >-
+        One exact node identity projected from a MATCH binding. Conjunctive
+        bindings deliberately do not expose traversal depth, distance, or path:
+        those values are not uniquely defined for branched patterns and may
+        depend on execution order.
+      properties:
+        key:
+          type: string
+          minLength: 1
+          description: Exact document key.
+        table:
+          type: string
+          minLength: 1
+          description: Owning table for a cross-table binding; omitted for the queried table.
+        document:
+          type: object
+          additionalProperties: true
+          description: Stored document when include_documents=true.
     GraphResultBinding:
-      x-go-type: '*GraphResultNode'
+      x-go-type: '*GraphBindingNode'
       oneOf:
-        - $ref: '#/components/schemas/GraphResultNode'
+        - $ref: '#/components/schemas/GraphBindingNode'
         - enum: [null]
     GraphResultRow:
       type: object

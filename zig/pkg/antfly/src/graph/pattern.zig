@@ -39,6 +39,7 @@ pub const default_max_explored_edges = work_budget_mod.default_max_explored_edge
 pub const default_max_explored_edge_bytes = work_budget_mod.default_max_explored_edge_bytes;
 pub const default_max_scanned_anchors = work_budget_mod.default_max_scanned_anchors;
 pub const default_max_intermediate_states = work_budget_mod.default_max_intermediate_states;
+pub const default_max_retained_state_bytes = work_budget_mod.default_max_retained_state_bytes;
 pub const default_max_distinct_identities: usize = 100_000;
 pub const default_max_distinct_identity_bytes: usize = 16 * 1024 * 1024;
 
@@ -378,20 +379,89 @@ const MatchState = struct {
     }
 };
 
+const PathAncestry = struct {
+    node: node_identity.Ref,
+    parent: ?*const PathAncestry,
+};
+
+/// Request-local ancestry storage. Every expanded state owns only its newest
+/// identity and a parent pointer; siblings no longer copy the complete path.
+/// The arena is released when one reachability walk finishes, while the byte
+/// counter prevents identifier payloads from amplifying retained memory beyond
+/// the public request ceiling.
+const ReachabilityAncestry = struct {
+    arena: std.heap.ArenaAllocator,
+    work_budget: *WorkBudget,
+    retained_bytes: usize = 0,
+
+    fn init(alloc: Allocator, work_budget: *WorkBudget) ReachabilityAncestry {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(alloc),
+            .work_budget = work_budget,
+        };
+    }
+
+    fn deinit(self: *ReachabilityAncestry) void {
+        self.work_budget.releaseStateBytes(self.retained_bytes);
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    fn append(
+        self: *ReachabilityAncestry,
+        key: []const u8,
+        table: ?[]const u8,
+        parent: ?*const PathAncestry,
+    ) !*const PathAncestry {
+        var added = std.math.add(usize, @sizeOf(PathAncestry), key.len) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        if (table) |value| added = std.math.add(usize, added, value.len) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        try self.work_budget.retainStateBytes(added);
+        errdefer self.work_budget.releaseStateBytes(added);
+
+        const arena_alloc = self.arena.allocator();
+        const owned_key = try arena_alloc.dupe(u8, key);
+        const owned_table = if (table) |value| try arena_alloc.dupe(u8, value) else null;
+        const ancestry = try arena_alloc.create(PathAncestry);
+        ancestry.* = .{
+            .node = .{ .key = owned_key, .table = owned_table },
+            .parent = parent,
+        };
+        self.retained_bytes += added;
+        return ancestry;
+    }
+};
+
 const Frontier = struct {
-    key: []u8,
-    table: ?[]u8 = null,
+    key: []const u8,
+    table: ?[]const u8 = null,
     path: []paths_mod.PathEdge,
-    path_nodes: []node_identity.Key,
+    ancestry: *const PathAncestry,
     hops: u32,
 
     fn deinit(self: *Frontier, alloc: Allocator) void {
-        alloc.free(self.key);
-        if (self.table) |table| alloc.free(table);
         freePathEdges(alloc, self.path);
-        for (self.path_nodes) |*node| node.deinit(alloc);
-        alloc.free(self.path_nodes);
         self.* = undefined;
+    }
+};
+
+const ReachableObserver = struct {
+    ctx: *anyopaque,
+    full_fn: *const fn (*anyopaque) bool,
+    observe_fn: *const fn (*anyopaque, node_identity.Ref, u32, []const paths_mod.PathEdge) anyerror!void,
+
+    fn full(self: ReachableObserver) bool {
+        return self.full_fn(self.ctx);
+    }
+
+    fn observe(
+        self: ReachableObserver,
+        node: node_identity.Ref,
+        depth: u32,
+        path: []const paths_mod.PathEdge,
+    ) !void {
+        return self.observe_fn(self.ctx, node, depth, path);
     }
 };
 
@@ -406,6 +476,38 @@ const ReachableNode = struct {
         if (self.table) |table| alloc.free(table);
         freePathEdges(alloc, self.path);
         self.* = undefined;
+    }
+};
+
+const ReachableCollector = struct {
+    alloc: Allocator,
+    results: *std.ArrayListUnmanaged(ReachableNode),
+    limit: usize,
+
+    fn observer(self: *ReachableCollector) ReachableObserver {
+        return .{
+            .ctx = self,
+            .full_fn = isFull,
+            .observe_fn = observe,
+        };
+    }
+
+    fn isFull(ctx: *anyopaque) bool {
+        const self: *ReachableCollector = @ptrCast(@alignCast(ctx));
+        return self.results.items.len >= self.limit;
+    }
+
+    fn observe(
+        ctx: *anyopaque,
+        node: node_identity.Ref,
+        depth: u32,
+        path: []const paths_mod.PathEdge,
+    ) !void {
+        const self: *ReachableCollector = @ptrCast(@alignCast(ctx));
+        if (self.results.items.len >= self.limit) return;
+        var reached = try initReachableNode(self.alloc, node.key, node.table, depth, path);
+        errdefer reached.deinit(self.alloc);
+        try self.results.append(self.alloc, reached);
     }
 };
 
@@ -638,6 +740,7 @@ pub fn matchPatternFromRefsWithEdgeReader(
                 step_idx + 1 == pattern.len and opts.target_required,
                 opts.max_results,
                 opts.require_complete,
+                opts.max_intermediate_states,
                 opts.evaluator,
                 opts.node_admission,
                 opts.include_paths,
@@ -967,12 +1070,69 @@ fn findReachableNodes(
     target_required: bool,
     max_results: u32,
     require_complete: bool,
+    max_intermediate_states: usize,
     evaluator: ?FilterEvaluator,
     node_admission: ?NodeAdmission,
     include_paths: bool,
     stats: ?*MatchStats,
     work_budget: *WorkBudget,
 ) ![]ReachableNode {
+    const result_limit: usize = if (require_complete)
+        std.math.maxInt(usize)
+    else if (max_results == 0)
+        1000
+    else
+        @min(
+            std.math.mul(usize, @as(usize, max_results), 10) catch std.math.maxInt(usize),
+            1000,
+        );
+    var results = std.ArrayListUnmanaged(ReachableNode).empty;
+    errdefer {
+        for (results.items) |*node| node.deinit(alloc);
+        results.deinit(alloc);
+    }
+    var collector = ReachableCollector{
+        .alloc = alloc,
+        .results = &results,
+        .limit = result_limit,
+    };
+    try streamReachableNodes(
+        alloc,
+        edge_reader,
+        start_key,
+        start_table,
+        edge,
+        node_filter,
+        target_nodes,
+        target_required,
+        max_intermediate_states,
+        evaluator,
+        node_admission,
+        include_paths,
+        stats,
+        work_budget,
+        collector.observer(),
+    );
+    return try results.toOwnedSlice(alloc);
+}
+
+fn streamReachableNodes(
+    alloc: Allocator,
+    edge_reader: anytype,
+    start_key: []const u8,
+    start_table: ?[]const u8,
+    edge: PatternEdgeStep,
+    node_filter: NodeFilter,
+    target_nodes: []const node_identity.Ref,
+    target_required: bool,
+    max_intermediate_states: usize,
+    evaluator: ?FilterEvaluator,
+    node_admission: ?NodeAdmission,
+    include_paths: bool,
+    stats: ?*MatchStats,
+    work_budget: *WorkBudget,
+    observer: ReachableObserver,
+) !void {
     const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
     const max_hops = if (edge.max_hops == 0) @as(u32, 1) else edge.max_hops;
     // A fixed relationship is not a variable-length path: a physical
@@ -986,33 +1146,19 @@ fn findReachableNodes(
                 return error.GraphReverseVariablePathUnsupported;
         }
     }
-    const result_limit: usize = if (require_complete)
-        std.math.maxInt(usize)
-    else if (max_results == 0)
-        1000
-    else
-        @min(
-            std.math.mul(usize, @as(usize, max_results), 10) catch std.math.maxInt(usize),
-            1000,
-        );
-
-    var results = std.ArrayListUnmanaged(ReachableNode).empty;
-    errdefer {
-        for (results.items) |*node| node.deinit(alloc);
-        results.deinit(alloc);
-    }
-
+    var ancestry = ReachabilityAncestry.init(alloc, work_budget);
+    defer ancestry.deinit();
     var current = std.ArrayListUnmanaged(Frontier).empty;
     defer {
         for (current.items) |*frontier| frontier.deinit(alloc);
         current.deinit(alloc);
     }
     {
-        var initial = try initFrontier(alloc, start_key, start_table, &.{}, &.{}, 0);
+        var initial = try initFrontier(&ancestry, start_key, start_table, &.{}, null, 0);
         errdefer initial.deinit(alloc);
         try current.append(alloc, initial);
     }
-    while (current.items.len > 0 and results.items.len < result_limit) {
+    while (current.items.len > 0 and !observer.full()) {
         var next = std.ArrayListUnmanaged(Frontier).empty;
         errdefer {
             for (next.items) |*frontier| frontier.deinit(alloc);
@@ -1162,16 +1308,12 @@ fn findReachableNodes(
                     targetNodeMatches(.{ .table = target_table, .key = target_key }, target_nodes, target_required) and
                     (if (filtered_edges) |mask| mask[edge_index] else true))
                 {
-                    var reached = try initReachableNode(
-                        alloc,
-                        target_key,
-                        target_table,
+                    try observer.observe(
+                        .{ .key = target_key, .table = target_table },
                         new_hops,
                         new_path,
                     );
-                    errdefer reached.deinit(alloc);
-                    try results.append(alloc, reached);
-                    if (results.items.len >= result_limit) {
+                    if (observer.full()) {
                         freePathEdges(alloc, new_path);
                         new_path_owned = false;
                         break;
@@ -1182,22 +1324,23 @@ fn findReachableNodes(
                 // cycle-closing target. Do not expand it into non-simple paths.
                 if (new_hops < max_hops and !revisits_path) {
                     var next_item = try initFrontier(
-                        alloc,
+                        &ancestry,
                         target_key,
                         target_table,
                         new_path,
-                        frontier.path_nodes,
+                        frontier.ancestry,
                         new_hops,
                     );
                     new_path_owned = false;
                     errdefer next_item.deinit(alloc);
+                    try work_budget.checkIntermediateStates(next.items.len + 1, max_intermediate_states);
                     try next.append(alloc, next_item);
                 } else {
                     freePathEdges(alloc, new_path);
                     new_path_owned = false;
                 }
             }
-            if (results.items.len >= result_limit) break;
+            if (observer.full()) break;
         }
 
         for (current.items) |*frontier| frontier.deinit(alloc);
@@ -1205,7 +1348,7 @@ fn findReachableNodes(
         current = next;
     }
 
-    return try results.toOwnedSlice(alloc);
+    return;
 }
 
 fn startNodeAdmitted(
@@ -2126,7 +2269,137 @@ fn streamConjunctiveGroup(
         target_node_storage[0] = .{ .key = binding.key, .table = binding.table };
         break :blk &target_node_storage;
     } else &.{};
-    const reachable = try findReachableNodes(
+    processed[edge_index] = true;
+    defer processed[edge_index] = false;
+    try streamReachableIntoConjunctiveGroup(
+        alloc,
+        edge_reader,
+        pattern,
+        group_nodes,
+        edges,
+        predicates,
+        state,
+        processed,
+        processed_count + 1,
+        completed_optional_index,
+        optional_match_count,
+        opts,
+        work_budget,
+        sink,
+        source,
+        target != null,
+        new_alias,
+        new_node,
+        step,
+        node_filter,
+        target_nodes,
+    );
+}
+
+fn streamReachableIntoConjunctiveGroup(
+    alloc: Allocator,
+    edge_reader: anytype,
+    pattern: ConjunctivePattern,
+    group_nodes: []const MatchNode,
+    edges: []const MatchEdge,
+    predicates: []const MatchPredicate,
+    state: ConjunctiveState,
+    processed: []bool,
+    processed_count: usize,
+    completed_optional_index: ?usize,
+    optional_match_count: ?*usize,
+    opts: MatchOptions,
+    work_budget: *WorkBudget,
+    sink: anytype,
+    source: PatternBinding,
+    target_bound: bool,
+    new_alias: []const u8,
+    new_node: ?MatchNode,
+    step: PatternEdgeStep,
+    node_filter: NodeFilter,
+    target_nodes: []const node_identity.Ref,
+) !void {
+    const EdgeReader = @TypeOf(edge_reader);
+    const Sink = @TypeOf(sink);
+    const Context = struct {
+        alloc: Allocator,
+        edge_reader: EdgeReader,
+        pattern: ConjunctivePattern,
+        group_nodes: []const MatchNode,
+        edges: []const MatchEdge,
+        predicates: []const MatchPredicate,
+        state: ConjunctiveState,
+        processed: []bool,
+        processed_count: usize,
+        completed_optional_index: ?usize,
+        optional_match_count: ?*usize,
+        opts: MatchOptions,
+        work_budget: *WorkBudget,
+        sink: Sink,
+        target_bound: bool,
+        new_alias: []const u8,
+        new_node: ?MatchNode,
+
+        fn isFull(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.sink.full();
+        }
+
+        fn observe(
+            raw: *anyopaque,
+            reached: node_identity.Ref,
+            depth: u32,
+            _: []const paths_mod.PathEdge,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.sink.full()) return;
+            if (self.new_node) |node| {
+                if (!declaredNodeTableMatches(self.edge_reader, reached.table, node.table)) return;
+            }
+            var expanded = try cloneConjunctiveState(self.alloc, self.state);
+            defer expanded.deinit(self.alloc);
+            if (!self.target_bound) {
+                try appendConcreteBindingRef(self.alloc, &expanded, self.new_alias, reached, depth);
+            }
+            try streamConjunctiveGroup(
+                self.alloc,
+                self.edge_reader,
+                self.pattern,
+                self.group_nodes,
+                self.edges,
+                self.predicates,
+                expanded,
+                self.processed,
+                self.processed_count,
+                self.completed_optional_index,
+                self.optional_match_count,
+                self.opts,
+                self.work_budget,
+                self.sink,
+            );
+        }
+    };
+
+    var context = Context{
+        .alloc = alloc,
+        .edge_reader = edge_reader,
+        .pattern = pattern,
+        .group_nodes = group_nodes,
+        .edges = edges,
+        .predicates = predicates,
+        .state = state,
+        .processed = processed,
+        .processed_count = processed_count,
+        .completed_optional_index = completed_optional_index,
+        .optional_match_count = optional_match_count,
+        .opts = opts,
+        .work_budget = work_budget,
+        .sink = sink,
+        .target_bound = target_bound,
+        .new_alias = new_alias,
+        .new_node = new_node,
+    };
+    try streamReachableNodes(
         alloc,
         edge_reader,
         source.key,
@@ -2134,45 +2407,15 @@ fn streamConjunctiveGroup(
         step,
         node_filter,
         target_nodes,
-        target != null,
-        0,
-        true,
+        target_bound,
+        opts.max_intermediate_states,
         opts.evaluator,
         opts.node_admission,
         false,
         opts.stats,
         work_budget,
+        .{ .ctx = &context, .full_fn = Context.isFull, .observe_fn = Context.observe },
     );
-    defer {
-        for (reachable) |*node| node.deinit(alloc);
-        if (reachable.len > 0) alloc.free(reachable);
-    }
-
-    processed[edge_index] = true;
-    defer processed[edge_index] = false;
-    for (reachable) |reached| {
-        if (sink.full()) break;
-        if (new_node) |node| if (!declaredNodeTableMatches(edge_reader, reached.table, node.table)) continue;
-        var expanded = try cloneConjunctiveState(alloc, state);
-        defer expanded.deinit(alloc);
-        if (target == null) try appendConcreteBinding(alloc, &expanded, new_alias, reached);
-        try streamConjunctiveGroup(
-            alloc,
-            edge_reader,
-            pattern,
-            group_nodes,
-            edges,
-            predicates,
-            expanded,
-            processed,
-            processed_count + 1,
-            completed_optional_index,
-            optional_match_count,
-            opts,
-            work_budget,
-            sink,
-        );
-    }
 }
 
 fn appendOwnedIdentity(alloc: Allocator, values: *std.ArrayListUnmanaged(node_identity.Ref), table_name: ?[]const u8, key_name: []const u8) !void {
@@ -2465,6 +2708,7 @@ fn expandConjunctiveEdge(
         target != null,
         0,
         opts.require_complete,
+        opts.max_intermediate_states,
         opts.evaluator,
         opts.node_admission,
         false,
@@ -2503,7 +2747,7 @@ fn correlatedEdgesExist(alloc: Allocator, edge_reader: anytype, state: Conjuncti
         const from = findBinding(state.bindings, edge.from) orelse return false;
         const to = findBinding(state.bindings, edge.to) orelse return false;
         const targets = [_]node_identity.Ref{.{ .key = to.key, .table = to.table }};
-        const reachable = try findReachableNodes(alloc, edge_reader, from.key, from.table, edge.step, .{}, &targets, true, 1, false, opts.evaluator, opts.node_admission, false, opts.stats, work_budget);
+        const reachable = try findReachableNodes(alloc, edge_reader, from.key, from.table, edge.step, .{}, &targets, true, 1, false, opts.max_intermediate_states, opts.evaluator, opts.node_admission, false, opts.stats, work_budget);
         defer {
             for (reachable) |*node| node.deinit(alloc);
             if (reachable.len > 0) alloc.free(reachable);
@@ -2555,9 +2799,26 @@ fn cloneConjunctiveState(alloc: Allocator, state: ConjunctiveState) !Conjunctive
 }
 
 fn appendConcreteBinding(alloc: Allocator, state: *ConjunctiveState, alias: []const u8, reached: ReachableNode) !void {
+    return appendConcreteBindingRef(
+        alloc,
+        state,
+        alias,
+        .{ .key = reached.key, .table = reached.table },
+        reached.depth,
+    );
+}
+
+fn appendConcreteBindingRef(
+    alloc: Allocator,
+    state: *ConjunctiveState,
+    alias: []const u8,
+    reached: node_identity.Ref,
+    depth: u32,
+) !void {
     const expanded = try alloc.alloc(PatternBinding, state.bindings.len + 1);
+    errdefer alloc.free(expanded);
     for (state.bindings, 0..) |binding, i| expanded[i] = binding;
-    expanded[state.bindings.len] = try initPatternBinding(alloc, alias, reached.key, reached.table, reached.depth);
+    expanded[state.bindings.len] = try initPatternBinding(alloc, alias, reached.key, reached.table, depth);
     if (state.bindings.len > 0) alloc.free(state.bindings);
     state.bindings = expanded;
 }
@@ -2714,41 +2975,28 @@ fn initPatternBinding(
 }
 
 fn initFrontier(
-    alloc: Allocator,
+    ancestry_store: *ReachabilityAncestry,
     key: []const u8,
     table: ?[]const u8,
     path: []paths_mod.PathEdge,
-    parent_path_nodes: []const node_identity.Key,
+    parent: ?*const PathAncestry,
     hops: u32,
 ) !Frontier {
-    const owned_key = try alloc.dupe(u8, key);
-    errdefer alloc.free(owned_key);
-    const owned_table = if (table) |table_name| try alloc.dupe(u8, table_name) else null;
-    errdefer if (owned_table) |table_name| alloc.free(table_name);
-    const path_nodes = try alloc.alloc(node_identity.Key, parent_path_nodes.len + 1);
-    var initialized: usize = 0;
-    errdefer {
-        for (path_nodes[0..initialized]) |*node| node.deinit(alloc);
-        alloc.free(path_nodes);
-    }
-    for (parent_path_nodes, 0..) |node, i| {
-        path_nodes[i] = try node_identity.Key.init(alloc, .{ .table = node.table(), .key = node.key() });
-        initialized += 1;
-    }
-    path_nodes[parent_path_nodes.len] = try node_identity.Key.init(alloc, .{ .table = table, .key = key });
-    initialized += 1;
+    const ancestry = try ancestry_store.append(key, table, parent);
     return .{
-        .key = owned_key,
-        .table = owned_table,
+        .key = ancestry.node.key,
+        .table = ancestry.node.table,
         .path = path,
-        .path_nodes = path_nodes,
+        .ancestry = ancestry,
         .hops = hops,
     };
 }
 
 fn frontierContainsNode(frontier: Frontier, node: node_identity.Ref) bool {
-    for (frontier.path_nodes) |path_node| {
-        if (optionalTableEql(path_node.table(), node.table) and std.mem.eql(u8, path_node.key(), node.key)) return true;
+    var ancestry: ?*const PathAncestry = frontier.ancestry;
+    while (ancestry) |entry| : (ancestry = entry.parent) {
+        if (optionalTableEql(entry.node.table, node.table) and
+            std.mem.eql(u8, entry.node.key, node.key)) return true;
     }
     return false;
 }
@@ -2985,6 +3233,7 @@ test "reverse variable expansion fails closed when the reader cannot prove inter
             false,
             0,
             true,
+            default_max_intermediate_states,
             null,
             null,
             false,

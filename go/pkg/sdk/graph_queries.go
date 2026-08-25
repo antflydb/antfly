@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
@@ -453,25 +454,8 @@ func NewGraphBindingsReturn(bindings []string, options GraphBindingsOptions) (Gr
 
 // NewGraphAggregatesReturn selects named exact graph aggregates.
 func NewGraphAggregatesReturn(aggregates map[string]GraphCountAggregate) (GraphReturn, error) {
-	if len(aggregates) == 0 {
-		return GraphReturn{}, fmt.Errorf("antfly: graph aggregates must not be empty")
-	}
-	if len(aggregates) > maxGraphCountAggregates {
-		return GraphReturn{}, fmt.Errorf("antfly: graph aggregates exceed the maximum of %d", maxGraphCountAggregates)
-	}
-	for name, aggregate := range aggregates {
-		if strings.TrimSpace(name) == "" || !validGraphIdentifier(name) {
-			return GraphReturn{}, invalidGraphIdentifier("graph aggregate name")
-		}
-		if strings.TrimSpace(aggregate.Count) == "" {
-			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate %q must name an alias or *", name)
-		}
-		if aggregate.Count == "*" && aggregate.Distinct {
-			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate %q cannot use distinct count(*)", name)
-		}
-		if aggregate.Count != "*" && !validGraphIdentifier(aggregate.Count) {
-			return GraphReturn{}, fmt.Errorf("antfly: graph aggregate %q references an invalid alias", name)
-		}
+	if err := validateGraphAggregates(aggregates, nil); err != nil {
+		return GraphReturn{}, err
 	}
 	var result GraphReturn
 	err := result.FromGraphAggregatesReturn(GraphAggregatesReturn{Aggregates: aggregates})
@@ -480,13 +464,26 @@ func NewGraphAggregatesReturn(aggregates map[string]GraphCountAggregate) (GraphR
 
 // CountGraphRows returns count(*) for graph bindings.
 func CountGraphRows() GraphCountAggregate {
-	return GraphCountAggregate{Count: "*"}
+	var aggregate GraphCountAggregate
+	if err := aggregate.FromGraphRowCountAggregate(GraphRowCountAggregate{
+		Count: GraphRowCountTarget("*"),
+	}); err != nil {
+		panic(fmt.Sprintf("antfly: construct count(*): %v", err))
+	}
+	return aggregate
 }
 
 // CountGraphAlias counts non-null bindings for alias. Set distinct to count
 // unique (table, key) node identities.
 func CountGraphAlias(alias string, distinct bool) GraphCountAggregate {
-	return GraphCountAggregate{Count: alias, Distinct: distinct}
+	var aggregate GraphCountAggregate
+	if err := aggregate.FromGraphAliasCountAggregate(GraphAliasCountAggregate{
+		Count:    alias,
+		Distinct: distinct,
+	}); err != nil {
+		panic(fmt.Sprintf("antfly: construct count(%s): %v", alias, err))
+	}
+	return aggregate
 }
 
 // NewGraphNotEqual rejects rows where two aliases resolve to the same exact
@@ -814,15 +811,14 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 	if err != nil {
 		return err
 	}
-	var value struct {
-		Bindings         []string                       `json:"bindings"`
-		Limit            int                            `json:"limit"`
-		IncludeDocuments bool                           `json:"include_documents"`
-		Fields           []string                       `json:"fields"`
-		Aggregates       map[string]GraphCountAggregate `json:"aggregates"`
-	}
-	if err := json.Unmarshal(encoded, &value); err != nil {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &members); err != nil {
 		return err
+	}
+	_, hasBindings := members["bindings"]
+	_, hasAggregates := members["aggregates"]
+	if hasBindings == hasAggregates {
+		return fmt.Errorf("antfly: graph return must contain exactly one of bindings or aggregates")
 	}
 	known := make(map[string]struct{}, len(match.Nodes))
 	for alias := range match.Nodes {
@@ -833,10 +829,14 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 			known[alias] = struct{}{}
 		}
 	}
-	if len(value.Bindings) == 0 && len(value.Aggregates) == 0 {
-		return fmt.Errorf("antfly: graph return must contain bindings or aggregates")
-	}
-	if len(value.Bindings) > 0 {
+	if hasBindings {
+		if err := rejectUnknownGraphFields("graph return", members, "bindings", "limit", "include_documents", "fields"); err != nil {
+			return err
+		}
+		var value GraphBindingsReturn
+		if err := json.Unmarshal(encoded, &value); err != nil {
+			return err
+		}
 		if err := validateGraphBindingsProjection(
 			value.Bindings,
 			value.Limit,
@@ -845,24 +845,105 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 		); err != nil {
 			return err
 		}
+		for _, binding := range value.Bindings {
+			if _, ok := known[binding]; !ok {
+				return fmt.Errorf("antfly: graph return references unknown alias %q", binding)
+			}
+		}
+		return nil
 	}
-	for _, binding := range value.Bindings {
-		if _, ok := known[binding]; !ok {
-			return fmt.Errorf("antfly: graph return references unknown alias %q", binding)
+	if err := rejectUnknownGraphFields("graph return", members, "aggregates"); err != nil {
+		return err
+	}
+	var value GraphAggregatesReturn
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		return err
+	}
+	return validateGraphAggregates(value.Aggregates, known)
+}
+
+func rejectUnknownGraphFields(context string, members map[string]json.RawMessage, allowed ...string) error {
+	known := make(map[string]struct{}, len(allowed))
+	for _, field := range allowed {
+		known[field] = struct{}{}
+	}
+	unknown := make([]string, 0)
+	for field := range members {
+		if _, ok := known[field]; !ok {
+			unknown = append(unknown, field)
 		}
 	}
-	for name, aggregate := range value.Aggregates {
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	return fmt.Errorf("antfly: %s contains unknown field %q", context, unknown[0])
+}
+
+func validateGraphAggregates(aggregates map[string]GraphCountAggregate, aliases map[string]struct{}) error {
+	if len(aggregates) == 0 {
+		return fmt.Errorf("antfly: graph aggregates must not be empty")
+	}
+	if len(aggregates) > maxGraphCountAggregates {
+		return fmt.Errorf("antfly: graph aggregates exceed the maximum of %d", maxGraphCountAggregates)
+	}
+	for name, aggregate := range aggregates {
 		if !validGraphIdentifier(name) {
-			return fmt.Errorf("antfly: graph aggregate name %q is invalid", name)
+			return invalidGraphIdentifier("graph aggregate name")
 		}
-		if aggregate.Count == "*" {
+		count, distinct, err := decodeGraphCountAggregate(aggregate)
+		if err != nil {
+			return fmt.Errorf("antfly: graph aggregate %q: %w", name, err)
+		}
+		if strings.TrimSpace(count) == "" {
+			return fmt.Errorf("antfly: graph aggregate %q must name an alias or *", name)
+		}
+		if count == "*" {
+			if distinct {
+				return fmt.Errorf("antfly: graph aggregate %q cannot use distinct count(*)", name)
+			}
 			continue
 		}
-		if _, ok := known[aggregate.Count]; !ok {
-			return fmt.Errorf("antfly: graph aggregate %q references unknown alias %q", name, aggregate.Count)
+		if !validGraphIdentifier(count) {
+			return fmt.Errorf("antfly: graph aggregate %q references an invalid alias", name)
+		}
+		if aliases != nil {
+			if _, ok := aliases[count]; !ok {
+				return fmt.Errorf("antfly: graph aggregate %q references unknown alias %q", name, count)
+			}
 		}
 	}
 	return nil
+}
+
+func decodeGraphCountAggregate(aggregate GraphCountAggregate) (count string, distinct bool, err error) {
+	encoded, err := json.Marshal(aggregate)
+	if err != nil {
+		return "", false, fmt.Errorf("encode count expression: %w", err)
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &members); err != nil {
+		return "", false, fmt.Errorf("decode count expression: %w", err)
+	}
+	if err := rejectUnknownGraphFields("graph count aggregate", members, "count", "distinct"); err != nil {
+		return "", false, err
+	}
+	rawCount, ok := members["count"]
+	if !ok {
+		return "", false, fmt.Errorf("count expression must contain count")
+	}
+	if err := json.Unmarshal(rawCount, &count); err != nil {
+		return "", false, fmt.Errorf("count must be a string: %w", err)
+	}
+	if rawDistinct, ok := members["distinct"]; ok {
+		if count == "*" {
+			return "", false, fmt.Errorf("distinct is only valid for alias counts")
+		}
+		if err := json.Unmarshal(rawDistinct, &distinct); err != nil {
+			return "", false, fmt.Errorf("distinct must be a boolean: %w", err)
+		}
+	}
+	return count, distinct, nil
 }
 
 func validateGraphBindingsProjection(bindings []string, limit int, includeDocuments bool, fields []string) error {

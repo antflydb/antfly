@@ -271,6 +271,11 @@ not run full-text analyzers. Range predicates use explicit `numeric_range` or
 ```
 
 Exact aggregation streams bindings without materializing a bounded row page.
+Row returns expose each alias as a compact `{key, table?, document?}` binding.
+Traversal-only metrics such as `depth`, `distance`, and `path` are intentionally
+absent because a node in a branched match has no single canonical traversal
+distance. Request a traversal or path operation when those metrics are the
+desired result.
 `match.anchor` names the alias enumerated from the query table. Omit a node's
 `table` for that same table; declare `table` on every cross-table alias. The
 declaration is part of the alias's identity and lets the planner safely expand a
@@ -309,6 +314,9 @@ escape `~` as `~0` and `/` within a key as `~1`.
 All graph expansion work is budgeted across the whole request, including every
 named operation and every K-shortest-path spur search. Traversal and path
 operations also retain their explicit per-operation depth and result bounds.
+The matcher also enforces a byte ceiling on retained frontier ancestry, in
+addition to its node, edge, and intermediate-state limits, so long identities
+cannot bypass the memory invariant.
 If Antfly cannot enumerate the complete authorized anchor relation or exhausts
 that budget, the request fails instead of returning a partial count.
 Exact `count(distinct alias)` sets also share a request-scoped identity and byte

@@ -223,6 +223,33 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 		t.Fatalf("expected final graph return validation to enforce the hydration budget, got %v", err)
 	}
 
+	for name, rawReturn := range map[string]string{
+		"mixed variants":          `{"bindings":["a"],"aggregates":{"rows":{"count":"*"}}}`,
+		"unknown field":           `{"bindings":["a"],"unexpected":true}`,
+		"distinct rows":           `{"aggregates":{"rows":{"count":"*","distinct":true}}}`,
+		"explicit false rows":     `{"aggregates":{"rows":{"count":"*","distinct":false}}}`,
+		"unknown aggregate field": `{"aggregates":{"rows":{"count":"*","unexpected":true}}}`,
+		"too many counts":         mustMarshalGraphAggregates(t, maxGraphCountAggregates+1),
+	} {
+		t.Run("unchecked return rejects "+name, func(t *testing.T) {
+			var unchecked GraphReturn
+			if err := json.Unmarshal([]byte(rawReturn), &unchecked); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewGraphMatchQuery(GraphMatchQuery{
+				Index: "graph_idx",
+				Match: GraphMatch{
+					Anchor: "a",
+					Nodes:  map[string]GraphMatchNode{"a": {}, "b": {}},
+					Edges:  []GraphMatchEdge{{From: "a", To: "b"}},
+				},
+				Return: unchecked,
+			}); err == nil {
+				t.Fatalf("expected unchecked %s to fail final validation", name)
+			}
+		})
+	}
+
 	validReturn, err := NewGraphBindingsReturn([]string{"b"}, GraphBindingsOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -526,7 +553,7 @@ func TestGraphMatchEdgeValidationMatchesServerDefaultsAndBudgets(t *testing.T) {
 
 func TestGraphResultRowUsesNullableTypedBindings(t *testing.T) {
 	row := GraphResultRow{
-		"author":   &GraphResultNode{Key: "person:1"},
+		"author":   &GraphBindingNode{Key: "person:1"},
 		"optional": nil,
 	}
 	encoded, err := json.Marshal(row)
@@ -543,4 +570,17 @@ func TestGraphResultRowUsesNullableTypedBindings(t *testing.T) {
 	if decoded["optional"] != nil {
 		t.Fatalf("optional binding = %#v", decoded["optional"])
 	}
+}
+
+func mustMarshalGraphAggregates(t *testing.T, count int) string {
+	t.Helper()
+	aggregates := make(map[string]GraphCountAggregate, count)
+	for i := 0; i < count; i++ {
+		aggregates[fmt.Sprintf("count_%d", i)] = CountGraphRows()
+	}
+	encoded, err := json.Marshal(map[string]any{"aggregates": aggregates})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
 }

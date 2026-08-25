@@ -320,6 +320,7 @@ type (
 	GraphPathEdge                  = oapi.GraphPathEdge
 	GraphPathEndpoint              = oapi.GraphPathEndpoint
 	GraphResultNode                = oapi.GraphResultNode
+	GraphBindingNode               = oapi.GraphBindingNode
 	GraphResultBinding             = oapi.GraphResultBinding
 	GraphResultRow                 = oapi.GraphResultRow
 	GraphAggregateValue            = oapi.GraphAggregateValue
@@ -338,6 +339,9 @@ type (
 	GraphBindingsReturn            = oapi.GraphBindingsReturn
 	GraphAggregatesReturn          = oapi.GraphAggregatesReturn
 	GraphCountAggregate            = oapi.GraphCountAggregate
+	GraphRowCountAggregate         = oapi.GraphRowCountAggregate
+	GraphRowCountTarget            = oapi.GraphRowCountTarget
+	GraphAliasCountAggregate       = oapi.GraphAliasCountAggregate
 	GraphWhereExpression           = oapi.GraphWhereExpression
 	GraphAliasOperand              = oapi.GraphAliasOperand
 	GraphNotEqualPredicate         = oapi.GraphNotEqualPredicate

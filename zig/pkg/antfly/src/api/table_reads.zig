@@ -18584,11 +18584,21 @@ fn appendRemoteGraphBinding(
     alloc: std.mem.Allocator,
     bindings: *std.ArrayListUnmanaged(db_mod.types.GraphPatternBinding),
     alias: []const u8,
-    node_value: indexes_openapi.GraphResultNode,
+    node_value: indexes_openapi.GraphBindingNode,
 ) !void {
     const owned_alias = try alloc.dupe(u8, alias);
     errdefer alloc.free(owned_alias);
-    var node = try parseRemoteGraphNodeWithKey(alloc, node_value.key, node_value);
+    try validateRemoteCanonicalGraphIdentity(node_value.key, node_value.table);
+    const owned_key = try alloc.dupe(u8, node_value.key);
+    errdefer alloc.free(owned_key);
+    const owned_table = if (node_value.table) |table| try alloc.dupe(u8, table) else null;
+    errdefer if (owned_table) |table| alloc.free(table);
+    var node = graph_query_mod.GraphResultNode{
+        .key = owned_key,
+        .table = owned_table,
+        .depth = 0,
+        .distance = 0,
+    };
     errdefer node.deinit(alloc);
     try bindings.append(alloc, .{ .alias = owned_alias, .node = node });
 }

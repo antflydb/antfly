@@ -309,6 +309,7 @@ from .graph_aggregates_result_kind import GraphAggregatesResultKind
 from .graph_aggregates_return import GraphAggregatesReturn
 from .graph_aggregates_return_aggregates import GraphAggregatesReturnAggregates
 from .graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
+from .graph_alias_count_aggregate import GraphAliasCountAggregate
 from .graph_alias_operand import GraphAliasOperand
 from .graph_anchor_filter_requires_index_error import GraphAnchorFilterRequiresIndexError
 from .graph_anchor_filter_requires_index_error_error import GraphAnchorFilterRequiresIndexErrorError
@@ -326,12 +327,13 @@ from .graph_artifact_producer_source_config_type import GraphArtifactProducerSou
 from .graph_artifact_source_config import GraphArtifactSourceConfig
 from .graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
 from .graph_artifact_source_config_kind import GraphArtifactSourceConfigKind
+from .graph_binding_node import GraphBindingNode
+from .graph_binding_node_document import GraphBindingNodeDocument
 from .graph_bindings_result import GraphBindingsResult
 from .graph_bindings_result_kind import GraphBindingsResultKind
 from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
-from .graph_count_aggregate import GraphCountAggregate
 from .graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
 from .graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
 from .graph_distinct_budget_exceeded_error_status import GraphDistinctBudgetExceededErrorStatus
@@ -408,6 +410,8 @@ from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
 from .graph_result_ref_node_selector import GraphResultRefNodeSelector
 from .graph_result_row import GraphResultRow
+from .graph_row_count_aggregate import GraphRowCountAggregate
+from .graph_row_count_target import GraphRowCountTarget
 from .graph_shortest_path import GraphShortestPath
 from .graph_shortest_path_query import GraphShortestPathQuery
 from .graph_traversal import GraphTraversal
@@ -1232,6 +1236,7 @@ __all__ = (
     "GraphAggregatesReturnAggregates",
     "GraphAggregateValue",
     "GraphAlgebraicPlanningConfig",
+    "GraphAliasCountAggregate",
     "GraphAliasOperand",
     "GraphAnchorFilterRequiresIndexError",
     "GraphAnchorFilterRequiresIndexErrorError",
@@ -1249,12 +1254,13 @@ __all__ = (
     "GraphArtifactSourceConfig",
     "GraphArtifactSourceConfigFormat",
     "GraphArtifactSourceConfigKind",
+    "GraphBindingNode",
+    "GraphBindingNodeDocument",
     "GraphBindingsResult",
     "GraphBindingsResultKind",
     "GraphBindingsReturn",
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
-    "GraphCountAggregate",
     "GraphDistinctBudgetExceededError",
     "GraphDistinctBudgetExceededErrorError",
     "GraphDistinctBudgetExceededErrorStatus",
@@ -1331,6 +1337,8 @@ __all__ = (
     "GraphResultNodeEvidence",
     "GraphResultRefNodeSelector",
     "GraphResultRow",
+    "GraphRowCountAggregate",
+    "GraphRowCountTarget",
     "GraphShortestPath",
     "GraphShortestPathQuery",
     "GraphTraversal",

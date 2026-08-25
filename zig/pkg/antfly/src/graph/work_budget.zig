@@ -14,6 +14,7 @@ pub const default_max_explored_edges: usize = 1_000_000;
 pub const default_max_explored_edge_bytes: usize = 64 * 1024 * 1024;
 pub const default_max_scanned_anchors: usize = 1_000_000;
 pub const default_max_intermediate_states: usize = 100_000;
+pub const default_max_retained_state_bytes: usize = 64 * 1024 * 1024;
 
 pub const Dimension = enum {
     explored_nodes,
@@ -21,6 +22,7 @@ pub const Dimension = enum {
     explored_edge_bytes,
     scanned_anchors,
     intermediate_states,
+    retained_state_bytes,
 };
 
 pub const Exhaustion = struct {
@@ -36,10 +38,12 @@ pub const WorkBudget = struct {
     max_edges: usize,
     max_edge_bytes: usize,
     max_anchors: usize,
+    max_retained_state_bytes: usize,
     remaining_nodes: usize,
     remaining_edges: usize,
     remaining_edge_bytes: usize,
     remaining_anchors: usize,
+    retained_state_bytes: usize = 0,
     last_exhaustion: ?Exhaustion = null,
 
     pub fn init(max_nodes: usize, max_edges: usize) WorkBudget {
@@ -48,6 +52,7 @@ pub const WorkBudget = struct {
             .max_edges = max_edges,
             .max_edge_bytes = default_max_explored_edge_bytes,
             .max_anchors = default_max_scanned_anchors,
+            .max_retained_state_bytes = default_max_retained_state_bytes,
             .remaining_nodes = max_nodes,
             .remaining_edges = max_edges,
             .remaining_edge_bytes = default_max_explored_edge_bytes,
@@ -106,6 +111,19 @@ pub const WorkBudget = struct {
         if (count > maximum) return self.exhaust(.intermediate_states, maximum);
     }
 
+    pub fn retainStateBytes(self: *WorkBudget, bytes: usize) !void {
+        const retained = std.math.add(usize, self.retained_state_bytes, bytes) catch
+            return self.exhaust(.retained_state_bytes, self.max_retained_state_bytes);
+        if (retained > self.max_retained_state_bytes)
+            return self.exhaust(.retained_state_bytes, self.max_retained_state_bytes);
+        self.retained_state_bytes = retained;
+    }
+
+    pub fn releaseStateBytes(self: *WorkBudget, bytes: usize) void {
+        std.debug.assert(bytes <= self.retained_state_bytes);
+        self.retained_state_bytes -= bytes;
+    }
+
     pub fn exhaust(self: *WorkBudget, dimension: Dimension, maximum: usize) error{GraphWorkBudgetExceeded} {
         self.last_exhaustion = .{ .dimension = dimension, .maximum = maximum };
         return error.GraphWorkBudgetExceeded;
@@ -135,4 +153,20 @@ test "anchor scans have an independent request-wide budget" {
     try budget.consumeAnchors(2);
     try std.testing.expectError(error.GraphWorkBudgetExceeded, budget.consumeAnchors(1));
     try std.testing.expectEqual(Dimension.scanned_anchors, budget.exhaustion().?.dimension);
+}
+
+test "retained expansion state has an explicit byte ceiling" {
+    var budget = WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 4;
+    try budget.retainStateBytes(3);
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        budget.retainStateBytes(2),
+    );
+    try std.testing.expectEqual(Dimension.retained_state_bytes, budget.exhaustion().?.dimension);
+    try std.testing.expectEqual(@as(usize, 3), budget.retained_state_bytes);
+    budget.releaseStateBytes(3);
+    try budget.retainStateBytes(4);
+    budget.releaseStateBytes(4);
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
 }

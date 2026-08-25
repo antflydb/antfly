@@ -5550,20 +5550,16 @@ fn toOpenApiGraphRows(
         var row: indexes_openapi.GraphResultRow = .{};
         errdefer row.deinit(alloc);
         for (match.bindings) |binding| {
-            try validateCanonicalGraphResultNode(binding.node);
-            const node = indexes_openapi.GraphResultNode{
+            if (binding.node.key.len == 0 or
+                (binding.node.table != null and binding.node.table.?.len == 0))
+                return error.InvalidRemoteResponse;
+            const node = indexes_openapi.GraphBindingNode{
                 .key = binding.node.key,
                 .table = binding.node.table,
-                .depth = @intCast(binding.node.depth),
-                .distance = binding.node.distance,
                 .document = try document_lookup.document(
                     binding.node.key,
                     binding.node.table,
                 ),
-                .path = try toOpenApiGraphNodePath(alloc, binding.node),
-                .path_edges = try toOpenApiOptionalGraphPathEdges(alloc, binding.node),
-                .provenance = binding.node.provenance,
-                .evidence = try graphNodeEvidenceJsonValue(alloc, binding.node),
             };
             try row.map.put(alloc, binding.alias, node);
         }
@@ -5606,8 +5602,8 @@ test "pattern response omits paths unless requested" {
         .alias = @constCast("node"),
         .node = .{
             .key = @constCast("doc:a"),
-            .depth = 0,
-            .distance = 0,
+            .depth = 7,
+            .distance = 42,
             .path = null,
             .path_edges = null,
         },
@@ -5635,6 +5631,15 @@ test "pattern response omits paths unless requested" {
     const rows = try toOpenApiGraphRows(alloc, graph_result, &document_lookup);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expect(rows[0].map.get("node") != null);
+
+    const encoded = try jsonStringifyAlloc(alloc, rows);
+    var parsed = try ant_json.parseFromSlice(std.json.Value, alloc, encoded, .{});
+    defer parsed.deinit();
+    const node = parsed.value.array.items[0].object.get("node").?.object;
+    try std.testing.expectEqualStrings("doc:a", node.get("key").?.string);
+    try std.testing.expect(node.get("depth") == null);
+    try std.testing.expect(node.get("distance") == null);
+    try std.testing.expect(node.get("path") == null);
 }
 
 test "graph aggregate response preserves exact decimal counts" {
@@ -9702,10 +9707,10 @@ fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMa
         const items = return_value.aggregates;
         var aggregate_it = items.map.iterator();
         while (aggregate_it.next()) |entry| {
-            const aggregate = entry.value_ptr.*;
-            if (std.mem.eql(u8, aggregate.count, "*")) {
-                if (aggregate.distinct == true) return error.InvalidQueryRequest;
-            } else if (!graphAliasIsDeclared(nodes, optional, aggregate.count)) {
+            const aggregate = try graphCountAggregateParts(entry.value_ptr.*);
+            if (!std.mem.eql(u8, aggregate.of, "*") and
+                !graphAliasIsDeclared(nodes, optional, aggregate.of))
+            {
                 return error.InvalidQueryRequest;
             }
         }
@@ -9988,22 +9993,42 @@ fn parseGraphCountAggregates(alloc: std.mem.Allocator, value: std.json.ArrayHash
     }
     var it = value.map.iterator();
     while (it.next()) |entry| {
-        if (!graph_query_mod.isValidIdentifier(entry.key_ptr.*) or
-            (!std.mem.eql(u8, entry.value_ptr.count, "*") and
-                !graph_query_mod.isValidIdentifier(entry.value_ptr.count)))
+        if (!graph_query_mod.isValidIdentifier(entry.key_ptr.*)) return error.InvalidQueryRequest;
+        const parsed_aggregate = try graphCountAggregateParts(entry.value_ptr.*);
+        if (!std.mem.eql(u8, parsed_aggregate.of, "*") and
+            !graph_query_mod.isValidIdentifier(parsed_aggregate.of))
             return error.InvalidQueryRequest;
         const name = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(name);
-        const of = try alloc.dupe(u8, entry.value_ptr.count);
+        const of = try alloc.dupe(u8, parsed_aggregate.of);
         errdefer alloc.free(of);
         aggregates[initialized] = .{
             .name = name,
             .of = of,
-            .distinct = entry.value_ptr.distinct orelse false,
+            .distinct = parsed_aggregate.distinct,
         };
         initialized += 1;
     }
     return aggregates;
+}
+
+const ParsedGraphCountAggregate = struct {
+    of: []const u8,
+    distinct: bool,
+};
+
+fn graphCountAggregateParts(value: indexes_openapi.GraphCountAggregate) !ParsedGraphCountAggregate {
+    return switch (value) {
+        .graph_row_count_aggregate => .{ .of = "*", .distinct = false },
+        .graph_alias_count_aggregate => |aggregate| blk: {
+            if (!graph_query_mod.isValidIdentifier(aggregate.count))
+                return error.InvalidQueryRequest;
+            break :blk .{
+                .of = aggregate.count,
+                .distinct = aggregate.distinct orelse false,
+            };
+        },
+    };
 }
 
 fn parseGraphFilterValue(alloc: std.mem.Allocator, value: ?indexes_openapi.GraphDocumentFilter) !graph_pattern_mod.NodeFilter {

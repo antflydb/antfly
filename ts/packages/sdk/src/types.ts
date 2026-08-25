@@ -227,6 +227,7 @@ export type GraphAggregateValue = components["schemas"]["GraphAggregateValue"];
 export type GraphQueryStats = components["schemas"]["GraphQueryStats"];
 export type GraphResultRow = components["schemas"]["GraphResultRow"];
 export type GraphResultBinding = components["schemas"]["GraphResultBinding"];
+export type GraphBindingNode = components["schemas"]["GraphBindingNode"];
 export type GraphResultNode = components["schemas"]["GraphResultNode"];
 export type GraphNodeSelector = components["schemas"]["GraphNodeSelector"];
 export type GraphKeyNodeSelector = components["schemas"]["GraphKeyNodeSelector"];
@@ -236,6 +237,9 @@ export type GraphReturn = components["schemas"]["GraphReturn"];
 export type GraphBindingsReturn = components["schemas"]["GraphBindingsReturn"];
 export type GraphAggregatesReturn = components["schemas"]["GraphAggregatesReturn"];
 export type GraphCountAggregate = components["schemas"]["GraphCountAggregate"];
+export type GraphRowCountAggregate = components["schemas"]["GraphRowCountAggregate"];
+export type GraphRowCountTarget = components["schemas"]["GraphRowCountTarget"];
+export type GraphAliasCountAggregate = components["schemas"]["GraphAliasCountAggregate"];
 export type GraphWhereExpression = components["schemas"]["GraphWhereExpression"];
 export type PathWeightMode = components["schemas"]["PathWeightMode"];
 

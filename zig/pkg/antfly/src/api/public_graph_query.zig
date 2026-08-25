@@ -1096,6 +1096,31 @@ test "parse supported graph queries accepts branches predicates optional groups 
     try std.testing.expectEqualStrings("count", items[0].query.aggregates[0].name);
 }
 
+test "parse supported graph queries rejects distinct field on count all" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{
+        \\  "graph_queries": {
+        \\    "invalid": {
+        \\      "index": "graph_idx",
+        \\      "match": {
+        \\        "anchor": "a",
+        \\        "nodes": {"a": {}},
+        \\        "edges": []
+        \\      },
+        \\      "return": {"aggregates": {"count": {"count": "*", "distinct": false}}}
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSupportedGraphQueriesAlloc(alloc, parsed.value),
+    );
+}
+
 test "parse supported graph queries accepts sibling bindings and exact aggregate matches" {
     const alloc = std.testing.allocator;
     var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,

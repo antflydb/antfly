@@ -52,6 +52,7 @@ pub fn dimensionName(dimension: Dimension) []const u8 {
         .explored_edge_bytes => "explored_edge_bytes",
         .scanned_anchors => "scanned_anchors",
         .intermediate_states => "intermediate_states",
+        .retained_state_bytes => "retained_state_bytes",
     };
 }
 
