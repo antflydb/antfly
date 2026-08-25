@@ -44,6 +44,9 @@ pub const StdHttpExecutorConfig = struct {
     /// when the individual request does not provide a tighter deadline. Zero
     /// preserves the caller's unbounded behavior.
     request_timeout_ms: u32 = 0,
+    /// Independent DNS-and-connect deadline for the resolved transport.
+    /// Unlike request_timeout_ms, this does not expire an established request.
+    connect_timeout_ms: u32 = 30_000,
     /// Proactively retire pooled HTTP/1.1 connections before a server-side
     /// keep-alive cap closes them. 0 means unlimited client-side reuse.
     max_requests_per_connection: u32 = 32,
@@ -272,7 +275,7 @@ pub const StdHttpExecutor = struct {
     fn resolvedClientConfig(cfg: StdHttpExecutorConfig) httpx.ClientConfig {
         return .{
             .timeouts = .{
-                .connect_ms = 30_000,
+                .connect_ms = cfg.connect_timeout_ms,
                 .read_ms = 30_000,
                 .write_ms = 30_000,
                 .request_ms = cfg.request_timeout_ms,
@@ -630,6 +633,17 @@ test "executor request deadline bounds resolved transport by default" {
         .request_timeout_ms = 7_500,
     };
     try std.testing.expectEqual(@as(u64, 7_500), StdHttpExecutor.resolvedClientConfig(cfg).timeouts.request_ms);
+}
+
+test "executor connect deadline is independent of whole request deadline" {
+    const cfg = StdHttpExecutorConfig{
+        .resolve_before_connect = true,
+        .connect_timeout_ms = 7_500,
+        .request_timeout_ms = 0,
+    };
+    const resolved = StdHttpExecutor.resolvedClientConfig(cfg);
+    try std.testing.expectEqual(@as(u64, 7_500), resolved.timeouts.connect_ms);
+    try std.testing.expectEqual(@as(u64, 0), resolved.timeouts.request_ms);
 }
 
 test "std http executor owns a finite controlled request worker budget" {
