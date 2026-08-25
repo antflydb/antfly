@@ -5,8 +5,6 @@ go 1.26.0
 require (
 	github.com/ajroetker/pdf v0.0.1-antfly001
 	github.com/antflydb/antfly/go/pkg/docsaf v0.0.0-20260207183149-045031239f8a
-	github.com/antflydb/antfly/go/pkg/generating v0.0.0
-	github.com/antflydb/antfly/go/pkg/libaf v0.0.1
 	github.com/antflydb/antfly/go/pkg/sdk v0.0.0
 	github.com/pdfcpu/pdfcpu v0.11.1
 )
@@ -104,7 +102,5 @@ require (
 
 replace (
 	github.com/antflydb/antfly/go/pkg/docsaf => ../../go/pkg/docsaf
-	github.com/antflydb/antfly/go/pkg/generating => ../../go/pkg/generating
-	github.com/antflydb/antfly/go/pkg/libaf => ../../go/pkg/libaf
 	github.com/antflydb/antfly/go/pkg/sdk => ../../go/pkg/sdk
 )

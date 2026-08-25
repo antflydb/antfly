@@ -43,13 +43,13 @@ func TestGenkit(t *testing.T) {
 	// TODO (ajr) Maybe we want a mock embedder for tests in antfly?
 	modelConfig, err := antfly.NewEmbedderConfig(antfly.OllamaEmbedderConfig{Model: "all-minilm"})
 	require.NoError(t, err)
-	idxConfig, err := antfly.NewIndexConfig(*testIndex, antfly.EmbeddingsIndexConfig{
+	idxConfig, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
 		Field:    textKey,
 		Embedder: *modelConfig,
 	})
 	require.NoError(t, err)
 	err = af.client.CreateTable(ctx, *testTable, antfly.CreateTableRequest{
-		Indexes: map[string]antfly.IndexConfig{
+		Indexes: map[string]antfly.CreateIndexRequest{
 			*testIndex: *idxConfig,
 		},
 	})

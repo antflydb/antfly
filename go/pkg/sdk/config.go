@@ -17,11 +17,10 @@ limitations under the License.
 package sdk
 
 import (
-	stdjson "encoding/json"
+	"encoding/json"
 	"fmt"
 	"math"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
@@ -385,12 +384,12 @@ func NewGraphIndexSources(sources ...GraphArtifactSourceConfig) ([]GraphArtifact
 		result[i] = source
 		result[i].Context.DocFields = fields
 		if source.Edge.Metadata != nil {
-			encoded, err := stdjson.Marshal(source.Edge.Metadata)
+			encoded, err := json.Marshal(source.Edge.Metadata)
 			if err != nil {
 				return nil, fmt.Errorf("sources[%d].edge.metadata must contain JSON values: %w", i, err)
 			}
 			result[i].Edge.Metadata = nil
-			if err := stdjson.Unmarshal(encoded, &result[i].Edge.Metadata); err != nil {
+			if err := json.Unmarshal(encoded, &result[i].Edge.Metadata); err != nil {
 				return nil, fmt.Errorf("copy sources[%d].edge.metadata: %w", i, err)
 			}
 		}
