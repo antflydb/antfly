@@ -26,6 +26,10 @@ const document_segment = @import("../serverless/document_segment/mod.zig");
 const runtime_manager = @import("../serverless/runtime/manager.zig");
 const head_coordination = @import("../serverless/head_coordination.zig");
 const maintenance_cancellation = @import("../serverless/maintenance_cancellation.zig");
+const search_sources = @import("../serverless/search_sources.zig");
+const serverless_http_server = @import("../serverless_http_server.zig");
+const serverless_http_client = @import("../serverless_http_client.zig");
+const io_http_executor = @import("../common/http/io_http_executor.zig");
 
 pub const Scenario = struct {
     pub const name: []const u8 = "serverless-workflow-production-recovery";
@@ -120,6 +124,14 @@ pub const Scenario = struct {
         query: query_mod.QueryRuntime,
         runtime: runtime_manager.ManagedRuntime,
         runtime_live: bool = false,
+        public_status: api_mod.RuntimeStatusResult = undefined,
+        public_handler: api_mod.HttpHandler = undefined,
+        public_server: serverless_http_server.ServerlessHttpServer = undefined,
+        public_runtime: serverless_http_server.HttpxRuntime = undefined,
+        public_executor: io_http_executor.IoHttpExecutor = undefined,
+        public_client: serverless_http_client.ServerlessHttpClient = undefined,
+        public_live: bool = false,
+        public_catalog_visible: bool = false,
         mode: Mode = .clean,
         complete: bool = false,
         first_attempt_interrupted: bool = false,
@@ -246,6 +258,8 @@ pub const Scenario = struct {
             );
             errdefer self.query.deinit();
             self.runtime_live = false;
+            self.public_live = false;
+            self.public_catalog_visible = false;
             self.mode = .clean;
             self.complete = false;
             self.first_attempt_interrupted = false;
@@ -260,7 +274,7 @@ pub const Scenario = struct {
 
             try self.initRuntime("worker-primary");
             errdefer self.runtime.deinit();
-            try std.testing.expect(try self.catalog.ensureNamespaceWithPolicy("docs", 100, .{
+            try std.testing.expect(try self.catalog.ensureTableWithPolicy("docs", 100, .{
                 .keep_latest_versions = 8,
                 .max_pending_records = 1,
                 .compaction_enabled = true,
@@ -270,6 +284,7 @@ pub const Scenario = struct {
         }
 
         pub fn deinit(self: *Fixture) void {
+            self.stopPublicCatalog();
             if (self.runtime_live) self.runtime.deinit();
             self.query.deinit();
             self.catalog.deinit();
@@ -288,6 +303,93 @@ pub const Scenario = struct {
             self.memory.deinit();
             if (self.owned_sim) |*owned| owned.deinit();
             self.alloc.destroy(self);
+        }
+
+        pub fn startPublicCatalog(self: *Fixture) !void {
+            if (self.public_live) return error.ServerlessPublicCatalogAlreadyStarted;
+            const targets = try self.alloc.alloc(api_mod.RuntimeStorageTarget, 0);
+            var status_transferred = false;
+            errdefer if (!status_transferred) self.alloc.free(targets);
+            var published_sources = try search_sources.defaultPublishedSearchSourcesAlloc(self.alloc);
+            errdefer if (!status_transferred)
+                search_sources.deinitPublishedSearchSources(self.alloc, &published_sources);
+            self.public_status = .{
+                .role = .combined,
+                .combined_mode = true,
+                .tick_interval_ms = 1,
+                .validated = true,
+                .published_search_sources = published_sources,
+                .targets = targets,
+            };
+            status_transferred = true;
+            errdefer self.public_status.deinit(self.alloc);
+            self.public_handler = api_mod.HttpHandler.init(
+                self.alloc,
+                &self.api,
+                &self.catalog,
+                &self.manifests,
+                &self.progress,
+                &self.query,
+                &self.public_status,
+            );
+            self.public_handler.setIo(self.sim.io());
+            self.public_handler.setRuntimeMetrics(&self.runtime);
+            self.public_server = serverless_http_server.ServerlessHttpServer.init(
+                self.alloc,
+                .{},
+                &self.public_handler,
+            );
+            self.public_runtime = try serverless_http_server.HttpxRuntime.start(
+                self.alloc,
+                self.sim.io(),
+                &self.public_server,
+            );
+            errdefer self.public_runtime.deinit();
+            self.public_executor = io_http_executor.IoHttpExecutor.init(self.alloc, self.sim.io(), .{
+                .keep_alive = true,
+                .connect_timeout_ms = 0,
+                .read_timeout_ms = 0,
+                .write_timeout_ms = 0,
+                .pool_max_connections = 8,
+                .pool_max_per_host = 8,
+            });
+            self.public_client = serverless_http_client.ServerlessHttpClient.init(
+                self.alloc,
+                self.public_executor.executor(),
+            );
+            self.public_live = true;
+        }
+
+        pub fn stopPublicCatalog(self: *Fixture) void {
+            if (!self.public_live) return;
+            self.public_executor.deinit();
+            self.public_runtime.deinit();
+            self.public_status.deinit(self.alloc);
+            self.public_live = false;
+        }
+
+        pub fn observePublicCatalogForMode(self: *Fixture, mode: Mode) !bool {
+            if (!self.public_live) return error.ServerlessPublicCatalogNotStarted;
+            var tables = try self.public_client.tables().list(self.public_runtime.base_uri);
+            defer tables.deinit();
+            var found = false;
+            for (tables.value) |table| found = found or std.mem.eql(u8, table.table_name, "docs");
+            if (!found) return false;
+
+            var query_result = try self.public_client.tables().queryPublished(
+                self.public_runtime.base_uri,
+                "docs",
+            );
+            defer query_result.deinit();
+            if (query_result.value.version != 3 or query_result.value.view != .published) return false;
+            var mask: u8 = 0;
+            for (query_result.value.documents) |document| {
+                if (std.mem.eql(u8, document.doc_id, "doc-a")) mask |= 1;
+                if (std.mem.eql(u8, document.doc_id, "doc-b")) mask |= 2;
+            }
+            const expected_mask: u8 = if (mode == .stale_enrichment_generation) 1 else 3;
+            self.public_catalog_visible = mask == expected_mask;
+            return self.public_catalog_visible;
         }
 
         fn initRuntime(self: *Fixture, owner_id: []const u8) !void {

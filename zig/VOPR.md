@@ -20,7 +20,10 @@ requires a public write to be denied, releases the competing owners, and then
 requires the same write and lookup to recover. The reusable deployment
 composer registers role dependencies, instances, directional links,
 process/storage/resource domains, fault scopes, and quiet-suffix evidence;
-full-cluster v4 is its first production-shaped consumer. Routed data,
+full-cluster v5 is its first production-shaped consumer. The same history now
+serves the worker-owned object catalog through the production serverless HTTP
+handler and queries the published version through the real public client.
+Routed data,
 split/merge, query assembly, and DataServer-owned
 maintenance services expose production-safe scheduler boundaries. Campaigns
 export unified reduction/causal/counterfactual debug recipes, bounded flight
@@ -69,10 +72,12 @@ deterministic machine: VOPR obtains deeper application scheduling and durable-
 state visibility by requiring production code to cross explicit `std.Io` and
 ownership seams. A deployment-shaped `full-cluster-vopr-test` now composes a
 three-node metadata quorum, two hosted data replicas, two replicated tables,
-three public HTTP servers, four concurrent clients, and a serverless workflow
-fixture on one `VoprIo`. The serverless fixture deliberately does not yet
-publish through that public cluster's catalog. Remaining distributed work is
-deeper composition and workload breadth, not a missing deterministic-
+three DataServer HTTP servers, four concurrent clients, and a serverless
+workflow fixture with its own production public catalog listener on one
+`VoprIo`. The worker publishes into the same object-backed catalog served by
+that listener; the serverless object catalog and metadata placement catalog
+remain intentionally distinct production domains. Remaining distributed work
+is deeper composition and workload breadth, not a missing deterministic-
 distributed foundation.
 
 ## Conformance Status
@@ -113,7 +118,7 @@ not yet co-reside every independently tested HA/data-plane owner.
 | Automatic debug recipes and deterministic corpus merging | `debug_recipe.zig`, callback-based `reducer.zig`, `corpus.zig`; `vopr-recipe`, `vopr-corpus-merge` | `zig build vopr-engine-test vopr-meta-test` |
 | Integrated fault composition, structured-choice auditing, and search-quality regression corpus | `fault.zig`, `fault_vopr_io.zig`, `choice.zig`, `explorer.zig`, `benchmark.zig`; precedence drives real `VoprIo` effects in the Parquet-cache suite. Three distinct scheduling, durability, and cancellation defects run under random, guided, spliced, starvation, and checkpoint-assisted policies with replay-before-retention, recurrence, Wilson confidence, logical-cost, and minimal-output evidence | `zig build vopr-engine-test parquet-cache-vopr-test vopr-benchmark` |
 | Integrated command-template composition and fail-closed entropy/source audit | `command.zig` implements first/parallel/serial/singleton/anytime/eventually/finally roles with compatibility, exclusion, fault, and quiescence policies; `determinism.zig` combines immediate-choice and borrowed-I/O entropy evidence; Antfly `vopr/determinism_audit.zig` covers every exported VOPR source and both legacy metadata replay regions | `zig build vopr-engine-test vopr-determinism-audit` |
-| Registered deployment topology and quiet suffix | `lib/vopr/src/deployment.zig` validates role dependencies, node/instance identity, directional links, disjoint process/storage/resource domains, typed fault compatibility, readiness, measured resource policy, and per-node quiet acknowledgments. Full-cluster v4 registers four owners, seven role instances, six directional links, and every scenario fault before requiring cluster-wide quiescence | `zig build vopr-engine-test full-cluster-vopr-test` |
+| Registered deployment topology and quiet suffix | `lib/vopr/src/deployment.zig` validates role dependencies, node/instance identity, directional links, disjoint process/storage/resource domains, typed fault compatibility, readiness, measured resource policy, and per-node quiet acknowledgments. Full-cluster v5 registers four owners, seven role instances, six directional links, and every scenario fault before requiring cluster-wide quiescence | `zig build vopr-engine-test full-cluster-vopr-test` |
 | Replay-before-retention campaigns, deterministic workers, bounded counterfactual graphs, and quarantine manifests/raw artifacts | Antfly `vopr/cli.zig` | `zig build vopr-meta-test` |
 | Same-fingerprint reduction, promotion, and migration | `reducer.zig`, `fixture.zig`, `vopr-reduce`, `vopr-promote`, `vopr-migrate` | `zig build vopr-engine-test vopr-meta-test` |
 | TLA+ export | transaction and Raft `vopr-tla` dispatch | `zig build transaction-vopr-test vopr-meta-test` |
@@ -134,7 +139,7 @@ not yet co-reside every independently tested HA/data-plane owner.
 | Query embedding cache | Antfly `vopr/query_embedding_cache.zig`; production cache miss coalescing, cancellation, deadline, admission, TTL, LRU, pinned eviction, and cleanup on one `VoprIo` | `zig build query-embedding-cache-vopr-test` |
 | Generation and reranking chains | Antfly `vopr/generation_reranking.zig`; production generation fallback/retry with borrowed `std.Io`, provider errors and cancellation, plus local reranker response validation | `zig build generation-reranking-vopr-test` |
 | Distributed graph/join/query execution | Antfly `vopr/distributed_query.zig`; production `executeCrossRange` planning, two-shard fanout/hydration, bounded topology retry, retry exhaustion, stale snapshot rejection, in-flight cancellation, and cross-table authorization | `zig build distributed-query-vopr-test` |
-| Deployment-shaped full cluster | Antfly `vopr/full_cluster.zig`, `metadata/sim_harness.zig`, and Raft `transport/httpx_runtime.zig`; one `VoprIo` owns a metadata quorum, two data hosts, two isolated replicated tables, three real public HTTP listeners, four concurrent cross-node clients, distinct per-node production resource managers, and a co-scheduled serverless fixture. Serialized Raft frames cross the replayable fault router and real `httpx` sockets. Clean, partition/heal, restart, partial-write, stale-serverless-generation, and node-memory denial/recovery modes exact replay. Full-cluster v4 also mirrors every fault into the registered deployment manifest and requires post-heal resource evidence plus quiet acknowledgment from all four nodes. The serverless fixture is not yet the public cluster's catalog owner, and HA/data-plane services remain separate suites | `zig build full-cluster-vopr-test` |
+| Deployment-shaped full cluster | Antfly `vopr/full_cluster.zig`, `vopr/serverless_workflow.zig`, `serverless_http_server.zig`, `metadata/sim_harness.zig`, and Raft `transport/httpx_runtime.zig`; one `VoprIo` owns a metadata quorum, two data hosts, two isolated replicated tables, three real DataServer HTTP listeners, a real serverless catalog listener, four concurrent cross-node clients, distinct per-node production resource managers, and a co-scheduled serverless worker. Serialized Raft frames and all public requests cross real `httpx`/VOPR sockets. Clean, partition/heal, restart, partial-write, stale-serverless-generation, and node-memory denial/recovery modes exact replay. Full-cluster v5 mirrors every fault into the registered deployment manifest, requires post-heal resource evidence and quiet acknowledgment from all four nodes, lists the worker's public table, and queries its published version and expected documents through `ServerlessHttpClient`. HA/data-plane services remain separate suites | `zig build full-cluster-vopr-test` |
 | Parquet cache, provisioning/startup, external lake, and media providers | Antfly `vopr/parquet_cache.zig`, `provisioning_startup.zig`, `external_lake.zig`, `media_runtime.zig`; borrowed `VoprIo`, real cache/reconcile/Iceberg-manifest/Parquet-query/provider-HTTP paths, injected I/O and object-store faults, provider retry/timeout/cancellation and active-request drain, cleanup, and exact replay | `zig build parquet-cache-vopr-test provisioning-startup-vopr-test external-lake-vopr-test media-runtime-vopr-test` |
 | Upgrade and compatibility campaign | Antfly `vopr/upgrade_compatibility.zig`; current production readers open v1 HA golden records, v12 manifests, v14 external inventories, legacy serverless heads, and v1 VOPR traces; fixture migration requires source and target exact replay plus semantic equivalence; incompatible traces, checkpoints, data directories, and future serverless artifacts fail closed; atomic data-directory publication recovers after a crash-before-rename | `zig build upgrade-compatibility-vopr-test` |
 
@@ -189,7 +194,7 @@ runs registered production entrypoints in one virtual `std.Io` world.
 | Node lifecycle and pressure | Pause, stop/kill, restart, and throttling | Integrated pause, crash/restart, CPU work, descriptor, socket, allocator, and storage limits |
 | Deterministic replay and branching | Deterministic hypervisor execution | Exact choice/transition/observation replay plus reduction and multiverse branching |
 | Whole unmodified deployment | Arbitrary containerized binaries and sidecars | Deliberate non-goal; only registered in-process entrypoints are deterministic |
-| One full Antfly deployment history | Runs a supplied Docker Compose or Kubernetes topology | Partially integrated in-process: `full-cluster-vopr-test` joins metadata, replicated data, public clients, real HTTP/Raft wire paths, per-node resources, and a co-scheduled serverless fixture. Co-resident HA/data-plane owners and public-catalog serverless publication remain ongoing; native sidecars, DNS, kernels, and mixed binaries remain differential concerns |
+| One full Antfly deployment history | Runs a supplied Docker Compose or Kubernetes topology | Partially integrated in-process: `full-cluster-vopr-test` joins metadata, replicated data, public clients, real HTTP/Raft wire paths, per-node resources, and a co-scheduled serverless worker whose object catalog is served and queried through the production public API. Co-resident HA/data-plane owners and cross-domain fault overlap remain ongoing; native sidecars, DNS, kernels, and mixed binaries remain differential concerns |
 
 Antithesis therefore does support distributed-system testing directly: its
 fault domains are containers or Kubernetes pods, including asymmetric network
@@ -685,7 +690,8 @@ containing all of the following at once:
 - multiple public API clients with concurrent write, read, query, cross-node
   routing, and two-table isolation workloads;
 - a co-scheduled serverless build/enrichment/publication fixture, including a
-  stale-generation fencing mode, but not yet the public cluster catalog owner;
+  stale-generation fencing mode and a production serverless HTTP listener over
+  the exact object-backed catalog mutated by the worker;
 - node-local storage roots and modeled devices plus distinct production
   resource managers injected into each node's DB and API paths;
 - production public HTTP and a real Raft `httpx` wire hop after deterministic
@@ -694,21 +700,26 @@ containing all of the following at once:
   safety, route/topology consistency, publication visibility, eventual
   convergence, and cleanup.
 
-The campaign uses production owners, real public HTTP forwarding/listeners,
+The campaign uses production owners, real DataServer and serverless public HTTP
+forwarding/listeners,
 real metadata/Raft paths, node-local roots and modeled devices, three distinct
 resource owners, and one shared `VoprIo`; clean, metadata-partition,
-node-restart, partial-HTTP-write, and stale-serverless-generation modes exact
-replay. Raft time and delivery eligibility remain explicit modeled rounds, but
+node-restart, partial-HTTP-write, stale-serverless-generation, and aggregate
+node-memory denial/recovery modes exact replay. After the worker completes, a
+production `ServerlessHttpClient` lists `docs` and queries version 3 through
+the real serverless handler and `httpx` listener; the expected documents differ
+for the stale-generation mode, so this also proves fencing at the public seam.
+Raft time and delivery eligibility remain explicit modeled rounds, but
 each successful delivered frame crosses the production binary codec, fault
 router, `IoHttpExecutor`, VOPR socket, httpx listener, and production Raft HTTP
-handler. Its current limits are equally important: the serverless fixture
-shares the scheduler but is not yet wired through the public cluster catalog,
-and HA/data-plane
-scenarios remain independently composed rather than co-resident production
-services. Routed write/read, Raft, split/merge, and worker internals should
-become finer scheduler-visible transitions only where production exposes safe
-suspension points. This must not grow simulation-only business logic or a
-container/hypervisor clone.
+handler. The serverless object catalog and metadata placement catalog are
+separate production domains; joining them would invent an ownership
+relationship that Antfly does not have. The current limits are instead that HA
+and data-plane scenarios remain independently composed rather than co-resident
+production services. Routed write/read, Raft, split/merge, and worker internals
+should become finer scheduler-visible transitions only where production
+exposes safe suspension points. This must not grow simulation-only business
+logic or a container/hypervisor clone.
 
 ### Derived Workflows
 
@@ -1190,8 +1201,8 @@ implements the analogous application-level fault domains inside a registered
 | Requirement | Current status | Remaining work |
 | --- | --- | --- |
 | Deterministic multi-node runtime, clocks, links, storage, restart, resources, replay, and quiet suffix | **Integrated foundation.** The reusable deployment composer registers node/role/domain/fault/quiet obligations; metadata, Raft, HA, transaction, data-plane, and full-cluster gates exercise complementary real owners | Adopt the manifest in the remaining distributed suites and maintain fail-closed audits as new owners appear |
-| Metadata quorum, replicated DataServers, public clients, and real HTTP/Raft transport in one history | **Integrated at the stated seam.** Full-cluster v4 sends serialized Raft frames through deterministic link policy and real `httpx`/`VoprIo` sockets, drives three public servers and four clients, injects three distinct production resource managers, exact-replays aggregate node-memory denial/recovery, and proves registered cluster quiescence | Add disk/socket pressure and richer overlapping link, storage-crash, restart, and pressure schedules |
-| Serverless workers in the same public catalog and ownership graph | **Partial.** The production serverless fixture shares the exact scheduler and includes stale-generation fencing, but owns a separate catalog fixture | Publish, lease, recover, and query the worker's output through the full cluster's public catalog |
+| Metadata quorum, replicated DataServers, public clients, and real HTTP/Raft transport in one history | **Integrated at the stated seam.** Full-cluster v5 sends serialized Raft frames through deterministic link policy and real `httpx`/`VoprIo` sockets, drives three DataServer listeners plus the serverless catalog listener, injects three distinct production resource managers, exact-replays aggregate node-memory denial/recovery, and proves registered cluster quiescence | Add disk/socket pressure and richer overlapping link, storage-crash, restart, and pressure schedules |
+| Serverless worker output through its production public catalog and ownership graph | **Integrated at the stated seam.** The production worker, durable lease, object stores, catalog service, HTTP handler/listener, and public client share one `VoprIo`. Every mode lists the worker-created table and queries the published head/documents; stale generation remains fenced. This correctly retains the distinct serverless object and metadata placement catalogs | Overlap serverless lease/object-store failures with metadata topology and node-resource faults, then add multi-worker placement when production owns that topology |
 | HA, data-plane, metadata, public API, and serverless owners all co-resident | **Ongoing.** Each domain has an integrated exact-replay suite; they do not yet all coexist in one history | Build one bounded deployment composition and cluster-wide recovery oracle without duplicating business logic |
 | Public distributed graph/join request from HTTP planning through fanout/hydration | **Partial.** The public HTTP and distributed-query seams are independently integrated | Join them in one trace with topology churn, authorization change, retry, cancellation, and partial-result policy |
 | Query-embedding cache | **Integrated focused seam.** Coalescing, cancellation, deadlines, admission, TTL, byte/LRU/pinned eviction, and cleanup exact replay | Compose node-local cache pressure with public full-cluster requests |
@@ -1524,9 +1535,9 @@ ownership is released.
 | P0 integrated | Replication backfill and rebalancing | `replication-backfill-vopr-test` covers snapshot-to-streaming cutover, resumable checkpoints, duplicate work, cancellation, source and target crashes, topology changes, stale ownership, schema changes, and exact replay through the production runners. |
 | P0 integrated | Standalone and serverless supervision | `supervision-vopr-test` covers partial-startup rollback, readiness publication, child-service failure, coordinated shutdown, virtual watchdog expiry, and restart through the production supervisor. The serverless manager now owns a borrowed-`std.Io` Future instead of a native run-loop thread. |
 | P0 integrated | User and authentication lifecycle | `auth-lifecycle-vopr-test` covers password, API-key, permission, and row-filter changes; deterministic seed capture; revoke and rotate; durable reload; partial persistence rollback; and stale-reader behavior through the production manager. |
-| P1 integrated | Complete serverless workflow | `serverless-workflow-vopr-test` covers durable claim/fencing, build, compaction, publication, and query-visible catalog cutover with duplicate workers, lease takeover, ambiguous completion, retry, cancellation, crash recovery, stale-enricher generation rejection, and progress-conflict fencing under exact replay through production orchestration. The same fixture borrows the full-cluster `VoprIo`; public-catalog co-residency remains follow-up depth. |
+| P1 integrated | Complete serverless workflow | `serverless-workflow-vopr-test` covers durable claim/fencing, build, compaction, publication, and query-visible catalog cutover with duplicate workers, lease takeover, ambiguous completion, retry, cancellation, crash recovery, stale-enricher generation rejection, and progress-conflict fencing under exact replay through production orchestration. In full-cluster v5 the same fixture borrows the cluster `VoprIo`, serves its worker-owned object catalog through the production serverless HTTP stack, and proves public table/head/document visibility. Cross-domain fault overlap and multi-worker placement remain follow-up depth. |
 | P1 integrated | DB and index request races | `db-index-race-vopr-test` exact-replays cross-index admission, same-index FIFO fairness, delete/materialize linearizations, published-reader/catalog-writer capture, cancellation, shutdown, and cleanup through production-safe seams rather than native test threads. |
-| P0 integrated | Full-cluster distributed composition | `full-cluster-vopr-test` exact-replays a three-node metadata quorum, two active DataServer hosts, three production public HTTP servers, non-host and cross-node clients, two replicated tables, three distinct production resource managers, and a serverless workflow fixture on one `VoprIo`. Serialized Raft frames pass through deterministic link policy and real `httpx`/VOPR sockets. Six modes cover clean operation, metadata partition/heal, non-host restart, partial HTTP write, stale serverless generation, and node-memory denial/recovery. The pressure mode fills every production process envelope through exactly-once reservations, requires a public write denial, releases pressure, then requires public write/read recovery. Version 4 registers all owners, role dependencies, directional links, and typed fault scopes with the reusable deployment composer, then requires measured resource evidence and cluster-wide quiet acknowledgment. HA/data-plane co-residency, disk/socket pressure, richer overlapping link/storage faults, and public-catalog integration for the serverless worker remain follow-up depth. |
+| P0 integrated | Full-cluster distributed composition | `full-cluster-vopr-test` exact-replays a three-node metadata quorum, two active DataServer hosts, three production DataServer HTTP servers plus a production serverless catalog listener, non-host and cross-node clients, two replicated tables, three distinct production resource managers, and a serverless workflow fixture on one `VoprIo`. Serialized Raft frames and public requests pass through real `httpx`/VOPR sockets. Six modes cover clean operation, metadata partition/heal, non-host restart, partial HTTP write, stale serverless generation, and node-memory denial/recovery. The pressure mode fills every production process envelope through exactly-once reservations, requires a public write denial, releases pressure, then requires public write/read recovery. Version 5 registers all owners, role dependencies, directional links, and typed fault scopes with the reusable deployment composer, requires measured resource evidence and cluster-wide quiet acknowledgment, and queries the worker's published version/documents through `ServerlessHttpClient`. HA/data-plane co-residency, disk/socket pressure, richer overlapping cross-domain faults, and multi-worker placement remain follow-up depth. |
 | P0 integrated | Query-embedding cache | `query-embedding-cache-vopr-test` exact-replays concurrent-miss coalescing, waiter cancellation, deadlines, in-flight admission, TTL, byte-budget/LRU eviction, pinned hits, and cleanup through the production cache on one `VoprIo`. |
 | P1 integrated | Distributed graph/join/public-query boundaries | `distributed-query-vopr-test` exact-replays production cross-range planning, two-shard fanout and hydration, topology change between plan and fanout, one-retry success, retry exhaustion, stale per-shard generation rejection, cancellation with outstanding shard work, and cross-table authorization. The full-cluster gate separately drives real public query HTTP; a single history joining public HTTP to graph fanout remains follow-up composition. |
 | P1 integrated | Generation and reranking chains | `generation-reranking-vopr-test` exact-replays generation success, retry/backoff on borrowed `std.Io`, timeout and rate-limit fallback, cancellation, reranking success, malformed count/non-finite results, timeout, and cancellation through production chain and local-provider boundaries. Remote HTTP provider parsing remains covered by `provider-boundary-vopr-test` and `media-runtime-vopr-test`, not duplicated here. |
@@ -1641,7 +1652,7 @@ Distributed Completion Audit and Ongoing Roadmap.
 | Priority | Capability | Required work |
 | --- | --- | --- |
 | P0 integrated | Reusable command-template composer | `lib/vopr/command.zig` implements Antithesis-style `first`, parallel, serial, singleton, anytime, eventually, and finally roles. Commands declare symmetric compatibility/deny lists, exclusion groups, fault policy, and before/after quiescence requirements. The composer tracks stable active invocation identities, enforces singleton and serial admission, snapshots quiet-suffix obligations, and exact-replays eventual/final completion. |
-| P0 integrated | Registered deployment composer | `lib/vopr/deployment.zig` validates deployment roles and acyclic readiness dependencies, node and instance identities, directional links, globally disjoint process/storage/resource domains, typed fault/domain compatibility, node-local resource policies, and per-node quiet acknowledgments. Full-cluster v4 registers its four owners, seven role instances, six metadata links, and all fault modes, then refuses completion until every fault is healed and every required node supplies bounded, task/socket-quiet evidence. |
+| P0 integrated | Registered deployment composer | `lib/vopr/deployment.zig` validates deployment roles and acyclic readiness dependencies, node and instance identities, directional links, globally disjoint process/storage/resource domains, typed fault/domain compatibility, node-local resource policies, and per-node quiet acknowledgments. Full-cluster v5 registers its four owners, seven role instances, six metadata links, and all fault modes, then refuses completion until every fault is healed and every required node supplies bounded, task/socket-quiet evidence. |
 | P0 integrated | Complete entropy interception and audit | `lib/vopr/determinism.zig` admits only immediate structured choices and borrowed-`std.Io` entropy as runtime evidence. `vopr-determinism-audit` fail-closes on host RNG, delayed private PRNGs, host clocks, native threads/I/O, filesystem escapes, native libraries, unordered iteration, and pointer-derived identity in replayable adapters; reviewed differential boundaries require line-local categorized rationale. Its manifest is checked against every exported VOPR source and includes both legacy metadata replay regions. |
 | P1 integrated | Continuous and quiescent validation phases | The runner automatically samples every history in continuous, recovery/quiescent, and final phases, aggregates bounded no-progress and recovery evidence, classifies allocator and unexpected process/panic failures, and retains the pointer-free diagnostic outside canonical replay bytes. `VoprIo.healthSnapshot` automatically populates task, descriptor, and optional physical-storage evidence; the replication, supervision, auth, serverless-workflow, DB/index, provider, composed-query, resource-pressure, cache, startup, generation, configuration, Embedded/Lite, external-lake, media, and upgrade/compatibility suites add domain progress, consistency, exhaustion, and cleanup semantics. `vopr-results` uses exact-replayed evidence automatically. |
 | P1 integrated | Richer retroactive logging | `event.Event` and the bounded `flight_recorder` own diagnostic name/value fields and text independently of canonical replay fields. Filters combine event identity, kind, actor/resource, logical index, exact or substring field predicates, and text search; materialization adds bounded before/after context. Generic, domain, distributed-data, and custom metadata replays feed the recorder directly, and every automatic debug recipe exact-replays its reduced artifact into a configurable flight window. `vopr-recipe` exposes filter, window, capacity, and limit controls. |
@@ -1666,12 +1677,12 @@ Wait for a real product or toolchain requirement before adding:
 ### Ongoing Roadmap
 
 1. Deepen the integrated full-cluster history: co-locate production HA and
-   data-plane owners, wire serverless publication into the same public catalog,
-   extend the integrated node-memory denial/recovery mode to disk and socket
-   pressure, combine directional link, storage-crash, restart, and pressure
-   faults, and prove a quiet cluster-wide recovery suffix. The real Raft wire
-   hop and memory-pressure recovery are complete; broaden their fault
-   combinations instead of rebuilding them.
+   data-plane owners, extend the integrated node-memory denial/recovery mode to
+   disk and socket pressure, and combine directional link, storage-crash,
+   restart, serverless lease/object-store, and pressure faults. The real Raft
+   wire hop, serverless public catalog path, memory-pressure recovery, and
+   quiet cluster-wide suffix are complete; broaden their fault combinations
+   instead of rebuilding them.
 2. Join the integrated public-HTTP and distributed-query boundaries into one
    history so a public graph/join request experiences planning, shard fanout,
    hydration, topology churn, retry, cancellation, and response assembly under

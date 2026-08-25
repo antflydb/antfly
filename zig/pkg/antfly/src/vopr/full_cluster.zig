@@ -13,13 +13,14 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 4;
+    pub const version: u32 = 5;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
     const routing_id = vopr.id.stable(name, "non-host-routing-sound");
     const isolation_id = vopr.id.stable(name, "multi-table-isolation");
     const publication_id = vopr.id.stable(name, "serverless-publication-visible");
+    const serverless_http_id = vopr.id.stable(name, "serverless-public-http-visible");
     const shared_io_id = vopr.id.stable(name, "one-shared-vopr-io");
     const raft_wire_id = vopr.id.stable(name, "raft-crosses-vopr-http-wire");
     const node_resources_id = vopr.id.stable(name, "node-resource-owners-distinct");
@@ -34,6 +35,7 @@ pub const Scenario = struct {
         .{ .id = routing_id, .name = name ++ ".non-host-routing-sound", .kind = .always },
         .{ .id = isolation_id, .name = name ++ ".multi-table-isolation", .kind = .always },
         .{ .id = publication_id, .name = name ++ ".serverless-publication-visible", .kind = .always },
+        .{ .id = serverless_http_id, .name = name ++ ".serverless-public-http-visible", .kind = .always },
         .{ .id = shared_io_id, .name = name ++ ".one-shared-vopr-io", .kind = .always },
         .{ .id = raft_wire_id, .name = name ++ ".raft-crosses-vopr-http-wire", .kind = .always },
         .{ .id = node_resources_id, .name = name ++ ".node-resource-owners-distinct", .kind = .always },
@@ -160,6 +162,8 @@ pub const Scenario = struct {
         initialization_failed: bool = false,
         serverless_done: bool = false,
         serverless_sound: bool = false,
+        serverless_public_sound: bool = false,
+        serverless_public_error_code: u64 = 0,
         shared_io_sound: bool = false,
         deployment_sound: bool = false,
         complete: bool = false,
@@ -188,6 +192,8 @@ pub const Scenario = struct {
             self.initialization_failed = false;
             self.serverless_done = false;
             self.serverless_sound = false;
+            self.serverless_public_sound = false;
+            self.serverless_public_error_code = 0;
             self.shared_io_sound = false;
             self.deployment_sound = false;
             self.complete = false;
@@ -240,6 +246,12 @@ pub const Scenario = struct {
                 self.complete = true;
                 return;
             };
+            self.serverless.startPublicCatalog() catch {
+                self.initialization_failed = true;
+                self.initialization_done = true;
+                self.complete = true;
+                return;
+            };
             self.shared_io_sound = self.serverless.sim == &self.sim and fixture.sim == &self.sim;
             fixture.start(mode.publicFault()) catch {
                 self.initialization_failed = true;
@@ -253,12 +265,18 @@ pub const Scenario = struct {
         }
 
         fn runServerless(self: *State) void {
+            defer self.serverless.stopPublicCatalog();
             const serverless_mode = self.mode.?.serverlessMode();
             self.serverless.runMode(serverless_mode) catch {
                 self.serverless_done = true;
                 return;
             };
-            self.serverless_sound = self.serverless.workflowVisibleForMode(serverless_mode);
+            self.serverless_public_sound = self.serverless.observePublicCatalogForMode(serverless_mode) catch |err| blk: {
+                self.serverless_public_error_code = @intFromError(err);
+                break :blk false;
+            };
+            self.serverless_sound = self.serverless.workflowVisibleForMode(serverless_mode) and
+                self.serverless_public_sound;
             self.serverless_done = true;
         }
 
@@ -387,6 +405,8 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".request-errors", if (fixture) |public_cluster| @intCast(public_cluster.request_errors) else 0);
         try builder.addNamed(allocator, name ++ ".last-request-error", if (fixture) |public_cluster| @intCast(public_cluster.last_request_error_code) else 0);
         try builder.addNamed(allocator, name ++ ".serverless-visible", @intFromBool(state.serverless_sound));
+        try builder.addNamed(allocator, name ++ ".serverless-public-http-visible", @intFromBool(state.serverless_public_sound));
+        try builder.addNamed(allocator, name ++ ".serverless-public-http-error", @intCast(state.serverless_public_error_code));
         try builder.addNamed(allocator, name ++ ".raft-wire-requests", if (cluster) |snapshot| @intCast(snapshot.raft_wire_requests) else 0);
         try builder.addNamed(allocator, name ++ ".node-resource-managers", if (cluster) |snapshot| @intCast(snapshot.node_resource_managers) else 0);
         try builder.addNamed(allocator, name ++ ".resource-denial-ok", @intFromBool(if (cluster) |snapshot| snapshot.resource_denial_ok else false));
@@ -410,6 +430,7 @@ pub const Scenario = struct {
         try sink.check(allocator, routing_id, !state.complete or (cluster != null and cluster.?.hosts == 2));
         try sink.check(allocator, isolation_id, !state.complete or (fixture != null and fixture.?.table_isolation_sound));
         try sink.check(allocator, publication_id, !state.complete or state.serverless_sound);
+        try sink.check(allocator, serverless_http_id, !state.complete or state.serverless_public_sound);
         try sink.check(allocator, shared_io_id, !state.initialization_done or state.shared_io_sound);
         try sink.check(allocator, raft_wire_id, !state.complete or (cluster != null and cluster.?.raft_wire_requests > 0));
         try sink.check(allocator, node_resources_id, !state.initialization_done or (cluster != null and cluster.?.node_resource_managers == 3));
@@ -460,7 +481,7 @@ test "full cluster VOPR exact replays metadata data serverless HTTP clients and 
             .transition_budget = 20_000,
             .resource_budget = 96,
             .backend_ids = &backend_ids,
-            .source_revision = "full-cluster-vopr-v4",
+            .source_revision = "full-cluster-vopr-v5",
             .target = "native",
             .optimize = @tagName(@import("builtin").mode),
         });
@@ -475,6 +496,10 @@ test "full cluster VOPR exact replays metadata data serverless HTTP clients and 
                 if (std.mem.eql(u8, feature.name, Scenario.name ++ ".last-request-error") and feature.value != 0) {
                     const request_error: anyerror = @errorFromInt(@as(u16, @intCast(feature.value)));
                     std.debug.print("  request-error-name={s}\n", .{@errorName(request_error)});
+                }
+                if (std.mem.eql(u8, feature.name, Scenario.name ++ ".serverless-public-http-error") and feature.value != 0) {
+                    const request_error: anyerror = @errorFromInt(@as(u16, @intCast(feature.value)));
+                    std.debug.print("  serverless-public-http-error-name={s}\n", .{@errorName(request_error)});
                 }
             };
         }
