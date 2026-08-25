@@ -6356,6 +6356,10 @@ pub const Node = struct {
             .metal
         else
             backend_selection.compiled_partition_backend;
+        native_backend_choice.validateRequiredCompiledBackend(
+            &self.session_manager,
+            effective_compiled_partition_backend,
+        ) catch |err| return modelLoadFailureResponse(ctx, err);
         const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
             .whole_model
         else

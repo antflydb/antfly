@@ -360,8 +360,17 @@ pub const SessionManager = struct {
     /// different valid required backend makes the fast path ineligible.
     pub fn allowsDirectBackend(self: *const SessionManager, backend: BackendType) !bool {
         if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        if (self.required_backend) |required| {
+            if (!required.supportsDirectSessionLoad()) return error.RequiredBackendUnavailable;
+        }
+        return self.allowsBackend(backend);
+    }
+
+    /// Whether a backend-specific execution path is compatible with the
+    /// process-level required backend, including compiled artifact runtimes.
+    pub fn allowsBackend(self: *const SessionManager, backend: BackendType) !bool {
+        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
         const required = self.required_backend orelse return true;
-        if (!required.supportsDirectSessionLoad()) return error.RequiredBackendUnavailable;
         return required == backend;
     }
 
@@ -636,6 +645,8 @@ test "required backend gates backend-specific fast paths" {
     manager.required_backend_invalid = false;
     try std.testing.expect(try manager.allowsDirectBackend(.cuda));
     try std.testing.expect(!try manager.allowsDirectBackend(.onnx));
+    try std.testing.expect(try manager.allowsBackend(.cuda));
+    try std.testing.expect(!try manager.allowsBackend(.onnx));
 
     manager.required_backend = null;
     try std.testing.expect(try manager.allowsDirectBackend(.onnx));

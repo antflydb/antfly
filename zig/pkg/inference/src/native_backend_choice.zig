@@ -102,6 +102,26 @@ pub fn compiledPartitionBackendForMode(choice: Choice, compiled_mode_requested: 
     return compiledPartitionBackend(choice);
 }
 
+pub fn validateRequiredCompiledBackend(
+    session_manager: *const backends.SessionManager,
+    compiled_backend: ?ops.BackendKind,
+) !void {
+    const backend = switch (compiled_backend orelse return) {
+        .native => backends.BackendType.native,
+        .metal => backends.BackendType.metal,
+        .onnx => backends.BackendType.onnx,
+        .pjrt => backends.BackendType.pjrt,
+        .cuda => backends.BackendType.cuda,
+        .wasm, .webgpu => backends.BackendType.wasm,
+        .graph => {
+            if (session_manager.required_backend_invalid) return error.InvalidRequiredBackend;
+            if (session_manager.required_backend != null) return error.RequiredBackendUnavailable;
+            return;
+        },
+    };
+    if (!try session_manager.allowsBackend(backend)) return error.RequiredBackendUnavailable;
+}
+
 pub fn forcesGraphMode(choice: Choice) bool {
     return compiledPartitionBackend(choice) != null;
 }
@@ -147,6 +167,32 @@ test "compiledPartitionBackend maps explicit compiled backends" {
         try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.webgpu, true));
     }
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.webgpu, false));
+}
+
+test "required backend gates compiled backend execution" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    manager.required_backend = .cuda;
+    manager.required_backend_invalid = false;
+    try validateRequiredCompiledBackend(&manager, null);
+    try validateRequiredCompiledBackend(&manager, .cuda);
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        validateRequiredCompiledBackend(&manager, .onnx),
+    );
+
+    manager.required_backend = .pjrt;
+    try validateRequiredCompiledBackend(&manager, .pjrt);
+
+    manager.required_backend = null;
+    manager.required_backend_invalid = true;
+    try std.testing.expectError(
+        error.InvalidRequiredBackend,
+        validateRequiredCompiledBackend(&manager, .onnx),
+    );
+    try std.testing.expectError(
+        error.InvalidRequiredBackend,
+        validateRequiredCompiledBackend(&manager, .graph),
+    );
 }
 
 test "explicit session preferences never silently fall back" {

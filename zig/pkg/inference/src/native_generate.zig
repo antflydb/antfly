@@ -410,6 +410,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     session_manager.kernel_jit = jit_config;
     session_manager.kernel_jit_load_context = .startup_preload;
 
+    try native_backend_choice.validateRequiredCompiledBackend(
+        &session_manager,
+        if (artifact_backend) |backend|
+            if (std.mem.eql(u8, backend, "onnx")) .onnx else .pjrt
+        else
+            null,
+    );
+
     const allow_direct_onnx = (opts.backend == .auto or opts.backend == .onnx) and
         try session_manager.allowsDirectBackend(.onnx);
     if (allow_direct_onnx and !jit_config.mode.compiles() and opts.kernel_jit_profile_out == null and effective_draft_model == null and build_options.enable_onnx and
@@ -680,6 +688,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
         break :blk @as(?ops.BackendKind, null);
     };
+    try native_backend_choice.validateRequiredCompiledBackend(&session_manager, explicit_partition_backend);
     const compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = opts.compiled_target orelse blk: {
         if (compiled_mode_requested and explicit_partition_backend == .metal) break :blk .whole_model;
         break :blk .partitioned;
