@@ -21,13 +21,13 @@ package sdk
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
