@@ -39,6 +39,7 @@ pub const ApplyRwLock = struct {
     reader_count: usize = 0,
     shared_waiters: AtomicU64 = .init(0),
     priority_shared_waiters: AtomicU64 = .init(0),
+    exclusive_waiters: AtomicU64 = .init(0),
     shared_lock_calls: AtomicU64 = .init(0),
     shared_contended_calls: AtomicU64 = .init(0),
     shared_wait_ns: AtomicU64 = .init(0),
@@ -53,22 +54,35 @@ pub const ApplyRwLock = struct {
         _ = self.shared_lock_calls.fetchAdd(1, .monotonic);
         _ = self.shared_waiters.fetchAdd(1, .monotonic);
         defer _ = self.shared_waiters.fetchSub(1, .monotonic);
-        if (!lockAtomic(&self.reader_gate)) {
+        // Readers already queued before a writer publishes its intent get one
+        // bounded handoff phase. Readers arriving after that intent must not
+        // barge indefinitely ahead of the writer.
+        const priority = self.exclusive_waiters.load(.acquire) == 0;
+        if (priority) _ = self.priority_shared_waiters.fetchAdd(1, .acq_rel);
+        defer if (priority) {
+            _ = self.priority_shared_waiters.fetchSub(1, .acq_rel);
+        };
+
+        var attempts: usize = 0;
+        while (!self.tryLockSharedQueued(priority)) : (attempts += 1) {
+            if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
+                std.atomic.spinLoopHint();
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
+        if (attempts != 0) {
             _ = self.shared_contended_calls.fetchAdd(1, .monotonic);
             noteWait(self, .shared, monotonicNs() -| started_ns);
-        }
-        defer self.reader_gate.unlock();
-
-        _ = lockAtomic(&self.reader_mutex);
-        defer self.reader_mutex.unlock();
-
-        self.reader_count += 1;
-        if (self.reader_count == 1) {
-            _ = lockAtomic(&self.resource_mutex);
         }
     }
 
     pub fn tryLockShared(self: *@This()) bool {
+        return self.tryLockSharedQueued(false);
+    }
+
+    fn tryLockSharedQueued(self: *@This(), priority: bool) bool {
+        if (!priority and self.exclusive_waiters.load(.acquire) > 0) return false;
         if (!self.reader_gate.tryLock()) return false;
         defer self.reader_gate.unlock();
 
@@ -89,14 +103,17 @@ pub const ApplyRwLock = struct {
         _ = self.shared_lock_calls.fetchAdd(1, .monotonic);
         _ = self.shared_waiters.fetchAdd(1, .monotonic);
         defer _ = self.shared_waiters.fetchSub(1, .monotonic);
-        _ = self.priority_shared_waiters.fetchAdd(1, .monotonic);
-        defer _ = self.priority_shared_waiters.fetchSub(1, .monotonic);
+        const priority = self.exclusive_waiters.load(.acquire) == 0;
+        if (priority) _ = self.priority_shared_waiters.fetchAdd(1, .acq_rel);
+        defer if (priority) {
+            _ = self.priority_shared_waiters.fetchSub(1, .acq_rel);
+        };
 
         var contended = false;
         var delay_us: i64 = 50 + @as(i64, @intCast(monotonicNs() & 0x3f));
         while (true) {
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
-            if (self.tryLockShared()) break;
+            if (self.tryLockSharedQueued(priority)) break;
             contended = true;
             io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake) catch |err| switch (err) {
                 error.Canceled => return error.Cancelled,
@@ -117,12 +134,39 @@ pub const ApplyRwLock = struct {
     pub fn lockExclusiveIo(self: *@This(), io: std.Io, cancellation: anytype) !void {
         const started_ns = monotonicNs();
         _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
+        _ = self.exclusive_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.exclusive_waiters.fetchSub(1, .acq_rel);
 
         var contended = false;
         var delay_us: i64 = 50 + @as(i64, @intCast((monotonicNs() >> 6) & 0x3f));
+        // Close admission to new readers, but let the readers which were
+        // already queued before this writer registered complete one handoff
+        // phase. This preserves reader progress without permitting an
+        // unbounded stream of later readers to starve publication.
+        while (self.priority_shared_waiters.load(.acquire) > 0) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            contended = true;
+            io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake) catch |err| switch (err) {
+                error.Canceled => return error.Cancelled,
+            };
+            delay_us = @min(delay_us * 2, 1_000);
+        }
+
+        // Retain the reader gate while active readers drain. Unlike repeatedly
+        // calling tryLockExclusive, this makes writer intent durable and keeps
+        // later readers from barging between retries.
+        while (!self.reader_gate.tryLock()) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            contended = true;
+            io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake) catch |err| switch (err) {
+                error.Canceled => return error.Cancelled,
+            };
+            delay_us = @min(delay_us * 2, 1_000);
+        }
+        errdefer self.reader_gate.unlock();
         while (true) {
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
-            if (self.tryLockExclusive()) break;
+            if (self.resource_mutex.tryLock()) break;
             contended = true;
             io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake) catch |err| switch (err) {
                 error.Canceled => return error.Cancelled,
@@ -147,6 +191,7 @@ pub const ApplyRwLock = struct {
     }
 
     pub fn tryLockExclusive(self: *@This()) bool {
+        if (self.exclusive_waiters.load(.acquire) > 0) return false;
         if (self.priority_shared_waiters.load(.monotonic) > 0) return false;
         if (!self.reader_gate.tryLock()) return false;
         if (!self.resource_mutex.tryLock()) {
@@ -159,8 +204,9 @@ pub const ApplyRwLock = struct {
     pub fn lockExclusive(self: *@This()) void {
         const started_ns = monotonicNs();
         _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
+        _ = self.exclusive_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.exclusive_waiters.fetchSub(1, .acq_rel);
         yieldToPriorityReadersBounded(self);
-        yieldToQueuedReaders(self);
         const gate_idle = lockAtomic(&self.reader_gate);
         errdefer self.reader_gate.unlock();
         const resource_idle = lockAtomic(&self.resource_mutex);
@@ -210,14 +256,6 @@ fn lockAtomic(mutex: *std.atomic.Mutex) bool {
         std.Thread.yield() catch {};
     }
     return attempts == 0;
-}
-
-fn yieldToQueuedReaders(lock: *const ApplyRwLock) void {
-    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
-    var attempts: usize = 0;
-    while (attempts < 64 and lock.shared_waiters.load(.monotonic) > 0) : (attempts += 1) {
-        std.Thread.yield() catch {};
-    }
 }
 
 fn yieldToPriorityReadersBounded(lock: *const ApplyRwLock) void {
@@ -362,7 +400,40 @@ test "apply rw lock runtime shared wait cancellation clears priority handoff" {
     lock.unlockExclusive();
 }
 
-test "apply rw lock cooperative writer yields to priority reader on one worker" {
+test "apply rw lock runtime writer cancellation clears intent and reader gate" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const Cancellation = struct {
+        signal: *const std.atomic.Value(bool),
+
+        fn isCancelled(self: @This()) bool {
+            return self.signal.load(.acquire);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var cancelled = std.atomic.Value(bool).init(true);
+    var lock: ApplyRwLock = .{};
+    lock.lockShared();
+
+    try std.testing.expectError(
+        error.Cancelled,
+        lock.lockExclusiveIo(io, @as(?Cancellation, .{ .signal = &cancelled })),
+    );
+    try std.testing.expectEqual(@as(u64, 0), lock.exclusive_waiters.load(.acquire));
+    lock.unlockShared();
+
+    // Cancellation after reserving the reader gate must release it as well as
+    // writer intent, otherwise every later reader and writer would wedge.
+    try std.testing.expect(lock.tryLockShared());
+    lock.unlockShared();
+    try std.testing.expect(lock.tryLockExclusive());
+    lock.unlockExclusive();
+}
+
+test "apply rw lock cooperative writer yields to queued reader on one-worker runtime" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const NeverCancelled = struct {
@@ -375,6 +446,7 @@ test "apply rw lock cooperative writer yields to priority reader on one worker" 
         io: std.Io,
         reader_done: std.atomic.Value(bool) = .init(false),
         writer_done: std.atomic.Value(bool) = .init(false),
+        writer_failed: std.atomic.Value(bool) = .init(false),
 
         fn reader(ctx: *@This()) !void {
             try ctx.lock.lockSharedIo(ctx.io, @as(?NeverCancelled, null));
@@ -386,6 +458,10 @@ test "apply rw lock cooperative writer yields to priority reader on one worker" 
             try ctx.lock.lockExclusiveIo(ctx.io, @as(?NeverCancelled, null));
             ctx.writer_done.store(true, .release);
             ctx.lock.unlockExclusive();
+        }
+
+        fn writerThread(ctx: *@This()) void {
+            writer(ctx) catch ctx.writer_failed.store(true, .release);
         }
     };
 
@@ -409,18 +485,77 @@ test "apply rw lock cooperative writer yields to priority reader on one worker" 
         try io.sleep(.fromMicroseconds(50), .awake);
     }
 
-    var writer = std.Io.async(io, Context.writer, .{&ctx});
-    var writer_awaited = false;
-    defer if (!writer_awaited) {
-        _ = writer.await(io) catch {};
-    };
+    // A second `Io.async` is permitted to execute inline when the only async
+    // slot is occupied. Starting a lock waiter that way while this caller
+    // still owns the lock makes the test itself deadlock before it can unlock.
+    // Use an independent caller for the writer while both lock waits continue
+    // to use the same one-worker backend Io.
+    const writer_thread = try std.Thread.spawn(.{}, Context.writerThread, .{&ctx});
+    defer writer_thread.join();
+    while (lock.exclusive_waiters.load(.acquire) == 0) {
+        std.Thread.yield() catch {};
+    }
     lock.unlockExclusive();
     exclusive_held = false;
 
     try reader.await(io);
     reader_awaited = true;
-    try writer.await(io);
-    writer_awaited = true;
     try std.testing.expect(ctx.reader_done.load(.acquire));
+    while (!ctx.writer_done.load(.acquire) and !ctx.writer_failed.load(.acquire)) {
+        try io.sleep(.fromMicroseconds(50), .awake);
+    }
+    try std.testing.expect(!ctx.writer_failed.load(.acquire));
+    try std.testing.expect(ctx.writer_done.load(.acquire));
+}
+
+test "apply rw lock queued io writer blocks later shared barging" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const NeverCancelled = struct {
+        fn isCancelled(_: @This()) bool {
+            return false;
+        }
+    };
+    const Context = struct {
+        lock: *ApplyRwLock,
+        io: std.Io,
+        writer_done: std.atomic.Value(bool) = .init(false),
+        writer_failed: std.atomic.Value(bool) = .init(false),
+
+        fn writer(ctx: *@This()) void {
+            ctx.lock.lockExclusiveIo(ctx.io, @as(?NeverCancelled, null)) catch {
+                ctx.writer_failed.store(true, .release);
+                return;
+            };
+            ctx.writer_done.store(true, .release);
+            ctx.lock.unlockExclusive();
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var lock: ApplyRwLock = .{};
+    lock.lockShared();
+    var shared_held = true;
+    defer if (shared_held) lock.unlockShared();
+
+    var ctx = Context{ .lock = &lock, .io = io };
+    const writer_thread = try std.Thread.spawn(.{}, Context.writer, .{&ctx});
+    defer writer_thread.join();
+    while (lock.exclusive_waiters.load(.acquire) == 0) {
+        std.Thread.yield() catch {};
+    }
+
+    // Once writer intent is visible, neither opportunistic nor blocking-new
+    // readers may enter ahead of it.
+    try std.testing.expect(!lock.tryLockShared());
+    lock.unlockShared();
+    shared_held = false;
+
+    while (!ctx.writer_done.load(.acquire) and !ctx.writer_failed.load(.acquire)) {
+        try io.sleep(.fromMicroseconds(50), .awake);
+    }
+    try std.testing.expect(!ctx.writer_failed.load(.acquire));
     try std.testing.expect(ctx.writer_done.load(.acquire));
 }
