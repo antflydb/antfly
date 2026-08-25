@@ -1,0 +1,77 @@
+name: Zig Scale Tests
+
+# Keep corpus-scale correctness gates isolated from required E2E latency and
+# resource accounting. Run them continuously on the default branch, manually,
+# or before merging a same-repository PR by applying `ci:scale-tests`.
+on:
+  schedule:
+    - cron: "30 9 * * *"
+  workflow_dispatch:
+  pull_request:
+    # A label opts the PR into this gate until it is removed. Re-run for every
+    # new head, and use the unlabeled event to cancel an in-flight scale run.
+    types: [labeled, unlabeled, synchronize, reopened]
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-cache-scale
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/zig/.zig-global-cache-scale
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  artifact-full-text:
+    name: Artifact full-text / >1M chunks
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'ci:scale-tests') &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: arc-antfly-heavy
+    timeout-minutes: 60
+    env:
+      ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
+      ANTFLY_CI_ZIG_STRIP: "true"
+      ANTFLY_ARTIFACT_FULL_TEXT_SCALE: "1"
+      ANTFLY_BIN: ./zig-out/bin/antfly
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          submodules: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+
+      - name: Compute CPU bound
+        id: cpus
+        run: |
+          jobs=$(nproc)
+          if [ "$jobs" -gt 8 ]; then jobs=8; fi
+          echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
+
+      - name: Build E2E executable
+        run: scripts/ci/zig-build-e2e-binaries.sh
+
+      - name: Run artifact full-text scale gate
+        working-directory: zig
+        run: |
+          chmod +x ./zig-out/bin/antfly
+          taskset -c ${{ steps.cpus.outputs.list }} \
+            uv run --project e2e/antfly pytest -q \
+            e2e/antfly/test_artifacts.py::test_artifact_full_text_scale_exceeds_one_million_chunks_on_three_shards

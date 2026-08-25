@@ -424,6 +424,7 @@ pub const Builder = struct {
             .last = .empty,
             .out = .empty,
         };
+        errdefer b.deinit();
 
         // Write header
         try b.out.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u64, version_v1)));
@@ -545,13 +546,13 @@ pub const Builder = struct {
         while (i_state + 1 < self.stack.items.len) {
             var unfinished = self.stack.items[self.stack.items.len - 1];
             self.stack.items.len -= 1;
+            defer unfinished.node.deinit(self.alloc);
             if (addr == none_addr) {
                 // popEmpty - don't call lastCompiled
             } else {
                 try unfinished.lastCompiled(self.alloc, addr);
             }
             addr = try self.compile(&unfinished.node);
-            unfinished.node.deinit(self.alloc);
         }
         try self.stack.items[self.stack.items.len - 1].lastCompiled(self.alloc, addr);
     }
@@ -1135,6 +1136,7 @@ pub const FSTIterator = struct {
             .aut_states_stack = .empty,
             .next_start = .empty,
         };
+        errdefer it.deinit();
         try it.pointTo(start_inclusive);
         return it;
     }
@@ -1470,6 +1472,25 @@ test "registry rollover sweep frees stale nodes" {
         try std.testing.expect((try fst.get("xx")).found);
         try std.testing.expect(!(try fst.get("aa")).found);
     }
+}
+
+test "builder releases every partial allocation" {
+    const alloc = std.testing.allocator;
+
+    const Runner = struct {
+        fn run(failing_alloc: Allocator) !void {
+            var builder = try Builder.init(failing_alloc, .{ .registry_table_size = 4 });
+            defer builder.deinit();
+
+            try builder.insert("alpha", 10);
+            try builder.insert("beta", 20);
+
+            const data = try builder.finish();
+            defer failing_alloc.free(data);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{});
 }
 
 test "builder.reset reuses one Builder for multiple FSTs" {
