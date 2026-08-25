@@ -13,7 +13,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 8;
+    pub const version: u32 = 9;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -21,6 +21,7 @@ pub const Scenario = struct {
     const isolation_id = vopr.id.stable(name, "multi-table-isolation");
     const graph_query_id = vopr.id.stable(name, "public-cross-range-graph-query-sound");
     const graph_restart_id = vopr.id.stable(name, "public-graph-inflight-restart-sound");
+    const graph_topology_id = vopr.id.stable(name, "public-graph-topology-churn-fails-closed");
     const graph_partial_id = vopr.id.stable(name, "public-graph-partial-result-rejected");
     const publication_id = vopr.id.stable(name, "serverless-publication-visible");
     const serverless_http_id = vopr.id.stable(name, "serverless-public-http-visible");
@@ -39,6 +40,7 @@ pub const Scenario = struct {
         .{ .id = isolation_id, .name = name ++ ".multi-table-isolation", .kind = .always },
         .{ .id = graph_query_id, .name = name ++ ".public-cross-range-graph-query-sound", .kind = .always },
         .{ .id = graph_restart_id, .name = name ++ ".public-graph-inflight-restart-sound", .kind = .always },
+        .{ .id = graph_topology_id, .name = name ++ ".public-graph-topology-churn-fails-closed", .kind = .always },
         .{ .id = graph_partial_id, .name = name ++ ".public-graph-partial-result-rejected", .kind = .always },
         .{ .id = publication_id, .name = name ++ ".serverless-publication-visible", .kind = .always },
         .{ .id = serverless_http_id, .name = name ++ ".serverless-public-http-visible", .kind = .always },
@@ -57,6 +59,7 @@ pub const Scenario = struct {
         metadata_partition,
         node_restart,
         graph_inflight_restart,
+        graph_topology_churn,
         graph_transport_failure,
         partial_http_write,
         serverless_stale_generation,
@@ -68,6 +71,7 @@ pub const Scenario = struct {
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
+                .graph_topology_churn => .graph_topology_churn,
                 .graph_transport_failure => .graph_transport_failure,
                 .partial_http_write => .partial_http_write,
                 .resource_pressure => .resource_pressure,
@@ -86,6 +90,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "metadata-partition"),
         vopr.id.stable(name, "node-restart"),
         vopr.id.stable(name, "graph-inflight-restart"),
+        vopr.id.stable(name, "graph-topology-churn"),
         vopr.id.stable(name, "graph-transport-failure"),
         vopr.id.stable(name, "partial-http-write"),
         vopr.id.stable(name, "serverless-stale-generation"),
@@ -96,6 +101,7 @@ pub const Scenario = struct {
         name ++ ".metadata-partition",
         name ++ ".node-restart",
         name ++ ".graph-inflight-restart",
+        name ++ ".graph-topology-churn",
         name ++ ".graph-transport-failure",
         name ++ ".partial-http-write",
         name ++ ".serverless-stale-generation",
@@ -334,6 +340,11 @@ pub const Scenario = struct {
                     .node_pause,
                     process_domains[fixture.graph_restart_node_index],
                 ),
+                // A range merge is an operator/workload transition, not an
+                // infrastructure fault domain. Its durable metadata and data
+                // owners are already registered above, so there is no fake
+                // process, link, or storage fault to activate here.
+                .graph_topology_churn => {},
                 // VoprIo's current outage primitive covers the complete
                 // inter-DataServer fabric. Mirror that scope in the manifest
                 // instead of pretending the failure belongs to one arbitrary
@@ -392,7 +403,7 @@ pub const Scenario = struct {
             inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, mode_name| try list.append(allocator, .{
                 .id = id,
                 .name = mode_name,
-                .kind = if (mode == .clean) .workload else .fault,
+                .kind = if (mode == .clean or mode == .graph_topology_churn) .workload else .fault,
             });
             return;
         }
@@ -437,6 +448,10 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".public-cross-range-graph-query", @intFromBool(if (cluster) |snapshot| snapshot.graph_query_ok else false));
         try builder.addNamed(allocator, name ++ ".graph-inflight-restart-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_inflight_restart_observed else false));
         try builder.addNamed(allocator, name ++ ".graph-inflight-restart-recovered", @intFromBool(if (cluster) |snapshot| snapshot.graph_inflight_restart_recovered else false));
+        try builder.addNamed(allocator, name ++ ".graph-topology-churn-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_topology_churn_observed else false));
+        try builder.addNamed(allocator, name ++ ".graph-topology-churn-finalized", @intFromBool(if (cluster) |snapshot| snapshot.graph_topology_churn_finalized else false));
+        try builder.addNamed(allocator, name ++ ".graph-topology-churn-error", if (cluster) |snapshot| @intCast(snapshot.graph_topology_churn_error_code) else 0);
+        try builder.addNamed(allocator, name ++ ".graph-topology-partial-rejected", @intFromBool(if (cluster) |snapshot| snapshot.graph_topology_partial_rejected_sound else false));
         try builder.addNamed(allocator, name ++ ".graph-transport-failure-injected", @intFromBool(if (cluster) |snapshot| snapshot.graph_transport_failure_injected else false));
         try builder.addNamed(allocator, name ++ ".graph-transport-failure-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_transport_failure_observed else false));
         try builder.addNamed(allocator, name ++ ".graph-transport-failure-error", if (cluster) |snapshot| @intCast(snapshot.graph_transport_failure_error_code) else 0);
@@ -471,6 +486,10 @@ pub const Scenario = struct {
         try sink.check(allocator, graph_query_id, !state.complete or (cluster != null and cluster.?.graph_query_ok));
         try sink.check(allocator, graph_restart_id, !state.complete or state.mode.? != .graph_inflight_restart or
             (cluster != null and cluster.?.graph_inflight_restart_observed and cluster.?.graph_inflight_restart_recovered and
+                cluster.?.graph_query_ok));
+        try sink.check(allocator, graph_topology_id, !state.complete or state.mode.? != .graph_topology_churn or
+            (cluster != null and cluster.?.graph_topology_churn_observed and cluster.?.graph_topology_churn_finalized and
+                cluster.?.graph_topology_churn_error_code != 0 and cluster.?.graph_topology_partial_rejected_sound and
                 cluster.?.graph_query_ok));
         try sink.check(allocator, graph_partial_id, !state.complete or state.mode.? != .graph_transport_failure or
             (cluster != null and cluster.?.graph_transport_failure_injected and
@@ -528,7 +547,7 @@ test "full cluster VOPR exact replays metadata data serverless HTTP clients and 
             .transition_budget = 50_000,
             .resource_budget = 96,
             .backend_ids = &backend_ids,
-            .source_revision = "full-cluster-vopr-v8",
+            .source_revision = "full-cluster-vopr-v9",
             .target = "native",
             .optimize = @tagName(@import("builtin").mode),
         });

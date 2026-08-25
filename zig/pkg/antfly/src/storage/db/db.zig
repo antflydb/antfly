@@ -14949,6 +14949,89 @@ pub const DB = struct {
         try self.core.index_manager.syncAll(force);
     }
 
+    /// Imports donor-owned derived artifacts into a live merge receiver while
+    /// both DBs are protected by transition leases. Primary documents are
+    /// copied separately from the authoritative Raft apply projection.
+    ///
+    /// The Raft apply projection used by range coordination deliberately stores
+    /// only primary documents. It therefore cannot reconstruct stripped inputs
+    /// such as `_edges` or explicit embeddings by itself. Copy the authoritative
+    /// document-scoped store rows and live graph projection before cutover so a
+    /// successful merge cannot publish primary data with incomplete indexes.
+    pub fn importMergeRangeFromTransitionDonor(
+        self: *DB,
+        donor: *DB,
+        byte_range: types.ByteRange,
+    ) !void {
+        if (self == donor or std.mem.eql(u8, self.core.path, donor.core.path))
+            return error.InvalidArgument;
+
+        // Transition activity prevents new public writes. The DB apply locks
+        // additionally give this copy one coherent donor view and keep index
+        // mutation atomic with respect to receiver maintenance. Order by path
+        // so independently initiated transitions cannot invert these locks.
+        const donor_first = std.mem.order(u8, donor.core.path, self.core.path) == .lt;
+        if (donor_first) {
+            donor.core.lockApplyShared();
+            defer donor.core.unlockApplyShared();
+            self.core.lockApply();
+            defer self.core.unlockApply();
+        } else {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            donor.core.lockApplyShared();
+            defer donor.core.unlockApplyShared();
+        }
+
+        const store_lower = try documentRangeLowerAlloc(self.alloc, byte_range.start);
+        defer self.alloc.free(store_lower);
+        const store_upper = if (byte_range.end.len > 0)
+            try documentRangeUpperAlloc(self.alloc, byte_range.end)
+        else
+            null;
+        defer if (store_upper) |key| self.alloc.free(key);
+        const donor_rows = try donor.core.scanStoreRange(
+            self.alloc,
+            store_lower,
+            if (store_upper) |key| key else "",
+        );
+        defer docstore_mod.DocStore.freeResults(self.alloc, donor_rows);
+
+        var derived_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer derived_writes.deinit(self.alloc);
+        for (donor_rows) |row| {
+            if (!internal_keys.isGraphEdgeArtifactKey(row.key) and
+                !internal_keys.isEmbeddingArtifactKey(row.key) and
+                !internal_keys.isDerivedEmbeddingArtifactKey(row.key)) continue;
+            try derived_writes.append(self.alloc, .{ .key = row.key, .value = row.value });
+        }
+        if (derived_writes.items.len > 0) {
+            const raw_writes: []const docstore_mod.KVPair = @ptrCast(derived_writes.items);
+            try self.core.store.putBatch(raw_writes, &.{});
+            try applySplitEmbeddingArtifactsFromBatch(
+                self.core.store,
+                self.core.index_manager,
+                derived_writes.items,
+                &.{},
+                &.{},
+            );
+        }
+        _ = try self.core.index_manager.copyGraphSplitDestinationFrom(
+            donor.core.index_manager,
+            byte_range.start,
+            byte_range.end,
+        );
+        try applySplitGraphArtifactsInRange(
+            self.alloc,
+            byte_range.start,
+            byte_range.end,
+            self.core.store,
+            self.core.index_manager,
+        );
+        try self.core.index_manager.syncAll(true);
+        try self.core.syncStore(true);
+    }
+
     fn restoreSnapshotStoreTo(
         alloc: Allocator,
         snapshot_root: []const u8,

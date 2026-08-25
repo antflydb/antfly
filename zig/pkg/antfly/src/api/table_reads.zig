@@ -119,6 +119,12 @@ pub fn normalizeDistributedGraphOperationalError(err: anyerror) anyerror {
         error.NameServerFailure,
         error.RecvFailed,
         error.SendFailed,
+        // A topology retry that loses its race twice is an availability
+        // outcome, not an internal server failure. The coordinator still
+        // owns all intermediate results and the caller can safely retry the
+        // complete request against a fresh plan.
+        error.TopologyChanged,
+        error.UnknownGroup,
         => error.DistributedQueryUnavailable,
         else => err,
     };
@@ -128,6 +134,8 @@ test "distributed graph transport failures become one retryable availability con
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.SendFailed));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.ConnectionResetByPeer));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.TopologyChanged));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.UnknownGroup));
     try std.testing.expectEqual(error.Timeout, normalizeDistributedGraphOperationalError(error.Timeout));
     try std.testing.expectEqual(error.InternalFailure, normalizeDistributedGraphOperationalError(error.InternalFailure));
 }

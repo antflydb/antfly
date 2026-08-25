@@ -16786,6 +16786,23 @@ test "backup storage resolution rejects a reused table name from another incarna
 }
 
 pub const HostedProvisionedTableWriteSource = struct {
+    /// Retains a hosted writer while a production-shaped structural operation
+    /// uses the DB directly. The caller must already own the corresponding
+    /// topology/admission fence; this lease only supplies lifetime ownership.
+    pub const GroupWriterLease = struct {
+        cached: ProvisionedTableWriteCache.CachedDb,
+        cache_alloc: std.mem.Allocator,
+
+        pub fn db(self: *const GroupWriterLease) *db_mod.DB {
+            return self.cached.db;
+        }
+
+        pub fn release(self: *GroupWriterLease) void {
+            self.cached.deinit(self.cache_alloc);
+            self.* = undefined;
+        }
+    };
+
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     router: table_router.HostedGroupRouter,
@@ -16875,6 +16892,24 @@ pub const HostedProvisionedTableWriteSource = struct {
     pub fn withForegroundDerivedProgress(self: *HostedProvisionedTableWriteSource) *HostedProvisionedTableWriteSource {
         self.foreground_derived_progress = true;
         return self;
+    }
+
+    /// Borrow the same cached writer used by hosted public requests. This is
+    /// the hosted equivalent of DataServer's transition DB lease and prevents
+    /// structural coordinators from attempting a second native root open.
+    pub fn leaseGroupWriter(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !GroupWriterLease {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        return .{
+            .cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async),
+            .cache_alloc = hosted_cache.write_cache.alloc,
+        };
     }
 
     fn transactionRecoveryConfig(self: *HostedProvisionedTableWriteSource) db_mod.transaction_runtime.Config {

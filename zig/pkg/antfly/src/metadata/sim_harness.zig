@@ -104,8 +104,6 @@ const SimSplitRuntime = struct {
     fn deinit(self: *@This()) void {
         for (self.entries[0..self.len]) |*entry| self.releaseCoordinator(entry);
         self.len = 0;
-        self.replica_root_dir = null;
-        self.backend_runtime = null;
     }
 
     fn iface(self: *@This()) transition_runtime.SplitRuntime {
@@ -363,15 +361,40 @@ const SimSplitRuntime = struct {
         source_root_dir: []const u8,
         source_group_id: u64,
     ) !void {
-        var source_store = try data_mod.RaftApplyStore.init(alloc, .{ .root_dir = source_root_dir });
-        defer source_store.deinit();
-        if ((try source_store.latestBatch(source_group_id)) != null) return;
-
         var db = db_mod.DB.open(alloc, source_root_dir, self.dbOptions(.{})) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer db.close();
+
+        try self.ensureSourceApplyStoreSeededFromDb(alloc, source_root_dir, source_group_id, &db);
+    }
+
+    fn ensureSourceApplyStoreSeededFromDb(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        source_root_dir: []const u8,
+        source_group_id: u64,
+        db: *db_mod.DB,
+    ) !void {
+        _ = self;
+        var source_store = try data_mod.RaftApplyStore.init(alloc, .{ .root_dir = source_root_dir });
+        defer source_store.deinit();
+
+        if (try source_store.latestBatchForTransition(source_group_id)) |watermark| {
+            const root_incarnation = try db.durableRootIncarnation();
+            if (!try source_store.reconcileGroupSnapshotFromAuthoritativeStoreAtRootIncarnation(
+                alloc,
+                source_group_id,
+                watermark,
+                root_incarnation,
+                db.getRange(),
+                db.core.store,
+                256,
+                2 * 1024 * 1024,
+            )) return error.SplitSourceProjectionAdvanced;
+            return;
+        }
 
         var ops = std.ArrayListUnmanaged([]u8).empty;
         defer {
@@ -2915,9 +2938,41 @@ fn projectedTableFieldContainsOnNode(
 }
 
 const SimMergeRuntime = struct {
+    const HostedLeaseContext = struct {
+        alloc: std.mem.Allocator,
+        lease: api_table_writes.HostedProvisionedTableWriteSource.GroupWriterLease,
+
+        fn release(ptr: *anyopaque) void {
+            const self: *HostedLeaseContext = @ptrCast(@alignCast(ptr));
+            self.lease.release();
+            const alloc = self.alloc;
+            alloc.destroy(self);
+        }
+
+        fn acquire(
+            alloc: std.mem.Allocator,
+            source: *api_table_writes.HostedProvisionedTableWriteSource,
+            group_id: u64,
+            table_name: []const u8,
+        ) !data_mod.storage.db_split_handoff.BorrowedDestinationDb {
+            const self = try alloc.create(HostedLeaseContext);
+            errdefer alloc.destroy(self);
+            self.* = .{
+                .alloc = alloc,
+                .lease = try source.leaseGroupWriter(alloc, group_id, table_name),
+            };
+            return .{
+                .db = self.lease.db(),
+                .ctx = self,
+                .release_fn = release,
+            };
+        }
+    };
+
     const Entry = struct {
         donor_group_id: u64,
         receiver_group_id: u64,
+        coord: ?*data_mod.MergeCoordinator = null,
         status: data_mod.MergeTransitionStatus = .{
             .phase = .prepare,
             .donor_group_id = 0,
@@ -2935,6 +2990,18 @@ const SimMergeRuntime = struct {
 
     entries: [16]Entry = undefined,
     len: usize = 0,
+    replica_root_dir: ?[]const u8 = null,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    donor_replica_root_dir: ?[]const u8 = null,
+    donor_backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    donor_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
+    receiver_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
+    table_name: []const u8 = "docs",
+
+    fn deinit(self: *@This()) void {
+        for (self.entries[0..self.len]) |*entry| self.releaseCoordinator(entry);
+        self.len = 0;
+    }
 
     fn iface(self: *@This()) transition_runtime.MergeRuntime {
         return .{
@@ -2978,17 +3045,38 @@ const SimMergeRuntime = struct {
 
     fn observeStatus(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !data_mod.MergeTransitionStatus {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !data_mod.MergeTransitionStatus {
+                    return try coord.status();
+                }
+            }.call, .{});
+        }
         return self.entryFor(donor_group_id, receiver_group_id).status;
     }
 
     fn recordDocIdentityReassignment(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !void {
+                    try coord.recordDocIdentityReassignmentOptIn();
+                }
+            }.call, .{});
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.allow_doc_identity_reassignment = true;
     }
 
     fn acceptReceiver(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !void {
+                    try coord.acceptDonorRange();
+                }
+            }.call, .{});
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .bootstrap_peer;
         entry.status.receiver_accepts_donor_range = true;
@@ -2996,6 +3084,14 @@ const SimMergeRuntime = struct {
 
     fn catchUpReceiver(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !usize {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !usize {
+                    _ = try coord.ensureReceiverBootstrapped();
+                    return try coord.catchUp();
+                }
+            }.call, .{});
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .cutover_ready;
         entry.status.bootstrapped = true;
@@ -3010,6 +3106,13 @@ const SimMergeRuntime = struct {
 
     fn finalizeMerge(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !bool {
+                    return try coord.finalizeMerge();
+                }
+            }.call, .{});
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .finalized;
         entry.status.replay_required = false;
@@ -3018,6 +3121,13 @@ const SimMergeRuntime = struct {
 
     fn rollbackMerge(ptr: *anyopaque, donor_group_id: u64, receiver_group_id: u64) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.replica_root_dir != null) {
+            return try self.withCoordinator(donor_group_id, receiver_group_id, struct {
+                fn call(coord: *data_mod.MergeCoordinator) !bool {
+                    return try coord.rollbackMerge();
+                }
+            }.call, .{});
+        }
         const entry = self.entryFor(donor_group_id, receiver_group_id);
         entry.status.phase = .rolled_back;
         entry.status.receiver_accepts_donor_range = false;
@@ -3027,6 +3137,116 @@ const SimMergeRuntime = struct {
         entry.status.cutover_ready = false;
         entry.status.receiver_ready_for_reads = false;
         return true;
+    }
+
+    fn releaseCoordinator(self: *@This(), entry: *Entry) void {
+        _ = self;
+        if (entry.coord) |coord| {
+            coord.deinit();
+            std.heap.page_allocator.destroy(coord);
+            entry.coord = null;
+        }
+    }
+
+    fn withCoordinator(
+        self: *@This(),
+        donor_group_id: u64,
+        receiver_group_id: u64,
+        comptime Func: anytype,
+        args: anytype,
+    ) !@typeInfo(@TypeOf(Func)).@"fn".return_type.? {
+        const entry = self.entryFor(donor_group_id, receiver_group_id);
+        if (entry.coord == null) {
+            const alloc = std.heap.page_allocator;
+            const replica_root_dir = self.replica_root_dir orelse return error.UnsupportedOperation;
+            const donor_replica_root_dir = self.donor_replica_root_dir orelse replica_root_dir;
+            const donor_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, donor_replica_root_dir, donor_group_id);
+            defer alloc.free(donor_root_dir);
+            const receiver_root_dir = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, receiver_group_id);
+            defer alloc.free(receiver_root_dir);
+
+            var donor_lease: ?data_mod.storage.db_split_handoff.BorrowedDestinationDb = if (self.donor_write_source) |source|
+                try HostedLeaseContext.acquire(alloc, source, donor_group_id, self.table_name)
+            else
+                null;
+            errdefer if (donor_lease) |lease| lease.release();
+            var receiver_lease: ?data_mod.storage.db_split_handoff.BorrowedDestinationDb = if (self.receiver_write_source) |source|
+                try HostedLeaseContext.acquire(alloc, source, receiver_group_id, self.table_name)
+            else
+                null;
+            errdefer if (receiver_lease) |lease| lease.release();
+
+            var seed_runtime = SimSplitRuntime{
+                .replica_root_dir = donor_replica_root_dir,
+                .backend_runtime = self.donor_backend_runtime orelse self.backend_runtime,
+            };
+            if (donor_lease) |lease|
+                try seed_runtime.ensureSourceApplyStoreSeededFromDb(alloc, donor_root_dir, donor_group_id, lease.db)
+            else
+                try seed_runtime.ensureSourceApplyStoreSeeded(alloc, donor_root_dir, donor_group_id);
+
+            var receiver_db_options = db_mod.OpenOptions{
+                .backend_runtime = self.backend_runtime,
+                .prefer_existing_identity_namespace = true,
+            };
+            const receiver_namespace = if (receiver_lease) |lease|
+                try identityNamespace(alloc, lease.db)
+            else
+                try self.receiverIdentityNamespace(alloc, receiver_root_dir);
+            if (receiver_namespace) |namespace| receiver_db_options.identity_namespace = namespace;
+            const donor_db_options = db_mod.OpenOptions{
+                .backend_runtime = self.donor_backend_runtime orelse self.backend_runtime,
+                .prefer_existing_identity_namespace = true,
+            };
+
+            const coord = try alloc.create(data_mod.MergeCoordinator);
+            errdefer alloc.destroy(coord);
+            const owned_donor_lease = donor_lease;
+            const owned_receiver_lease = receiver_lease;
+            donor_lease = null;
+            receiver_lease = null;
+            coord.* = try data_mod.MergeCoordinator.init(alloc, .{
+                .donor_root_dir = donor_root_dir,
+                .receiver_root_dir = receiver_root_dir,
+                .donor_group_id = donor_group_id,
+                .receiver_group_id = receiver_group_id,
+                .donor_db = donor_db_options,
+                .donor_lease = owned_donor_lease,
+                .receiver = .{ .root_dir = receiver_root_dir, .db = receiver_db_options },
+                .receiver_lease = owned_receiver_lease,
+                .receiver_identity_reassignment_namespace = receiver_namespace,
+            });
+            entry.coord = coord;
+        }
+        return @call(.auto, Func, .{entry.coord.?} ++ args);
+    }
+
+    fn receiverIdentityNamespace(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        receiver_root_dir: []const u8,
+    ) !?db_mod.DocIdentityNamespace {
+        var db = db_mod.DB.open(alloc, receiver_root_dir, .{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+            .backend_runtime = self.backend_runtime,
+            .prefer_existing_identity_namespace = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer db.close();
+        return try identityNamespace(alloc, &db);
+    }
+
+    fn identityNamespace(alloc: std.mem.Allocator, db: *db_mod.DB) !?db_mod.DocIdentityNamespace {
+        const stats = try db.runtimeStatusStatsConsistent(alloc);
+        if (stats.doc_identity.namespace_table_id == 0) return null;
+        return .{
+            .table_id = stats.doc_identity.namespace_table_id,
+            .shard_id = stats.doc_identity.namespace_shard_id,
+            .range_id = stats.doc_identity.namespace_range_id,
+        };
     }
 };
 
@@ -3060,6 +3280,12 @@ const TestDescriptorFactory = struct {
     trace_group_id: ?u64 = null,
     trace_logger: ?raft_engine.core.TraceLogger = null,
     active_descriptors: usize = 0,
+    retain_transition_runtimes: bool = false,
+
+    fn deinitTransitionRuntimes(self: *@This()) void {
+        self.split_runtime.deinit();
+        self.merge_runtime.deinit();
+    }
 
     fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
         return .{
@@ -3122,7 +3348,8 @@ const TestDescriptorFactory = struct {
         self.alloc.free(desc.group.raft_config.peers);
         std.debug.assert(self.active_descriptors > 0);
         self.active_descriptors -= 1;
-        if (self.active_descriptors == 0) self.split_runtime.deinit();
+        if (self.active_descriptors == 0 and !self.retain_transition_runtimes)
+            self.deinitTransitionRuntimes();
     }
 };
 
@@ -5919,7 +6146,7 @@ fn PublicApiTestRig(comptime N: usize) type {
 /// explicit-step transport while every public listener, forwarding request,
 /// client, timeout, and shutdown task borrows the caller's single VoprIo.
 pub const VoprPublicClusterFixture = struct {
-    pub const FaultMode = enum { clean, metadata_partition, node_restart, graph_inflight_restart, graph_transport_failure, partial_http_write, resource_pressure };
+    pub const FaultMode = enum { clean, metadata_partition, node_restart, graph_inflight_restart, graph_topology_churn, graph_transport_failure, partial_http_write, resource_pressure };
     const node_count = 3;
     const metadata_group_id: u64 = 6840;
     const table_id: u64 = 6841;
@@ -5940,6 +6167,7 @@ pub const VoprPublicClusterFixture = struct {
     stores: [node_count]raft_engine.core.MemoryStorage = undefined,
     store_count: usize = 0,
     factories: [node_count]TestDescriptorFactory = undefined,
+    factory_count: usize = 0,
     modeled_devices: [node_count]storage_sim.ModeledDevice = undefined,
     modeled_device_count: usize = 0,
     modeled_configurators: [node_count]ModeledDbOpenConfigurator = undefined,
@@ -5996,6 +6224,10 @@ pub const VoprPublicClusterFixture = struct {
     graph_query_sound: bool = false,
     graph_inflight_restart_observed: bool = false,
     graph_inflight_restart_recovered: bool = false,
+    graph_topology_churn_observed: bool = false,
+    graph_topology_churn_finalized: bool = false,
+    graph_topology_churn_error_code: u64 = 0,
+    graph_topology_partial_rejected_sound: bool = false,
     graph_transport_failure_injected: bool = false,
     graph_transport_failure_observed: bool = false,
     graph_transport_failure_error_code: u64 = 0,
@@ -6055,8 +6287,14 @@ pub const VoprPublicClusterFixture = struct {
                 .alloc = alloc,
                 .store = &self.stores[index],
                 .peers = &.{ 1, 2, 3 },
+                // This composed fixture owns structural transitions across
+                // replica descriptor retirement. Individual descriptor churn
+                // must not discard a coordinator between workflow steps.
+                .retain_transition_runtimes = true,
             };
+            self.factory_count += 1;
             self.factories[index].split_runtime.replica_root_dir = self.roots[index];
+            self.factories[index].merge_runtime.replica_root_dir = self.roots[index];
         }
 
         var configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
@@ -6110,6 +6348,7 @@ pub const VoprPublicClusterFixture = struct {
         for (0..node_count) |index| {
             self.cluster.backendRuntime(index).setDbOpenConfigurator(self.modeled_configurators[index].iface());
             self.factories[index].split_runtime.backend_runtime = self.cluster.backendRuntime(index);
+            self.factories[index].merge_runtime.backend_runtime = self.cluster.backendRuntime(index);
         }
         self.metadata_leader_index = try finishBootstrappedMetadataCluster(&self.cluster, 48, true);
         self.cluster_started = true;
@@ -6151,6 +6390,26 @@ pub const VoprPublicClusterFixture = struct {
         try std.testing.expect(try self.cluster.waitForGroupStatusCount(graph_data_group_id, .active, 2, 192));
         self.graph_restart_node_index = currentGroupLeaderIndex(&self.cluster, graph_data_group_id) orelse
             return error.FullClusterGraphLeaderMissing;
+        const receiver_leader_index = currentGroupLeaderIndex(&self.cluster, data_group_id) orelse
+            return error.FullClusterDataLeaderMissing;
+        // Metadata transition actions execute on the metadata leader, while
+        // adjacent data ranges need not be colocated with it. Point that
+        // runtime at the actual donor and receiver leaders so the VOPR mode
+        // crosses a real node-local storage boundary instead of silently
+        // falling back to an empty metadata-leader directory.
+        for (&self.factories) |*factory| {
+            factory.merge_runtime.replica_root_dir = null;
+            factory.merge_runtime.backend_runtime = null;
+            factory.merge_runtime.donor_replica_root_dir = null;
+            factory.merge_runtime.donor_backend_runtime = null;
+            factory.merge_runtime.donor_write_source = null;
+            factory.merge_runtime.receiver_write_source = null;
+        }
+        const merge_runtime = &self.factories[self.metadata_leader_index].merge_runtime;
+        merge_runtime.replica_root_dir = self.roots[receiver_leader_index];
+        merge_runtime.backend_runtime = self.cluster.backendRuntime(receiver_leader_index);
+        merge_runtime.donor_replica_root_dir = self.roots[self.graph_restart_node_index];
+        merge_runtime.donor_backend_runtime = self.cluster.backendRuntime(self.graph_restart_node_index);
         var graph_remote_client_found = false;
         for (0..node_count) |index| {
             if (self.cluster.node(index).status(graph_data_group_id) == .active) continue;
@@ -6253,6 +6512,11 @@ pub const VoprPublicClusterFixture = struct {
             .{ .resource_managers = &self.resource_managers },
             &self.api_base_uris,
         );
+        // The hosted public stack owns the resident group writers. Retain
+        // those exact writers for the real merge coordinator instead of
+        // reopening live LSM roots through a parallel test-only path.
+        merge_runtime.donor_write_source = &self.write_sources[self.graph_restart_node_index];
+        merge_runtime.receiver_write_source = &self.write_sources[receiver_leader_index];
         const graph_hook = api_distributed_graph.LifecycleHook{
             .ptr = self,
             .reach_fn = reachDistributedGraphLifecycle,
@@ -6286,6 +6550,10 @@ pub const VoprPublicClusterFixture = struct {
             .graph_inflight_restart => {
                 self.resource_recovered.set(self.sim.io());
                 _ = self.sim.io().async(restartGraphLeaderDuringQuery, .{self});
+            },
+            .graph_topology_churn => {
+                self.resource_recovered.set(self.sim.io());
+                _ = self.sim.io().async(mergeGraphRangesDuringQuery, .{self});
             },
             .graph_transport_failure => self.resource_recovered.set(self.sim.io()),
             .partial_http_write => {
@@ -6401,7 +6669,7 @@ pub const VoprPublicClusterFixture = struct {
         self.graph_fault_workload_ready.waitUncancelable(self.sim.io());
         if (self.fault_mode == .graph_transport_failure) {
             while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
-        } else if (self.fault_mode != .graph_inflight_restart) {
+        } else if (self.fault_mode != .graph_inflight_restart and self.fault_mode != .graph_topology_churn) {
             while (!self.fault_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
         }
         const query_body = test_contract_helpers.encodeGraphTraverseQueryRequest(
@@ -6418,9 +6686,9 @@ pub const VoprPublicClusterFixture = struct {
             return;
         };
         defer self.alloc.free(query_body);
-        if (self.fault_mode == .graph_transport_failure) {
+        if (self.fault_mode == .graph_transport_failure or self.fault_mode == .graph_topology_churn) {
             var failed = self.client.fetchQueryRaw(
-                self.api_base_uris[self.graph_remote_client_index],
+                self.api_base_uris[if (self.fault_mode == .graph_transport_failure) self.graph_remote_client_index else self.client_index],
                 "docs",
                 query_body,
             ) catch |err| {
@@ -6431,14 +6699,20 @@ pub const VoprPublicClusterFixture = struct {
                 return;
             };
             defer failed.deinit(self.alloc);
-            self.graph_partial_rejected_sound = self.graph_transport_failure_injected and
-                self.graph_transport_failure_observed and failed.status == 503 and
+            const fail_closed = failed.status == 503 and
                 std.mem.indexOf(u8, failed.body, "\"code\":\"distributed_query_unavailable\"") != null and
                 std.mem.indexOf(u8, failed.body, "\"retryable\":true") != null and
                 std.mem.indexOf(u8, failed.body, "graph_results") == null and
                 std.mem.indexOf(u8, failed.body, "doc:z") == null and
                 std.mem.indexOf(u8, failed.body, "doc:y") == null;
-            if (!self.graph_partial_rejected_sound) {
+            if (self.fault_mode == .graph_transport_failure) {
+                self.graph_partial_rejected_sound = self.graph_transport_failure_injected and
+                    self.graph_transport_failure_observed and fail_closed;
+            } else {
+                self.graph_topology_partial_rejected_sound = self.graph_topology_churn_observed and
+                    self.graph_topology_churn_finalized and self.graph_topology_churn_error_code != 0 and fail_closed;
+            }
+            if (!fail_closed) {
                 self.sim.setNetworkOutage(false);
                 self.fault_finished = true;
                 return;
@@ -6476,6 +6750,10 @@ pub const VoprPublicClusterFixture = struct {
             found_y = found_y or std.mem.eql(u8, node.key, "doc:y");
         }
         self.graph_query_sound = walk.total == 2 and nodes.len == 2 and found_z and found_y;
+        if (!self.graph_query_sound) std.debug.print(
+            "full cluster graph recovery returned incomplete result after mode={s}: {s}\n",
+            .{ @tagName(self.fault_mode), query.body },
+        );
     }
 
     fn reachDistributedGraphLifecycle(ptr: *anyopaque, event: api_distributed_graph.LifecycleEvent) void {
@@ -6488,6 +6766,19 @@ pub const VoprPublicClusterFixture = struct {
                 self.graph_inflight_restart_observed = true;
                 self.graph_round_paused.set(self.sim.io());
                 self.graph_fault_recovered.waitUncancelable(self.sim.io());
+            },
+            .graph_topology_churn => switch (event.phase) {
+                .expand_round_completed => {
+                    if (event.depth != 1 or self.graph_topology_churn_observed) return;
+                    self.graph_topology_churn_observed = true;
+                    self.graph_round_paused.set(self.sim.io());
+                    self.graph_fault_recovered.waitUncancelable(self.sim.io());
+                },
+                .attempt_failed => {
+                    if (!self.graph_topology_churn_observed or self.graph_topology_churn_error_code != 0) return;
+                    self.graph_topology_churn_error_code = event.error_code;
+                },
+                else => {},
             },
             .graph_transport_failure => switch (event.phase) {
                 .expand_round_completed => {
@@ -6567,6 +6858,92 @@ pub const VoprPublicClusterFixture = struct {
         };
         self.graph_inflight_restart_recovered = recovered;
         self.topology_sound = recovered;
+        self.fault_finished = true;
+        self.graph_fault_recovered.set(self.sim.io());
+    }
+
+    fn mergeGraphRangesDuringQuery(self: *VoprPublicClusterFixture) void {
+        self.graph_round_paused.waitUncancelable(self.sim.io());
+        while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+        const transition_id: u64 = 6_845_001;
+        var workflow = metadata_table_workflow.TableWorkflow.init(self.alloc);
+        defer workflow.deinit();
+        _ = workflow.requestMerge(&self.cluster.node(leader_index), .{
+            .transition_id = transition_id,
+            .table_id = table_id,
+            .donor_group_id = graph_data_group_id,
+            .receiver_group_id = data_group_id,
+            // These independently bootstrapped ranges own distinct document
+            // identity namespaces. The operator-visible merge contract must
+            // explicitly authorize the receiver namespace to win.
+            .allow_doc_identity_reassignment = true,
+        }) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+        const finalized = waitForMergeTransitionFinalized(
+            &self.cluster,
+            transition_id,
+            null,
+            leader_index,
+            192,
+        ) catch false;
+        if (finalized) {
+            const reconcile_index = currentMetadataLeaderIndex(&self.cluster) orelse leader_index;
+            workflow.bootstrapDesiredFromCommitted(&self.cluster.node(reconcile_index)) catch |err| {
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+                self.fault_finished = true;
+                self.graph_fault_recovered.set(self.sim.io());
+                return;
+            };
+            _ = retireFinalizedMergeTransition(self.cluster.node(reconcile_index), workflow.controlLoop()) catch |err| {
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+                self.fault_finished = true;
+                self.graph_fault_recovered.set(self.sim.io());
+                return;
+            };
+            const receiver_ready = self.cluster.waitForGroupStatusCount(data_group_id, .active, 2, 192) catch false;
+            const donor_retired = self.cluster.waitForGroupStatus(graph_data_group_id, .absent, 192) catch false;
+            if (!receiver_ready or !donor_retired) {
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(error.FullClusterGraphMergeNotReady);
+                self.fault_finished = true;
+                self.graph_fault_recovered.set(self.sim.io());
+                return;
+            }
+            ensureGroupGraphIndexOnActiveReplicas(
+                &self.cluster,
+                self.roots[0..],
+                data_group_id,
+                graph_index_name,
+                192,
+            ) catch |err| {
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+                self.fault_finished = true;
+                self.graph_fault_recovered.set(self.sim.io());
+                return;
+            };
+        }
+        self.graph_topology_churn_finalized = finalized;
+        self.topology_sound = finalized;
         self.fault_finished = true;
         self.graph_fault_recovered.set(self.sim.io());
     }
@@ -6685,6 +7062,7 @@ pub const VoprPublicClusterFixture = struct {
                 return;
             };
         }
+        for (self.factories[0..self.factory_count]) |*factory| factory.deinitTransitionRuntimes();
         if (self.stack_live) {
             deinitPublicApiStack(node_count, &self.listeners, &self.servers, &self.write_sources);
             self.stack_live = false;
@@ -6718,6 +7096,7 @@ pub const VoprPublicClusterFixture = struct {
 
     pub fn deinit(self: *VoprPublicClusterFixture) void {
         self.releaseNodeMemory();
+        for (self.factories[0..self.factory_count]) |*factory| factory.deinitTransitionRuntimes();
         if (self.stack_live) {
             deinitPublicApiStack(node_count, &self.listeners, &self.servers, &self.write_sources);
             self.stack_live = false;
@@ -6778,6 +7157,10 @@ pub const VoprPublicClusterFixture = struct {
         graph_query_ok: bool,
         graph_inflight_restart_observed: bool,
         graph_inflight_restart_recovered: bool,
+        graph_topology_churn_observed: bool,
+        graph_topology_churn_finalized: bool,
+        graph_topology_churn_error_code: u64,
+        graph_topology_partial_rejected_sound: bool,
         graph_transport_failure_injected: bool,
         graph_transport_failure_observed: bool,
         graph_transport_failure_error_code: u64,
@@ -6799,6 +7182,10 @@ pub const VoprPublicClusterFixture = struct {
             .graph_query_ok = self.graph_query_sound,
             .graph_inflight_restart_observed = self.graph_inflight_restart_observed,
             .graph_inflight_restart_recovered = self.graph_inflight_restart_recovered,
+            .graph_topology_churn_observed = self.graph_topology_churn_observed,
+            .graph_topology_churn_finalized = self.graph_topology_churn_finalized,
+            .graph_topology_churn_error_code = self.graph_topology_churn_error_code,
+            .graph_topology_partial_rejected_sound = self.graph_topology_partial_rejected_sound,
             .graph_transport_failure_injected = self.graph_transport_failure_injected,
             .graph_transport_failure_observed = self.graph_transport_failure_observed,
             .graph_transport_failure_error_code = self.graph_transport_failure_error_code,

@@ -4508,6 +4508,9 @@ pub fn build(b: *std.Build) void {
         "wal replica state refuses a missing durable snapshot payload on reopen",
         "wal replica provider wires host through WAL-backed local state",
         "db merge coordinator opt-in applies configured receiver identity namespace",
+        "db merge coordinator finalize persists across reopen",
+        "db merge coordinator requires durable bootstrap evidence for a pre-covering receiver",
+        "merge replay decodes production raft batch envelopes in request order",
         "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
     };
