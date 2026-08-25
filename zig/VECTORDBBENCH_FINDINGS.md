@@ -1765,6 +1765,38 @@ large L0 generation instead. That keeps the existing lower base untouched,
 removes fragmented L0 fan-out with roughly 1 GB of streaming input, and makes
 the geometric growth rule prevent repeated rewrites of the sealed generation.
 
+The first same-level implementation deliberately required the complete L0
+output to be at least twice its largest input generation. Its 1M control never
+sealed: the final manifest contained a 1.036 GB anchor plus 384.6 MB spread
+over 17 newer generations, so the complete 1.42 GB L0 could not satisfy 2x
+growth. It nevertheless provided a matched control at 818.28 seconds ready,
+0.9852 live recall, 3.36 GB peak live RSS, 2.35 GB demand, and 42.73/91.82 ms
+detailed mean/p95. Final L0 was 43 physical runs across 18 generations above
+a 2.095 GB lower base. This corrected the policy: the established anchor must
+not be part of a newer-delta seal.
+
+The anchor-preserving prefix seal passed the next 1M gate. Once total L0
+reached half the lower base, it compacted a newer prefix only after that prefix
+was at least twice its largest component. The authoritative manifest retained
+the original 991.9 MB anchor and 2.077 GB lower base, published one 381.9 MB
+prefix generation, and finished with 28 L0 runs across 12 generations. Ready
+time improved to 804.56 seconds, compaction time fell from 118.70 to 105.24
+seconds, pressure steps fell from 654 to 615, and snapshot cloning fell from
+917.8 to 792.8 MB. Total compaction input remained essentially flat at
+15.22 versus 15.16 GB because the prefix seal replaced geometric carries
+rather than adding a base rewrite.
+
+Memory and warm query latency also improved: peak live RSS fell from 3.36 to
+3.06 GB, demand from 2.35 to 2.28 GB, warm p95 from 88.6 to 79.8 ms, and the
+detailed profile from 42.73/91.82 to 37.21/81.37 ms mean/p95. Detailed recall
+was 0.98354 versus 0.98481, a 0.127 percentage-point delta. The live
+concurrency curve regressed under a noisier host interval, however, and disk
+rose from 3,773,788 to 3,857,468 KiB, mostly in native posting segments plus a
+smaller primary-boundary difference. Treat the policy as a checkpoint, not the
+final result. A recursive geometric stack can next seal the remaining 66 MB
+newer prefix above the 381.9 MB generation without rewriting either anchor;
+each tier must retain the same 2x growth proof.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process

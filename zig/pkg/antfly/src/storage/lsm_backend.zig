@@ -340,11 +340,12 @@ pub const Options = struct {
     // Zero disables it. The tier lane streams equal-sized publication
     // generations without repeatedly rewriting the overlapping lower level.
     bulk_ingest_tiered_l0_fan_in: usize = 0,
-    // Permit a leveled L0 promotion once L0 reaches 1/N of all lower-level
-    // bytes. Zero disables ratio promotion. This complements geometric L0
-    // carries: meaningful base growth may create the next level, while small
-    // deltas stay in L0 and cannot repeatedly rewrite the lower base.
-    bulk_ingest_l0_base_growth_ratio_denominator: usize = 0,
+    // Seal fragmented L0 generations once their bytes reach 1/N of all
+    // lower-level bytes. Zero disables ratio sealing. The seal remains in L0,
+    // excludes the largest established anchor, and must be at least twice its
+    // largest input generation, so small deltas cannot rewrite prior tiers or
+    // the lower base.
+    bulk_ingest_l0_delta_seal_ratio_denominator: usize = 0,
     level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
     level_target_bytes_base: usize = 1024 * 1024,
@@ -5563,8 +5564,8 @@ pub const Backend = struct {
         return pressure;
     }
 
-    fn bulkL0BaseGrowthDueLocked(self: *const Backend, l0_bytes: u64) bool {
-        const denominator = self.options.bulk_ingest_l0_base_growth_ratio_denominator;
+    fn bulkL0DeltaSealDueLocked(self: *const Backend, l0_bytes: u64) bool {
+        const denominator = self.options.bulk_ingest_l0_delta_seal_ratio_denominator;
         if (denominator == 0 or l0_bytes == 0) return false;
 
         var lower_bytes: u64 = 0;
@@ -5603,8 +5604,12 @@ pub const Backend = struct {
         while (pressure.overHardLimit(hard_runs, hard_bytes) and steps < max_steps) {
             const before_step_compactions = self.compaction_stats.compactions;
             const byte_hard = hard_bytes > 0 and pressure.bytes > hard_bytes;
-            const base_growth_due = self.bulkL0BaseGrowthDueLocked(pressure.bytes);
-            const tiered = if (!byte_hard and !base_growth_due and
+            const delta_seal_due = self.bulkL0DeltaSealDueLocked(pressure.bytes);
+            const sealed = if (!byte_hard and delta_seal_due)
+                try compaction_mod.compactBulkL0DeltaSeal(Backend, self, 2)
+            else
+                false;
+            const tiered = if (!byte_hard and !sealed and
                 hard_runs > 0 and pressure.runs > hard_runs and
                 self.options.bulk_ingest_tiered_l0_fan_in >= 2)
                 try compaction_mod.compactBulkL0Tier(
@@ -5614,7 +5619,7 @@ pub const Backend = struct {
                 )
             else
                 false;
-            if (!tiered) {
+            if (!sealed and !tiered) {
                 _ = try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
             }
             if (self.compaction_stats.compactions == before_step_compactions) break;
@@ -10876,14 +10881,14 @@ test "lsm backend hard run pressure prefers a complete geometric L0 carry" {
     try std.testing.expectEqual(@as(u64, 0), backend.write_stats.write_pressure_overloads);
 }
 
-test "lsm backend hard run pressure promotes meaningful L0 base growth" {
+test "lsm backend hard run pressure seals meaningful L0 delta without rewriting base" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,
         .compact_threshold_runs = 100,
         .l0_soft_limit_runs = 1,
         .l0_hard_limit_runs = 100,
         .bulk_ingest_tiered_l0_fan_in = 4,
-        .bulk_ingest_l0_base_growth_ratio_denominator = 2,
+        .bulk_ingest_l0_delta_seal_ratio_denominator = 2,
     });
     defer backend.close();
 
@@ -10903,15 +10908,28 @@ test "lsm backend hard run pressure promotes meaningful L0 base growth" {
     try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
     try std.testing.expect(countLevelRuns(backend.runs.items, 1) > 0);
     const setup_overloads = backend.write_stats.write_pressure_overloads;
+    var lower_bytes_before: u64 = 0;
+    for (backend.runs.items) |run| {
+        if (run.level > 0) lower_bytes_before +|= run.size_bytes;
+    }
 
-    // A same-sized overwrite generation is meaningful growth. At run-hard
-    // pressure it must promote and merge with L1 rather than remain in L0 as
-    // an otherwise valid four-way geometric carry.
+    // Establish one dominant L0 anchor, then add four smaller newer
+    // generations. At run-hard pressure only the fragmented newer prefix must
+    // seal; neither the anchor nor L1 may be rewritten.
+    var anchor_value: [4096]u8 = undefined;
+    @memset(&anchor_value, 'a');
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:0", &anchor_value);
+        try txn.commit();
+    }
+    const anchor_run_id = backend.runs.items[0].id;
     for (0..4) |_| {
         var txn = try backend.beginWrite();
         try txn.put(.{ .name = "docs" }, "doc:0", "newer");
         try txn.commit();
     }
+    const l0_runs_before = countLevelRuns(backend.runs.items, 0);
     backend.options.l0_hard_limit_runs = 3;
     {
         const locked = runtime_mod.lockBackend(Backend, &backend);
@@ -10919,10 +10937,20 @@ test "lsm backend hard run pressure promotes meaningful L0 base growth" {
         try backend.enforceWritePressure();
     }
 
-    // Generic promotion retains the newest precedence run. A same-level
-    // four-way carry would leave that run plus its L0 output (two total).
-    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+    // The four newer runs become one. The dominant anchor and the small L0
+    // precedence run retained by setup remain separate generations.
+    try std.testing.expectEqual(l0_runs_before - 3, countLevelRuns(backend.runs.items, 0));
+    var retained_anchor = false;
+    for (backend.runs.items) |run| {
+        if (run.id == anchor_run_id) retained_anchor = true;
+    }
+    try std.testing.expect(retained_anchor);
     try std.testing.expect(countLevelRuns(backend.runs.items, 1) > 0);
+    var lower_bytes_after: u64 = 0;
+    for (backend.runs.items) |run| {
+        if (run.level > 0) lower_bytes_after +|= run.size_bytes;
+    }
+    try std.testing.expectEqual(lower_bytes_before, lower_bytes_after);
     try std.testing.expectEqualStrings("newer", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
     try std.testing.expectEqual(@as(u64, 2), backend.write_stats.write_pressure_compactions);
     try std.testing.expectEqual(setup_overloads, backend.write_stats.write_pressure_overloads);

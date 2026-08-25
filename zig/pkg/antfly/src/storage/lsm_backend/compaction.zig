@@ -353,6 +353,66 @@ pub fn compactBulkL0Tier(
     return true;
 }
 
+/// Collapse the fragmented generations newer than the largest L0 anchor into
+/// one logical generation without promoting into or rewriting the anchor or
+/// lower levels. The output must be at least `min_growth_factor` times its
+/// largest selected generation. Consequently a later seal cannot rewrite this
+/// output until a comparable amount of newer L0 data has accumulated.
+pub fn compactBulkL0DeltaSeal(
+    comptime BackendType: type,
+    backend: *BackendType,
+    min_growth_factor: usize,
+) !bool {
+    if (min_growth_factor < 2) return false;
+    const l0_count = countLeadingL0Runs(backend.runs.items);
+    if (l0_count < 2) return false;
+
+    var anchor_start: usize = 0;
+    var anchor_bytes: u64 = 0;
+    var start: usize = 0;
+    while (start < l0_count) {
+        const end = l0GenerationEnd(backend.runs.items, start, l0_count);
+        const generation_bytes = sumRunBytes(backend.runs.items[start..end]);
+        if (generation_bytes > anchor_bytes) {
+            anchor_start = start;
+            anchor_bytes = generation_bytes;
+        }
+        start = end;
+    }
+
+    // Bulk publications prepend newer generations. Treat the largest
+    // established generation as an immutable anchor and seal only the newer
+    // prefix. An anchor at the front has no newer delta for this lane.
+    if (anchor_start == 0) return false;
+
+    var generation_count: usize = 0;
+    var max_generation_bytes: u64 = 0;
+    var input_bytes: u64 = 0;
+    start = 0;
+    while (start < anchor_start) {
+        const end = l0GenerationEnd(backend.runs.items, start, anchor_start);
+        const generation_bytes = sumRunBytes(backend.runs.items[start..end]);
+        generation_count += 1;
+        max_generation_bytes = @max(max_generation_bytes, generation_bytes);
+        input_bytes +|= generation_bytes;
+        start = end;
+    }
+    if (generation_count < 2 or
+        input_bytes < max_generation_bytes *| @as(u64, @intCast(min_growth_factor))) return false;
+    if (backend.options.max_compaction_input_bytes > 0 and
+        input_bytes > backend.options.max_compaction_input_bytes) return false;
+
+    try compactPlanAt(BackendType, backend, .{
+        .source_level = 0,
+        .source_start = 0,
+        .source_len = anchor_start,
+        .target_start = anchor_start,
+        .target_len = 0,
+        .output_level = 0,
+    });
+    return true;
+}
+
 /// Variant used while a bulk window is open. A non-zero sequence ceiling
 /// keeps the tier merger out of the request publications owned by that
 /// window; those are combined exactly once by `compactBulkL0WindowScheduled`.

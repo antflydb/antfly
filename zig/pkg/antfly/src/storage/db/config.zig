@@ -75,11 +75,10 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     // external merge tree. This bounds L0 read amplification during sustained
     // imports without repeatedly merging each window through the full base.
     .bulk_ingest_tiered_l0_fan_in = 4,
-    // Once the accumulated L0 delta is at least half of all lower-level data,
-    // one leveled promotion is meaningful base growth. With the production
-    // level targets this normally creates a stable intermediate level instead
-    // of rewriting the large base; smaller deltas retain geometric L0 carries.
-    .bulk_ingest_l0_base_growth_ratio_denominator = 2,
+    // Once fragmented L0 is at least half of all lower-level data, seal its
+    // newer delta above the largest anchor. The seal must also grow by at
+    // least 2x, bounding rewrite amplification while leaving the base intact.
+    .bulk_ingest_l0_delta_seal_ratio_denominator = 2,
     // Preserve throughput batching while bounding retained WAL for every
     // workload shape. Meaningful bursts checkpoint promptly; low-rate tables
     // accumulate instead of producing one run per write and checkpoint at the
@@ -596,7 +595,7 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(primary_opts.flush_threshold_bytes, primary_opts.read_snapshot_rotate_mutable_bytes);
     try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024), primary_opts.direct_bulk_ingest_min_bytes);
     try std.testing.expectEqual(@as(usize, 4), primary_opts.bulk_ingest_tiered_l0_fan_in);
-    try std.testing.expectEqual(@as(usize, 2), primary_opts.bulk_ingest_l0_base_growth_ratio_denominator);
+    try std.testing.expectEqual(@as(usize, 2), primary_opts.bulk_ingest_l0_delta_seal_ratio_denominator);
     try std.testing.expectEqual(@as(u64, 0), primary_opts.bulk_ingest_current_scan_clone_max_bytes);
     try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), primary_opts.mutable_idle_flush_after_ns);
     try std.testing.expectEqual(@as(u64, mib), primary_opts.mutable_idle_flush_min_bytes);
