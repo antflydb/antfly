@@ -549,7 +549,8 @@ test "apply rw lock queued io writer blocks later shared barging" {
 
     // Once writer intent is visible, neither opportunistic nor blocking-new
     // readers may enter ahead of it.
-    try std.testing.expect(!lock.tryLockShared());
+    const barged = lock.tryLockShared();
+    if (barged) lock.unlockShared();
     lock.unlockShared();
     shared_held = false;
 
@@ -558,4 +559,9 @@ test "apply rw lock queued io writer blocks later shared barging" {
     }
     try std.testing.expect(!ctx.writer_failed.load(.acquire));
     try std.testing.expect(ctx.writer_done.load(.acquire));
+    // Assert only after releasing both the opportunistic acquisition (if the
+    // invariant regressed) and the original blocker. The failure path must not
+    // deadlock its deferred writer join and turn a useful failure into a hung
+    // test process.
+    try std.testing.expect(!barged);
 }

@@ -2176,17 +2176,17 @@ pub fn searchProfiledRequest(
             searchProfiledRequestAttempt(self, req, token.snapshot, false, now_fn_u64, elapsed_fn_u64)) catch |err| {
             const attempt_current = completeSnapshotAttemptStillCurrent(self, token);
             if (err == error.StalePublishedSnapshot or
-                (err == error.IncompletePublishedSnapshot and !capture_durable_snapshot and !attempt_current))
+                (err == error.IncompletePublishedSnapshot and !attempt_current))
             {
-                // The optimistic pass overlapped a publisher. Retry once under
-                // a short reader fence to capture a durable MVCC transaction.
+                // The attempt overlapped a publisher. Retry under a short
+                // reader fence to capture a durable MVCC transaction.
                 // Traversal then runs cache-free after releasing the fence, so
                 // writers are not serialized behind the O(N) exhaustive pass.
                 pessimistic = true;
                 continue;
             }
-            if (err == error.IncompletePublishedSnapshot and (!capture_durable_snapshot or attempt_current)) {
-                noteIncompletePublishedSnapshotIfSupported(self);
+            if (err == error.IncompletePublishedSnapshot) {
+                noteIncompletePublishedSnapshotIfSupported(self, token.snapshot.publish_generation);
             }
             return err;
         };
@@ -2786,9 +2786,11 @@ fn notifyCompleteSnapshotCapturedForTestIfSupported(self: anytype) void {
     }
 }
 
-fn noteIncompletePublishedSnapshotIfSupported(self: anytype) void {
+fn noteIncompletePublishedSnapshotIfSupported(self: anytype, generation: u64) void {
     const Index = comptime childType(@TypeOf(self));
-    if (comptime @hasDecl(Index, "noteIncompletePublishedSnapshot")) {
+    if (comptime @hasDecl(Index, "noteIncompletePublishedSnapshotForGeneration")) {
+        self.noteIncompletePublishedSnapshotForGeneration(generation);
+    } else if (comptime @hasDecl(Index, "noteIncompletePublishedSnapshot")) {
         self.noteIncompletePublishedSnapshot();
     }
 }

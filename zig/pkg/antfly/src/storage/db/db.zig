@@ -23623,6 +23623,33 @@ pub const DB = struct {
         try self.applyGraphExpandStrategy(alloc, base, req.expand_strategy);
     }
 
+    /// Persist the fail-closed repair decision before reporting that the index
+    /// is rebuilding. The HBC marker is generation-scoped, so a failure from a
+    /// snapshot superseded before this callback arrived cannot quarantine the
+    /// current serving generation.
+    fn persistIncompleteHbcSnapshotRepair(
+        self: *DB,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+    ) !bool {
+        if (!entry.index.generationRepairPending()) return false;
+        _ = self.ensureAutomaticDenseGenerationRepairIntent(
+            self.alloc,
+            entry.config,
+            .projection_generation_invalid,
+            "dense_hbc_published_snapshot_incomplete",
+        ) catch |err| switch (err) {
+            error.DurableIndexRepairStateUnavailable => {
+                // Embedded/Lite runtimes intentionally have no durable repair
+                // owner. The query gate is already closed; their maintenance
+                // pass performs the same synchronous shadow replacement used
+                // for other automatic generation repairs.
+                std.log.warn("incomplete dense index quarantined without durable repair owner name={s}", .{entry.config.name});
+            },
+            else => return err,
+        };
+        return true;
+    }
+
     fn hbcSearchCallback(
         ctx: ?*anyopaque,
         entry: *index_manager_mod.IndexManager.DenseIndex,
@@ -23631,13 +23658,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return self.core.index_manager.searchDenseEntryWithRequest(entry, req) catch |err| switch (err) {
             error.IncompletePublishedSnapshot => {
-                // Quarantine immediately so later requests do not repeatedly
-                // rediscover the same broken generation. The maintenance plan
-                // observes generationRepairPending and persists a shadow-
-                // generation repair intent.
-                self.core.index_manager.markRepairUnavailable(entry.config.name) catch |gate_err| {
-                    std.log.err("failed to quarantine incomplete dense index name={s} err={}", .{ entry.config.name, gate_err });
-                };
+                if (!try self.persistIncompleteHbcSnapshotRepair(entry)) return err;
                 return error.IndexRebuilding;
             },
             else => return err,
@@ -23652,9 +23673,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req) catch |err| switch (err) {
             error.IncompletePublishedSnapshot => {
-                self.core.index_manager.markRepairUnavailable(entry.config.name) catch |gate_err| {
-                    std.log.err("failed to quarantine incomplete dense index name={s} err={}", .{ entry.config.name, gate_err });
-                };
+                if (!try self.persistIncompleteHbcSnapshotRepair(entry)) return err;
                 return error.IndexRebuilding;
             },
             else => return err,
@@ -74958,33 +74977,56 @@ test "db forced generation repair completion is crash idempotent before api ackn
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
 }
 
-test "db incomplete HBC snapshot schedules durable generation repair" {
+test "db incomplete HBC snapshot persists generation repair before maintenance" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    var repair_id: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+
+        const stale_generation = dense.index.publishedGeneration();
+        dense.index.refreshPublishedSearchState();
+        dense.index.noteIncompletePublishedSnapshotForGeneration(stale_generation);
+        try std.testing.expect(!try db.persistIncompleteHbcSnapshotRepair(dense));
+        try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
+        try std.testing.expect(!db.core.index_manager.repairUnavailable("dense_idx"));
+
+        dense.index.noteIncompletePublishedSnapshot();
+
+        try std.testing.expect(try db.persistIncompleteHbcSnapshotRepair(dense));
+        try std.testing.expect(db.core.index_manager.repairUnavailable("dense_idx"));
+        repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
+        var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer repair.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Trigger.projection_generation_invalid, repair.intent.trigger);
+        try std.testing.expectEqualStrings("dense_hbc_published_snapshot_incomplete", repair.intent.last_error.?);
+    }
+
+    // The query-path decision must survive a process boundary even if the
+    // periodic repair-maintenance pass never ran in the detecting process.
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
-    defer db.close();
-    try db.addIndex(.{
-        .name = "dense_idx",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
-    });
-    const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
-    dense.index.noteIncompletePublishedSnapshot();
-
-    try std.testing.expect(try db.denseArtifactRebuildMaintenanceNeeded(alloc));
-    try std.testing.expect(try db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null));
-    try std.testing.expect(db.core.index_manager.repairUnavailable("dense_idx"));
-    const repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
-    var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
-    defer repair.deinit(alloc);
-    try std.testing.expectEqual(index_repair_state.Trigger.projection_generation_invalid, repair.intent.trigger);
-    try std.testing.expectEqualStrings("dense_hbc_published_snapshot_incomplete", repair.intent.last_error.?);
+    defer reopened.close();
+    try std.testing.expectEqual(
+        repair_id,
+        (try reopened.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expect(reopened.core.index_manager.repairUnavailable("dense_idx"));
 }
 
 test "db forced repair attaches to automatic generation intent idempotently" {

@@ -2197,7 +2197,7 @@ pub const HBCIndex = struct {
     // A complete-snapshot query found that the published generation cannot
     // prove coverage. Link repair may make traversal safer, but only a shadow
     // generation rebuild can recover orphaned or duplicate membership.
-    generation_repair_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    generation_repair_pending_generation: AtomicU64 = .init(std.math.maxInt(u64)),
     quantizer: quantizer_mod.RaBitQuantizer,
     rot: vec.RandomOrthogonalTransformer,
     node_cache: std.AutoHashMapUnmanaged(u64, *NodeCacheEntry),
@@ -7851,31 +7851,19 @@ pub const HBCIndex = struct {
 
     /// Search for the k nearest vectors. Returns results sorted by distance.
     pub fn search(self: *HBCIndex, query: []const f32, k: usize) !SearchResults {
-        return vectorindex_hbc_index.search(self, query, k, nowNs, elapsedSince) catch |err| {
-            if (err == error.IncompletePublishedSnapshot) self.noteIncompletePublishedSnapshot();
-            return err;
-        };
+        return try vectorindex_hbc_index.search(self, query, k, nowNs, elapsedSince);
     }
 
     pub fn searchWithRequest(self: *HBCIndex, req: SearchRequest) !SearchResults {
-        return vectorindex_hbc_index.searchWithRequest(self, req, nowNs, elapsedSince) catch |err| {
-            if (err == error.IncompletePublishedSnapshot) self.noteIncompletePublishedSnapshot();
-            return err;
-        };
+        return try vectorindex_hbc_index.searchWithRequest(self, req, nowNs, elapsedSince);
     }
 
     pub fn searchProfiled(self: *HBCIndex, query: []const f32, k: usize) !ProfiledSearchResults {
-        return vectorindex_hbc_index.searchProfiled(self, query, k, nowNs, elapsedSince) catch |err| {
-            if (err == error.IncompletePublishedSnapshot) self.noteIncompletePublishedSnapshot();
-            return err;
-        };
+        return try vectorindex_hbc_index.searchProfiled(self, query, k, nowNs, elapsedSince);
     }
 
     pub fn searchProfiledRequest(self: *HBCIndex, req: SearchRequest) !ProfiledSearchResults {
-        return vectorindex_hbc_index.searchProfiledRequest(self, req, nowNs, elapsedSince) catch |err| {
-            if (err == error.IncompletePublishedSnapshot) self.noteIncompletePublishedSnapshot();
-            return err;
-        };
+        return try vectorindex_hbc_index.searchProfiledRequest(self, req, nowNs, elapsedSince);
     }
 
     fn routeRateEwma(previous: u64, sample: u64) u64 {
@@ -8126,12 +8114,29 @@ pub const HBCIndex = struct {
     }
 
     pub fn noteIncompletePublishedSnapshot(self: *HBCIndex) void {
+        self.noteIncompletePublishedSnapshotForGeneration(self.publishedGeneration());
+    }
+
+    pub fn noteIncompletePublishedSnapshotForGeneration(self: *HBCIndex, generation: u64) void {
         self.link_repair_pending.store(true, .release);
-        self.generation_repair_pending.store(true, .release);
+        // Concurrent searches may finish out of order. Never let a delayed
+        // failure from an older snapshot overwrite a newer generation's
+        // repair signal.
+        var pending = self.generation_repair_pending_generation.load(.acquire);
+        while (pending == std.math.maxInt(u64) or generation > pending) {
+            pending = self.generation_repair_pending_generation.cmpxchgWeak(
+                pending,
+                generation,
+                .acq_rel,
+                .acquire,
+            ) orelse break;
+        }
     }
 
     pub fn generationRepairPending(self: *const HBCIndex) bool {
-        return self.generation_repair_pending.load(.acquire);
+        const generation = self.publishedGeneration();
+        return (generation & 1) == 0 and
+            self.generation_repair_pending_generation.load(.acquire) == generation;
     }
 
     pub fn treeLinkRepairPending(self: *const HBCIndex) bool {
@@ -8730,6 +8735,37 @@ test "small quantized complete snapshot validates authoritative leaf assignments
             .load_metadata = false,
         }),
     );
+    try std.testing.expect(idx.generationRepairPending());
+}
+
+test "incomplete snapshot repair marker is scoped to its publication generation" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 4,
+        .branching_factor = 4,
+        .use_quantization = false,
+    });
+    defer idx.close();
+
+    const old_generation = idx.publishedGeneration();
+    idx.noteIncompletePublishedSnapshotForGeneration(old_generation);
+    try std.testing.expect(idx.generationRepairPending());
+
+    idx.refreshPublishedSearchState();
+    try std.testing.expect(!idx.generationRepairPending());
+
+    // A delayed search completion from the old snapshot cannot poison the
+    // newer serving generation or overwrite a newer repair observation.
+    idx.noteIncompletePublishedSnapshotForGeneration(old_generation);
+    try std.testing.expect(!idx.generationRepairPending());
+    idx.noteIncompletePublishedSnapshotForGeneration(idx.publishedGeneration());
+    try std.testing.expect(idx.generationRepairPending());
+    idx.noteIncompletePublishedSnapshotForGeneration(old_generation);
     try std.testing.expect(idx.generationRepairPending());
 }
 
