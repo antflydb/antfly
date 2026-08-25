@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
 const platform_time = @import("antfly_platform").time;
 const foreign_mod = @import("../foreign/mod.zig");
 const table_writes_api = @import("../api/table_writes.zig");
@@ -79,6 +80,9 @@ fn classifyReplicationError(err: anyerror) []const u8 {
         error.UnknownColumn,
         error.InvalidQueryRequest,
         error.UnsupportedReplicationStreaming,
+        error.StoredDestinationAuthorizationMissing,
+        error.StoredDestinationAuthorizationInvalid,
+        error.StoredDestinationAuthorizationRevoked,
         => "terminal",
         else => "retryable",
     };
@@ -101,6 +105,7 @@ pub const SnapshotBackfillRunner = struct {
     prepared_snapshot_timeout_ns: u64 = default_prepared_snapshot_timeout_ns,
     quantum_deadline_ns: ?u64 = null,
     work_permit: ?WorkPermit = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 
     fn checkpointWork(self: *SnapshotBackfillRunner) !void {
         if (self.work_permit) |permit| try permit.checkpoint();
@@ -197,7 +202,7 @@ pub const SnapshotBackfillRunner = struct {
             &progress_cutover_provider_identity,
         ) catch |err| {
             self.checkpointWork() catch return err;
-            var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal) catch return err;
+            var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer) catch return err;
             defer parsed.deinit(self.alloc);
 
             callUpsertStatus(status_sink, .{
@@ -261,7 +266,7 @@ pub const SnapshotBackfillRunner = struct {
         progress_cutover_provider_identity: *foreign_mod.ExactCutoverIntent.ProviderIdentity,
     ) !BackfillSummary {
         try self.checkpointWork();
-        var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal);
+        var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer);
         defer parsed.deinit(self.alloc);
 
         var resolved_dsn = try secrets.resolveReferenceWithGenerationOwned(self.alloc, self.secret_store, parsed.dsn);
@@ -1205,6 +1210,7 @@ pub const StreamingReplicationRunner = struct {
     secret_store: ?*secrets.FileStore = null,
     batch_size: usize = 256,
     work_permit: ?WorkPermit = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 
     fn checkpointWork(self: *StreamingReplicationRunner) !void {
         if (self.work_permit) |permit| try permit.checkpoint();
@@ -1230,7 +1236,7 @@ pub const StreamingReplicationRunner = struct {
 
         return self.runTableSourceInner(status_sink, table, source_ordinal, snapshot_offset, cutover_mode, resume_checkpoint, existing_status, &progress_checkpoint) catch |err| {
             self.checkpointWork() catch return err;
-            var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal) catch return err;
+            var parsed = parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer) catch return err;
             defer parsed.deinit(self.alloc);
             const prior_failures = if (existing_status) |status|
                 if (std.mem.eql(u8, status.phase, "streaming_failed")) status.consecutive_failures else 0
@@ -1314,7 +1320,7 @@ pub const StreamingReplicationRunner = struct {
         progress_checkpoint: *std.ArrayListUnmanaged(u8),
     ) !StreamSummary {
         try self.checkpointWork();
-        var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal);
+        var parsed = try parseReplicationSourceConfig(self.alloc, table.name, table.replication_sources_json, source_ordinal, self.destination_authorizer);
         defer parsed.deinit(self.alloc);
 
         var resolved_dsn = try secrets.resolveReferenceWithGenerationOwned(self.alloc, self.secret_store, parsed.dsn);
@@ -1684,6 +1690,7 @@ fn parseReplicationSourceConfig(
     table_name: []const u8,
     replication_sources_json: []const u8,
     source_ordinal: u32,
+    destination_authorizer: ?stored_destination_authorization.Authorizer,
 ) !ParsedReplicationSourceConfig {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, replication_sources_json, .{});
     defer parsed.deinit();
@@ -1693,6 +1700,12 @@ fn parseReplicationSourceConfig(
 
     const source = parsed.value.array.items[source_ordinal];
     if (source != .object) return error.InvalidReplicationSourceConfig;
+    try stored_destination_authorization.authorizeReplicationSourceValue(
+        alloc,
+        source,
+        table_name,
+        destination_authorizer,
+    );
 
     const type_name = try parseRequiredStringFieldAlloc(alloc, source, "type");
     errdefer alloc.free(type_name);
@@ -4195,6 +4208,7 @@ test "metadata replication backfill routes matching snapshot rows to target tabl
         \\  "dsn":"postgres://db",
         \\  "postgres_table":"users",
         \\  "key_template":"id",
+        \\  "_antfly_destination_authorization_v1":{"principal":"service:auth-disabled","signature":"auth-disabled","destinations":["premium_users","free_users"]},
         \\  "routes":[
         \\    {
         \\      "target_table":"premium_users",
@@ -4235,6 +4249,7 @@ test "metadata replication source parser derives slot and publication names like
         "docs",
         "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"Users-Prod\",\"key_template\":\"id\"}]",
         0,
+        null,
     );
     defer parsed.deinit(alloc);
 
@@ -4252,6 +4267,7 @@ test "metadata replication source parser preserves explicit slot and publication
         "docs",
         "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"slot_name\":\"custom_slot\",\"publication_name\":\"custom_pub\",\"on_delete\":[{\"op\":\"$unset\",\"path\":\"name\"}]}]",
         0,
+        null,
     );
     defer parsed.deinit(alloc);
 
@@ -4268,6 +4284,7 @@ test "metadata exact cutover config ownership survives credential rotation" {
         "docs",
         "[{\"type\":\"postgres\",\"dsn\":\"postgres://alice:old-secret@db/app\",\"postgres_table\":\"users\",\"slot_name\":\"custom_slot\",\"publication_name\":\"custom_pub\"}]",
         0,
+        null,
     );
     defer before.deinit(alloc);
     var after = try parseReplicationSourceConfig(
@@ -4275,6 +4292,7 @@ test "metadata exact cutover config ownership survives credential rotation" {
         "docs",
         "[{\"type\":\"postgres\",\"dsn\":\"postgres://alice:new-secret@db/app\",\"postgres_table\":\"users\",\"slot_name\":\"custom_slot\",\"publication_name\":\"custom_pub\"}]",
         0,
+        null,
     );
     defer after.deinit(alloc);
 
@@ -4291,6 +4309,7 @@ test "metadata replication source parser accepts null optional fields" {
         "docs",
         "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"key_template\":null,\"slot_name\":null,\"publication_name\":null,\"on_update\":null,\"on_delete\":null,\"publication_filter\":null,\"routes\":null}]",
         0,
+        null,
     );
     defer parsed.deinit(alloc);
 
@@ -4314,6 +4333,7 @@ test "metadata replication source parser detects delete document op" {
         "docs",
         "[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\",\"on_delete\":[{\"op\":\"$delete_document\"}]}]",
         0,
+        null,
     );
     defer parsed.deinit(alloc);
 
@@ -5413,6 +5433,7 @@ test "metadata replication stream routes matching rows to target tables" {
         \\  "postgres_table":"users",
         \\  "key_template":"id",
         \\  "on_update":[{"op":"$set","path":"ignored","value":"true"}],
+        \\  "_antfly_destination_authorization_v1":{"principal":"service:auth-disabled","signature":"auth-disabled","destinations":["premium_users","free_users"]},
         \\  "routes":[
         \\    {
         \\      "target_table":"premium_users",

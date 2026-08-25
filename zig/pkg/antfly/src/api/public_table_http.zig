@@ -198,6 +198,7 @@ pub const TableApi = struct {
         RestoreDurabilityPending,
         RestoreDurabilityConfirmed,
         BackupIntegrityFailure,
+        RestoreDestinationReauthorizationRequired,
         InvalidBackupRequest,
         InternalFailure,
     };
@@ -1592,6 +1593,10 @@ pub fn handleTableRestore(
         error.RestoreDurabilityPending => return .{ .status = 202, .body = try backups_api.encodeRestoreDurabilityPending(alloc), .json = true },
         error.RestoreDurabilityConfirmed => return .{ .status = 200, .body = try backups_api.encodeRestoreDurabilityConfirmed(alloc), .json = true },
         error.BackupIntegrityFailure => return .{ .status = 422, .body = try alloc.dupe(u8, backups_api.integrity_failure_message) },
+        error.RestoreDestinationReauthorizationRequired => return .{
+            .status = 409,
+            .body = try alloc.dupe(u8, "restore was queued before destination authorization was recorded; resubmit it to reauthorize CDC and graph destinations"),
+        },
         error.InvalidBackupRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };

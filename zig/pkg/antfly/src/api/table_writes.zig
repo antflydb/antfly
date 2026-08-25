@@ -59,6 +59,7 @@ const coverage_policy_mod = @import("coverage_policy.zig");
 const query_api = @import("query.zig");
 const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
+const stored_destination_authorization = @import("stored_destination_authorization.zig");
 
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
@@ -5474,6 +5475,7 @@ pub const ProvisionedTableWriteSource = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     restore_open_options: backups_api.OpenOptions = .{},
     remote_content: ?*const scraping.RemoteContentConfig = null,
     resolution_candidate_source: ?db_mod.CandidateSource = null,
@@ -5847,6 +5849,14 @@ pub const ProvisionedTableWriteSource = struct {
         self.restore_open_options.secret_store = secret_store;
         if (self.write_cache) |cache| cache.secret_store = secret_store;
         if (self.startup_write_cache) |cache| cache.secret_store = secret_store;
+        return self;
+    }
+
+    pub fn withDestinationAuthorization(
+        self: *ProvisionedTableWriteSource,
+        authorizer: ?stored_destination_authorization.Authorizer,
+    ) *ProvisionedTableWriteSource {
+        self.destination_authorizer = authorizer;
         return self;
     }
 
@@ -8307,6 +8317,8 @@ pub const ProvisionedTableWriteSource = struct {
             const effective_ha_mirror = haMirrorForManagedDbOpenMode(mode, self.ha_async_mirror);
             var effective_open_options = managed_open_options;
             effective_open_options.drain_resolver_backfill = false;
+            effective_open_options.source_table = table_name;
+            effective_open_options.destination_authorizer = self.destination_authorizer;
             effective_open_options.inference_api_url = self.inference_api_url;
             effective_open_options.ha_write_gate = self.ha_write_gate;
             effective_open_options.ha_async_effect_mirror = effective_ha_mirror;
@@ -8960,6 +8972,7 @@ pub const ProvisionedTableWriteSource = struct {
             .{
                 .backend_runtime = backend_runtime,
                 .restore_open_options = self.restore_open_options,
+                .destination_authorizer = self.destination_authorizer,
             },
         );
 
@@ -12007,7 +12020,11 @@ pub const ProvisionedTableWriteSource = struct {
                 alloc,
                 cached.db,
                 indexes_json,
-                .{ .drain_resolver_backfill = false },
+                .{
+                    .drain_resolver_backfill = false,
+                    .source_table = table_name,
+                    .destination_authorizer = self.destination_authorizer,
+                },
             );
             try self.repairRestoredDbRuntimeStateBlocking(alloc, cached.db, group_id, 0);
 
@@ -12733,6 +12750,8 @@ pub const ProvisionedTableWriteSource = struct {
                 else
                     try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                         .drain_resolver_backfill = false,
+                        .source_table = table_name,
+                        .destination_authorizer = self.destination_authorizer,
                     });
                 if (reconcile_summary.indexes_pending != 0) {
                     _ = try cached.db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
@@ -12923,6 +12942,8 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
                     .drain_resolver_backfill = false,
+                    .source_table = table_name,
+                    .destination_authorizer = self.destination_authorizer,
                 });
             if (reconcile_summary.indexes_pending != 0) {
                 _ = try db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
@@ -13516,6 +13537,8 @@ pub const ProvisionedTableWriteSource = struct {
                     );
                     _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                         .drain_resolver_backfill = false,
+                        .source_table = table_name,
+                        .destination_authorizer = self.destination_authorizer,
                     });
                     cached_groups.appendAssumeCapacity(cached);
                 }
@@ -13616,6 +13639,8 @@ pub const ProvisionedTableWriteSource = struct {
             // names that already exist on reopen).
             _ = try metadata_table_provisioner.ensureResolversWithOptions(alloc, &opened.?, indexes_json, .{
                 .drain_backfill = false,
+                .source_table = table_name,
+                .destination_authorizer = self.destination_authorizer,
             });
             if (seed_create_table_writer) {
                 try self.write_cache.?.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
@@ -16775,6 +16800,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     foreground_derived_progress: bool = false,
 
     pub fn init(
@@ -16818,6 +16844,14 @@ pub const HostedProvisionedTableWriteSource = struct {
         if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
             cache.write_cache.inference_api_url = inference_api_url;
         }
+        return self;
+    }
+
+    pub fn withDestinationAuthorization(
+        self: *HostedProvisionedTableWriteSource,
+        authorizer: ?stored_destination_authorization.Authorizer,
+    ) *HostedProvisionedTableWriteSource {
+        self.destination_authorizer = authorizer;
         return self;
     }
 
@@ -17037,6 +17071,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .drain_resolver_backfill = false,
+                    .source_table = table_name,
+                    .destination_authorizer = self.destination_authorizer,
                     .inference_api_url = cache.write_cache.inference_api_url,
                     .ha_write_gate = cache.write_cache.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
@@ -20799,6 +20835,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
 
 const ManagedDbOpenOptions = struct {
     drain_resolver_backfill: bool = true,
+    source_table: []const u8 = "",
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     /// HA replay must reconcile catalog-driven indexes while the node remains a
     /// read-only standby. Perform that structural reconciliation in an isolated
     /// workerless open, then reopen with the live HA gate before publishing the
@@ -21287,6 +21325,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     else
         try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
             .drain_resolver_backfill = options.drain_resolver_backfill,
+            .source_table = options.source_table,
+            .destination_authorizer = options.destination_authorizer,
         });
     if (summary.indexManagerCatalogChanged() or options.reconcile_for_replicated_apply) {
         // First-open provisioning can mutate the live index manager. Reopen so

@@ -2961,6 +2961,7 @@ pub fn build(b: *std.Build) void {
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
+            "failed destination authorization refresh reuses the idempotent restore job",
             "delayed replicated restore refresh cannot regress a running job",
             "restore job store is idempotent and fenced",
             "restore idempotency keys are scoped by principal and resource",
@@ -5445,6 +5446,15 @@ pub fn build(b: *std.Build) void {
         "query builder runtime preflight injects mandatory row filter",
         "MCP document sampling pushes mandatory row filters into storage scans",
         "usermgr api key permission intersection narrows owner and key wildcards",
+        "stored destination admission requires write permission on every eventual sink",
+        "stored destination envelopes cannot be forged and validate on resume",
+        "stored destination grants bind credential source and live permissions",
+        "legacy restore jobs resume only when backed-up definitions are sink free",
+        "failed destination authorization refresh reuses the idempotent restore job",
+        "destination authorization adoption requires source table admin",
+        "legacy stored destinations can be adopted idempotently",
+        "api http server cluster restore",
+        "cluster restore repository errors preserve operational failure semantics",
     };
     const authorization_sink_tests = b.addTest(.{
         .root_module = lib_test_mod,

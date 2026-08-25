@@ -1012,6 +1012,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/destination-authorization": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table whose stored destinations should be adopted */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Adopt stored write destinations with the current credential
+         * @description Reauthorizes the table's existing CDC routes and graph resolver destinations
+         *     using the caller's current permissions. This idempotent operation is intended
+         *     for upgrading tables created before durable destination authorization was
+         *     introduced, and for explicitly transferring destination ownership after a
+         *     credential is rotated. The caller needs admin permission on the source table
+         *     and write permission on every eventual destination table.
+         */
+        post: operations["reauthorizeTableDestinations"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/schema": {
         parameters: {
             query?: never;
@@ -15521,6 +15549,15 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             409: components["responses"]["Conflict"];
+            /** @description The selected backup contains durable destinations that cannot be bound to this credential type */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
         };
@@ -15893,6 +15930,15 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            /** @description Durable destinations cannot be bound to this credential type */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     dropTable: {
@@ -16116,8 +16162,66 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             409: components["responses"]["Conflict"];
+            /** @description The backup contains durable destinations that cannot be bound to this credential type */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    reauthorizeTableDestinations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table whose stored destinations should be adopted */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Destination authorization was durably adopted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        table: string;
+                        /** @enum {string} */
+                        status: "authorized";
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Caller lacks authority on the source or a destination table */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            /** @description Durable destinations cannot be bound to this credential type */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
         };
     };
     updateSchema: {
@@ -16894,6 +16998,15 @@ export interface operations {
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["Conflict"];
+            /** @description Graph resolver destinations cannot be bound to this credential type */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             429: components["responses"]["StorageResourceExhausted"];
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
