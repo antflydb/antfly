@@ -32247,7 +32247,7 @@ test "api http server serves table create and drop" {
             try std.testing.expectEqualStrings("docs table", req.description.?);
             try std.testing.expect(req.schema_json == null);
             try std.testing.expect(try indexes_api.equivalentIndexConfigJson(std.testing.allocator, tables_api.default_indexes_json, req.indexes_json.?));
-            try std.testing.expect(req.replication_sources_json == null);
+            try std.testing.expectEqualStrings("[]", req.replication_sources_json.?);
             self.created = true;
             self.replaceIndexesJson(inner_alloc, try inner_alloc.dupe(u8, req.indexes_json.?), true);
         }
