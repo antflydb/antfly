@@ -3803,6 +3803,8 @@ pub fn build(b: *std.Build) void {
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "table contract admits and preserves multi-source index requests",
+        "table contract rejects malformed multi-source members",
         "created index configs normalize single-source input forms",
         "created graph index response projects closed nested schemas",
         "index encoders expose graph artifact source materialization status",
@@ -7665,6 +7667,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.document_mapper.",
             "storage.db.document_query.",
             "storage.db.generation_lifecycle.",
+            "storage.db.graph_asset_state.",
             "storage.db.lease.",
             "storage.db.mod.",
             "storage.db.ownership.",

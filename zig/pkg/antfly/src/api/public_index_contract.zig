@@ -14,6 +14,8 @@
 
 const std = @import("std");
 
+pub const max_artifact_sources = 64;
+
 /// Public index kinds shared by request admission and response projection.
 /// Keeping the field contract here prevents a field accepted on write from
 /// being accidentally omitted on read, or an engine-owned field from leaking.
@@ -273,6 +275,7 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
         std.mem.eql(u8, field, "description")) return isString(value);
     if (std.mem.eql(u8, field, "version")) return isInteger(value);
     if (std.mem.eql(u8, field, "enrichments")) return value == .array;
+    if (std.mem.eql(u8, field, "sources")) return value == .array;
 
     return switch (kind) {
         .full_text => if (std.mem.eql(u8, field, "mem_only"))

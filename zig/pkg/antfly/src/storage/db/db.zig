@@ -16714,7 +16714,7 @@ pub const DB = struct {
                 var state_key_owned = true;
                 errdefer if (state_key_owned) self.alloc.free(state_key);
 
-                if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
+                if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key, graph_entry.config.coverage_generation)) |previous_keys| {
                     defer freeOwnedConstKeySlice(self.alloc, previous_keys);
                     for (previous_keys) |previous_key| {
                         if (containsDeleteKey(deletes.items, previous_key)) continue;
@@ -16738,7 +16738,7 @@ pub const DB = struct {
                 var mention_state_key_owned = true;
                 errdefer if (mention_state_key_owned) self.alloc.free(mention_state_key);
 
-                if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, mention_state_key)) |previous_keys| {
+                if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, mention_state_key, graph_entry.config.coverage_generation)) |previous_keys| {
                     defer freeOwnedConstKeySlice(self.alloc, previous_keys);
                     for (previous_keys) |previous_key| {
                         if (containsDeleteKey(deletes.items, previous_key)) continue;
@@ -30600,12 +30600,18 @@ fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []c
     return try graph_asset_state.encodeAlloc(alloc, generation, writes);
 }
 
-fn loadGraphAssetStateKeysAlloc(alloc: Allocator, store: *docstore_mod.DocStore, state_key: []const u8) !?[][]const u8 {
+fn loadGraphAssetStateKeysAlloc(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    state_key: []const u8,
+    expected_generation: u64,
+) !?[][]const u8 {
     const raw = store.get(alloc, state_key) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
     defer alloc.free(raw);
+    if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return null;
     const entries = try graph_asset_state.decodeAlloc(alloc, raw);
     defer graph_asset_state.freeEntries(alloc, entries);
     const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};
@@ -30657,7 +30663,9 @@ fn addGraphStateManifest(
     state_key: []const u8,
     source_priority: usize,
     raw: []const u8,
+    expected_generation: u64,
 ) !void {
+    if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return;
     const entries = try graph_asset_state.decodeAlloc(alloc, raw);
     defer graph_asset_state.freeEntries(alloc, entries);
     for (entries) |entry| {
@@ -30727,12 +30735,13 @@ fn loadGraphEdgeWinners(
     current_state_value: []const u8,
     pending_writes: []const docstore_mod.KVPair,
     sources: []const index_manager_mod.GraphArtifactSource,
+    expected_generation: u64,
 ) !GraphEdgeWinners {
     var overrides = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer overrides.deinit(alloc);
     try overrides.append(alloc, .{ .key = current_state_key, .value = current_state_value });
     try overrides.appendSlice(alloc, pending_writes);
-    return try loadGraphEdgeWinnersWithOverrides(alloc, store, doc_key, index_name, overrides.items, sources);
+    return try loadGraphEdgeWinnersWithOverrides(alloc, store, doc_key, index_name, overrides.items, sources, expected_generation);
 }
 
 fn loadGraphEdgeWinnersWithOverrides(
@@ -30742,6 +30751,7 @@ fn loadGraphEdgeWinnersWithOverrides(
     index_name: []const u8,
     state_overrides: []const docstore_mod.KVPair,
     sources: []const index_manager_mod.GraphArtifactSource,
+    expected_generation: u64,
 ) !GraphEdgeWinners {
     var winners = GraphEdgeWinners{};
     errdefer winners.deinit(alloc);
@@ -30759,13 +30769,13 @@ fn loadGraphEdgeWinnersWithOverrides(
             _ = override_values.remove(entry.key);
         }
         const source_priority = try graphStateSourcePriorityAlloc(alloc, entry.key, prefix, sources) orelse continue;
-        try addGraphStateManifest(alloc, &winners, entry.key, source_priority, raw);
+        try addGraphStateManifest(alloc, &winners, entry.key, source_priority, raw, expected_generation);
     }
     var override_it = override_values.iterator();
     while (override_it.next()) |override| {
         if (!std.mem.startsWith(u8, override.key_ptr.*, prefix)) continue;
         const source_priority = try graphStateSourcePriorityAlloc(alloc, override.key_ptr.*, prefix, sources) orelse continue;
-        try addGraphStateManifest(alloc, &winners, override.key_ptr.*, source_priority, override.value_ptr.*);
+        try addGraphStateManifest(alloc, &winners, override.key_ptr.*, source_priority, override.value_ptr.*, expected_generation);
     }
     return winners;
 }
@@ -32771,6 +32781,7 @@ const PrecomputedGraphReconcileGroup = struct {
     doc_key: []const u8,
     index_name: []const u8,
     sources: []const index_manager_mod.GraphArtifactSource,
+    generation: u64,
     updates: std.ArrayListUnmanaged(PrecomputedGraphStateUpdate) = .empty,
 };
 
@@ -32881,7 +32892,7 @@ fn preparePrecomputedGraphSourceArtifactMutation(
 
         const state_name = try graphArtifactStateNameAlloc(scratch, artifact_ref);
         const state_key = try graphAssetStateKeyAlloc(scratch, artifact_ref.document_id, graph_entry.config.name, state_name);
-        const previous_keys = try loadGraphAssetStateKeysAlloc(scratch, self.core.store, state_key);
+        const previous_keys = try loadGraphAssetStateKeysAlloc(scratch, self.core.store, state_key, graph_entry.config.coverage_generation);
         if (previous_keys == null and self.core.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(scratch, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(scratch, protected_keys);
@@ -32904,6 +32915,7 @@ fn preparePrecomputedGraphSourceArtifactMutation(
                 .doc_key = try scratch.dupe(u8, artifact_ref.document_id),
                 .index_name = graph_entry.config.name,
                 .sources = self.core.index_manager.graphArtifactSources(graph_entry.config.name),
+                .generation = graph_entry.config.coverage_generation,
             });
             try group_positions.put(scratch, group_key, position);
             break :blk position;
@@ -32942,7 +32954,7 @@ fn reconcilePrecomputedGraphGroup(
         }
     }
 
-    var winners = try loadGraphEdgeWinnersWithOverrides(scratch, self.core.store, group.doc_key, group.index_name, overrides, group.sources);
+    var winners = try loadGraphEdgeWinnersWithOverrides(scratch, self.core.store, group.doc_key, group.index_name, overrides, group.sources, group.generation);
     defer winners.deinit(scratch);
     for (affected.items) |edge_key| {
         try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, edge_key);
@@ -39167,6 +39179,9 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                     .sequence = batch.sequence,
                 });
                 defer graph_mutations.deinit();
+                if (graph_mutations.generation_bindings.len > 0) {
+                    try ctx.store.putBatch(graph_mutations.generation_bindings, &.{});
+                }
                 try ctx.index_manager.applyGraphMutationsByName(index_ref.name, graph_mutations.writes, graph_mutations.deletes);
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.graph_apply_ns, apply_start_ns);
@@ -40483,7 +40498,7 @@ fn materializeGraphSourceArtifactsForIndex(
         defer alloc.free(state_name);
         const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, state_name);
         defer alloc.free(state_key);
-        const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key);
+        const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key, generation);
         defer if (previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
         if (previous_keys == null and sources.len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
@@ -40502,7 +40517,7 @@ fn materializeGraphSourceArtifactsForIndex(
         const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
         var state_value_owned = true;
         defer if (state_value_owned) alloc.free(state_value);
-        var winners = try loadGraphEdgeWinners(alloc, store, artifact_ref.document_id, index_name, state_key, state_value, &.{}, sources);
+        var winners = try loadGraphEdgeWinners(alloc, store, artifact_ref.document_id, index_name, state_key, state_value, &.{}, sources, generation);
         defer winners.deinit(alloc);
         var affected = std.ArrayListUnmanaged([]u8).empty;
         defer {
@@ -40630,13 +40645,13 @@ fn materializeMentionEdgesForResolutionKey(
         );
     }
 
-    const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key);
+    const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key, generation);
     defer if (previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
     const graph_write_count = writes.items.len;
     const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
     var state_value_owned = true;
     defer if (state_value_owned) alloc.free(state_value);
-    var winners = try loadGraphEdgeWinners(alloc, store, parsed_key.doc_key, index_name, state_key, state_value, &.{}, index_manager.graphArtifactSources(index_name));
+    var winners = try loadGraphEdgeWinners(alloc, store, parsed_key.doc_key, index_name, state_key, state_value, &.{}, index_manager.graphArtifactSources(index_name), generation);
     defer winners.deinit(alloc);
     var affected = std.ArrayListUnmanaged([]u8).empty;
     defer {
@@ -40664,7 +40679,7 @@ fn materializeMentionEdgesForResolutionKey(
     defer alloc.free(mention_state_name);
     const mention_state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, mention_state_name);
     defer alloc.free(mention_state_key);
-    if (try loadGraphAssetStateKeysAlloc(alloc, store, mention_state_key)) |previous_mention_keys| {
+    if (try loadGraphAssetStateKeysAlloc(alloc, store, mention_state_key, generation)) |previous_mention_keys| {
         defer freeOwnedConstKeySlice(alloc, previous_mention_keys);
         for (previous_mention_keys) |previous_key| {
             if (containsStoreWriteKey(mention_writes.items, previous_key)) continue;
@@ -40775,6 +40790,7 @@ fn resolutionMentionStateKeysForGraphSourceAlloc(
     source: index_manager_mod.GraphArtifactSource,
 ) ![][]const u8 {
     if (source.mention_edge_type.len == 0) return try alloc.alloc([]const u8, 0);
+    const generation = (index_manager.graphIndex(index_name) orelse return error.IndexNotFound).config.coverage_generation;
 
     var protected = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -40790,7 +40806,7 @@ fn resolutionMentionStateKeysForGraphSourceAlloc(
         const state_key = try graphAssetStateKeyAlloc(alloc, doc_key, index_name, state_name);
         defer alloc.free(state_key);
 
-        const state_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key) orelse continue;
+        const state_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key, generation) orelse continue;
         defer freeOwnedConstKeySlice(alloc, state_keys);
         for (state_keys) |key| {
             try protected.append(alloc, try alloc.dupe(u8, key));
@@ -41496,6 +41512,7 @@ const OwnedGraphMutations = struct {
     alloc: Allocator,
     writes: []types.GraphEdgeWrite = &.{},
     deletes: []types.GraphEdgeDelete = &.{},
+    generation_bindings: []docstore_mod.KVPair = &.{},
 
     fn deinit(self: *OwnedGraphMutations) void {
         for (self.writes) |write| {
@@ -41514,6 +41531,12 @@ const OwnedGraphMutations = struct {
             self.alloc.free(@constCast(delete.edge_type));
         }
         if (self.deletes.len > 0) self.alloc.free(self.deletes);
+
+        for (self.generation_bindings) |binding| {
+            self.alloc.free(@constCast(binding.key));
+            self.alloc.free(@constCast(binding.value));
+        }
+        if (self.generation_bindings.len > 0) self.alloc.free(self.generation_bindings);
         self.* = undefined;
     }
 };
@@ -41551,6 +41574,14 @@ fn collectGraphMutationsForArtifacts(
             alloc.free(@constCast(delete.edge_type));
         }
         deletes.deinit(alloc);
+    }
+    var generation_bindings = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    errdefer {
+        for (generation_bindings.items) |binding| {
+            alloc.free(@constCast(binding.key));
+            alloc.free(@constCast(binding.value));
+        }
+        generation_bindings.deinit(alloc);
     }
 
     var txn = try store.beginReadTxn();
@@ -41596,9 +41627,8 @@ fn collectGraphMutationsForArtifacts(
                     return err;
                 },
             };
-            if (decoded.generation != options.expected_generation and
-                !enrichment_artifact_codec.isPortableUnboundGraphEdge(value))
-            {
+            const portable_unbound = enrichment_artifact_codec.isPortableUnboundGraphEdge(value);
+            if (decoded.generation != options.expected_generation and !portable_unbound) {
                 decoded.deinit(alloc);
                 try deletes.append(alloc, .{
                     .index_name = try alloc.dupe(u8, parsed.index_name),
@@ -41607,6 +41637,17 @@ fn collectGraphMutationsForArtifacts(
                     .edge_type = try alloc.dupe(u8, parsed.edge_type),
                 });
                 continue;
+            }
+            if (portable_unbound) {
+                const bound_value = try enrichment_artifact_codec.bindPortableGraphEdgeGenerationAlloc(
+                    alloc,
+                    value,
+                    options.expected_generation,
+                );
+                errdefer alloc.free(bound_value);
+                const bound_key = try alloc.dupe(u8, artifact_key);
+                errdefer alloc.free(bound_key);
+                try generation_bindings.append(alloc, .{ .key = bound_key, .value = bound_value });
             }
             errdefer decoded.deinit(alloc);
             try writes.append(alloc, .{
@@ -41635,6 +41676,7 @@ fn collectGraphMutationsForArtifacts(
         .alloc = alloc,
         .writes = try writes.toOwnedSlice(alloc),
         .deletes = try deletes.toOwnedSlice(alloc),
+        .generation_bindings = try generation_bindings.toOwnedSlice(alloc),
     };
 }
 
@@ -42742,6 +42784,9 @@ fn applySplitGraphArtifactsForIndex(
     );
     defer graph_mutations.deinit();
     const mutation_count = graph_mutations.writes.len + graph_mutations.deletes.len;
+    if (graph_mutations.generation_bindings.len > 0) {
+        try dest_store.putBatch(graph_mutations.generation_bindings, &.{});
+    }
     try dest_indexes.applyGraphMutationsByName(index_name, graph_mutations.writes, graph_mutations.deletes);
     return mutation_count;
 }
@@ -42832,6 +42877,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
         batch_size: usize,
         expected_generation: u64,
         writes: std.ArrayListUnmanaged(types.GraphEdgeWrite) = .empty,
+        generation_bindings: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty,
         mutation_count: usize = 0,
 
         fn freeWrites(state: *@This()) void {
@@ -42845,17 +42891,31 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
             state.writes.clearRetainingCapacity();
         }
 
+        fn freeGenerationBindings(state: *@This()) void {
+            for (state.generation_bindings.items) |binding| {
+                state.ctx.alloc.free(@constCast(binding.key));
+                state.ctx.alloc.free(@constCast(binding.value));
+            }
+            state.generation_bindings.clearRetainingCapacity();
+        }
+
         fn deinit(state: *@This()) void {
             state.freeWrites();
             state.writes.deinit(state.ctx.alloc);
+            state.freeGenerationBindings();
+            state.generation_bindings.deinit(state.ctx.alloc);
         }
 
         fn flush(state: *@This()) !void {
             try checkAsyncRepairCancelled(state.ctx);
-            if (state.writes.items.len == 0) return;
+            if (state.writes.items.len == 0 and state.generation_bindings.items.len == 0) return;
             try checkAsyncRepairCapacityBoundary(state.ctx);
             if (comptime builtin.is_test) {
                 _ = test_graph_repair_stream_flushes.fetchAdd(1, .monotonic);
+            }
+            if (state.generation_bindings.items.len > 0) {
+                try state.ctx.store.putBatch(state.generation_bindings.items, &.{});
+                state.freeGenerationBindings();
             }
             try state.ctx.index_manager.applyGraphMutationsByName(state.index_name, state.writes.items, &.{});
             state.mutation_count += state.writes.items.len;
@@ -42897,11 +42957,21 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                     return .@"continue";
                 },
             };
-            if (decoded.generation != state.expected_generation and
-                !enrichment_artifact_codec.isPortableUnboundGraphEdge(value))
-            {
+            const portable_unbound = enrichment_artifact_codec.isPortableUnboundGraphEdge(value);
+            if (decoded.generation != state.expected_generation and !portable_unbound) {
                 decoded.deinit(state.ctx.alloc);
                 return .@"continue";
+            }
+            if (portable_unbound) {
+                const bound_value = try enrichment_artifact_codec.bindPortableGraphEdgeGenerationAlloc(
+                    state.ctx.alloc,
+                    value,
+                    state.expected_generation,
+                );
+                errdefer state.ctx.alloc.free(bound_value);
+                const bound_key = try state.ctx.alloc.dupe(u8, key);
+                errdefer state.ctx.alloc.free(bound_key);
+                try state.generation_bindings.append(state.ctx.alloc, .{ .key = bound_key, .value = bound_value });
             }
             errdefer decoded.deinit(state.ctx.alloc);
             try state.writes.append(state.ctx.alloc, .{
@@ -51454,6 +51524,26 @@ test "db lsm generated chunked enrichment publishes replay stream state" {
     try std.testing.expect(result.total_hits > 0);
 }
 
+test "graph state winner arbitration ignores stale index generations" {
+    const alloc = std.testing.allocator;
+    const stale = try encodeGraphAssetStateKeysAlloc(alloc, 41, &.{
+        docstore_mod.KVPair{ .key = "edge:a", .value = "stale" },
+    });
+    defer alloc.free(stale);
+    const current = try encodeGraphAssetStateKeysAlloc(alloc, 42, &.{
+        docstore_mod.KVPair{ .key = "edge:a", .value = "current" },
+    });
+    defer alloc.free(current);
+
+    var winners = GraphEdgeWinners{};
+    defer winners.deinit(alloc);
+    try addGraphStateManifest(alloc, &winners, "state:stale", 0, stale, 42);
+    try std.testing.expectEqual(@as(usize, 0), winners.map.count());
+
+    try addGraphStateManifest(alloc, &winners, "state:current", 1, current, 42);
+    try std.testing.expectEqualStrings("current", winners.map.get("edge:a").?.payload);
+}
+
 test "db direct graph writes record graph artifacts in the replay stream instead of graph payload replay" {
     const alloc = std.testing.allocator;
 
@@ -53814,8 +53904,7 @@ test "db graph edge artifact replay catches up after reopen" {
 
         const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
         defer alloc.free(graph_key);
-        const graph_generation = db.core.index_manager.graphIndex("relations_graph").?.config.coverage_generation;
-        const graph_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, graph_generation, 0.8, 0, 0, "");
+        const graph_value = try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(alloc, 0.8, 0, 0, "");
         defer alloc.free(graph_value);
         var ctx = db.batchContext();
         const sequence = db.core.store.reserveNextReplaySequence(1);
@@ -53841,6 +53930,28 @@ test "db graph edge artifact replay catches up after reopen" {
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
     try std.testing.expectApproxEqAbs(@as(f64, 0.8), edges[0].weight, 0.0001);
+
+    const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(graph_key);
+    const bound_value = try reopened.core.store.get(alloc, graph_key);
+    defer alloc.free(bound_value);
+    try std.testing.expect(!enrichment_artifact_codec.isPortableUnboundGraphEdge(bound_value));
+    const graph_generation = reopened.core.index_manager.graphIndex("relations_graph").?.config.coverage_generation;
+    var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, bound_value);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(graph_generation, decoded.generation);
+
+    var recreated_generation = try collectGraphMutationsForArtifacts(
+        alloc,
+        reopened.core.store,
+        &.{graph_key},
+        "relations_graph",
+        .{ .expected_generation = graph_generation + 1 },
+    );
+    defer recreated_generation.deinit();
+    try std.testing.expectEqual(@as(usize, 0), recreated_generation.writes.len);
+    try std.testing.expectEqual(@as(usize, 1), recreated_generation.deletes.len);
+    try std.testing.expectEqual(@as(usize, 0), recreated_generation.generation_bindings.len);
 }
 
 test "db query_readonly opens empty declared graph index" {

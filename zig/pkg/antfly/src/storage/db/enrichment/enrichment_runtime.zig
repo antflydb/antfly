@@ -7373,7 +7373,7 @@ fn materializeGraphAssetForRuntime(
 
         const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, artifact_name);
         defer runtime.alloc.free(state_key);
-        const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key);
+        const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key, graph_entry.config.coverage_generation);
         defer if (previous_keys) |keys| freeOwnedConstKeySlice(runtime.alloc, keys);
         if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
@@ -7444,7 +7444,7 @@ fn materializeGraphAssetDeleteForRuntime(
 
         const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, artifact_name);
         defer runtime.alloc.free(state_key);
-        const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key);
+        const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key, graph_entry.config.coverage_generation);
         defer if (previous_keys) |keys| freeOwnedConstKeySlice(runtime.alloc, keys);
         if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
@@ -7561,7 +7561,9 @@ fn runtimeAddGraphStateManifest(
     state_key: []const u8,
     source_priority: usize,
     raw: []const u8,
+    expected_generation: u64,
 ) !void {
+    if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return;
     const entries = try graph_asset_state.decodeAlloc(alloc, raw);
     defer graph_asset_state.freeEntries(alloc, entries);
     for (entries) |entry| {
@@ -7616,6 +7618,7 @@ fn runtimeLoadGraphEdgeWinners(
     errdefer winners.deinit(runtime.alloc);
     const prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(runtime.alloc, doc_key, index_name);
     defer runtime.alloc.free(prefix);
+    const expected_generation = (runtime.index_manager.graphIndex(index_name) orelse return error.IndexNotFound).config.coverage_generation;
     const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
     defer backend_scan.freeResults(runtime.alloc, existing);
     var saw_current = false;
@@ -7624,9 +7627,9 @@ fn runtimeLoadGraphEdgeWinners(
             saw_current = true;
             break :blk current_state_value;
         } else entry.value;
-        try runtimeAddGraphStateManifest(runtime.alloc, &winners, entry.key, try runtimeGraphStateSourcePriorityAlloc(runtime, entry.key, prefix, index_name), raw);
+        try runtimeAddGraphStateManifest(runtime.alloc, &winners, entry.key, try runtimeGraphStateSourcePriorityAlloc(runtime, entry.key, prefix, index_name), raw, expected_generation);
     }
-    if (!saw_current) try runtimeAddGraphStateManifest(runtime.alloc, &winners, current_state_key, try runtimeGraphStateSourcePriorityAlloc(runtime, current_state_key, prefix, index_name), current_state_value);
+    if (!saw_current) try runtimeAddGraphStateManifest(runtime.alloc, &winners, current_state_key, try runtimeGraphStateSourcePriorityAlloc(runtime, current_state_key, prefix, index_name), current_state_value, expected_generation);
     return winners;
 }
 
@@ -11490,6 +11493,7 @@ fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
     source: index_manager_mod.GraphArtifactSource,
 ) ![][]const u8 {
     if (source.mention_edge_type.len == 0) return try runtime.alloc.alloc([]const u8, 0);
+    const generation = (runtime.index_manager.graphIndex(index_name) orelse return error.IndexNotFound).config.coverage_generation;
 
     var protected = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -11505,7 +11509,7 @@ fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
         const state_key = try graphAssetStateKeyAlloc(runtime.alloc, doc_key, index_name, state_name);
         defer runtime.alloc.free(state_key);
 
-        const state_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key) orelse continue;
+        const state_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key, generation) orelse continue;
         defer freeOwnedConstKeySlice(runtime.alloc, state_keys);
         for (state_keys) |key| {
             try protected.append(runtime.alloc, try runtime.alloc.dupe(u8, key));
@@ -11519,13 +11523,14 @@ fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []c
     return try graph_asset_state.encodeAlloc(alloc, generation, writes);
 }
 
-fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8) !?[][]const u8 {
+fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8, expected_generation: u64) !?[][]const u8 {
     const alloc = runtime.alloc;
     const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return null,
     };
     defer alloc.free(raw);
+    if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return null;
     const entries = try graph_asset_state.decodeAlloc(alloc, raw);
     defer graph_asset_state.freeEntries(alloc, entries);
     const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};

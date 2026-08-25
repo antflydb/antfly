@@ -1528,7 +1528,17 @@ fn importEdgeBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !voi
 
 fn graphArtifactValueFromPortableEdgeValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
     if (enrichment_artifact_codec.decodeHeader(value)) |header| {
-        if (header.kind == .graph_edge) return try alloc.dupe(u8, value);
+        if (header.kind == .graph_edge) {
+            var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, value);
+            defer decoded.deinit(alloc);
+            return try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(
+                alloc,
+                decoded.weight,
+                decoded.created_at,
+                decoded.updated_at,
+                decoded.metadata_json,
+            );
+        }
     } else |_| {}
 
     if (value.len >= 24) {
@@ -2351,6 +2361,8 @@ test "export and import graph edge artifacts round trip with arbitrary ids" {
         defer alloc.free(val);
         var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, val);
         defer decoded.deinit(alloc);
+        try std.testing.expect(enrichment_artifact_codec.isPortableUnboundGraphEdge(val));
+        try std.testing.expectEqual(@as(u64, 0), decoded.generation);
         try std.testing.expectApproxEqAbs(@as(f64, 2.5), decoded.weight, 0.001);
         try std.testing.expectEqual(@as(u64, 11), decoded.created_at);
         try std.testing.expectEqual(@as(u64, 22), decoded.updated_at);

@@ -80,6 +80,7 @@ comptime {
     _ = @import("db/enrichment/enrichment_worker.zig");
     _ = @import("db/enrichment/utf8_text.zig");
     _ = @import("db/generation_lifecycle.zig");
+    _ = @import("db/graph_asset_state.zig");
     _ = @import("db/lease.zig");
     _ = @import("db/maintenance/transaction_runtime.zig");
     _ = @import("db/maintenance/ttl_runtime.zig");

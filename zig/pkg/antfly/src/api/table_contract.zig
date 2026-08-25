@@ -406,6 +406,13 @@ fn validatePublicIndexObject(object: anytype) !void {
 
 fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_contract.Kind) !void {
     const Object = @TypeOf(object);
+    const sources = if (@hasField(Object, "map")) object.map.get("sources") else object.get("sources");
+    if (sources) |value| {
+        if (value != .null) try validatePublicArtifactSources(
+            value,
+            if (index_type == .graph) .graph_sources else .artifact_sources,
+        );
+    }
     if (index_type == .embeddings) {
         const chunker = if (@hasField(Object, "map")) object.map.get("chunker") else object.get("chunker");
         if (chunker) |value| {
@@ -450,6 +457,20 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
     const resolvers = if (@hasField(Object, "map")) object.map.get("resolvers") else object.get("resolvers");
     if (resolvers) |value| {
         if (value != .null) try validatePublicCreatedShape(value, .graph_resolvers);
+    }
+}
+
+fn validatePublicArtifactSources(value: std.json.Value, shape: public_index_contract.CreatedObjectShape) !void {
+    try validatePublicCreatedShape(value, shape);
+    if (value.array.items.len == 0 or value.array.items.len > public_index_contract.max_artifact_sources)
+        return error.InvalidCreateIndexRequest;
+
+    for (value.array.items, 0..) |source, i| {
+        const artifact = source.object.get("artifact").?.string;
+        for (value.array.items[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.object.get("artifact").?.string, artifact))
+                return error.InvalidCreateIndexRequest;
+        }
     }
 }
 
@@ -930,6 +951,56 @@ test "table contract preserves embeddings create request fields" {
         "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":384}",
         config_json,
     );
+}
+
+test "table contract admits and preserves multi-source index requests" {
+    const cases = [_]struct {
+        name: []const u8,
+        body: []const u8,
+        expected_sources: []const u8,
+    }{
+        .{
+            .name = "document_text",
+            .body = "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"document_units_v1\"},{\"artifact\":\"document_chunks_v1\"}]}",
+            .expected_sources = "\"sources\":[{\"artifact\":\"document_units_v1\"},{\"artifact\":\"document_chunks_v1\"}]",
+        },
+        .{
+            .name = "document_vectors",
+            .body = "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"},{\"artifact\":\"document_chunk_dense_v1\"}]}",
+            .expected_sources = "\"sources\":[{\"artifact\":\"document_dense_v1\"},{\"artifact\":\"document_chunk_dense_v1\"}]",
+        },
+        .{
+            .name = "document_graph",
+            .body = "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"document_relations_v1\",\"path\":\"$.relations[*]\"},{\"artifact\":\"document_links_v1\",\"format\":\"extraction_graph\"}]}",
+            .expected_sources = "\"sources\":[{\"artifact\":\"document_relations_v1\",\"path\":\"$.relations[*]\"},{\"artifact\":\"document_links_v1\",\"format\":\"extraction_graph\"}]",
+        },
+    };
+
+    for (cases) |case| {
+        const config_json = try parseCreateIndexRequest(std.testing.allocator, case.name, case.body);
+        defer std.testing.allocator.free(config_json);
+        try std.testing.expect(std.mem.indexOf(u8, config_json, case.expected_sources) != null);
+
+        const response = try indexes_api.encodeCreatedIndexConfig(std.testing.allocator, case.name, config_json);
+        defer std.testing.allocator.free(response);
+        try std.testing.expect(std.mem.indexOf(u8, response, case.expected_sources) != null);
+    }
+}
+
+test "table contract rejects malformed multi-source members" {
+    const invalid = [_][]const u8{
+        "{\"type\":\"full_text\",\"sources\":[]}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"dense_v1\"},{\"artifact\":\"dense_v1\"}]}",
+        "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\",\"path\":\"$.text\"}]}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{}]}",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"unknown\":true}]}",
+    };
+    for (invalid) |body| {
+        try std.testing.expectError(
+            error.InvalidCreateIndexRequest,
+            parseCreateIndexRequest(std.testing.allocator, "multi", body),
+        );
+    }
 }
 
 test "table contract public response omits unknown nested provider fields" {

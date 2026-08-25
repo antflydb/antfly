@@ -321,6 +321,25 @@ pub fn isPortableUnboundGraphEdge(data: []const u8) bool {
     return std.mem.readInt(u64, data[header_len..][0..8], .little) == 0;
 }
 
+/// Bind a portable graph edge to the destination index incarnation. Portable
+/// edges deliberately omit their source cluster's generation; callers must
+/// persist the returned value before exposing the edge to an active index.
+pub fn bindPortableGraphEdgeGenerationAlloc(alloc: Allocator, data: []const u8, generation: u64) ![]u8 {
+    if (!isPortableUnboundGraphEdge(data)) return error.GraphGenerationAlreadyBound;
+
+    var decoded = try decodeGraphEdgeAlloc(alloc, data);
+    defer decoded.deinit(alloc);
+    return encodeGraphEdgeAlloc(
+        alloc,
+        null,
+        generation,
+        decoded.weight,
+        decoded.created_at,
+        decoded.updated_at,
+        decoded.metadata_json,
+    );
+}
+
 pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
     const header = try decodeHeader(data);
     if (header.kind != .graph_edge) return error.InvalidArtifactKind;
@@ -547,4 +566,20 @@ test "artifact codec encodes graph edge with version and source hash" {
     try std.testing.expectEqual(@as(u64, 10), decoded.created_at);
     try std.testing.expectEqual(@as(u64, 20), decoded.updated_at);
     try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
+}
+
+test "artifact codec binds portable graph edge generation exactly once" {
+    const alloc = std.testing.allocator;
+    const portable = try encodePortableUnboundGraphEdgeAlloc(alloc, 1.5, 10, 20, "{\"k\":1}");
+    defer alloc.free(portable);
+
+    const bound = try bindPortableGraphEdgeGenerationAlloc(alloc, portable, 42);
+    defer alloc.free(bound);
+    try std.testing.expect(!isPortableUnboundGraphEdge(bound));
+
+    var decoded = try decodeGraphEdgeAlloc(alloc, bound);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 42), decoded.generation);
+    try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
+    try std.testing.expectError(error.GraphGenerationAlreadyBound, bindPortableGraphEdgeGenerationAlloc(alloc, bound, 43));
 }
