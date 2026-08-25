@@ -570,17 +570,22 @@ pub const TypeGenerator = struct {
             const disc_field = try naming.zigFieldName(self.arena, disc.property_name);
             try self.w.line("pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {{", .{});
             self.w.indent();
-            try self.w.line("const Probe = struct {{ {s}: ?[]const u8 = null }};", .{disc_field});
+            try self.generateDiscriminatorProbe(disc_field);
             try self.w.line("var probe_options = options;", .{});
             try self.w.line("probe_options.ignore_unknown_fields = true;", .{});
             try self.w.line("const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);", .{});
-            try self.w.line("const disc_str = probe.{s} orelse {{", .{disc_field});
+            try self.w.line("const disc_str = switch (probe.{s}) {{", .{disc_field});
+            self.w.indent();
+            try self.w.line(".value => |value| value,", .{});
+            try self.w.line(".missing => {{", .{});
             self.w.indent();
             if (fallback_variant) |fallback| {
                 try self.w.line("return .{{ .{s} = try std.json.parseFromSliceLeaky({s}, allocator, input, options) }};", .{ fallback.field, fallback.zig_type });
             } else {
                 try self.w.line("return error.MissingField;", .{});
             }
+            self.w.dedent();
+            try self.w.line("}},", .{});
             self.w.dedent();
             try self.w.line("}};", .{});
             for (variants.items) |v| {
@@ -847,24 +852,32 @@ pub const TypeGenerator = struct {
                 const disc_field = try naming.zigFieldName(self.arena, disc.property_name);
                 try self.w.line("pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {{", .{});
                 self.w.indent();
-                try self.w.line("const Probe = struct {{ {s}: ?[]const u8 = null }};", .{disc_field});
+                try self.generateDiscriminatorProbe(disc_field);
                 try self.w.line("var probe_options = options;", .{});
                 try self.w.line("probe_options.ignore_unknown_fields = true;", .{});
                 try self.w.line("const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);", .{});
-                try self.w.line("if (probe.{s}) |disc_str| {{", .{disc_field});
+                try self.w.line("switch (probe.{s}) {{", .{disc_field});
+                self.w.indent();
+                try self.w.line(".value => |disc_str| {{", .{});
                 self.w.indent();
                 for (variants.items, disc.values) |variant, value| {
                     try self.w.line("if (std.mem.eql(u8, disc_str, \"{f}\")) return .{{ .{s} = try parseStructuralVariantFromSlice({s}, allocator, input, options) }};", .{ std.zig.fmtString(value), variant.field, variant.zig_type });
                 }
                 try self.w.line("return error.UnexpectedToken;", .{});
                 self.w.dedent();
-                try self.w.line("}}", .{});
+                try self.w.line("}},", .{});
+                try self.w.line(".missing => {{", .{});
+                self.w.indent();
                 if (disc.fallback_index) |fallback_index| {
                     const fallback = variants.items[fallback_index];
                     try self.w.line("return .{{ .{s} = try parseStructuralVariantFromSlice({s}, allocator, input, options) }};", .{ fallback.field, fallback.zig_type });
                 } else {
                     try self.w.line("return error.MissingField;", .{});
                 }
+                self.w.dedent();
+                try self.w.line("}},", .{});
+                self.w.dedent();
+                try self.w.line("}}", .{});
                 self.w.dedent();
                 try self.w.line("}}", .{});
                 try self.w.blank();
@@ -883,24 +896,47 @@ pub const TypeGenerator = struct {
             self.w.indent();
             try self.w.line("if (source != .object) return error.UnexpectedToken;", .{});
 
-            for (variants.items) |variant| {
-                if (variant.selector_keys.len == 0) continue;
-                try self.w.line("if (objectHasAnyKey(source.object, &.{{", .{});
+            if (inferred_discriminator) |disc| {
+                try self.w.line("const disc_val = source.object.get(\"{s}\") orelse {{", .{disc.property_name});
                 self.w.indent();
-                for (variant.selector_keys) |selector_key| {
-                    try self.w.line("\"{s}\",", .{selector_key});
+                if (disc.fallback_index) |fallback_index| {
+                    const fallback = variants.items[fallback_index];
+                    try self.w.line("const parsed = try parseStructuralVariant({s}, allocator, source, options) orelse return error.UnexpectedToken;", .{fallback.zig_type});
+                    try self.w.line("return .{{ .{s} = parsed }};", .{fallback.field});
+                } else {
+                    try self.w.line("return error.MissingField;", .{});
                 }
                 self.w.dedent();
-                try self.w.line("}})) {{", .{});
-                self.w.indent();
-                try self.w.line("if (try parseStructuralVariant({s}, allocator, source, options)) |parsed| return .{{ .{s} = parsed }};", .{ variant.zig_type, variant.field });
-                self.w.dedent();
-                try self.w.line("}}", .{});
-            }
+                try self.w.line("}};", .{});
+                try self.w.line("const disc_str = switch (disc_val) {{ .string => |value| value, else => return error.UnexpectedToken }};", .{});
+                for (variants.items, disc.values) |variant, value| {
+                    try self.w.line("if (std.mem.eql(u8, disc_str, \"{f}\")) {{", .{std.zig.fmtString(value)});
+                    self.w.indent();
+                    try self.w.line("const parsed = try parseStructuralVariant({s}, allocator, source, options) orelse return error.UnexpectedToken;", .{variant.zig_type});
+                    try self.w.line("return .{{ .{s} = parsed }};", .{variant.field});
+                    self.w.dedent();
+                    try self.w.line("}}", .{});
+                }
+            } else {
+                for (variants.items) |variant| {
+                    if (variant.selector_keys.len == 0) continue;
+                    try self.w.line("if (objectHasAnyKey(source.object, &.{{", .{});
+                    self.w.indent();
+                    for (variant.selector_keys) |selector_key| {
+                        try self.w.line("\"{s}\",", .{selector_key});
+                    }
+                    self.w.dedent();
+                    try self.w.line("}})) {{", .{});
+                    self.w.indent();
+                    try self.w.line("if (try parseStructuralVariant({s}, allocator, source, options)) |parsed| return .{{ .{s} = parsed }};", .{ variant.zig_type, variant.field });
+                    self.w.dedent();
+                    try self.w.line("}}", .{});
+                }
 
-            for (variants.items) |variant| {
-                if (variant.selector_keys.len > 0) continue;
-                try self.w.line("if (try parseStructuralVariant({s}, allocator, source, options)) |parsed| return .{{ .{s} = parsed }};", .{ variant.zig_type, variant.field });
+                for (variants.items) |variant| {
+                    if (variant.selector_keys.len > 0) continue;
+                    try self.w.line("if (try parseStructuralVariant({s}, allocator, source, options)) |parsed| return .{{ .{s} = parsed }};", .{ variant.zig_type, variant.field });
+                }
             }
             try self.w.line("return error.UnexpectedToken;", .{});
             self.w.dedent();
@@ -923,6 +959,24 @@ pub const TypeGenerator = struct {
 
         self.w.dedent();
         try self.w.line("}};", .{});
+    }
+
+    /// Emit a discriminator probe whose default represents only an omitted
+    /// property. An explicit JSON null still invokes jsonParse and fails the
+    /// string parse, so compatibility fallbacks cannot accidentally accept it.
+    fn generateDiscriminatorProbe(self: *TypeGenerator, field_name: []const u8) !void {
+        try self.w.line("const DiscriminatorProbe = union(enum) {{", .{});
+        self.w.indent();
+        try self.w.line("missing,", .{});
+        try self.w.line("value: []const u8,", .{});
+        try self.w.line("pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {{", .{});
+        self.w.indent();
+        try self.w.line("return .{{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) }};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        try self.w.line("const Probe = struct {{ {s}: DiscriminatorProbe = .missing }};", .{field_name});
     }
 
     /// Emit stub jsonParseFromValue/jsonStringify for unions with no resolved variants.
@@ -1450,6 +1504,8 @@ test "discriminated union emits raw fast path and one optional-discriminator fal
     try gen.generateAll(&doc);
     const output = w.toSlice();
     try std.testing.expect(std.mem.indexOf(u8, output, "pub fn jsonParseFromSliceLeaky") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "const DiscriminatorProbe = union(enum)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "kind: DiscriminatorProbe = .missing") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, ".legacy = try std.json.parseFromSliceLeaky(Legacy") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, ".legacy = try std.json.parseFromValueLeaky(Legacy") != null);
 }
@@ -1557,9 +1613,11 @@ test "structural union infers allocation-light enum selector with legacy fallbac
     const output = w.toSlice();
 
     try std.testing.expect(std.mem.indexOf(u8, output, "pub fn jsonParseFromSliceLeaky") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "const Probe = struct { kind: ?[]const u8 = null };") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "const DiscriminatorProbe = union(enum)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "kind: DiscriminatorProbe = .missing") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "disc_str, \"cur\\\"rent\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, ".legacy = try parseStructuralVariantFromSlice(Legacy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "const disc_val = source.object.get(\"kind\")") != null);
 }
 
 test "allOf flattens nested oneOf member properties into struct" {

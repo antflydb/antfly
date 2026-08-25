@@ -177,12 +177,22 @@ pub const ConnectionConfig = union(enum) {
     cdc_connection_variant: CdcConnectionVariant,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { kind: ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { kind: DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = probe.kind orelse {
-            return error.MissingField;
+        const disc_str = switch (probe.kind) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
         };
         if (std.mem.eql(u8, disc_str, "inference")) {
             return .{ .inference_connection_variant = try std.json.parseFromSliceLeaky(InferenceConnectionVariant, allocator, input, options) };
@@ -277,12 +287,22 @@ pub const ExternalIoConnectionConfig = union(enum) {
     http_external_io_config: HttpExternalIoConfig,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { protocol: ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { protocol: DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = probe.protocol orelse {
-            return error.MissingField;
+        const disc_str = switch (probe.protocol) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
         };
         if (std.mem.eql(u8, disc_str, "s3")) {
             return .{ .s3_external_io_config = try std.json.parseFromSliceLeaky(S3ExternalIoConfig, allocator, input, options) };

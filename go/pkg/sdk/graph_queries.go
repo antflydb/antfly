@@ -1068,6 +1068,10 @@ func validGraphIdentifier(value string) bool {
 	if value == "" || len(value) > maxGraphIdentifierBytes || !utf8.ValidString(value) {
 		return false
 	}
+	// Keep aliases disjoint from the count(*) sentinel and result/control refs.
+	if value == "*" || value[0] == '$' || strings.TrimSpace(value) == "" {
+		return false
+	}
 	count := utf8.RuneCountInString(value)
 	return count >= 1 && count <= maxGraphIdentifierRunes
 }

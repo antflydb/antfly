@@ -307,12 +307,22 @@ pub const CreateIndexRequest = union(enum) {
     create_algebraic_index_request: CreateAlgebraicIndexRequest,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { type: ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = probe.type orelse {
-            return error.MissingField;
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
         };
         if (std.mem.eql(u8, disc_str, "full_text")) {
             return .{ .create_full_text_index_request = try std.json.parseFromSliceLeaky(CreateFullTextIndexRequest, allocator, input, options) };
@@ -525,12 +535,22 @@ pub const CreatedIndex = union(enum) {
     created_algebraic_index: CreatedAlgebraicIndex,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { type: ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = probe.type orelse {
-            return error.MissingField;
+        const disc_str = switch (probe.type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
         };
         if (std.mem.eql(u8, disc_str, "full_text")) {
             return .{ .created_full_text_index = try std.json.parseFromSliceLeaky(CreatedFullTextIndex, allocator, input, options) };
@@ -1324,7 +1344,7 @@ pub const GraphBoundedTraversalConfig = struct {
 };
 
 pub const GraphCountAggregate = struct {
-    /// Use `*` to count rows, or an alias to count non-null bindings.
+    /// Use the reserved token `*` to count rows, or an alias to count non-null bindings. Graph aliases cannot be `*`, all-whitespace, or begin with `$`; the `$` namespace is reserved for result references.
     count: []const u8,
     /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
@@ -2016,18 +2036,29 @@ pub const GraphQueryResult = union(enum) {
     }
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { kind: ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { kind: DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        if (probe.kind) |disc_str| {
-            if (std.mem.eql(u8, disc_str, "legacy")) return .{ .legacy_graph_query_result = try parseStructuralVariantFromSlice(LegacyGraphQueryResult, allocator, input, options) };
-            if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
-            if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
-            if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
-            return error.UnexpectedToken;
+        switch (probe.kind) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "legacy")) return .{ .legacy_graph_query_result = try parseStructuralVariantFromSlice(LegacyGraphQueryResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return .{ .legacy_graph_query_result = try parseStructuralVariantFromSlice(LegacyGraphQueryResult, allocator, input, options) };
+            },
         }
-        return .{ .legacy_graph_query_result = try parseStructuralVariantFromSlice(LegacyGraphQueryResult, allocator, input, options) };
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -2037,38 +2068,29 @@ pub const GraphQueryResult = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "kind",
-            "type",
-            "nodes",
-            "paths",
-            "matches",
-            "total",
-            "took",
-        })) {
-            if (try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options)) |parsed| return .{ .legacy_graph_query_result = parsed };
+        const disc_val = source.object.get("kind") orelse {
+            const parsed = try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .legacy_graph_query_result = parsed };
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "legacy")) {
+            const parsed = try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .legacy_graph_query_result = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "kind",
-            "nodes",
-            "paths",
-            "stats",
-        })) {
-            if (try parseStructuralVariant(GraphNodesResult, allocator, source, options)) |parsed| return .{ .graph_nodes_result = parsed };
+        if (std.mem.eql(u8, disc_str, "nodes")) {
+            const parsed = try parseStructuralVariant(GraphNodesResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_nodes_result = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "kind",
-            "aggregates",
-            "stats",
-        })) {
-            if (try parseStructuralVariant(GraphAggregatesResult, allocator, source, options)) |parsed| return .{ .graph_aggregates_result = parsed };
+        if (std.mem.eql(u8, disc_str, "aggregates")) {
+            const parsed = try parseStructuralVariant(GraphAggregatesResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_aggregates_result = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "kind",
-            "rows",
-            "stats",
-        })) {
-            if (try parseStructuralVariant(GraphBindingsResult, allocator, source, options)) |parsed| return .{ .graph_bindings_result = parsed };
+        if (std.mem.eql(u8, disc_str, "bindings")) {
+            const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_bindings_result = parsed };
         }
         return error.UnexpectedToken;
     }
@@ -2612,12 +2634,22 @@ pub const IndexStats = union(enum) {
     algebraic_index_stats: AlgebraicIndexStats,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { index_type: ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { index_type: DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = probe.index_type orelse {
-            return error.MissingField;
+        const disc_str = switch (probe.index_type) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
         };
         if (std.mem.eql(u8, disc_str, "full_text")) {
             return .{ .full_text_index_stats = try std.json.parseFromSliceLeaky(FullTextIndexStats, allocator, input, options) };

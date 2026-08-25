@@ -1449,10 +1449,11 @@ test "distinct graph aggregates include table identity" {
 
 fn patternQueryNeedsHits(req: types.SearchRequest, named: *const types.NamedGraphQuery) bool {
     if (named.query.include_documents or req.expand_strategy != null) return true;
-    // Canonical MATCH dependencies always select an explicit binding and are
-    // resolved directly from GraphPatternMatch rows. Only the deprecated
-    // unbound compatibility format still depends on flattened SearchHits.
-    if (named.response_format != .legacy) return false;
+    // Conjunctive MATCH dependencies select an explicit binding and resolve
+    // directly from GraphPatternMatch rows. Only the older linear pattern IR
+    // has unbound dependency flattening, so derive this from plan semantics
+    // instead of leaking a public response dialect into execution.
+    if (named.query.query_type != .pattern or named.query.match_pattern != null) return false;
     for (req.graph_queries) |candidate| {
         if (selectorReferencesGraphResult(candidate.query.start_nodes, named.name)) return true;
         if (candidate.query.target_nodes) |selector| {
@@ -1478,7 +1479,6 @@ fn selectorReferencesGraphResult(selector: graph_query_mod.NodeSelector, name: [
 test "pattern hit shaping is lazy but preserves graph dependencies" {
     const seed = types.NamedGraphQuery{
         .name = "seed",
-        .response_format = .legacy,
         .query = .{
             .query_type = .pattern,
             .index_name = "graph",

@@ -1297,11 +1297,11 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
-    /// Owned, validated public `graph_queries` or `graph_searches` object used
-    /// only when a single-owner request must be proxied to its remote owner.
-    /// Keeping the admitted wire fragment avoids maintaining a second public
-    /// graph DSL serializer alongside the OpenAPI contract.
-    graph_queries_wire_json: []const u8 = "",
+    /// Owned, validated API envelope containing exactly one `graph_queries` or
+    /// transitional `graph_searches` member. Execution never inspects this
+    /// transport sidecar; it is retained only for transparent owner proxying
+    /// and response shaping at the API boundary.
+    graph_queries_proxy_json: []const u8 = "",
     merge_config: ?MergeConfig = null,
     reranker: ?reranking_mod.Config = null,
     reranker_query_text: []const u8 = "",
@@ -1369,7 +1369,7 @@ pub const SearchRequest = struct {
     /// wire state after graph execution has been disabled.
     pub fn clearGraphQueries(self: *SearchRequest) void {
         self.graph_queries = &.{};
-        self.graph_queries_wire_json = "";
+        self.graph_queries_proxy_json = "";
     }
 };
 
@@ -1427,7 +1427,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "dense_queries",
     "sparse_queries",
     "graph_queries",
-    "graph_queries_wire_json",
+    "graph_queries_proxy_json",
     "merge_config",
     "reranker",
     "reranker_query_text",
@@ -1656,14 +1656,9 @@ pub const HierarchyChildrenRequest = struct {
     level: HierarchyGroupLevel = .unit,
 };
 
-/// Response compatibility belongs to the request envelope, not the graph
-/// execution IR. Executors therefore see one canonical GraphQuery shape.
-pub const GraphResponseFormat = enum { canonical, legacy };
-
 pub const NamedGraphQuery = struct {
     name: []const u8,
     query: graph_query_mod.GraphQuery,
-    response_format: GraphResponseFormat = .canonical,
 };
 
 pub const NamedFullTextQuery = struct {

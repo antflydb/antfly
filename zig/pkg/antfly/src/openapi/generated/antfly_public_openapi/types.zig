@@ -596,12 +596,22 @@ pub const BackupMetadataUnavailableError = union(enum) {
     metadata_leader_unavailable_error: MetadataLeaderUnavailableError,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { code: ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { code: DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = probe.code orelse {
-            return error.MissingField;
+        const disc_str = switch (probe.code) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
         };
         if (std.mem.eql(u8, disc_str, "metadata_capability_unavailable")) {
             return .{ .metadata_capability_unavailable_error = try std.json.parseFromSliceLeaky(MetadataCapabilityUnavailableError, allocator, input, options) };
@@ -2381,12 +2391,22 @@ pub const QueryConflictError = union(enum) {
     topology_changed_error: TopologyChangedError,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { @"error": ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { @"error": DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = probe.@"error" orelse {
-            return error.MissingField;
+        const disc_str = switch (probe.@"error") {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
         };
         if (std.mem.eql(u8, disc_str, "hierarchy_cursor_stale")) {
             return .{ .hierarchy_cursor_stale_error = try std.json.parseFromSliceLeaky(HierarchyCursorStaleError, allocator, input, options) };
@@ -2661,12 +2681,22 @@ pub const QueryUnprocessableError = union(enum) {
     graph_match_operation_limit_exceeded_error: GraphMatchOperationLimitExceededError,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { @"error": ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { @"error": DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = probe.@"error" orelse {
-            return error.MissingField;
+        const disc_str = switch (probe.@"error") {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
         };
         if (std.mem.eql(u8, disc_str, "unsupported_exact_sort")) {
             return .{ .exact_sort_error = try std.json.parseFromSliceLeaky(ExactSortError, allocator, input, options) };
@@ -3615,12 +3645,22 @@ pub const TableBackupConflictError = union(enum) {
     backup_outcome_ambiguous_conflict: BackupOutcomeAmbiguousConflict,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { code: ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { code: DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        const disc_str = probe.code orelse {
-            return error.MissingField;
+        const disc_str = switch (probe.code) {
+            .value => |value| value,
+            .missing => {
+                return error.MissingField;
+            },
         };
         if (std.mem.eql(u8, disc_str, "backup_already_exists")) {
             return .{ .backup_already_exists_conflict = try std.json.parseFromSliceLeaky(BackupAlreadyExistsConflict, allocator, input, options) };

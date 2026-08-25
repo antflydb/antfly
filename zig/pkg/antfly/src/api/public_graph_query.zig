@@ -92,7 +92,7 @@ pub fn parseSupportedGraphQueriesAlloc(
             const query = try query_contract.parseLegacyGraphQuery(alloc, entry.value_ptr.*);
             var query_owned = true;
             errdefer if (query_owned) freeGraphQuery(alloc, query);
-            try items.append(alloc, .{ .name = name, .query = query, .response_format = .legacy });
+            try items.append(alloc, .{ .name = name, .query = query });
             name_owned = false;
             query_owned = false;
         }
@@ -593,7 +593,6 @@ test "parse supported graph queries accepts deprecated graph searches" {
     defer freeNamedGraphQueries(alloc, items);
 
     try std.testing.expectEqual(@as(usize, 1), items.len);
-    try std.testing.expect(items[0].response_format == .legacy);
     try std.testing.expect(items[0].query.start_nodes == .keys);
     try std.testing.expectEqual(graph_query_mod.QueryType.neighbors, items[0].query.query_type);
     try std.testing.expectEqualStrings("graph_idx", items[0].query.index_name);
@@ -676,7 +675,6 @@ test "legacy graph result refs preserve their retrieval lane" {
     defer parsed.deinit();
     const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
-    try std.testing.expect(items[0].response_format == .legacy);
     try std.testing.expectEqualStrings("$full_text_results", items[0].query.start_nodes.result_ref.ref);
 }
 

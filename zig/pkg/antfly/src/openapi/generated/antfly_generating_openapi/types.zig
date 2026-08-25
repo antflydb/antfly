@@ -194,17 +194,28 @@ pub const ContentPart = union(enum) {
     }
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const Probe = struct { type: ?[]const u8 = null };
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
         var probe_options = options;
         probe_options.ignore_unknown_fields = true;
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        if (probe.type) |disc_str| {
-            if (std.mem.eql(u8, disc_str, "media")) return .{ .media_content_part = try parseStructuralVariantFromSlice(MediaContentPart, allocator, input, options) };
-            if (std.mem.eql(u8, disc_str, "image_url")) return .{ .image_url_content_part = try parseStructuralVariantFromSlice(ImageURLContentPart, allocator, input, options) };
-            if (std.mem.eql(u8, disc_str, "text")) return .{ .text_content_part = try parseStructuralVariantFromSlice(TextContentPart, allocator, input, options) };
-            return error.UnexpectedToken;
+        switch (probe.type) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "media")) return .{ .media_content_part = try parseStructuralVariantFromSlice(MediaContentPart, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "image_url")) return .{ .image_url_content_part = try parseStructuralVariantFromSlice(ImageURLContentPart, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "text")) return .{ .text_content_part = try parseStructuralVariantFromSlice(TextContentPart, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return error.MissingField;
+            },
         }
-        return error.MissingField;
     }
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -214,24 +225,24 @@ pub const ContentPart = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "data",
-            "mime_type",
-        })) {
-            if (try parseStructuralVariant(MediaContentPart, allocator, source, options)) |parsed| return .{ .media_content_part = parsed };
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "media")) {
+            const parsed = try parseStructuralVariant(MediaContentPart, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .media_content_part = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "image_url",
-        })) {
-            if (try parseStructuralVariant(ImageURLContentPart, allocator, source, options)) |parsed| return .{ .image_url_content_part = parsed };
+        if (std.mem.eql(u8, disc_str, "image_url")) {
+            const parsed = try parseStructuralVariant(ImageURLContentPart, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .image_url_content_part = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "type",
-            "text",
-        })) {
-            if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
+        if (std.mem.eql(u8, disc_str, "text")) {
+            const parsed = try parseStructuralVariant(TextContentPart, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .text_content_part = parsed };
         }
         return error.UnexpectedToken;
     }

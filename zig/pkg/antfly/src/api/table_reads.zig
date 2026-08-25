@@ -16908,7 +16908,7 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
         try appendTextQueryField(alloc, &out, &first, "exclusion_query", exclusion_text);
     }
     if (req.graph_queries.len > 0) {
-        try appendGraphQueriesField(alloc, &out, &first, req.graph_queries, req.graph_queries_wire_json);
+        try appendGraphQueriesField(alloc, &out, &first, req.graph_queries, req.graph_queries_proxy_json);
     }
     if (req.expand_strategy) |expand_strategy| {
         try appendJsonFieldString(alloc, &out, &first, "expand_strategy", switch (expand_strategy) {
@@ -16935,7 +16935,7 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
 
 test "generic shard query wire preserves admitted canonical graph operations" {
     const graph_wire =
-        \\{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}
+        \\{"graph_queries":{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}}
     ;
     const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "neighbors",
@@ -16947,7 +16947,7 @@ test "generic shard query wire preserves admitted canonical graph operations" {
     }};
     const encoded = try encodeQueryRequest(std.testing.allocator, .{
         .graph_queries = &graph_queries,
-        .graph_queries_wire_json = graph_wire,
+        .graph_queries_proxy_json = graph_wire,
     });
     defer std.testing.allocator.free(encoded);
     var parsed = try ant_json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
@@ -16990,8 +16990,8 @@ test "generic shard query wire never drops graph table authorization" {
 
     try std.testing.expectError(error.UnsupportedQueryRequest, encodeQueryRequest(std.testing.allocator, .{
         .graph_queries = &graph_queries,
-        .graph_queries_wire_json =
-        \\{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}
+        .graph_queries_proxy_json =
+        \\{"graph_queries":{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}}
         ,
         .graph_table_read_authorizer = .{
             .ctx = null,
@@ -17008,26 +17008,29 @@ fn appendGraphQueriesField(
     out: *std.ArrayListUnmanaged(u8),
     first: *bool,
     graph_queries: []const db_mod.types.NamedGraphQuery,
-    graph_queries_wire_json: []const u8,
+    graph_queries_proxy_json: []const u8,
 ) !void {
     if (graph_queries.len == 0) return;
-    const legacy = graph_queries[0].response_format == .legacy;
-    for (graph_queries[1..]) |named| {
-        if ((named.response_format == .legacy) != legacy) return error.InvalidQueryRequest;
-    }
-
-    const wire = std.mem.trim(u8, graph_queries_wire_json, &std.ascii.whitespace);
+    const wire = std.mem.trim(u8, graph_queries_proxy_json, &std.ascii.whitespace);
     var parsed = ant_json.parseFromSlice(std.json.Value, alloc, wire, .{}) catch
         return error.UnsupportedQueryRequest;
     defer parsed.deinit();
-    if (parsed.value != .object or parsed.value.object.count() != graph_queries.len)
+    if (parsed.value != .object or parsed.value.object.count() != 1)
+        return error.UnsupportedQueryRequest;
+    const canonical = parsed.value.object.get("graph_queries");
+    const legacy = parsed.value.object.get("graph_searches");
+    if ((canonical == null) == (legacy == null)) return error.UnsupportedQueryRequest;
+    const operations = canonical orelse legacy.?;
+    if (operations != .object or operations.object.count() != graph_queries.len)
         return error.UnsupportedQueryRequest;
     for (graph_queries) |named| {
-        if (parsed.value.object.get(named.name) == null) return error.UnsupportedQueryRequest;
+        if (operations.object.get(named.name) == null) return error.UnsupportedQueryRequest;
     }
 
-    try appendJsonFieldName(alloc, out, first, if (legacy) "graph_searches" else "graph_queries");
-    try out.appendSlice(alloc, wire);
+    try appendJsonFieldName(alloc, out, first, if (legacy != null) "graph_searches" else "graph_queries");
+    const encoded_operations = try std.json.Stringify.valueAlloc(alloc, operations, .{});
+    defer alloc.free(encoded_operations);
+    try out.appendSlice(alloc, encoded_operations);
 }
 
 fn appendQueryHierarchyField(
@@ -17901,6 +17904,19 @@ fn appendOptionalTextQueryBoostField(
 }
 
 fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
+    return parseRemoteSearchResultInner(alloc, body) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.QueryCandidateBudgetExceeded => error.QueryCandidateBudgetExceeded,
+        else => error.InvalidRemoteResponse,
+    };
+}
+
+/// Decode data received from another Antfly node behind one trust boundary.
+/// The inner decoder may reuse local contract helpers whose errors are phrased
+/// for client requests; the public wrapper above deliberately collapses every
+/// non-resource failure to InvalidRemoteResponse so an owner can never make a
+/// malformed shard response look like a caller error.
+fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) !db_mod.types.SearchResult {
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, body, .{});
     defer parsed.deinit();
     const responses = parsed.value.responses orelse return error.InvalidQueryRequest;
@@ -17909,6 +17925,8 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
     const hits_obj = response.hits orelse return error.InvalidQueryRequest;
     const total_obj = hits_obj.total orelse return error.InvalidQueryRequest;
     const hits_value = hits_obj.hits orelse return error.InvalidQueryRequest;
+    const total_hits = try query_contract.queryHitsTotalValueToU32(total_obj);
+    const total_hits_relation = try query_contract.parseTotalHitsRelation(total_obj.relation);
 
     const hits = try alloc.alloc(db_mod.types.SearchHit, hits_value.len);
     var initialized: usize = 0;
@@ -17917,18 +17935,18 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
         alloc.free(hits);
     }
     for (hits_value, 0..) |item, i| {
-        hits[i] = .{
-            .id = try alloc.dupe(u8, item._id),
-            .score = item._score,
-            .distance = item._distance,
-            .index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores),
-            .sort_values = try db_mod.types.cloneJsonValues(alloc, item._sort orelse &.{}),
-            .stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null,
-            .ancestor_source_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .source),
-            .ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .unit),
-            .artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(alloc, item.hierarchy),
-            .chunk_hits = try parseRemoteHierarchyMatchesAlloc(alloc, item.hierarchy),
-        };
+        var hit: db_mod.types.SearchHit = .{ .id = try alloc.dupe(u8, item._id) };
+        errdefer hit.deinit(alloc);
+        hit.score = item._score;
+        hit.distance = item._distance;
+        hit.index_scores = try parseRemoteIndexScoresAlloc(alloc, item._index_scores);
+        hit.sort_values = try db_mod.types.cloneJsonValues(alloc, item._sort orelse &.{});
+        hit.stored_data = if (item._source) |value| try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})}) else null;
+        hit.ancestor_source_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .source);
+        hit.ancestor_unit_data = try remoteHierarchyAncestorDocumentAlloc(alloc, item.hierarchy, .unit);
+        hit.artifact_ref = try parseRemoteHierarchyArtifactRefAlloc(alloc, item.hierarchy);
+        hit.chunk_hits = try parseRemoteHierarchyMatchesAlloc(alloc, item.hierarchy);
+        hits[i] = hit;
         initialized += 1;
     }
 
@@ -17940,8 +17958,8 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
     return .{
         .alloc = alloc,
         .hits = hits,
-        .total_hits = try query_contract.queryHitsTotalValueToU32(total_obj),
-        .total_hits_relation = try query_contract.parseTotalHitsRelation(total_obj.relation),
+        .total_hits = total_hits,
+        .total_hits_relation = total_hits_relation,
         .graph_results = graph_results,
     };
 }
@@ -18202,6 +18220,8 @@ fn parseRemoteGraphResults(
             .graph_nodes_result => |result| blk: {
                 if (result.nodes.len > public_limits.max_graph_result_items or
                     result.paths.len > public_limits.max_graph_result_items)
+                    return error.InvalidRemoteResponse;
+                if (result.paths.len > 0 and result.nodes.len != result.paths.len)
                     return error.InvalidRemoteResponse;
                 const returned_items = if (result.paths.len > 0) result.paths.len else result.nodes.len;
                 if (!remoteGraphReturnedItemsMatch(result.stats.returned_items, returned_items))
@@ -18465,10 +18485,10 @@ fn parseRemoteGraphNodeWithKey(
     item: indexes_openapi.GraphResultNode,
 ) !graph_query_mod.GraphResultNode {
     try validateRemoteCanonicalGraphIdentity(key, item.table);
-    const depth = std.math.cast(u32, item.depth orelse 0) orelse return error.InvalidQueryRequest;
-    if (depth > graph_pattern_mod.max_pattern_hops) return error.InvalidQueryRequest;
+    const depth = std.math.cast(u32, item.depth orelse 0) orelse return error.InvalidRemoteResponse;
+    if (depth > graph_pattern_mod.max_pattern_hops) return error.InvalidRemoteResponse;
     const distance = item.distance orelse 0;
-    if (!std.math.isFinite(distance) or distance < 0) return error.InvalidQueryRequest;
+    if (!std.math.isFinite(distance) or distance < 0) return error.InvalidRemoteResponse;
     if (item.path) |path| {
         try validateRemoteCanonicalGraphPathNodes(path);
     }
@@ -18479,7 +18499,7 @@ fn parseRemoteGraphNodeWithKey(
     const owned_path = if (item.path) |value| try cloneRemoteCanonicalGraphNodePath(alloc, value) else null;
     errdefer if (owned_path) |value| value.deinit(alloc);
     const path_edges = if (item.path_edges) |value| blk: {
-        const path = item.path orelse return error.InvalidQueryRequest;
+        const path = item.path orelse return error.InvalidRemoteResponse;
         try validateRemoteCanonicalGraphPathEdges(path, value);
         break :blk try cloneRemoteCanonicalGraphNodePathEdges(alloc, value);
     } else null;
@@ -18503,7 +18523,11 @@ fn parseRemoteLegacyGraphNodeWithKey(
     key: []const u8,
     item: indexes_openapi.LegacyGraphResultNode,
 ) !graph_query_mod.GraphResultNode {
-    const depth = std.math.cast(u32, item.depth orelse 0) orelse return error.InvalidQueryRequest;
+    try validateRemoteCanonicalGraphIdentity(key, item.table);
+    const depth = std.math.cast(u32, item.depth orelse 0) orelse return error.InvalidRemoteResponse;
+    if (depth > graph_pattern_mod.max_pattern_hops) return error.InvalidRemoteResponse;
+    const distance = item.distance orelse 0;
+    if (!std.math.isFinite(distance) or distance < 0) return error.InvalidRemoteResponse;
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_table = if (item.table) |table| try alloc.dupe(u8, table) else null;
@@ -18518,7 +18542,7 @@ fn parseRemoteLegacyGraphNodeWithKey(
         .key = owned_key,
         .table = owned_table,
         .depth = depth,
-        .distance = item.distance orelse 0,
+        .distance = distance,
         .path = path,
         .path_edges = path_edges,
         .provenance = provenance,
@@ -18679,11 +18703,11 @@ fn cloneRemoteLegacyGraphNodePathEdges(
     var initialized: usize = 0;
     errdefer freeRemoteGraphNodePathEdgeItems(alloc, edges, initialized);
     for (value, 0..) |item, i| {
-        const source = try alloc.dupe(u8, item.source orelse return error.InvalidQueryRequest);
+        const source = try alloc.dupe(u8, item.source orelse return error.InvalidRemoteResponse);
         errdefer alloc.free(source);
-        const target = try alloc.dupe(u8, item.target orelse return error.InvalidQueryRequest);
+        const target = try alloc.dupe(u8, item.target orelse return error.InvalidRemoteResponse);
         errdefer alloc.free(target);
-        const edge_type = try alloc.dupe(u8, item.type orelse return error.InvalidQueryRequest);
+        const edge_type = try alloc.dupe(u8, item.type orelse return error.InvalidRemoteResponse);
         errdefer alloc.free(edge_type);
         const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
         errdefer if (metadata.len > 0) alloc.free(metadata);
@@ -18691,11 +18715,12 @@ fn cloneRemoteLegacyGraphNodePathEdges(
             .source = source,
             .target = target,
             .edge_type = edge_type,
-            .weight = item.weight orelse return error.InvalidQueryRequest,
+            .weight = item.weight orelse return error.InvalidRemoteResponse,
             .metadata = metadata,
         };
         initialized += 1;
     }
+    for (edges) |edge| graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
     return edges;
 }
 
@@ -18755,11 +18780,48 @@ fn parseRemoteLegacyGraphPaths(alloc: std.mem.Allocator, value: []const indexes_
         alloc.free(paths);
     }
     for (value, 0..) |item, i| {
+        const wire_nodes = item.nodes orelse return error.InvalidRemoteResponse;
+        const wire_edges = item.edges orelse return error.InvalidRemoteResponse;
+        const wire_length = item.length orelse return error.InvalidRemoteResponse;
+        const length = std.math.cast(u32, wire_length) orelse return error.InvalidRemoteResponse;
+        if (wire_nodes.len == 0 or wire_nodes.len > graph_pattern_mod.max_pattern_hops + 1 or
+            wire_edges.len + 1 != wire_nodes.len or length != wire_edges.len)
+            return error.InvalidRemoteResponse;
+        for (wire_nodes) |node| if (node.len == 0) return error.InvalidRemoteResponse;
+        const total_weight = item.total_weight orelse return error.InvalidRemoteResponse;
+        if (!std.math.isFinite(total_weight) or total_weight < 0) return error.InvalidRemoteResponse;
+        var weight_sum: f64 = 0;
+        for (wire_edges, 0..) |edge, edge_index| {
+            const source = edge.source orelse return error.InvalidRemoteResponse;
+            const target = edge.target orelse return error.InvalidRemoteResponse;
+            const edge_type = edge.type orelse return error.InvalidRemoteResponse;
+            const weight = edge.weight orelse return error.InvalidRemoteResponse;
+            if (source.len == 0 or target.len == 0 or edge_type.len == 0 or
+                !std.mem.eql(u8, source, wire_nodes[edge_index]) or
+                !std.mem.eql(u8, target, wire_nodes[edge_index + 1]))
+                return error.InvalidRemoteResponse;
+            graph_edge_weight.validateStored(weight) catch return error.InvalidRemoteResponse;
+            weight_sum += weight;
+            if (!std.math.isFinite(weight_sum)) return error.InvalidRemoteResponse;
+        }
+        if (!graphPathScoreEql(total_weight, weight_sum)) return error.InvalidRemoteResponse;
+        const nodes = try cloneRemoteGraphNodePath(alloc, wire_nodes);
+        errdefer freeRemoteGraphNodePath(alloc, nodes);
+        const edges = try parseRemotePathEdges(alloc, wire_edges);
+        errdefer {
+            for (edges) |edge| {
+                alloc.free(edge.source);
+                alloc.free(edge.target);
+                alloc.free(edge.edge_type);
+                if (edge.metadata.len > 0) alloc.free(edge.metadata);
+            }
+            if (edges.len > 0) alloc.free(edges);
+        }
         paths[i] = .{
-            .nodes = try cloneRemoteGraphNodePath(alloc, item.nodes orelse return error.InvalidQueryRequest),
-            .edges = try parseRemotePathEdges(alloc, item.edges orelse return error.InvalidQueryRequest),
-            .total_weight = item.total_weight orelse return error.InvalidQueryRequest,
-            .length = @intCast(item.length orelse return error.InvalidQueryRequest),
+            .nodes = nodes,
+            .edges = edges,
+            .total_weight = total_weight,
+            .length = length,
         };
         initialized += 1;
     }
@@ -18791,7 +18853,7 @@ fn parseRemoteCanonicalGraphPath(
 ) !graph_paths.Path {
     if (item.length < 0 or item.length > graph_pattern_mod.max_pattern_hops or
         @as(u64, @intCast(item.length)) != item.edges.len)
-        return error.InvalidQueryRequest;
+        return error.InvalidRemoteResponse;
     try validateRemoteCanonicalGraphPathScores(item);
     const nodes = try alloc.alloc([]const u8, item.nodes.len);
     var initialized_nodes: usize = 0;
@@ -18836,39 +18898,39 @@ fn parseRemoteCanonicalGraphPath(
         .node_tables = node_tables,
         .edges = edges,
         .total_weight = item.weight_sum,
-        .length = std.math.cast(u32, item.length) orelse return error.InvalidQueryRequest,
+        .length = std.math.cast(u32, item.length) orelse return error.InvalidRemoteResponse,
     };
 }
 
 fn validateRemoteCanonicalGraphPathScores(item: indexes_openapi.GraphPath) !void {
     if (!std.math.isFinite(item.weight_sum) or !std.math.isFinite(item.objective_value))
-        return error.InvalidQueryRequest;
+        return error.InvalidRemoteResponse;
     var sum: f64 = 0;
     var product: f64 = 1;
     for (item.edges) |edge| {
-        graph_edge_weight.validateStored(edge.weight) catch return error.InvalidQueryRequest;
+        graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
         switch (item.weight_mode) {
             .min_hops => {},
             .min_weight => _ = graph_paths.pathEdgeCost(.min_weight, edge.weight) catch
-                return error.InvalidQueryRequest,
+                return error.InvalidRemoteResponse,
             .max_weight => _ = graph_paths.pathEdgeCost(.max_weight, edge.weight) catch
-                return error.InvalidQueryRequest,
+                return error.InvalidRemoteResponse,
         }
         sum += edge.weight;
-        if (!std.math.isFinite(sum)) return error.InvalidQueryRequest;
+        if (!std.math.isFinite(sum)) return error.InvalidRemoteResponse;
         if (item.weight_mode == .max_weight) {
             product *= edge.weight;
-            if (!std.math.isFinite(product)) return error.InvalidQueryRequest;
+            if (!std.math.isFinite(product)) return error.InvalidRemoteResponse;
         }
     }
-    if (!graphPathScoreEql(item.weight_sum, sum)) return error.InvalidQueryRequest;
+    if (!graphPathScoreEql(item.weight_sum, sum)) return error.InvalidRemoteResponse;
     const objective: f64 = switch (item.weight_mode) {
         .min_hops => @floatFromInt(item.edges.len),
         .min_weight => sum,
         .max_weight => product,
     };
     if (!std.math.isFinite(objective) or !graphPathScoreEql(item.objective_value, objective))
-        return error.InvalidQueryRequest;
+        return error.InvalidRemoteResponse;
 }
 
 fn graphPathScoreEql(left: f64, right: f64) bool {
@@ -18879,15 +18941,43 @@ fn graphPathScoreEql(left: f64, right: f64) bool {
 
 fn parseRemotePathEdges(alloc: std.mem.Allocator, value: []const indexes_openapi.PathEdge) ![]graph_paths.PathEdge {
     const edges = try alloc.alloc(graph_paths.PathEdge, value.len);
-    errdefer alloc.free(edges);
+    var initialized: usize = 0;
+    errdefer {
+        for (edges[0..initialized]) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        if (edges.len > 0) alloc.free(edges);
+    }
     for (value, 0..) |item, i| {
+        const source_value = item.source orelse return error.InvalidRemoteResponse;
+        const target_value = item.target orelse return error.InvalidRemoteResponse;
+        const edge_type_value = item.type orelse return error.InvalidRemoteResponse;
+        const weight = item.weight orelse return error.InvalidRemoteResponse;
+        if (source_value.len == 0 or target_value.len == 0 or edge_type_value.len == 0)
+            return error.InvalidRemoteResponse;
+        graph_edge_weight.validateStored(weight) catch return error.InvalidRemoteResponse;
+        const source = try alloc.dupe(u8, source_value);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, target_value);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, edge_type_value);
+        errdefer alloc.free(edge_type);
+        const metadata = if (item.metadata) |metadata_value|
+            try std.json.Stringify.valueAlloc(alloc, metadata_value, .{})
+        else
+            "";
+        errdefer if (metadata.len > 0) alloc.free(metadata);
         edges[i] = .{
-            .source = try alloc.dupe(u8, item.source orelse return error.InvalidQueryRequest),
-            .target = try alloc.dupe(u8, item.target orelse return error.InvalidQueryRequest),
-            .edge_type = try alloc.dupe(u8, item.type orelse return error.InvalidQueryRequest),
-            .weight = item.weight orelse return error.InvalidQueryRequest,
-            .metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "",
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
+            .weight = weight,
+            .metadata = metadata,
         };
+        initialized += 1;
     }
     return edges;
 }
@@ -18933,15 +19023,15 @@ fn validateRemoteCanonicalGraphPathEdges(
     edges: []const indexes_openapi.GraphPathEdge,
 ) !void {
     try validateRemoteCanonicalGraphPathNodes(nodes);
-    if (edges.len != nodes.len - 1) return error.InvalidQueryRequest;
+    if (edges.len != nodes.len - 1) return error.InvalidRemoteResponse;
     for (edges, 0..) |edge, i| {
-        if (edge.type.len == 0) return error.InvalidQueryRequest;
-        graph_edge_weight.validateStored(edge.weight) catch return error.InvalidQueryRequest;
+        if (edge.type.len == 0) return error.InvalidRemoteResponse;
+        graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
         try validateRemoteCanonicalGraphIdentity(edge.from.key, edge.from.table);
         try validateRemoteCanonicalGraphIdentity(edge.to.key, edge.to.table);
         if (!graphPathEndpointEql(edge.from, nodes[i]) or
             !graphPathEndpointEql(edge.to, nodes[i + 1]))
-            return error.InvalidQueryRequest;
+            return error.InvalidRemoteResponse;
     }
 }
 
@@ -18949,13 +19039,13 @@ fn validateRemoteCanonicalGraphPathNodes(
     nodes: []const indexes_openapi.GraphPathEndpoint,
 ) !void {
     if (nodes.len == 0 or nodes.len > graph_pattern_mod.max_pattern_hops + 1)
-        return error.InvalidQueryRequest;
+        return error.InvalidRemoteResponse;
     for (nodes) |node| try validateRemoteCanonicalGraphIdentity(node.key, node.table);
 }
 
 fn validateRemoteCanonicalGraphIdentity(key: []const u8, table: ?[]const u8) !void {
-    if (key.len == 0) return error.InvalidQueryRequest;
-    if (table) |value| if (value.len == 0) return error.InvalidQueryRequest;
+    if (key.len == 0) return error.InvalidRemoteResponse;
+    if (table) |value| if (value.len == 0) return error.InvalidRemoteResponse;
 }
 
 fn graphPathEndpointEql(
@@ -18969,24 +19059,24 @@ fn graphPathEndpointEql(
 
 test "remote canonical graph nodes reject invalid identity and numeric domains" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "", .{ .key = "" }));
-    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "", .{ .key = "" }));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
         .table = "",
     }));
-    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
         .depth = -1,
     }));
-    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
         .depth = graph_pattern_mod.max_pattern_hops + 1,
     }));
-    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
         .distance = -0.1,
     }));
-    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
         .distance = std.math.inf(f64),
     }));
@@ -18994,19 +19084,48 @@ test "remote canonical graph nodes reject invalid identity and numeric domains" 
     const too_many_path_nodes = [_]indexes_openapi.GraphPathEndpoint{.{ .key = "node" }} **
         (graph_pattern_mod.max_pattern_hops + 2);
     try std.testing.expectError(
-        error.InvalidQueryRequest,
+        error.InvalidRemoteResponse,
         validateRemoteCanonicalGraphPathNodes(&too_many_path_nodes),
     );
 }
 
 test "remote canonical graph result stats and aggregate exactness fail closed" {
     const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc, "{"));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"walk":{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":1,"truncated":false}}}}]}
+        \\{"responses":[{}]}
+    ));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"walk":{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
     ));
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"counted":{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}}}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"counted":{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}},"took":0,"status":200,"table":"docs"}]}
     ));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a"},{"key":"extra"}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
+    ));
+}
+
+test "remote legacy graph paths require contiguous identities and exact weight sums" {
+    const alloc = std.testing.allocator;
+    const nodes = [_][]const u8{ "a", "b" };
+    var edges = [_]indexes_openapi.PathEdge{.{
+        .source = "a",
+        .target = "wrong",
+        .type = "related",
+        .weight = 0.5,
+    }};
+    var paths = [_]indexes_openapi.Path{.{
+        .nodes = &nodes,
+        .edges = &edges,
+        .total_weight = 0.5,
+        .length = 1,
+    }};
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteLegacyGraphPaths(alloc, &paths));
+
+    edges[0].target = "b";
+    paths[0].total_weight = 0.25;
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteLegacyGraphPaths(alloc, &paths));
 }
 
 test "remote canonical graph paths reject impossible shapes and weight domains" {
@@ -19032,13 +19151,13 @@ test "remote canonical graph paths reject impossible shapes and weight domains" 
     try validateRemoteCanonicalGraphPathScores(path);
 
     try std.testing.expectError(
-        error.InvalidQueryRequest,
+        error.InvalidRemoteResponse,
         validateRemoteCanonicalGraphPathEdges(&.{}, &.{}),
     );
 
     edges[0].type = "";
     try std.testing.expectError(
-        error.InvalidQueryRequest,
+        error.InvalidRemoteResponse,
         validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
     );
     edges[0].type = "related";
@@ -19047,19 +19166,19 @@ test "remote canonical graph paths reject impossible shapes and weight domains" 
     path.weight_mode = .min_hops;
     path.weight_sum = -0.1;
     path.objective_value = 1;
-    try std.testing.expectError(error.InvalidQueryRequest, validateRemoteCanonicalGraphPathScores(path));
+    try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(path));
 
     edges[0].weight = 1.1;
     path.weight_mode = .max_weight;
     path.weight_sum = 1.1;
     path.objective_value = 1.1;
-    try std.testing.expectError(error.InvalidQueryRequest, validateRemoteCanonicalGraphPathScores(path));
+    try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(path));
 
     const overflow_edges = [_]indexes_openapi.GraphPathEdge{
         .{ .from = .{ .key = "a" }, .to = .{ .key = "b" }, .type = "e", .weight = std.math.floatMax(f64) },
         .{ .from = .{ .key = "b" }, .to = .{ .key = "c" }, .type = "e", .weight = std.math.floatMax(f64) },
     };
-    try std.testing.expectError(error.InvalidQueryRequest, validateRemoteCanonicalGraphPathScores(.{
+    try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(.{
         .nodes = &.{ .{ .key = "a" }, .{ .key = "b" }, .{ .key = "c" } },
         .edges = &overflow_edges,
         .weight_mode = .min_hops,
@@ -26615,11 +26734,11 @@ test "graph coordinator base request avoids an implicit retrieval scan" {
 
     const graph_only = graphCoordinatorBaseRequest(.{
         .graph_queries = &graph_queries,
-        .graph_queries_wire_json = "{\"links\":{}}",
+        .graph_queries_proxy_json = "{\"graph_queries\":{\"links\":{}}}",
         .expand_strategy = .@"union",
     });
     try std.testing.expectEqual(@as(usize, 0), graph_only.graph_queries.len);
-    try std.testing.expectEqualStrings("", graph_only.graph_queries_wire_json);
+    try std.testing.expectEqualStrings("", graph_only.graph_queries_proxy_json);
     try std.testing.expectEqual(@as(?graph_query_mod.ExpandStrategy, null), graph_only.expand_strategy);
     try std.testing.expect(graph_only.query == .match_none);
     try std.testing.expect(graph_only.full_text == null);
@@ -26668,7 +26787,6 @@ test "unsupported graph query modes fail closed" {
     };
     const legacy_pattern_queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "mentions",
-        .response_format = .legacy,
         .query = .{
             .query_type = .pattern,
             .index_name = "graph_v1",

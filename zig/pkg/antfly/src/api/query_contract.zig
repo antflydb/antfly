@@ -421,6 +421,15 @@ pub const QueryResponseMeta = struct {
     }
 };
 
+/// Transitional public response shaping. This remains API-local; graph
+/// executors and storage graph plans always use the canonical IR.
+const GraphResponseFormat = enum { canonical, legacy };
+
+fn graphResponseFormat(req: db_mod.types.SearchRequest) GraphResponseFormat {
+    const envelope = std.mem.trim(u8, req.graph_queries_proxy_json, &std.ascii.whitespace);
+    return if (std.mem.startsWith(u8, envelope, "{\"graph_searches\":")) .legacy else .canonical;
+}
+
 fn appendJsonFieldName(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -2666,7 +2675,7 @@ pub fn parseQueryRequestWithDeadline(
     req.sparse_queries = vector_queries.sparse;
     req.graph_queries = try buildGraphQueries(alloc, request);
     if (req.graph_queries.len > 0) {
-        req.graph_queries_wire_json = try captureGraphQueriesWireAlloc(alloc, effective_body);
+        req.graph_queries_proxy_json = try captureGraphQueriesProxyEnvelopeAlloc(alloc, effective_body);
     }
     if (request.expand_strategy) |expand_strategy| {
         req.expand_strategy = try parseExpandStrategy(expand_strategy);
@@ -5288,6 +5297,7 @@ fn buildGraphQueryResults(
 ) !std.json.ArrayHashMap(indexes_openapi.GraphQueryResult) {
     var out: std.json.ArrayHashMap(indexes_openapi.GraphQueryResult) = .{};
     errdefer out.deinit(alloc);
+    const response_format = graphResponseFormat(req);
 
     for (req.graph_queries) |requested| {
         var occurrences: usize = 0;
@@ -5305,7 +5315,7 @@ fn buildGraphQueryResults(
             graph_query.query,
             meta,
             graph_result,
-            graph_query.response_format,
+            response_format,
         ) catch |err| {
             if (graph_path_weight_diagnostic.isDomainError(err)) {
                 graph_path_weight_diagnostic.record(graph_query.name, err);
@@ -5402,7 +5412,7 @@ fn toOpenApiGraphQueryResultWithFormat(
     query: graph_query_mod.GraphQuery,
     meta: QueryResponseMeta,
     graph_result: db_mod.types.GraphSearchResult,
-    response_format: db_mod.types.GraphResponseFormat,
+    response_format: GraphResponseFormat,
 ) !indexes_openapi.GraphQueryResult {
     var document_lookup = try GraphDocumentLookup.init(
         alloc,
@@ -5464,6 +5474,10 @@ fn toOpenApiGraphQueryResultWithFormat(
 
     const nodes = try toOpenApiGraphNodes(alloc, graph_result, &document_lookup);
     const paths = try toOpenApiGraphPaths(alloc, graph_result.paths, query.params.weight_mode);
+    // A path operation exposes one terminal node per returned path. Enforce
+    // that relationship at the producer boundary so result references cannot
+    // observe nodes that are absent from the public path cardinality.
+    if (paths.len > 0 and nodes.len != paths.len) return error.InvalidRemoteResponse;
     const response = try alloc.create(indexes_openapi.GraphNodesResult);
     errdefer alloc.destroy(response);
     response.* = .{
@@ -5762,6 +5776,40 @@ test "graph response encoding requires exactly one result per traversal operatio
     ));
 }
 
+test "canonical path responses require one terminal node per path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var nodes = [_]graph_query_mod.GraphResultNode{
+        .{ .key = "a", .depth = 0, .distance = 0 },
+        .{ .key = "extra", .depth = 0, .distance = 0 },
+    };
+    var path_nodes = [_][]const u8{"a"};
+    var paths = [_]graph_paths_mod.Path{.{
+        .nodes = &path_nodes,
+        .edges = &.{},
+        .total_weight = 0,
+        .length = 0,
+    }};
+    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+        alloc,
+        .{
+            .query_type = .shortest_path,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"a"} },
+            .target_nodes = .{ .keys = &.{"a"} },
+        },
+        .{},
+        .{
+            .name = @constCast("path"),
+            .nodes = &nodes,
+            .paths = &paths,
+            .hits = &.{},
+            .total_hits = 1,
+        },
+    ));
+}
+
 test "deprecated graph search preserves its response envelope" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5791,7 +5839,6 @@ test "deprecated graph search preserves its response envelope" {
 
     const named_queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "neighbors",
-        .response_format = .legacy,
         .query = .{
             .query_type = .neighbors,
             .index_name = "graph_idx",
@@ -5806,7 +5853,12 @@ test "deprecated graph search preserves its response envelope" {
     var encoded = try encodeQueryResponses(
         alloc,
         "docs",
-        .{ .graph_queries = &named_queries },
+        .{
+            .graph_queries = &named_queries,
+            .graph_queries_proxy_json =
+            \\{"graph_searches":{"neighbors":{"type":"neighbors"}}}
+            ,
+        },
         .{ .took_ms = 3 },
         .{
             .alloc = alloc,
@@ -5863,6 +5915,12 @@ test "canonical graph paths preserve table-qualified node identities" {
         .total_weight = 1,
         .length = 1,
     }};
+    var result_nodes = [_]graph_query_mod.GraphResultNode{.{
+        .key = "shared",
+        .table = "entities",
+        .depth = 1,
+        .distance = 1,
+    }};
     const query = graph_query_mod.GraphQuery{
         .query_type = .shortest_path,
         .index_name = "graph_idx",
@@ -5871,6 +5929,7 @@ test "canonical graph paths preserve table-qualified node identities" {
     };
     const graph_result = db_mod.types.GraphSearchResult{
         .name = @constCast("path"),
+        .nodes = &result_nodes,
         .paths = &paths,
         .hits = &.{},
         .total_hits = 1,
@@ -5931,6 +5990,25 @@ test "generated graph result union decodes pre-discriminator legacy responses" {
     defer simd_parsed.deinit();
     try std.testing.expect(simd_parsed.value == .legacy_graph_query_result);
     try std.testing.expectEqual(@as(i64, 12), simd_parsed.value.legacy_graph_query_result.total);
+}
+
+test "generated graph result union rejects an explicit null discriminator" {
+    const raw =
+        \\{"kind":null,"type":"neighbors","total":12}
+    ;
+
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(
+        indexes_openapi.GraphQueryResult,
+        std.testing.allocator,
+        raw,
+        .{},
+    ));
+    try std.testing.expectError(error.UnexpectedToken, ant_json.parseFromSlice(
+        indexes_openapi.GraphQueryResult,
+        std.testing.allocator,
+        raw,
+        .{},
+    ));
 }
 
 fn toOpenApiGraphNodes(
@@ -9284,7 +9362,7 @@ fn buildGraphQueries(
             const query = try parseLegacyGraphQuery(alloc, entry.value_ptr.*);
             var query_owned = true;
             errdefer if (query_owned) freeGraphQuery(alloc, query);
-            try items.append(alloc, .{ .name = name, .query = query, .response_format = .legacy });
+            try items.append(alloc, .{ .name = name, .query = query });
             name_owned = false;
             query_owned = false;
         }
@@ -10258,7 +10336,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     freeNamedDenseQueries(alloc, req.dense_queries);
     freeNamedSparseQueries(alloc, req.sparse_queries);
     freeNamedGraphQueries(alloc, req.graph_queries);
-    if (req.graph_queries_wire_json.len > 0) alloc.free(req.graph_queries_wire_json);
+    if (req.graph_queries_proxy_json.len > 0) alloc.free(req.graph_queries_proxy_json);
     freeNamedDocFilterBindings(alloc, req.doc_filter_bindings);
     if (req.sparse) |sparse| {
         alloc.free(sparse.indices);
@@ -10288,7 +10366,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
 /// Capture only the admitted graph operation map for transparent single-owner
 /// proxying. This stays independent of generated OpenAPI representation details
 /// and avoids a reverse serializer that would have to evolve with the DSL.
-fn captureGraphQueriesWireAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+fn captureGraphQueriesProxyEnvelopeAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
         return error.InvalidQueryRequest;
     defer parsed.deinit();
@@ -10303,7 +10381,10 @@ fn captureGraphQueriesWireAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u
     if (canonical != null and legacy != null) return error.InvalidQueryRequest;
     const value = canonical orelse legacy orelse return error.InvalidQueryRequest;
     if (value != .object) return error.InvalidQueryRequest;
-    return try std.json.Stringify.valueAlloc(alloc, value, .{});
+    var envelope = std.json.ObjectMap.empty;
+    defer envelope.deinit(alloc);
+    try envelope.put(alloc, if (canonical != null) "graph_queries" else "graph_searches", value);
+    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = envelope }, .{});
 }
 
 fn freeNamedDocFilterBindings(alloc: std.mem.Allocator, bindings: []const db_mod.types.NamedDocFilterBinding) void {
@@ -14437,9 +14518,10 @@ test "api query contract owns the admitted graph wire for exact proxying" {
     defer owned.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
-    var wire = try ant_json.parseFromSlice(std.json.Value, alloc, owned.req.graph_queries_wire_json, .{});
+    var wire = try ant_json.parseFromSlice(std.json.Value, alloc, owned.req.graph_queries_proxy_json, .{});
     defer wire.deinit();
-    const walk = wire.value.object.get("walk") orelse return error.TestUnexpectedResult;
+    const graph_queries = wire.value.object.get("graph_queries") orelse return error.TestUnexpectedResult;
+    const walk = graph_queries.object.get("walk") orelse return error.TestUnexpectedResult;
     const traverse = walk.object.get("traverse") orelse return error.TestUnexpectedResult;
     try std.testing.expect(traverse.object.get("direction") == null);
     const filter = traverse.object.get("filter") orelse return error.TestUnexpectedResult;

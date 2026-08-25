@@ -308,6 +308,19 @@ func TestGraphAggregateConstructorAllowsDuplicateExpressionsUnderDifferentNames(
 	}
 }
 
+func TestGraphIdentifiersReserveControlTokens(t *testing.T) {
+	for _, name := range []string{"*", "$query_results", " \t "} {
+		if _, err := NewGraphAggregatesReturn(map[string]GraphCountAggregate{
+			name: CountGraphRows(),
+		}); err == nil {
+			t.Fatalf("expected aggregate name %q to be rejected", name)
+		}
+		if _, err := NewGraphBindingsReturn([]string{name}, GraphBindingsOptions{}); err == nil {
+			t.Fatalf("expected binding alias %q to be rejected", name)
+		}
+	}
+}
+
 func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 	var result GraphQueryResult
 	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`), &result); err != nil {

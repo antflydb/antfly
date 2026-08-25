@@ -1967,7 +1967,7 @@ test "query parser adapts deprecated graph searches" {
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
     try std.testing.expectEqualStrings("neighbors", owned.req.graph_queries[0].name);
     try std.testing.expect(owned.req.graph_queries[0].query.query_type == .neighbors);
-    try std.testing.expect(owned.req.graph_queries[0].response_format == .legacy);
+    try std.testing.expect(std.mem.startsWith(u8, owned.req.graph_queries_proxy_json, "{\"graph_searches\":"));
 }
 
 test "query parser rejects graph queries and graph searches together" {

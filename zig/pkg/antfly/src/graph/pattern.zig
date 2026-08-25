@@ -331,6 +331,11 @@ fn consumeMaterializedEdges(work_budget: *WorkBudget, edges: []const graph_mod.E
 
 pub fn isValidIdentifier(value: []const u8) bool {
     if (value.len == 0 or value.len > max_identifier_bytes) return false;
+    // `*` is the count-rows sentinel and `$...` is reserved for result/control
+    // references. Keeping both out of the alias namespace makes every parsed
+    // identifier unambiguous throughout admission and execution.
+    if (std.mem.eql(u8, value, "*") or value[0] == '$') return false;
+    if (std.mem.trim(u8, value, &std.ascii.whitespace).len == 0) return false;
     const codepoints = std.unicode.utf8CountCodepoints(value) catch return false;
     return codepoints >= 1 and codepoints <= max_identifier_codepoints;
 }

@@ -12061,7 +12061,7 @@ export interface components {
             fields?: string[];
         };
         GraphCountAggregate: {
-            /** @description Use `*` to count rows, or an alias to count non-null bindings. */
+            /** @description Use the reserved token `*` to count rows, or an alias to count non-null bindings. Graph aliases cannot be `*`, all-whitespace, or begin with `$`; the `$` namespace is reserved for result references. */
             count: string;
             /**
              * @description Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
