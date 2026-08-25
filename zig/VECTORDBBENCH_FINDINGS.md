@@ -1809,6 +1809,28 @@ planner and test were reverted; the validated anchor-preserving checkpoint is
 the retained policy. Do not weaken the 2x bound merely to force a prettier
 final manifest.
 
+Public-profile boundary diagnostics also ruled out tree shape as the cause of
+the earlier 1M query-latency spread. Replaying the same 1,000 public API
+queries against the anchor-preserving and no-seal trees produced 443.69 versus
+438.91 rerank candidates/query, 0.00789 versus 0.00786 mean boundary-tail
+error, and materially identical interval gaps and recall. Their prior
+37.21/81.37 versus 52.15/104.59 ms mean/p95 profiles were therefore cache and
+host-state variance, not a quality regression caused by the L0 layout.
+
+A promising-candidate-first progressive rerank was implemented and rejected.
+It kept candidate selection unchanged and sorted vector ids within each
+128-vector storage batch, but activated the existing interval stop much more
+often. At 1M it skipped 75.17 of 444.88 candidates/query and improved a noisy
+cold replay from 96.92/144.85 to 60.80/109.33 ms mean/p95, while recall moved
+from 0.98392 to 0.98072. At 50K it skipped 106.11 of 254.31 candidates/query
+but recall fell from 0.98396 to 0.95400, outside the parity envelope. The
+quantization intervals are not a sufficient hard membership proof for this
+reordering. The execution change was reverted; retain vector-id ordering and
+boundary rerank until a stronger conservative bound is available. Also do not
+compare the 50K diagnostic-only cold replay's 14.16 ms mean against the 3.67
+ms post-warm profile: diagnostic-only resume intentionally skips the two
+official serial warm-up stages.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process

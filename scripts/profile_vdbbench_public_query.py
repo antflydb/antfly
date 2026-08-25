@@ -35,6 +35,42 @@ PROFILE_FIELDS = (
     "postprocess_ns",
 )
 
+COUNT_PROFILE_FIELDS = (
+    "hbc_nodes_visited",
+    "hbc_leaves_explored",
+    "hbc_approx_vectors_scored",
+    "hbc_exact_vectors_scored",
+    "hbc_reranked_vectors",
+    "hbc_approx_candidate_count",
+    "hbc_rerank_candidate_count",
+    "hbc_rerank_batches",
+    "hbc_rerank_max_batch_size",
+    "hbc_rerank_candidates_skipped_by_bound",
+    "hbc_ambiguous_top_k_pairs",
+    "hbc_ambiguous_boundary_pairs",
+    "hbc_ambiguous_distance_over_hits",
+    "hbc_ambiguous_distance_under_hits",
+    "hbc_top_k_count",
+    "hbc_rerank_metadata_vectors_loaded",
+    "hbc_rerank_lsm_cache_hits",
+    "hbc_rerank_lsm_cache_misses",
+    "hbc_rerank_artifact_cache_hits",
+    "hbc_rerank_artifact_vectors_loaded",
+)
+
+FLOAT_PROFILE_FIELDS = (
+    "hbc_min_distance_gap_top_k",
+    "hbc_min_interval_gap_top_k",
+    "hbc_boundary_tail_error_avg",
+    "hbc_boundary_tail_error_max",
+    "hbc_boundary_tail_distance_gap_avg",
+    "hbc_boundary_tail_distance_gap_min",
+    "hbc_boundary_tail_distance_gap_max",
+    "hbc_boundary_tail_interval_gap_avg",
+    "hbc_boundary_tail_interval_gap_min",
+    "hbc_boundary_tail_interval_gap_max",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -82,6 +118,17 @@ def timing_summary(values: list[float]) -> dict[str, float]:
     }
 
 
+def value_summary(values: list[float]) -> dict[str, float]:
+    return {
+        "mean": sum(values) / len(values),
+        "min": min(values),
+        "p50": percentile(values, 0.50),
+        "p95": percentile(values, 0.95),
+        "p99": percentile(values, 0.99),
+        "max": max(values),
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     vectors = pq.ParquetFile(args.dataset / "test.parquet").read(columns=["emb"])["emb"]
     neighbors = pq.ParquetFile(args.dataset / "neighbors.parquet").read(
@@ -100,6 +147,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     approximate: list[int] = []
     exact: list[int] = []
     profile_timings: dict[str, list[float]] = {field: [] for field in PROFILE_FIELDS}
+    profile_values: dict[str, list[float]] = {
+        field: [] for field in COUNT_PROFILE_FIELDS + FLOAT_PROFILE_FIELDS
+    }
+    full_rerank_due_to_threshold = 0
     samples: list[dict[str, Any]] = []
     url = f"http://{args.host}:{args.port}/db/v1/tables/{args.table}/query"
 
@@ -143,6 +194,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 value_ms = float(profile.get(field, 0) or 0) / 1_000_000
                 profile_timings[field].append(value_ms)
                 sample[field.removesuffix("_ns") + "_ms"] = value_ms
+            for field in COUNT_PROFILE_FIELDS:
+                value = int(profile.get(field, 0) or 0)
+                profile_values[field].append(float(value))
+                sample[field] = value
+            for field in FLOAT_PROFILE_FIELDS:
+                value = float(profile.get(field, 0) or 0)
+                profile_values[field].append(value)
+                sample[field] = value
+            if bool(profile.get("hbc_full_rerank_due_to_threshold", False)):
+                full_rerank_due_to_threshold += 1
             samples.append(sample)
 
     return {
@@ -158,6 +219,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "leaves_mean": sum(leaves) / len(leaves),
         "approximate_vectors_mean": sum(approximate) / len(approximate),
         "exact_vectors_mean": sum(exact) / len(exact),
+        "profile_values": {
+            field: value_summary(values) for field, values in profile_values.items()
+        },
+        "full_rerank_due_to_threshold_count": full_rerank_due_to_threshold,
         "server_timings": {
             field: timing_summary(values) for field, values in profile_timings.items()
         },
