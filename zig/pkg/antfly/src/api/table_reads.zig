@@ -3873,6 +3873,11 @@ pub const HostedProvisionedTableReadSource = struct {
         return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else backend_current_root_generation;
     }
 
+    fn monotonicNs(self: *const HostedProvisionedTableReadSource) u64 {
+        const io_impl = self.io_impl orelse return platform_time.monotonicNs();
+        return @intCast(std.Io.Clock.now(.awake, io_impl.io()).nanoseconds);
+    }
+
     pub fn source(self: *HostedProvisionedTableReadSource) TableReadSource {
         return .{
             .ptr = self,
@@ -4133,7 +4138,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        const start_ns = platform_time.monotonicNs();
+        const start_ns = self.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
             defer route.deinit(alloc);
@@ -4146,7 +4151,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 defer result.deinit();
                 const response_req = execution.request;
                 var meta: query_api.QueryResponseMeta = .{
-                    .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
+                    .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
                     .shard_count = 1,
                     .dense_search = execution.dense_profile,
                 };
@@ -4173,7 +4178,7 @@ pub const HostedProvisionedTableReadSource = struct {
             merged.graph_results = graph_results;
 
             var meta: query_api.QueryResponseMeta = .{
-                .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
+                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
                 .shard_count = @intCast(group_ids.len),
                 .merged = true,
             };
@@ -4187,7 +4192,7 @@ pub const HostedProvisionedTableReadSource = struct {
         try checkQueryDeadline(req);
         defer merged.deinit();
         var meta: query_api.QueryResponseMeta = .{
-            .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
+            .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
             .shard_count = @intCast(group_ids.len),
             .merged = group_ids.len > 1,
         };

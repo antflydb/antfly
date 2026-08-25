@@ -125,8 +125,8 @@ pub const GraphResultNode = struct {
     key: []const u8,
     depth: u32,
     distance: f64,
-    path: ?[]const []const u8,
-    path_edges: ?[]const PathEdgeInfo,
+    path: ?[]const []const u8 = null,
+    path_edges: ?[]const PathEdgeInfo = null,
     provenance: ?[]const []const u8 = null,
     /// Table the node's document lives in, when an edge reaching it declared a
     /// cross-table endpoint (`target_table` in its metadata). Null means the
@@ -157,6 +157,19 @@ pub const GraphResultNode = struct {
         self.* = undefined;
     }
 };
+
+test "graph result node JSON accepts omitted optional path fields" {
+    var parsed = try std.json.parseFromSlice(
+        GraphResultNode,
+        std.testing.allocator,
+        "{\"key\":\"doc:z\",\"depth\":1,\"distance\":1}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expect(parsed.value.path == null);
+    try std.testing.expect(parsed.value.path_edges == null);
+}
 
 pub const GraphQueryResult = struct {
     nodes: []GraphResultNode,

@@ -21,7 +21,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "distributed-query";
-    pub const version: u32 = 1;
+    pub const version: u32 = 2;
 
     const result_id = vopr.id.stable(name, "result-sound");
     const retry_id = vopr.id.stable(name, "retry-bounded");
@@ -43,6 +43,7 @@ pub const Scenario = struct {
 
     const Mode = enum {
         fanout_hydrate,
+        fanout_nodes_only,
         topology_retry,
         retry_exhausted,
         cancel_in_flight,
@@ -137,7 +138,7 @@ pub const Scenario = struct {
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *State = @ptrCast(@alignCast(ptr));
             const ranges: []const metadata_table_manager.RangeRecord = switch (self.mode.?) {
-                .fanout_hydrate, .cancel_in_flight => fanout_ranges[0..],
+                .fanout_hydrate, .fanout_nodes_only, .cancel_in_flight => fanout_ranges[0..],
                 else => retry_ranges[@min(self.phase, retry_ranges.len - 1)][0..],
             };
             return .{
@@ -256,7 +257,7 @@ pub const Scenario = struct {
                 return;
             }
 
-            const start_nodes = if (self.mode.? == .fanout_hydrate or self.mode.? == .cancel_in_flight)
+            const start_nodes = if (self.mode.? == .fanout_hydrate or self.mode.? == .fanout_nodes_only or self.mode.? == .cancel_in_flight)
                 &[_][]const u8{ "doc:a", "doc:n" }
             else
                 &[_][]const u8{"doc:a"};
@@ -269,6 +270,7 @@ pub const Scenario = struct {
                         .index_name = "graph_idx",
                         .start_nodes = .{ .keys = start_nodes },
                         .params = .{},
+                        .include_documents = self.mode.? != .fanout_nodes_only,
                     },
                 }},
                 .identity_read_generation = if (self.mode.? == .stale_generation) null else 77,
@@ -307,6 +309,9 @@ pub const Scenario = struct {
                 .fanout_hydrate => self.expand_calls.load(.monotonic) == 2 and
                     self.hydrate_calls.load(.monotonic) == 2 and results.len == 1 and
                     results[0].nodes.len == 2 and results[0].hits.len == 2,
+                .fanout_nodes_only => self.expand_calls.load(.monotonic) == 2 and
+                    self.hydrate_calls.load(.monotonic) == 0 and results.len == 1 and
+                    results[0].nodes.len == 2 and results[0].hits.len == 0,
                 .topology_retry => self.expand_calls.load(.monotonic) == 2 and
                     self.hydrate_calls.load(.monotonic) == 1 and results.len == 1,
                 else => false,
@@ -340,7 +345,7 @@ pub const Scenario = struct {
                 .id = id,
                 .name = mode_name,
                 .kind = switch (mode) {
-                    .fanout_hydrate, .topology_retry, .cross_table_authorization => .workload,
+                    .fanout_hydrate, .fanout_nodes_only, .topology_retry, .cross_table_authorization => .workload,
                     else => .fault,
                 },
             });
@@ -418,7 +423,7 @@ test "distributed query VOPR exact replays fanout topology snapshots cancellatio
             .system = "antfly",
             .transition_budget = 2_000,
             .backend_ids = &backend_ids,
-            .source_revision = "distributed-query-vopr-v1",
+            .source_revision = "distributed-query-vopr-v2",
             .target = "native",
             .optimize = @tagName(@import("builtin").mode),
         });

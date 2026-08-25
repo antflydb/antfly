@@ -502,6 +502,12 @@ const EnsureGroupTextIndexProgressContext = struct {
     index_name: []const u8,
 };
 
+const EnsureGroupGraphIndexProgressContext = struct {
+    replica_root_dir: []const u8,
+    group_id: u64,
+    index_name: []const u8,
+};
+
 fn projectedIdentityNamespaceForGroup(
     cluster: *MetadataHttpClusterSimulation,
     group_id: u64,
@@ -599,6 +605,78 @@ fn ensureGroupTextIndexOnActiveReplicas(
     if (ensured == 0) return error.TestExpectedEqual;
 }
 
+fn ensureGroupGraphIndexProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
+    const ctx: *EnsureGroupGraphIndexProgressContext = @ptrCast(@alignCast(ptr));
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(cluster.alloc, ctx.replica_root_dir, ctx.group_id);
+    defer cluster.alloc.free(path);
+    const identity_namespace = try projectedIdentityNamespaceForGroup(cluster, ctx.group_id);
+
+    var read_db = db_mod.DB.open(cluster.alloc, path, .{
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .identity_namespace = identity_namespace,
+        .backend_runtime = backendRuntimeForReplicaRoot(cluster, ctx.replica_root_dir),
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists, error.FileNotFound => return false,
+        else => return err,
+    };
+    defer read_db.close();
+
+    if (read_db.core.index_manager.graphIndex(ctx.index_name) != null) return true;
+
+    var db = db_mod.DB.open(cluster.alloc, path, .{
+        .start_index_workers = false,
+        .identity_namespace = identity_namespace,
+        .backend_runtime = backendRuntimeForReplicaRoot(cluster, ctx.replica_root_dir),
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists, error.FileNotFound => return false,
+        error.LsmRootWriterAlreadyOpen => return true,
+        else => return err,
+    };
+    defer db.close();
+
+    if (db.core.index_manager.graphIndex(ctx.index_name) == null) {
+        try db.addIndex(.{
+            .name = ctx.index_name,
+            .kind = .graph,
+            .config_json = "{}",
+        });
+    }
+    return true;
+}
+
+fn ensureGroupGraphIndex(
+    cluster: *MetadataHttpClusterSimulation,
+    replica_root_dir: []const u8,
+    group_id: u64,
+    index_name: []const u8,
+    max_rounds: usize,
+) !void {
+    var ctx = EnsureGroupGraphIndexProgressContext{
+        .replica_root_dir = replica_root_dir,
+        .group_id = group_id,
+        .index_name = index_name,
+    };
+    if (try cluster.runUntil(max_rounds, &ctx, ensureGroupGraphIndexProgressPredicate)) return;
+    return error.FileNotFound;
+}
+
+fn ensureGroupGraphIndexOnActiveReplicas(
+    cluster: *MetadataHttpClusterSimulation,
+    replica_root_dirs: []const []const u8,
+    group_id: u64,
+    index_name: []const u8,
+    max_rounds: usize,
+) !void {
+    var ensured: usize = 0;
+    for (0..cluster.cluster.nodes.len) |i| {
+        if (cluster.node(i).status(group_id) != .active) continue;
+        try ensureGroupGraphIndex(cluster, replica_root_dirs[i], group_id, index_name, max_rounds);
+        ensured += 1;
+    }
+    if (ensured == 0) return error.TestExpectedEqual;
+}
+
 fn runtimeDocIdentityStatusReportFromStats(
     stats: db_mod.types.DocIdentityStats,
 ) metadata_table_manager.RuntimeDocIdentityStatusReport {
@@ -639,7 +717,7 @@ fn reportRuntimeDocIdentityForActiveReplicas(
     group_ids: []const u64,
     metrics_override: ?RuntimeGroupMetricsOverride,
 ) !void {
-    const alloc = std.testing.allocator;
+    const alloc = cluster.alloc;
     var reports = std.ArrayListUnmanaged(metadata_table_manager.StoreStatusReport).empty;
     defer {
         for (reports.items) |report| {
@@ -744,6 +822,7 @@ fn seedGroupDocsAcrossReplicaRoots(
     group_id: u64,
     writes: []const db_mod.types.BatchWrite,
 ) !void {
+    const identity_namespace = try projectedIdentityNamespaceForGroup(cluster, group_id);
     for (replica_root_dirs) |replica_root_dir| {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(cluster.alloc, replica_root_dir, group_id);
         defer cluster.alloc.free(path);
@@ -753,6 +832,8 @@ fn seedGroupDocsAcrossReplicaRoots(
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
             .backend_runtime = backendRuntimeForReplicaRoot(cluster, replica_root_dir),
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = identity_namespace != null,
         }) catch |err| switch (err) {
             error.PathAlreadyExists, error.FileNotFound => continue,
             else => return err,
@@ -5844,6 +5925,9 @@ pub const VoprPublicClusterFixture = struct {
     const data_group_id: u64 = 6842;
     const tenant_table_id: u64 = 6843;
     const tenant_data_group_id: u64 = 6844;
+    const graph_data_group_id: u64 = 6845;
+    const graph_index_name = "graph_idx";
+    const graph_indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}";
 
     alloc: std.mem.Allocator,
     sim: *vopr.vopr_io.VoprIo,
@@ -5895,12 +5979,14 @@ pub const VoprPublicClusterFixture = struct {
     read_finished: bool = false,
     tenant_write_finished: bool = false,
     tenant_read_finished: bool = false,
+    graph_read_finished: bool = false,
     fault_finished: bool = false,
     write_sound: bool = false,
     read_sound: bool = false,
     tenant_write_sound: bool = false,
     tenant_read_sound: bool = false,
     table_isolation_sound: bool = false,
+    graph_query_sound: bool = false,
     topology_sound: bool = false,
     resource_denial_sound: bool = false,
     resource_recovery_sound: bool = false,
@@ -6017,37 +6103,70 @@ pub const VoprPublicClusterFixture = struct {
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
-        const ranges = [_]metadata_table_manager.RangeRecord{.{
-            .group_id = data_group_id,
-            .table_id = table_id,
-            .start_key = "doc:a",
-            .end_key = null,
-        }};
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{
+                .group_id = data_group_id,
+                .table_id = table_id,
+                .start_key = "doc:a",
+                .end_key = "doc:m",
+            },
+            .{
+                .group_id = graph_data_group_id,
+                .table_id = table_id,
+                .start_key = "doc:m",
+                .end_key = null,
+            },
+        };
         try createActiveTableRanges(&workflow, &self.cluster, self.metadata_leader_index, .{
             .table_id = table_id,
             .name = "docs",
             .description = "full cluster VOPR documents",
-            .indexes_json = api_tables.default_indexes_json,
+            .indexes_json = graph_indexes_json,
             .desired_replica_count = 2,
             .min_ranges = 1,
-        }, &ranges, 64);
+        }, &ranges, 192);
         const placement = try waitForFirstProjectedRange(
             &self.cluster,
             self.metadata_leader_index,
-            1,
+            2,
             2,
             true,
-            64,
+            192,
         );
         self.actual_host_count = placement.active_count;
         self.client_index = placement.non_host_index orelse return error.FullClusterNonHostMissing;
-        try ensureGroupTextIndexOnActiveReplicas(
+        try std.testing.expect(try self.cluster.waitForGroupStatusCount(graph_data_group_id, .active, 2, 192));
+        try ensureGroupGraphIndexOnActiveReplicas(
             &self.cluster,
             self.roots[0..],
             data_group_id,
-            api_tables.default_full_text_index_name,
-            64,
+            graph_index_name,
+            192,
         );
+        try ensureGroupGraphIndexOnActiveReplicas(
+            &self.cluster,
+            self.roots[0..],
+            graph_data_group_id,
+            graph_index_name,
+            192,
+        );
+        try seedGroupDocsAcrossReplicaRoots(&self.cluster, self.roots[0..], data_group_id, &.{
+            .{ .key = "doc:b", .value = "{\"title\":\"identity bootstrap left\"}" },
+        });
+        try seedGroupDocsAcrossReplicaRoots(&self.cluster, self.roots[0..], graph_data_group_id, &.{
+            .{ .key = "doc:x", .value = "{\"title\":\"identity bootstrap right\"}" },
+        });
+        const graph_groups = [_]u64{ data_group_id, graph_data_group_id };
+        const status_node = currentMetadataMutationNode(self.cluster.node(self.metadata_leader_index));
+        try reportRuntimeDocIdentityForActiveReplicas(
+            &self.cluster,
+            status_node,
+            self.roots[0..],
+            "docs",
+            &graph_groups,
+            null,
+        );
+        try self.cluster.stepAll();
 
         const tenant_ranges = [_]metadata_table_manager.RangeRecord{.{
             .group_id = tenant_data_group_id,
@@ -6062,21 +6181,21 @@ pub const VoprPublicClusterFixture = struct {
             .indexes_json = api_tables.default_indexes_json,
             .desired_replica_count = 2,
             .min_ranges = 1,
-        }, &tenant_ranges, 64);
+        }, &tenant_ranges, 192);
         _ = try waitForFirstProjectedRange(
             &self.cluster,
             self.metadata_leader_index,
-            2,
+            3,
             2,
             true,
-            64,
+            192,
         );
         try ensureGroupTextIndexOnActiveReplicas(
             &self.cluster,
             self.roots[0..],
             tenant_data_group_id,
             api_tables.default_full_text_index_name,
-            64,
+            192,
         );
 
         const deterministic_http_config: io_http_executor.IoHttpExecutorConfig = .{
@@ -6148,6 +6267,7 @@ pub const VoprPublicClusterFixture = struct {
         _ = self.sim.io().async(runReader, .{self});
         _ = self.sim.io().async(runTenantWriter, .{self});
         _ = self.sim.io().async(runTenantReader, .{self});
+        _ = self.sim.io().async(runGraphReader, .{self});
         _ = self.sim.io().async(shutdownWhenComplete, .{self});
     }
 
@@ -6158,7 +6278,7 @@ pub const VoprPublicClusterFixture = struct {
             self.write_done.set(self.sim.io());
         }
         var response = self.client.fetchBatch(self.api_base_uris[self.client_index], "docs",
-            \\{"inserts":{"doc:z":{"title":"zeta","body":"hello distributed world"},"doc:y":{"title":"gamma","body":"hello cluster"}}}
+            \\{"inserts":{"doc:a":{"title":"alpha","body":"graph source","_edges":{"graph_idx":{"links":[{"target":"doc:z"}]}}},"doc:z":{"title":"zeta","body":"hello distributed world","_edges":{"graph_idx":{"links":[{"target":"doc:y"}]}}},"doc:y":{"title":"gamma","body":"hello cluster"}},"sync_level":"full_index"}
         ) catch |err| {
             self.request_errors +|= 1;
             self.last_request_error_code = @intFromError(err);
@@ -6166,7 +6286,7 @@ pub const VoprPublicClusterFixture = struct {
         };
         defer response.deinit(self.alloc);
         self.write_sound = response.status >= 200 and response.status < 300 and
-            std.mem.indexOf(u8, response.body, "\"inserted\":2") != null;
+            std.mem.indexOf(u8, response.body, "\"inserted\":3") != null;
     }
 
     fn runReader(self: *VoprPublicClusterFixture) void {
@@ -6184,16 +6304,7 @@ pub const VoprPublicClusterFixture = struct {
             return;
         };
         defer lookup.deinit(self.alloc);
-        if (std.mem.indexOf(u8, lookup.body, "\"zeta\"") == null) return;
-        var query = self.client.fetchQuery(self.api_base_uris[self.client_index], "docs",
-            \\{"full_text_search":{"match":{"field":"body","text":"distributed"}},"fields":["title","body"],"limit":10}
-        ) catch |err| {
-            self.request_errors +|= 1;
-            self.last_request_error_code = @intFromError(err);
-            return;
-        };
-        defer query.deinit(self.alloc);
-        self.read_sound = std.mem.indexOf(u8, query.body, "\"_id\":\"doc:z\"") != null;
+        self.read_sound = std.mem.indexOf(u8, lookup.body, "\"zeta\"") != null;
     }
 
     fn runTenantWriter(self: *VoprPublicClusterFixture) void {
@@ -6228,17 +6339,73 @@ pub const VoprPublicClusterFixture = struct {
             return;
         };
         defer tenant_query.deinit(self.alloc);
-        var docs_query = self.client.fetchQuery(self.api_base_uris[self.client_index], "docs",
-            \\{"full_text_search":{"match":{"field":"body","text":"tenant-isolation-sentinel"}},"fields":["title","body"],"limit":10}
+        self.tenant_read_sound = std.mem.indexOf(u8, tenant_query.body, "\"_id\":\"tenant:z\"") != null;
+        if (self.client.fetchLookup(
+            self.api_base_uris[self.client_index],
+            "docs",
+            "tenant:z",
+            null,
+        )) |response| {
+            var unexpected = response;
+            unexpected.deinit(self.alloc);
+        } else |err| {
+            if (err == error.UnexpectedHttpStatus) {
+                self.table_isolation_sound = self.tenant_read_sound;
+            } else {
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+            }
+        }
+    }
+
+    fn runGraphReader(self: *VoprPublicClusterFixture) void {
+        self.write_done.waitUncancelable(self.sim.io());
+        defer self.graph_read_finished = true;
+        if (!self.write_sound) return;
+
+        while (!self.fault_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
+        const query_body = test_contract_helpers.encodeGraphTraverseQueryRequest(
+            self.alloc,
+            "walk",
+            graph_index_name,
+            &.{"doc:a"},
+            &.{"links"},
+            2,
+            10,
         ) catch |err| {
             self.request_errors +|= 1;
             self.last_request_error_code = @intFromError(err);
             return;
         };
-        defer docs_query.deinit(self.alloc);
-        self.tenant_read_sound = std.mem.indexOf(u8, tenant_query.body, "\"_id\":\"tenant:z\"") != null;
-        self.table_isolation_sound = self.tenant_read_sound and
-            std.mem.indexOf(u8, docs_query.body, "\"_id\":\"tenant:z\"") == null;
+        defer self.alloc.free(query_body);
+        var query = self.client.fetchQuery(
+            self.api_base_uris[self.client_index],
+            "docs",
+            query_body,
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer query.deinit(self.alloc);
+        var parsed = std.json.parseFromSlice(metadata_openapi.QueryResponses, self.alloc, query.body, .{}) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer parsed.deinit();
+        const responses = parsed.value.responses orelse return;
+        if (responses.len != 1) return;
+        const graph_results = responses[0].graph_results orelse return;
+        const walk = graph_results.map.get("walk") orelse return;
+        const nodes = walk.nodes orelse return;
+        var found_z = false;
+        var found_y = false;
+        for (nodes) |node| {
+            found_z = found_z or std.mem.eql(u8, node.key, "doc:z");
+            found_y = found_y or std.mem.eql(u8, node.key, "doc:y");
+        }
+        self.graph_query_sound = walk.total == 2 and nodes.len == 2 and found_z and found_y;
     }
 
     fn healMetadataPartition(self: *VoprPublicClusterFixture, node_id: u64) void {
@@ -6259,6 +6426,12 @@ pub const VoprPublicClusterFixture = struct {
     }
 
     fn restartNonHost(self: *VoprPublicClusterFixture) void {
+        self.write_done.waitUncancelable(self.sim.io());
+        while (!self.read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            return;
+        };
         self.cluster.restartNode(self.client_index) catch {
             self.request_errors +|= 1;
             self.fault_finished = true;
@@ -6267,6 +6440,8 @@ pub const VoprPublicClusterFixture = struct {
         self.raft_wire_runtimes[self.client_index].setTarget(
             self.cluster.cluster.node(self.client_index).serverRequestExecutor(),
         );
+        self.read_sources[self.client_index].requester =
+            self.cluster.cluster.node(self.client_index).runtime.svc.readableLeaseRequester();
         const restarted_node_id = self.cluster.cluster.configs[self.client_index].host.http.host.local_node_id;
         self.cluster.virtual_network.registerNode(
             restarted_node_id,
@@ -6276,13 +6451,31 @@ pub const VoprPublicClusterFixture = struct {
             self.fault_finished = true;
             return;
         };
+        var recovered = false;
         var rounds: usize = 0;
-        while (rounds < 16) : (rounds += 1) self.cluster.stepAll() catch {
-            self.request_errors +|= 1;
-            self.fault_finished = true;
-            return;
-        };
-        self.topology_sound = currentMetadataLeaderIndex(&self.cluster) != null;
+        while (rounds < 192) : (rounds += 1) {
+            self.cluster.stepAll() catch {
+                self.request_errors +|= 1;
+                self.fault_finished = true;
+                return;
+            };
+            if (currentMetadataLeaderIndex(&self.cluster) == null or
+                currentGroupLeaderIndex(&self.cluster, data_group_id) == null or
+                currentGroupLeaderIndex(&self.cluster, graph_data_group_id) == null)
+                continue;
+
+            const ranges = self.cluster.node(self.client_index).listProjectedRanges(self.alloc) catch continue;
+            defer self.cluster.node(self.client_index).freeProjectedRanges(self.alloc, ranges);
+            var docs_ranges: usize = 0;
+            for (ranges) |range| if (range.table_id == table_id) {
+                docs_ranges += 1;
+            };
+            if (docs_ranges == 2) {
+                recovered = true;
+                break;
+            }
+        }
+        self.topology_sound = recovered;
         self.fault_finished = true;
     }
 
@@ -6358,7 +6551,7 @@ pub const VoprPublicClusterFixture = struct {
 
     fn shutdownWhenComplete(self: *VoprPublicClusterFixture) void {
         while (!self.write_finished or !self.read_finished or !self.tenant_write_finished or
-            !self.tenant_read_finished or !self.fault_finished)
+            !self.tenant_read_finished or !self.graph_read_finished or !self.fault_finished)
         {
             self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
                 self.request_errors +|= 1;
@@ -6455,11 +6648,13 @@ pub const VoprPublicClusterFixture = struct {
         resource_recovery_ok: bool,
         resource_pressure_observed: bool,
         resource_denial_error_code: u64,
+        graph_query_ok: bool,
     } {
         return .{
             .hosts = self.actual_host_count,
             .requests_ok = self.write_sound and self.read_sound and self.tenant_write_sound and
-                self.tenant_read_sound and self.table_isolation_sound and self.request_errors == 0,
+                self.tenant_read_sound and self.table_isolation_sound and self.graph_query_sound and
+                self.request_errors == 0,
             .topology_ok = self.topology_sound,
             .cleanup_ok = self.cleanup_sound,
             .raft_wire_requests = self.raft_wire_requests,
@@ -6468,6 +6663,7 @@ pub const VoprPublicClusterFixture = struct {
             .resource_recovery_ok = self.resource_recovery_sound,
             .resource_pressure_observed = self.resource_pressure_observed,
             .resource_denial_error_code = self.resource_denial_error_code,
+            .graph_query_ok = self.graph_query_sound,
         };
     }
 

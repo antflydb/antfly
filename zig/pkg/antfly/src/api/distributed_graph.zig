@@ -1938,11 +1938,13 @@ fn executeDistributedTraverse(
         frontier = try next_frontier.toOwnedSlice(alloc);
     }
 
-    state.hits = try adoptHydratedHits(
-        alloc,
-        state.hits,
-        try hydrateHitsForResultNodes(alloc, admission, state.nodes.items),
-    );
+    if (graph_query.query.include_documents) {
+        state.hits = try adoptHydratedHits(
+            alloc,
+            state.hits,
+            try hydrateHitsForResultNodes(alloc, admission, state.nodes.items),
+        );
+    }
 
     const total_hits: u32 = @intCast(state.nodes.items.len);
     const name = state.name;
@@ -1992,7 +1994,10 @@ fn executeDistributedShortestPath(
         alloc.free(nodes);
     };
 
-    const hits = try hydrateHitsForResultNodes(alloc, admission, nodes);
+    const hits = if (graph_query.query.include_documents)
+        try hydrateHitsForResultNodes(alloc, admission, nodes)
+    else
+        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
     errdefer {
         for (hits) |*hit| hit.deinit(alloc);
         if (hits.len > 0) alloc.free(hits);
@@ -2217,7 +2222,10 @@ fn executeDistributedKShortestPaths(
         alloc.free(out_paths);
     }
 
-    const hits = try hydrateHitsForResultNodes(alloc, admission, out_nodes);
+    const hits = if (graph_query.query.include_documents)
+        try hydrateHitsForResultNodes(alloc, admission, out_nodes)
+    else
+        @constCast((&[_]db_mod.types.SearchHit{})[0..]);
     errdefer {
         for (hits) |*hit| hit.deinit(alloc);
         if (hits.len > 0) alloc.free(hits);
