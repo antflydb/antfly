@@ -5028,6 +5028,10 @@ pub const DataServer = struct {
         }
         _ = self.read_source.withSecretStore(api_server_cfg.secret_store);
         _ = self.write_source.withSecretStore(api_server_cfg.secret_store);
+        _ = self.write_source.withDestinationAuthorization(.{
+            .manager = api_server_cfg.user_manager,
+            .auth_enabled = api_server_cfg.auth_enabled,
+        });
         const restore_io = if (self.backend_runtime) |runtime| runtime.apiIo() else null;
         _ = self.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
         _ = self.read_source.withRemoteContent(api_server_cfg.remote_content);
@@ -5047,6 +5051,10 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             apply_sm.attachProvisionedStorage(&self.provisioned_storage);
             _ = apply_sm.write_source.withSecretStore(api_server_cfg.secret_store);
+            _ = apply_sm.write_source.withDestinationAuthorization(.{
+                .manager = api_server_cfg.user_manager,
+                .auth_enabled = api_server_cfg.auth_enabled,
+            });
             _ = apply_sm.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
             _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
             _ = try apply_sm.write_source.withHAWriteGate(ha_write_gate);

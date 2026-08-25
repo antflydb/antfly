@@ -246,6 +246,12 @@ pub fn parseBatchWriteBody(allocator: std.mem.Allocator, body: []const u8) !std.
     return std.json.parseFromSlice(types.BatchRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Adopt stored write destinations with the current credential
+pub const ReauthorizeTableDestinationsPathParams = struct {
+    /// Name of the table whose stored destinations should be adopted
+    table_name: []const u8,
+};
+
 /// Scan documents in a table within a key range
 pub const ScanKeysPathParams = struct {
     /// Name of the table
@@ -575,6 +581,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel", .operation_id = "cancelDocumentArtifactReprocessJob", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/backup", .operation_id = "backupTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/batch", .operation_id = "batchWrite", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/destination-authorization", .operation_id = "reauthorizeTableDestinations", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/documents", .operation_id = "scanKeys", .request_body = .buffered, .streaming_response = true },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey", .request_body = .none, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests", .request_body = .none, .streaming_response = false },
@@ -652,6 +659,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "cancelDocumentArtifactReprocessJob")) @compileError("ServerRouter: Impl missing required method 'cancelDocumentArtifactReprocessJob'");
         if (!@hasDecl(Impl, "backupTable")) @compileError("ServerRouter: Impl missing required method 'backupTable'");
         if (!@hasDecl(Impl, "batchWrite")) @compileError("ServerRouter: Impl missing required method 'batchWrite'");
+        if (!@hasDecl(Impl, "reauthorizeTableDestinations")) @compileError("ServerRouter: Impl missing required method 'reauthorizeTableDestinations'");
         if (!@hasDecl(Impl, "scanKeys")) @compileError("ServerRouter: Impl missing required method 'scanKeys'");
         if (!@hasDecl(Impl, "lookupKey")) @compileError("ServerRouter: Impl missing required method 'lookupKey'");
         if (!@hasDecl(Impl, "listDocumentArtifactManifests")) @compileError("ServerRouter: Impl missing required method 'listDocumentArtifactManifests'");
@@ -727,6 +735,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/artifacts/:artifactName/reprocess-jobs/:jobId/cancel", httpx.Handler.bind(self.impl, cancelDocumentArtifactReprocessJob));
             try server.post("/tables/:tableName/backup", httpx.Handler.bind(self.impl, backupTable));
             try server.post("/tables/:tableName/batch", httpx.Handler.bind(self.impl, batchWrite));
+            try server.post("/tables/:tableName/destination-authorization", httpx.Handler.bind(self.impl, reauthorizeTableDestinations));
             try server.post("/tables/:tableName/documents", httpx.Handler.bind(self.impl, scanKeys));
             try server.get("/tables/:tableName/documents/:key", httpx.Handler.bind(self.impl, lookupKey));
             try server.get("/tables/:tableName/documents/:key/artifacts", httpx.Handler.bind(self.impl, listDocumentArtifactManifests));
@@ -1001,6 +1010,13 @@ pub fn ServerRouter(comptime Impl: type) type {
         fn batchWrite(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             return impl.batchWrite(ctx, table_name);
+        }
+
+        /// Adopt stored write destinations with the current credential
+        /// POST /tables/{tableName}/destination-authorization
+        fn reauthorizeTableDestinations(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.reauthorizeTableDestinations(ctx, table_name);
         }
 
         /// Scan documents in a table within a key range
@@ -1285,6 +1301,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn cancelDocumentArtifactReprocessJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !httpx.Response
 //   fn backupTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn batchWrite(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn reauthorizeTableDestinations(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response

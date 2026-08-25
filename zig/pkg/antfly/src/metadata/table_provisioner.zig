@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
 const backups_api = @import("../api/backups.zig");
 const common_config = @import("../common/config.zig");
 const fs_paths = @import("../common/fs_paths.zig");
@@ -76,6 +77,7 @@ pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
     restore_open_options: backups_api.OpenOptions = .{},
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 };
 
 fn provisioningDbOpenOptions() db_mod.OpenOptions {
@@ -237,7 +239,10 @@ pub fn reconcileReplicaRootWithOptions(
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;
-        const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
+        const index_summary = try reconcileDbIndexesWithOptions(alloc, &db, table.indexes_json, .{
+            .source_table = table.name,
+            .destination_authorizer = options.destination_authorizer,
+        });
         summary.merge(index_summary);
     }
     return summary;
@@ -260,6 +265,8 @@ pub fn reconcileDbIndexes(
 
 pub const ReconcileDbIndexOptions = struct {
     drain_resolver_backfill: bool = true,
+    source_table: []const u8 = "",
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 };
 
 fn dbIndexReconciliationCanMutate(db: *const db_mod.DB) bool {
@@ -290,6 +297,8 @@ pub fn reconcileDbIndexesWithOptions(
     const enrichment_summary = try ensureEnrichments(db, desired_enrichments.items);
     const resolver_summary = try ensureResolversWithOptions(alloc, db, indexes_json, .{
         .drain_backfill = options.drain_resolver_backfill,
+        .source_table = options.source_table,
+        .destination_authorizer = options.destination_authorizer,
     });
     const missing_indexes_removed = try removeMissingIndexes(alloc, db, indexes_json);
     const index_summary = try ensureIndexes(alloc, db, indexes_json);
@@ -1272,6 +1281,8 @@ pub fn ensureResolvers(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: [
 
 pub const EnsureResolverOptions = struct {
     drain_backfill: bool = true,
+    source_table: []const u8 = "",
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 };
 
 pub fn ensureResolversWithOptions(
@@ -1280,6 +1291,12 @@ pub fn ensureResolversWithOptions(
     indexes_json: []const u8,
     options: EnsureResolverOptions,
 ) !ResolverReconcileSummary {
+    try stored_destination_authorization.authorizeIndexesJson(
+        alloc,
+        indexes_json,
+        options.source_table,
+        options.destination_authorizer,
+    );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
 
@@ -2181,7 +2198,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
-        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1,"_antfly_destination_authorization_v1":{"principal":"service:auth-disabled","signature":"auth-disabled","destinations":["entities"]}}
         \\  ]
         \\}
     ;
@@ -2238,7 +2255,7 @@ test "table provisioner registers a resolver declared in the table index config"
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
-        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2}
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":2,"_antfly_destination_authorization_v1":{"principal":"service:auth-disabled","signature":"auth-disabled","destinations":["entities"]}}
         \\  ]
         \\}
     ;
@@ -2358,7 +2375,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
-        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}
+        \\     "key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1,"_antfly_destination_authorization_v1":{"principal":"service:auth-disabled","signature":"auth-disabled","destinations":["entities"]}}
         \\  ]
         \\}
     ;
