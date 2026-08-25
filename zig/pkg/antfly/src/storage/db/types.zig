@@ -169,6 +169,31 @@ pub const SplitTransitionMutation = struct {
     split_key: []const u8 = "",
 };
 
+/// Private receiver-side data-Raft checkpoint for a range merge. Document
+/// transfer batches are ordinary replicated writes; this record makes the
+/// structural phase, receiver range, and donor watermark durable on every
+/// receiver replica in the same log order.
+pub const MergeReplicationCheckpoint = struct {
+    pub const Kind = enum {
+        accept,
+        bootstrap_complete,
+        finalize,
+        rollback,
+    };
+
+    kind: Kind,
+    transition_id: u64,
+    donor_group_id: u64,
+    receiver_group_id: u64,
+    receiver_base_start: []const u8,
+    receiver_base_end: []const u8,
+    merged_start: []const u8,
+    merged_end: []const u8,
+    bootstrap_applied_index: u64 = 0,
+    allow_doc_identity_reassignment: bool = false,
+    receiver_identity_reassignment_namespace: ?doc_identity_mod.Namespace = null,
+};
+
 /// Private data-Raft command used by the distributed transaction protocol.
 /// Every value that can affect durable state is carried in the command so
 /// replay is deterministic on followers and after restart.
@@ -229,6 +254,8 @@ pub const BatchRequest = struct {
     split_replication: ?SplitReplicationContext = null,
     /// Internal source lifecycle mutation. It must be ordered with data writes.
     split_transition: ?SplitTransitionMutation = null,
+    /// Internal receiver merge lifecycle. Public batch parsing never sets it.
+    merge_checkpoint: ?MergeReplicationCheckpoint = null,
     /// Internal 2PC phase. Public batch parsing never accepts this field.
     transaction: ?TransactionMutation = null,
 };

@@ -15107,6 +15107,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(path);
         const apply_req = req;
         const split_identity_namespace = try validateSplitReplicationForApply(apply_req, group_id);
+        try validateMergeCheckpointForApply(apply_req, group_id);
         if (metadata_source == .catalog) if (apply_req.split_replication) |replication| {
             try validateSplitReplicationIdentityAgainstCatalog(alloc, self.catalog, table_name, replication);
         };
@@ -23989,6 +23990,28 @@ fn validateSplitCheckpointGroup(checkpoint: ?db_mod.types.SplitReplicationCheckp
         .destination_begin, .destination_complete => if (value.destination_group_id != group_id) return error.InvalidBatchRequest,
         .source_ack => if (value.source_group_id != group_id) return error.InvalidBatchRequest,
     }
+}
+
+fn validateMergeCheckpointForApply(
+    req: db_mod.types.BatchRequest,
+    group_id: u64,
+) !void {
+    const value = req.merge_checkpoint orelse return;
+    if (value.transition_id == 0 or value.donor_group_id == 0 or
+        value.receiver_group_id == 0 or value.donor_group_id == value.receiver_group_id or
+        value.receiver_group_id != group_id)
+        return error.InvalidBatchRequest;
+    if (value.allow_doc_identity_reassignment !=
+        (value.receiver_identity_reassignment_namespace != null))
+        return error.InvalidBatchRequest;
+    if (value.kind == .accept and value.bootstrap_applied_index != 0)
+        return error.InvalidBatchRequest;
+    if (req.split_checkpoint != null or req.split_replication != null or
+        req.split_transition != null or req.transaction != null or
+        req.transforms.len != 0 or req.predicates.len != 0 or req.writes.len != 0 or
+        req.graph_writes.len != 0 or req.graph_deletes.len != 0 or
+        (req.deletes.len != 0 and value.kind != .rollback))
+        return error.InvalidBatchRequest;
 }
 
 fn validateSplitReplicationIdentityAgainstCatalog(

@@ -9211,9 +9211,18 @@ pub const DataServer = struct {
             record.allow_doc_identity_reassignment,
         );
         if (self.local_transition_runtime) |runtime| return try runtime.shardOperationAdapter().observeMerge(record);
+        // MergeCoordinator mutates a receiver DB directly. That is correct for
+        // the legacy single-copy runtime, but it is not a replicated data-Raft
+        // command: running it only on the selected leader would acknowledge a
+        // transition that followers cannot recover after failover. Until the
+        // merge transfer and its durable control markers are carried in the
+        // receiver Raft log, fail closed instead of silently publishing a
+        // leader-local merge.
+        if (self.data_raft != null) return error.ReplicatedMergeTransitionUnavailable;
         self.lockLocalTransition();
         defer self.unlockLocalTransition();
         var runtime = try self.initLocalMergeRuntime(
+            record.transition_id,
             record.donor_group_id,
             record.receiver_group_id,
             record.allow_doc_identity_reassignment,
@@ -10144,6 +10153,7 @@ pub const DataServer = struct {
 
     fn initLocalMergeRuntime(
         self: *DataServer,
+        transition_id: u64,
         donor_group_id: u64,
         receiver_group_id: u64,
         allow_doc_identity_reassignment: bool,
@@ -10205,6 +10215,7 @@ pub const DataServer = struct {
         donor_lease = null;
         receiver_lease = null;
         return try antfly.raft.MergeCoordinatorRuntime.init(self.alloc, .{
+            .transition_id = transition_id,
             .donor_root_dir = donor_root_dir,
             .receiver_root_dir = receiver_root_dir,
             .donor_group_id = donor_group_id,
@@ -10591,9 +10602,11 @@ pub const DataServer = struct {
         if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
         } else {
+            if (self.data_raft != null) return error.ReplicatedMergeTransitionUnavailable;
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
             var runtime = try self.initLocalMergeRuntime(
+                op.transition_id,
                 op.donor_group_id,
                 op.receiver_group_id,
                 op.allow_doc_identity_reassignment,
@@ -10624,9 +10637,11 @@ pub const DataServer = struct {
         if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .catch_up_merge_receiver = op });
         } else {
+            if (self.data_raft != null) return error.ReplicatedMergeTransitionUnavailable;
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
             var runtime = try self.initLocalMergeRuntime(
+                op.transition_id,
                 op.donor_group_id,
                 op.receiver_group_id,
                 op.allow_doc_identity_reassignment,
@@ -10657,9 +10672,11 @@ pub const DataServer = struct {
         if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
         } else {
+            if (self.data_raft != null) return error.ReplicatedMergeTransitionUnavailable;
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
             var runtime = try self.initLocalMergeRuntime(
+                op.transition_id,
                 op.donor_group_id,
                 op.receiver_group_id,
                 op.allow_doc_identity_reassignment,
@@ -10706,9 +10723,11 @@ pub const DataServer = struct {
         if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });
         } else {
+            if (self.data_raft != null) return error.ReplicatedMergeTransitionUnavailable;
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
             var runtime = try self.initLocalMergeRuntime(
+                op.transition_id,
                 op.donor_group_id,
                 op.receiver_group_id,
                 op.allow_doc_identity_reassignment,
@@ -18959,6 +18978,67 @@ test "data runtime live writer source follows raft apply ownership" {
     try std.testing.expectEqual(
         server.write_source.localDbMutex(),
         apply_sm.write_source.localDbMutex(),
+    );
+}
+
+test "data raft merge actions fail closed until their mutations are replicated" {
+    var raft_stub: antfly.raft.ManagedHttpHostService = undefined;
+    var server: DataServer = undefined;
+    server.data_raft = &raft_stub;
+    server.local_transition_runtime = null;
+
+    const contract: antfly.metadata.TransitionTableContract = .{
+        .table_id = 7,
+        .table_name = "docs",
+        .indexes_json = "{}",
+        .source_identity = .{ .shard_id = 71, .range_id = 711 },
+        .target_identity = .{ .shard_id = 72, .range_id = 721 },
+    };
+    const record: antfly.metadata.MergeTransitionRecord = .{
+        .transition_id = 7001,
+        .donor_group_id = 71,
+        .receiver_group_id = 72,
+        .allow_doc_identity_reassignment = true,
+        .table_contract = contract,
+    };
+    var adapter = server.localShardOperationAdapter();
+    try std.testing.expectError(
+        error.ReplicatedMergeTransitionUnavailable,
+        adapter.observeMerge(record),
+    );
+
+    inline for (.{
+        antfly.metadata.TransitionAction{ .accept_merge_receiver = .{
+            .transition_id = record.transition_id,
+            .donor_group_id = record.donor_group_id,
+            .receiver_group_id = record.receiver_group_id,
+            .allow_doc_identity_reassignment = true,
+            .table_contract = contract,
+        } },
+        antfly.metadata.TransitionAction{ .catch_up_merge_receiver = .{
+            .transition_id = record.transition_id,
+            .donor_group_id = record.donor_group_id,
+            .receiver_group_id = record.receiver_group_id,
+            .allow_doc_identity_reassignment = true,
+            .table_contract = contract,
+        } },
+        antfly.metadata.TransitionAction{ .finalize_merge = .{
+            .transition_id = record.transition_id,
+            .donor_group_id = record.donor_group_id,
+            .receiver_group_id = record.receiver_group_id,
+            .allow_doc_identity_reassignment = true,
+            .table_contract = contract,
+        } },
+        antfly.metadata.TransitionAction{ .rollback_merge = .{
+            .transition_id = record.transition_id,
+            .donor_group_id = record.donor_group_id,
+            .receiver_group_id = record.receiver_group_id,
+            .allow_doc_identity_reassignment = true,
+            .table_contract = contract,
+        } },
+    }) |action| try std.testing.expectError(
+        error.ReplicatedMergeTransitionUnavailable,
+        adapter.execute(action),
     );
 }
 

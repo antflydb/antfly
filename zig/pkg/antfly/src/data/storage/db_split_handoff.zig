@@ -24,6 +24,7 @@ const db_mod = @import("../../storage/db/db.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const db_types = @import("../../storage/db/types.zig");
 const range_state = @import("../../storage/db/range_state.zig");
+const merge_state = @import("../../storage/db/merge_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 const range_transition = @import("range_transition.zig");
 
@@ -147,6 +148,7 @@ fn validateActiveSplitDestination(state: shard_state_store.AppliedSplitState, tr
 }
 
 pub const MergeConfig = struct {
+    transition_id: u64 = 0,
     donor_root_dir: []const u8,
     receiver_root_dir: []const u8,
     donor_group_id: u64,
@@ -161,26 +163,9 @@ pub const MergeConfig = struct {
     receiver_identity_reassignment_namespace: ?doc_identity.Namespace = null,
 };
 
-const merge_state_key = "raftmerge:state";
-
-const MergeLifecyclePhase = enum(u8) {
-    none = 0,
-    accepting = 1,
-    finalized = 2,
-    rolling_back = 3,
-    rolled_back = 4,
-};
-
-const PersistedMergeState = struct {
-    donor_group_id: u64,
-    receiver_group_id: u64,
-    phase: MergeLifecyclePhase,
-    receiver_base_range: db_types.ByteRange,
-    allow_doc_identity_reassignment: bool = false,
-    receiver_identity_reassignment_namespace: ?doc_identity.Namespace = null,
-    bootstrap_complete: bool = false,
-    bootstrap_applied_index: u64 = 0,
-};
+const merge_state_key = merge_state.key;
+const MergeLifecyclePhase = merge_state.Phase;
+const PersistedMergeState = merge_state.State;
 
 pub const SplitTransitionPhase = range_transition.TransitionPhase;
 
@@ -397,13 +382,13 @@ pub const Destination = struct {
     pub fn loadMergeState(self: *Destination, alloc: std.mem.Allocator) !?PersistedMergeState {
         const raw = (try self.db.core.getStoreValue(alloc, merge_state_key)) orelse return null;
         defer alloc.free(raw);
-        return try decodeMergeStateAlloc(alloc, raw);
+        return try merge_state.decodeAlloc(alloc, raw);
     }
 
     pub fn saveMergeState(self: *Destination, alloc: std.mem.Allocator, state: PersistedMergeState) !void {
         var encoded = std.ArrayListUnmanaged(u8).empty;
         defer encoded.deinit(alloc);
-        try encodeMergeState(&encoded, alloc, state);
+        try merge_state.encode(&encoded, alloc, state);
         try self.db.core.putStoreBatch(&.{
             .{ .key = merge_state_key, .value = encoded.items },
         }, &.{});
@@ -854,6 +839,7 @@ pub const MergeCoordinator = struct {
     receiver_root_dir: []u8,
     donor_group_id: u64,
     receiver_group_id: u64,
+    transition_id: u64,
     donor_cfg: data_store.RaftApplyStoreConfig,
     donor_db_options: db_mod.OpenOptions,
     receiver_cfg: DestinationConfig,
@@ -910,8 +896,13 @@ pub const MergeCoordinator = struct {
         receiver_lease = null;
         errdefer receiver.deinit();
 
-        const persisted = try receiver.loadMergeState(alloc);
-        defer if (persisted) |state| range_state.freeRange(alloc, state.receiver_base_range);
+        var persisted = try receiver.loadMergeState(alloc);
+        defer if (persisted) |*state| state.deinit(alloc);
+        if (persisted) |state| {
+            if (cfg.transition_id != 0 and state.transition_id != 0 and
+                cfg.transition_id != state.transition_id)
+                return error.ConflictingMergeTransition;
+        }
 
         const base_range: db_types.ByteRange = if (persisted) |state| .{
             .start = try alloc.dupe(u8, state.receiver_base_range.start),
@@ -930,6 +921,7 @@ pub const MergeCoordinator = struct {
             .receiver_root_dir = receiver_root_dir,
             .donor_group_id = cfg.donor_group_id,
             .receiver_group_id = cfg.receiver_group_id,
+            .transition_id = cfg.transition_id,
             .donor_cfg = donor_cfg,
             .donor_db_options = cfg.donor_db,
             .receiver_cfg = receiver_cfg,
@@ -1184,7 +1176,11 @@ pub const MergeCoordinator = struct {
     }
 
     fn persistMergeState(self: *MergeCoordinator) !void {
+        const donor_range = try self.donor.currentRange(self.alloc, self.donor_group_id);
+        defer range_state.freeRange(self.alloc, donor_range);
+        const merged_range = mergeRanges(self.receiver_base_range, donor_range);
         try self.receiver.saveMergeState(self.alloc, .{
+            .transition_id = self.transition_id,
             .donor_group_id = self.donor_group_id,
             .receiver_group_id = self.receiver_group_id,
             .phase = self.merge_phase,
@@ -1192,6 +1188,7 @@ pub const MergeCoordinator = struct {
                 .start = self.receiver_base_range.start,
                 .end = self.receiver_base_range.end,
             },
+            .merged_range = merged_range,
             .allow_doc_identity_reassignment = self.allow_doc_identity_reassignment,
             .receiver_identity_reassignment_namespace = self.receiver_identity_reassignment_namespace,
             .bootstrap_complete = self.bootstrap_complete,
@@ -1262,94 +1259,6 @@ fn receiverCoversDonor(receiver: db_types.ByteRange, donor: db_types.ByteRange) 
     const starts_ok = receiver.start.len == 0 or donor.start.len == 0 or std.mem.order(u8, receiver.start, donor.start) != .gt;
     const ends_ok = receiver.end.len == 0 or donor.end.len == 0 or std.mem.order(u8, receiver.end, donor.end) != .lt;
     return starts_ok and ends_ok;
-}
-
-fn encodeMergeState(list: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, state: PersistedMergeState) !void {
-    try list.append(alloc, @intFromEnum(state.phase));
-    try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.donor_group_id)));
-    try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.receiver_group_id)));
-    const start_len: u32 = @intCast(state.receiver_base_range.start.len);
-    try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u32, start_len)));
-    try list.appendSlice(alloc, state.receiver_base_range.start);
-    const end_len: u32 = @intCast(state.receiver_base_range.end.len);
-    try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u32, end_len)));
-    try list.appendSlice(alloc, state.receiver_base_range.end);
-    try list.append(alloc, if (state.allow_doc_identity_reassignment) 1 else 0);
-    if (state.receiver_identity_reassignment_namespace) |namespace| {
-        try list.append(alloc, 1);
-        try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, namespace.table_id)));
-        try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, namespace.shard_id)));
-        try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, namespace.range_id)));
-    } else {
-        try list.append(alloc, 0);
-    }
-    try list.append(alloc, if (state.bootstrap_complete) 1 else 0);
-    try list.appendSlice(alloc, std.mem.asBytes(&std.mem.nativeToLittle(u64, state.bootstrap_applied_index)));
-}
-
-fn decodeMergeStateAlloc(alloc: std.mem.Allocator, data: []const u8) !PersistedMergeState {
-    if (data.len < 1 + 8 + 8 + 4 + 4) return error.InvalidMergeState;
-    var pos: usize = 0;
-    const phase: MergeLifecyclePhase = @enumFromInt(data[pos]);
-    pos += 1;
-    const donor_group_id = std.mem.readInt(u64, data[pos..][0..8], .little);
-    pos += 8;
-    const receiver_group_id = std.mem.readInt(u64, data[pos..][0..8], .little);
-    pos += 8;
-    const start_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-    pos += 4;
-    if (pos + start_len > data.len) return error.InvalidMergeState;
-    const start = try alloc.dupe(u8, data[pos .. pos + start_len]);
-    errdefer alloc.free(start);
-    pos += start_len;
-    const end_len = std.mem.readInt(u32, data[pos..][0..4], .little);
-    pos += 4;
-    if (pos + end_len > data.len) return error.InvalidMergeState;
-    const end = try alloc.dupe(u8, data[pos .. pos + end_len]);
-    pos += end_len;
-    const allow_doc_identity_reassignment = if (pos < data.len) blk: {
-        const allowed = data[pos] != 0;
-        pos += 1;
-        break :blk allowed;
-    } else false;
-    const receiver_identity_reassignment_namespace: ?doc_identity.Namespace = if (pos < data.len) blk: {
-        const has_namespace = data[pos] != 0;
-        pos += 1;
-        if (!has_namespace) break :blk null;
-        if (pos + 24 > data.len) return error.InvalidMergeState;
-        const table_id = std.mem.readInt(u64, data[pos..][0..8], .little);
-        pos += 8;
-        const shard_id = std.mem.readInt(u64, data[pos..][0..8], .little);
-        pos += 8;
-        const range_id = std.mem.readInt(u64, data[pos..][0..8], .little);
-        pos += 8;
-        break :blk .{ .table_id = table_id, .shard_id = shard_id, .range_id = range_id };
-    } else null;
-    const bootstrap_complete = if (pos < data.len) blk: {
-        const complete = data[pos] != 0;
-        pos += 1;
-        break :blk complete;
-    } else false;
-    const bootstrap_applied_index = if (pos < data.len) blk: {
-        if (pos + 8 > data.len) return error.InvalidMergeState;
-        const index = std.mem.readInt(u64, data[pos..][0..8], .little);
-        pos += 8;
-        break :blk index;
-    } else 0;
-    if (pos != data.len) return error.InvalidMergeState;
-    return .{
-        .donor_group_id = donor_group_id,
-        .receiver_group_id = receiver_group_id,
-        .phase = phase,
-        .receiver_base_range = .{
-            .start = start,
-            .end = end,
-        },
-        .allow_doc_identity_reassignment = allow_doc_identity_reassignment,
-        .receiver_identity_reassignment_namespace = receiver_identity_reassignment_namespace,
-        .bootstrap_complete = bootstrap_complete,
-        .bootstrap_applied_index = bootstrap_applied_index,
-    };
 }
 
 fn appendLegacyReplayOperation(

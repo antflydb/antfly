@@ -25,6 +25,7 @@ const query_graph = @import("query/graph_exec.zig");
 const query_result_shape = @import("query/result_shape.zig");
 
 pub const types = @import("types.zig");
+pub const merge_state = @import("merge_state.zig");
 pub const docstore = @import("../docstore.zig");
 pub const lease = @import("lease.zig");
 pub const ownership = @import("ownership.zig");
@@ -177,6 +178,7 @@ pub const testing = if (builtin.is_test) struct {
 
 test {
     _ = types;
+    _ = merge_state;
     _ = docstore;
     _ = lease;
     _ = ownership;

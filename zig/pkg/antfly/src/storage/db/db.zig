@@ -48,6 +48,7 @@ const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resolver_lib = @import("antfly_resolver");
 const backfill_state_mod = @import("backfill_state.zig");
 const range_state_mod = @import("range_state.zig");
+const merge_state_mod = @import("merge_state.zig");
 const types = @import("types.zig");
 const document_artifact_child_range = @import("document_artifact_child_range.zig");
 const aggregations_mod = @import("aggregations.zig");
@@ -64,6 +65,7 @@ test {
     _ = index_repair_state;
     _ = index_generation_manifest;
     _ = root_identity;
+    _ = merge_state_mod;
 }
 const change_journal_mod = @import("derived/change_journal.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
@@ -6418,6 +6420,10 @@ pub const DB = struct {
         }
         var split_range_value: ?[]u8 = null;
         defer if (split_range_value) |value| self.alloc.free(value);
+        var merge_range_value: ?[]u8 = null;
+        defer if (merge_range_value) |value| self.alloc.free(value);
+        var merge_state_value = std.ArrayListUnmanaged(u8).empty;
+        defer merge_state_value.deinit(self.alloc);
         var split_sequence_buf: [8]u8 = undefined;
         var split_marker_buf: [4 * @sizeOf(u64) + 1]u8 = undefined;
         var persisted_range: ?types.ByteRange = null;
@@ -6457,6 +6463,40 @@ pub const DB = struct {
                     .destination_group_id = checkpoint.destination_group_id,
                     .bootstrap_complete = checkpoint.kind == .destination_complete,
                 }, &split_marker_buf),
+            });
+        }
+        if (req.merge_checkpoint) |checkpoint| {
+            if (checkpoint.receiver_identity_reassignment_namespace) |namespace| {
+                if (!checkpoint.allow_doc_identity_reassignment or
+                    !self.core.identity_namespace.eql(namespace))
+                    return error.DocIdentityNamespaceMismatch;
+            } else if (checkpoint.allow_doc_identity_reassignment) {
+                return error.InvalidBatchRequest;
+            }
+            const existing_raw = try self.core.getStoreValue(self.alloc, merge_state_mod.key);
+            defer if (existing_raw) |value| self.alloc.free(value);
+            var existing_state: ?merge_state_mod.State = if (existing_raw) |value|
+                try merge_state_mod.decodeAlloc(self.alloc, value)
+            else
+                null;
+            defer if (existing_state) |*state| state.deinit(self.alloc);
+            const plan = try merge_state_mod.planCheckpointApply(
+                if (existing_state) |*state| state else null,
+                self.core.byteRange(),
+                checkpoint,
+            );
+            persisted_range = plan.range;
+            persisted_range_start_owned = try self.alloc.dupe(u8, plan.range.start);
+            persisted_range_end_owned = try self.alloc.dupe(u8, plan.range.end);
+            merge_range_value = try range_state_mod.encodeRangeAlloc(self.alloc, plan.range);
+            try store_writes.append(self.alloc, .{
+                .key = range_state_mod.range_key,
+                .value = merge_range_value.?,
+            });
+            try merge_state_mod.encode(&merge_state_value, self.alloc, plan.state);
+            try store_writes.append(self.alloc, .{
+                .key = merge_state_mod.key,
+                .value = merge_state_value.items,
             });
         }
         try appendDenseArtifactCounterMutations(
@@ -88878,6 +88918,127 @@ test "db replicated split bootstrap requires and preserves begin barrier" {
     var found = (try db.lookup(alloc, "doc:z", .{})) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"v\":1}", found.json);
+}
+
+test "db replicated merge checkpoints persist phase range and watermark across reopen" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const namespace: DocIdentityNamespace = .{ .table_id = 7, .shard_id = 42, .range_id = 420 };
+    const base_range: types.ByteRange = .{ .start = "doc:m", .end = "" };
+    const merged_range: types.ByteRange = .{ .start = "doc:a", .end = "" };
+    const checkpoint_base: types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 40,
+        .donor_group_id = 41,
+        .receiver_group_id = 42,
+        .receiver_base_start = base_range.start,
+        .receiver_base_end = base_range.end,
+        .merged_start = merged_range.start,
+        .merged_end = merged_range.end,
+        .allow_doc_identity_reassignment = true,
+        .receiver_identity_reassignment_namespace = namespace,
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .identity_namespace = namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.updateRange(base_range);
+        try db.batchReplicatedApply(.{ .merge_checkpoint = checkpoint_base });
+        try std.testing.expectEqualStrings("doc:m", db.getRange().start);
+
+        var premature_finalize = checkpoint_base;
+        premature_finalize.kind = .finalize;
+        premature_finalize.bootstrap_applied_index = 19;
+        try std.testing.expectError(
+            error.MergeTransitionNotReady,
+            db.batchReplicatedApply(.{ .merge_checkpoint = premature_finalize }),
+        );
+
+        var conflicting_range = checkpoint_base;
+        conflicting_range.kind = .bootstrap_complete;
+        conflicting_range.merged_start = "doc:b";
+        conflicting_range.bootstrap_applied_index = 19;
+        try std.testing.expectError(
+            error.ConflictingMergeTransition,
+            db.batchReplicatedApply(.{ .merge_checkpoint = conflicting_range }),
+        );
+
+        try db.batchReplicatedApply(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"from donor\"}" }},
+        });
+        var complete = checkpoint_base;
+        complete.kind = .bootstrap_complete;
+        complete.bootstrap_applied_index = 19;
+        try db.batchReplicatedApply(.{ .merge_checkpoint = complete });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+        // A delayed accept is a no-op: it cannot regress either the expanded
+        // range or the durable bootstrap watermark.
+        try db.batchReplicatedApply(.{ .merge_checkpoint = checkpoint_base });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+
+        const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        var state = try merge_state_mod.decodeAlloc(alloc, raw);
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(merge_state_mod.Phase.accepting, state.phase);
+        try std.testing.expect(state.bootstrap_complete);
+        try std.testing.expectEqual(@as(u64, 19), state.bootstrap_applied_index);
+        try std.testing.expectEqual(@as(u64, 40), state.transition_id);
+        const corrupt = try alloc.dupe(u8, raw);
+        defer alloc.free(corrupt);
+        corrupt[0] = 0xff;
+        try std.testing.expectError(error.InvalidMergeState, merge_state_mod.decodeAlloc(alloc, corrupt));
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .identity_namespace = namespace,
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+        const donor = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
+        defer alloc.free(donor);
+        try std.testing.expectEqualStrings("{\"title\":\"from donor\"}", donor);
+
+        var finalized = checkpoint_base;
+        finalized.kind = .finalize;
+        finalized.bootstrap_applied_index = 19;
+        try db.batchReplicatedApply(.{ .merge_checkpoint = finalized });
+        try db.batchReplicatedApply(.{ .merge_checkpoint = checkpoint_base });
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
+        var newer_after_finalize = finalized;
+        newer_after_finalize.bootstrap_applied_index = 20;
+        try std.testing.expectError(
+            error.ConflictingMergeTransition,
+            db.batchReplicatedApply(.{ .merge_checkpoint = newer_after_finalize }),
+        );
+        var different_transition = checkpoint_base;
+        different_transition.transition_id = 41;
+        try std.testing.expectError(
+            error.ConflictingMergeTransition,
+            db.batchReplicatedApply(.{ .merge_checkpoint = different_transition }),
+        );
+        var rollback = checkpoint_base;
+        rollback.kind = .rollback;
+        try std.testing.expectError(
+            error.ConflictingMergeTransition,
+            db.batchReplicatedApply(.{ .merge_checkpoint = rollback }),
+        );
+        const raw = (try db.core.getStoreValue(alloc, merge_state_mod.key)) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        var state = try merge_state_mod.decodeAlloc(alloc, raw);
+        defer state.deinit(alloc);
+        try std.testing.expectEqual(merge_state_mod.Phase.finalized, state.phase);
+        try std.testing.expect(state.bootstrap_complete);
+        try std.testing.expectEqual(@as(u64, 19), state.bootstrap_applied_index);
+    }
 }
 
 test "db split cutover fences enrichment to the owning range with durable lsm primary backend" {

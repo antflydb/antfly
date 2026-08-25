@@ -220,6 +220,37 @@ test "raft batch round trips internal split replication identity" {
     try std.testing.expect(replication.identity_namespace.eql(namespace));
 }
 
+test "raft batch round trips internal merge checkpoint" {
+    const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 42, .range_id = 420 };
+    const encoded = try encode(std.testing.allocator, "docs", .{
+        .merge_checkpoint = .{
+            .kind = .bootstrap_complete,
+            .transition_id = 40,
+            .donor_group_id = 41,
+            .receiver_group_id = 42,
+            .receiver_base_start = "doc:a",
+            .receiver_base_end = "doc:m",
+            .merged_start = "doc:a",
+            .merged_end = "doc:z",
+            .bootstrap_applied_index = 19,
+            .allow_doc_identity_reassignment = true,
+            .receiver_identity_reassignment_namespace = namespace,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    const checkpoint = decoded.batch.req.merge_checkpoint orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(db_mod.types.MergeReplicationCheckpoint.Kind.bootstrap_complete, checkpoint.kind);
+    try std.testing.expectEqual(@as(u64, 41), checkpoint.donor_group_id);
+    try std.testing.expectEqual(@as(u64, 42), checkpoint.receiver_group_id);
+    try std.testing.expectEqualStrings("doc:m", checkpoint.receiver_base_end);
+    try std.testing.expectEqualStrings("doc:z", checkpoint.merged_end);
+    try std.testing.expectEqual(@as(u64, 19), checkpoint.bootstrap_applied_index);
+    try std.testing.expect(checkpoint.receiver_identity_reassignment_namespace.?.eql(namespace));
+}
+
 test "raft batch round trips deterministic transaction begin" {
     const txn_id: db_mod.types.TxnId = .{1} ** 16;
     const encoded = try encode(std.testing.allocator, "docs", .{
