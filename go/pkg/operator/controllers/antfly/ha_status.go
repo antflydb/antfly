@@ -653,12 +653,39 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 		}
 		return err
 	}
-	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) != localNodeID ||
+	if lease.Spec.HolderIdentity == nil || strings.TrimSpace(*lease.Spec.HolderIdentity) == "" ||
 		lease.Spec.LeaseTransitions == nil || *lease.Spec.LeaseTransitions <= 0 || lease.Spec.RenewTime == nil ||
 		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
 		return nil
 	}
-	if strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt]) != "" {
+	currentHolder := strings.TrimSpace(*lease.Spec.HolderIdentity)
+	transitions := *lease.Spec.LeaseTransitions
+	handoffRenewal := currentHolder != localNodeID &&
+		lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" &&
+		lease.Annotations[haFencingLeaseAnnotationFormerHolder] == localNodeID &&
+		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] == string(cluster.UID) &&
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10)
+	if currentHolder != localNodeID && !handoffRenewal {
+		return nil
+	}
+	bootstrapReceipt := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt])
+	if handoffRenewal {
+		// The periodic path keeps an already-committed successor alive even when
+		// no further CR or runtime event queues the full reconciler. An optional
+		// process receipt must be exact; this path advances time only and loses
+		// permission as soon as the successor clears the transfer annotations.
+		if bootstrapReceipt != "" {
+			processBootID := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID])
+			if !haWatchdogProcessBootIDValid(processBootID) ||
+				bootstrapReceipt != haFencingLeaseBootstrapReceipt(currentHolder, transitions, processBootID) {
+				return nil
+			}
+		}
+		now := metav1.NewMicroTime(r.haNow())
+		lease.Spec.RenewTime = &now
+		return r.Update(ctx, lease)
+	}
+	if bootstrapReceipt != "" {
 		// The full reconciler owns the one-shot transition from a bound but
 		// pending process receipt to ordinary authority. Advancing renewTime here
 		// can continually outrun its next watchdog observation and make the two
@@ -690,7 +717,7 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 		ctx,
 		cluster,
 		localNodeID,
-		uint64(*lease.Spec.LeaseTransitions),
+		uint64(transitions),
 		lease.Spec.RenewTime.Time,
 		true,
 	)

@@ -246,6 +246,66 @@ func TestDedicatedLeaseRenewalPreservesPendingBootstrapCompareBoundary(t *testin
 	}
 }
 
+func TestDedicatedLeaseRenewalAdvancesOnlyExactCommittedHandoff(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		receipt     string
+		wantRenewed bool
+	}{
+		{name: "before successor process binding", wantRenewed: true},
+		{
+			name: "exact bound successor process",
+			receipt: haFencingLeaseBootstrapReceipt(
+				"standby-a", 2, strings.Repeat("b", 64),
+			),
+			wantRenewed: true,
+		},
+		{
+			name: "mismatched bound successor process",
+			receipt: haFencingLeaseBootstrapReceipt(
+				"standby-a", 2, strings.Repeat("c", 64),
+			),
+			wantRenewed: false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+			cluster.Status.HAStatus = caughtUpHAStatus()
+			leaseRenewedAt := now.Add(-time.Second)
+			lease := haFenceLease(cluster, leaseRenewedAt, 30, 2, "standby-a")
+			lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+			lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+			lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+			lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+			lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
+			if tt.receipt != "" {
+				lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = tt.receipt
+			}
+			reconciler := testHAReconciler(t, cluster, lease)
+			reconciler.Now = func() time.Time { return now }
+
+			if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+				t.Fatalf("dedicated committed-handoff renewal: %v", err)
+			}
+			observed := getOwnershipTestLease(t, reconciler)
+			wantRenewTime := leaseRenewedAt
+			if tt.wantRenewed {
+				wantRenewTime = now
+			}
+			if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(wantRenewTime) {
+				t.Fatalf("renewTime = %#v, want %s", observed.Spec.RenewTime, wantRenewTime)
+			}
+			if observed.Spec.HolderIdentity == nil || *observed.Spec.HolderIdentity != "standby-a" ||
+				observed.Spec.LeaseTransitions == nil || *observed.Spec.LeaseTransitions != 2 ||
+				observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" ||
+				observed.Annotations[haFencingLeaseAnnotationProcessBootID] != strings.Repeat("b", 64) {
+				t.Fatalf("dedicated handoff renewal mutated authority: %#v", observed)
+			}
+		})
+	}
+}
+
 func TestDedicatedLeaseRenewalUsesAuthenticatedWatchdogProofEndpoint(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	t.Setenv("TEST_HA_WATCHDOG_TOKEN", "watchdog-token")
