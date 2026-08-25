@@ -7771,6 +7771,28 @@ test "required backend is applied before model manager backend planning" {
     try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, effective);
 }
 
+test "model manager rejects an unavailable required backend before artifact selection" {
+    const allocator = std.testing.allocator;
+    var session_manager = backends.SessionManager.init(allocator);
+    session_manager.required_backend = .pjrt;
+    session_manager.required_backend_invalid = false;
+    var manager = ModelManager.init(allocator, session_manager);
+    defer manager.deinit();
+
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        manager.acquireFromDir("/nonexistent/required-backend-model"),
+    );
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        manager.componentLoaderForPaths(
+            "/nonexistent/required-backend-model",
+            &.{.native},
+            &.{"/nonexistent/component"},
+        ),
+    );
+}
+
 test "isManifestPotentiallyLoadableInCurrentBuild accepts onnx-only models when onnx model support is enabled" {
     const allocator = std.testing.allocator;
 

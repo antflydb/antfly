@@ -2596,6 +2596,35 @@ fn classifyExtractionResolutionFailure(err: anyerror) ExtractionResolutionFailur
     };
 }
 
+fn compatibilityBackendsForSessionManager(
+    session_manager: *const backends_mod.SessionManager,
+    required_scratch: *[1]backends_mod.BackendType,
+) ![]const backends_mod.BackendType {
+    return session_manager.requiredBackendCandidates(
+        session_manager.preferred_backends,
+        required_scratch,
+    );
+}
+
+test "compatibility backend candidates honor required policy" {
+    var session_manager = backends_mod.SessionManager.init(std.testing.allocator);
+    session_manager.preferred_backends = &.{ .native, .cuda };
+    session_manager.required_backend = .cuda;
+    session_manager.required_backend_invalid = false;
+    var required_scratch: [1]backends_mod.BackendType = undefined;
+    try std.testing.expectEqualSlices(
+        backends_mod.BackendType,
+        &.{.cuda},
+        try compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+
+    session_manager.required_backend = .pjrt;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+}
+
 pub const Node = struct {
     config: NodeConfig,
     allocator: std.mem.Allocator,
@@ -2872,6 +2901,11 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !CompatibilitySummary {
+        var required_backend_scratch: [1]backends_mod.BackendType = undefined;
+        const compatibility_backends = try compatibilityBackendsForSessionManager(
+            &self.session_manager,
+            &required_backend_scratch,
+        );
         var io_impl: ?std.Io.Threaded = null;
         defer if (io_impl) |*threaded| threaded.deinit();
         const io = self.session_manager.io orelse blk: {
@@ -2930,7 +2964,7 @@ pub const Node = struct {
                 allocator,
                 model_path,
                 &man,
-                self.session_manager.preferred_backends,
+                compatibility_backends,
             );
 
             var verification_manifest = try manifest_mod.loadListingFromDir(

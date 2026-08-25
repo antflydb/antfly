@@ -348,6 +348,10 @@ pub const SessionManager = struct {
         required_buf: *[1]BackendType,
     ) ![]const BackendType {
         if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        if (self.required_backend) |backend| {
+            if (!backend.supportsDirectSessionLoad())
+                return error.RequiredBackendUnavailable;
+        }
         return enforceRequiredBackend(self.required_backend, fallback_backends, required_buf);
     }
 
