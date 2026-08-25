@@ -12495,6 +12495,12 @@ func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollout(ctx context.Co
 	if sts == nil || sts.Name == "" || sts.Status.UpdateRevision == "" {
 		return false, nil
 	}
+	if sts.Spec.UpdateStrategy.Type == appsv1.OnDeleteStatefulSetStrategyType {
+		// OnDelete is an explicit instruction to preserve the running stateful
+		// process while publishing a restart-safe template. It is never a blocked
+		// rollout for this automatic repair path.
+		return false, nil
+	}
 
 	replicas := int32(1)
 	if sts.Spec.Replicas != nil {
@@ -12526,7 +12532,8 @@ func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollout(ctx context.Co
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
-		if effectiveTopologyMode(cluster) == topologyModeStandalone && hasExactPromotedProcessBinding(cluster, sts, pod) {
+		if effectiveTopologyMode(cluster) == topologyModeStandalone &&
+			promotedStandaloneProcessRolloutProtected(cluster, sts, pod) {
 			log.FromContext(ctx).Info(
 				"Preserving exact promoted process during deferred StatefulSet rollout",
 				"statefulset", sts.Name,
@@ -12552,6 +12559,21 @@ func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollout(ctx context.Co
 	}
 
 	return false, nil
+}
+
+func promotedStandaloneProcessRolloutProtected(cluster *antflyv1.AntflyCluster, sts *appsv1.StatefulSet, pod *corev1.Pod) bool {
+	if hasExactPromotedProcessBinding(cluster, sts, pod) {
+		return true
+	}
+	if cluster == nil || sts == nil || pod == nil {
+		return false
+	}
+	ha := cluster.Spec.HighAvailability
+	return ha != nil && ha.Runtime != nil &&
+		ha.Runtime.Role == antflyv1.HARuntimeRolePrimary &&
+		isPodControlledByExactStatefulSet(pod, sts) &&
+		strings.TrimSpace(pod.Annotations[haNodeIDAnnotation]) == strings.TrimSpace(ha.Runtime.NodeID) &&
+		podRunsHAStandbyCommand(pod)
 }
 
 func isPodControlledByStatefulSet(pod *corev1.Pod, statefulSetName string) bool {

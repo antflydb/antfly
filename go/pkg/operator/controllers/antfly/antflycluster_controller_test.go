@@ -12241,12 +12241,22 @@ func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthyStandalonePod(t *t
 
 func TestRepairBlockedStatefulSetRolloutPreservesOnlyExactPromotedProcess(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		bindingUID   types.UID
-		wantRepaired bool
+		name           string
+		bindingUID     types.UID
+		standbyProcess bool
+		onDelete       bool
+		wantRepaired   bool
 	}{
 		{name: "exact receipt and Pod UID", bindingUID: types.UID("promoted-process-uid"), wantRepaired: false},
 		{name: "different Pod UID", bindingUID: types.UID("replaced-process-uid"), wantRepaired: true},
+		{
+			name:       "standby-shaped promoted process before binding cache convergence",
+			bindingUID: types.UID("replaced-process-uid"), standbyProcess: true, wantRepaired: false,
+		},
+		{
+			name:       "explicit OnDelete rollout",
+			bindingUID: types.UID("replaced-process-uid"), onDelete: true, wantRepaired: false,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			g := NewWithT(t)
@@ -12295,6 +12305,9 @@ func TestRepairBlockedStatefulSetRolloutPreservesOnlyExactPromotedProcess(t *tes
 				},
 				Status: appsv1.StatefulSetStatus{UpdateRevision: "standalone-new"},
 			}
+			if tc.onDelete {
+				sts.Spec.UpdateStrategy.Type = appsv1.OnDeleteStatefulSetStrategyType
+			}
 			controller := true
 			pod := &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
@@ -12318,6 +12331,11 @@ func TestRepairBlockedStatefulSetRolloutPreservesOnlyExactPromotedProcess(t *tes
 						Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady",
 					}},
 				},
+			}
+			if tc.standbyProcess {
+				pod.Spec.Containers[0].Args = []string{
+					"exec /antfly standalone --ha-standby-log '/antflydb/ha/standby.wal'",
+				}
 			}
 			reconciler := &AntflyClusterReconciler{
 				Client: fake.NewClientBuilder().WithScheme(s).WithObjects(pod).Build(),
