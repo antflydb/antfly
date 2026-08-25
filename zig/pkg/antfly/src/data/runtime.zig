@@ -9435,10 +9435,7 @@ pub const DataServer = struct {
         fn run(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             defer self.server.invalidateLocalGroupStatusCache();
-            defer if (self.lane_held) {
-                self.lane.deinit();
-                self.lane_held = false;
-            };
+            defer self.releaseLane();
             self.runAction() catch |err| {
                 std.log.warn("replicated split action failed kind={s} transition_id={} attempt_epoch={} source_group_id={} destination_group_id={} err={s}", .{
                     @tagName(self.kind),
@@ -9452,8 +9449,7 @@ pub const DataServer = struct {
             };
             // Release the per-source transition owner before a scheduler hook
             // can suspend this durable job.
-            self.lane.deinit();
-            self.lane_held = false;
+            self.releaseLane();
             try self.server.reachDataRequestLifecycle(.{
                 .phase = .split_copy_completed,
                 .group_id = self.source_group_id,
@@ -9485,10 +9481,16 @@ pub const DataServer = struct {
 
         fn deinit(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.lane_held) self.lane.deinit();
+            self.releaseLane();
             const alloc = self.alloc;
             self.table_contract.deinitOwned(alloc);
             alloc.destroy(self);
+        }
+
+        fn releaseLane(self: *@This()) void {
+            if (!self.lane_held) return;
+            self.lane.deinit();
+            self.lane_held = false;
         }
     };
 
@@ -9505,7 +9507,8 @@ pub const DataServer = struct {
             return error.BackgroundOwnerClosing;
         var lane = self.replicated_transition_action_lanes.tryAcquire(source_group_id) orelse
             return error.TransitionOperationBusy;
-        errdefer lane.deinit();
+        var caller_owns_lane = true;
+        errdefer if (caller_owns_lane) lane.deinit();
 
         const runtime = try self.ensureBackendRuntime();
         const owner_id = try self.replicatedTransitionActionOwnerId(runtime);
@@ -9528,6 +9531,12 @@ pub const DataServer = struct {
             .destination_group_id = destination_group_id,
             .table_contract = owned_table_contract,
         };
+        caller_owns_lane = false;
+        // Manual runtimes execute durable jobs inline. If run() fails it has
+        // already released the lane, whereas a submission failure before
+        // run() leaves the lane attached to the job. Inspect the transferred
+        // owner instead of unconditionally unlocking the caller's old lease.
+        errdefer job.releaseLane();
         try runtime.durable_jobs.submit(.{
             .owner_id = owner_id,
             .class = .maintenance,
@@ -28836,7 +28845,7 @@ const MultiOwnerReplayStep = struct {
     clock_only: bool,
 };
 
-fn runThreeDataServerReplicatedMergeVoprHistory(
+fn runThreeDataServerReplicatedTransitionVoprHistory(
     trace_alloc: std.mem.Allocator,
     replay_trace: ?[]const MultiOwnerReplayStep,
     recorded_trace: *std.ArrayListUnmanaged(MultiOwnerReplayStep),
@@ -28941,37 +28950,45 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
 
     const incarnation: antfly.metadata_api.MetadataClusterIncarnation =
         "22222222222222222222222222222222".*;
-    const contract: antfly.metadata.TransitionTableContract = .{
+    const merge_contract: antfly.metadata.TransitionTableContract = .{
         .table_id = 17,
         .table_name = "docs",
         .indexes_json = "{}",
         .source_identity = .{ .shard_id = 171, .range_id = 1711 },
         .target_identity = .{ .shard_id = 172, .range_id = 1721 },
     };
+    const split_contract: antfly.metadata.TransitionTableContract = .{
+        .table_id = 17,
+        .table_name = "docs",
+        .indexes_json = "{}",
+        .source_identity = .{ .shard_id = 172, .range_id = 1721 },
+        .target_identity = .{ .shard_id = 172, .range_id = 1721 },
+    };
     const tables = [_]antfly.metadata.table_manager.TableRecord{.{
-        .table_id = contract.table_id,
-        .name = contract.table_name,
+        .table_id = merge_contract.table_id,
+        .name = merge_contract.table_name,
         .placement_role = "data",
     }};
-    const ranges = [_]antfly.metadata.table_manager.RangeRecord{
+    var ranges = [3]antfly.metadata.table_manager.RangeRecord{
         .{
             .group_id = 171,
-            .range_id = contract.source_identity.range_id,
-            .table_id = contract.table_id,
+            .range_id = merge_contract.source_identity.range_id,
+            .table_id = merge_contract.table_id,
             .start_key = "doc:a",
             .end_key = "doc:m",
-            .doc_identity_shard_id = contract.source_identity.shard_id,
-            .doc_identity_range_id = contract.source_identity.range_id,
+            .doc_identity_shard_id = merge_contract.source_identity.shard_id,
+            .doc_identity_range_id = merge_contract.source_identity.range_id,
         },
         .{
             .group_id = 172,
-            .range_id = contract.target_identity.range_id,
-            .table_id = contract.table_id,
+            .range_id = merge_contract.target_identity.range_id,
+            .table_id = merge_contract.table_id,
             .start_key = "doc:m",
             .end_key = null,
-            .doc_identity_shard_id = contract.target_identity.shard_id,
-            .doc_identity_range_id = contract.target_identity.range_id,
+            .doc_identity_shard_id = merge_contract.target_identity.shard_id,
+            .doc_identity_range_id = merge_contract.target_identity.range_id,
         },
+        undefined,
     };
     var stores: [3]antfly.metadata.table_manager.StoreRecord = undefined;
     for (&stores, 0..) |*store, i| store.* = .{
@@ -28983,8 +29000,8 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
         .api_url = api_uris[i],
         .raft_url = raft_uris[i],
     };
-    var placements: [6]antfly.raft.reconciler.PlacementIntent = undefined;
-    for ([_]u64{ 171, 172 }, 0..) |group_id, group_index| {
+    var placements: [9]antfly.raft.reconciler.PlacementIntent = undefined;
+    for ([_]u64{ 171, 172, 173 }, 0..) |group_id, group_index| {
         for (0..3) |node_index| {
             placements[group_index * 3 + node_index] = .{
                 .record = .{
@@ -28997,13 +29014,24 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
             };
         }
     }
-    const record: antfly.metadata.MergeTransitionRecord = .{
+    const merge_record: antfly.metadata.MergeTransitionRecord = .{
         .transition_id = 17_001,
         .donor_group_id = 171,
         .receiver_group_id = 172,
         .allow_doc_identity_reassignment = true,
-        .table_contract = contract,
+        .table_contract = merge_contract,
     };
+    const split_record: antfly.metadata.SplitTransitionRecord = .{
+        .transition_id = 17_002,
+        .attempt_epoch = 1,
+        .source_group_id = 172,
+        .destination_group_id = 173,
+        .split_key = "doc:t",
+        .source_range_end = null,
+        .table_contract = split_contract,
+    };
+    var merge_records = [1]antfly.metadata.MergeTransitionRecord{merge_record};
+    var split_records = [1]antfly.metadata.SplitTransitionRecord{split_record};
     var snapshot = antfly.metadata_api.AdminSnapshot{
         .status = .{
             .metadata_group_id = 19,
@@ -29012,11 +29040,11 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
             .metrics = .{},
         },
         .tables = @constCast(tables[0..]),
-        .ranges = @constCast(ranges[0..]),
+        .ranges = ranges[0..2],
         .stores = stores[0..],
-        .placement_intents = placements[0..],
-        .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
-        .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{record})[0..]),
+        .placement_intents = placements[0..6],
+        .split_transitions = split_records[0..0],
+        .merge_transitions = merge_records[0..],
     };
 
     const SnapshotPublisher = struct {
@@ -29039,16 +29067,16 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
         defer alloc.free(donor_path);
         var donor = try antfly.db.DB.open(alloc, donor_path, .{
             .identity_namespace = .{
-                .table_id = contract.table_id,
-                .shard_id = contract.source_identity.shard_id,
-                .range_id = contract.source_identity.range_id,
+                .table_id = merge_contract.table_id,
+                .shard_id = merge_contract.source_identity.shard_id,
+                .range_id = merge_contract.source_identity.range_id,
             },
             .backend_runtime = runtime.ptr(),
             .start_index_workers = false,
             .start_optional_runtimes = false,
             .start_optional_runtime_workers = false,
         });
-        try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &donor, contract.schema_json);
+        try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &donor, merge_contract.schema_json);
         try donor.updateRange(.{ .start = "doc:a", .end = "doc:m" });
         try donor.batch(.{ .writes = &.{.{
             .key = "doc:b",
@@ -29060,16 +29088,16 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
         defer alloc.free(receiver_path);
         var receiver = try antfly.db.DB.open(alloc, receiver_path, .{
             .identity_namespace = .{
-                .table_id = contract.table_id,
-                .shard_id = contract.target_identity.shard_id,
-                .range_id = contract.target_identity.range_id,
+                .table_id = merge_contract.table_id,
+                .shard_id = merge_contract.target_identity.shard_id,
+                .range_id = merge_contract.target_identity.range_id,
             },
             .backend_runtime = runtime.ptr(),
             .start_index_workers = false,
             .start_optional_runtimes = false,
             .start_optional_runtime_workers = false,
         });
-        try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &receiver, contract.schema_json);
+        try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &receiver, merge_contract.schema_json);
         try receiver.updateRange(.{ .start = "doc:m", .end = "" });
         try receiver.batch(.{ .writes = &.{.{
             .key = "doc:z",
@@ -29183,9 +29211,14 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
         api_uris: *[3][]u8,
         raft_uris: *[3][]u8,
         stores: *[3]antfly.metadata.table_manager.StoreRecord,
+        ranges: *[3]antfly.metadata.table_manager.RangeRecord,
+        placements: *[9]antfly.raft.reconciler.PlacementIntent,
+        merge_records: *[1]antfly.metadata.MergeTransitionRecord,
+        split_records: *[1]antfly.metadata.SplitTransitionRecord,
         snapshot: *antfly.metadata_api.AdminSnapshot,
         hosted: *antfly.raft.HostedShardOperationAdapter,
-        record: antfly.metadata.MergeTransitionRecord,
+        merge_record: antfly.metadata.MergeTransitionRecord,
+        split_record: antfly.metadata.SplitTransitionRecord,
         done: bool = false,
         driver_done: [3]bool = .{ false, false, false },
         driver_active: [3]bool = .{ false, false, false },
@@ -29194,6 +29227,7 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
         failure: ?anyerror = null,
         driver_failure: ?anyerror = null,
         observation: ?antfly.metadata.transition_state.MergeObservation = null,
+        split_observation: ?antfly.metadata.transition_state.SplitObservation = null,
         stage: u8 = 0,
 
         fn drive(self: *@This(), index: usize) void {
@@ -29250,19 +29284,19 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
             var ops = self.servers[0].localShardOperationAdapter();
             self.stage = 10;
             try self.executeIdempotent(&ops, .{ .accept_merge_receiver = .{
-                .transition_id = self.record.transition_id,
-                .donor_group_id = self.record.donor_group_id,
-                .receiver_group_id = self.record.receiver_group_id,
-                .allow_doc_identity_reassignment = self.record.allow_doc_identity_reassignment,
-                .table_contract = self.record.table_contract,
+                .transition_id = self.merge_record.transition_id,
+                .donor_group_id = self.merge_record.donor_group_id,
+                .receiver_group_id = self.merge_record.receiver_group_id,
+                .allow_doc_identity_reassignment = self.merge_record.allow_doc_identity_reassignment,
+                .table_contract = self.merge_record.table_contract,
             } });
             self.stage = 11;
             try self.executeIdempotent(&ops, .{ .catch_up_merge_receiver = .{
-                .transition_id = self.record.transition_id,
-                .donor_group_id = self.record.donor_group_id,
-                .receiver_group_id = self.record.receiver_group_id,
-                .allow_doc_identity_reassignment = self.record.allow_doc_identity_reassignment,
-                .table_contract = self.record.table_contract,
+                .transition_id = self.merge_record.transition_id,
+                .donor_group_id = self.merge_record.donor_group_id,
+                .receiver_group_id = self.merge_record.receiver_group_id,
+                .allow_doc_identity_reassignment = self.merge_record.allow_doc_identity_reassignment,
+                .table_contract = self.merge_record.table_contract,
             } });
 
             // Move both structural owners before cutover. The finalize command
@@ -29274,33 +29308,122 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
             ops = self.servers[1].localShardOperationAdapter();
             self.stage = 30;
             try self.executeIdempotent(&ops, .{ .finalize_merge = .{
-                .transition_id = self.record.transition_id,
-                .donor_group_id = self.record.donor_group_id,
-                .receiver_group_id = self.record.receiver_group_id,
-                .allow_doc_identity_reassignment = self.record.allow_doc_identity_reassignment,
-                .table_contract = self.record.table_contract,
+                .transition_id = self.merge_record.transition_id,
+                .donor_group_id = self.merge_record.donor_group_id,
+                .receiver_group_id = self.merge_record.receiver_group_id,
+                .allow_doc_identity_reassignment = self.merge_record.allow_doc_identity_reassignment,
+                .table_contract = self.merge_record.table_contract,
             } });
             try self.waitForFinalizedEverywhere();
 
-            // Restart the receiver leader from its node-local durable image,
-            // publish its new endpoints, and require it to lead both groups.
+            // Move both groups once more and prove the merge terminal through
+            // the network-routed adapter. The physical restart comes after
+            // the subsequent split so one recovery validates the composed
+            // durable history instead of invalidating a live peer endpoint
+            // between the two protocols.
             self.stage = 4;
-            try self.restartNode(2);
             try self.transferAndWait(171, 3);
             try self.transferAndWait(172, 3);
             ops = self.hosted.adapter();
             self.stage = 40;
             try self.executeIdempotent(&ops, .{ .finalize_merge = .{
-                .transition_id = self.record.transition_id,
-                .donor_group_id = self.record.donor_group_id,
-                .receiver_group_id = self.record.receiver_group_id,
-                .allow_doc_identity_reassignment = self.record.allow_doc_identity_reassignment,
-                .table_contract = self.record.table_contract,
+                .transition_id = self.merge_record.transition_id,
+                .donor_group_id = self.merge_record.donor_group_id,
+                .receiver_group_id = self.merge_record.receiver_group_id,
+                .allow_doc_identity_reassignment = self.merge_record.allow_doc_identity_reassignment,
+                .table_contract = self.merge_record.table_contract,
             } });
-            self.observation = try ops.observeMerge(self.record);
+            self.observation = try ops.observeMerge(self.merge_record);
             try self.waitForFinalizedEverywhere();
             try self.verifyDocumentsEverywhere();
-            try self.waitForDurableWatermarkConvergence();
+            try self.waitForDurableWatermarkConvergence(&.{ 171, 172 });
+
+            // Admit a fresh destination generation only after the merge has
+            // converged. The next protocol therefore consumes the output of
+            // the first transition instead of relying on independently seeded
+            // fixture state.
+            self.stage = 5;
+            try self.activateSplitTopology();
+            try self.transferAndWait(self.split_record.source_group_id, 1);
+            try self.transferAndWait(self.split_record.destination_group_id, 1);
+            ops = self.servers[0].localShardOperationAdapter();
+            self.stage = 50;
+            try self.executeIdempotent(&ops, .{ .prepare_split_source = .{
+                .transition_id = self.split_record.transition_id,
+                .attempt_epoch = self.split_record.attempt_epoch,
+                .source_group_id = self.split_record.source_group_id,
+                .destination_group_id = self.split_record.destination_group_id,
+                .split_key = self.split_record.split_key.?,
+                .source_range_end = self.split_record.source_range_end,
+                .table_contract = self.split_record.table_contract,
+            } });
+            try self.executeIdempotent(&ops, .{ .start_split_source = .{
+                .transition_id = self.split_record.transition_id,
+                .attempt_epoch = self.split_record.attempt_epoch,
+                .source_group_id = self.split_record.source_group_id,
+                .destination_group_id = self.split_record.destination_group_id,
+                .table_contract = self.split_record.table_contract,
+            } });
+            self.stage = 51;
+            try self.executeIdempotent(&ops, .{ .bootstrap_split_destination = .{
+                .transition_id = self.split_record.transition_id,
+                .attempt_epoch = self.split_record.attempt_epoch,
+                .source_group_id = self.split_record.source_group_id,
+                .destination_group_id = self.split_record.destination_group_id,
+                .table_contract = self.split_record.table_contract,
+            } });
+            try self.waitForSplitProgress(.bootstrapped);
+            try self.transferAndWait(self.split_record.source_group_id, 1);
+
+            // This ordinary public write lands after the base snapshot. It
+            // must be captured in the source delta log and replayed to the new
+            // owner before cutover.
+            self.stage = 52;
+            try self.writeSplitDelta();
+            try self.transferAndWait(self.split_record.source_group_id, 2);
+            try self.transferAndWait(self.split_record.destination_group_id, 2);
+            ops = self.servers[1].localShardOperationAdapter();
+            self.stage = 53;
+            try self.executeIdempotent(&ops, .{ .catch_up_split_destination = .{
+                .transition_id = self.split_record.transition_id,
+                .attempt_epoch = self.split_record.attempt_epoch,
+                .source_group_id = self.split_record.source_group_id,
+                .destination_group_id = self.split_record.destination_group_id,
+                .table_contract = self.split_record.table_contract,
+            } });
+            try self.waitForSplitProgress(.caught_up);
+            try self.transferAndWait(self.split_record.destination_group_id, 3);
+            self.stage = 54;
+            try self.executeIdempotent(&ops, .{ .finalize_split_source = .{
+                .transition_id = self.split_record.transition_id,
+                .attempt_epoch = self.split_record.attempt_epoch,
+                .source_group_id = self.split_record.source_group_id,
+                .destination_group_id = self.split_record.destination_group_id,
+                .table_contract = self.split_record.table_contract,
+            } });
+            try self.waitForSplitFinalizedEverywhere();
+            try self.publishFinalizedSplitTopology();
+
+            // Restart a physical owner after cutover, lead both resulting
+            // groups from its durable images, then prove the terminal command
+            // remains exactly idempotent through the routed adapter.
+            self.stage = 6;
+            try self.restartNode(1);
+            try self.transferAndWait(self.split_record.source_group_id, 2);
+            try self.transferAndWait(self.split_record.destination_group_id, 2);
+            ops = self.hosted.adapter();
+            self.stage = 60;
+            try self.executeIdempotent(&ops, .{ .finalize_split_source = .{
+                .transition_id = self.split_record.transition_id,
+                .attempt_epoch = self.split_record.attempt_epoch,
+                .source_group_id = self.split_record.source_group_id,
+                .destination_group_id = self.split_record.destination_group_id,
+                .table_contract = self.split_record.table_contract,
+            } });
+            self.split_observation = try ops.observeSplit(self.split_record);
+            try self.waitForSplitFinalizedEverywhere();
+            try self.verifySplitDocumentsEverywhere();
+            try self.waitForDurableWatermarkConvergence(&.{ 172, 173 });
         }
 
         fn executeIdempotent(
@@ -29308,11 +29431,15 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
             ops: *antfly.raft.ShardOperationAdapter,
             action: antfly.metadata.TransitionAction,
         ) !void {
-            for (0..6) |_| {
+            for (0..20) |_| {
                 ops.execute(action) catch |err| switch (err) {
                     error.GroupLeaderUnavailable,
                     error.LeaderUnavailable,
                     error.RaftBatchWriteOutcomeUnknown,
+                    error.ConnectionRefused,
+                    error.ConnectionResetByPeer,
+                    error.EndOfStream,
+                    error.Timeout,
                     => {
                         try self.io.sleep(.fromMilliseconds(10), .awake);
                         continue;
@@ -29339,6 +29466,14 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
                 if (self.leader(group_id) == expected) return;
                 if (self.driver_failure) |err| return err;
                 try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            for (self.servers, 0..) |*server, i| {
+                const raft = server.data_raft orelse continue;
+                const status = raft.host.http_host.host.raftStatus(group_id);
+                std.log.err(
+                    "multi-owner leader timeout group={} expected={} node={} status={any}",
+                    .{ group_id, expected, i + 1, status },
+                );
             }
             return error.VoprDataServerLeaderTimeout;
         }
@@ -29390,8 +29525,8 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
         fn verifyDocumentsEverywhere(self: *@This()) !void {
             for (self.servers) |*server| {
                 const receiver = try server.leaseTransitionDbForTableGroup(
-                    self.record.receiver_group_id,
-                    self.record.table_contract,
+                    self.merge_record.receiver_group_id,
+                    self.merge_record.table_contract,
                     .target,
                     .exact,
                 );
@@ -29407,20 +29542,197 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
             }
         }
 
-        fn waitForDurableWatermarkConvergence(self: *@This()) !void {
+        fn activateSplitTopology(self: *@This()) !void {
+            self.merge_records[0].phase = .finalized;
+            self.ranges[0] = .{
+                .group_id = self.split_record.source_group_id,
+                .range_id = self.split_record.table_contract.source_identity.range_id,
+                .table_id = self.split_record.table_contract.table_id,
+                .start_key = "doc:a",
+                .end_key = null,
+                .doc_identity_shard_id = self.split_record.table_contract.source_identity.shard_id,
+                .doc_identity_range_id = self.split_record.table_contract.source_identity.range_id,
+            };
+            self.snapshot.ranges = self.ranges[0..1];
+            // The merge donor is retired from placement at publication; only
+            // the surviving source and the newly admitted split destination
+            // remain owners in this metadata generation.
+            self.snapshot.placement_intents = self.placements[3..];
+            self.snapshot.split_transitions = self.split_records[0..];
+            self.snapshot.merge_transitions = self.merge_records[0..];
+            try self.publishAndSyncSnapshot();
+        }
+
+        fn publishFinalizedSplitTopology(self: *@This()) !void {
+            self.split_records[0].phase = .finalized;
+            self.ranges[0] = .{
+                .group_id = self.split_record.source_group_id,
+                .range_id = self.split_record.table_contract.source_identity.range_id,
+                .table_id = self.split_record.table_contract.table_id,
+                .start_key = "doc:a",
+                .end_key = self.split_record.split_key,
+                .doc_identity_shard_id = self.split_record.table_contract.source_identity.shard_id,
+                .doc_identity_range_id = self.split_record.table_contract.source_identity.range_id,
+            };
+            self.ranges[1] = .{
+                .group_id = self.split_record.destination_group_id,
+                .range_id = self.split_record.destination_group_id,
+                .table_id = self.split_record.table_contract.table_id,
+                .start_key = self.split_record.split_key.?,
+                .end_key = self.split_record.source_range_end,
+                .doc_identity_shard_id = self.split_record.table_contract.target_identity.shard_id,
+                .doc_identity_range_id = self.split_record.table_contract.target_identity.range_id,
+            };
+            self.snapshot.ranges = self.ranges[0..2];
+            try self.publishAndSyncSnapshot();
+        }
+
+        fn publishAndSyncSnapshot(self: *@This()) !void {
+            self.snapshot.status.metadata_epoch +|= 1;
+            for (self.servers, 0..) |*server, i| {
+                if (!self.initialized[i]) continue;
+                try SnapshotPublisher.publish(server, self.snapshot.*);
+                try server.syncDataRaftFromSnapshot(self.snapshot);
+            }
+        }
+
+        fn writeSplitDelta(self: *@This()) !void {
+            var executor = antfly.common.http.IoHttpExecutor.init(self.alloc, self.io, .{});
+            defer executor.deinit();
+            var client = antfly.public_api.ApiHttpClient.init(self.alloc, executor.executor());
+            var response = try client.fetchBatch(self.api_uris[0], self.split_record.table_contract.table_name,
+                \\{"inserts":{"doc:y":{"side":"split-delta"}},"sync_level":"write"}
+            );
+            defer response.deinit(self.alloc);
+            try std.testing.expect(response.status == 201 or response.status == 202);
+            try std.testing.expect(std.mem.indexOf(u8, response.body, "\"inserted\":1") != null);
+        }
+
+        const SplitProgress = enum { bootstrapped, caught_up };
+
+        fn waitForSplitProgress(self: *@This(), expected: SplitProgress) !void {
             for (0..30_000) |_| {
-                const donor_applied = self.servers[0].localDataRaftAppliedIndex(self.record.donor_group_id) orelse
-                    return error.MissingDataRaft;
-                const receiver_applied = self.servers[0].localDataRaftAppliedIndex(self.record.receiver_group_id) orelse
-                    return error.MissingDataRaft;
+                const source_leader = self.leader(self.split_record.source_group_id) orelse {
+                    try self.io.sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                };
+                var ops = self.servers[source_leader - 1].localShardOperationAdapter();
+                const observation = ops.observeSplit(self.split_record) catch |err| switch (err) {
+                    error.GroupLeaderUnavailable,
+                    error.LeaderUnavailable,
+                    error.UnknownGroup,
+                    error.UnknownSplitRuntime,
+                    error.MissingSplitRuntime,
+                    error.MissingSplitSourceStore,
+                    error.ConnectionRefused,
+                    error.ConnectionResetByPeer,
+                    error.EndOfStream,
+                    error.Timeout,
+                    => {
+                        try self.io.sleep(.fromMilliseconds(1), .awake);
+                        continue;
+                    },
+                    else => return err,
+                };
+                const ready = switch (expected) {
+                    .bootstrapped => observation.status.bootstrapped,
+                    .caught_up => observation.status.replay_caught_up and observation.status.cutover_ready,
+                };
+                if (ready) return;
+                if (self.driver_failure) |err| return err;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.VoprDataServerSplitProgressTimeout;
+        }
+
+        fn waitForSplitFinalizedEverywhere(self: *@This()) !void {
+            for (0..30_000) |_| {
                 var converged = true;
-                for (self.servers[1..]) |*server| {
-                    if (server.localDataRaftAppliedIndex(self.record.donor_group_id) != donor_applied or
-                        server.localDataRaftAppliedIndex(self.record.receiver_group_id) != receiver_applied)
+                for (self.servers, 0..) |*server, i| {
+                    if (self.paused[i] or !self.initialized[i]) {
+                        converged = false;
+                        break;
+                    }
+                    const store = server.localTransitionApplyStore() orelse {
+                        converged = false;
+                        break;
+                    };
+                    const terminal = try store.currentSplitTerminal(self.alloc, self.split_record.source_group_id);
+                    defer if (terminal) |value| antfly.data.storage.shard_state_store.freeSplitTerminal(self.alloc, value);
+                    if (terminal == null or
+                        terminal.?.transition_id != self.split_record.transition_id or
+                        terminal.?.attempt_epoch != self.split_record.attempt_epoch or
+                        terminal.?.destination_group_id != self.split_record.destination_group_id or
+                        terminal.?.outcome != .finalized)
                     {
                         converged = false;
                         break;
                     }
+                    const source_range = try store.currentRange(self.alloc, self.split_record.source_group_id);
+                    defer range_state_mod.freeRange(self.alloc, source_range);
+                    const destination_range = try store.currentRange(self.alloc, self.split_record.destination_group_id);
+                    defer range_state_mod.freeRange(self.alloc, destination_range);
+                    if (!std.mem.eql(u8, source_range.start, "doc:a") or
+                        !std.mem.eql(u8, source_range.end, self.split_record.split_key.?) or
+                        !std.mem.eql(u8, destination_range.start, self.split_record.split_key.?) or
+                        destination_range.end.len != 0)
+                    {
+                        converged = false;
+                        break;
+                    }
+                }
+                if (converged) return;
+                if (self.driver_failure) |err| return err;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.VoprDataServerSplitReplicaConvergenceTimeout;
+        }
+
+        fn verifySplitDocumentsEverywhere(self: *@This()) !void {
+            for (self.servers) |*server| {
+                const source = try server.leaseTransitionDbForTableGroup(
+                    self.split_record.source_group_id,
+                    self.split_record.table_contract,
+                    .source,
+                    .exact,
+                );
+                defer source.release();
+                const source_doc = (try source.db.get(self.alloc, "doc:b")) orelse
+                    return error.MissingSplitSourceDocument;
+                defer self.alloc.free(source_doc);
+                try std.testing.expectEqualStrings("{\"side\":\"donor\"}", source_doc);
+
+                const destination = try server.leaseTransitionDbForTableGroup(
+                    self.split_record.destination_group_id,
+                    self.split_record.table_contract,
+                    .target,
+                    .exact,
+                );
+                defer destination.release();
+                const base_doc = (try destination.db.get(self.alloc, "doc:z")) orelse
+                    return error.MissingSplitBootstrapDocument;
+                defer self.alloc.free(base_doc);
+                try std.testing.expectEqualStrings("{\"side\":\"receiver\"}", base_doc);
+                const delta_doc = (try destination.db.get(self.alloc, "doc:y")) orelse
+                    return error.MissingSplitDeltaDocument;
+                defer self.alloc.free(delta_doc);
+                try std.testing.expectEqualStrings("{\"side\":\"split-delta\"}", delta_doc);
+            }
+        }
+
+        fn waitForDurableWatermarkConvergence(self: *@This(), group_ids: []const u64) !void {
+            for (0..30_000) |_| {
+                var converged = true;
+                for (group_ids) |group_id| {
+                    const applied = self.servers[0].localDataRaftAppliedIndex(group_id) orelse
+                        return error.MissingDataRaft;
+                    for (self.servers[1..]) |*server| {
+                        if (server.localDataRaftAppliedIndex(group_id) != applied) {
+                            converged = false;
+                            break;
+                        }
+                    }
+                    if (!converged) break;
                 }
                 if (converged) return;
                 if (self.driver_failure) |err| return err;
@@ -29461,12 +29773,7 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
             self.api_uris[index] = try self.servers[index].baseUri(self.alloc);
             self.stores[index].api_url = self.api_uris[index];
             self.stores[index].raft_url = self.raft_uris[index];
-            self.snapshot.status.metadata_epoch +|= 1;
-            for (self.servers, 0..) |*server, i| {
-                if (!self.initialized[i]) continue;
-                try SnapshotPublisher.publish(server, self.snapshot.*);
-                try server.syncDataRaftFromSnapshot(self.snapshot);
-            }
+            try self.publishAndSyncSnapshot();
             self.paused[index] = false;
         }
     };
@@ -29481,9 +29788,14 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
         .api_uris = &api_uris,
         .raft_uris = &raft_uris,
         .stores = &stores,
+        .ranges = &ranges,
+        .placements = &placements,
+        .merge_records = &merge_records,
+        .split_records = &split_records,
         .snapshot = &snapshot,
         .hosted = &hosted,
-        .record = record,
+        .merge_record = merge_record,
+        .split_record = split_record,
     };
     var driver_futures: [3]std.Io.Future(void) = undefined;
     for (0..3) |index| driver_futures[index] = io.async(Shared.drive, .{ &shared, index });
@@ -29609,7 +29921,7 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
         };
         try sim.scheduler().executeReady(selected.id, &events, alloc);
         transitions += 1;
-        if (transitions > 200_000) {
+        if (transitions > 400_000) {
             std.log.err(
                 "multi-owner DataServer VOPR transition budget stage={} donor_leader={?} receiver_leader={?} now_ns={} rounds={any}",
                 .{
@@ -29679,6 +29991,8 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
     const observation = shared.observation orelse return error.MissingMergeObservation;
     try std.testing.expectEqual(.finalized, observation.donor.phase);
     try std.testing.expectEqual(.finalized, observation.receiver.phase);
+    const split_observation = shared.split_observation orelse return error.MissingSplitObservation;
+    try std.testing.expectEqual(.finalized, split_observation.status.phase);
 
     if (sim.firstCapabilityViolation()) |violation| {
         std.log.err("multi-owner DataServer VOPR capability violation operation={s} sequence={}", .{
@@ -29689,12 +30003,29 @@ fn runThreeDataServerReplicatedMergeVoprHistory(
     try sim.ensureNoCapabilityViolation();
 }
 
-test "three production DataServers converge replicated merge across failover and restart on VoprIo" {
+test "three production DataServers compose replicated merge and split across public writes failover and restart on VoprIo" {
     var trace: std.ArrayListUnmanaged(MultiOwnerReplayStep) = .empty;
     defer trace.deinit(std.testing.allocator);
-    try runThreeDataServerReplicatedMergeVoprHistory(std.testing.allocator, null, &trace);
+    try runThreeDataServerReplicatedTransitionVoprHistory(std.testing.allocator, null, &trace);
     try std.testing.expect(trace.items.len > 0);
-    try runThreeDataServerReplicatedMergeVoprHistory(std.testing.allocator, trace.items, &trace);
+    try runThreeDataServerReplicatedTransitionVoprHistory(std.testing.allocator, trace.items, &trace);
+}
+
+test "inline replicated split action failure releases its transition lane exactly once" {
+    var lanes: TransitionActionLanes = .{};
+    var job: DataServer.ReplicatedSplitActionJob = undefined;
+    job.lane = lanes.tryAcquire(172) orelse return error.TestUnexpectedResult;
+    job.lane_held = true;
+
+    // Inline durable-job execution may release the lane before submit()
+    // returns the job's error to enqueueReplicatedSplitAction. The submission
+    // cleanup must observe that ownership transfer instead of unlocking the
+    // caller's stale copy a second time.
+    job.releaseLane();
+    job.releaseLane();
+
+    var reacquired = lanes.tryAcquire(172) orelse return error.TestUnexpectedResult;
+    reacquired.deinit();
 }
 
 test "data server mirrors managed primary writes into HA replication log" {
