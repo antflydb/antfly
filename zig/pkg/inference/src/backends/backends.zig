@@ -333,11 +333,11 @@ pub const SessionManager = struct {
             std.log.info("selected backend {s} for {s}", .{ @tagName(backend), model_path });
             return session;
         }
-        if (self.required_backend != null) return error.RequiredBackendUnavailable;
+        if (self.required_backend != null) return backendLoadFailure(self.required_backend, first_err);
         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return error.KernelJitProfileRequiresMetalBackend;
         if (self.kernel_jit.mode.failClosed()) return error.KernelJitRequiredBackendUnavailable;
         // NoBackendAvailable only when no backend produced a real error.
-        return first_err orelse error.NoBackendAvailable;
+        return backendLoadFailure(null, first_err);
     }
 
     /// Apply the process-level fail-closed backend policy before callers make
@@ -353,6 +353,16 @@ pub const SessionManager = struct {
                 return error.RequiredBackendUnavailable;
         }
         return enforceRequiredBackend(self.required_backend, fallback_backends, required_buf);
+    }
+
+    /// Whether a backend-specific fast path may bypass normal session loading.
+    /// Invalid or unsupported required policies still fail closed, while a
+    /// different valid required backend makes the fast path ineligible.
+    pub fn allowsDirectBackend(self: *const SessionManager, backend: BackendType) !bool {
+        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        const required = self.required_backend orelse return true;
+        if (!required.supportsDirectSessionLoad()) return error.RequiredBackendUnavailable;
+        return required == backend;
     }
 
     fn createImportedOnnxSession(
@@ -581,6 +591,11 @@ fn enforceRequiredBackend(
     return required_buf;
 }
 
+fn backendLoadFailure(required_backend: ?BackendType, first_err: ?anyerror) anyerror {
+    if (required_backend != null) return first_err orelse error.RequiredBackendUnavailable;
+    return first_err orelse error.NoBackendAvailable;
+}
+
 test "required backend parser rejects auto and invalid values" {
     try std.testing.expectEqual(BackendType.cuda, requiredBackendConfigForValue("cuda").backend.?);
     try std.testing.expectEqual(BackendType.pjrt, requiredBackendConfigForValue("pjrt").backend.?);
@@ -615,6 +630,20 @@ test "required backend replaces every fallback candidate" {
     );
 }
 
+test "required backend gates backend-specific fast paths" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = .cuda;
+    manager.required_backend_invalid = false;
+    try std.testing.expect(try manager.allowsDirectBackend(.cuda));
+    try std.testing.expect(!try manager.allowsDirectBackend(.onnx));
+
+    manager.required_backend = null;
+    try std.testing.expect(try manager.allowsDirectBackend(.onnx));
+
+    manager.required_backend_invalid = true;
+    try std.testing.expectError(error.InvalidRequiredBackend, manager.allowsDirectBackend(.onnx));
+}
+
 test "invalid required backend fails before model loading" {
     var manager = SessionManager.init(std.testing.allocator);
     manager.required_backend = null;
@@ -628,6 +657,17 @@ test "unavailable required backend does not fall back" {
     manager.required_backend_invalid = false;
     manager.preferred_backends = &.{.native};
     try std.testing.expectError(error.RequiredBackendUnavailable, manager.loadModel("/nonexistent/model"));
+}
+
+test "failing required backend preserves its load error" {
+    try std.testing.expectEqual(
+        error.NoTensorStoreFound,
+        backendLoadFailure(.native, error.NoTensorStoreFound),
+    );
+    try std.testing.expectEqual(
+        error.RequiredBackendUnavailable,
+        backendLoadFailure(.cuda, null),
+    );
 }
 
 fn gpuEagerDenseMaxBytes() u64 {

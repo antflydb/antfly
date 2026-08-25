@@ -6019,7 +6019,10 @@ pub const Node = struct {
             self.config.allow_unknown_models,
         )) |response|
             return response;
-        const allow_onnx = effective_draft_model_name == null and
+        const required_policy_allows_onnx = self.session_manager.allowsDirectBackend(.onnx) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        const allow_onnx = required_policy_allows_onnx and
+            effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
             (body.backend == null or backend_selection.native_choice == .onnx);
 
