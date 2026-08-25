@@ -948,9 +948,17 @@ fn appendPublicIndexConfig(
     const single_graph_source = if (!has_sources and index_type == .graph) blk: {
         const source = config.object.get("source") orelse break :blk null;
         if (source != .object) break :blk null;
-        const kind = source.object.get("kind") orelse break :blk null;
-        if (kind != .string or !std.mem.eql(u8, kind.string, "artifact")) break :blk null;
+        const artifact = source.object.get("artifact") orelse break :blk null;
+        if (artifact != .string or artifact.string.len == 0) break :blk null;
+        if (source.object.get("kind")) |kind| {
+            if (kind != .string or !std.mem.eql(u8, kind.string, "artifact")) break :blk null;
+        }
         break :blk source;
+    } else null;
+    const single_embedding_artifact = if (!has_sources and index_type == .embeddings) blk: {
+        const artifact = config.object.get("embedding_name") orelse break :blk null;
+        if (artifact != .string or artifact.string.len == 0) break :blk null;
+        break :blk artifact;
     } else null;
     if (single_full_text_artifact) |artifact| {
         if (artifact == .string and artifact.string.len > 0) {
@@ -961,6 +969,10 @@ fn appendPublicIndexConfig(
     } else if (single_graph_source) |source| {
         try out.appendSlice(alloc, ",\"sources\":");
         try appendCanonicalSingleGraphSource(alloc, out, config, source);
+    } else if (single_embedding_artifact) |artifact| {
+        try out.appendSlice(alloc, ",\"sources\":[{\"artifact\":");
+        try appendJsonString(alloc, out, artifact.string);
+        try out.appendSlice(alloc, "}]");
     }
 
     var it = config.object.iterator();
@@ -973,6 +985,9 @@ fn appendPublicIndexConfig(
                 std.mem.eql(u8, entry.key_ptr.*, "nodes") or
                 std.mem.eql(u8, entry.key_ptr.*, "edge") or
                 std.mem.eql(u8, entry.key_ptr.*, "context"))) continue;
+        if (single_embedding_artifact != null and
+            (std.mem.eql(u8, entry.key_ptr.*, "embedding_name") or
+                std.mem.eql(u8, entry.key_ptr.*, "source_artifact_name"))) continue;
         if (!public_index_contract.isAllowedConfigField(index_type, entry.key_ptr.*)) continue;
         if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
         if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
@@ -1009,9 +1024,7 @@ fn appendCanonicalSingleGraphSource(
     var it = source.object.iterator();
     while (it.next()) |entry| {
         if (!public_index_contract.isAllowedGraphArtifactSourceField(entry.key_ptr.*)) continue;
-        if (std.mem.eql(u8, entry.key_ptr.*, "nodes") or
-            std.mem.eql(u8, entry.key_ptr.*, "edge") or
-            std.mem.eql(u8, entry.key_ptr.*, "context")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "kind")) continue;
         if (!public_index_contract.createdFieldValueMatches(.graph_source, entry.key_ptr.*, entry.value_ptr.*)) continue;
         const child_shape = public_index_contract.createdObjectShapeForChild(.graph_source, entry.key_ptr.*);
         if (!public_index_contract.createdValueMatchesShape(child_shape, entry.value_ptr.*)) continue;
@@ -1027,6 +1040,9 @@ fn appendCanonicalSingleGraphSource(
         .{ .name = "context", .shape = .graph_context },
     };
     for (mappings) |mapping| {
+        if (source.object.get(mapping.name)) |nested| {
+            if (nested != .null) continue;
+        }
         const value = config.object.get(mapping.name) orelse continue;
         if (!public_index_contract.createdValueMatchesShape(mapping.shape, value)) continue;
         if (!first) try out.append(alloc, ',');
@@ -1369,6 +1385,10 @@ fn appendGraphSourceStatusObject(
     materialization_pending: bool,
 ) !void {
     try out.append(alloc, '{');
+    try appendJsonString(alloc, out, "artifact");
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, out, source.artifact);
+    try out.append(alloc, ',');
     try appendJsonString(alloc, out, "name");
     try out.append(alloc, ':');
     try appendJsonString(alloc, out, source.artifact);
@@ -3849,6 +3869,9 @@ fn appendSingleIndexRuntimeStatus(
         try appendIntValue(alloc, out, item.algebraic_graph_traversal_result_node_count);
         try out.appendSlice(alloc, "}}");
         if (graph_source_status) |status| {
+            // Preserve the old aggregate projection until clients have moved to
+            // the enclosing catch-up fields. It is deliberately identical for
+            // every source and must not be treated as per-source telemetry.
             const materialization_pending = catch_up_active or replay_catch_up_required;
             try out.appendSlice(alloc, ",\"source_artifacts\":[");
             var first = true;
@@ -4572,12 +4595,20 @@ test "created index configs normalize single-source input forms" {
         full_text,
     );
 
-    const graph = try encodeCreatedIndexConfig(std.testing.allocator, "relations", "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"nodes\":{\"model\":\"external\",\"target\":\"{{ _item.id }}\"}}");
+    const graph = try encodeCreatedIndexConfig(std.testing.allocator, "relations", "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"nodes\":{\"model\":\"external\",\"target\":\"{{ _item.id }}\"}}}");
     defer std.testing.allocator.free(graph);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"relations\",\"type\":\"graph\",\"sources\":[{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"nodes\":{\"model\":\"external\",\"target\":\"{{ _item.id }}\"}}]}",
+        "{\"name\":\"relations\",\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"model\":\"external\",\"target\":\"{{ _item.id }}\"}}]}",
         graph,
+    );
+
+    const embeddings = try encodeCreatedIndexConfig(std.testing.allocator, "vectors", "{\"type\":\"embeddings\",\"dimension\":3,\"embedding_name\":\"body_dense_v1\",\"source_artifact_name\":\"body_chunks_v1\"}");
+    defer std.testing.allocator.free(embeddings);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"vectors\",\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"body_dense_v1\"}],\"dimension\":3}",
+        embeddings,
     );
 }
 
@@ -4714,7 +4745,7 @@ test "created graph index response projects closed nested schemas" {
         \\{"type":"graph","template":{"client_value":"private-root-value"},"source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":{"client_value":"private-format-value"},"client_value":"private-source-value","settings":{"opaque":"private-source-settings"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}","client_value":"private-source-value"},"content_type":{"client_value":"private-content-type"},"producer_json":{"provider":"private","api_key":"private-key"},"execution":{"batch_items":8,"settings":{"opaque":"private-execution-settings"}},"client_value":"private-artifact-value","settings":{"opaque":"private-artifact-settings"}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}","client_value":"private-node-value"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","api_key":"private-metadata-key","nested":{"label":"public","authorization":"private-authorization"}},"client_value":"private-edge-mapping-value"},"context":{"doc_fields":["title","body"],"client_value":"private-context-value"},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":true,"client_value":"private-bounded-value"},"client_value":"private-planning-value"},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"],"client_value":"private-edge-value"},{"name":"malformed","required_metadata":{"client_value":"private-metadata-value"}},{"name":{"client_value":"private-required-value"}}],"resolvers":["private-malformed-resolver",{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix","candidate_limit":{"client_value":"private-limit-value"},"client_value":"private-resolver-value","settings":{"opaque":"private-resolver-settings"}}]}
     ;
     const expected =
-        \\{"name":"relations_graph","type":"graph","sources":[{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","nested":{"label":"public"}}},"context":{"doc_fields":["title","body"]}}],"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"execution":{"batch_items":8}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"]},{"name":"malformed"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
+        \\{"name":"relations_graph","type":"graph","sources":[{"artifact":"relations_v1","path":"$.relations[*]","nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","nested":{"label":"public"}}},"context":{"doc_fields":["title","body"]}}],"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"execution":{"batch_items":8}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"]},{"name":"malformed"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
     ;
     const created = try encodeCreatedIndexConfig(std.testing.allocator, "relations_graph", config);
     defer std.testing.allocator.free(created);
@@ -5184,7 +5215,7 @@ test "index encoders expose graph artifact source materialization status" {
 
     const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "relations_graph", &local_status)).?;
     defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifacts\":[{\"name\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\",\"materialization_pending\":true},{\"name\":\"graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\",\"materialization_pending\":true}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifacts\":[{\"artifact\":\"relations_v1\",\"name\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\",\"materialization_pending\":true},{\"artifact\":\"graph_v1\",\"name\":\"graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\",\"materialization_pending\":true}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
 }
 

@@ -18013,14 +18013,15 @@ components:
         embedding_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Generated embedding artifact name consumed by this vector index. Use with a matching
-            embedding enrichment for artifact-backed managed embeddings.
+          deprecated: true
+          description: Deprecated single-source artifact reference. Use sources with a matching embedding
+            enrichment; accepted requests are normalized to sources.
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Artifact stream consumed by the embedding enrichment backing this vector index.
-            This is descriptive public configuration; the matching enrichment defines the materialized
-            source.
+          deprecated: true
+          description: Deprecated index-level description of an embedding producer input. Put this field
+            on the matching embedding enrichment and select its output through sources.
         template:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -18137,6 +18138,9 @@ components:
           enum:
             - artifact
           default: artifact
+          deprecated: true
+          description: Compatibility discriminator for the former graph source union. Omit it; artifact
+            is the only public source kind.
         artifact:
           type: string
           minLength: 1
@@ -18395,10 +18399,19 @@ components:
         artifact:
           $ref: '#/components/schemas/GraphArtifactProducerConfig'
         nodes:
+          deprecated: true
+          description: Deprecated root-level single-source mapping. Put nodes inside source or each sources
+            item.
           $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
         edge:
+          deprecated: true
+          description: Deprecated root-level single-source mapping. Put edge inside source or each sources
+            item.
           $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
         context:
+          deprecated: true
+          description: Deprecated root-level single-source mapping. Put context inside source or each
+            sources item.
           $ref: '#/components/schemas/GraphArtifactContextConfig'
         algebraic_planning:
           $ref: '#/components/schemas/GraphAlgebraicPlanningConfig'
@@ -19579,9 +19592,18 @@ components:
         - path
         - format
         - materialization_pending
+      description: Configured graph artifact source projected in deterministic precedence order. New servers
+        always populate artifact; it remains optional in the transition schema so new clients can read
+        older servers. Deprecated aliases remain populated for rolling client compatibility.
       properties:
+        artifact:
+          type: string
+          description: Canonical artifact source identity. New servers always populate this field; clients
+            may fall back to the deprecated name alias when reading an older server.
         name:
           type: string
+          deprecated: true
+          description: Deprecated compatibility alias for artifact.
         path:
           type: string
         format:
@@ -19591,6 +19613,9 @@ components:
             - extraction_graph
         materialization_pending:
           type: boolean
+          deprecated: true
+          description: Deprecated aggregate compatibility projection. This mirrors enclosing index catch-up
+            state and is not source-specific.
     GraphIndexStats:
       type: object
       description: Statistics for graph index
@@ -19624,7 +19649,9 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GraphSourceArtifactStatus'
-          description: Per-source materialization status in configured precedence order.
+          description: Configured artifact sources in deterministic precedence order. Catch-up and repair
+            state is reported by the enclosing index status; deprecated per-item compatibility projections
+            must not be interpreted as source-specific telemetry.
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -22551,11 +22578,27 @@ components:
             $ref: '#/components/schemas/CreatedEnrichmentConfig'
           x-go-type-skip-optional-pointer: true
           description: Normalized inline managed enrichment definitions required by this index.
+    CreatedFullTextIndexConfig:
+      type: object
+      description: Canonical full-text configuration returned after creation. Single-source request aliases
+        are represented through sources.
+      properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/ArtifactIndexSource'
+        mem_only:
+          type: boolean
+        field:
+          type: string
     CreatedFullTextIndex:
       description: Normalized effective full-text index configuration returned after creation.
       allOf:
         - $ref: '#/components/schemas/CreatedIndexCommon'
-        - $ref: '#/components/schemas/FullTextIndexConfig'
+        - $ref: '#/components/schemas/CreatedFullTextIndexConfig'
         - type: object
           required:
             - type
@@ -22646,8 +22689,6 @@ components:
           minimum: 1
         field:
           type: string
-        embedding_name:
-          type: string
         sources:
           type: array
           minItems: 1
@@ -22656,8 +22697,6 @@ components:
           items:
             $ref: '#/components/schemas/ArtifactIndexSource'
           description: Embedding artifact streams indexed together as independent vector members.
-        source_artifact_name:
-          type: string
         template:
           type: string
         distance_metric:
@@ -22739,18 +22778,8 @@ components:
           maxItems: 64
           items:
             $ref: '#/components/schemas/GraphArtifactSourceConfig'
-        source:
-          description: Single-source convenience form. Mutually exclusive with sources; normalized responses
-            use sources.
-          $ref: '#/components/schemas/GraphArtifactSourceConfig'
         artifact:
           $ref: '#/components/schemas/CreatedGraphArtifactProducerConfig'
-        nodes:
-          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
-        edge:
-          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
-        context:
-          $ref: '#/components/schemas/GraphArtifactContextConfig'
         algebraic_planning:
           $ref: '#/components/schemas/GraphAlgebraicPlanningConfig'
         resolvers:

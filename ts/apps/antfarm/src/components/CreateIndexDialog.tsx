@@ -11,7 +11,12 @@ import {
   FormActions,
   Switch,
 } from "@antfly/design-system";
-import type { EmbedderConfig, GeneratorConfig, IndexConfig } from "@antfly/sdk";
+import {
+  artifactEmbeddingIndexConfig,
+  type EmbedderConfig,
+  type GeneratorConfig,
+  type IndexConfig,
+} from "@antfly/sdk";
 import { zodResolver } from "@hookform/resolvers/zod";
 import type React from "react";
 import { useEffect, useState } from "react";
@@ -46,44 +51,96 @@ export function getSchemaFieldNames(schema: TableSchema | null): string[] {
   return [...new Set(fields)].sort((a, b) => a.localeCompare(b));
 }
 
-const indexFormSchema = z.object({
-  name: z.string().min(1, "Index name is required."),
-  dimension: z.number().optional(),
-  field: z.string().optional(),
-  template: z.string().optional(),
-  sourceType: z.enum(["field", "template"]),
-  embedder: z.object({
-    provider: z.enum([
-      "antfly",
-      "ollama",
-      "gemini",
-      "vertex",
-      "openai",
-      "openrouter",
-      "bedrock",
-      "cohere",
-      "mock",
-    ]),
-    model: z.string().min(1, "Model is required."),
-    api_key: z.string().optional(),
-    url: z.string().optional(),
-    aws_access_key_id: z.string().optional(),
-    aws_secret_access_key: z.string().optional(),
-    region: z.string().optional(),
-  }),
-  chunker: z
-    .object({
-      provider: z.enum(["antfly", "mock"]),
-      strategy: z.enum(["hugot", "fixed"]),
-      api_url: z.string().optional(),
-      target_tokens: z.number().optional(),
-      overlap_tokens: z.number().optional(),
-      separator: z.string().optional(),
-      max_chunks: z.number().optional(),
-      threshold: z.number().optional(),
-    })
-    .optional(),
-});
+const indexFormSchema = z
+  .object({
+    name: z.string().trim().min(1, "Index name is required."),
+    dimension: z.number().optional(),
+    field: z.string().optional(),
+    template: z.string().optional(),
+    sourceType: z.enum(["field", "template", "artifacts"]),
+    artifactSources: z
+      .array(
+        z.object({
+          artifact: z.string(),
+          sourceArtifact: z.string().optional(),
+          field: z.string().optional(),
+        })
+      )
+      .max(64, "At most 64 artifact sources are allowed."),
+    vectorSpace: z.string().optional(),
+    embedder: z.object({
+      provider: z.enum([
+        "antfly",
+        "ollama",
+        "gemini",
+        "vertex",
+        "openai",
+        "openrouter",
+        "bedrock",
+        "cohere",
+        "mock",
+      ]),
+      model: z.string().trim().min(1, "Model is required."),
+      api_key: z.string().optional(),
+      url: z.string().optional(),
+      aws_access_key_id: z.string().optional(),
+      aws_secret_access_key: z.string().optional(),
+      region: z.string().optional(),
+    }),
+    chunker: z
+      .object({
+        provider: z.enum(["antfly", "mock"]),
+        strategy: z.enum(["hugot", "fixed"]),
+        api_url: z.string().optional(),
+        target_tokens: z.number().optional(),
+        overlap_tokens: z.number().optional(),
+        separator: z.string().optional(),
+        max_chunks: z.number().optional(),
+        threshold: z.number().optional(),
+      })
+      .optional(),
+  })
+  .superRefine((data, context) => {
+    if (data.sourceType === "field" && !data.field?.trim()) {
+      context.addIssue({ code: "custom", path: ["field"], message: "Field is required." });
+    }
+    if (data.sourceType === "template" && !data.template?.trim()) {
+      context.addIssue({ code: "custom", path: ["template"], message: "Template is required." });
+    }
+    if (data.sourceType !== "artifacts") return;
+    if (data.artifactSources.length === 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["artifactSources"],
+        message: "At least one artifact source is required.",
+      });
+    }
+    const seen = new Set<string>();
+    data.artifactSources.forEach((source, index) => {
+      const artifact = source.artifact.trim();
+      if (!artifact) {
+        context.addIssue({
+          code: "custom",
+          path: ["artifactSources", index, "artifact"],
+          message: "Artifact name is required.",
+        });
+      } else if (seen.has(artifact)) {
+        context.addIssue({
+          code: "custom",
+          path: ["artifactSources", index, "artifact"],
+          message: "Artifact names must be unique.",
+        });
+      }
+      seen.add(artifact);
+      if (!source.field?.trim()) {
+        context.addIssue({
+          code: "custom",
+          path: ["artifactSources", index, "field"],
+          message: "Embedding input field is required.",
+        });
+      }
+    });
+  });
 
 type IndexFormData = z.infer<typeof indexFormSchema>;
 
@@ -109,6 +166,8 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
       sourceType: "field",
       field: "",
       template: "",
+      artifactSources: [{ artifact: "", sourceArtifact: "", field: "text" }],
+      vectorSpace: undefined,
       dimension: 0,
       embedder: {
         provider: "ollama",
@@ -122,16 +181,39 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
   useEffect(() => {
     if (viewMode === "form") {
       const subscription = watch((data) => {
-        const { sourceType, chunker, ...rest } = data;
-        const indexConfig = {
-          name: rest.name || "",
-          type: "embeddings" as const,
-          dimension: rest.dimension || 0,
-          field: sourceType === "field" ? rest.field : undefined,
-          template: sourceType === "template" ? rest.template : undefined,
-          embedder: rest.embedder as GeneratorConfig,
-          chunker: chunker || undefined,
-        } as IndexConfig;
+        const { sourceType, chunker, artifactSources = [], vectorSpace, ...rest } = data;
+        const indexConfig =
+          sourceType === "artifacts"
+            ? ({
+                name: rest.name || "",
+                type: "embeddings" as const,
+                dimension: rest.dimension || undefined,
+                sources: artifactSources
+                  .filter((source) => source?.artifact)
+                  .map((source) => ({ artifact: source?.artifact || "" })),
+                enrichments: artifactSources
+                  .filter((source) => source?.artifact)
+                  .map((source) => ({
+                    name: source?.artifact || "",
+                    kind: "embedding" as const,
+                    field: source?.field || "text",
+                    ...(source?.sourceArtifact
+                      ? { source_artifact_name: source.sourceArtifact }
+                      : {}),
+                    ...(rest.dimension ? { expected_dims: rest.dimension } : {}),
+                    ...(vectorSpace ? { vector_space: vectorSpace } : {}),
+                  })),
+                embedder: rest.embedder as GeneratorConfig,
+              } as IndexConfig)
+            : ({
+                name: rest.name || "",
+                type: "embeddings" as const,
+                dimension: rest.dimension || 0,
+                field: sourceType === "field" ? rest.field : undefined,
+                template: sourceType === "template" ? rest.template : undefined,
+                embedder: rest.embedder as GeneratorConfig,
+                chunker: chunker || undefined,
+              } as IndexConfig);
         setJsonPayload(indexConfig);
       });
       return () => subscription.unsubscribe();
@@ -139,6 +221,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
   }, [watch, viewMode]);
 
   const onSubmit = async (data: IndexFormData) => {
+    setError(null);
     try {
       let indexConfig: IndexConfig;
       if (viewMode === "json") {
@@ -182,22 +265,36 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
             throw new Error("Invalid provider");
         }
 
-        indexConfig = {
-          name: data.name,
-          type: "embeddings" as const,
-          dimension: data.dimension || 0,
-          field: data.sourceType === "field" ? data.field : undefined,
-          template: data.sourceType === "template" ? data.template : undefined,
-          embedder: embedderConfig,
-          chunker: data.chunker || undefined,
-        } as IndexConfig;
+        indexConfig =
+          data.sourceType === "artifacts"
+            ? artifactEmbeddingIndexConfig(data.name, {
+                sources: data.artifactSources.map((source) => ({
+                  artifact: source.artifact.trim(),
+                  ...(source.sourceArtifact?.trim()
+                    ? { sourceArtifact: source.sourceArtifact.trim() }
+                    : {}),
+                  field: source.field?.trim() || "text",
+                })),
+                embedder: embedderConfig,
+                ...(data.dimension ? { dimension: data.dimension } : {}),
+                ...(data.vectorSpace?.trim() ? { vectorSpace: data.vectorSpace.trim() } : {}),
+              })
+            : ({
+                name: data.name,
+                type: "embeddings" as const,
+                dimension: data.dimension || 0,
+                field: data.sourceType === "field" ? data.field : undefined,
+                template: data.sourceType === "template" ? data.template : undefined,
+                embedder: embedderConfig,
+                chunker: data.chunker || undefined,
+              } as IndexConfig);
       }
       const { indexName, request } = createIndexArguments(indexConfig);
       await api.indexes.create(tableName, indexName, request);
       onIndexCreated();
       onClose();
     } catch (e) {
-      setError("Failed to create index.");
+      setError(e instanceof Error && e.message ? e.message : "Failed to create index.");
       console.error(e);
     }
   };
@@ -205,12 +302,28 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
   const handleViewChange = (checked: boolean) => {
     const newMode = checked ? "json" : "form";
     if (newMode === "form") {
-      if (!("embedder" in jsonPayload) || !("dimension" in jsonPayload)) {
+      if (!("embedder" in jsonPayload)) {
         return;
       }
       const { name, dimension, field, template, embedder } = jsonPayload;
       const chunker = "chunker" in jsonPayload ? jsonPayload.chunker : undefined;
-      const sourceType = field ? "field" : "template";
+      const sources =
+        "sources" in jsonPayload && Array.isArray(jsonPayload.sources) ? jsonPayload.sources : [];
+      const enrichments =
+        "enrichments" in jsonPayload && Array.isArray(jsonPayload.enrichments)
+          ? jsonPayload.enrichments
+          : [];
+      const sourceType = sources.length > 0 ? "artifacts" : field ? "field" : "template";
+      const vectorSpaces = enrichments.flatMap((candidate) =>
+        typeof candidate === "object" &&
+        candidate !== null &&
+        "vector_space" in candidate &&
+        typeof candidate.vector_space === "string" &&
+        candidate.vector_space.length > 0
+          ? [candidate.vector_space]
+          : []
+      );
+      const uniqueVectorSpaces = [...new Set(vectorSpaces)];
       reset({
         name,
         dimension,
@@ -219,6 +332,33 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
         sourceType,
         embedder,
         chunker: chunker || undefined,
+        vectorSpace: uniqueVectorSpaces.length === 1 ? uniqueVectorSpaces[0] : undefined,
+        artifactSources: sources.map((source) => {
+          const enrichment = enrichments.find(
+            (candidate) =>
+              typeof candidate === "object" &&
+              candidate !== null &&
+              "name" in candidate &&
+              candidate.name === source.artifact
+          );
+          return {
+            artifact: source.artifact,
+            sourceArtifact:
+              typeof enrichment === "object" &&
+              enrichment !== null &&
+              "source_artifact_name" in enrichment &&
+              typeof enrichment.source_artifact_name === "string"
+                ? enrichment.source_artifact_name
+                : "",
+            field:
+              typeof enrichment === "object" &&
+              enrichment !== null &&
+              "field" in enrichment &&
+              typeof enrichment.field === "string"
+                ? enrichment.field
+                : "text",
+          };
+        }),
       });
     }
     setViewMode(newMode);
@@ -228,7 +368,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent className="max-w-[450px]">
+      <DialogContent className="max-h-[90vh] max-w-[640px] overflow-y-auto">
         <div className="flex justify-between items-center mb-2">
           <DialogTitle>Create New Index</DialogTitle>
           <div className="flex items-center gap-2">

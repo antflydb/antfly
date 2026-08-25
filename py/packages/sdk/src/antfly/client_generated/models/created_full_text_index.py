@@ -28,12 +28,9 @@ class CreatedFullTextIndex:
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[CreatedEnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required
             by this index.
-        sources (list[ArtifactIndexSource] | Unset): Chunk or textual asset streams indexed together; every artifact
-            record is an independent full-text member.
-        mem_only (bool | Unset): Whether to use memory-only storage
-        field (str | Unset): Document field indexed as text. Omit for the table's default full-document text index.
-        artifact_name (str | Unset): Single-source convenience form. Mutually exclusive with sources; normalized
-            responses use sources.
+        sources (list[ArtifactIndexSource] | Unset):
+        mem_only (bool | Unset):
+        field (str | Unset):
     """
 
     name: str
@@ -44,7 +41,6 @@ class CreatedFullTextIndex:
     sources: list[ArtifactIndexSource] | Unset = UNSET
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
-    artifact_name: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -74,8 +70,6 @@ class CreatedFullTextIndex:
 
         field = self.field
 
-        artifact_name = self.artifact_name
-
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -96,8 +90,6 @@ class CreatedFullTextIndex:
             field_dict["mem_only"] = mem_only
         if field is not UNSET:
             field_dict["field"] = field
-        if artifact_name is not UNSET:
-            field_dict["artifact_name"] = artifact_name
 
         return field_dict
 
@@ -137,8 +129,6 @@ class CreatedFullTextIndex:
 
         field = d.pop("field", UNSET)
 
-        artifact_name = d.pop("artifact_name", UNSET)
-
         created_full_text_index = cls(
             name=name,
             type_=type_,
@@ -148,7 +138,6 @@ class CreatedFullTextIndex:
             sources=sources,
             mem_only=mem_only,
             field=field,
-            artifact_name=artifact_name,
         )
 
         created_full_text_index.additional_properties = d

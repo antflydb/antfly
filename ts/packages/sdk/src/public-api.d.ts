@@ -9207,9 +9207,15 @@ export interface components {
             field?: string;
             /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. */
             sources?: components["schemas"]["ArtifactIndexSource"][];
-            /** @description Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings. */
+            /**
+             * @deprecated
+             * @description Deprecated single-source artifact reference. Use sources with a matching embedding enrichment; accepted requests are normalized to sources.
+             */
             embedding_name?: string;
-            /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
+            /**
+             * @deprecated
+             * @description Deprecated index-level description of an embedding producer input. Put this field on the matching embedding enrichment and select its output through sources.
+             */
             source_artifact_name?: string;
             /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
@@ -9283,6 +9289,8 @@ export interface components {
         /** @description Artifact stream materialized into graph edges. */
         GraphArtifactSourceConfig: {
             /**
+             * @deprecated
+             * @description Compatibility discriminator for the former graph source union. Omit it; artifact is the only public source kind.
              * @default artifact
              * @enum {string}
              */
@@ -9420,8 +9428,20 @@ export interface components {
             /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. */
             source?: components["schemas"]["GraphArtifactSourceConfig"];
             artifact?: components["schemas"]["GraphArtifactProducerConfig"];
+            /**
+             * @deprecated
+             * @description Deprecated root-level single-source mapping. Put nodes inside source or each sources item.
+             */
             nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            /**
+             * @deprecated
+             * @description Deprecated root-level single-source mapping. Put edge inside source or each sources item.
+             */
             edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            /**
+             * @deprecated
+             * @description Deprecated root-level single-source mapping. Put context inside source or each sources item.
+             */
             context?: components["schemas"]["GraphArtifactContextConfig"];
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
@@ -10163,11 +10183,22 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** @description Configured graph artifact source projected in deterministic precedence order. New servers always populate artifact; it remains optional in the transition schema so new clients can read older servers. Deprecated aliases remain populated for rolling client compatibility. */
         GraphSourceArtifactStatus: {
+            /** @description Canonical artifact source identity. New servers always populate this field; clients may fall back to the deprecated name alias when reading an older server. */
+            artifact?: string;
+            /**
+             * @deprecated
+             * @description Deprecated compatibility alias for artifact.
+             */
             name: string;
             path: string;
             /** @enum {string} */
             format: "extraction_relation" | "extraction_graph";
+            /**
+             * @deprecated
+             * @description Deprecated aggregate compatibility projection. This mirrors enclosing index catch-up state and is not source-specific.
+             */
             materialization_pending: boolean;
         };
         /** @description Statistics for graph index */
@@ -10189,7 +10220,7 @@ export interface components {
             edge_types?: {
                 [key: string]: number;
             };
-            /** @description Per-source materialization status in configured precedence order. */
+            /** @description Configured artifact sources in deterministic precedence order. Catch-up and repair state is reported by the enclosing index status; deprecated per-item compatibility projections must not be interpreted as source-specific telemetry. */
             source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
@@ -11981,8 +12012,14 @@ export interface components {
             /** @description Normalized inline managed enrichment definitions required by this index. */
             enrichments?: components["schemas"]["CreatedEnrichmentConfig"][];
         };
+        /** @description Canonical full-text configuration returned after creation. Single-source request aliases are represented through sources. */
+        CreatedFullTextIndexConfig: {
+            sources?: components["schemas"]["ArtifactIndexSource"][];
+            mem_only?: boolean;
+            field?: string;
+        };
         /** @description Normalized effective full-text index configuration returned after creation. */
-        CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["FullTextIndexConfig"] & {
+        CreatedFullTextIndex: components["schemas"]["CreatedIndexCommon"] & components["schemas"]["CreatedFullTextIndexConfig"] & {
             /** @enum {string} */
             type: "full_text";
         } & {
@@ -12033,10 +12070,8 @@ export interface components {
             sparse?: boolean;
             dimension?: number;
             field?: string;
-            embedding_name?: string;
             /** @description Embedding artifact streams indexed together as independent vector members. */
             sources?: components["schemas"]["ArtifactIndexSource"][];
-            source_artifact_name?: string;
             template?: string;
             distance_metric?: components["schemas"]["DistanceMetric"];
             mem_only?: boolean;
@@ -12081,12 +12116,7 @@ export interface components {
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
             max_edges_per_document?: number;
             sources?: components["schemas"]["GraphArtifactSourceConfig"][];
-            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. */
-            source?: components["schemas"]["GraphArtifactSourceConfig"];
             artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];
-            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
-            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
-            context?: components["schemas"]["GraphArtifactContextConfig"];
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
         };

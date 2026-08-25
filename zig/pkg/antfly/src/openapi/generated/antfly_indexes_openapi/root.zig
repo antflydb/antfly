@@ -18,6 +18,7 @@ pub const CreatedEmbeddingsIndex = types.CreatedEmbeddingsIndex;
 pub const CreatedEmbeddingsIndexConfig = types.CreatedEmbeddingsIndexConfig;
 pub const CreatedEnrichmentConfig = types.CreatedEnrichmentConfig;
 pub const CreatedFullTextIndex = types.CreatedFullTextIndex;
+pub const CreatedFullTextIndexConfig = types.CreatedFullTextIndexConfig;
 pub const CreatedGraphArtifactProducerConfig = types.CreatedGraphArtifactProducerConfig;
 pub const CreatedGraphIndex = types.CreatedGraphIndex;
 pub const CreatedGraphIndexConfig = types.CreatedGraphIndexConfig;

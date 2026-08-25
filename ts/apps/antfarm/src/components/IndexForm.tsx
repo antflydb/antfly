@@ -3,6 +3,7 @@ import {
   AccordionContent,
   AccordionItem,
   AccordionTrigger,
+  Button,
   FormControl,
   FormField,
   FormItem,
@@ -21,7 +22,7 @@ import type { EmbedderProvider } from "@antfly/sdk";
 import { embedderProviders } from "@antfly/sdk";
 import type React from "react";
 import { useMemo } from "react";
-import { useFormContext } from "react-hook-form";
+import { useFieldArray, useFormContext } from "react-hook-form";
 import { liveModelSuggestions, useConnectedModels } from "@/hooks/use-connections";
 import ChunkingForm from "./ChunkingForm";
 import { Combobox } from "./Combobox";
@@ -51,6 +52,10 @@ interface IndexFormProps {
 const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = [] }) => {
   const { control, watch } = useFormContext();
   const prefix = fieldPrefix ? `${fieldPrefix}.` : "";
+  const artifactSources = useFieldArray({
+    control,
+    name: `${prefix}artifactSources`,
+  });
 
   // Live model lists per configured provider from /db/v1/connections.
   const { providers: connectedProviders, loading: inferenceModelsLoading } = useConnectedModels();
@@ -145,6 +150,12 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
                   </FormControl>
                   <FormLabel className="font-normal">Template</FormLabel>
                 </FormItem>
+                <FormItem className="flex items-center space-x-3 space-y-0">
+                  <FormControl>
+                    <RadioGroupItem value="artifacts" />
+                  </FormControl>
+                  <FormLabel className="font-normal">Artifacts</FormLabel>
+                </FormItem>
               </RadioGroup>
             </FormControl>
             <FormMessage />
@@ -177,7 +188,7 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
             </FormItem>
           )}
         />
-      ) : (
+      ) : sourceType === "template" ? (
         <FormField
           control={control}
           name={`${prefix}template`}
@@ -191,6 +202,93 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
             </FormItem>
           )}
         />
+      ) : (
+        <div className="space-y-3 rounded-md border p-3">
+          <div>
+            <FormLabel>Embedding artifact streams</FormLabel>
+            <p className="text-xs text-muted-foreground">
+              Add document- and chunk-level embedding outputs that share this vector space.
+            </p>
+          </div>
+          {artifactSources.fields.map((source, index) => (
+            <div key={source.id} className="space-y-2 rounded-md border p-3">
+              <FormField
+                control={control}
+                name={`${prefix}artifactSources.${index}.artifact`}
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Embedding artifact</FormLabel>
+                    <FormControl>
+                      <Input placeholder="document_dense_v1" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={control}
+                name={`${prefix}artifactSources.${index}.sourceArtifact`}
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Upstream artifact (optional)</FormLabel>
+                    <FormControl>
+                      <Input placeholder="document_chunks_v1" {...field} />
+                    </FormControl>
+                    <p className="text-xs text-muted-foreground">
+                      Leave empty for a document-level vector; set a chunk artifact for chunk
+                      vectors.
+                    </p>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={control}
+                name={`${prefix}artifactSources.${index}.field`}
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Embedding input field</FormLabel>
+                    <FormControl>
+                      <Input placeholder="text" {...field} />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              {artifactSources.fields.length > 1 && (
+                <Button type="button" variant="ghost" onClick={() => artifactSources.remove(index)}>
+                  Remove source
+                </Button>
+              )}
+            </div>
+          ))}
+          <Button
+            type="button"
+            variant="outline"
+            disabled={artifactSources.fields.length >= 64}
+            onClick={() =>
+              artifactSources.append({ artifact: "", sourceArtifact: "", field: "text" })
+            }
+          >
+            Add artifact source
+          </Button>
+          <FormField
+            control={control}
+            name={`${prefix}vectorSpace`}
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Vector space override (optional)</FormLabel>
+                <FormControl>
+                  <Input placeholder="searchaf:v1" {...field} />
+                </FormControl>
+                <p className="text-xs text-muted-foreground">
+                  Use only to assert compatibility across intentionally distinct producers.
+                </p>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </div>
       )}
 
       <FormField
@@ -251,22 +349,24 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
                 )}
               />
 
-              <div className="border-t pt-3 mt-3">
-                <Accordion type="single" collapsible>
-                  <AccordionItem value="chunking" className="border-b last:border-b-0">
-                    <AccordionTrigger>Document Chunking (Optional)</AccordionTrigger>
-                    <AccordionContent>
-                      <div className="flex flex-col gap-3 mt-3">
-                        <p className="text-sm text-muted-foreground">
-                          Configure chunking to split documents into smaller segments before
-                          embedding.
-                        </p>
-                        <ChunkingForm fieldPrefix={`${prefix}chunker`} />
-                      </div>
-                    </AccordionContent>
-                  </AccordionItem>
-                </Accordion>
-              </div>
+              {sourceType !== "artifacts" && (
+                <div className="border-t pt-3 mt-3">
+                  <Accordion type="single" collapsible>
+                    <AccordionItem value="chunking" className="border-b last:border-b-0">
+                      <AccordionTrigger>Document Chunking (Optional)</AccordionTrigger>
+                      <AccordionContent>
+                        <div className="flex flex-col gap-3 mt-3">
+                          <p className="text-sm text-muted-foreground">
+                            Configure chunking to split documents into smaller segments before
+                            embedding.
+                          </p>
+                          <ChunkingForm fieldPrefix={`${prefix}chunker`} />
+                        </div>
+                      </AccordionContent>
+                    </AccordionItem>
+                  </Accordion>
+                </div>
+              )}
 
               {provider === "gemini" && (
                 <FormField

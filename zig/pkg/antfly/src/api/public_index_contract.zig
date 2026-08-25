@@ -409,6 +409,9 @@ fn graphArtifactSourceFieldValueMatches(field: []const u8, value: std.json.Value
             (std.mem.eql(u8, value.string, "extraction_relation") or
                 std.mem.eql(u8, value.string, "extraction_graph"));
     if (std.mem.eql(u8, field, "artifact")) return isNonEmptyString(value);
+    if (std.mem.eql(u8, field, "nodes") or
+        std.mem.eql(u8, field, "edge") or
+        std.mem.eql(u8, field, "context")) return value == .object;
     return isString(value);
 }
 

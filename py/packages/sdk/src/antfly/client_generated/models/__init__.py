@@ -138,6 +138,7 @@ from .created_embeddings_index_config import CreatedEmbeddingsIndexConfig
 from .created_embeddings_index_type import CreatedEmbeddingsIndexType
 from .created_enrichment_config import CreatedEnrichmentConfig
 from .created_full_text_index import CreatedFullTextIndex
+from .created_full_text_index_config import CreatedFullTextIndexConfig
 from .created_full_text_index_type import CreatedFullTextIndexType
 from .created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
 from .created_graph_artifact_producer_config_kind import CreatedGraphArtifactProducerConfigKind
@@ -959,6 +960,7 @@ __all__ = (
     "CreatedEmbeddingsIndexType",
     "CreatedEnrichmentConfig",
     "CreatedFullTextIndex",
+    "CreatedFullTextIndexConfig",
     "CreatedFullTextIndexType",
     "CreatedGraphArtifactProducerConfig",
     "CreatedGraphArtifactProducerConfigKind",

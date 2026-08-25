@@ -227,9 +227,9 @@ pub const CreateEmbeddingsIndexRequest = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    /// Deprecated single-source artifact reference. Use sources with a matching embedding enrichment; accepted requests are normalized to sources.
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Deprecated index-level description of an embedding producer input. Put this field on the matching embedding enrichment and select its output through sources.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -293,8 +293,11 @@ pub const CreateGraphIndexRequest = struct {
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
+    /// Deprecated root-level single-source mapping. Put nodes inside source or each sources item.
     nodes: ?GraphArtifactNodeMappingConfig = null,
+    /// Deprecated root-level single-source mapping. Put edge inside source or each sources item.
     edge: ?GraphArtifactEdgeMappingConfig = null,
+    /// Deprecated root-level single-source mapping. Put context inside source or each sources item.
     context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
@@ -385,10 +388,8 @@ pub const CreatedEmbeddingsIndex = struct {
     sparse: ?bool = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
-    embedding_name: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
     sources: ?[]const ArtifactIndexSource = null,
-    source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
@@ -409,10 +410,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     sparse: ?bool = null,
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
-    embedding_name: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
     sources: ?[]const ArtifactIndexSource = null,
-    source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
@@ -453,15 +452,17 @@ pub const CreatedFullTextIndex = struct {
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const CreatedEnrichmentConfig = null,
-    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Whether to use memory-only storage
     mem_only: ?bool = null,
-    /// Document field indexed as text. Omit for the table's default full-document text index.
     field: ?[]const u8 = null,
-    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
-    artifact_name: ?[]const u8 = null,
     type: []const u8,
+};
+
+/// Canonical full-text configuration returned after creation. Single-source request aliases are represented through sources.
+pub const CreatedFullTextIndexConfig = struct {
+    sources: ?[]const ArtifactIndexSource = null,
+    mem_only: ?bool = null,
+    field: ?[]const u8 = null,
 };
 
 /// Credential-free graph artifact producer configuration returned after creation.
@@ -488,12 +489,7 @@ pub const CreatedGraphIndex = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
     sources: ?[]const GraphArtifactSourceConfig = null,
-    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
-    source: ?GraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
-    nodes: ?GraphArtifactNodeMappingConfig = null,
-    edge: ?GraphArtifactEdgeMappingConfig = null,
-    context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
@@ -506,12 +502,7 @@ pub const CreatedGraphIndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
     sources: ?[]const GraphArtifactSourceConfig = null,
-    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
-    source: ?GraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
-    nodes: ?GraphArtifactNodeMappingConfig = null,
-    edge: ?GraphArtifactEdgeMappingConfig = null,
-    context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
 };
@@ -847,9 +838,9 @@ pub const EmbeddingsIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    /// Deprecated single-source artifact reference. Use sources with a matching embedding enrichment; accepted requests are normalized to sources.
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Deprecated index-level description of an embedding producer input. Put this field on the matching embedding enrichment and select its output through sources.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -1250,6 +1241,7 @@ pub const GraphArtifactProducerSourceConfig = struct {
 
 /// Artifact stream materialized into graph edges.
 pub const GraphArtifactSourceConfig = struct {
+    /// Compatibility discriminator for the former graph source union. Omit it; artifact is the only public source kind.
     kind: ?[]const u8 = null,
     artifact: []const u8,
     path: ?[]const u8 = null,
@@ -1280,8 +1272,11 @@ pub const GraphIndexConfig = struct {
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
+    /// Deprecated root-level single-source mapping. Put nodes inside source or each sources item.
     nodes: ?GraphArtifactNodeMappingConfig = null,
+    /// Deprecated root-level single-source mapping. Put edge inside source or each sources item.
     edge: ?GraphArtifactEdgeMappingConfig = null,
+    /// Deprecated root-level single-source mapping. Put context inside source or each sources item.
     context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
@@ -1321,7 +1316,7 @@ pub const GraphIndexStats = struct {
     total_edges: ?i64 = null,
     /// Count of edges per edge type
     edge_types: ?std.json.ArrayHashMap(i64) = null,
-    /// Per-source materialization status in configured precedence order.
+    /// Configured artifact sources in deterministic precedence order. Catch-up and repair state is reported by the enclosing index status; deprecated per-item compatibility projections must not be interpreted as source-specific telemetry.
     source_artifacts: ?[]const GraphSourceArtifactStatus = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
@@ -1546,10 +1541,15 @@ pub const GraphResultNode = struct {
     edges: ?[]const Edge = null,
 };
 
+/// Configured graph artifact source projected in deterministic precedence order. New servers always populate artifact; it remains optional in the transition schema so new clients can read older servers. Deprecated aliases remain populated for rolling client compatibility.
 pub const GraphSourceArtifactStatus = struct {
+    /// Canonical artifact source identity. New servers always populate this field; clients may fall back to the deprecated name alias when reading an older server.
+    artifact: ?[]const u8 = null,
+    /// Deprecated compatibility alias for artifact.
     name: []const u8,
     path: []const u8,
     format: []const u8,
+    /// Deprecated aggregate compatibility projection. This mirrors enclosing index catch-up state and is not source-specific.
     materialization_pending: bool,
 };
 
@@ -1583,9 +1583,9 @@ pub const IndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
+    /// Deprecated single-source artifact reference. Use sources with a matching embedding enrichment; accepted requests are normalized to sources.
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Deprecated index-level description of an embedding producer input. Put this field on the matching embedding enrichment and select its output through sources.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -1611,8 +1611,11 @@ pub const IndexConfig = struct {
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
+    /// Deprecated root-level single-source mapping. Put nodes inside source or each sources item.
     nodes: ?GraphArtifactNodeMappingConfig = null,
+    /// Deprecated root-level single-source mapping. Put edge inside source or each sources item.
     edge: ?GraphArtifactEdgeMappingConfig = null,
+    /// Deprecated root-level single-source mapping. Put context inside source or each sources item.
     context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,

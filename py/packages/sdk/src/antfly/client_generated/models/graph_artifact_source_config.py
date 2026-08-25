@@ -24,7 +24,8 @@ class GraphArtifactSourceConfig:
 
     Attributes:
         artifact (str):
-        kind (GraphArtifactSourceConfigKind | Unset):  Default: GraphArtifactSourceConfigKind.ARTIFACT.
+        kind (GraphArtifactSourceConfigKind | Unset): Compatibility discriminator for the former graph source union.
+            Omit it; artifact is the only public source kind. Default: GraphArtifactSourceConfigKind.ARTIFACT.
         path (str | Unset):
         format_ (GraphArtifactSourceConfigFormat | Unset):  Default:
             GraphArtifactSourceConfigFormat.EXTRACTION_RELATION.

@@ -407,7 +407,18 @@ The compatibility matrix is:
 `sources` has union semantics. Every record in every selected stream is an
 independent member. The singular `artifact_name` (full-text) and `source`
 (graph) forms are supported single-source convenience inputs but cannot be
-combined with `sources`; normalized responses use `sources`.
+combined with `sources`; normalized responses use `sources`. A graph
+`source` owns its `nodes`, `edge`, and `context` mappings just like one item in
+`sources`. The former root-level graph mappings and the redundant graph-source
+`kind: "artifact"` discriminator remain accepted compatibility inputs, but are
+deprecated and omitted from normalized output. Conflicting root and nested
+mappings are rejected.
+
+The embeddings root fields `embedding_name` and `source_artifact_name` are
+deprecated single-source compatibility inputs. New artifact-backed vector
+indexes use `sources` to select embedding outputs and put
+`source_artifact_name` only on the matching embedding enrichment. Normalized
+responses represent the consumed embedding through `sources`.
 
 For example, one full-text index can search both extracted units and derived
 chunks:
@@ -483,12 +494,16 @@ embeddings produced directly from primary documents with embeddings produced
 from chunk artifacts. Parent-level query results use each member's artifact
 identity to collapse chunk members to their parent while retaining direct
 document members in the same score-ordered result, and expose the winning
-member's artifact identity as provenance. `return_mode: "member"` returns the
-raw heterogeneous members; `chunk` remains a compatibility spelling with the
-same behavior. `parent_with_chunks` returns grouped parents and includes only
-genuinely chunk-backed members in `chunk_hits`. Unit modes require every member
-to have a unit identity and are therefore rejected for mixed document/chunk
-indexes with an actionable 422 response.
+member's artifact identity as provenance. Public queries select raw members by
+including an empty `hierarchy` object, or group at source level with
+`hierarchy.group_by`; grouped provenance is exposed as `matched_artifact`.
+Internal workers use `return_mode: "member"`, while `chunk` remains a
+rolling-upgrade wire spelling with the same behavior. The former public
+hierarchy controls `return_level`, `rollup`, `include`, and
+`max_children_per_parent` are compatibility-only, are not present in OpenAPI,
+and must not be emitted by new clients. Unit modes require every member to have
+a unit identity and are therefore rejected for mixed document/chunk indexes
+with an actionable 422 response.
 `sources` cannot be combined with `external`, `field`, `template`, `chunker`, or
 the supported single-source artifact convenience forms.
 
@@ -502,6 +517,12 @@ source without rescanning all edges. Batch reconciliation coalesces repeated
 artifact mutations, groups them by document and index, and scans each state
 prefix once. Graph manifests and edge payloads carry the index generation;
 retired generations are never replayed into a recreated index.
+Graph status echoes the configured artifact, path, and format in that same
+precedence order and uses `artifact` as the source identity. Catch-up and repair
+state remains index-wide. The deprecated `name` alias remains identical to
+`artifact`, and deprecated per-item `materialization_pending` mirrors aggregate
+index catch-up state only; new clients use the enclosing catch-up and repair
+fields instead.
 
 ```json
 {

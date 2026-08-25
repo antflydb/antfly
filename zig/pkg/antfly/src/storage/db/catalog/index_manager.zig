@@ -19506,15 +19506,17 @@ fn initGraphArtifactSource(
 fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtifactSource {
     const source = root.object.get("source") orelse return null;
     if (source != .object) return error.InvalidIndexConfig;
-    const kind = source.object.get("kind") orelse return error.InvalidIndexConfig;
-    if (kind != .string) return error.InvalidIndexConfig;
-    if (std.mem.eql(u8, kind.string, "document_field")) {
+    const kind = source.object.get("kind");
+    if (kind) |value| {
+        if (value != .string) return error.InvalidIndexConfig;
+    }
+    if (kind != null and std.mem.eql(u8, kind.?.string, "document_field")) {
         const field = source.object.get("field") orelse return error.InvalidIndexConfig;
         if (field != .string or field.string.len == 0) return error.InvalidIndexConfig;
         if (!std.mem.eql(u8, field.string, "_edges")) return error.InvalidIndexConfig;
         return null;
     }
-    if (!std.mem.eql(u8, kind.string, "artifact")) return error.InvalidIndexConfig;
+    if (kind != null and !std.mem.eql(u8, kind.?.string, "artifact")) return error.InvalidIndexConfig;
 
     const artifact = source.object.get("artifact") orelse return error.InvalidIndexConfig;
     if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
@@ -19542,7 +19544,19 @@ fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtif
         .mention_edge_type = if (mention_edge_type.len > 0) try alloc.dupe(u8, mention_edge_type) else "",
     };
     errdefer out.deinit(alloc);
-    out.mapping = try parseGraphArtifactMapping(alloc, root);
+    const mapping_fields = [_][]const u8{ "nodes", "edge", "context" };
+    var source_has_mapping = false;
+    var root_has_mapping = false;
+    for (mapping_fields) |field| {
+        if (source.object.get(field)) |value| {
+            if (value != .null) source_has_mapping = true;
+        }
+        if (root.object.get(field)) |value| {
+            if (value != .null) root_has_mapping = true;
+        }
+    }
+    if (source_has_mapping and root_has_mapping) return error.InvalidIndexConfig;
+    out.mapping = try parseGraphArtifactMapping(alloc, if (source_has_mapping) source else root);
     return out;
 }
 
@@ -19772,6 +19786,25 @@ test "graph config parses artifact source and shorthand asset enrichment" {
     try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.producer_json, "\"type\":\"extractor\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_items\":8") != null);
     try std.testing.expect(std.mem.indexOf(u8, cfg.shorthand_asset.?.execution_json, "\"batch_bytes\":262144") != null);
+}
+
+test "graph config accepts canonical single-source mappings without a discriminator" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{"source":{"artifact":"relations_v1","nodes":{"model":"external","target":"{{ _item.id }}"},"edge":{"type":"{{ _item.type }}"},"context":{"doc_fields":["tenant"]}}}
+    );
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.artifact_sources.len);
+    try std.testing.expectEqualStrings("relations_v1", cfg.artifact_sources[0].artifact_name);
+    try std.testing.expectEqual(GraphNodeModel.external, cfg.artifact_sources[0].mapping.node_model);
+    try std.testing.expectEqualStrings("{{ _item.id }}", cfg.artifact_sources[0].mapping.target_template);
+    try std.testing.expectEqualStrings("{{ _item.type }}", cfg.artifact_sources[0].mapping.edge_type_template);
+    try std.testing.expectEqualStrings("tenant", cfg.artifact_sources[0].mapping.context_doc_fields[0]);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"artifact":"relations_v1","nodes":{"model":"document"}},"nodes":{"model":"external"}}
+    ));
 }
 
 test "graph config parses multiple artifact sources with per-source mappings" {

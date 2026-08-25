@@ -69,6 +69,7 @@ type ArtifactAwareIndexConfig = IndexStatus["config"] & {
   embedding_name?: string;
   field?: string;
   source_artifact_name?: string;
+  sources?: Array<{ artifact: string }>;
 };
 
 type ArtifactEnrichment = NonNullable<TableStatus["artifact_enrichments"]>[number];
@@ -93,7 +94,13 @@ export function tableRequiresSafeProjection(
 
   return indexes.some((index) => {
     const config = index.config as ArtifactAwareIndexConfig;
-    if (config.artifact_name || config.source_artifact_name) return true;
+    if (
+      artifactSourceNames(config).length > 0 ||
+      config.artifact_name ||
+      config.source_artifact_name
+    ) {
+      return true;
+    }
     const enrichments = structuredEnrichments(
       tableStatus?.indexes?.[config.name]?.enrichments ?? config.enrichments
     );
@@ -187,6 +194,22 @@ export function artifactRetrievalDefaults(
       tableStatus?.indexes?.[name]?.enrichments ?? config.enrichments
     );
     if (config.type === "embeddings") {
+      const sourceNames = artifactSourceNames(config);
+      if (sourceNames.length > 0) {
+        const sourceEnrichments = findSourceEnrichments(
+          sourceNames,
+          enrichments,
+          tableEnrichments,
+          "embedding"
+        );
+        for (const enrichment of sourceEnrichments) {
+          const field = enrichment.field?.trim() || "text";
+          artifactSearchFields.add(field);
+          artifactProjectionFields.add(field);
+        }
+        artifactIndexCount++;
+        continue;
+      }
       if (!config.source_artifact_name) {
         ordinaryIndexCount++;
         continue;
@@ -203,13 +226,17 @@ export function artifactRetrievalDefaults(
     // candidates, but must never turn an unrelated vector index into an
     // artifact-backed index.
     const allEnrichments = [...enrichments, ...tableEnrichments];
-    const artifactEnrichments = allEnrichments.filter(
-      (enrichment) =>
-        (enrichment.kind === "chunk" || enrichment.kind === "asset") &&
-        (config.artifact_name
-          ? enrichment.name === config.artifact_name
-          : enrichment.full_text_index === true)
-    );
+    const sourceNames = artifactSourceNames(config);
+    const artifactEnrichments =
+      sourceNames.length > 0
+        ? findSourceEnrichments(sourceNames, enrichments, tableEnrichments, "chunk", "asset")
+        : allEnrichments.filter(
+            (enrichment) =>
+              (enrichment.kind === "chunk" || enrichment.kind === "asset") &&
+              (config.artifact_name
+                ? enrichment.name === config.artifact_name
+                : enrichment.full_text_index === true)
+          );
 
     if (artifactEnrichments.length > 0) {
       for (const enrichment of artifactEnrichments) {
@@ -226,7 +253,7 @@ export function artifactRetrievalDefaults(
         artifactProjectionFields.add(field);
       }
       artifactIndexCount++;
-    } else if (config.artifact_name) {
+    } else if (sourceNames.length > 0 || config.artifact_name) {
       const field = config.field?.trim() || "text";
       artifactSearchFields.add(field);
       artifactProjectionFields.add(field);
@@ -256,6 +283,32 @@ function structuredEnrichments(enrichments: unknown): ArtifactEnrichment[] {
     (enrichment): enrichment is ArtifactEnrichment =>
       typeof enrichment === "object" && enrichment !== null
   );
+}
+
+function artifactSourceNames(config: ArtifactAwareIndexConfig): string[] {
+  if (!Array.isArray(config.sources)) return [];
+  return config.sources
+    .map((source) => source?.artifact)
+    .filter((artifact): artifact is string => typeof artifact === "string" && artifact.length > 0);
+}
+
+function findSourceEnrichments(
+  sourceNames: string[],
+  indexEnrichments: ArtifactEnrichment[],
+  tableEnrichments: ArtifactEnrichment[],
+  ...kinds: ArtifactEnrichment["kind"][]
+): ArtifactEnrichment[] {
+  const names = new Set(sourceNames);
+  const allowedKinds = new Set(kinds);
+  const found = new Map<string, ArtifactEnrichment>();
+  for (const enrichment of [...indexEnrichments, ...tableEnrichments]) {
+    if (!names.has(enrichment.name) || !allowedKinds.has(enrichment.kind)) continue;
+    if (!found.has(enrichment.name)) found.set(enrichment.name, enrichment);
+  }
+  return sourceNames.flatMap((name) => {
+    const enrichment = found.get(name);
+    return enrichment ? [enrichment] : [];
+  });
 }
 
 function findEmbeddingSourceEnrichment(

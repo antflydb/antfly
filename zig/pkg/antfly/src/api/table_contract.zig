@@ -354,6 +354,8 @@ fn normalizeIndexConfigJson(
     options: NormalizeIndexOptions,
 ) ![]u8 {
     try validatePublicIndexObject(object);
+    const index_type = public_index_contract.parseKind(extractPublicIndexType(object) orelse "full_text") orelse
+        return error.InvalidCreateIndexRequest;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -371,21 +373,74 @@ fn normalizeIndexConfigJson(
         try appendField(alloc, &out, "type", .{ .string = "full_text" }, &first);
     }
 
+    const canonicalize_single_graph_source = index_type == .graph and
+        indexObjectGet(object, "sources") == null and
+        indexObjectGet(object, "source") != null;
+    if (canonicalize_single_graph_source) {
+        try appendCanonicalSingleGraphSourcesField(alloc, &out, object, &first);
+    }
+
     if (@hasField(Object, "map")) {
         var it = object.map.iterator();
         while (it.next()) |entry| {
             if (!options.include_name and std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
+            if (canonicalize_single_graph_source and
+                (std.mem.eql(u8, entry.key_ptr.*, "source") or
+                    std.mem.eql(u8, entry.key_ptr.*, "nodes") or
+                    std.mem.eql(u8, entry.key_ptr.*, "edge") or
+                    std.mem.eql(u8, entry.key_ptr.*, "context"))) continue;
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     } else {
         var it = object.iterator();
         while (it.next()) |entry| {
             if (!options.include_name and std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
+            if (canonicalize_single_graph_source and
+                (std.mem.eql(u8, entry.key_ptr.*, "source") or
+                    std.mem.eql(u8, entry.key_ptr.*, "nodes") or
+                    std.mem.eql(u8, entry.key_ptr.*, "edge") or
+                    std.mem.eql(u8, entry.key_ptr.*, "context"))) continue;
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn indexObjectGet(object: anytype, key: []const u8) ?std.json.Value {
+    const Object = @TypeOf(object);
+    return if (@hasField(Object, "map")) object.map.get(key) else object.get(key);
+}
+
+fn appendCanonicalSingleGraphSourcesField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    object: anytype,
+    first_root_field: *bool,
+) !void {
+    const source_value = indexObjectGet(object, "source") orelse return error.InvalidCreateIndexRequest;
+    if (source_value != .object) return error.InvalidCreateIndexRequest;
+
+    if (!first_root_field.*) try out.append(alloc, ',');
+    first_root_field.* = false;
+    try out.appendSlice(alloc, "\"sources\":[{");
+    var first_source_field = true;
+    var source_it = source_value.object.iterator();
+    while (source_it.next()) |entry| {
+        if (entry.value_ptr.* == .null or std.mem.eql(u8, entry.key_ptr.*, "kind")) continue;
+        try appendField(alloc, out, entry.key_ptr.*, entry.value_ptr.*, &first_source_field);
+    }
+
+    const mappings = [_][]const u8{ "nodes", "edge", "context" };
+    for (mappings) |mapping| {
+        if (source_value.object.get(mapping)) |value| {
+            if (value != .null) continue;
+        }
+        const value = indexObjectGet(object, mapping) orelse continue;
+        if (value == .null) continue;
+        try appendField(alloc, out, mapping, value, &first_source_field);
+    }
+    try out.appendSlice(alloc, "}]");
 }
 
 fn validatePublicIndexObject(object: anytype) !void {
@@ -413,6 +468,14 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
             if (index_type == .graph) .graph_sources else .artifact_sources,
         );
     }
+    const source = if (@hasField(Object, "map")) object.map.get("source") else object.get("source");
+    if (sources != null and source != null and sources.? != .null and source.? != .null)
+        return error.InvalidCreateIndexRequest;
+    if (index_type == .full_text) {
+        const artifact_name = indexObjectGet(object, "artifact_name");
+        if (sources != null and artifact_name != null and sources.? != .null and artifact_name.? != .null)
+            return error.InvalidCreateIndexRequest;
+    }
     if (index_type == .embeddings) {
         const chunker = if (@hasField(Object, "map")) object.map.get("chunker") else object.get("chunker");
         if (chunker) |value| {
@@ -426,9 +489,24 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
     }
     if (index_type != .graph) return;
 
-    const source = if (@hasField(Object, "map")) object.map.get("source") else object.get("source");
     if (source) |value| {
         if (value != .null) try validatePublicCreatedShape(value, .graph_source);
+    }
+
+    const graph_mappings = [_][]const u8{ "nodes", "edge", "context" };
+    if (sources) |value| {
+        if (value != .null) for (graph_mappings) |mapping| {
+            const root_value = indexObjectGet(object, mapping) orelse continue;
+            if (root_value != .null) return error.InvalidCreateIndexRequest;
+        };
+    }
+    if (source) |source_value| {
+        if (source_value == .object) for (graph_mappings) |mapping| {
+            const nested_value = source_value.object.get(mapping) orelse continue;
+            if (nested_value == .null) continue;
+            const root_value = indexObjectGet(object, mapping) orelse continue;
+            if (root_value != .null) return error.InvalidCreateIndexRequest;
+        };
     }
 
     const artifact = if (@hasField(Object, "map")) object.map.get("artifact") else object.get("artifact");
@@ -1054,13 +1132,13 @@ test "table contract canonicalizes generated optional null fields" {
 
 test "table contract preserves typed artifact-backed graph configuration" {
     const body =
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"},"execution":{"batch_items":8,"batch_bytes":262144}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
+        \\{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions","nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"},"execution":{"batch_items":8,"batch_bytes":262144}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
     ;
     const config_json = try parseCreateIndexRequest(std.testing.allocator, "relations_graph", body);
     defer std.testing.allocator.free(config_json);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"source\":{\"type\":\"template\",\"value\":\"{{ body }}\"},\"execution\":{\"batch_items\":8,\"batch_bytes\":262144}},\"nodes\":{\"model\":\"document\",\"target\":\"{{ _item.target.text }}\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
+        "{\"name\":\"relations_graph\",\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"model\":\"document\",\"target\":\"{{ _item.target.text }}\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]}}],\"artifact\":{\"name\":\"relations_v1\",\"source\":{\"type\":\"template\",\"value\":\"{{ body }}\"},\"execution\":{\"batch_items\":8,\"batch_bytes\":262144}},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\",\"candidate_search\":\"prefix\"}]}",
         config_json,
     );
 
@@ -1071,9 +1149,24 @@ test "table contract preserves typed artifact-backed graph configuration" {
     defer table_req.deinit(std.testing.allocator);
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"nodes\":{\"model\":\"document\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]},\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\"}]}}",
+        "{\"relations_graph\":{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"model\":\"document\"},\"edge\":{\"weight\":0.75},\"context\":{\"doc_fields\":[\"title\",\"body\"]}}],\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}},\"resolvers\":[{\"name\":\"kg\"}]}}",
         table_req.indexes_json.?,
     );
+}
+
+test "table contract rejects ambiguous index source spellings" {
+    const invalid = [_][]const u8{
+        "{\"type\":\"full_text\",\"artifact_name\":\"chunks_v1\",\"sources\":[{\"artifact\":\"chunks_v2\"}]}",
+        "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"sources\":[{\"artifact\":\"relations_v2\"}]}",
+        "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"nodes\":{\"model\":\"document\"},\"sources\":[{\"artifact\":\"relations_v2\"}]}",
+        "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"nodes\":{\"model\":\"document\"}},\"nodes\":{\"model\":\"external\"}}",
+    };
+    for (invalid) |body| {
+        try std.testing.expectError(
+            error.InvalidCreateIndexRequest,
+            parseCreateIndexRequest(std.testing.allocator, "ambiguous", body),
+        );
+    }
 }
 
 test "table contract rejects unknown fields in closed nested index objects" {
