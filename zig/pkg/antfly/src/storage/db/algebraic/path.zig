@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const law = @import("law.zig");
 const tensor = @import("tensor.zig");
 const token = @import("token.zig");
+const work_budget_mod = @import("../../../graph/work_budget.zig");
 
 pub const Edge = struct {
     from: []const u8,
@@ -51,6 +52,10 @@ pub fn provenanceLabelsAlloc(alloc: Allocator, provenance: []const u8) ![][]u8 {
 
 pub const BoundedReachabilityOptions = struct {
     target_nodes: []const []const u8 = &.{},
+    /// Optional request-owned accounting for tensor edge inspections and
+    /// intermediate frontier state. Physical graph reads are charged by the
+    /// caller that constructs `edges`.
+    work_budget: ?*work_budget_mod.WorkBudget = null,
 };
 
 pub const ExecutionOptions = struct {
@@ -135,11 +140,15 @@ pub fn boundedReachabilityWithOptionsAlloc(
         while (it.next()) |entry| {
             const from = entry.key_ptr.*;
             for (edges) |edge| {
+                if (options.work_budget) |budget| try budget.consumeEdges(1);
                 if (!std.mem.eql(u8, edge.from, from)) continue;
                 const product = (try law.multiplyAlloc(alloc, .provenance_semiring, entry.value_ptr.provenance, edge.provenance)) orelse try law.identityAlloc(alloc, .provenance_semiring);
                 defer alloc.free(product);
                 try mergePending(alloc, &results, edge.to, product, depth + 1);
                 try mergePending(alloc, &next, edge.to, product, depth + 1);
+                if (options.work_budget) |budget| {
+                    try budget.checkIntermediateStates(next.count(), work_budget_mod.default_max_intermediate_states);
+                }
             }
         }
         deinitPendingMap(alloc, &frontier);

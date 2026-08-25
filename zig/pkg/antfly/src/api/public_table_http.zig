@@ -842,7 +842,7 @@ pub fn graphAnchorFilterRequiresIndexBody(alloc: std.mem.Allocator) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
         .@"error" = "graph_anchor_filter_requires_index",
-        .message = "exact graph anchor enumeration requires native index coverage for match.anchor and authorization filters",
+        .message = "exact graph anchor enumeration requires native index coverage for stored-field and authorization filters; ids-only filters use the primary identity index",
         .retryable = false,
     }, .{});
 }

@@ -34,12 +34,32 @@ const GraphIndex = graph_mod.GraphIndex;
 const NodeAdmission = @import("node_admission.zig").NodeAdmission;
 const NodeRef = @import("node_admission.zig").NodeRef;
 const traversal_mod = @import("traversal.zig");
+const work_budget_mod = @import("work_budget.zig");
 
 const GraphIndexEdgeReader = struct {
     graph_index: *GraphIndex,
 
     pub fn getEdges(self: @This(), alloc: Allocator, key: []const u8, direction: EdgeDirection) ![]Edge {
         return try self.graph_index.getEdges(alloc, key, "", direction);
+    }
+
+    pub fn getEdgesBoundedForPath(
+        self: @This(),
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: EdgeDirection,
+        max_edges: usize,
+        max_bytes: usize,
+    ) ![]Edge {
+        return try self.graph_index.getEdgesByTypesBounded(
+            alloc,
+            key,
+            edge_types,
+            direction,
+            max_edges,
+            max_bytes,
+        );
     }
 
     pub fn freeEdges(_: @This(), alloc: Allocator, edges: []Edge) void {
@@ -61,6 +81,9 @@ pub const PathFindOptions = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     node_admission: ?NodeAdmission = null,
+    /// Shared by every path operation in the enclosing request. Yen spur
+    /// searches deliberately reuse this pointer rather than resetting limits.
+    work_budget: ?*work_budget_mod.WorkBudget = null,
 };
 
 pub const PathEdge = struct {
@@ -278,8 +301,15 @@ fn findShortestPathWithExclusionsAndEdgeReader(
     excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
     excluded_edges: ?*const ExcludedEdgeSet,
 ) !?Path {
-    if (opts.node_admission) |admission| {
-        if (!try traversal_mod.startNodeAdmittedWithEdgeReader(alloc, edge_reader, source, opts.direction, admission)) {
+    var local_work_budget = work_budget_mod.WorkBudget.init(
+        work_budget_mod.default_max_explored_nodes,
+        work_budget_mod.default_max_explored_edges,
+    );
+    var effective_opts = opts;
+    if (effective_opts.work_budget == null) effective_opts.work_budget = &local_work_budget;
+
+    if (effective_opts.node_admission) |admission| {
+        if (!try traversal_mod.startNodeAdmittedWithEdgeReader(alloc, edge_reader, source, effective_opts.direction, admission, effective_opts.work_budget)) {
             return null;
         }
     }
@@ -297,10 +327,10 @@ fn findShortestPathWithExclusionsAndEdgeReader(
         };
     }
 
-    if (opts.weight_mode == .min_hops) {
-        return bfsShortestPath(alloc, edge_reader, source, target, opts, excluded_nodes, excluded_edges);
+    if (effective_opts.weight_mode == .min_hops) {
+        return bfsShortestPath(alloc, edge_reader, source, target, effective_opts, excluded_nodes, excluded_edges);
     } else {
-        return dijkstraPath(alloc, edge_reader, source, target, opts, excluded_nodes, excluded_edges);
+        return dijkstraPath(alloc, edge_reader, source, target, effective_opts, excluded_nodes, excluded_edges);
     }
 }
 
@@ -317,6 +347,7 @@ fn bfsShortestPath(
     excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
     excluded_edges: ?*const ExcludedEdgeSet,
 ) !?Path {
+    const work_budget = opts.work_budget.?;
     // Arena for PathNodes — freed at end
     var node_pool = std.ArrayListUnmanaged(*PathNode).empty;
     defer {
@@ -355,7 +386,9 @@ fn bfsShortestPath(
     };
     try node_pool.append(alloc, start);
     try queue.append(alloc, start);
+    try work_budget.checkIntermediateStates(queue.items.len, work_budget_mod.default_max_intermediate_states);
     try visited.put(alloc, try alloc.dupe(u8, source), {});
+    try work_budget.consumeNode();
 
     while (queue_head < queue.items.len) {
         const current = queue.items[queue_head];
@@ -363,8 +396,9 @@ fn bfsShortestPath(
 
         if (opts.max_depth > 0 and current.hops >= opts.max_depth) continue;
 
-        const edges = try edge_reader.getEdges(alloc, current.key, opts.direction);
+        const edges = try getEdgesForPathBudget(alloc, edge_reader, current.key, opts, work_budget);
         defer edge_reader.freeEdges(alloc, edges);
+        try work_budget.consumeMaterializedEdges(edges);
 
         const admitted_edges = if (opts.node_admission) |admission| blk: {
             const edge_mask = try alloc.alloc(bool, edges.len);
@@ -443,6 +477,7 @@ fn bfsShortestPath(
                 },
             };
             try node_pool.append(alloc, node);
+            try work_budget.consumeNode();
 
             // Found target — reconstruct path
             if (std.mem.eql(u8, next_key, target)) {
@@ -450,6 +485,7 @@ fn bfsShortestPath(
             }
 
             try queue.append(alloc, node);
+            try work_budget.checkIntermediateStates(queue.items.len, work_budget_mod.default_max_intermediate_states);
         }
     }
 
@@ -469,6 +505,7 @@ fn dijkstraPath(
     excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
     excluded_edges: ?*const ExcludedEdgeSet,
 ) !?Path {
+    const work_budget = opts.work_budget.?;
     var node_pool = std.ArrayListUnmanaged(*PathNode).empty;
     defer {
         for (node_pool.items) |n| {
@@ -504,7 +541,9 @@ fn dijkstraPath(
     };
     try node_pool.append(alloc, start);
     try heap.push(alloc, start);
+    try work_budget.checkIntermediateStates(heap.items.len, work_budget_mod.default_max_intermediate_states);
     try best_dist.put(alloc, .{ .node = start.key, .hops = 0 }, 0.0);
+    try work_budget.consumeNode();
 
     while (heap.pop()) |current| {
         if (pathStateDominated(&best_dist, current.key, current.hops, current.distance, true)) continue;
@@ -515,8 +554,9 @@ fn dijkstraPath(
 
         if (opts.max_depth > 0 and current.hops >= opts.max_depth) continue;
 
-        const edges = try edge_reader.getEdges(alloc, current.key, opts.direction);
+        const edges = try getEdgesForPathBudget(alloc, edge_reader, current.key, opts, work_budget);
         defer edge_reader.freeEdges(alloc, edges);
+        try work_budget.consumeMaterializedEdges(edges);
 
         const admitted_edges = if (opts.node_admission) |admission| blk: {
             const edge_mask = try alloc.alloc(bool, edges.len);
@@ -595,8 +635,10 @@ fn dijkstraPath(
                     },
                 };
                 try node_pool.append(alloc, node);
+                try work_budget.consumeNode();
                 try best_dist.put(alloc, .{ .node = node.key, .hops = next_hops }, new_dist);
                 try heap.push(alloc, node);
+                try work_budget.checkIntermediateStates(heap.items.len, work_budget_mod.default_max_intermediate_states);
             }
         }
     }
@@ -638,6 +680,13 @@ pub fn findKShortestPathsWithEdgeReader(
 ) ![]Path {
     if (k == 0) return try alloc.alloc(Path, 0);
 
+    var local_work_budget = work_budget_mod.WorkBudget.init(
+        work_budget_mod.default_max_explored_nodes,
+        work_budget_mod.default_max_explored_edges,
+    );
+    var effective_opts = opts;
+    if (effective_opts.work_budget == null) effective_opts.work_budget = &local_work_budget;
+
     var results = std.ArrayListUnmanaged(Path).empty;
     errdefer {
         for (results.items) |p| freePath(alloc, p);
@@ -645,7 +694,7 @@ pub fn findKShortestPathsWithEdgeReader(
     }
 
     // Find first shortest path
-    const first = try findShortestPathWithEdgeReader(alloc, edge_reader, source, target, opts);
+    const first = try findShortestPathWithEdgeReader(alloc, edge_reader, source, target, effective_opts);
     if (first == null) return try alloc.alloc(Path, 0);
     try results.append(alloc, first.?);
 
@@ -718,11 +767,11 @@ pub fn findKShortestPathsWithEdgeReader(
                 }
             }
 
-            var spur_opts = opts;
-            if (opts.max_depth > 0) {
+            var spur_opts = effective_opts;
+            if (effective_opts.max_depth > 0) {
                 const root_hops: u32 = @intCast(spur_idx);
-                if (root_hops >= opts.max_depth) continue;
-                spur_opts.max_depth = opts.max_depth - root_hops;
+                if (root_hops >= effective_opts.max_depth) continue;
+                spur_opts.max_depth = effective_opts.max_depth - root_hops;
             }
 
             // Find a spur path within the remaining end-to-end depth budget.
@@ -740,7 +789,7 @@ pub fn findKShortestPathsWithEdgeReader(
                 // Build total path = root[0..spur_idx] + spur_path
                 const total_path = try joinPaths(alloc, prev_path, spur_idx, &sp);
                 freePath(alloc, sp);
-                if (opts.max_depth > 0 and total_path.length > opts.max_depth) {
+                if (effective_opts.max_depth > 0 and total_path.length > effective_opts.max_depth) {
                     freePath(alloc, total_path);
                     continue;
                 }
@@ -749,6 +798,7 @@ pub fn findKShortestPathsWithEdgeReader(
                 if (!seen_paths.contains(pkey)) {
                     try seen_paths.put(alloc, pkey, {});
                     try candidates.append(alloc, total_path);
+                    try effective_opts.work_budget.?.checkIntermediateStates(candidates.items.len, work_budget_mod.default_max_intermediate_states);
                 } else {
                     alloc.free(pkey);
                     freePath(alloc, total_path);
@@ -761,7 +811,7 @@ pub fn findKShortestPathsWithEdgeReader(
         // Find the best candidate under the same objective as the spur search.
         var best_idx: usize = 0;
         for (candidates.items[1..], 1..) |c, i| {
-            if (comparePathScore(&c, &candidates.items[best_idx], opts.weight_mode) == .lt) {
+            if (comparePathScore(&c, &candidates.items[best_idx], effective_opts.weight_mode) == .lt) {
                 best_idx = i;
             }
         }
@@ -774,6 +824,35 @@ pub fn findKShortestPathsWithEdgeReader(
     const owned = try alloc.dupe(Path, results.items);
     results.deinit(alloc);
     return owned;
+}
+
+fn getEdgesForPathBudget(
+    alloc: Allocator,
+    edge_reader: anytype,
+    key: []const u8,
+    opts: PathFindOptions,
+    work_budget: *work_budget_mod.WorkBudget,
+) ![]Edge {
+    if (comptime @hasDecl(@TypeOf(edge_reader), "getEdgesBoundedForPath")) {
+        return edge_reader.getEdgesBoundedForPath(
+            alloc,
+            key,
+            opts.edge_types,
+            opts.direction,
+            work_budget.edgeLimit(),
+            work_budget.edgeByteLimit(),
+        ) catch |err| {
+            const widened: anyerror = err;
+            if (widened == error.GraphExploredEdgesBudgetExceeded)
+                return work_budget.exhaust(.explored_edges, work_budget.max_edges);
+            if (widened == error.GraphExploredEdgeBytesBudgetExceeded)
+                return work_budget.exhaust(.explored_edge_bytes, work_budget.max_edge_bytes);
+            if (widened == error.QueryCandidateBudgetExceeded)
+                return work_budget.exhaust(.explored_edges, work_budget.max_edges);
+            return err;
+        };
+    }
+    return try edge_reader.getEdges(alloc, key, opts.direction);
 }
 
 // ============================================================================
@@ -925,20 +1004,51 @@ fn reconstructPath(alloc: Allocator, end_node: *PathNode) !Path {
 
 fn pathToKey(alloc: Allocator, path: *const Path) ![]u8 {
     var total_len: usize = 0;
-    for (path.nodes) |node| {
+    for (path.nodes, 0..) |node, i| {
+        const table = if (path.node_tables.len == path.nodes.len) path.node_tables[i] else null;
+        total_len = std.math.add(usize, total_len, 1 + @sizeOf(u64)) catch
+            return error.PathIdentityTooLarge;
+        if (table) |value| total_len = std.math.add(usize, total_len, value.len) catch
+            return error.PathIdentityTooLarge;
         total_len = std.math.add(usize, total_len, @sizeOf(u64)) catch
             return error.PathIdentityTooLarge;
         total_len = std.math.add(usize, total_len, node.len) catch
             return error.PathIdentityTooLarge;
     }
+    for (path.edges) |edge| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+            total_len = std.math.add(usize, total_len, @sizeOf(u64)) catch
+                return error.PathIdentityTooLarge;
+            total_len = std.math.add(usize, total_len, part.len) catch
+                return error.PathIdentityTooLarge;
+        }
+    }
 
     const buf = try alloc.alloc(u8, total_len);
     var pos: usize = 0;
-    for (path.nodes) |node| {
+    for (path.nodes, 0..) |node, i| {
+        const table = if (path.node_tables.len == path.nodes.len) path.node_tables[i] else null;
+        buf[pos] = if (table == null) 0 else 1;
+        pos += 1;
+        const table_len: u64 = if (table) |value| @intCast(value.len) else 0;
+        std.mem.writeInt(u64, buf[pos..][0..8], table_len, .little);
+        pos += 8;
+        if (table) |value| {
+            @memcpy(buf[pos..][0..value.len], value);
+            pos += value.len;
+        }
         std.mem.writeInt(u64, buf[pos..][0..8], @intCast(node.len), .little);
         pos += 8;
         @memcpy(buf[pos..][0..node.len], node);
         pos += node.len;
+    }
+    for (path.edges) |edge| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+            std.mem.writeInt(u64, buf[pos..][0..8], @intCast(part.len), .little);
+            pos += 8;
+            @memcpy(buf[pos..][0..part.len], part);
+            pos += part.len;
+        }
     }
     return buf;
 }
@@ -947,8 +1057,24 @@ fn rootPathMatches(a: *const Path, b: *const Path, up_to: usize) bool {
     if (a.nodes.len <= up_to or b.nodes.len <= up_to) return false;
     for (0..up_to + 1) |i| {
         if (!std.mem.eql(u8, a.nodes[i], b.nodes[i])) return false;
+        const a_table = if (a.node_tables.len == a.nodes.len) a.node_tables[i] else null;
+        const b_table = if (b.node_tables.len == b.nodes.len) b.node_tables[i] else null;
+        if (!optionalStringEql(a_table, b_table)) return false;
     }
+    if (a.edges.len < up_to or b.edges.len < up_to) return false;
+    for (0..up_to) |i| if (!pathEdgeIdentityEql(a.edges[i], b.edges[i])) return false;
     return true;
+}
+
+fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn pathEdgeIdentityEql(a: PathEdge, b: PathEdge) bool {
+    return std.mem.eql(u8, a.source, b.source) and
+        std.mem.eql(u8, a.target, b.target) and
+        std.mem.eql(u8, a.edge_type, b.edge_type);
 }
 
 fn joinPaths(alloc: Allocator, root: *const Path, spur_idx: usize, spur: *const Path) !Path {
@@ -1267,6 +1393,67 @@ test "k shortest paths" {
     try std.testing.expectEqual(@as(u32, 2), found_paths[0].length);
     try std.testing.expect(found_paths[0].total_weight <= found_paths[1].total_weight);
     try std.testing.expect(found_paths[1].total_weight <= found_paths[2].total_weight);
+}
+
+test "k shortest paths preserve parallel typed edge identities" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const store_path = tmpPath(&sb, "k-parallel-edge-s");
+    defer cleanupTmp(store_path);
+    var rb: [256]u8 = undefined;
+    const reverse_path = tmpPath(&rb, "k-parallel-edge-r");
+    defer cleanupTmp(reverse_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, reverse_path, "test", .{});
+    defer graph.close();
+
+    try graph.addEdge("A", "B", "primary", 1.0, 0, 0, "");
+    try graph.addEdge("A", "B", "secondary", 1.0, 0, 0, "");
+    try graph.addEdge("B", "C", "finish", 1.0, 0, 0, "");
+
+    const found_paths = try findKShortestPaths(alloc, &graph, "A", "C", 2, .{});
+    defer freePaths(alloc, found_paths);
+
+    try std.testing.expectEqual(@as(usize, 2), found_paths.len);
+    try std.testing.expectEqualStrings("A", found_paths[0].nodes[0]);
+    try std.testing.expectEqualStrings("B", found_paths[0].nodes[1]);
+    try std.testing.expectEqualStrings("C", found_paths[0].nodes[2]);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        found_paths[0].edges[0].edge_type,
+        found_paths[1].edges[0].edge_type,
+    ));
+}
+
+test "k shortest paths share one cumulative work budget across spur searches" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const store_path = tmpPath(&sb, "k-shared-budget-s");
+    defer cleanupTmp(store_path);
+    var rb: [256]u8 = undefined;
+    const reverse_path = tmpPath(&rb, "k-shared-budget-r");
+    defer cleanupTmp(reverse_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, reverse_path, "test", .{});
+    defer graph.close();
+
+    try graph.addEdge("A", "B", "one", 1.0, 0, 0, "");
+    try graph.addEdge("A", "D", "two", 1.0, 0, 0, "");
+    try graph.addEdge("B", "C", "finish", 1.0, 0, 0, "");
+    try graph.addEdge("D", "C", "finish", 1.0, 0, 0, "");
+
+    // The first BFS admits exactly A, B, D, and C. A fresh budget per Yen
+    // spur would incorrectly allow the second search to proceed.
+    var budget = work_budget_mod.WorkBudget.init(4, 100);
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        findKShortestPaths(alloc, &graph, "A", "C", 2, .{ .work_budget = &budget }),
+    );
+    try std.testing.expectEqual(work_budget_mod.Dimension.explored_nodes, budget.exhaustion().?.dimension);
 }
 
 test "k shortest paths apply max_depth to the complete candidate" {

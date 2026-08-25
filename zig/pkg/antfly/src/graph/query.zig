@@ -30,6 +30,7 @@ const NodeRef = @import("node_admission.zig").NodeRef;
 const pattern_mod = @import("pattern.zig");
 const traversal_mod = @import("traversal.zig");
 const paths_mod = @import("paths.zig");
+const work_budget_mod = @import("work_budget.zig");
 const algebraic_ir = @import("../storage/db/algebraic/ir.zig");
 const algebraic_planner = @import("../storage/db/algebraic/planner.zig");
 const algebraic_path_mod = @import("../storage/db/algebraic/path.zig");
@@ -211,9 +212,6 @@ pub const GraphQuery = struct {
     query_type: QueryType,
     index_name: []const u8,
     start_nodes: NodeSelector,
-    /// Preserve the v0.2 `graph_searches` response envelope while that request
-    /// field remains available as a deprecated compatibility adapter.
-    legacy_response: bool = false,
     params: QueryParams = .{},
     target_nodes: ?NodeSelector = null,
     k: u32 = 1,
@@ -312,6 +310,9 @@ pub const GraphQueryResult = struct {
 pub const GraphQueryEngine = struct {
     alloc: Allocator,
     node_admission: ?NodeAdmission = null,
+    /// Public request coordinators install one shared budget here. Internal
+    /// callers may omit it and retain the graph algorithms' standalone limit.
+    work_budget: ?*work_budget_mod.WorkBudget = null,
 
     /// Execute a graph query. For result_ref node selectors, the caller must
     /// resolve refs to keys and pass them as resolved_keys.
@@ -376,6 +377,7 @@ pub const GraphQueryEngine = struct {
             .deduplicate = params.deduplicate,
             .include_paths = params.include_paths,
             .node_admission = self.node_admission,
+            .work_budget = self.work_budget,
             .result_admission = .{
                 .ctx = &result_admission_context,
                 .admit_one = TraverseResultAdmissionContext.admit,
@@ -445,7 +447,7 @@ pub const GraphQueryEngine = struct {
 
         for (start_keys, 0..) |start_key, start_index| {
             if (admitted_starts) |mask| if (!mask[start_index]) continue;
-            var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, params);
+            var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, params, self.work_budget);
             defer algebraic_edges.deinit(self.alloc);
             // Algebraic reachability currently keys tensor vertices by document
             // key alone. A cross-table endpoint introduces a distinct namespace,
@@ -459,7 +461,10 @@ pub const GraphQueryEngine = struct {
                 );
             }
 
-            const reached = try algebraic_path_mod.boundedReachabilityWithOptionsAlloc(self.alloc, start_key, algebraic_edges.items, params.max_depth, .{ .target_nodes = target_keys });
+            const reached = try algebraic_path_mod.boundedReachabilityWithOptionsAlloc(self.alloc, start_key, algebraic_edges.items, params.max_depth, .{
+                .target_nodes = target_keys,
+                .work_budget = self.work_budget,
+            });
             defer algebraic_path_mod.deinitPathResults(self.alloc, reached);
 
             for (reached) |item| {
@@ -512,6 +517,7 @@ pub const GraphQueryEngine = struct {
             .min_weight = gq.params.min_weight,
             .max_weight = gq.params.max_weight,
             .node_admission = self.node_admission,
+            .work_budget = self.work_budget,
         };
         const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
@@ -570,7 +576,7 @@ pub const GraphQueryEngine = struct {
                     continue;
                 }
 
-                var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, params);
+                var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, params, self.work_budget);
                 defer algebraic_edges.deinit(self.alloc);
                 // Tensor vertex names are key-only; cross-table endpoints must
                 // use the exact table-aware path implementation below.
@@ -588,7 +594,10 @@ pub const GraphQueryEngine = struct {
                     start_key,
                     algebraic_edges.items,
                     params.max_depth,
-                    .{ .target_nodes = &.{target_key} },
+                    .{
+                        .target_nodes = &.{target_key},
+                        .work_budget = self.work_budget,
+                    },
                 );
                 defer algebraic_path_mod.deinitPathResults(self.alloc, reached);
 
@@ -624,6 +633,7 @@ pub const GraphQueryEngine = struct {
             .min_weight = gq.params.min_weight,
             .max_weight = gq.params.max_weight,
             .node_admission = self.node_admission,
+            .work_budget = self.work_budget,
         };
         const admitted_starts = try self.admittedStartKeysAlloc(start_keys, gq.params.direction);
         defer if (admitted_starts) |mask| self.alloc.free(mask);
@@ -683,6 +693,7 @@ pub const GraphQueryEngine = struct {
                 .max_results = gq.params.max_results,
                 .return_aliases = gq.return_aliases,
                 .node_admission = self.node_admission,
+                .work_budget = self.work_budget,
             },
         );
         errdefer pattern_mod.freeMatches(self.alloc, matches);
@@ -734,11 +745,13 @@ pub const GraphQueryEngine = struct {
         for (start_keys) |start_key| {
             if (!graphQueryPassesPrefixFilter(start_key, gq.pattern[0].node_filter)) continue;
 
-            var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, plan.params);
+            var algebraic_edges = try collectAlgebraicReachabilityEdges(self.alloc, graph_index, start_key, plan.params, self.work_budget);
             defer algebraic_edges.deinit(self.alloc);
             if (algebraic_edges.has_cross_table_edges) return null;
 
-            const reached = try algebraic_path_mod.boundedReachabilityWithOptionsAlloc(self.alloc, start_key, algebraic_edges.items, plan.depth, .{});
+            const reached = try algebraic_path_mod.boundedReachabilityWithOptionsAlloc(self.alloc, start_key, algebraic_edges.items, plan.depth, .{
+                .work_budget = self.work_budget,
+            });
             defer algebraic_path_mod.deinitPathResults(self.alloc, reached);
 
             for (reached) |item| {
@@ -1411,6 +1424,7 @@ fn collectAlgebraicReachabilityEdges(
     graph_index: *graph_mod.GraphIndex,
     start_key: []const u8,
     params: QueryParams,
+    work_budget: ?*work_budget_mod.WorkBudget,
 ) !AlgebraicReachabilityEdges {
     var edges = std.ArrayListUnmanaged(algebraic_path_mod.Edge).empty;
     errdefer {
@@ -1442,6 +1456,10 @@ fn collectAlgebraicReachabilityEdges(
         .key = try alloc.dupe(u8, start_key),
         .depth = 0,
     });
+    if (work_budget) |budget| {
+        try budget.consumeNode();
+        try budget.checkIntermediateStates(queue.items.len, work_budget_mod.default_max_intermediate_states);
+    }
     try visited.put(alloc, try alloc.dupe(u8, start_key), {});
 
     scan: while (queue_head < queue.items.len) {
@@ -1449,8 +1467,23 @@ fn collectAlgebraicReachabilityEdges(
         queue_head += 1;
         if (current.depth >= params.max_depth) continue;
 
-        const graph_edges = try graph_index.getEdges(alloc, current.key, "", params.direction);
+        const graph_edges = if (work_budget) |budget|
+            graph_index.getEdgesByTypesBounded(
+                alloc,
+                current.key,
+                params.edge_types,
+                params.direction,
+                budget.edgeLimit(),
+                budget.edgeByteLimit(),
+            ) catch |err| switch (err) {
+                error.GraphExploredEdgesBudgetExceeded, error.QueryCandidateBudgetExceeded => return budget.exhaust(.explored_edges, budget.max_edges),
+                error.GraphExploredEdgeBytesBudgetExceeded => return budget.exhaust(.explored_edge_bytes, budget.max_edge_bytes),
+                else => return err,
+            }
+        else
+            try graph_index.getEdges(alloc, current.key, "", params.direction);
         defer graph_mod.GraphIndex.freeEdges(alloc, graph_edges);
+        if (work_budget) |budget| try budget.consumeMaterializedEdges(graph_edges);
         for (graph_edges) |edge| {
             if (!graphEdgeTypeAllowed(params.edge_types, edge.edge_type)) continue;
             if (!graphEdgeWeightAllowed(params, edge.weight)) continue;
@@ -1467,7 +1500,10 @@ fn collectAlgebraicReachabilityEdges(
             }
             if (std.mem.eql(u8, next_key, start_key)) continue;
             const already_visited = visited.contains(next_key);
-            if (!already_visited) try visited.put(alloc, try alloc.dupe(u8, next_key), {});
+            if (!already_visited) {
+                try visited.put(alloc, try alloc.dupe(u8, next_key), {});
+                if (work_budget) |budget| try budget.consumeNode();
+            }
 
             const provenance_label = try std.fmt.allocPrint(alloc, "{s}\x1f{s}\x1f{s}", .{ edge.source, edge.edge_type, edge.target });
             defer alloc.free(provenance_label);
@@ -1494,6 +1530,9 @@ fn collectAlgebraicReachabilityEdges(
                     .key = try alloc.dupe(u8, next_key),
                     .depth = current.depth + 1,
                 });
+                if (work_budget) |budget| {
+                    try budget.checkIntermediateStates(queue.items.len, work_budget_mod.default_max_intermediate_states);
+                }
             }
         }
     }
@@ -1726,6 +1765,34 @@ test "traverse: multi-start with depth 2" {
     try std.testing.expectEqual(@as(usize, 5), result.nodes.len);
 }
 
+test "graph query engine shares traversal work across start nodes" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    var rb: [256]u8 = undefined;
+    const ctx = try setupGraph(alloc, "gq-budget-s", "gq-budget-r", &sb, &rb);
+    defer {
+        ctx.deinit();
+        alloc.destroy(ctx);
+    }
+
+    try ctx.graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try ctx.graph.addEdge("X", "Y", "e", 1.0, 0, 0, "");
+
+    var work_budget = work_budget_mod.WorkBudget.init(3, 10);
+    var engine = GraphQueryEngine{
+        .alloc = alloc,
+        .work_budget = &work_budget,
+    };
+    const start_keys: []const []const u8 = &.{ "A", "X" };
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, engine.execute(&ctx.graph, .{
+        .query_type = .traverse,
+        .index_name = "test",
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{ .max_depth = 1 },
+    }, start_keys));
+    try std.testing.expectEqual(work_budget_mod.Dimension.explored_nodes, work_budget.exhaustion().?.dimension);
+}
+
 test "traverse preserves table-scoped identities across result dedup and algebraic fallback" {
     const alloc = std.testing.allocator;
     var sb: [256]u8 = undefined;
@@ -1751,7 +1818,7 @@ test "traverse preserves table-scoped identities across result dedup and algebra
         .max_depth = 1,
         .max_results = 0,
         .algebraic_semiring = true,
-    });
+    }, null);
     defer algebraic_probe.deinit(alloc);
     try std.testing.expect(algebraic_probe.has_cross_table_edges);
 

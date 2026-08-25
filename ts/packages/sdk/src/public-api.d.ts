@@ -12038,7 +12038,7 @@ export interface components {
             where?: components["schemas"]["GraphWhereExpression"];
         };
         GraphMatch: {
-            /** @description Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. Filters on this alias, including row-level authorization filters, must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`. */
+            /** @description Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on this alias must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`. */
             anchor: string;
             /** @description Aliases are limited to 128 Unicode code points. */
             nodes: {
@@ -12435,17 +12435,23 @@ export interface components {
             };
             stats: components["schemas"]["GraphQueryStats"];
         };
-        /** @description An ordered canonical graph path with table-qualified node identities. */
+        /** @description An ordered canonical graph path with table-qualified node identities and a self-describing ranking score. */
         GraphPath: {
             /** @description Ordered node identities. Table is omitted for nodes in the query table. */
             nodes: components["schemas"]["GraphPathEndpoint"][];
             /** @description Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1]. */
             edges: components["schemas"]["GraphPathEdge"][];
+            weight_mode: components["schemas"]["PathWeightMode"];
             /**
              * Format: double
-             * @description Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
+             * @description Sum of raw edge weights along the path, independent of the selected ranking objective.
              */
-            total_weight: number;
+            weight_sum: number;
+            /**
+             * Format: double
+             * @description The user-facing value optimized by weight_mode; edge count for min_hops, weight_sum for min_weight, and the raw edge-weight product for max_weight.
+             */
+            objective_value: number;
             length: number;
         };
         /** @description Composable result nodes and any materialized paths from a canonical traversal or path query. */

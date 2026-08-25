@@ -15906,6 +15906,7 @@ pub const DB = struct {
             min_weight,
             max_weight,
             null,
+            null,
         );
     }
 
@@ -15944,6 +15945,7 @@ pub const DB = struct {
             max_depth,
             min_weight,
             max_weight,
+            null,
             null,
         );
     }
@@ -24375,6 +24377,31 @@ pub const DB = struct {
 
     fn searchRequestWithAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
         if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return .{ .req = req };
+        // `_id` is the primary identity access path, not a user-provisioned
+        // secondary index. Resolve a closed ID union directly even for callers
+        // that require exact native resolution (notably canonical MATCH anchor
+        // scans). This keeps bounded point-source queries exact on every table
+        // while arbitrary predicates still fail closed without index coverage.
+        if (req.doc_filter_bindings.len == 0 and
+            req.filter_query_json.len > 0 and
+            req.exclusion_query_json.len == 0)
+        {
+            if (try db_query_search.exactStructuredFilterDocIdsAlloc(self.alloc, req.filter_query_json)) |doc_ids| {
+                defer freeConstDocIds(self.alloc, doc_ids);
+                const resolved_filter = try self.alloc.create(doc_set.ResolvedDocFilter);
+                errdefer self.alloc.destroy(resolved_filter);
+                resolved_filter.* = try self.resolvedDocFilterForIdsAlloc(true, doc_ids, &.{}, req.identity_read_generation);
+                errdefer resolved_filter.deinit(self.alloc);
+                var next = req;
+                next.filter_query_json = "";
+                next.resolved_doc_filter = resolved_filter;
+                return .{
+                    .req = next,
+                    .resolved_doc_filter = resolved_filter,
+                    .resolved_doc_filter_alloc = self.alloc,
+                };
+            }
+        }
         if (!req.require_algebraic_filter_resolution and req.doc_filter_bindings.len == 0) {
             if (try self.searchRequestWithDynamicStructuredDocFilterAlloc(req)) |direct| return direct;
         }
@@ -25403,7 +25430,7 @@ pub const DB = struct {
                 predicate_aware,
                 budgets,
             ),
-            else => try db_query_graph.executeSingleNonPatternQueryWithSets(alloc, req, named, named_sets, .{
+            else => try db_query_graph.executeSingleNonPatternQueryWithSetsWithBudgets(alloc, req, named, named_sets, .{
                 .ctx = self,
                 .graph_ctx = if (predicate_aware) &execution else null,
                 .predicate_aware = predicate_aware,
@@ -25424,7 +25451,7 @@ pub const DB = struct {
                 .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
                 .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
                 .filter_keys = filterGraphKeysCallback,
-            }),
+            }, budgets),
         };
         errdefer result.deinit(alloc);
         try self.annotateSearchHitOrdinalsNoLock(alloc, req, result.hits);
@@ -26038,9 +26065,10 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         source: []const u8,
         target: []const u8,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) anyerror!?types.GraphPath {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.findShortestPath(
+        return try self.core.graphFindShortestPath(
             alloc,
             named.query.index_name,
             source,
@@ -26051,6 +26079,8 @@ pub const DB = struct {
             named.query.params.max_depth,
             named.query.params.min_weight,
             named.query.params.max_weight,
+            null,
+            work_budget,
         );
     }
 
@@ -26060,6 +26090,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         source: []const u8,
         target: []const u8,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) anyerror!?types.GraphPath {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.core.graphFindShortestPath(
@@ -26074,6 +26105,7 @@ pub const DB = struct {
             named.query.params.min_weight,
             named.query.params.max_weight,
             execution.admission.iface(),
+            work_budget,
         );
     }
 
@@ -26083,9 +26115,10 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         source: []const u8,
         target: []const u8,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) anyerror![]types.GraphPath {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.findKShortestPaths(
+        return try self.core.graphFindKShortestPaths(
             alloc,
             named.query.index_name,
             source,
@@ -26097,6 +26130,8 @@ pub const DB = struct {
             named.query.params.max_depth,
             named.query.params.min_weight,
             named.query.params.max_weight,
+            null,
+            work_budget,
         );
     }
 
@@ -26106,6 +26141,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         source: []const u8,
         target: []const u8,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) anyerror![]types.GraphPath {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try execution.db.core.graphFindKShortestPaths(
@@ -26121,6 +26157,7 @@ pub const DB = struct {
             named.query.params.min_weight,
             named.query.params.max_weight,
             execution.admission.iface(),
+            work_budget,
         );
     }
 
@@ -26130,9 +26167,10 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try executeGraphQueryWithTargets(self, alloc, named.query, start_key_refs, target_keys);
+        return try executeGraphQueryWithTargets(self, alloc, named.query, start_key_refs, target_keys, work_budget);
     }
 
     fn executeGraphQueryWithAdmissionCallback(
@@ -26141,6 +26179,7 @@ pub const DB = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const execution: *GraphPredicateExecutionContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try executeGraphQueryWithAdmission(
@@ -26150,6 +26189,7 @@ pub const DB = struct {
             start_key_refs,
             target_keys,
             execution.admission.iface(),
+            work_budget,
         );
     }
 
@@ -26224,7 +26264,7 @@ pub const DB = struct {
         target_keys: [][]u8,
     ) anyerror!graph_query_mod.GraphQueryResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try executeGraphQueryWithTargets(self, alloc, graph_query, start_key_refs, target_keys);
+        return try executeGraphQueryWithTargets(self, alloc, graph_query, start_key_refs, target_keys, null);
     }
 
     fn executeSearchGraphQueryWithAdmissionCallback(
@@ -26242,6 +26282,7 @@ pub const DB = struct {
             start_key_refs,
             target_keys,
             execution.admission.iface(),
+            null,
         );
     }
 
@@ -26320,6 +26361,7 @@ pub const DB = struct {
         graph_query: graph_query_mod.GraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
+        work_budget: ?*graph_pattern_mod.WorkBudget,
     ) !graph_query_mod.GraphQueryResult {
         const entry = self.core.graphIndex(graph_query.index_name) orelse {
             try self.failIfIndexQuarantined(graph_query.index_name);
@@ -26341,7 +26383,10 @@ pub const DB = struct {
             }
         };
 
-        var graph_engine = graph_query_mod.GraphQueryEngine{ .alloc = alloc };
+        var graph_engine = graph_query_mod.GraphQueryEngine{
+            .alloc = alloc,
+            .work_budget = work_budget,
+        };
         return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
     }
 
@@ -26352,6 +26397,7 @@ pub const DB = struct {
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
         admission: NodeAdmission,
+        work_budget: ?*graph_pattern_mod.WorkBudget,
     ) !graph_query_mod.GraphQueryResult {
         const entry = self.core.graphIndex(graph_query.index_name) orelse {
             try self.failIfIndexQuarantined(graph_query.index_name);
@@ -26373,6 +26419,7 @@ pub const DB = struct {
         var graph_engine = graph_query_mod.GraphQueryEngine{
             .alloc = alloc,
             .node_admission = admission,
+            .work_budget = work_budget,
         };
         return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
     }

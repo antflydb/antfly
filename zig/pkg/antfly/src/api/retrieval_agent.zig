@@ -7248,8 +7248,10 @@ test "annotate tree document prefers graph path branch metadata" {
         .{
             .nodes = &.{ .{ .key = "doc:root" }, .{ .key = "doc:child" }, .{ .key = "doc:leaf" } },
             .edges = &.{},
-            .total_weight = 2,
             .length = 2,
+            .weight_mode = .min_hops,
+            .weight_sum = 2,
+            .objective_value = 2,
         },
     };
     const annotated = try annotateTreeDocument(
@@ -7281,8 +7283,8 @@ test "extract tree hits prefers strongest branches and ancestor ordering" {
         \\{"key":"doc:a","depth":1,"document":{"title":"branch a"}},
         \\{"key":"doc:a:leaf","depth":2,"document":{"title":"branch a leaf"}}
         \\],"paths":[
-        \\{"nodes":[{"key":"doc:root"},{"key":"doc:a"},{"key":"doc:a:leaf"}],"edges":[],"total_weight":2,"length":2},
-        \\{"nodes":[{"key":"doc:root"},{"key":"doc:b"}],"edges":[],"total_weight":1,"length":1}
+        \\{"nodes":[{"key":"doc:root"},{"key":"doc:a"},{"key":"doc:a:leaf"}],"edges":[],"length":2,"weight_mode":"min_hops","weight_sum":2,"objective_value":2},
+        \\{"nodes":[{"key":"doc:root"},{"key":"doc:b"}],"edges":[],"length":1,"weight_mode":"min_hops","weight_sum":1,"objective_value":1}
         \\],"stats":{"returned_items":3,"truncated":false}}}}]}
     ;
 

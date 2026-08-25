@@ -92,7 +92,7 @@ pub fn parseSupportedGraphQueriesAlloc(
             const query = try query_contract.parseLegacyGraphQuery(alloc, entry.value_ptr.*);
             var query_owned = true;
             errdefer if (query_owned) freeGraphQuery(alloc, query);
-            try items.append(alloc, .{ .name = name, .query = query });
+            try items.append(alloc, .{ .name = name, .query = query, .response_format = .legacy });
             name_owned = false;
             query_owned = false;
         }
@@ -593,7 +593,7 @@ test "parse supported graph queries accepts deprecated graph searches" {
     defer freeNamedGraphQueries(alloc, items);
 
     try std.testing.expectEqual(@as(usize, 1), items.len);
-    try std.testing.expect(items[0].query.legacy_response);
+    try std.testing.expect(items[0].response_format == .legacy);
     try std.testing.expect(items[0].query.start_nodes == .keys);
     try std.testing.expectEqual(graph_query_mod.QueryType.neighbors, items[0].query.query_type);
     try std.testing.expectEqualStrings("graph_idx", items[0].query.index_name);
@@ -676,7 +676,7 @@ test "legacy graph result refs preserve their retrieval lane" {
     defer parsed.deinit();
     const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
-    try std.testing.expect(items[0].query.legacy_response);
+    try std.testing.expect(items[0].response_format == .legacy);
     try std.testing.expectEqualStrings("$full_text_results", items[0].query.start_nodes.result_ref.ref);
 }
 
@@ -1087,4 +1087,54 @@ test "parse supported graph queries accepts branches predicates optional groups 
     try std.testing.expectEqual(@as(usize, 1), pattern.optional.len);
     try std.testing.expectEqual(@as(usize, 1), items[0].query.aggregates.len);
     try std.testing.expectEqualStrings("count", items[0].query.aggregates[0].name);
+}
+
+test "parse supported graph queries accepts sibling bindings and exact aggregate matches" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{
+        \\  "graph_queries": {
+        \\    "two_hop": {
+        \\      "index": "graph_idx",
+        \\      "match": {
+        \\        "anchor": "a",
+        \\        "nodes": {
+        \\          "a": {"filter": {"ids": ["doc-a"]}},
+        \\          "b": {"filter": {"term": "beta", "path": "/title"}},
+        \\          "c": {"filter": {"prefix": "ga", "path": "/title"}}
+        \\        },
+        \\        "edges": [
+        \\          {"from": "a", "to": "b", "types": ["cites"]},
+        \\          {"from": "b", "to": "c", "types": ["cites"]}
+        \\        ]
+        \\      },
+        \\      "return": {"bindings": ["a", "b", "c"], "limit": 10}
+        \\    },
+        \\    "two_hop_count": {
+        \\      "index": "graph_idx",
+        \\      "match": {
+        \\        "anchor": "a",
+        \\        "nodes": {
+        \\          "a": {"filter": {"ids": ["doc-a"]}},
+        \\          "b": {"filter": {"term": "beta", "path": "/title"}},
+        \\          "c": {"filter": {"prefix": "ga", "path": "/title"}}
+        \\        },
+        \\        "edges": [
+        \\          {"from": "a", "to": "b", "types": ["cites"]},
+        \\          {"from": "b", "to": "c", "types": ["cites"]}
+        \\        ]
+        \\      },
+        \\      "return": {"aggregates": {"rows": {"count": "*"}}}
+        \\    }
+        \\  },
+        \\  "limit": 10
+        \\}
+    , .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    defer freeNamedGraphQueries(alloc, items);
+    try std.testing.expectEqual(@as(usize, 2), items.len);
 }

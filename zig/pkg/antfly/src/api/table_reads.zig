@@ -17009,9 +17009,9 @@ fn appendGraphQueriesField(
     graph_queries_wire_json: []const u8,
 ) !void {
     if (graph_queries.len == 0) return;
-    const legacy = graph_queries[0].query.legacy_response;
+    const legacy = graph_queries[0].response_format == .legacy;
     for (graph_queries[1..]) |named| {
-        if (named.query.legacy_response != legacy) return error.InvalidQueryRequest;
+        if ((named.response_format == .legacy) != legacy) return error.InvalidQueryRequest;
     }
 
     const wire = std.mem.trim(u8, graph_queries_wire_json, &std.ascii.whitespace);
@@ -18153,7 +18153,7 @@ test "parseRemoteSearchResult preserves typed graph rows and hydrated documents"
 test "parseRemoteSearchResult preserves canonical graph path table identities" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}],"total_weight":1,"length":1}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}],"length":1,"weight_mode":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
@@ -18735,6 +18735,7 @@ fn parseRemoteCanonicalGraphPath(
 ) !graph_paths.Path {
     if (item.length < 0 or @as(u64, @intCast(item.length)) != item.edges.len)
         return error.InvalidQueryRequest;
+    try validateRemoteCanonicalGraphPathScores(item);
     const nodes = try alloc.alloc([]const u8, item.nodes.len);
     var initialized_nodes: usize = 0;
     errdefer {
@@ -18777,9 +18778,34 @@ fn parseRemoteCanonicalGraphPath(
         .nodes = nodes,
         .node_tables = node_tables,
         .edges = edges,
-        .total_weight = item.total_weight,
+        .total_weight = item.weight_sum,
         .length = std.math.cast(u32, item.length) orelse return error.InvalidQueryRequest,
     };
+}
+
+fn validateRemoteCanonicalGraphPathScores(item: indexes_openapi.GraphPath) !void {
+    if (!std.math.isFinite(item.weight_sum) or !std.math.isFinite(item.objective_value))
+        return error.InvalidQueryRequest;
+    var sum: f64 = 0;
+    var product: f64 = 1;
+    for (item.edges) |edge| {
+        if (!std.math.isFinite(edge.weight)) return error.InvalidQueryRequest;
+        sum += edge.weight;
+        product *= edge.weight;
+    }
+    if (!graphPathScoreEql(item.weight_sum, sum)) return error.InvalidQueryRequest;
+    const objective: f64 = switch (item.weight_mode) {
+        .min_hops => @floatFromInt(item.edges.len),
+        .min_weight => sum,
+        .max_weight => product,
+    };
+    if (!std.math.isFinite(objective) or !graphPathScoreEql(item.objective_value, objective))
+        return error.InvalidQueryRequest;
+}
+
+fn graphPathScoreEql(left: f64, right: f64) bool {
+    const scale = @max(@as(f64, 1), @max(@abs(left), @abs(right)));
+    return @abs(left - right) <= 1e-12 * scale;
 }
 
 fn parseRemotePathEdges(alloc: std.mem.Allocator, value: []const indexes_openapi.PathEdge) ![]graph_paths.PathEdge {
@@ -26456,11 +26482,11 @@ test "unsupported graph query modes fail closed" {
     };
     const legacy_pattern_queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "mentions",
+        .response_format = .legacy,
         .query = .{
             .query_type = .pattern,
             .index_name = "graph_v1",
             .start_nodes = .{ .keys = &.{"entity:ada"} },
-            .legacy_response = true,
             .pattern = &legacy_pattern,
         },
     }};

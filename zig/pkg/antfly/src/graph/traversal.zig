@@ -29,6 +29,7 @@ const GraphIndex = graph_mod.GraphIndex;
 const NodeAdmission = @import("node_admission.zig").NodeAdmission;
 const NodeRef = @import("node_admission.zig").NodeRef;
 const node_identity = @import("node_identity.zig");
+const work_budget_mod = @import("work_budget.zig");
 
 // ============================================================================
 // Traversal types
@@ -47,6 +48,9 @@ pub const TraversalRules = struct {
     /// Optional query-scoped output admission. Rejected nodes remain eligible
     /// for expansion; only admitted nodes count toward `max_results`.
     result_admission: ?ResultAdmission = null,
+    /// Shared request budget for expansion work. Omit only for internal callers
+    /// that want the standard standalone graph limits.
+    work_budget: ?*work_budget_mod.WorkBudget = null,
 };
 
 pub const ResultAdmission = struct {
@@ -109,6 +113,18 @@ pub fn traverse(alloc: Allocator, graph_index: *GraphIndex, start_key: []const u
             return try self.graph_index.getEdges(a, key, "", direction);
         }
 
+        pub fn getEdgesBoundedForTraversal(
+            self: @This(),
+            a: Allocator,
+            key: []const u8,
+            edge_types: []const []const u8,
+            direction: EdgeDirection,
+            max_edges: usize,
+            max_bytes: usize,
+        ) ![]Edge {
+            return try self.graph_index.getEdgesByTypesBounded(a, key, edge_types, direction, max_edges, max_bytes);
+        }
+
         pub fn freeEdges(_: @This(), a: Allocator, edges: []Edge) void {
             GraphIndex.freeEdges(a, edges);
         }
@@ -125,14 +141,22 @@ pub fn traverseWithEdgeReader(
     start_key: []const u8,
     rules: TraversalRules,
 ) ![]TraversalResult {
+    var local_work_budget = work_budget_mod.WorkBudget.init(
+        work_budget_mod.default_max_explored_nodes,
+        work_budget_mod.default_max_explored_edges,
+    );
+    var effective_rules = rules;
+    if (effective_rules.work_budget == null) effective_rules.work_budget = &local_work_budget;
+    const work_budget = effective_rules.work_budget.?;
+
     var results = std.ArrayListUnmanaged(TraversalResult).empty;
     errdefer {
         freeResults(alloc, results.items);
         results.deinit(alloc);
     }
 
-    if (rules.node_admission) |admission| {
-        if (!try startNodeAdmittedWithEdgeReader(alloc, edge_reader, start_key, rules.direction, admission)) {
+    if (effective_rules.node_admission) |admission| {
+        if (!try startNodeAdmittedWithEdgeReader(alloc, edge_reader, start_key, effective_rules.direction, admission, work_budget)) {
             return try results.toOwnedSlice(alloc);
         }
     }
@@ -158,7 +182,7 @@ pub fn traverseWithEdgeReader(
     var start_entry_owned = true;
     errdefer if (start_entry_owned) start_entry.deinit(alloc);
     var start_path: ?std.ArrayListUnmanaged([]const u8) = null;
-    if (rules.include_paths) {
+    if (effective_rules.include_paths) {
         start_path = std.ArrayListUnmanaged([]const u8).empty;
         const path_key = try alloc.dupe(u8, start_key);
         start_path.?.append(alloc, path_key) catch |err| {
@@ -168,9 +192,11 @@ pub fn traverseWithEdgeReader(
     }
     start_entry.path = start_path;
     try queue.append(alloc, start_entry);
+    try work_budget.checkIntermediateStates(queue.items.len, work_budget_mod.default_max_intermediate_states);
     start_entry_owned = false;
+    try work_budget.consumeNode();
 
-    if (rules.deduplicate) {
+    if (effective_rules.deduplicate) {
         _ = try visited.putIfAbsent(alloc, .{ .table = null, .key = start_key }, {});
     }
 
@@ -182,7 +208,7 @@ pub fn traverseWithEdgeReader(
 
         // Add to results (skip depth 0 = start node)
         const include_in_results = current.depth > 0 and
-            (rules.result_admission == null or try rules.result_admission.?.admit(.{
+            (effective_rules.result_admission == null or try effective_rules.result_admission.?.admit(.{
                 .key = current.key,
                 .table = current.target_table,
                 .external = current.target_table != null,
@@ -194,13 +220,13 @@ pub fn traverseWithEdgeReader(
             try results.append(alloc, result);
             result_owned = false;
 
-            if (rules.max_results > 0 and results.items.len >= rules.max_results) {
+            if (effective_rules.max_results > 0 and results.items.len >= effective_rules.max_results) {
                 break;
             }
         }
 
         // Check max depth
-        if (rules.max_depth > 0 and current.depth >= rules.max_depth) continue;
+        if (effective_rules.max_depth > 0 and current.depth >= effective_rules.max_depth) continue;
 
         // Cross-table nodes are expanded by the distributed owner router.
         // Looking them up in this source-table index aliases distinct node
@@ -208,10 +234,11 @@ pub fn traverseWithEdgeReader(
         if (current.target_table != null) continue;
 
         // Get edges
-        const edges = try edge_reader.getEdges(alloc, current.key, rules.direction);
+        const edges = try getEdgesForTraversalBudget(alloc, edge_reader, current.key, effective_rules, work_budget);
         defer edge_reader.freeEdges(alloc, edges);
+        try work_budget.consumeMaterializedEdges(edges);
 
-        const admitted_edges = if (rules.node_admission) |admission| blk: {
+        const admitted_edges = if (effective_rules.node_admission) |admission| blk: {
             const edge_mask = try alloc.alloc(bool, edges.len);
             @memset(edge_mask, false);
             errdefer alloc.free(edge_mask);
@@ -222,13 +249,13 @@ pub fn traverseWithEdgeReader(
             try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
             try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
             for (edges, 0..) |edge, edge_index| {
-                if (!shouldTraverseEdge(&rules, &edge)) continue;
+                if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
                 const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
                 const target_table = if (std.mem.eql(u8, next_key, edge.target))
                     metadataTargetTable(edge.metadata)
                 else
                     null;
-                if (rules.deduplicate and visited.contains(.{
+                if (effective_rules.deduplicate and visited.contains(.{
                     .table = target_table,
                     .key = next_key,
                 })) continue;
@@ -256,13 +283,13 @@ pub fn traverseWithEdgeReader(
             if (admitted_edges) |mask| {
                 if (!mask[edge_index]) continue;
             } else {
-                if (!shouldTraverseEdge(&rules, &edge)) continue;
+                if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
             }
             const target_table = if (std.mem.eql(u8, next_key, edge.target))
                 metadataTargetTable(edge.metadata)
             else
                 null;
-            if (rules.deduplicate and !try visited.putIfAbsent(
+            if (effective_rules.deduplicate and !try visited.putIfAbsent(
                 alloc,
                 .{ .table = target_table, .key = next_key },
                 {},
@@ -270,7 +297,7 @@ pub fn traverseWithEdgeReader(
 
             // Build path for next node
             var next_path: ?std.ArrayListUnmanaged([]const u8) = null;
-            if (rules.include_paths) {
+            if (effective_rules.include_paths) {
                 next_path = std.ArrayListUnmanaged([]const u8).empty;
                 errdefer if (next_path) |path| freeQueuePath(alloc, path);
                 if (current.path) |cp| {
@@ -309,7 +336,9 @@ pub fn traverseWithEdgeReader(
             var next_entry_owned = true;
             errdefer if (next_entry_owned) next_entry.deinit(alloc);
             try queue.append(alloc, next_entry);
+            try work_budget.checkIntermediateStates(queue.items.len, work_budget_mod.default_max_intermediate_states);
             next_entry_owned = false;
+            try work_budget.consumeNode();
         }
     }
 
@@ -388,6 +417,7 @@ pub fn startNodeAdmitted(
         start_key,
         direction,
         admission,
+        null,
     );
 }
 
@@ -397,6 +427,7 @@ pub fn startNodeAdmittedWithEdgeReader(
     start_key: []const u8,
     direction: EdgeDirection,
     admission: NodeAdmission,
+    work_budget: ?*work_budget_mod.WorkBudget,
 ) !bool {
     const statically_external = admission.external_targets and direction == .in;
     const keys = [_][]const u8{start_key};
@@ -404,8 +435,15 @@ pub fn startNodeAdmittedWithEdgeReader(
     defer alloc.free(admitted);
     if (admitted[0] or statically_external or direction == .out) return admitted[0];
 
-    const incoming = try edge_reader.getEdges(alloc, start_key, .in);
+    const incoming = if (work_budget) |budget|
+        try getEdgesForTraversalBudget(alloc, edge_reader, start_key, .{
+            .direction = .in,
+            .work_budget = budget,
+        }, budget)
+    else
+        try edge_reader.getEdges(alloc, start_key, .in);
     defer edge_reader.freeEdges(alloc, incoming);
+    if (work_budget) |budget| try budget.consumeMaterializedEdges(incoming);
     for (incoming) |edge| {
         if (std.mem.eql(u8, edge.target, start_key) and
             (admission.external_targets or metadataTargetTable(edge.metadata) != null))
@@ -414,6 +452,35 @@ pub fn startNodeAdmittedWithEdgeReader(
         }
     }
     return false;
+}
+
+fn getEdgesForTraversalBudget(
+    alloc: Allocator,
+    edge_reader: anytype,
+    key: []const u8,
+    rules: TraversalRules,
+    work_budget: *work_budget_mod.WorkBudget,
+) ![]Edge {
+    if (comptime @hasDecl(@TypeOf(edge_reader), "getEdgesBoundedForTraversal")) {
+        return edge_reader.getEdgesBoundedForTraversal(
+            alloc,
+            key,
+            rules.edge_types,
+            rules.direction,
+            work_budget.edgeLimit(),
+            work_budget.edgeByteLimit(),
+        ) catch |err| {
+            const widened: anyerror = err;
+            if (widened == error.GraphExploredEdgesBudgetExceeded)
+                return work_budget.exhaust(.explored_edges, work_budget.max_edges);
+            if (widened == error.GraphExploredEdgeBytesBudgetExceeded)
+                return work_budget.exhaust(.explored_edge_bytes, work_budget.max_edge_bytes);
+            if (widened == error.QueryCandidateBudgetExceeded)
+                return work_budget.exhaust(.explored_edges, work_budget.max_edges);
+            return err;
+        };
+    }
+    return try edge_reader.getEdges(alloc, key, rules.direction);
 }
 
 fn shouldTraverseEdge(rules: *const TraversalRules, edge: *const Edge) bool {

@@ -25,6 +25,8 @@ const join_model = @import("../../api/join_model.zig");
 const query_api = @import("../../api/query.zig");
 const public_graph_query = @import("../../api/public_graph_query.zig");
 const graph_query_diagnostic = @import("../../api/graph_query_diagnostic.zig");
+const graph_path_weight_diagnostic = @import("../../graph/path_weight_diagnostic.zig");
+const graph_work_budget_diagnostic = @import("../../graph/work_budget_diagnostic.zig");
 const public_search_request = @import("../../api/public_search_request.zig");
 const public_text_query = @import("../../api/public_text_query.zig");
 const public_table_http = @import("../../api/public_table_http.zig");
@@ -2649,10 +2651,10 @@ pub const HttpHandler = struct {
         };
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch return null;
         defer raw_request.deinit();
-        if (raw_request.value == .object and
+        const has_graph_request = raw_request.value == .object and
             (raw_request.value.object.get("graph_queries") != null or
-                raw_request.value.object.get("graph_searches") != null))
-        {
+                raw_request.value.object.get("graph_searches") != null);
+        if (has_graph_request) {
             const unsupported_controls = [_][]const u8{
                 "aggregations",
                 "analyses",
@@ -2674,9 +2676,11 @@ pub const HttpHandler = struct {
             }
         }
         var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
-            .ignore_unknown_fields = true,
             .allocate = .alloc_always,
-        }) catch return null;
+        }) catch {
+            if (has_graph_request) return error.InvalidQueryRequest;
+            return null;
+        };
         defer parsed_request.deinit();
         const request = parsed_request.value;
         if (request.graph_queries == null and request.graph_searches == null) return null;
@@ -2700,7 +2704,10 @@ pub const HttpHandler = struct {
         }
 
         const started_ns = platform_time.monotonicNs();
-        const graph_queries = try public_graph_query.parseSupportedGraphQueriesAlloc(self.alloc, request);
+        const graph_queries = public_graph_query.parseSupportedGraphQueriesAlloc(self.alloc, request) catch |err| {
+            std.log.warn("serverless public graph request admission failed table={s} err={}", .{ table_name, err });
+            return err;
+        };
         defer public_graph_query.freeNamedGraphQueries(self.alloc, graph_queries);
 
         var req: db_types.SearchRequest = .{
@@ -2790,7 +2797,10 @@ pub const HttpHandler = struct {
             session.setCancellation(cancellation);
         }
 
-        const results = try self.executePublicGraphQueriesAlloc(&session, table_name, graph_queries, initial_sets.items);
+        const results = self.executePublicGraphQueriesAlloc(&session, table_name, graph_queries, initial_sets.items) catch |err| {
+            std.log.warn("serverless public graph request execution failed table={s} err={}", .{ table_name, err });
+            return err;
+        };
         defer {
             for (results) |*result| result.deinit(self.alloc);
             if (results.len > 0) self.alloc.free(results);
@@ -2803,13 +2813,16 @@ pub const HttpHandler = struct {
             .graph_results = results,
         };
 
-        var response = try query_api.encodeQueryResponses(
+        var response = query_api.encodeQueryResponses(
             self.alloc,
             table_name,
             req,
             .{ .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - started_ns, std.time.ns_per_ms)) },
             result,
-        );
+        ) catch |err| {
+            std.log.warn("serverless public graph response encoding failed table={s} err={}", .{ table_name, err });
+            return err;
+        };
         defer response.deinit(self.alloc);
         return try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, response.json);
     }
@@ -3122,7 +3135,10 @@ pub const HttpHandler = struct {
             graph_pattern_mod.default_max_distinct_identities,
             graph_pattern_mod.default_max_distinct_identity_bytes,
         );
-        var request_graph_read_budget = ServerlessGraphReadBudget{ .cancellation = session.cancellation };
+        var request_graph_read_budget = ServerlessGraphReadBudget{
+            .cancellation = session.cancellation,
+            .work_budget = &request_work_budget,
+        };
         var request_cache = PublicGraphRequestCache.init(self, session);
         defer request_cache.deinit();
 
@@ -3148,6 +3164,18 @@ pub const HttpHandler = struct {
                 &request_graph_read_budget,
                 &request_cache,
             ) catch |err| {
+                std.log.warn(
+                    "serverless public graph operation failed operation={s} mode={s} err={}",
+                    .{ named_query.name, graph_query_diagnostic.mode(named_query.query), err },
+                );
+                if (graph_path_weight_diagnostic.isDomainError(err)) {
+                    graph_path_weight_diagnostic.record(named_query.name, err);
+                }
+                if (err == error.GraphWorkBudgetExceeded) {
+                    if (request_work_budget.exhaustion()) |exhaustion| {
+                        graph_work_budget_diagnostic.record(named_query.name, named_query.query, exhaustion);
+                    }
+                }
                 if (graph_query_diagnostic.reasonForError(err)) |reason| {
                     graph_query_diagnostic.record(
                         named_query.name,
@@ -3179,10 +3207,10 @@ pub const HttpHandler = struct {
         request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
         return switch (named_query.query.query_type) {
-            .neighbors => try self.executePublicNeighborsQueryAlloc(source_table, named_query, available_sets, request_graph_read_budget, request_cache),
-            .traverse => try self.executePublicTraverseQueryAlloc(source_table, named_query, available_sets, request_graph_read_budget, request_cache),
-            .shortest_path => try self.executePublicShortestPathQueryAlloc(source_table, named_query, available_sets, request_graph_read_budget, request_cache),
-            .k_shortest_paths => try self.executePublicKShortestPathsQueryAlloc(source_table, named_query, available_sets, request_graph_read_budget, request_cache),
+            .neighbors => try self.executePublicNeighborsQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache),
+            .traverse => try self.executePublicTraverseQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache),
+            .shortest_path => try self.executePublicShortestPathQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache),
+            .k_shortest_paths => try self.executePublicKShortestPathsQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache),
             .pattern => try self.executePublicPatternQueryAlloc(
                 source_table,
                 named_query,
@@ -3200,12 +3228,13 @@ pub const HttpHandler = struct {
         source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
         request_graph_read_budget: *ServerlessGraphReadBudget,
         request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
         var effective = named_query;
         effective.query.params.max_depth = 1;
-        return try self.executePublicTraversalQueryAlloc(source_table, effective, available_sets, request_graph_read_budget, request_cache);
+        return try self.executePublicTraversalQueryAlloc(source_table, effective, available_sets, request_work_budget, request_graph_read_budget, request_cache);
     }
 
     fn executePublicTraverseQueryAlloc(
@@ -3213,10 +3242,11 @@ pub const HttpHandler = struct {
         source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
         request_graph_read_budget: *ServerlessGraphReadBudget,
         request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
-        return try self.executePublicTraversalQueryAlloc(source_table, named_query, available_sets, request_graph_read_budget, request_cache);
+        return try self.executePublicTraversalQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache);
     }
 
     fn executePublicTraversalQueryAlloc(
@@ -3224,6 +3254,7 @@ pub const HttpHandler = struct {
         source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
         request_graph_read_budget: *ServerlessGraphReadBudget,
         request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
@@ -3236,6 +3267,7 @@ pub const HttpHandler = struct {
             .alloc = self.alloc,
             .documents = request_cache,
             .cache = &request_cache.filter_cache,
+            .source_table = source_table,
         };
         var admission_ctx = ServerlessGraphAdmissionContext{
             .filter_ctx = &filter_ctx,
@@ -3285,6 +3317,7 @@ pub const HttpHandler = struct {
                 .deduplicate = named_query.query.params.deduplicate,
                 .include_paths = named_query.query.params.include_paths,
                 .node_admission = admission,
+                .work_budget = request_work_budget,
             });
             defer graph_traversal.freeOwnedResults(self.alloc, traversal_nodes);
             const traversal_overflow = bounded and traversal_nodes.len > remaining;
@@ -3319,7 +3352,7 @@ pub const HttpHandler = struct {
             for (owned_nodes) |*node| node.deinit(self.alloc);
             if (owned_nodes.len > 0) self.alloc.free(owned_nodes);
         }
-        const hits = try self.buildGraphNodeDocumentHitsAlloc(named_query.query, owned_nodes, request_cache);
+        const hits = try self.buildGraphNodeDocumentHitsAlloc(source_table, named_query.query, owned_nodes, request_cache);
         errdefer {
             for (hits) |*hit| hit.deinit(self.alloc);
             if (hits.len > 0) self.alloc.free(hits);
@@ -3338,10 +3371,11 @@ pub const HttpHandler = struct {
         source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
         request_graph_read_budget: *ServerlessGraphReadBudget,
         request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
-        return try self.executePublicPathsQueryAlloc(source_table, named_query, available_sets, request_graph_read_budget, request_cache, false);
+        return try self.executePublicPathsQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache, false);
     }
 
     fn executePublicKShortestPathsQueryAlloc(
@@ -3349,10 +3383,11 @@ pub const HttpHandler = struct {
         source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
         request_graph_read_budget: *ServerlessGraphReadBudget,
         request_cache: *PublicGraphRequestCache,
     ) !db_types.GraphSearchResult {
-        return try self.executePublicPathsQueryAlloc(source_table, named_query, available_sets, request_graph_read_budget, request_cache, true);
+        return try self.executePublicPathsQueryAlloc(source_table, named_query, available_sets, request_work_budget, request_graph_read_budget, request_cache, true);
     }
 
     fn executePublicPathsQueryAlloc(
@@ -3360,6 +3395,7 @@ pub const HttpHandler = struct {
         source_table: []const u8,
         named_query: db_types.NamedGraphQuery,
         available_sets: []const GraphResultSet,
+        request_work_budget: *graph_pattern_mod.WorkBudget,
         request_graph_read_budget: *ServerlessGraphReadBudget,
         request_cache: *PublicGraphRequestCache,
         multiple: bool,
@@ -3376,6 +3412,7 @@ pub const HttpHandler = struct {
             .alloc = self.alloc,
             .documents = request_cache,
             .cache = &request_cache.filter_cache,
+            .source_table = source_table,
         };
         var admission_ctx = ServerlessGraphAdmissionContext{
             .filter_ctx = &filter_ctx,
@@ -3393,6 +3430,7 @@ pub const HttpHandler = struct {
             .min_weight = named_query.query.params.min_weight,
             .max_weight = named_query.query.params.max_weight,
             .node_admission = admission,
+            .work_budget = request_work_budget,
         };
 
         var paths = std.ArrayListUnmanaged(db_types.GraphPath).empty;
@@ -3443,7 +3481,7 @@ pub const HttpHandler = struct {
         // Result identities exist independently of document hydration. This
         // keeps `$graph_results.<name>` composition stable when callers toggle
         // include_documents and mirrors the distributed path executor.
-        const hits = try self.buildGraphNodeDocumentHitsAlloc(named_query.query, nodes, request_cache);
+        const hits = try self.buildGraphNodeDocumentHitsAlloc(source_table, named_query.query, nodes, request_cache);
         errdefer {
             for (hits) |*hit| hit.deinit(self.alloc);
             if (hits.len > 0) self.alloc.free(hits);
@@ -3496,6 +3534,7 @@ pub const HttpHandler = struct {
             .alloc = self.alloc,
             .documents = request_cache,
             .cache = &request_cache.filter_cache,
+            .source_table = source_table,
         };
 
         const start_keys = if (conjunctive_pattern == null)
@@ -3662,7 +3701,7 @@ pub const HttpHandler = struct {
             if (matches.len > 0) self.alloc.free(matches);
         }
 
-        const hits = try self.buildPatternDocumentHitsAlloc(named_query.query, matches, request_cache);
+        const hits = try self.buildPatternDocumentHitsAlloc(source_table, named_query.query, matches, request_cache);
         errdefer {
             for (hits) |*hit| hit.deinit(self.alloc);
             if (hits.len > 0) self.alloc.free(hits);
@@ -3756,6 +3795,7 @@ pub const HttpHandler = struct {
 
     fn buildPatternDocumentHitsAlloc(
         self: *HttpHandler,
+        source_table: []const u8,
         query: graph_query_mod.GraphQuery,
         matches: []const db_types.GraphPatternMatch,
         request_cache: *PublicGraphRequestCache,
@@ -3784,9 +3824,14 @@ pub const HttpHandler = struct {
                 // This request cache owns one source-table snapshot. Fail
                 // closed when document hydration would require a different
                 // snapshot rather than returning a partial response.
-                if (binding.node.table != null) {
-                    if (query.include_documents) return error.UnsupportedQueryRequest;
-                    continue;
+                if (binding.node.table) |table| {
+                    if (!std.mem.eql(u8, table, source_table)) {
+                        if (query.include_documents) return error.UnsupportedQueryRequest;
+                        continue;
+                    }
+                    // A same-table qualifier is part of the canonical graph
+                    // identity, but it still belongs to this exact published
+                    // snapshot and is safe to hydrate.
                 }
                 if (seen.contains(binding.node.key)) continue;
                 try seen.put(self.alloc, try self.alloc.dupe(u8, binding.node.key), {});
@@ -3813,6 +3858,7 @@ pub const HttpHandler = struct {
 
     fn buildGraphNodeDocumentHitsAlloc(
         self: *HttpHandler,
+        source_table: []const u8,
         query: graph_query_mod.GraphQuery,
         nodes: []const graph_query_mod.GraphResultNode,
         request_cache: *PublicGraphRequestCache,
@@ -3829,10 +3875,12 @@ pub const HttpHandler = struct {
             null;
         defer freeFields(self.alloc, projected_fields);
         for (nodes) |node| {
-            // This request cache owns one source-table snapshot. Qualified
-            // nodes remain valid graph results, but their documents cannot be
-            // hydrated safely here.
-            if (node.table != null) return error.UnsupportedQueryRequest;
+            // This request cache owns one source-table snapshot. Same-table
+            // qualifiers are safe; external qualified nodes cannot be
+            // hydrated from this snapshot.
+            if (node.table) |table| {
+                if (!std.mem.eql(u8, table, source_table)) return error.UnsupportedQueryRequest;
+            }
             const stored_data = if (try request_cache.documentBody(node.key)) |body|
                 if (query.include_all_fields)
                     try self.alloc.dupe(u8, body)
@@ -5100,6 +5148,7 @@ const PatternDocumentFilterContext = struct {
     alloc: Allocator,
     documents: *PublicGraphRequestCache,
     cache: *db_query_graph.PreparedPatternFilterCache,
+    source_table: []const u8,
 };
 
 const ServerlessGraphAdmissionContext = struct {
@@ -5229,12 +5278,17 @@ const public_graph_anchor_page_size: usize = 256;
 const ServerlessGraphReadBudget = struct {
     cancellation: CancellationToken,
     edges_scanned: usize = 0,
+    work_budget: ?*graph_pattern_mod.WorkBudget = null,
 
     fn admitEdges(self: *ServerlessGraphReadBudget, count: usize) !void {
-        self.edges_scanned = std.math.add(usize, self.edges_scanned, count) catch
+        self.edges_scanned = std.math.add(usize, self.edges_scanned, count) catch {
+            if (self.work_budget) |budget| return budget.exhaust(.explored_edges, budget.max_edges);
             return error.GraphTraversalQueryBudgetExceeded;
-        if (self.edges_scanned > public_graph_max_edges_scanned)
+        };
+        if (self.edges_scanned > public_graph_max_edges_scanned) {
+            if (self.work_budget) |budget| return budget.exhaust(.explored_edges, budget.max_edges);
             return error.GraphTraversalQueryBudgetExceeded;
+        }
         try self.cancellation.check();
     }
 };
@@ -5250,6 +5304,18 @@ const ServerlessTraversalEdgeReader = struct {
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
         return try allocPublicSegmentEdges(alloc, self.cached, self.budget, null, key, &.{}, direction, true);
+    }
+
+    pub fn getEdgesBoundedForTraversal(
+        self: @This(),
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_bytes: usize,
+    ) ![]graph_mod.Edge {
+        return try allocPublicSegmentEdgesBounded(alloc, self.cached, self.budget, null, key, edge_types, direction, true, max_edges, max_bytes);
     }
 
     pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
@@ -5272,6 +5338,18 @@ const ServerlessPathEdgeReader = struct {
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
         return try allocPublicSegmentEdges(alloc, self.cached, self.budget, null, key, &.{}, direction, false);
+    }
+
+    pub fn getEdgesBoundedForPath(
+        self: @This(),
+        alloc: Allocator,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+        max_edges: usize,
+        max_bytes: usize,
+    ) ![]graph_mod.Edge {
+        return try allocPublicSegmentEdgesBounded(alloc, self.cached, self.budget, null, key, edge_types, direction, false, max_edges, max_bytes);
     }
 
     pub fn freeEdges(_: @This(), alloc: Allocator, edges: []graph_mod.Edge) void {
@@ -5644,7 +5722,10 @@ fn publishedPatternNodeFilterEvaluator(ctx: ?*anyopaque, node: graph_node_identi
     const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
     if (filter.filter_prefix.len > 0 and !std.mem.startsWith(u8, node.key, filter.filter_prefix)) return false;
     if (filter.filter_query_json == null) return true;
-    if (node.table != null) return error.GraphExternalAliasDocumentFilterUnsupported;
+    if (node.table) |table| {
+        if (!std.mem.eql(u8, table, active.source_table))
+            return error.GraphExternalAliasDocumentFilterUnsupported;
+    }
     const body = try active.documents.documentBody(node.key) orelse return false;
     const prepared = try active.cache.getOrPrepare(filter.filter_query_json.?);
     return try prepared.matchesStored(active.alloc, node.key, body);
@@ -5659,7 +5740,10 @@ fn serverlessGraphNodeAdmission(
     const admitted = try alloc.alloc(bool, nodes.len);
     errdefer alloc.free(admitted);
     for (nodes, 0..) |node, i| {
-        admitted[i] = !node.external and node.table == null and try publishedPatternNodeFilterEvaluator(
+        admitted[i] = (!node.external or if (node.table) |table|
+            std.mem.eql(u8, table, active.filter_ctx.source_table)
+        else
+            true) and try publishedPatternNodeFilterEvaluator(
             @ptrCast(active.filter_ctx),
             .{ .table = node.table, .key = node.key },
             active.filter,
@@ -10908,6 +10992,12 @@ test "serverless public graph query rejects exact sort controls" {
         "{\"graph_queries\":{\"related\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"max_depth\":1}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
         .none,
     ));
+    try std.testing.expectError(error.InvalidQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_queries\":{\"related\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"max_depth\":1}}},\"limti\":10}",
+        .none,
+    ));
 }
 
 test "serverless public graph reader shares weighted traversal and k shortest semantics" {
@@ -11158,6 +11248,7 @@ test "serverless conjunctive anchors are enumerated in borrowed bounded pages" {
         .alloc = std.testing.allocator,
         .documents = undefined,
         .cache = undefined,
+        .source_table = "docs",
     };
     var cursor: usize = 0;
     var buffer: [2][]const u8 = undefined;

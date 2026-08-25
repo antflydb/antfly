@@ -52,7 +52,7 @@ pub fn mode(query: graph_query.GraphQuery) []const u8 {
         .traverse => "traverse",
         .shortest_path => "shortest_path",
         .k_shortest_paths => "k_shortest_paths",
-        .pattern => if (query.match_pattern != null and !query.legacy_response) "match" else "pattern",
+        .pattern => if (query.match_pattern != null) "match" else "pattern",
     };
 }
 

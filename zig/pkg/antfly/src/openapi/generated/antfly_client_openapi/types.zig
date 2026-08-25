@@ -4900,7 +4900,7 @@ pub const GraphKeyNodeSelector = struct {
 };
 
 pub const GraphMatch = struct {
-    /// Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. Filters on this alias, including row-level authorization filters, must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
+    /// Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on this alias must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
     anchor: []const u8,
     /// Aliases are limited to 128 Unicode code points.
     nodes: std.json.ArrayHashMap(GraphMatchNode),
@@ -5034,14 +5034,17 @@ pub const GraphOptionalMatch = struct {
     where: ?GraphWhereExpression = null,
 };
 
-/// An ordered canonical graph path with table-qualified node identities.
+/// An ordered canonical graph path with table-qualified node identities and a self-describing ranking score.
 pub const GraphPath = struct {
     /// Ordered node identities. Table is omitted for nodes in the query table.
     nodes: []const GraphPathEndpoint,
     /// Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
     edges: []const GraphPathEdge,
-    /// Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
-    total_weight: f64,
+    weight_mode: PathWeightMode,
+    /// Sum of raw edge weights along the path, independent of the selected ranking objective.
+    weight_sum: f64,
+    /// The user-facing value optimized by weight_mode; edge count for min_hops, weight_sum for min_weight, and the raw edge-weight product for max_weight.
+    objective_value: f64,
     length: i64,
 };
 

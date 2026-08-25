@@ -1111,6 +1111,7 @@ pub const DBCore = struct {
         min_weight: ?f64,
         max_weight: ?f64,
         node_admission: ?NodeAdmission,
+        work_budget: ?*graph_pattern_mod.WorkBudget,
     ) !?paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findShortestPath(alloc, &entry.index, source, target, .{
@@ -1121,6 +1122,7 @@ pub const DBCore = struct {
             .min_weight = min_weight,
             .max_weight = max_weight,
             .node_admission = node_admission,
+            .work_budget = work_budget,
         });
     }
 
@@ -1138,6 +1140,7 @@ pub const DBCore = struct {
         min_weight: ?f64,
         max_weight: ?f64,
         node_admission: ?NodeAdmission,
+        work_budget: ?*graph_pattern_mod.WorkBudget,
     ) ![]paths_mod.Path {
         const entry = self.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
         return try paths_mod.findKShortestPaths(alloc, &entry.index, source, target, k, .{
@@ -1148,6 +1151,7 @@ pub const DBCore = struct {
             .min_weight = min_weight,
             .max_weight = max_weight,
             .node_admission = node_admission,
+            .work_budget = work_budget,
         });
     }
 

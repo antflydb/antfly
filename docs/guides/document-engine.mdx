@@ -292,17 +292,19 @@ predictable and let the matcher compile projection membership once per operation
 Top-level full-text, semantic, and filter clauses shape the retrieval result only;
 they do not implicitly narrow `MATCH`. Put source constraints on the node named by
 `match.anchor`. Row-level authorization still applies to every anchor and reached
-node. Because exact anchors are cursor-scanned in `_id` order, fields used by the
-anchor or authorization filters must have native index coverage. Antfly returns
+node. An `ids` filter, or a disjunction containing only `ids` filters, resolves
+through the primary identity index and needs no secondary index. Other fields
+used by anchor or authorization filters must have native index coverage because
+exact anchors are cursor-scanned in `_id` order. Antfly returns
 `graph_anchor_filter_requires_index` when it cannot prove that complete scan;
 index the referenced fields rather than relying on stored-source fallback.
 Graph document filters address stored values with RFC 6901 JSON Pointers. For
 example, use `/kind` for a top-level field and `/author/name` for a nested field;
 escape `~` as `~0` and `/` within a key as `~1`.
 
-MATCH and compatibility-pattern expansion work is budgeted across the whole
-request, not once per named operation. Traversal and path operations retain
-their explicit per-operation depth and result bounds.
+All graph expansion work is budgeted across the whole request, including every
+named operation and every K-shortest-path spur search. Traversal and path
+operations also retain their explicit per-operation depth and result bounds.
 If Antfly cannot enumerate the complete authorized anchor relation or exhausts
 that budget, the request fails instead of returning a partial count.
 Exact `count(distinct alias)` sets also share a request-scoped identity and byte

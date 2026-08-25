@@ -1656,9 +1656,14 @@ pub const HierarchyChildrenRequest = struct {
     level: HierarchyGroupLevel = .unit,
 };
 
+/// Response compatibility belongs to the request envelope, not the graph
+/// execution IR. Executors therefore see one canonical GraphQuery shape.
+pub const GraphResponseFormat = enum { canonical, legacy };
+
 pub const NamedGraphQuery = struct {
     name: []const u8,
     query: graph_query_mod.GraphQuery,
+    response_format: GraphResponseFormat = .canonical,
 };
 
 pub const NamedFullTextQuery = struct {

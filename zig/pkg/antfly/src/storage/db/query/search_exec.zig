@@ -10940,6 +10940,44 @@ fn collectExactDocIds(
     };
 }
 
+/// Return an owned, de-duplicated identity set only when the complete stored
+/// predicate is exactly an ID union. This is intentionally narrower than
+/// `collectPositiveDocIdSuperset`: callers use it to bypass secondary-index
+/// planning without leaving a residual predicate that could be evaluated
+/// incompletely.
+pub fn exactStructuredFilterDocIdsAlloc(
+    alloc: Allocator,
+    filter_query_json: []const u8,
+) !?[]const []const u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+    const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch
+        return null;
+    if (patternFilterValueHasRole(parsed.value)) return null;
+    const compiled = (try compilePatternFilterOptional(arena_alloc, parsed.value)) orelse return null;
+    var ids = std.ArrayListUnmanaged([]const u8).empty;
+    defer ids.deinit(arena_alloc);
+    if (!(try collectExactDocIds(arena_alloc, compiled, &ids))) return null;
+    return try dupeDocIdSliceAlloc(alloc, ids.items);
+}
+
+test "exact structured ID filters resolve without a secondary index" {
+    const alloc = std.testing.allocator;
+    const ids = (try exactStructuredFilterDocIdsAlloc(alloc,
+        \\{"disjuncts":[{"doc_id":["doc:b","doc:a"]},{"doc_id":["doc:a","doc:c"]}]}
+    )).?;
+    defer freeDocIdSlice(alloc, ids);
+    try std.testing.expectEqual(@as(usize, 3), ids.len);
+    try std.testing.expectEqualStrings("doc:b", ids[0]);
+    try std.testing.expectEqualStrings("doc:a", ids[1]);
+    try std.testing.expectEqualStrings("doc:c", ids[2]);
+
+    try std.testing.expect((try exactStructuredFilterDocIdsAlloc(alloc,
+        \\{"conjuncts":[{"doc_id":["doc:a"]},{"term":{"path":"/tenant","term":"acme"}}]}
+    )) == null);
+}
+
 fn collectAllExactDocIds(
     alloc: Allocator,
     items: []const graph_exec.CompiledPatternFilter,

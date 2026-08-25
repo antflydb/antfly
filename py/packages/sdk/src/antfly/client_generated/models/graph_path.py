@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.path_weight_mode import PathWeightMode
+
 if TYPE_CHECKING:
     from ..models.graph_path_edge import GraphPathEdge
     from ..models.graph_path_endpoint import GraphPathEndpoint
@@ -15,19 +17,26 @@ T = TypeVar("T", bound="GraphPath")
 
 @_attrs_define
 class GraphPath:
-    """An ordered canonical graph path with table-qualified node identities.
+    """An ordered canonical graph path with table-qualified node identities and a self-describing ranking score.
 
     Attributes:
         nodes (list[GraphPathEndpoint]): Ordered node identities. Table is omitted for nodes in the query table.
         edges (list[GraphPathEdge]): Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
-        total_weight (float): Sum of raw edge weights along the path. Path ordering still follows the selected weight
-            mode.
+        weight_mode (PathWeightMode): Path weighting algorithm for pathfinding:
+            - min_hops: Minimize number of edges
+            - min_weight: Minimize sum of finite non-negative edge weights
+            - max_weight: Maximize product of finite edge weights in [0,1]
+        weight_sum (float): Sum of raw edge weights along the path, independent of the selected ranking objective.
+        objective_value (float): The user-facing value optimized by weight_mode; edge count for min_hops, weight_sum for
+            min_weight, and the raw edge-weight product for max_weight.
         length (int):
     """
 
     nodes: list[GraphPathEndpoint]
     edges: list[GraphPathEdge]
-    total_weight: float
+    weight_mode: PathWeightMode
+    weight_sum: float
+    objective_value: float
     length: int
 
     def to_dict(self) -> dict[str, Any]:
@@ -41,7 +50,11 @@ class GraphPath:
             edges_item = edges_item_data.to_dict()
             edges.append(edges_item)
 
-        total_weight = self.total_weight
+        weight_mode = self.weight_mode.value
+
+        weight_sum = self.weight_sum
+
+        objective_value = self.objective_value
 
         length = self.length
 
@@ -51,7 +64,9 @@ class GraphPath:
             {
                 "nodes": nodes,
                 "edges": edges,
-                "total_weight": total_weight,
+                "weight_mode": weight_mode,
+                "weight_sum": weight_sum,
+                "objective_value": objective_value,
                 "length": length,
             }
         )
@@ -78,14 +93,20 @@ class GraphPath:
 
             edges.append(edges_item)
 
-        total_weight = d.pop("total_weight")
+        weight_mode = PathWeightMode(d.pop("weight_mode"))
+
+        weight_sum = d.pop("weight_sum")
+
+        objective_value = d.pop("objective_value")
 
         length = d.pop("length")
 
         graph_path = cls(
             nodes=nodes,
             edges=edges,
-            total_weight=total_weight,
+            weight_mode=weight_mode,
+            weight_sum=weight_sum,
+            objective_value=objective_value,
             length=length,
         )
 

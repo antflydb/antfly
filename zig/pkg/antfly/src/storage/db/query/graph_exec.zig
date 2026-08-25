@@ -67,9 +67,9 @@ pub const GraphQueryExecutor = struct {
     ) anyerror!doc_set.ResolvedDocSet = null,
 };
 
-/// MATCH expansion and exact-distinct state are resources of the enclosing
-/// graph request. Every local execution path receives the same pair so named
-/// operations cannot multiply the documented limits.
+/// Graph expansion and exact-distinct state are resources of the enclosing
+/// request. Every local execution path receives the same pair so named
+/// operations and K-path spur searches cannot multiply documented limits.
 pub const RequestGraphBudgets = struct {
     work: *graph_pattern_mod.WorkBudget,
     distinct: *graph_pattern_mod.DistinctBudget,
@@ -143,6 +143,7 @@ pub const NonPatternQueryExecutor = struct {
         named: *const types.NamedGraphQuery,
         source: []const u8,
         target: []const u8,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) anyerror!?types.GraphPath,
     find_k_shortest_paths: *const fn (
         ctx: ?*anyopaque,
@@ -150,6 +151,7 @@ pub const NonPatternQueryExecutor = struct {
         named: *const types.NamedGraphQuery,
         source: []const u8,
         target: []const u8,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) anyerror![]types.GraphPath,
     execute_graph_query: *const fn (
         ctx: ?*anyopaque,
@@ -157,6 +159,7 @@ pub const NonPatternQueryExecutor = struct {
         named: *const types.NamedGraphQuery,
         start_key_refs: []const []const u8,
         target_keys: [][]u8,
+        work_budget: *graph_pattern_mod.WorkBudget,
     ) anyerror!graph_query_mod.GraphQueryResult,
     load_projected_document: *const fn (
         ctx: ?*anyopaque,
@@ -1449,7 +1452,7 @@ fn patternQueryNeedsHits(req: types.SearchRequest, named: *const types.NamedGrap
     // Canonical MATCH dependencies always select an explicit binding and are
     // resolved directly from GraphPatternMatch rows. Only the deprecated
     // unbound compatibility format still depends on flattened SearchHits.
-    if (!named.query.legacy_response) return false;
+    if (named.response_format != .legacy) return false;
     for (req.graph_queries) |candidate| {
         if (selectorReferencesGraphResult(candidate.query.start_nodes, named.name)) return true;
         if (candidate.query.target_nodes) |selector| {
@@ -1475,11 +1478,11 @@ fn selectorReferencesGraphResult(selector: graph_query_mod.NodeSelector, name: [
 test "pattern hit shaping is lazy but preserves graph dependencies" {
     const seed = types.NamedGraphQuery{
         .name = "seed",
+        .response_format = .legacy,
         .query = .{
             .query_type = .pattern,
             .index_name = "graph",
             .start_nodes = .{ .keys = &.{"doc:a"} },
-            .legacy_response = true,
             .pattern = &.{ .{ .alias = "a" }, .{ .alias = "b" } },
         },
     };
@@ -1538,6 +1541,32 @@ pub fn executeSingleNonPatternQueryWithSets(
     named_sets: []const NamedResultSet,
     executor: NonPatternQueryExecutor,
 ) !types.GraphSearchResult {
+    var work_budget = graph_pattern_mod.WorkBudget.init(
+        graph_pattern_mod.default_max_explored_nodes,
+        graph_pattern_mod.default_max_explored_edges,
+    );
+    var distinct_budget = graph_pattern_mod.DistinctBudget.init(
+        graph_pattern_mod.default_max_distinct_identities,
+        graph_pattern_mod.default_max_distinct_identity_bytes,
+    );
+    return try executeSingleNonPatternQueryWithSetsWithBudgets(
+        alloc,
+        req,
+        named,
+        named_sets,
+        executor,
+        .{ .work = &work_budget, .distinct = &distinct_budget },
+    );
+}
+
+pub fn executeSingleNonPatternQueryWithSetsWithBudgets(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    named: *const types.NamedGraphQuery,
+    named_sets: []const NamedResultSet,
+    executor: NonPatternQueryExecutor,
+    budgets: RequestGraphBudgets,
+) !types.GraphSearchResult {
     var start_keys = try resolveGraphSelectorFromSets(alloc, named.query.start_nodes, named_sets, .{
         .ctx = executor.ctx,
         .func = executor.resolve_doc_set_doc_ids,
@@ -1577,6 +1606,7 @@ pub fn executeSingleNonPatternQueryWithSets(
                 named,
                 start_keys[0],
                 target_keys[0],
+                budgets.work,
             );
             errdefer if (path) |owned| paths_mod.freePath(alloc, owned);
             if (!executor.predicate_aware and path != null and searchRequestHasGraphPredicates(req) and
@@ -1604,6 +1634,7 @@ pub fn executeSingleNonPatternQueryWithSets(
                 named,
                 start_keys[0],
                 target_keys[0],
+                budgets.work,
             );
             errdefer freeOwnedGraphPaths(alloc, paths);
             if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -1630,6 +1661,7 @@ pub fn executeSingleNonPatternQueryWithSets(
         &effective_named,
         start_key_refs,
         target_keys,
+        budgets.work,
     );
     errdefer graph_result.deinit(alloc);
     if (!executor.predicate_aware and searchRequestHasGraphPredicates(req)) {
@@ -4966,6 +4998,7 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             _: *const types.NamedGraphQuery,
             _: []const u8,
             _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!?types.GraphPath {
             return null;
         }
@@ -4976,6 +5009,7 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             _: *const types.NamedGraphQuery,
             _: []const u8,
             _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror![]types.GraphPath {
             return try alloc_inner.alloc(types.GraphPath, 0);
         }
@@ -4986,6 +5020,7 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
             named: *const types.NamedGraphQuery,
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!graph_query_mod.GraphQueryResult {
             try std.testing.expectEqualStrings("tree_search", named.name);
             try std.testing.expectEqual(@as(usize, 1), start_key_refs.len);
@@ -5159,6 +5194,7 @@ test "stateful path results materialize endpoint nodes for result refs" {
             _: *const types.NamedGraphQuery,
             source: []const u8,
             target: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!?types.GraphPath {
             return try makePath(alloc_inner, source, target);
         }
@@ -5169,6 +5205,7 @@ test "stateful path results materialize endpoint nodes for result refs" {
             _: *const types.NamedGraphQuery,
             source: []const u8,
             target: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror![]types.GraphPath {
             const paths = try alloc_inner.alloc(types.GraphPath, 1);
             errdefer alloc_inner.free(paths);
@@ -5182,6 +5219,7 @@ test "stateful path results materialize endpoint nodes for result refs" {
             _: *const types.NamedGraphQuery,
             _: []const []const u8,
             _: [][]u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!graph_query_mod.GraphQueryResult {
             return error.TestUnexpectedResult;
         }
@@ -5890,6 +5928,7 @@ test "executeGraphQueries projects base hits to resolved doc-set for unbounded s
             _: *const types.NamedGraphQuery,
             _: []const u8,
             _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -5900,6 +5939,7 @@ test "executeGraphQueries projects base hits to resolved doc-set for unbounded s
             _: *const types.NamedGraphQuery,
             _: []const u8,
             _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -5910,6 +5950,7 @@ test "executeGraphQueries projects base hits to resolved doc-set for unbounded s
             named: *const types.NamedGraphQuery,
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -6029,6 +6070,7 @@ test "executeGraphQueries supports limited embeddings result_ref without base do
             _: *const types.NamedGraphQuery,
             _: []const u8,
             _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6039,6 +6081,7 @@ test "executeGraphQueries supports limited embeddings result_ref without base do
             _: *const types.NamedGraphQuery,
             _: []const u8,
             _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6049,6 +6092,7 @@ test "executeGraphQueries supports limited embeddings result_ref without base do
             _: *const types.NamedGraphQuery,
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -6189,6 +6233,7 @@ test "graph result_ref uses resolved doc-set for unbounded selectors" {
             _: *const types.NamedGraphQuery,
             _: []const u8,
             _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6199,6 +6244,7 @@ test "graph result_ref uses resolved doc-set for unbounded selectors" {
             _: *const types.NamedGraphQuery,
             _: []const u8,
             _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6209,6 +6255,7 @@ test "graph result_ref uses resolved doc-set for unbounded selectors" {
             named: *const types.NamedGraphQuery,
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;
@@ -6498,6 +6545,7 @@ test "graph result_ref with limit preserves hit order" {
             _: *const types.NamedGraphQuery,
             _: []const u8,
             _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!?types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6508,6 +6556,7 @@ test "graph result_ref with limit preserves hit order" {
             _: *const types.NamedGraphQuery,
             _: []const u8,
             _: []const u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror![]types.GraphPath {
             return error.TestUnexpectedResult;
         }
@@ -6518,6 +6567,7 @@ test "graph result_ref with limit preserves hit order" {
             _: *const types.NamedGraphQuery,
             start_key_refs: []const []const u8,
             target_keys: [][]u8,
+            _: *graph_pattern_mod.WorkBudget,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             self.projected = true;

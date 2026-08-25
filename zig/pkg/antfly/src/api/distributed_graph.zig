@@ -1638,6 +1638,7 @@ fn executeSingleCrossRange(
             graph_query,
             consistency,
             &admission,
+            request_work_budget,
         ),
         .shortest_path => try executeDistributedShortestPath(
             alloc,
@@ -1650,6 +1651,7 @@ fn executeSingleCrossRange(
             graph_query,
             consistency,
             &admission,
+            request_work_budget,
         ),
         .k_shortest_paths => try executeDistributedKShortestPaths(
             alloc,
@@ -1662,6 +1664,7 @@ fn executeSingleCrossRange(
             graph_query,
             consistency,
             &admission,
+            request_work_budget,
         ),
         .pattern => try executeDistributedPattern(
             alloc,
@@ -2743,6 +2746,7 @@ fn executeDistributedTraverse(
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
 ) !db_mod.types.GraphSearchResult {
     const include_paths = graph_query.query.params.include_paths;
     const result_limit = graph_query.query.params.max_results;
@@ -2773,6 +2777,8 @@ fn executeDistributedTraverse(
     var frontier = try resolveStartFrontier(alloc, &state, table_name, req, base_result, prior_results, graph_query.query.start_nodes, include_paths);
     defer freeFrontier(alloc, frontier);
     frontier = try retainAdmittedFrontier(alloc, admission, frontier);
+    try request_work_budget.consumeNodes(frontier.len);
+    try request_work_budget.checkIntermediateStates(frontier.len, graph_pattern_mod.default_max_intermediate_states);
 
     for (frontier) |item| {
         _ = try state.seen.putIfAbsent(
@@ -2823,6 +2829,7 @@ fn executeDistributedTraverse(
 
                     var step_result = try worker.executeGraphExpand(alloc, entry.key_ptr.group_id, batch_table, step_req, consistency);
                     defer step_result.deinit(alloc);
+                    try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
 
                     const admitted = try graphExpansionNodeAdmissionMaskAlloc(
                         alloc,
@@ -2869,6 +2876,7 @@ fn executeDistributedTraverse(
 
                             if (merged_node.depth < max_depth) {
                                 try next_frontier.append(alloc, try frontierFromState(alloc, &state, merged_node, path_state_id));
+                                try request_work_budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                             }
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
@@ -2905,6 +2913,7 @@ fn executeDistributedTraverse(
 
                 for (slots, batch_entries) |slot, batch_entry| {
                     const step_result = slot.result.?;
+                    try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
                     const admitted = try graphExpansionNodeAdmissionMaskAlloc(
                         alloc,
                         admission,
@@ -2950,6 +2959,7 @@ fn executeDistributedTraverse(
 
                             if (merged_node.depth < max_depth) {
                                 try next_frontier.append(alloc, try frontierFromState(alloc, &state, merged_node, path_state_id));
+                                try request_work_budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                             }
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
@@ -2978,6 +2988,7 @@ fn executeDistributedTraverse(
 
                 var step_result = try worker.executeGraphExpand(alloc, entry.key_ptr.group_id, batch_table, step_req, consistency);
                 defer step_result.deinit(alloc);
+                try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
 
                 const admitted = try graphExpansionNodeAdmissionMaskAlloc(
                     alloc,
@@ -3024,6 +3035,7 @@ fn executeDistributedTraverse(
 
                         if (merged_node.depth < max_depth) {
                             try next_frontier.append(alloc, try frontierFromState(alloc, &state, merged_node, path_state_id));
+                            try request_work_budget.checkIntermediateStates(next_frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
                         }
                         if (return_node) {
                             try state.nodes.append(alloc, merged_node);
@@ -3096,8 +3108,9 @@ fn executeDistributedShortestPath(
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
 ) !db_mod.types.GraphSearchResult {
-    var path_result = try findDistributedShortestPath(alloc, catalog, worker, table_name, req, base_result, prior_results, graph_query, consistency, admission, null, null, null);
+    var path_result = try findDistributedShortestPath(alloc, catalog, worker, table_name, req, base_result, prior_results, graph_query, consistency, admission, request_work_budget, null, null, null);
     defer if (path_result) |*result| result.deinit(alloc);
 
     const nodes = if (path_result) |result| blk: {
@@ -3152,6 +3165,7 @@ fn executeDistributedKShortestPaths(
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
 ) !db_mod.types.GraphSearchResult {
     const start_nodes = try resolveSelectorNodes(
         alloc,
@@ -3188,7 +3202,7 @@ fn executeDistributedKShortestPaths(
         seen_paths.deinit(alloc);
     }
 
-    const first = try findDistributedShortestPath(alloc, catalog, worker, table_name, req, base_result, prior_results, graph_query, consistency, admission, null, null, null);
+    const first = try findDistributedShortestPath(alloc, catalog, worker, table_name, req, base_result, prior_results, graph_query, consistency, admission, request_work_budget, null, null, null);
     if (first == null) {
         return .{
             .name = try alloc.dupe(u8, graph_query.name),
@@ -3293,6 +3307,7 @@ fn executeDistributedKShortestPaths(
                 spur_query,
                 consistency,
                 admission,
+                request_work_budget,
                 graphPathNodeTable(prev_path.*, spur_idx),
                 &excluded_nodes,
                 &excluded_edges,
@@ -3399,6 +3414,7 @@ fn findDistributedShortestPath(
     graph_query: db_mod.types.NamedGraphQuery,
     consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
+    request_work_budget: *graph_pattern_mod.WorkBudget,
     start_table_override: ?[]const u8,
     excluded_nodes: ?*graph_node_identity.Map(void),
     excluded_edges: ?*const std.StringHashMapUnmanaged(void),
@@ -3418,7 +3434,7 @@ fn findDistributedShortestPath(
     );
     defer target_set.deinit(alloc);
 
-    var frontier = std.ArrayListUnmanaged(FrontierState).empty;
+    var frontier = std.PriorityQueue(FrontierState, void, frontierStateOrder).initContext({});
     defer {
         for (frontier.items) |*item| item.deinit(alloc);
         frontier.deinit(alloc);
@@ -3450,7 +3466,9 @@ fn findDistributedShortestPath(
             item.path_state_id,
         );
         errdefer owned_item.deinit(alloc);
-        try frontier.append(alloc, owned_item);
+        try frontier.push(alloc, owned_item);
+        try request_work_budget.consumeNode();
+        try request_work_budget.checkIntermediateStates(frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
         _ = try best_cost.recordIfPareto(
             alloc,
             .{ .table = item.table, .key = item.key },
@@ -3459,9 +3477,8 @@ fn findDistributedShortestPath(
         );
     }
 
-    while (frontier.items.len > 0) {
-        const best_index = popBestFrontierIndex(frontier.items);
-        var item = frontier.swapRemove(best_index);
+    while (frontier.pop()) |popped| {
+        var item = popped;
         defer item.deinit(alloc);
 
         const item_ref = graph_node_identity.Ref{ .table = item.table, .key = item.key };
@@ -3506,6 +3523,7 @@ fn findDistributedShortestPath(
 
         var step_result = try worker.executeGraphExpand(alloc, group_id, expansion_table, step_req, consistency);
         defer step_result.deinit(alloc);
+        try consumeDistributedExpansionWork(request_work_budget, step_result.expansions);
 
         if (step_result.expansions.len == 0) continue;
         const step_graph = step_result.expansions[0].graph_result;
@@ -3556,7 +3574,8 @@ fn findDistributedShortestPath(
                 path_state_id,
             );
             errdefer next_item.deinit(alloc);
-            try frontier.append(alloc, next_item);
+            try frontier.push(alloc, next_item);
+            try request_work_budget.checkIntermediateStates(frontier.items.len, graph_pattern_mod.default_max_intermediate_states);
         }
     }
 
@@ -4609,17 +4628,52 @@ pub fn parseGraphEdgesResponse(alloc: std.mem.Allocator, body: []const u8) !Grap
     return .{ .edges = edges };
 }
 
-fn popBestFrontierIndex(frontier: []const FrontierState) usize {
-    var best_index: usize = 0;
-    var i: usize = 1;
-    while (i < frontier.len) : (i += 1) {
-        if (frontier[i].cost < frontier[best_index].cost) {
-            best_index = i;
-        } else if (frontier[i].cost == frontier[best_index].cost and frontier[i].depth < frontier[best_index].depth) {
-            best_index = i;
+/// Charge coordinator-side work from the complete fan-out response, before
+/// admission or deduplication can hide it. This keeps rejected candidates and
+/// every Yen spur search inside the same request-owned budget.
+fn consumeDistributedExpansionWork(
+    budget: *graph_pattern_mod.WorkBudget,
+    expansions: []const GraphExpansion,
+) !void {
+    var node_count: usize = 0;
+    var owned_bytes: usize = 0;
+    for (expansions) |expansion| {
+        for (expansion.graph_result.nodes) |node| {
+            node_count = std.math.add(usize, node_count, 1) catch
+                return budget.exhaust(.explored_nodes, graph_pattern_mod.default_max_explored_nodes);
+            owned_bytes = std.math.add(usize, owned_bytes, @sizeOf(graph_query_mod.GraphResultNode)) catch
+                return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+            owned_bytes = std.math.add(usize, owned_bytes, node.key.len) catch
+                return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+            if (node.table) |table| {
+                owned_bytes = std.math.add(usize, owned_bytes, table.len) catch
+                    return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+            }
+            if (node.path_edges) |edges| {
+                for (edges) |edge| {
+                    owned_bytes = std.math.add(usize, owned_bytes, @sizeOf(graph_query_mod.PathEdgeInfo)) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                    owned_bytes = std.math.add(usize, owned_bytes, edge.source.len) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                    owned_bytes = std.math.add(usize, owned_bytes, edge.target.len) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                    owned_bytes = std.math.add(usize, owned_bytes, edge.edge_type.len) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                    owned_bytes = std.math.add(usize, owned_bytes, edge.metadata.len) catch
+                        return budget.exhaust(.explored_edge_bytes, graph_pattern_mod.default_max_explored_edge_bytes);
+                }
+            }
         }
     }
-    return best_index;
+    try budget.consumeNodes(node_count);
+    try budget.consumeEdges(node_count);
+    try budget.consumeEdgeBytes(owned_bytes);
+}
+
+fn frontierStateOrder(_: void, a: FrontierState, b: FrontierState) std.math.Order {
+    const cost_order = std.math.order(a.cost, b.cost);
+    if (cost_order != .eq) return cost_order;
+    return std.math.order(a.depth, b.depth);
 }
 
 fn edgeWeightFromNode(node: graph_query_mod.GraphResultNode) f64 {
@@ -4789,6 +4843,14 @@ fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 
         total_len = std.math.add(usize, total_len, node.len) catch
             return error.PathIdentityTooLarge;
     }
+    for (path.edges) |edge| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+            total_len = std.math.add(usize, total_len, @sizeOf(u64)) catch
+                return error.PathIdentityTooLarge;
+            total_len = std.math.add(usize, total_len, part.len) catch
+                return error.PathIdentityTooLarge;
+        }
+    }
 
     const out = try alloc.alloc(u8, total_len);
     var pos: usize = 0;
@@ -4808,6 +4870,14 @@ fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 
         @memcpy(out[pos..][0..node.len], node);
         pos += node.len;
     }
+    for (path.edges) |edge| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+            std.mem.writeInt(u64, out[pos..][0..8], @intCast(part.len), .little);
+            pos += 8;
+            @memcpy(out[pos..][0..part.len], part);
+            pos += part.len;
+        }
+    }
     return out;
 }
 
@@ -4821,7 +4891,45 @@ fn rootPathMatches(a: db_mod.types.GraphPath, b: db_mod.types.GraphPath, spur_id
             graphPathNodeTable(b, i),
         )) return false;
     }
+    if (a.edges.len < spur_idx or b.edges.len < spur_idx) return false;
+    i = 0;
+    while (i < spur_idx) : (i += 1) {
+        if (!std.mem.eql(u8, a.edges[i].source, b.edges[i].source) or
+            !std.mem.eql(u8, a.edges[i].target, b.edges[i].target) or
+            !std.mem.eql(u8, a.edges[i].edge_type, b.edges[i].edge_type)) return false;
+    }
     return true;
+}
+
+test "distributed K path identity preserves parallel typed edges" {
+    const alloc = std.testing.allocator;
+    var first_edge = [_]graph_paths_mod.PathEdge{.{
+        .source = "a",
+        .target = "b",
+        .edge_type = "primary",
+        .weight = 1,
+    }};
+    var second_edge = first_edge;
+    second_edge[0].edge_type = "secondary";
+    var nodes = [_][]const u8{ "a", "b" };
+    const first = db_mod.types.GraphPath{
+        .nodes = &nodes,
+        .edges = &first_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const second = db_mod.types.GraphPath{
+        .nodes = first.nodes,
+        .edges = &second_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const first_key = try graphPathToKey(alloc, first);
+    defer alloc.free(first_key);
+    const second_key = try graphPathToKey(alloc, second);
+    defer alloc.free(second_key);
+    try std.testing.expect(!std.mem.eql(u8, first_key, second_key));
+    try std.testing.expect(!rootPathMatches(first, second, 1));
 }
 
 fn joinDistributedPaths(

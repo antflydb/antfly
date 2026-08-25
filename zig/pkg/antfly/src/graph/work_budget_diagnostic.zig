@@ -6,18 +6,10 @@
 
 const std = @import("std");
 const graph_query = @import("query.zig");
+const work_budget = @import("work_budget.zig");
 
-pub const Dimension = enum {
-    explored_nodes,
-    explored_edges,
-    explored_edge_bytes,
-    intermediate_states,
-};
-
-pub const Exhaustion = struct {
-    dimension: Dimension,
-    maximum: usize,
-};
+pub const Dimension = work_budget.Dimension;
+pub const Exhaustion = work_budget.Exhaustion;
 
 pub const Diagnostic = struct {
     operation: []const u8,
@@ -68,7 +60,7 @@ fn mode(query: graph_query.GraphQuery) []const u8 {
         .traverse => "traverse",
         .shortest_path => "shortest_path",
         .k_shortest_paths => "k_shortest_paths",
-        .pattern => if (query.match_pattern != null and !query.legacy_response) "match" else "pattern",
+        .pattern => if (query.match_pattern != null) "match" else "pattern",
     };
 }
 

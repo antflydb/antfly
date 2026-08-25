@@ -5298,11 +5298,12 @@ fn buildGraphQueryResults(
     for (result.graph_results) |graph_result| {
         const graph_query = findGraphQuery(req.graph_queries, graph_result.name) orelse
             return error.InvalidRemoteResponse;
-        try out.map.put(alloc, graph_result.name, try toOpenApiGraphQueryResult(
+        try out.map.put(alloc, graph_result.name, try toOpenApiGraphQueryResultWithFormat(
             alloc,
-            graph_query,
+            graph_query.query,
             meta,
             graph_result,
+            graph_query.response_format,
         ));
     }
     return out;
@@ -5322,9 +5323,9 @@ fn findGraphQueryIncludePaths(
 fn findGraphQuery(
     graph_queries: []const db_mod.types.NamedGraphQuery,
     name: []const u8,
-) ?graph_query_mod.GraphQuery {
+) ?db_mod.types.NamedGraphQuery {
     for (graph_queries) |graph_query| {
-        if (std.mem.eql(u8, graph_query.name, name)) return graph_query.query;
+        if (std.mem.eql(u8, graph_query.name, name)) return graph_query;
     }
     return null;
 }
@@ -5385,6 +5386,16 @@ fn toOpenApiGraphQueryResult(
     meta: QueryResponseMeta,
     graph_result: db_mod.types.GraphSearchResult,
 ) !indexes_openapi.GraphQueryResult {
+    return toOpenApiGraphQueryResultWithFormat(alloc, query, meta, graph_result, .canonical);
+}
+
+fn toOpenApiGraphQueryResultWithFormat(
+    alloc: std.mem.Allocator,
+    query: graph_query_mod.GraphQuery,
+    meta: QueryResponseMeta,
+    graph_result: db_mod.types.GraphSearchResult,
+    response_format: db_mod.types.GraphResponseFormat,
+) !indexes_openapi.GraphQueryResult {
     var document_lookup = try GraphDocumentLookup.init(
         alloc,
         graph_result.hits,
@@ -5392,7 +5403,7 @@ fn toOpenApiGraphQueryResult(
     );
     defer document_lookup.deinit(alloc);
 
-    if (query.legacy_response) {
+    if (response_format == .legacy) {
         const response = try alloc.create(indexes_openapi.LegacyGraphQueryResult);
         errdefer alloc.destroy(response);
         response.* = .{
@@ -5440,7 +5451,7 @@ fn toOpenApiGraphQueryResult(
     }
 
     const nodes = try toOpenApiGraphNodes(alloc, graph_result, &document_lookup);
-    const paths = try toOpenApiGraphPaths(alloc, graph_result.paths);
+    const paths = try toOpenApiGraphPaths(alloc, graph_result.paths, query.params.weight_mode);
     const response = try alloc.create(indexes_openapi.GraphNodesResult);
     errdefer alloc.destroy(response);
     response.* = .{
@@ -5723,13 +5734,12 @@ test "deprecated graph search preserves its response envelope" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const result = try toOpenApiGraphQueryResult(
+    const result = try toOpenApiGraphQueryResultWithFormat(
         alloc,
         .{
             .query_type = .neighbors,
             .index_name = "graph_idx",
             .start_nodes = .{ .keys = &.{"doc:a"} },
-            .legacy_response = true,
         },
         .{ .took_ms = 3 },
         .{
@@ -5737,6 +5747,7 @@ test "deprecated graph search preserves its response envelope" {
             .hits = &.{},
             .total_hits = 12,
         },
+        .legacy,
     );
 
     try std.testing.expect(result == .legacy_graph_query_result);
@@ -5748,11 +5759,11 @@ test "deprecated graph search preserves its response envelope" {
 
     const named_queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "neighbors",
+        .response_format = .legacy,
         .query = .{
             .query_type = .neighbors,
             .index_name = "graph_idx",
             .start_nodes = .{ .keys = &.{"doc:a"} },
-            .legacy_response = true,
         },
     }};
     const graph_results = [_]db_mod.types.GraphSearchResult{.{
@@ -5840,12 +5851,28 @@ test "canonical graph paths preserve table-qualified node identities" {
     try std.testing.expectEqualStrings("doc:a", canonical.graph_nodes_result.paths[0].edges[0].from.key);
     try std.testing.expectEqualStrings("shared", canonical.graph_nodes_result.paths[0].edges[0].to.key);
     try std.testing.expectEqualStrings("entities", canonical.graph_nodes_result.paths[0].edges[0].to.table.?);
+    try std.testing.expectEqual(indexes_openapi.PathWeightMode.min_hops, canonical.graph_nodes_result.paths[0].weight_mode);
+    try std.testing.expectEqual(@as(f64, 1), canonical.graph_nodes_result.paths[0].weight_sum);
+    try std.testing.expectEqual(@as(f64, 1), canonical.graph_nodes_result.paths[0].objective_value);
 
-    var legacy_query = query;
-    legacy_query.legacy_response = true;
-    const legacy = try toOpenApiGraphQueryResult(alloc, legacy_query, .{}, graph_result);
+    const legacy = try toOpenApiGraphQueryResultWithFormat(alloc, query, .{}, graph_result, .legacy);
     try std.testing.expect(legacy == .legacy_graph_query_result);
     try std.testing.expectEqualStrings("shared", legacy.legacy_graph_query_result.paths.?[0].nodes.?[1]);
+}
+
+test "canonical graph path objective exposes max weight product" {
+    const edges = [_]graph_paths_mod.PathEdge{
+        .{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.8 },
+        .{ .source = "b", .target = "c", .edge_type = "e", .weight = 0.5 },
+    };
+    var nodes = [_][]const u8{ "a", "b", "c" };
+    const path = db_mod.types.GraphPath{
+        .nodes = &nodes,
+        .edges = @constCast(edges[0..]),
+        .total_weight = 1.3,
+        .length = 2,
+    };
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), graphPathObjectiveValue(path, .max_weight), 0.000001);
 }
 
 test "generated graph result union decodes pre-discriminator legacy responses" {
@@ -5957,6 +5984,7 @@ fn toOpenApiPaths(
 fn toOpenApiGraphPaths(
     alloc: std.mem.Allocator,
     paths: []const db_mod.types.GraphPath,
+    weight_mode: graph_paths_mod.PathWeightMode,
 ) ![]const indexes_openapi.GraphPath {
     const out = try alloc.alloc(indexes_openapi.GraphPath, paths.len);
     for (paths, 0..) |path, i| {
@@ -5979,11 +6007,32 @@ fn toOpenApiGraphPaths(
                 path.node_tables,
                 path.edges,
             ),
-            .total_weight = path.total_weight,
             .length = @intCast(path.length),
+            .weight_mode = switch (weight_mode) {
+                .min_hops => .min_hops,
+                .min_weight => .min_weight,
+                .max_weight => .max_weight,
+            },
+            .weight_sum = path.total_weight,
+            .objective_value = graphPathObjectiveValue(path, weight_mode),
         };
     }
     return out;
+}
+
+fn graphPathObjectiveValue(
+    path: db_mod.types.GraphPath,
+    weight_mode: graph_paths_mod.PathWeightMode,
+) f64 {
+    return switch (weight_mode) {
+        .min_hops => @floatFromInt(path.length),
+        .min_weight => path.total_weight,
+        .max_weight => blk: {
+            var product: f64 = 1.0;
+            for (path.edges) |edge| product *= edge.weight;
+            break :blk product;
+        },
+    };
 }
 
 fn toOpenApiPathEdges(
@@ -9113,7 +9162,7 @@ fn buildGraphQueries(
             const query = try parseLegacyGraphQuery(alloc, entry.value_ptr.*);
             var query_owned = true;
             errdefer if (query_owned) freeGraphQuery(alloc, query);
-            try items.append(alloc, .{ .name = name, .query = query });
+            try items.append(alloc, .{ .name = name, .query = query, .response_format = .legacy });
             name_owned = false;
             query_owned = false;
         }
@@ -9196,7 +9245,6 @@ pub fn parseLegacyGraphQuery(
         },
         .index_name = index_name,
         .start_nodes = start_nodes,
-        .legacy_response = true,
         .params = params,
         .target_nodes = target_nodes,
         .k = k,

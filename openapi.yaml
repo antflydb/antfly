@@ -22818,10 +22818,11 @@ components:
           minLength: 1
           maxLength: 128
           description: Alias enumerated from the query table as the source relation. Every other alias
-            is reached through graph edges and may resolve to a table-qualified target identity. Filters
-            on this alias, including row-level authorization filters, must have native index coverage
-            so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails
-            with `graph_anchor_filter_requires_index`.
+            is reached through graph edges and may resolve to a table-qualified target identity. An `ids`
+            filter, or a disjunction made only of `ids` filters, uses the table's primary identity access
+            path and needs no secondary index. Stored-field predicates and row-level authorization filters
+            on this alias must have native index coverage so Antfly can enumerate the complete relation
+            in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
         nodes:
           type: object
           minProperties: 1
@@ -23651,9 +23652,12 @@ components:
       required:
         - nodes
         - edges
-        - total_weight
         - length
-      description: An ordered canonical graph path with table-qualified node identities.
+        - weight_mode
+        - weight_sum
+        - objective_value
+      description: An ordered canonical graph path with table-qualified node identities and a self-describing
+        ranking score.
       properties:
         nodes:
           type: array
@@ -23665,11 +23669,17 @@ components:
           items:
             $ref: '#/components/schemas/GraphPathEdge'
           description: Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
-        total_weight:
+        weight_mode:
+          $ref: '#/components/schemas/PathWeightMode'
+        weight_sum:
           type: number
           format: double
-          description: Sum of raw edge weights along the path. Path ordering still follows the selected
-            weight mode.
+          description: Sum of raw edge weights along the path, independent of the selected ranking objective.
+        objective_value:
+          type: number
+          format: double
+          description: The user-facing value optimized by weight_mode; edge count for min_hops, weight_sum
+            for min_weight, and the raw edge-weight product for max_weight.
         length:
           type: integer
     GraphNodesResult:

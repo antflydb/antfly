@@ -21,6 +21,7 @@ const paths_mod = @import("paths.zig");
 const traversal_mod = @import("traversal.zig");
 const node_identity = @import("node_identity.zig");
 const work_budget_diagnostic = @import("work_budget_diagnostic.zig");
+const work_budget_mod = @import("work_budget.zig");
 
 pub const max_pattern_steps: usize = 64;
 pub const max_pattern_hops: u32 = 64;
@@ -32,10 +33,10 @@ pub const max_match_predicate_depth: usize = 16;
 pub const max_count_aggregates: usize = 64;
 pub const max_identifier_codepoints: usize = 128;
 pub const max_identifier_bytes: usize = max_identifier_codepoints * 4;
-pub const default_max_explored_nodes: usize = 100_000;
-pub const default_max_explored_edges: usize = 1_000_000;
-pub const default_max_explored_edge_bytes: usize = 64 * 1024 * 1024;
-pub const default_max_intermediate_states: usize = 100_000;
+pub const default_max_explored_nodes = work_budget_mod.default_max_explored_nodes;
+pub const default_max_explored_edges = work_budget_mod.default_max_explored_edges;
+pub const default_max_explored_edge_bytes = work_budget_mod.default_max_explored_edge_bytes;
+pub const default_max_intermediate_states = work_budget_mod.default_max_intermediate_states;
 pub const default_max_distinct_identities: usize = 100_000;
 pub const default_max_distinct_identity_bytes: usize = 16 * 1024 * 1024;
 
@@ -228,62 +229,7 @@ pub const MatchOptions = struct {
     distinct_budget: ?*DistinctBudget = null,
 };
 
-pub const WorkBudget = struct {
-    max_nodes: usize,
-    max_edges: usize,
-    max_edge_bytes: usize,
-    remaining_nodes: usize,
-    remaining_edges: usize,
-    remaining_edge_bytes: usize,
-    last_exhaustion: ?work_budget_diagnostic.Exhaustion = null,
-
-    pub fn init(max_nodes: usize, max_edges: usize) WorkBudget {
-        return .{
-            .max_nodes = max_nodes,
-            .max_edges = max_edges,
-            .max_edge_bytes = default_max_explored_edge_bytes,
-            .remaining_nodes = max_nodes,
-            .remaining_edges = max_edges,
-            .remaining_edge_bytes = default_max_explored_edge_bytes,
-        };
-    }
-
-    pub fn edgeLimit(self: WorkBudget) usize {
-        return self.remaining_edges;
-    }
-
-    pub fn edgeByteLimit(self: WorkBudget) usize {
-        return self.remaining_edge_bytes;
-    }
-
-    fn consumeNode(self: *WorkBudget) !void {
-        if (self.remaining_nodes == 0) return self.exhaust(.explored_nodes, self.max_nodes);
-        self.remaining_nodes -= 1;
-    }
-
-    fn consumeEdges(self: *WorkBudget, count: usize) !void {
-        if (count > self.remaining_edges) return self.exhaust(.explored_edges, self.max_edges);
-        self.remaining_edges -= count;
-    }
-
-    fn consumeEdgeBytes(self: *WorkBudget, bytes: usize) !void {
-        if (bytes > self.remaining_edge_bytes) return self.exhaust(.explored_edge_bytes, self.max_edge_bytes);
-        self.remaining_edge_bytes -= bytes;
-    }
-
-    fn checkIntermediateStates(self: *WorkBudget, count: usize, maximum: usize) !void {
-        if (count > maximum) return self.exhaust(.intermediate_states, maximum);
-    }
-
-    fn exhaust(self: *WorkBudget, dimension: work_budget_diagnostic.Dimension, maximum: usize) error{GraphWorkBudgetExceeded} {
-        self.last_exhaustion = .{ .dimension = dimension, .maximum = maximum };
-        return error.GraphWorkBudgetExceeded;
-    }
-
-    pub fn exhaustion(self: WorkBudget) ?work_budget_diagnostic.Exhaustion {
-        return self.last_exhaustion;
-    }
-};
+pub const WorkBudget = work_budget_mod.WorkBudget;
 
 fn edgeOwnedBytes(edges: []const graph_mod.Edge) !usize {
     var total: usize = 0;
@@ -375,9 +321,7 @@ fn getEdgesForBudget(
 }
 
 fn consumeMaterializedEdges(work_budget: *WorkBudget, edges: []const graph_mod.Edge) !void {
-    try work_budget.consumeEdges(edges.len);
-    const bytes = edgeOwnedBytes(edges) catch return work_budget.exhaust(.explored_edge_bytes, work_budget.max_edge_bytes);
-    try work_budget.consumeEdgeBytes(bytes);
+    try work_budget.consumeMaterializedEdges(edges);
 }
 
 pub fn isValidIdentifier(value: []const u8) bool {
