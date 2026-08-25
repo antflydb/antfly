@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-
-	"github.com/antflydb/antfly/go/pkg/libaf/ai"
 )
 
 // FallbackReader tries multiple Readers in order, returning the first
@@ -22,7 +20,7 @@ func NewFallbackReader(readers ...Reader) *FallbackReader {
 // Read tries each reader in order, returning the first result where any
 // page produced non-empty text. If all readers fail or return empty results,
 // returns the last error (or empty strings if no errors occurred).
-func (f *FallbackReader) Read(ctx context.Context, pages []ai.BinaryContent, opts *ReadOptions) ([]string, error) {
+func (f *FallbackReader) Read(ctx context.Context, pages []BinaryContent, opts *ReadOptions) ([]string, error) {
 	var lastErr error
 
 	for _, r := range f.readers {

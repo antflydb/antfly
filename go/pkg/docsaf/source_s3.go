@@ -2,22 +2,77 @@ package docsaf
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"strings"
 	"sync"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/s3"
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 )
+
+// S3Credentials configures a direct connection to an S3-compatible service.
+type S3Credentials struct {
+	// AccessKeyID is the S3 access key. When both key fields are empty, the
+	// standard AWS environment variables are used.
+	AccessKeyID string `json:"access_key_id,omitempty"`
+	// SecretAccessKey is the S3 secret key.
+	SecretAccessKey string `json:"secret_access_key,omitempty"`
+	// SessionToken is the optional token for temporary credentials.
+	SessionToken string `json:"session_token,omitempty"`
+	// Endpoint is an S3-compatible host or URL.
+	Endpoint string `json:"endpoint,omitempty"`
+	// UseSSL controls TLS when Endpoint does not include a URL scheme.
+	UseSSL bool `json:"use_ssl,omitempty"`
+}
+
+func (creds S3Credentials) newMinioClient() (*minio.Client, error) {
+	if creds.Endpoint == "" {
+		return nil, errors.New("endpoint is required")
+	}
+	var provider *credentials.Credentials
+	if creds.AccessKeyID == "" && creds.SecretAccessKey == "" {
+		provider = credentials.NewEnvAWS()
+	} else {
+		if creds.AccessKeyID == "" {
+			return nil, errors.New("access key ID is required")
+		}
+		if creds.SecretAccessKey == "" {
+			return nil, errors.New("secret access key is required")
+		}
+		provider = credentials.NewStaticV4(creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken)
+	}
+
+	endpoint, secure := parseS3Endpoint(creds.Endpoint, creds.UseSSL)
+	client, err := minio.New(endpoint, &minio.Options{
+		Creds:  provider,
+		Secure: secure,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating S3 client for endpoint %s: %w", endpoint, err)
+	}
+	return client, nil
+}
+
+func parseS3Endpoint(endpoint string, useSSL bool) (string, bool) {
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		parsed, err := url.Parse(endpoint)
+		if err == nil && parsed.Host != "" {
+			return parsed.Host, parsed.Scheme == "https"
+		}
+	}
+	return endpoint, useSSL
+}
 
 // S3SourceConfig holds configuration for an S3Source.
 type S3SourceConfig struct {
 	// Credentials holds S3/MinIO connection credentials.
-	// Supports keystore syntax and environment variable fallbacks.
-	Credentials s3.Credentials
+	// Empty key fields fall back to the standard AWS environment variables.
+	Credentials S3Credentials
 
 	// Bucket is the S3 bucket name (required).
 	Bucket string
@@ -63,7 +118,7 @@ func NewS3Source(config S3SourceConfig) (*S3Source, error) {
 	}
 
 	// Create MinIO client from credentials
-	client, err := config.Credentials.NewMinioClient()
+	client, err := config.Credentials.newMinioClient()
 	if err != nil {
 		return nil, fmt.Errorf("creating S3 client: %w", err)
 	}

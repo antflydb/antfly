@@ -897,6 +897,13 @@ pub const DocStore = struct {
     }
 
     pub fn beginReadTxn(self: *DocStore) !Txn {
+        return try self.beginReadTxnWithBlockCacheAdmission(.retain);
+    }
+
+    pub fn beginReadTxnWithBlockCacheAdmission(
+        self: *DocStore,
+        admission: backend_types.Namespace.BlockCacheAdmission,
+    ) !Txn {
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var txn = try self.env.begin(.{ .read_only = true });
@@ -910,7 +917,7 @@ pub const DocStore = struct {
             } else error.UnsupportedPlatform,
             .runtime => .{
                 .alloc = self.alloc,
-                .read = try self.runtime_store.beginRead(),
+                .read = try self.runtime_store.beginReadWithBlockCacheAdmission(admission),
             },
         };
     }
@@ -922,11 +929,18 @@ pub const DocStore = struct {
     /// requiring write access. LMDB keeps the normal read-only transaction
     /// because its snapshot semantics are cheap.
     pub fn beginProbeTxn(self: *DocStore) !Txn {
+        return try self.beginProbeTxnWithBlockCacheAdmission(.retain);
+    }
+
+    pub fn beginProbeTxnWithBlockCacheAdmission(
+        self: *DocStore,
+        admission: backend_types.Namespace.BlockCacheAdmission,
+    ) !Txn {
         return switch (self.kind) {
-            .lmdb => try self.beginReadTxn(),
+            .lmdb => try self.beginReadTxnWithBlockCacheAdmission(admission),
             .runtime => .{
                 .alloc = self.alloc,
-                .probe = try self.runtime_store.beginProbe(),
+                .probe = try self.runtime_store.beginProbeWithBlockCacheAdmission(admission),
             },
         };
     }

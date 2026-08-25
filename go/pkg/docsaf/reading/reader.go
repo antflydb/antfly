@@ -2,16 +2,14 @@ package reading
 
 import (
 	"context"
-
-	"github.com/antflydb/antfly/go/pkg/libaf/ai"
 )
 
 // Reader extracts text from images and single-page PDFs using OCR models.
 type Reader interface {
 	// Read extracts text from one or more pages. Each page should be a
-	// single image (PNG, JPEG) or a single-page PDF as ai.BinaryContent.
+	// single image (PNG, JPEG) or a single-page PDF as BinaryContent.
 	// Returns one string per input page.
-	Read(ctx context.Context, pages []ai.BinaryContent, opts *ReadOptions) ([]string, error)
+	Read(ctx context.Context, pages []BinaryContent, opts *ReadOptions) ([]string, error)
 
 	// Close releases any resources held by the reader (sessions, connections, etc.)
 	Close() error
@@ -31,9 +29,9 @@ func ReadPages(ctx context.Context, r Reader, pages [][]byte, mimeType string, o
 	if len(pages) == 0 {
 		return []string{}, nil
 	}
-	contents := make([]ai.BinaryContent, len(pages))
+	contents := make([]BinaryContent, len(pages))
 	for i, p := range pages {
-		contents[i] = ai.BinaryContent{MIMEType: mimeType, Data: p}
+		contents[i] = BinaryContent{MIMEType: mimeType, Data: p}
 	}
 	return r.Read(ctx, contents, opts)
 }

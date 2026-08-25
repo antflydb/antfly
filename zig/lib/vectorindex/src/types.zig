@@ -94,6 +94,9 @@ pub const Node = struct {
     level: u16,
     parent: u64,
     centroid: []f32,
+    /// Euclidean radius around `centroid` covering every vector in this
+    /// subtree. NaN is the backward-compatible "unknown" value.
+    covering_radius: f32 = std.math.nan(f32),
     children: []u64,
     members: []u64,
     posting_state: PostingState = .{},
@@ -134,6 +137,7 @@ pub const Node = struct {
             .level = self.level,
             .parent = self.parent,
             .centroid = try alloc.dupe(f32, self.centroid),
+            .covering_radius = self.covering_radius,
             .children = try alloc.dupe(u64, self.children),
             .members = try alloc.dupe(u64, self.members),
             .posting_state = self.posting_state,
@@ -179,6 +183,10 @@ pub const PriorityItem = struct {
     id: u64,
     distance: f32,
     error_bound: f32 = 0,
+    /// Admissible subtree lower bound, distinct from centroid quantization
+    /// error. Unknown bounds remain NaN and force the width fallback.
+    lower_bound: f32 = std.math.nan(f32),
+    bound_resolved: bool = true,
     is_leaf: bool = false,
 
     pub fn definitelyCloser(self: PriorityItem, other: PriorityItem) bool {

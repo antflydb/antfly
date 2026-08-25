@@ -197,7 +197,7 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 		},
 	}
 
-	embIdx, err := client.NewIndexConfig(embeddingIndex, client.EmbeddingsIndexConfig{
+	embIdx, err := client.NewCreateIndexRequest(client.EmbeddingsIndexConfig{
 		Dimension: embedderDimension,
 		Field:     "content",
 		Embedder: client.EmbedderConfig{
@@ -208,7 +208,7 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 		return fmt.Errorf("build embedding index config: %w", err)
 	}
 
-	graphIdx, err := client.NewIndexConfig(graphIndex, client.GraphIndexConfig{
+	graphIdx, err := client.NewCreateIndexRequest(client.GraphIndexConfig{
 		EdgeTypes: []client.EdgeTypeConfig{
 			{Name: "mentions", MaxWeight: 1.0, MinWeight: 0.0, AllowSelfLoops: false},
 			{Name: "related_to", MaxWeight: 1.0, MinWeight: 0.0, AllowSelfLoops: false},
@@ -227,7 +227,7 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 				"memory": memorySchema,
 			},
 		},
-		Indexes: map[string]client.IndexConfig{
+		Indexes: map[string]client.CreateIndexRequest{
 			embeddingIndex: *embIdx,
 			graphIndex:     *graphIdx,
 		},
@@ -249,7 +249,7 @@ func (h *Handler) ensureNamespace(ctx context.Context, namespace string) error {
 			TtlDuration: DefaultEphemeralTTL,
 			TtlField:    "created_at",
 		},
-		Indexes: map[string]client.IndexConfig{
+		Indexes: map[string]client.CreateIndexRequest{
 			embeddingIndex: *embIdx,
 			graphIndex:     *graphIdx,
 		},

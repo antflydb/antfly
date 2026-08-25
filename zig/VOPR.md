@@ -988,6 +988,11 @@ VOPR work has found concrete production and harness defects:
   task. The helper now uses the fixture allocator. The same bootstrap could
   create replica stores under an identity namespace different from metadata's
   projected namespace; seeding now preserves the projected identity contract.
+- A later production index-cache expansion made the public HTTP-to-transaction-
+  to-index-open call chain overflow the full-cluster fixture's 4 MiB fiber
+  stack and strand Zig's signal unwinder. The deployment history now declares
+  an 8 MiB task stack, matching a conventional native main-thread budget;
+  focused suites keep the smaller reusable default.
 - A public read racing restart of its Raft-hosting DataServer returned HTTP 200
   with a partial result during exploration. The durability checkpoint now
   sequences the baseline acknowledged read before restart and proves the

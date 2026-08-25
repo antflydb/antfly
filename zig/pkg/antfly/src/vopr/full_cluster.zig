@@ -179,7 +179,11 @@ pub const Scenario = struct {
             const fixture_alloc = self.fixture_allocator.allocator();
             self.sim = try vopr.vopr_io.VoprIo.init(.{
                 .seed = 0x4655_4c4c,
-                .tasks = .{ .stack_size = 4 * 1024 * 1024 },
+                // The production HTTP -> transaction -> DB/index-open path
+                // has a deeper synchronous frame chain than focused suites.
+                // Match a conventional native main-thread stack so VOPR does
+                // not turn ordinary production stack use into a fiber fault.
+                .tasks = .{ .stack_size = 8 * 1024 * 1024 },
                 .network = .{ .max_sockets = 96, .stream_capacity = 256 * 1024 },
                 .files = .{ .capacity_bytes = 64 * 1024 * 1024 },
                 .instrumentation = .{ .enabled = false, .map_digest = 0x4655_4c4c },

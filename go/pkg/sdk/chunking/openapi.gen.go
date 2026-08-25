@@ -13,7 +13,7 @@ import (
 	"path"
 	"strings"
 
-	externalRef0 "github.com/antflydb/antfly/go/pkg/generating"
+	externalRef0 "github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/oapi-codegen/runtime"
 )

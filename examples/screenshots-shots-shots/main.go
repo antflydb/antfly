@@ -25,8 +25,8 @@ import (
 	"strings"
 	"time"
 
-	antfly "github.com/antflydb/antfly/pkg/client"
-	"github.com/antflydb/antfly/pkg/client/oapi"
+	antfly "github.com/antflydb/antfly/go/pkg/sdk"
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 // ANCHOR_END: imports
@@ -98,18 +98,18 @@ func main() {
 		Model: "openai/clip-vit-base-patch32",
 	})
 
-	var indexConfig oapi.IndexConfig
-	indexConfig.Name = "embeddings"
-	indexConfig.Type = oapi.IndexTypeEmbeddings
-	indexConfig.FromEmbeddingsIndexConfig(oapi.EmbeddingsIndexConfig{
+	indexConfig, err := antfly.NewCreateIndexRequest(oapi.EmbeddingsIndexConfig{
 		Dimension: 512,
 		Template:  "{{remoteMedia url=file_url}}{{filename}}",
 		Embedder:  embedderConfig,
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	err = client.CreateTable(ctx, "screenshots", antfly.CreateTableRequest{
-		Indexes: map[string]oapi.IndexConfig{
-			"embeddings": indexConfig,
+		Indexes: map[string]antfly.CreateIndexRequest{
+			"embeddings": *indexConfig,
 		},
 	})
 	if err != nil {
