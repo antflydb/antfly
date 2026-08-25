@@ -13,7 +13,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 7;
+    pub const version: u32 = 8;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -21,6 +21,7 @@ pub const Scenario = struct {
     const isolation_id = vopr.id.stable(name, "multi-table-isolation");
     const graph_query_id = vopr.id.stable(name, "public-cross-range-graph-query-sound");
     const graph_restart_id = vopr.id.stable(name, "public-graph-inflight-restart-sound");
+    const graph_partial_id = vopr.id.stable(name, "public-graph-partial-result-rejected");
     const publication_id = vopr.id.stable(name, "serverless-publication-visible");
     const serverless_http_id = vopr.id.stable(name, "serverless-public-http-visible");
     const shared_io_id = vopr.id.stable(name, "one-shared-vopr-io");
@@ -38,6 +39,7 @@ pub const Scenario = struct {
         .{ .id = isolation_id, .name = name ++ ".multi-table-isolation", .kind = .always },
         .{ .id = graph_query_id, .name = name ++ ".public-cross-range-graph-query-sound", .kind = .always },
         .{ .id = graph_restart_id, .name = name ++ ".public-graph-inflight-restart-sound", .kind = .always },
+        .{ .id = graph_partial_id, .name = name ++ ".public-graph-partial-result-rejected", .kind = .always },
         .{ .id = publication_id, .name = name ++ ".serverless-publication-visible", .kind = .always },
         .{ .id = serverless_http_id, .name = name ++ ".serverless-public-http-visible", .kind = .always },
         .{ .id = shared_io_id, .name = name ++ ".one-shared-vopr-io", .kind = .always },
@@ -55,6 +57,7 @@ pub const Scenario = struct {
         metadata_partition,
         node_restart,
         graph_inflight_restart,
+        graph_transport_failure,
         partial_http_write,
         serverless_stale_generation,
         resource_pressure,
@@ -65,6 +68,7 @@ pub const Scenario = struct {
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
+                .graph_transport_failure => .graph_transport_failure,
                 .partial_http_write => .partial_http_write,
                 .resource_pressure => .resource_pressure,
             };
@@ -82,6 +86,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "metadata-partition"),
         vopr.id.stable(name, "node-restart"),
         vopr.id.stable(name, "graph-inflight-restart"),
+        vopr.id.stable(name, "graph-transport-failure"),
         vopr.id.stable(name, "partial-http-write"),
         vopr.id.stable(name, "serverless-stale-generation"),
         vopr.id.stable(name, "resource-pressure"),
@@ -91,6 +96,7 @@ pub const Scenario = struct {
         name ++ ".metadata-partition",
         name ++ ".node-restart",
         name ++ ".graph-inflight-restart",
+        name ++ ".graph-transport-failure",
         name ++ ".partial-http-write",
         name ++ ".serverless-stale-generation",
         name ++ ".resource-pressure",
@@ -277,19 +283,19 @@ pub const Scenario = struct {
         }
 
         fn runServerless(self: *State) void {
-            defer self.serverless.stopPublicCatalog();
-            const serverless_mode = self.mode.?.serverlessMode();
-            self.serverless.runMode(serverless_mode) catch {
+            defer {
+                self.serverless.stopPublicCatalog();
                 self.serverless_done = true;
-                return;
-            };
+                if (self.public_cluster) |fixture| fixture.allowGraphFaultWorkload();
+            }
+            const serverless_mode = self.mode.?.serverlessMode();
+            self.serverless.runMode(serverless_mode) catch return;
             self.serverless_public_sound = self.serverless.observePublicCatalogForMode(serverless_mode) catch |err| blk: {
                 self.serverless_public_error_code = @intFromError(err);
                 break :blk false;
             };
             self.serverless_sound = self.serverless.workflowVisibleForMode(serverless_mode) and
                 self.serverless_public_sound;
-            self.serverless_done = true;
         }
 
         fn waitForCompletion(self: *State) void {
@@ -327,6 +333,15 @@ pub const Scenario = struct {
                     vopr.id.stable(name, "fault.graph-inflight-restart"),
                     .node_pause,
                     process_domains[fixture.graph_restart_node_index],
+                ),
+                // VoprIo's current outage primitive covers the complete
+                // inter-DataServer fabric. Mirror that scope in the manifest
+                // instead of pretending the failure belongs to one arbitrary
+                // directional link.
+                .graph_transport_failure => for (deployment_links, 0..) |link, index| try deployment.activateFault(
+                    vopr.id.derive("full-cluster.graph-transport-failure", link.id, index),
+                    .network,
+                    link.id,
                 ),
                 .partial_http_write => try deployment.activateFault(
                     vopr.id.stable(name, "fault.partial-http-write"),
@@ -422,6 +437,10 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".public-cross-range-graph-query", @intFromBool(if (cluster) |snapshot| snapshot.graph_query_ok else false));
         try builder.addNamed(allocator, name ++ ".graph-inflight-restart-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_inflight_restart_observed else false));
         try builder.addNamed(allocator, name ++ ".graph-inflight-restart-recovered", @intFromBool(if (cluster) |snapshot| snapshot.graph_inflight_restart_recovered else false));
+        try builder.addNamed(allocator, name ++ ".graph-transport-failure-injected", @intFromBool(if (cluster) |snapshot| snapshot.graph_transport_failure_injected else false));
+        try builder.addNamed(allocator, name ++ ".graph-transport-failure-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_transport_failure_observed else false));
+        try builder.addNamed(allocator, name ++ ".graph-transport-failure-error", if (cluster) |snapshot| @intCast(snapshot.graph_transport_failure_error_code) else 0);
+        try builder.addNamed(allocator, name ++ ".graph-partial-result-rejected", @intFromBool(if (cluster) |snapshot| snapshot.graph_partial_rejected_sound else false));
         try builder.addNamed(allocator, name ++ ".request-errors", if (fixture) |public_cluster| @intCast(public_cluster.request_errors) else 0);
         try builder.addNamed(allocator, name ++ ".last-request-error", if (fixture) |public_cluster| @intCast(public_cluster.last_request_error_code) else 0);
         try builder.addNamed(allocator, name ++ ".serverless-visible", @intFromBool(state.serverless_sound));
@@ -453,6 +472,10 @@ pub const Scenario = struct {
         try sink.check(allocator, graph_restart_id, !state.complete or state.mode.? != .graph_inflight_restart or
             (cluster != null and cluster.?.graph_inflight_restart_observed and cluster.?.graph_inflight_restart_recovered and
                 cluster.?.graph_query_ok));
+        try sink.check(allocator, graph_partial_id, !state.complete or state.mode.? != .graph_transport_failure or
+            (cluster != null and cluster.?.graph_transport_failure_injected and
+                cluster.?.graph_transport_failure_observed and cluster.?.graph_transport_failure_error_code != 0 and
+                cluster.?.graph_partial_rejected_sound and cluster.?.graph_query_ok));
         try sink.check(allocator, publication_id, !state.complete or state.serverless_sound);
         try sink.check(allocator, serverless_http_id, !state.complete or state.serverless_public_sound);
         try sink.check(allocator, shared_io_id, !state.initialization_done or state.shared_io_sound);
@@ -505,7 +528,7 @@ test "full cluster VOPR exact replays metadata data serverless HTTP clients and 
             .transition_budget = 50_000,
             .resource_budget = 96,
             .backend_ids = &backend_ids,
-            .source_revision = "full-cluster-vopr-v7",
+            .source_revision = "full-cluster-vopr-v8",
             .target = "native",
             .optimize = @tagName(@import("builtin").mode),
         });

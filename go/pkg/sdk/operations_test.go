@@ -614,6 +614,12 @@ func TestQueryPreservesTemporaryAvailabilityRetryGuidance(t *testing.T) {
 	}
 }
 
+func TestDistributedQueryUnavailableIsRetryableAvailabilityCode(t *testing.T) {
+	if !isQueryTemporarilyUnavailableCode("distributed_query_unavailable") {
+		t.Fatal("distributed_query_unavailable must remain a typed retryable query condition")
+	}
+}
+
 func TestBatchRejectsOversizedRequestBeforeSending(t *testing.T) {
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

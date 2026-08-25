@@ -738,6 +738,25 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !QueryResponse {
+        var resp = try self.fetchQueryRaw(base_uri, table_name, body);
+        defer resp.deinit(self.alloc);
+        if (resp.status != 200) return error.UnexpectedHttpStatus;
+        return .{
+            .content_type = if (resp.content_type) |content_type| try self.alloc.dupe(u8, content_type) else null,
+            .body = try self.alloc.dupe(u8, resp.body),
+        };
+    }
+
+    /// Execute the public query route while preserving its HTTP status and
+    /// error body. Higher-level callers normally use `fetchQuery`; recovery
+    /// coordinators and conformance tests need the raw response to distinguish
+    /// a retryable/fail-closed response from an accidentally partial success.
+    pub fn fetchQueryRaw(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+    ) !http_common.HttpResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -747,18 +766,12 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        return try self.executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
         });
-        defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
-        return .{
-            .content_type = if (resp.content_type) |content_type| try self.alloc.dupe(u8, content_type) else null,
-            .body = try self.alloc.dupe(u8, resp.body),
-        };
     }
 
     pub fn fetchRetrievalAgent(

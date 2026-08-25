@@ -93,6 +93,44 @@ const http_common = @import("../raft/transport/http_common.zig");
 const platform_time = @import("antfly_platform").time;
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const fusion_mod = @import("../search/fusion.zig");
+
+/// Collapse failures of the internal graph-fanout transport into one public
+/// availability condition. The coordinator owns every intermediate graph
+/// result, so callers must never receive a successful response assembled from
+/// only the workers that happened to answer.
+pub fn normalizeDistributedGraphOperationalError(err: anyerror) anyerror {
+    return switch (err) {
+        error.RemoteUnavailable,
+        error.ConnectionFailed,
+        error.ConnectionReset,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionClosed,
+        error.ConnectionAborted,
+        error.ConnectionTimeout,
+        error.ConnectionTimedOut,
+        error.BrokenPipe,
+        error.NotConnected,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.HostUnreachable,
+        error.DnsResolutionFailed,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.RecvFailed,
+        error.SendFailed,
+        => error.DistributedQueryUnavailable,
+        else => err,
+    };
+}
+
+test "distributed graph transport failures become one retryable availability condition" {
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.SendFailed));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.Timeout, normalizeDistributedGraphOperationalError(error.Timeout));
+    try std.testing.expectEqual(error.InternalFailure, normalizeDistributedGraphOperationalError(error.InternalFailure));
+}
 const regex_mod = @import("../search/regex.zig");
 const httpx = @import("httpx");
 const Io = std.Io;
@@ -3159,7 +3197,8 @@ pub const ProvisionedTableReadSource = struct {
 
             var worker_ctx = ProvisionedGraphWorkerContext.init(self);
             const worker = worker_ctx.worker();
-            const graph_results = try distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency);
+            const graph_results = distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency) catch |err|
+                return normalizeDistributedGraphOperationalError(err);
             merged.graph_results = graph_results;
 
             // Aggregation may return to the source table after graph fanout.
@@ -4190,7 +4229,8 @@ pub const HostedProvisionedTableReadSource = struct {
             const graph_req = requestWithResultIdentityGeneration(req, merged);
 
             const worker = hostedGraphWorker(self);
-            const graph_results = try distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency);
+            const graph_results = distributed_graph.executeCrossRange(alloc, self.catalog, worker, table_name, graph_req, merged, consistency) catch |err|
+                return normalizeDistributedGraphOperationalError(err);
             merged.graph_results = graph_results;
 
             var meta: query_api.QueryResponseMeta = .{

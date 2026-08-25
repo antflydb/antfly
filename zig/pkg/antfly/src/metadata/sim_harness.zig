@@ -5919,7 +5919,7 @@ fn PublicApiTestRig(comptime N: usize) type {
 /// explicit-step transport while every public listener, forwarding request,
 /// client, timeout, and shutdown task borrows the caller's single VoprIo.
 pub const VoprPublicClusterFixture = struct {
-    pub const FaultMode = enum { clean, metadata_partition, node_restart, graph_inflight_restart, partial_http_write, resource_pressure };
+    pub const FaultMode = enum { clean, metadata_partition, node_restart, graph_inflight_restart, graph_transport_failure, partial_http_write, resource_pressure };
     const node_count = 3;
     const metadata_group_id: u64 = 6840;
     const table_id: u64 = 6841;
@@ -5972,6 +5972,7 @@ pub const VoprPublicClusterFixture = struct {
     client: api_http_client.ApiHttpClient = undefined,
     metadata_leader_index: usize = 0,
     client_index: usize = 0,
+    graph_remote_client_index: usize = 0,
     graph_restart_node_index: usize = 0,
     actual_host_count: usize = 0,
     write_done: std.Io.Event = .unset,
@@ -5979,6 +5980,7 @@ pub const VoprPublicClusterFixture = struct {
     resource_recovered: std.Io.Event = .unset,
     graph_round_paused: std.Io.Event = .unset,
     graph_fault_recovered: std.Io.Event = .unset,
+    graph_fault_workload_ready: std.Io.Event = .unset,
     fault_mode: FaultMode = .clean,
     write_finished: bool = false,
     read_finished: bool = false,
@@ -5994,6 +5996,10 @@ pub const VoprPublicClusterFixture = struct {
     graph_query_sound: bool = false,
     graph_inflight_restart_observed: bool = false,
     graph_inflight_restart_recovered: bool = false,
+    graph_transport_failure_injected: bool = false,
+    graph_transport_failure_observed: bool = false,
+    graph_transport_failure_error_code: u64 = 0,
+    graph_partial_rejected_sound: bool = false,
     topology_sound: bool = false,
     resource_denial_sound: bool = false,
     resource_recovery_sound: bool = false,
@@ -6145,6 +6151,14 @@ pub const VoprPublicClusterFixture = struct {
         try std.testing.expect(try self.cluster.waitForGroupStatusCount(graph_data_group_id, .active, 2, 192));
         self.graph_restart_node_index = currentGroupLeaderIndex(&self.cluster, graph_data_group_id) orelse
             return error.FullClusterGraphLeaderMissing;
+        var graph_remote_client_found = false;
+        for (0..node_count) |index| {
+            if (self.cluster.node(index).status(graph_data_group_id) == .active) continue;
+            self.graph_remote_client_index = index;
+            graph_remote_client_found = true;
+            break;
+        }
+        if (!graph_remote_client_found) return error.FullClusterGraphRemoteClientMissing;
         try ensureGroupGraphIndexOnActiveReplicas(
             &self.cluster,
             self.roots[0..],
@@ -6253,6 +6267,7 @@ pub const VoprPublicClusterFixture = struct {
 
     pub fn start(self: *VoprPublicClusterFixture, mode: FaultMode) !void {
         self.fault_mode = mode;
+        if (mode != .graph_transport_failure) self.graph_fault_workload_ready.set(self.sim.io());
         switch (mode) {
             .clean => {
                 self.resource_recovered.set(self.sim.io());
@@ -6272,6 +6287,7 @@ pub const VoprPublicClusterFixture = struct {
                 self.resource_recovered.set(self.sim.io());
                 _ = self.sim.io().async(restartGraphLeaderDuringQuery, .{self});
             },
+            .graph_transport_failure => self.resource_recovered.set(self.sim.io()),
             .partial_http_write => {
                 self.resource_recovered.set(self.sim.io());
                 try self.sim.limitNextNetworkWrite(1);
@@ -6382,8 +6398,12 @@ pub const VoprPublicClusterFixture = struct {
         defer self.graph_read_finished = true;
         if (!self.write_sound) return;
 
-        if (self.fault_mode != .graph_inflight_restart)
+        self.graph_fault_workload_ready.waitUncancelable(self.sim.io());
+        if (self.fault_mode == .graph_transport_failure) {
+            while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
+        } else if (self.fault_mode != .graph_inflight_restart) {
             while (!self.fault_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
+        }
         const query_body = test_contract_helpers.encodeGraphTraverseQueryRequest(
             self.alloc,
             "walk",
@@ -6398,8 +6418,38 @@ pub const VoprPublicClusterFixture = struct {
             return;
         };
         defer self.alloc.free(query_body);
+        if (self.fault_mode == .graph_transport_failure) {
+            var failed = self.client.fetchQueryRaw(
+                self.api_base_uris[self.graph_remote_client_index],
+                "docs",
+                query_body,
+            ) catch |err| {
+                self.sim.setNetworkOutage(false);
+                self.fault_finished = true;
+                self.request_errors +|= 1;
+                self.last_request_error_code = @intFromError(err);
+                return;
+            };
+            defer failed.deinit(self.alloc);
+            self.graph_partial_rejected_sound = self.graph_transport_failure_injected and
+                self.graph_transport_failure_observed and failed.status == 503 and
+                std.mem.indexOf(u8, failed.body, "\"code\":\"distributed_query_unavailable\"") != null and
+                std.mem.indexOf(u8, failed.body, "\"retryable\":true") != null and
+                std.mem.indexOf(u8, failed.body, "graph_results") == null and
+                std.mem.indexOf(u8, failed.body, "doc:z") == null and
+                std.mem.indexOf(u8, failed.body, "doc:y") == null;
+            if (!self.graph_partial_rejected_sound) {
+                self.sim.setNetworkOutage(false);
+                self.fault_finished = true;
+                return;
+            }
+        }
+        const query_route_index = if (self.fault_mode == .graph_transport_failure)
+            self.graph_remote_client_index
+        else
+            self.client_index;
         var query = self.client.fetchQuery(
-            self.api_base_uris[self.client_index],
+            self.api_base_uris[query_route_index],
             "docs",
             query_body,
         ) catch |err| {
@@ -6430,13 +6480,36 @@ pub const VoprPublicClusterFixture = struct {
 
     fn reachDistributedGraphLifecycle(ptr: *anyopaque, event: api_distributed_graph.LifecycleEvent) void {
         const self: *VoprPublicClusterFixture = @ptrCast(@alignCast(ptr));
-        if (self.fault_mode != .graph_inflight_restart or
-            event.phase != .expand_round_completed or event.depth != 1 or
-            self.graph_inflight_restart_observed)
-            return;
-        self.graph_inflight_restart_observed = true;
-        self.graph_round_paused.set(self.sim.io());
-        self.graph_fault_recovered.waitUncancelable(self.sim.io());
+        switch (self.fault_mode) {
+            .graph_inflight_restart => {
+                if (event.phase != .expand_round_completed or event.depth != 1 or
+                    self.graph_inflight_restart_observed)
+                    return;
+                self.graph_inflight_restart_observed = true;
+                self.graph_round_paused.set(self.sim.io());
+                self.graph_fault_recovered.waitUncancelable(self.sim.io());
+            },
+            .graph_transport_failure => switch (event.phase) {
+                .expand_round_completed => {
+                    if (event.depth != 1 or self.graph_transport_failure_injected) return;
+                    self.graph_transport_failure_injected = true;
+                    self.sim.setNetworkOutage(true);
+                },
+                .attempt_failed => {
+                    if (!self.graph_transport_failure_injected or self.graph_transport_failure_observed) return;
+                    self.graph_transport_failure_observed = true;
+                    self.graph_transport_failure_error_code = event.error_code;
+                    self.sim.setNetworkOutage(false);
+                    self.fault_finished = true;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    pub fn allowGraphFaultWorkload(self: *VoprPublicClusterFixture) void {
+        self.graph_fault_workload_ready.set(self.sim.io());
     }
 
     fn healMetadataPartition(self: *VoprPublicClusterFixture, node_id: u64) void {
@@ -6705,6 +6778,10 @@ pub const VoprPublicClusterFixture = struct {
         graph_query_ok: bool,
         graph_inflight_restart_observed: bool,
         graph_inflight_restart_recovered: bool,
+        graph_transport_failure_injected: bool,
+        graph_transport_failure_observed: bool,
+        graph_transport_failure_error_code: u64,
+        graph_partial_rejected_sound: bool,
     } {
         return .{
             .hosts = self.actual_host_count,
@@ -6722,6 +6799,10 @@ pub const VoprPublicClusterFixture = struct {
             .graph_query_ok = self.graph_query_sound,
             .graph_inflight_restart_observed = self.graph_inflight_restart_observed,
             .graph_inflight_restart_recovered = self.graph_inflight_restart_recovered,
+            .graph_transport_failure_injected = self.graph_transport_failure_injected,
+            .graph_transport_failure_observed = self.graph_transport_failure_observed,
+            .graph_transport_failure_error_code = self.graph_transport_failure_error_code,
+            .graph_partial_rejected_sound = self.graph_partial_rejected_sound,
         };
     }
 

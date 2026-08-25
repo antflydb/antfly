@@ -284,6 +284,7 @@ func isQueryTemporarilyUnavailableCode(code string) bool {
 	case "doc_identity_unavailable",
 		"read_requires_primary",
 		"standby_read_unavailable",
+		"distributed_query_unavailable",
 		"storage_read_temporarily_unavailable",
 		"index_rebuilding",
 		"query_embedding_temporarily_unavailable":

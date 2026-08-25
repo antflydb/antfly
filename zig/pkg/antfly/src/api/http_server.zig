@@ -8170,6 +8170,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => return error.ReadUnavailable,
+            error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageReadTemporarilyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
@@ -8356,6 +8357,7 @@ pub const ApiHttpServer = struct {
                 error.HAReadWaitForMetadata,
                 error.ReadUnavailable,
                 => return error.ReadUnavailable,
+                error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
                 error.PersistentDescriptorAdmissionExhausted,
                 error.StorageReadTemporarilyUnavailable,
                 => return error.StorageReadTemporarilyUnavailable,
@@ -8404,6 +8406,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => return error.ReadUnavailable,
+            error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageReadTemporarilyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
@@ -8480,6 +8483,7 @@ pub const ApiHttpServer = struct {
             error.HAReadWaitForMetadata,
             error.ReadUnavailable,
             => return error.ReadUnavailable,
+            error.DistributedQueryUnavailable => return error.DistributedQueryUnavailable,
             error.PersistentDescriptorAdmissionExhausted,
             error.StorageReadTemporarilyUnavailable,
             => return error.StorageReadTemporarilyUnavailable,
@@ -9186,7 +9190,7 @@ pub const ApiHttpServer = struct {
                 // supposedly-ready index that disappeared, retains its
                 // diagnostic instead of being masked as transient readiness.
                 error.IndexNotFound => if (try missing_index_lifecycle.isRebuilding(table_name, req)) return error.IndexRebuilding else return err,
-                error.Timeout, error.Cancelled => return err,
+                error.Timeout, error.Cancelled, error.DistributedQueryUnavailable => return err,
                 else => {
                     std.log.warn("public table query read failed table={s} err={}", .{ table_name, err });
                     return err;
@@ -11553,6 +11557,7 @@ pub const ApiHttpServer = struct {
             error.IndexRebuilding => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .index_rebuilding),
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
+            error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
             error.PersistentDescriptorAdmissionExhausted, error.StorageReadTemporarilyUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .storage_read_temporarily_unavailable),
             error.InvalidManifest,
             error.InvalidTableFile,
@@ -28626,6 +28631,7 @@ test "api http server preserves public query availability errors" {
     }{
         .{ .query_error = error.DocIdentityNamespaceMismatch, .status = 503, .body = "", .json = true, .unavailable_code = "doc_identity_unavailable", .unavailable_message = "doc identity unavailable" },
         .{ .query_error = error.ReadUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "standby_read_unavailable", .unavailable_message = "standby read unavailable" },
+        .{ .query_error = error.DistributedQueryUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "distributed_query_unavailable", .unavailable_message = "distributed query unavailable" },
         .{ .query_error = error.ReadRequiresPrimary, .status = 503, .body = "", .json = true, .unavailable_code = "read_requires_primary", .unavailable_message = "read requires primary" },
         .{ .query_error = error.StorageReadTemporarilyUnavailable, .status = 503, .body = "", .json = true, .unavailable_code = "storage_read_temporarily_unavailable", .unavailable_message = "storage read temporarily unavailable" },
         .{ .query_error = error.IndexRebuilding, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
