@@ -2010,18 +2010,14 @@ pub fn searchProfiledRequest(
     var pessimistic = false;
     while (true) {
         var fence_held = false;
-        if (comptime @hasDecl(Index, "beginCompleteSnapshotRead")) {
-            self.beginCompleteSnapshotRead();
+        if (pessimistic and comptime @hasDecl(Index, "beginCompleteSnapshotRead")) {
+            try self.beginCompleteSnapshotRead(req.cancellation);
             fence_held = true;
         }
         const token = CompleteSnapshotAttempt{
-            .snapshot = loadStableSearchPublishedSnapshot(self),
+            .snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation),
             .mutation_epoch = publishedMutationEpoch(self),
         };
-        if (!pessimistic and fence_held) {
-            self.endCompleteSnapshotRead();
-            fence_held = false;
-        }
 
         const profiled = searchProfiledRequestAttempt(self, req, token.snapshot, now_fn_u64, elapsed_fn_u64) catch |err| {
             if (fence_held) self.endCompleteSnapshotRead();
@@ -2083,7 +2079,7 @@ fn searchProfiledRequestAttempt(
     try search_types.checkCancelled(req);
     const coverage_policy = search_types.coveragePolicy(req);
     const exhaustive_coverage = coverage_policy == .complete_snapshot;
-    var published_snapshot = expected_snapshot orelse loadStableSearchPublishedSnapshot(self);
+    var published_snapshot = expected_snapshot orelse try loadStableSearchPublishedSnapshot(self, req.cancellation);
     if (published_snapshot.active_count == 0) {
         if (!exhaustive_coverage or publishedSnapshotStillCurrent(self, published_snapshot)) {
             const empty = search_results.SearchResults.init(self.alloc, req.k);
@@ -2093,7 +2089,7 @@ fn searchProfiledRequestAttempt(
                 .profile = profile,
             };
         }
-        published_snapshot = loadStableSearchPublishedSnapshot(self);
+        published_snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation);
     }
     var coverage_tracker = CompleteCoverageTracker.init(try beginCompleteCoverageValidationIfSupported(
         self,
@@ -2521,11 +2517,11 @@ fn finishPublishSearchStateIfSupported(self: anytype, publishing: bool) void {
     }
 }
 
-fn markPublishSearchStateCommittingIfSupported(self: anytype, publishing: bool) void {
+fn markPublishSearchStateCommittingIfSupported(self: anytype, publishing: bool) !void {
     if (!publishing) return;
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "markPublishedSearchStateCommitting")) {
-        self.markPublishedSearchStateCommitting();
+        try self.markPublishedSearchStateCommitting();
     }
 }
 
@@ -2544,7 +2540,27 @@ const SearchPublishedSnapshot = struct {
     publish_generation: u64,
 };
 
-fn loadStableSearchPublishedSnapshot(self: anytype) SearchPublishedSnapshot {
+fn waitForStableSearchPublicationIfSupported(
+    self: anytype,
+    generation: u64,
+    cancellation: ?search_types.CancellationToken,
+) !void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "waitForPublishedSearchState")) {
+        return try self.waitForPublishedSearchState(generation, cancellation);
+    }
+    if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+    if (builtin.os.tag == .freestanding) {
+        std.atomic.spinLoopHint();
+    } else {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn loadStableSearchPublishedSnapshot(
+    self: anytype,
+    cancellation: ?search_types.CancellationToken,
+) !SearchPublishedSnapshot {
     const Index = comptime childType(@TypeOf(self));
     if (comptime !@hasDecl(Index, "publishedGeneration")) {
         return .{
@@ -2558,7 +2574,7 @@ fn loadStableSearchPublishedSnapshot(self: anytype) SearchPublishedSnapshot {
     while (true) {
         const generation = self.publishedGeneration();
         if ((generation & 1) != 0) {
-            std.atomic.spinLoopHint();
+            try waitForStableSearchPublicationIfSupported(self, generation, cancellation);
             continue;
         }
         const snapshot: SearchPublishedSnapshot = .{
@@ -2569,7 +2585,7 @@ fn loadStableSearchPublishedSnapshot(self: anytype) SearchPublishedSnapshot {
         };
         const generation_after = self.publishedGeneration();
         if (generation == generation_after and (generation_after & 1) == 0) return snapshot;
-        std.atomic.spinLoopHint();
+        try waitForStableSearchPublicationIfSupported(self, generation_after, cancellation);
     }
 }
 
@@ -4767,7 +4783,7 @@ pub fn delete(self: anytype, vector_id: u64) !void {
     try deleteTxn(self, &txn, vector_id);
     try runAutoPostingMaintenanceTxn(self, &txn);
     try self.flushMetadata(&txn);
-    markPublishSearchStateCommittingIfSupported(self, publishing);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
     finishPublishSearchStateIfSupported(self, publishing);
 }
@@ -4784,7 +4800,7 @@ pub fn batchDelete(self: anytype, vector_ids: []const u64) !void {
     try batchDeleteTxn(self, &batch, vector_ids);
     try runAutoPostingMaintenanceTxn(self, &batch);
     try self.flushMetadata(&batch);
-    markPublishSearchStateCommittingIfSupported(self, publishing);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
     finishPublishSearchStateIfSupported(self, publishing);
 }
@@ -5189,7 +5205,7 @@ pub fn repairLinks(self: anytype, max_nodes: usize) !TreeLinkRepairReport {
     errdefer abortVectorCacheMutationsIfSupported(self);
     const report = try repairTreeLinks(self, &txn, max_nodes);
     try self.flushMetadata(&txn);
-    markPublishSearchStateCommittingIfSupported(self, publishing);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
     finishPublishSearchStateIfSupported(self, publishing);
     return report;
@@ -5441,7 +5457,7 @@ pub fn insertWithMetadata(
     try self.flushMetadata(&txn);
     self.write_profile.insert_flush_metadata_ns += elapsed_fn_u64(flush_start);
     const commit_start = now_fn_u64();
-    markPublishSearchStateCommittingIfSupported(self, publishing);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
     self.write_profile.insert_commit_ns += elapsed_fn_u64(commit_start);
     finishPublishSearchStateIfSupported(self, publishing);
@@ -6674,7 +6690,7 @@ pub fn batchApplyOptions(
         try batchDeleteTxn(self, &batch, deletes);
         try finalizeWriteTxnOptions(self, &batch, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
-        markPublishSearchStateCommittingIfSupported(self, publishing);
+        try markPublishSearchStateCommittingIfSupported(self, publishing);
         try batch.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
         finishPublishSearchStateIfSupported(self, publishing);
@@ -6707,7 +6723,7 @@ pub fn batchApplyOptions(
     if (!grouped) try batchInsertWithMetadataTxnOptions(self, &batch, writes, insert_options);
     try finalizeWriteTxnOptions(self, &batch, insert_options, now_fn, elapsed_fn);
     const commit_start = now_fn();
-    markPublishSearchStateCommittingIfSupported(self, publishing);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
     finishPublishSearchStateIfSupported(self, publishing);
@@ -6740,7 +6756,7 @@ pub fn batchInsertWithMetadataOptions(
         if (!grouped) try batchInsertWithMetadataTxnOptions(self, &batch, items, options);
         try finalizeWriteTxnOptions(self, &batch, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
-        markPublishSearchStateCommittingIfSupported(self, publishing);
+        try markPublishSearchStateCommittingIfSupported(self, publishing);
         try batch.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
         finishPublishSearchStateIfSupported(self, publishing);
@@ -6754,7 +6770,7 @@ pub fn batchInsertWithMetadataOptions(
         try batchInsertWithMetadataTxnOptions(self, &txn, items, options);
         try finalizeWriteTxnOptions(self, &txn, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
-        markPublishSearchStateCommittingIfSupported(self, publishing);
+        try markPublishSearchStateCommittingIfSupported(self, publishing);
         try txn.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
         finishPublishSearchStateIfSupported(self, publishing);
@@ -7464,7 +7480,7 @@ pub fn bulkBuildWithMetadataOptions(
     try bulkBuildWithMetadataTxnOptions(self, &batch, items, options, now_fn, elapsed_fn);
     try finalizeWriteTxnOptions(self, &batch, .{}, now_fn, elapsed_fn);
     const commit_start = now_fn();
-    markPublishSearchStateCommittingIfSupported(self, publishing);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
     finishPublishSearchStateIfSupported(self, publishing);

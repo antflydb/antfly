@@ -184,7 +184,27 @@ pub const PublishedSnapshot = struct {
     publish_generation: u64,
 };
 
-fn loadStablePublishedSnapshot(self: anytype) PublishedSnapshot {
+fn waitForStablePublicationIfSupported(
+    self: anytype,
+    generation: u64,
+    cancellation: ?search_types.CancellationToken,
+) !void {
+    const Index = comptime @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "waitForPublishedSearchState")) {
+        return try self.waitForPublishedSearchState(generation, cancellation);
+    }
+    if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+    if (builtin.os.tag == .freestanding) {
+        std.atomic.spinLoopHint();
+    } else {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn loadStablePublishedSnapshot(
+    self: anytype,
+    cancellation: ?search_types.CancellationToken,
+) !PublishedSnapshot {
     const Index = comptime @TypeOf(self.*);
     if (comptime !@hasDecl(Index, "publishedGeneration")) {
         return .{
@@ -197,7 +217,7 @@ fn loadStablePublishedSnapshot(self: anytype) PublishedSnapshot {
     while (true) {
         const generation = publishedGenerationSnapshot(self);
         if ((generation & 1) != 0) {
-            std.atomic.spinLoopHint();
+            try waitForStablePublicationIfSupported(self, generation, cancellation);
             continue;
         }
         const root_node = publishedRootNodeSnapshot(self);
@@ -210,7 +230,7 @@ fn loadStablePublishedSnapshot(self: anytype) PublishedSnapshot {
                 .publish_generation = generation,
             };
         }
-        std.atomic.spinLoopHint();
+        try waitForStablePublicationIfSupported(self, generation_after, cancellation);
     }
 }
 
@@ -438,7 +458,7 @@ fn acquireFlatCentroidDirectory(
     }
 
     while (true) {
-        const snapshot = loadStablePublishedSnapshot(self);
+        const snapshot = try loadStablePublishedSnapshot(self, cancellation);
 
         var stale: ?*FlatCentroidDirectory = null;
         lockAtomicMutex(&self.flat_centroid_mu);
@@ -466,7 +486,7 @@ fn acquireFlatCentroidDirectory(
         }
         errdefer built.deinit(self.alloc);
 
-        const current = loadStablePublishedSnapshot(self);
+        const current = try loadStablePublishedSnapshot(self, cancellation);
         if (current.root_node != snapshot.root_node or
             current.node_count != snapshot.node_count or
             current.publish_generation != snapshot.publish_generation)

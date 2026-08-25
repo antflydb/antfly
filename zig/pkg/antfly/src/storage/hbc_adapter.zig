@@ -2106,6 +2106,13 @@ const CompleteCoverageFlight = struct {
     refs: usize = 1,
 };
 
+const PublishedSearchStateFlight = struct {
+    generation: u64 = 0,
+    io: std.Io = undefined,
+    ready: std.Io.Event = .unset,
+    refs: usize = 0,
+};
+
 pub const HBCIndex = struct {
     alloc: Allocator,
     env_owner: EnvOwner,
@@ -2117,15 +2124,22 @@ pub const HBCIndex = struct {
     published_node_count: AtomicU64,
     published_generation: AtomicU64,
     // Publishers take the exclusive side before mutating topology or caches.
-    // Complete searches normally use short shared capture/validation sections
-    // and retry optimistically; only a conflicting retry holds the shared side
-    // for progress. Best-effort searches remain lock-free.
+    // Complete searches retry optimistically; only a conflicting retry holds
+    // the shared side for progress. Shared acquisition and odd-generation
+    // waits are cooperative through std.Io. Best-effort searches remain
+    // lock-free.
     published_snapshot_mu: apply_rw_lock_mod.ApplyRwLock = .{},
     published_mutation_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Seqlock-style epoch for optimistic complete-snapshot searches. Every
     /// mutation, including an aborted one that leaves the durable generation
     /// unchanged, advances this from even -> odd -> even.
     published_mutation_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Publication commits may include durable I/O. Readers of an odd
+    /// generation retain the active flight and sleep on its runtime event
+    /// instead of occupying an OS thread with an unbounded seqlock spin.
+    published_flight_mu: std.atomic.Mutex = .unlocked,
+    published_flight: ?*PublishedSearchStateFlight = null,
+    published_spare_flight: ?*PublishedSearchStateFlight = null,
     /// Exact reachable-vector coverage is immutable within a published
     /// generation, so only the first complete search needs to validate it.
     complete_coverage_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64)),
@@ -2265,7 +2279,12 @@ pub const HBCIndex = struct {
 
             pub fn commit(self: *Self) !void {
                 if (!self.active) return error.TransactionClosed;
-                self.owner.markPublishedSearchStateCommitting();
+                self.owner.markPublishedSearchStateCommitting() catch |err| {
+                    self.inner.abort();
+                    self.owner.abortPublishedSearchStateRefresh();
+                    self.active = false;
+                    return err;
+                };
                 self.inner.commit() catch |err| {
                     self.inner.abort();
                     self.owner.abortPublishedSearchStateRefresh();
@@ -2701,7 +2720,7 @@ pub const HBCIndex = struct {
                 try self.flushMetadataNow(&batch);
                 if (!has_more_deferred_splits) try self.clearBulkPublishStateTxn(&batch);
                 const commit_start = nowNs();
-                self.markPublishedSearchStateCommitting();
+                try self.markPublishedSearchStateCommitting();
                 try batch.commit();
                 self.write_profile.insert_commit_ns += elapsedSince(commit_start);
                 self.finishPublishedSearchStateRefresh();
@@ -2927,6 +2946,10 @@ pub const HBCIndex = struct {
         const cache_identity = try hbcCacheIdentityAlloc(alloc, std.mem.span(path));
         errdefer alloc.free(cache_identity.stable_path);
 
+        const published_spare_flight = try alloc.create(PublishedSearchStateFlight);
+        errdefer alloc.destroy(published_spare_flight);
+        published_spare_flight.* = .{};
+
         const idx = HBCIndex{
             .alloc = alloc,
             .env_owner = env_owner,
@@ -2937,6 +2960,7 @@ pub const HBCIndex = struct {
             .published_active_count = .init(metadata.active_count),
             .published_node_count = .init(metadata.node_count),
             .published_generation = .init(0),
+            .published_spare_flight = published_spare_flight,
             .rng = go_rand.GoPcg.init(effective_config.quantizer_seed, 1024),
             .quantizer = quantizer,
             .rot = rot,
@@ -3010,34 +3034,130 @@ pub const HBCIndex = struct {
         self.published_mutation_active.store(true, .release);
     }
 
-    pub fn markPublishedSearchStateCommitting(self: *HBCIndex) void {
+    fn acquirePublishedSearchStateFlight(self: *HBCIndex) !*PublishedSearchStateFlight {
+        lockAtomic(&self.published_flight_mu);
+        if (self.published_spare_flight) |flight| {
+            self.published_spare_flight = null;
+            self.published_flight_mu.unlock();
+            return flight;
+        }
+        self.published_flight_mu.unlock();
+        const flight = try self.alloc.create(PublishedSearchStateFlight);
+        flight.* = .{};
+        return flight;
+    }
+
+    fn releasePublishedSearchStateFlightRef(self: *HBCIndex, flight: *PublishedSearchStateFlight) void {
+        var destroy = false;
+        lockAtomic(&self.published_flight_mu);
+        std.debug.assert(flight.refs > 0);
+        flight.refs -= 1;
+        if (flight.refs == 0) {
+            if (self.published_spare_flight == null) {
+                self.published_spare_flight = flight;
+            } else {
+                destroy = true;
+            }
+        }
+        self.published_flight_mu.unlock();
+        if (destroy) self.alloc.destroy(flight);
+    }
+
+    fn wakePublishedSearchStateWaiters(self: *HBCIndex) void {
+        lockAtomic(&self.published_flight_mu);
+        const flight = self.published_flight;
+        self.published_flight = null;
+        self.published_flight_mu.unlock();
+        if (flight) |active| {
+            active.ready.set(active.io);
+            self.releasePublishedSearchStateFlightRef(active);
+        }
+    }
+
+    pub fn waitForPublishedSearchState(
+        self: *HBCIndex,
+        observed_generation: u64,
+        cancellation: ?vectorindex_search_types.CancellationToken,
+    ) !void {
+        while (true) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+
+            lockAtomic(&self.published_flight_mu);
+            const current_generation = self.published_generation.load(.acquire);
+            if (current_generation != observed_generation or (current_generation & 1) == 0) {
+                self.published_flight_mu.unlock();
+                return;
+            }
+            const flight = self.published_flight orelse {
+                // In-memory refreshes have a deliberately tiny odd window and
+                // do not allocate a flight. Yield through the backend runtime
+                // rather than falling back to an OS-thread spin.
+                self.published_flight_mu.unlock();
+                self.runtimeIo().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch |err| switch (err) {
+                    error.Canceled => return error.Cancelled,
+                };
+                continue;
+            };
+            std.debug.assert(flight.generation == observed_generation);
+            flight.refs += 1;
+            self.published_flight_mu.unlock();
+            defer self.releasePublishedSearchStateFlightRef(flight);
+
+            while (!flight.ready.isSet()) {
+                if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+                flight.ready.waitTimeout(flight.io, .{
+                    .duration = .{
+                        .raw = std.Io.Duration.fromMilliseconds(5),
+                        .clock = .awake,
+                    },
+                }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    error.Canceled => return error.Cancelled,
+                };
+            }
+            return;
+        }
+    }
+
+    pub fn markPublishedSearchStateCommitting(self: *HBCIndex) !void {
         std.debug.assert(self.published_mutation_active.load(.acquire));
+        const flight = try self.acquirePublishedSearchStateFlight();
+        const generation = self.published_generation.load(.acquire);
+        std.debug.assert((generation & 1) == 0);
+        flight.ready.reset();
+        flight.generation = generation +% 1;
+        flight.io = self.runtimeIo();
+        flight.refs = 1;
+
+        // Install the flight before making the odd generation observable, so
+        // every durable-commit waiter has a stable event to retain.
+        lockAtomic(&self.published_flight_mu);
+        std.debug.assert(self.published_flight == null);
+        self.published_flight = flight;
         _ = self.published_generation.fetchAdd(1, .acq_rel);
+        self.published_flight_mu.unlock();
         vectorindex_spfresh_index.clearFlatCentroidDirectory(self);
     }
 
     pub fn finishPublishedSearchStateRefresh(self: *HBCIndex) void {
-        // Publication paths normally mark explicitly just before commit so
-        // readers cannot observe an odd durable generation early. Keep this
-        // fallback for adapters that only provide begin/finish hooks.
-        if ((self.published_generation.load(.acquire) & 1) == 0) {
-            self.markPublishedSearchStateCommitting();
-        }
+        // Publication paths mark explicitly just before commit, after staging
+        // is complete, so the odd generation covers only the durable commit
+        // and final in-memory publication.
+        std.debug.assert((self.published_generation.load(.acquire) & 1) != 0);
         self.published_root_node.store(self.metadata.root_node, .release);
         self.published_active_count.store(self.metadata.active_count, .release);
         self.published_node_count.store(self.metadata.node_count, .release);
-        _ = self.published_generation.fetchAdd(1, .acq_rel);
         self.finishVectorCacheMutations();
         const previous_mutation = self.published_mutation_epoch.fetchAdd(1, .acq_rel);
         std.debug.assert((previous_mutation & 1) != 0);
         self.published_mutation_active.store(false, .release);
+        _ = self.published_generation.fetchAdd(1, .acq_rel);
+        self.wakePublishedSearchStateWaiters();
         self.published_snapshot_mu.unlockExclusive();
     }
 
     pub fn abortPublishedSearchStateRefresh(self: *HBCIndex) void {
-        if ((self.published_generation.load(.acquire) & 1) != 0) {
-            _ = self.published_generation.fetchAdd(1, .acq_rel);
-        }
+        const marked_committing = (self.published_generation.load(.acquire) & 1) != 0;
         // Mutation helpers can populate caches before the storage commit so
         // later operations in the same transaction can reuse staged state.
         // None of those entries may escape an abort. Clearing transaction-
@@ -3053,13 +3173,29 @@ pub const HBCIndex = struct {
         const previous_mutation = self.published_mutation_epoch.fetchAdd(1, .acq_rel);
         std.debug.assert((previous_mutation & 1) != 0);
         self.published_mutation_active.store(false, .release);
+        if (marked_committing) {
+            _ = self.published_generation.fetchAdd(1, .acq_rel);
+            self.wakePublishedSearchStateWaiters();
+        }
         self.published_snapshot_mu.unlockExclusive();
     }
 
     pub fn refreshPublishedSearchState(self: *HBCIndex) void {
         self.beginPublishedSearchStateRefresh();
-        self.markPublishedSearchStateCommitting();
-        self.finishPublishedSearchStateRefresh();
+        // This path only republishes already-durable in-memory state. Its odd
+        // window contains no storage I/O, so readers that observe it take the
+        // cooperative no-flight wait in waitForPublishedSearchState.
+        _ = self.published_generation.fetchAdd(1, .acq_rel);
+        vectorindex_spfresh_index.clearFlatCentroidDirectory(self);
+        self.published_root_node.store(self.metadata.root_node, .release);
+        self.published_active_count.store(self.metadata.active_count, .release);
+        self.published_node_count.store(self.metadata.node_count, .release);
+        self.finishVectorCacheMutations();
+        const previous_mutation = self.published_mutation_epoch.fetchAdd(1, .acq_rel);
+        std.debug.assert((previous_mutation & 1) != 0);
+        self.published_mutation_active.store(false, .release);
+        _ = self.published_generation.fetchAdd(1, .acq_rel);
+        self.published_snapshot_mu.unlockExclusive();
     }
 
     pub fn shouldPublishSearchStateAfterWrite(self: *const HBCIndex) bool {
@@ -3096,7 +3232,7 @@ pub const HBCIndex = struct {
         self.runtime_io = io;
     }
 
-    fn coverageIo(self: *const HBCIndex) std.Io {
+    fn runtimeIo(self: *const HBCIndex) std.Io {
         return self.runtime_io orelse std.Io.Threaded.global_single_threaded.io();
     }
 
@@ -3156,7 +3292,7 @@ pub const HBCIndex = struct {
 
             self.complete_coverage_state_mu.unlock();
             const candidate = try self.alloc.create(CompleteCoverageFlight);
-            candidate.* = .{ .generation = generation, .io = self.coverageIo() };
+            candidate.* = .{ .generation = generation, .io = self.runtimeIo() };
             if (cancellation) |token| if (token.isCancelled()) {
                 self.alloc.destroy(candidate);
                 return error.Cancelled;
@@ -3837,6 +3973,12 @@ pub const HBCIndex = struct {
             scratch.deinit(self.alloc);
         }
         vectorindex_spfresh_index.clearFlatCentroidDirectory(self);
+        lockAtomic(&self.published_flight_mu);
+        std.debug.assert(self.published_flight == null);
+        const published_spare_flight = self.published_spare_flight;
+        self.published_spare_flight = null;
+        self.published_flight_mu.unlock();
+        if (published_spare_flight) |flight| self.alloc.destroy(flight);
         self.deinitBulkSplitVectorWorkspace();
         self.deferred_oversized_leaves.clearRetainingCapacity();
         self.apply_workspace_split_bytes = 0;
@@ -4221,8 +4363,24 @@ pub const HBCIndex = struct {
             try self.beginRuntimeSearchTxn();
     }
 
-    pub fn beginCompleteSnapshotRead(self: *HBCIndex) void {
-        self.published_snapshot_mu.lockShared();
+    pub fn beginCompleteSnapshotRead(
+        self: *HBCIndex,
+        cancellation: ?vectorindex_search_types.CancellationToken,
+    ) !void {
+        while (!self.published_snapshot_mu.tryLockShared()) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            const generation = self.published_generation.load(.acquire);
+            if ((generation & 1) != 0) {
+                try self.waitForPublishedSearchState(generation, cancellation);
+                continue;
+            }
+            // A writer can hold the progress fence while preparing a mutation,
+            // before a durable commit makes generation odd. Wait cooperatively
+            // so a pessimistic complete-search retry remains cancellable.
+            self.runtimeIo().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch |err| switch (err) {
+                error.Canceled => return error.Cancelled,
+            };
+        }
     }
 
     pub fn endCompleteSnapshotRead(self: *HBCIndex) void {
@@ -8228,6 +8386,116 @@ test "complete coverage validation waiter honors cancellation without canceling 
     idx.finishCompleteCoverageValidation(generation, true);
     owner_active = false;
     try std.testing.expect(!try idx.beginCompleteCoverageValidation(generation, null));
+}
+
+test "search publication wait uses runtime wakeups and honors cancellation" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    idx.setIo(io);
+
+    const Searcher = struct {
+        fn run(index: *HBCIndex, cancellation: ?vectorindex_search_types.CancellationToken) !usize {
+            var results = try index.searchWithRequest(.{
+                .query = &.{ 0, 0 },
+                .k = 1,
+                .cancellation = cancellation,
+            });
+            defer results.deinit();
+            return results.getHits().len;
+        }
+    };
+    const FenceReader = struct {
+        fn run(index: *HBCIndex, signal: *const std.atomic.Value(bool)) !void {
+            try index.beginCompleteSnapshotRead(vectorindex_search_types.CancellationToken.fromAtomic(signal));
+            index.endCompleteSnapshotRead();
+        }
+    };
+
+    idx.beginPublishedSearchStateRefresh();
+    var publication_active = true;
+    defer if (publication_active) idx.abortPublishedSearchStateRefresh();
+
+    // The writer fence is acquired before generation becomes odd. A
+    // pessimistic complete-search retry must also wait cooperatively and honor
+    // cancellation during this preparation window.
+    var fence_cancelled = std.atomic.Value(bool).init(false);
+    var fence_reader = std.Io.async(io, FenceReader.run, .{ &idx, &fence_cancelled });
+    try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    fence_cancelled.store(true, .release);
+    try std.testing.expectError(error.Cancelled, fence_reader.await(io));
+
+    try idx.markPublishedSearchStateCommitting();
+    const first_odd_generation = idx.publishedGeneration();
+    try std.testing.expect((first_odd_generation & 1) != 0);
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    var cancelled_search = std.Io.async(io, Searcher.run, .{
+        &idx,
+        vectorindex_search_types.CancellationToken.fromAtomic(&cancelled),
+    });
+    try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    cancelled.store(true, .release);
+    try std.testing.expectError(error.Cancelled, cancelled_search.await(io));
+
+    // Cancellation releases only the reader reference. The publisher still
+    // owns the flight and can complete the aborted generation normally.
+    idx.abortPublishedSearchStateRefresh();
+    publication_active = false;
+    try std.testing.expect((idx.publishedGeneration() & 1) == 0);
+    try std.testing.expect(idx.published_flight == null);
+    try std.testing.expect(idx.published_spare_flight != null);
+
+    // Reuse the same flight for a second generation and prove that a normal
+    // waiter wakes immediately when publication becomes stable.
+    idx.beginPublishedSearchStateRefresh();
+    try idx.markPublishedSearchStateCommitting();
+    publication_active = true;
+    const second_odd_generation = idx.publishedGeneration();
+    try std.testing.expect(second_odd_generation > first_odd_generation);
+    var waiting_search = std.Io.async(io, Searcher.run, .{ &idx, null });
+    try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    idx.finishPublishedSearchStateRefresh();
+    publication_active = false;
+    try std.testing.expectEqual(@as(usize, 0), try waiting_search.await(io));
+    try std.testing.expect((idx.publishedGeneration() & 1) == 0);
+    try std.testing.expect(idx.published_flight == null);
+    try std.testing.expect(idx.published_spare_flight != null);
+
+    // A waiter may retain the old flight after its generation is stable. The
+    // next publisher must safely allocate and initialize an overflow flight;
+    // releasing either generation later must preserve exactly one spare.
+    idx.beginPublishedSearchStateRefresh();
+    try idx.markPublishedSearchStateCommitting();
+    publication_active = true;
+    lockAtomic(&idx.published_flight_mu);
+    const retained_flight = idx.published_flight.?;
+    retained_flight.refs += 1;
+    idx.published_flight_mu.unlock();
+    idx.finishPublishedSearchStateRefresh();
+    publication_active = false;
+    try std.testing.expect(idx.published_spare_flight == null);
+
+    idx.beginPublishedSearchStateRefresh();
+    try idx.markPublishedSearchStateCommitting();
+    publication_active = true;
+    const overflow_flight = idx.published_flight.?;
+    try std.testing.expect(overflow_flight != retained_flight);
+    try std.testing.expect(!overflow_flight.ready.isSet());
+    try std.testing.expectEqual(@as(usize, 1), overflow_flight.refs);
+    idx.abortPublishedSearchStateRefresh();
+    publication_active = false;
+    idx.releasePublishedSearchStateFlightRef(retained_flight);
+    try std.testing.expect(idx.published_flight == null);
+    try std.testing.expect(idx.published_spare_flight != null);
 }
 
 test "complete snapshot retries optimistic publication conflicts under a progress fence" {
