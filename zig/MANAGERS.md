@@ -819,6 +819,8 @@ The reproducible production-boundary driver is
 `scripts/run_resource_manager_cache_matrix.sh`. It builds the production
 standalone server and harness in `ReleaseFast` by default, assigns an explicit
 process memory envelope to every child,
+routes process/filesystem operations through `std.Io`, and uses
+`lib/platform` for monotonic time, sleeping, and cooperative thread waits,
 and records commands, environment, per-case logs, status, and JSONL summaries
 under `zig/bench/results/resource-manager-cache-matrix/`. Its default matrix
 covers dense and 1%/10% filtered-dense searches at 50k, 600k, 700k, 800k, and 1M,
@@ -831,18 +833,26 @@ selectivity regresses below 70% of the matched 10% lane, when the maximum
 thread lane fails to exceed one-thread QPS by 25%, when the search health probe
 exceeds 20 ms (invalidating a contaminated-host result), when the exact source
 vector is not returned at k, top-1 source recall falls below 95%, or sampled
-exact ground-truth recall@k falls below 90%, when
+exact ground-truth recall@k falls below 90% in any of the 50k/1%, 1M dense,
+1M/1%, or 1M/10% lanes, when
 the maximum load or search RSS across successful recorded cases exceeds 125%
 of the explicit process envelope, when their maximum HBC-accounted bytes
 exceed that envelope, when the maintenance soak falls below 70% of its
 base lane, or without separately populated cold/warm phases. All thresholds
 remain environment-overridable for an explicitly different resource envelope.
 The release-blocker recall suite, per-lane source-vector canary, and sampled
-exact top-k ground truth run before a result is accepted as evidence. Exact
-ground-truth scans and their validation requests run after every timed QPS,
-latency, cache-residency, and RSS measurement so validation cannot warm or
-otherwise improve the reported performance lane. The sample count and minimum
-recall remain environment-overridable for longer qualification runs.
+exact top-k ground truth run before a result is accepted as evidence. The
+primary concurrent worker retains the selected response hits during the timed
+QPS lane, while exact ground-truth scans run locally afterward. Validation
+therefore observes the routing and cache pressure that produced the reported
+QPS without issuing post-measurement requests that could take a different
+adaptive route. Production runs sample every one of the eight generated-vector
+clusters before revisiting a cluster and record `exact_recall_lane`, sample
+count, and covered strata in each JSON summary. The sample count, required
+strata, and minimum recall remain environment-overridable for longer
+qualification runs. Exact truth is enabled explicitly only for those four
+qualification cases (and reduced smoke cases); maintenance soaks and ad-hoc
+scale diagnostics never inherit the full scans from a matching shape or size.
 Run the reduced
 endpoint/integration check before the evidence-producing matrix:
 
