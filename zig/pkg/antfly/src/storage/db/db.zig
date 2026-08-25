@@ -6258,7 +6258,25 @@ pub const DB = struct {
         defer sync_targets.deinit(self.alloc);
         var materialized_derived_batch: ?derived_types.DerivedBatch = null;
         defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(self.alloc, materialized_batch);
-        const sequence = self.core.reserveDerivedAppendSequence();
+        // An exact source retry that only refreshes timestamp metadata has no
+        // derived visibility transition. Reuse the current committed fence
+        // instead of reserving a sequence that would either be lost (and make
+        // the in-memory generation move backwards after restart) or require a
+        // synthetic replay item that every managed consumer must drain.
+        const elide_semantic_noop_replay = use_thin_replay_fast_path and
+            opts.extra_store_writes.len == 0 and
+            opts.transaction_resolution == null and
+            opts.ha_applied_lsn_marker == null and
+            !thinReplayInputsHaveDerivedWork(
+                effective_req,
+                deleted_artifact_keys,
+                changed_graph_artifact_keys.items,
+                derived_changed_flags,
+            );
+        const sequence = if (elide_semantic_noop_replay)
+            self.core.nextDerivedSequence()
+        else
+            self.core.reserveDerivedAppendSequence();
         const identity_metadata_start_ns = monotonicTimeNs();
         const identity_live_before = if (identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
             (try doc_identity.fastStatsFromStore(self.core.store)).live_ordinals
@@ -6359,7 +6377,7 @@ pub const DB = struct {
         };
         defer self.alloc.free(replay_payload);
         const append_derived_replay = !opts.suppress_derived_replay_append and
-            (!use_thin_replay_fast_path or try thinReplayPayloadHasDerivedWork(self.alloc, replay_payload));
+            !elide_semantic_noop_replay;
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.build_derived_ns, build_derived_start_ns);
 
         const store_write_start_ns = monotonicTimeNs();
@@ -6610,15 +6628,28 @@ pub const DB = struct {
         return json_helpers.jsonValuesEqual(lhs_parsed.value, rhs_parsed.value);
     }
 
-    fn thinReplayPayloadHasDerivedWork(alloc: Allocator, payload: []const u8) !bool {
-        var decoded = try change_journal_mod.decodeRecord(alloc, payload);
-        defer decoded.deinit();
-        const record = decoded.record;
-        return record.changed_doc_keys.len != 0 or
-            record.deleted_doc_keys.len != 0 or
-            record.overwritten_doc_keys.len != 0 or
-            record.changed_artifact_keys.len != 0 or
-            record.target_hints.len != 0;
+    fn thinReplayInputsHaveDerivedWork(
+        req: types.BatchRequest,
+        deleted_artifact_keys: []const []u8,
+        changed_artifact_keys: []const []u8,
+        derived_changed_flags: []const bool,
+    ) bool {
+        if (req.deletes.len != 0 or
+            req.graph_writes.len != 0 or
+            req.graph_deletes.len != 0 or
+            deleted_artifact_keys.len != 0 or
+            changed_artifact_keys.len != 0 or
+            req.split_checkpoint != null or
+            req.split_replication != null or
+            req.split_transition != null or
+            req.transaction != null)
+        {
+            return true;
+        }
+        for (derived_changed_flags) |changed| {
+            if (changed) return true;
+        }
+        return false;
     }
 
     fn removePendingStoreWriteByKey(writes: *std.ArrayListUnmanaged(docstore_mod.KVPair), key: []const u8) void {
@@ -85465,15 +85496,29 @@ test "db identical rewrite refreshes timestamp metadata" {
         .writes = &.{.{ .key = "doc:a", .value = document }},
         .timestamp_ns = 100,
     });
+    const first_replay_sequence = db.core.nextDerivedSequence();
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = document }},
         .timestamp_ns = 200,
     });
+    const no_op_replay_sequence = db.core.nextDerivedSequence();
 
     try std.testing.expectEqual(@as(u64, 200), try db.getTimestamp(alloc, "doc:a"));
+    try std.testing.expectEqual(first_replay_sequence, no_op_replay_sequence);
     const stored = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
     defer alloc.free(stored);
     try std.testing.expectEqualStrings(document, stored);
+
+    const replay = try db.core.store.iterateReplayFrom(alloc, no_op_replay_sequence + 1);
+    defer {
+        for (replay) |*entry| entry.deinit(alloc);
+        alloc.free(replay);
+    }
+    try std.testing.expectEqual(@as(usize, 0), replay.len);
+
+    db.close();
+    db = try DB.open(alloc, std.mem.span(path), .{});
+    try std.testing.expectEqual(no_op_replay_sequence, db.core.nextDerivedSequence());
 }
 
 test "db lookup hides expired documents when ttl schema is configured" {

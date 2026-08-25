@@ -110,6 +110,13 @@ def main() -> int:
         fail("the quickstart must have exactly one shared Wikipedia ingestion step")
     if source.index("antfly load --table wikipedia") > source.index("## Search"):
         fail("the shared ingestion step must precede every search example")
+    load_blocks = [
+        block
+        for language, block in blocks
+        if language in {"bash", "sh", "shell"} and "antfly load --table wikipedia" in block
+    ]
+    if len(load_blocks) != 1 or "--sync-level full_text" not in load_blocks[0]:
+        fail("the shared load must fence full-text visibility without waiting for embeddings")
     wait_blocks = [
         block
         for language, block in blocks

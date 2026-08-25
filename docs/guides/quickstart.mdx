@@ -315,12 +315,15 @@ managed embeddings index created above.
 # Load all 10,000 articles using the title as the document ID
 antfly load --table wikipedia \
   --file wiki-articles.jsonl \
-  --id-field title
+  --id-field title \
+  --sync-level full_text
 ```
 
 <Callout type="info">
 This shared load step ensures that every query tab below runs against the same
-dataset. The CLI reads JSONL and batches documents automatically. Applications
+dataset. `full_text` fences the inexpensive text index for each load batch but
+does not wait for embeddings, which continue asynchronously. The CLI reads
+JSONL and batches documents automatically. Applications
 that need to own ingestion should use the SDK [Batch Operations](/docs/api/data-operations)
 workflow with bounded batches and retries.
 </Callout>
