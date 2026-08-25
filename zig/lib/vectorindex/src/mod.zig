@@ -187,6 +187,8 @@ test "search effort normalization owns exhaustive coverage semantics" {
     try std.testing.expectEqual(@as(f32, 1), search_types.normalizedSearchEffort(.{ .query = &.{}, .k = 1, .search_effort = 2 }).?);
     try std.testing.expect(!search_types.requiresExhaustiveCoverage(.{ .query = &.{}, .k = 1, .search_effort = 0.999 }));
     try std.testing.expect(search_types.requiresExhaustiveCoverage(.{ .query = &.{}, .k = 1, .search_effort = 1 }));
+    try std.testing.expectEqual(search_types.CoveragePolicy.best_effort, search_types.coveragePolicy(.{ .query = &.{}, .k = 1, .search_effort = 0.999 }));
+    try std.testing.expectEqual(search_types.CoveragePolicy.complete_snapshot, search_types.coveragePolicy(.{ .query = &.{}, .k = 1, .search_effort = 1 }));
 }
 
 test "candidate ANN ordering is independent of resolved subtree bounds" {

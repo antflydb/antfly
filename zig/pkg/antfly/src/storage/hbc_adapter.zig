@@ -7624,6 +7624,105 @@ test "hbc repairTreeLinks clears dangling references and restores consistency" {
     }
 }
 
+test "flat rabitq complete snapshot rejects a directory built with dangling nodes" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 4,
+        .leaf_size = 4,
+        .branching_factor = 4,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .flat_centroid_block_size = 4,
+    });
+    defer idx.close();
+
+    var prng = std.Random.DefaultPrng.init(0xf1a7_d1a0);
+    const random = prng.random();
+    var id: u64 = 1;
+    while (id <= 60) : (id += 1) {
+        var vector: [4]f32 = undefined;
+        for (&vector) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+        try idx.insert(id, &vector);
+    }
+
+    const victim_leaf = (try idx.debugLeafForVector(7)) orelse return error.TestUnexpectedResult;
+    {
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        try idx.deleteNode(&txn, victim_leaf);
+        try txn.commit();
+    }
+
+    const query = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    var partial = try idx.searchWithRequest(.{
+        .query = &query,
+        .k = 5,
+        .load_metadata = false,
+    });
+    defer partial.deinit();
+    try std.testing.expect(partial.getHits().len > 0);
+
+    try std.testing.expectError(
+        error.IncompletePublishedSnapshot,
+        idx.searchWithRequest(.{
+            .query = &query,
+            .k = 5,
+            .search_effort = 1,
+            .load_metadata = false,
+        }),
+    );
+}
+
+test "root leaf complete snapshot rejects a missing referenced vector" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 64,
+        .branching_factor = 4,
+        .use_quantization = false,
+    });
+    defer idx.close();
+
+    try idx.insert(1, &.{ 0, 0 });
+    try idx.insert(2, &.{ 1, 0 });
+    try idx.insert(3, &.{ 0, 1 });
+
+    {
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        var key_buf: [10]u8 = undefined;
+        try idx.deleteNamespaced(&txn, .vecs, encodeVecKey(&key_buf, 1));
+        try txn.commit();
+    }
+    idx.invalidateVectorCache(1);
+
+    var partial = try idx.searchWithRequest(.{
+        .query = &.{ 0, 0 },
+        .k = 3,
+        .load_metadata = false,
+    });
+    defer partial.deinit();
+    try std.testing.expectEqual(@as(usize, 2), partial.getHits().len);
+
+    try std.testing.expectError(
+        error.IncompletePublishedSnapshot,
+        idx.searchWithRequest(.{
+            .query = &.{ 0, 0 },
+            .k = 3,
+            .search_effort = 1,
+            .load_metadata = false,
+        }),
+    );
+}
+
 test "hbc duplicate child links are dropped by unlink and repair" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};

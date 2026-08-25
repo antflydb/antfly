@@ -9324,6 +9324,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    const hbc_isolate_build_options = b.addOptions();
+    hbc_isolate_build_options.addOption([]const u8, "lmdb_backend", @tagName(lmdb_backend));
+    hbc_isolate_build_options.addOption(bool, "lmdb_evented_async_io", lmdb_evented_async_io);
+    hbc_isolate_build_options.addOption(bool, "storage_sim_soak", false);
+    hbc_isolate_build_options.addOption(bool, "with_tla", with_tla);
+    hbc_isolate_build_options.addOption(bool, "link_libc", true);
+    hbc_isolate_build_options.addOption(bool, "standalone_runtime_focused_test", false);
+    hbc_isolate_build_options.addOption(bool, "lmdb_enabled", true);
+    hbc_isolate_build_options.addOption(bool, "bench_minimal_deps", true);
+    hbc_isolate_root_mod.addOptions("build_options", hbc_isolate_build_options);
     hbc_isolate_root_mod.addImport("lmdb_engine", lmdb_engine_mod);
     hbc_isolate_root_mod.addImport("bloom", bloom_mod);
     hbc_isolate_root_mod.addImport("antfly_vector", vector_mod);

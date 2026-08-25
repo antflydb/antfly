@@ -81,8 +81,23 @@ pub fn normalizedSearchEffort(req: SearchRequest) ?f32 {
     return std.math.clamp(effort, 0, 1);
 }
 
+/// Controls whether search may tolerate a partially readable index snapshot.
+/// Approximate requests preserve availability by skipping missing artifacts;
+/// full-effort requests must either cover the published snapshot or fail.
+pub const CoveragePolicy = enum {
+    best_effort,
+    complete_snapshot,
+};
+
+pub fn coveragePolicy(req: SearchRequest) CoveragePolicy {
+    return if ((normalizedSearchEffort(req) orelse return .best_effort) >= 1)
+        .complete_snapshot
+    else
+        .best_effort;
+}
+
 pub fn requiresExhaustiveCoverage(req: SearchRequest) bool {
-    return (normalizedSearchEffort(req) orelse return false) >= 1;
+    return coveragePolicy(req) == .complete_snapshot;
 }
 
 pub fn checkCancelled(req: SearchRequest) !void {

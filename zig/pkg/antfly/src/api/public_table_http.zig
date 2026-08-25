@@ -137,6 +137,7 @@ pub const TableApi = struct {
         CorruptInput,
         UnsupportedVersion,
         Corrupted,
+        IncompletePublishedSnapshot,
         InternalFailure,
     };
 
@@ -704,6 +705,7 @@ pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
         error.CorruptInput,
         error.UnsupportedVersion,
         error.Corrupted,
+        error.IncompletePublishedSnapshot,
         => true,
         else => false,
     };
@@ -952,6 +954,7 @@ pub fn handleTableQueryRequest(
             error.CorruptInput,
             error.UnsupportedVersion,
             error.Corrupted,
+            error.IncompletePublishedSnapshot,
             => {
                 std.log.err("public table query storage unreadable table={s} err={}", .{ table_name, err });
                 return .{
@@ -2745,6 +2748,7 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.HierarchyCursorStale, .status = 409, .body = "{\"status\":409,\"error\":\"hierarchy_cursor_stale\",\"message\":\"the source hierarchy changed after this cursor was issued\",\"action\":\"restart_hierarchy_traversal\",\"restart_without\":\"search_after\",\"retryable\":false}", .json = true },
         .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
+        .{ .err = error.IncompletePublishedSnapshot, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"IncompletePublishedSnapshot\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
 
     for (cases) |tc| {

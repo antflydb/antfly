@@ -8004,6 +8004,7 @@ pub const ApiHttpServer = struct {
             error.CorruptInput => return error.CorruptInput,
             error.UnsupportedVersion => return error.UnsupportedVersion,
             error.Corrupted => return error.Corrupted,
+            error.IncompletePublishedSnapshot => return error.IncompletePublishedSnapshot,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -8183,6 +8184,7 @@ pub const ApiHttpServer = struct {
                 error.CorruptInput,
                 error.UnsupportedVersion,
                 error.Corrupted,
+                error.IncompletePublishedSnapshot,
                 => return err,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -8231,6 +8233,7 @@ pub const ApiHttpServer = struct {
             error.CorruptInput,
             error.UnsupportedVersion,
             error.Corrupted,
+            error.IncompletePublishedSnapshot,
             => return err,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
@@ -8307,6 +8310,7 @@ pub const ApiHttpServer = struct {
             error.CorruptInput,
             error.UnsupportedVersion,
             error.Corrupted,
+            error.IncompletePublishedSnapshot,
             => return err,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -11361,6 +11365,7 @@ pub const ApiHttpServer = struct {
             error.CorruptInput,
             error.UnsupportedVersion,
             error.Corrupted,
+            error.IncompletePublishedSnapshot,
             => contextual_operations.jsonWithStatus(500, try public_table_http.tableStorageUnreadableBody(self.alloc, err), false),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -28385,6 +28390,7 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
         .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
+        .{ .query_error = error.IncompletePublishedSnapshot, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"IncompletePublishedSnapshot\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
     };
     for (cases) |case| {
         var reads = FakeReads{ .query_error = case.query_error };

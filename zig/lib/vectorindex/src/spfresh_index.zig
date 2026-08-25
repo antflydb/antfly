@@ -42,6 +42,8 @@ pub const FlatCentroidDirectory = struct {
     node_count_snapshot: u64 = 0,
     publish_generation_snapshot: u64 = 0,
     posting_count: usize = 0,
+    missing_node_count: usize = 0,
+    invalid_posting_count: usize = 0,
 
     pub fn retain(self: *FlatCentroidDirectory) void {
         _ = self.ref_count.fetchAdd(1, .acq_rel);
@@ -57,6 +59,10 @@ pub const FlatCentroidDirectory = struct {
         for (self.blocks) |*block| block.deinit(alloc);
         alloc.free(self.blocks);
         self.* = .{};
+    }
+
+    fn complete(self: *const FlatCentroidDirectory) bool {
+        return self.missing_node_count == 0 and self.invalid_posting_count == 0;
     }
 };
 
@@ -269,12 +275,17 @@ fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_
 
     var block_count: usize = 0;
     var posting_count: usize = 0;
+    var missing_node_count: usize = 0;
+    var invalid_posting_count: usize = 0;
 
     var cursor: usize = 0;
     while (cursor < pending.items.len) : (cursor += 1) {
         const node_id = pending.items[cursor];
         var node = loadPublishedNode(self, txn, node_id) catch |err| {
-            if (isNotFoundGeneric(err)) continue;
+            if (isNotFoundGeneric(err)) {
+                missing_node_count += 1;
+                continue;
+            }
             return err;
         };
         defer node.deinit(self.alloc);
@@ -282,7 +293,11 @@ fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_
             for (node.children) |child_id| try pending.append(self.alloc, child_id);
             continue;
         }
-        if (node.members.len == 0 or node.centroid.len != dims) continue;
+        if (node.members.len == 0) continue;
+        if (node.centroid.len != dims) {
+            invalid_posting_count += 1;
+            continue;
+        }
 
         posting_ids[block_count] = node.id;
         covering_radii[block_count] = node.covering_radius;
@@ -305,6 +320,8 @@ fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_
         .node_count_snapshot = node_count,
         .publish_generation_snapshot = publish_generation,
         .posting_count = posting_count,
+        .missing_node_count = missing_node_count,
+        .invalid_posting_count = invalid_posting_count,
     };
 }
 
@@ -389,6 +406,7 @@ pub fn selectFlatRabitqPostingsAlloc(
     query: []const f32,
     scratch: anytype,
     profile: *search_types.SearchProfile,
+    coverage_policy: search_types.CoveragePolicy,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) ![]FlatCentroidProbe {
@@ -396,6 +414,9 @@ pub fn selectFlatRabitqPostingsAlloc(
     const directory = try acquireFlatCentroidDirectory(self, txn);
     defer directory.release(self.alloc);
     defer profile.child_expand_ns += elapsed_fn_u64(start);
+    if (coverage_policy == .complete_snapshot and !directory.complete()) {
+        return error.IncompletePublishedSnapshot;
+    }
 
     var posting_count: usize = 0;
     for (directory.blocks) |*block| {

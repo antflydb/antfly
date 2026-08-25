@@ -2051,7 +2051,8 @@ pub fn searchProfiledRequest(
         .inner_product => 0,
     };
     const search_width = req.search_width orelse self.config.search_width;
-    const exhaustive_coverage = search_types.requiresExhaustiveCoverage(req);
+    const coverage_policy = search_types.coveragePolicy(req);
+    const exhaustive_coverage = coverage_policy == .complete_snapshot;
     const epsilon = req.epsilon orelse self.config.epsilon;
     const rerank_factor: usize = req.rerank_factor orelse search_mod.rerankFactor(epsilon);
     const should_rerank = self.config.use_quantization and self.config.rerank_policy != .never;
@@ -2083,6 +2084,7 @@ pub fn searchProfiledRequest(
             transformed_query,
             scratch,
             &profile,
+            coverage_policy,
             now_fn_u64,
             elapsed_fn_u64,
         );
@@ -2130,7 +2132,7 @@ pub fn searchProfiledRequest(
             if (i % 64 == 0) try search_types.checkCancelled(req);
             profile.nodes_visited += 1;
             var leaf_handle = loadNodeReadHandleProfiled(self, &txn, probe.posting_id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| {
-                try handleTraversalNodeLoadError(err, exhaustive_coverage);
+                try handleTraversalNodeLoadError(err, coverage_policy);
                 continue;
             };
             var leaf_handle_active = true;
@@ -2139,6 +2141,7 @@ pub fn searchProfiledRequest(
             if (!leaf.is_leaf) {
                 leaf_handle.deinit(self.alloc);
                 leaf_handle_active = false;
+                if (exhaustive_coverage) return error.IncompletePublishedSnapshot;
                 continue;
             }
             const leaf_posting = try posting.PostingStore.view(leaf);
@@ -2208,6 +2211,7 @@ pub fn searchProfiledRequest(
             root_handle_active = false;
             @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
                 error.NotFound => {
+                    if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                     approx_results.deinit();
                     const empty = search_results.SearchResults.init(self.alloc, req.k);
                     profile.total_ns = elapsed_fn_u64(total_start);
@@ -2239,7 +2243,7 @@ pub fn searchProfiledRequest(
         const root_uses_nonquantized_payload = usesNonQuantizedPayload(root);
         root_handle.deinit(self.alloc);
         root_handle_active = false;
-        try addChildCandidatesFromIds(self, &txn, root_id, root_uses_nonquantized_payload, root_child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, exhaustive_coverage, now_fn_u64, elapsed_fn_u64);
+        try addChildCandidatesFromIds(self, &txn, root_id, root_uses_nonquantized_payload, root_child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, coverage_policy, now_fn_u64, elapsed_fn_u64);
     }
 
     var beam_state = search_mod.BeamSearchState{};
@@ -2273,7 +2277,7 @@ pub fn searchProfiledRequest(
         profile.nodes_visited += 1;
 
         var node_handle = loadNodeReadHandleProfiled(self, &txn, candidate.id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| {
-            try handleTraversalNodeLoadError(err, exhaustive_coverage);
+            try handleTraversalNodeLoadError(err, coverage_policy);
             continue;
         };
         var node_handle_active = true;
@@ -2335,7 +2339,7 @@ pub fn searchProfiledRequest(
             const node_uses_nonquantized_payload = usesNonQuantizedPayload(node);
             node_handle.deinit(self.alloc);
             node_handle_active = false;
-            try addChildCandidatesFromIds(self, &txn, node_id, node_uses_nonquantized_payload, child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, exhaustive_coverage, now_fn_u64, elapsed_fn_u64);
+            try addChildCandidatesFromIds(self, &txn, node_id, node_uses_nonquantized_payload, child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, coverage_policy, now_fn_u64, elapsed_fn_u64);
         }
     }
 
@@ -2418,7 +2422,7 @@ pub fn addChildCandidates(
     try scratch.ensureMemberIdCapacity(self.alloc, node.children.len);
     const child_ids = scratch.member_ids[0..node.children.len];
     @memcpy(child_ids, node.children);
-    return try addChildCandidatesFromIds(self, txn, node.id, usesNonQuantizedPayload(node), child_ids, query, query_measure, candidates, scratch, profile, false, now_fn_u64, elapsed_fn_u64);
+    return try addChildCandidatesFromIds(self, txn, node.id, usesNonQuantizedPayload(node), child_ids, query, query_measure, candidates, scratch, profile, .best_effort, now_fn_u64, elapsed_fn_u64);
 }
 
 fn addChildCandidatesFromIds(
@@ -2432,7 +2436,7 @@ fn addChildCandidatesFromIds(
     candidates: *std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan),
     scratch: anytype,
     profile: *search_types.SearchProfile,
-    require_complete_snapshot: bool,
+    coverage_policy: search_types.CoveragePolicy,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
@@ -2478,7 +2482,7 @@ fn addChildCandidatesFromIds(
         }
 
         var child_handle = loadNodeReadHandle(self, txn, child_id) catch |err| {
-            try handleTraversalNodeLoadError(err, require_complete_snapshot);
+            try handleTraversalNodeLoadError(err, coverage_policy);
             continue;
         };
         defer child_handle.deinit(self.alloc);
@@ -2529,6 +2533,7 @@ fn scoreLeafMemberIds(
 ) !void {
     const start = now_fn_u64();
     defer profile.leaf_score_ns += elapsed_fn_u64(start);
+    const coverage_policy = search_types.coveragePolicy(req);
     try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
 
     // Resolve selective ID and metadata-prefix predicates once per leaf. The
@@ -2567,6 +2572,7 @@ fn scoreLeafMemberIds(
         var prefix_count: usize = 0;
         for (candidates, scratch.metadata[0..filtered_count], scratch.positions[0..filtered_count]) |member_id, maybe_metadata, original_index| {
             const metadata = maybe_metadata orelse {
+                if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                 profile.filter_rejected += 1;
                 continue;
             };
@@ -2671,7 +2677,10 @@ fn scoreLeafMemberIds(
     if (external_scored) {
         for (fetch_member_ids[0..fetch_count], 0..) |member_id, i| {
             const dist = exact_distances[i];
-            if (!std.math.isFinite(dist)) continue;
+            if (!std.math.isFinite(dist)) {
+                if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
+                continue;
+            }
             if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false)) {
                 continue;
             }
@@ -2700,6 +2709,9 @@ fn scoreLeafMemberIds(
         vector_views[scored_count] = member_vec;
         scored_positions[scored_count] = i;
         scored_count += 1;
+    }
+    if (coverage_policy == .complete_snapshot and scored_count != fetch_count) {
+        return error.IncompletePublishedSnapshot;
     }
     if (scored_count == 0) return;
     try search_types.checkCancelled(req);
@@ -2739,6 +2751,7 @@ pub fn rerankResults(
 ) !search_results.SearchResults {
     const start = now_fn_u64();
     defer profile.rerank_ns += elapsed_fn_u64(start);
+    const coverage_policy = search_types.coveragePolicy(req);
     const ranked_items = approx_results.items.items;
     const has_extra_filters = search_runtime.requestHasExtraFilters(req, filter_state);
     try scratch.ensureRerankCapacity(self.alloc, ranked_items.len);
@@ -2823,9 +2836,13 @@ pub fn rerankResults(
                     const item = &ranked_items[index];
                     const dist = batch_distances[slot];
                     rerank_selection.flags[index] = false;
-                    if (!std.math.isFinite(dist) or
-                        (has_extra_filters and !try memberMatchesRequest(self, txn, item.vector_id, dist, 0, req, filter_state, false)))
-                    {
+                    if (!std.math.isFinite(dist)) {
+                        if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
+                        item.distance = std.math.inf(f32);
+                        item.error_bound = 0;
+                        continue;
+                    }
+                    if (has_extra_filters and !try memberMatchesRequest(self, txn, item.vector_id, dist, 0, req, filter_state, false)) {
                         item.distance = std.math.inf(f32);
                         item.error_bound = 0;
                         continue;
@@ -2874,6 +2891,7 @@ pub fn rerankResults(
                 const item = &ranked_items[index];
                 const member_vec = vector_views[slot];
                 if (member_vec.len == 0) {
+                    if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                     item.distance = std.math.inf(f32);
                     item.error_bound = 0;
                     continue;
@@ -9011,9 +9029,9 @@ fn isNotFoundGeneric(err: anyerror) bool {
 /// without turning a partially useful index into an outage. Full-effort
 /// searches promise coverage of the published snapshot, so the same missing
 /// node must be surfaced instead of silently weakening that contract.
-fn handleTraversalNodeLoadError(err: anyerror, require_complete_snapshot: bool) !void {
+fn handleTraversalNodeLoadError(err: anyerror, coverage_policy: search_types.CoveragePolicy) !void {
     if (!isNotFoundGeneric(err)) return err;
-    if (require_complete_snapshot) return error.IncompletePublishedSnapshot;
+    if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
 }
 
 fn nowNsI128Fixed() i128 {
