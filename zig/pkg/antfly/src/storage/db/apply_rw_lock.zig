@@ -38,6 +38,7 @@ pub const ApplyRwLock = struct {
     resource_mutex: std.atomic.Mutex = .unlocked,
     reader_count: usize = 0,
     shared_waiters: AtomicU64 = .init(0),
+    priority_shared_waiters: AtomicU64 = .init(0),
     shared_lock_calls: AtomicU64 = .init(0),
     shared_contended_calls: AtomicU64 = .init(0),
     shared_wait_ns: AtomicU64 = .init(0),
@@ -79,6 +80,35 @@ pub const ApplyRwLock = struct {
         return true;
     }
 
+    /// Acquire shared ownership without blocking a backend-runtime worker on
+    /// the synchronous atomic wait path. Register for the entire wait so an
+    /// exclusive reacquisition loop yields to this reader, while bounded
+    /// runtime sleeps preserve cancellation and avoid a hot polling herd.
+    pub fn lockSharedIo(self: *@This(), io: std.Io, cancellation: anytype) !void {
+        const started_ns = monotonicNs();
+        _ = self.shared_lock_calls.fetchAdd(1, .monotonic);
+        _ = self.shared_waiters.fetchAdd(1, .monotonic);
+        defer _ = self.shared_waiters.fetchSub(1, .monotonic);
+        _ = self.priority_shared_waiters.fetchAdd(1, .monotonic);
+        defer _ = self.priority_shared_waiters.fetchSub(1, .monotonic);
+
+        var contended = false;
+        var delay_us: i64 = 50 + @as(i64, @intCast(monotonicNs() & 0x3f));
+        while (true) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            if (self.tryLockShared()) break;
+            contended = true;
+            io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake) catch |err| switch (err) {
+                error.Canceled => return error.Cancelled,
+            };
+            delay_us = @min(delay_us * 2, 1_000);
+        }
+        if (contended) {
+            _ = self.shared_contended_calls.fetchAdd(1, .monotonic);
+            noteWait(self, .shared, monotonicNs() -| started_ns);
+        }
+    }
+
     pub fn unlockShared(self: *@This()) void {
         _ = lockAtomic(&self.reader_mutex);
         defer self.reader_mutex.unlock();
@@ -91,6 +121,7 @@ pub const ApplyRwLock = struct {
     }
 
     pub fn tryLockExclusive(self: *@This()) bool {
+        if (self.priority_shared_waiters.load(.monotonic) > 0) return false;
         if (!self.reader_gate.tryLock()) return false;
         if (!self.resource_mutex.tryLock()) {
             self.reader_gate.unlock();
@@ -102,6 +133,7 @@ pub const ApplyRwLock = struct {
     pub fn lockExclusive(self: *@This()) void {
         const started_ns = monotonicNs();
         _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
+        yieldToPriorityReaders(self);
         yieldToQueuedReaders(self);
         const gate_idle = lockAtomic(&self.reader_gate);
         errdefer self.reader_gate.unlock();
@@ -158,6 +190,13 @@ fn yieldToQueuedReaders(lock: *const ApplyRwLock) void {
     if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
     var attempts: usize = 0;
     while (attempts < 64 and lock.shared_waiters.load(.monotonic) > 0) : (attempts += 1) {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn yieldToPriorityReaders(lock: *const ApplyRwLock) void {
+    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
+    while (lock.priority_shared_waiters.load(.monotonic) > 0) {
         std.Thread.yield() catch {};
     }
 }
@@ -268,4 +307,30 @@ test "apply rw lock lets queued readers through sustained exclusive loop" {
     try std.testing.expect(ctx.reader_ready.load(.acquire));
     try std.testing.expect(ctx.reader_done.load(.acquire));
     try std.testing.expect(!ctx.writer_done.load(.acquire) or spins < 100_000);
+}
+
+test "apply rw lock runtime shared wait cancellation clears priority handoff" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const Cancellation = struct {
+        signal: *const std.atomic.Value(bool),
+
+        fn isCancelled(self: @This()) bool {
+            return self.signal.load(.acquire);
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var cancelled = std.atomic.Value(bool).init(true);
+    var lock: ApplyRwLock = .{};
+
+    try std.testing.expectError(
+        error.Cancelled,
+        lock.lockSharedIo(io, @as(?Cancellation, .{ .signal = &cancelled })),
+    );
+    try std.testing.expectEqual(@as(u64, 0), lock.priority_shared_waiters.load(.acquire));
+    try std.testing.expect(lock.tryLockExclusive());
+    lock.unlockExclusive();
 }

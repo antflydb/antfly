@@ -4367,20 +4367,7 @@ pub const HBCIndex = struct {
         self: *HBCIndex,
         cancellation: ?vectorindex_search_types.CancellationToken,
     ) !void {
-        while (!self.published_snapshot_mu.tryLockShared()) {
-            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
-            const generation = self.published_generation.load(.acquire);
-            if ((generation & 1) != 0) {
-                try self.waitForPublishedSearchState(generation, cancellation);
-                continue;
-            }
-            // A writer can hold the progress fence while preparing a mutation,
-            // before a durable commit makes generation odd. Wait cooperatively
-            // so a pessimistic complete-search retry remains cancellable.
-            self.runtimeIo().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch |err| switch (err) {
-                error.Canceled => return error.Cancelled,
-            };
-        }
+        try self.published_snapshot_mu.lockSharedIo(self.runtimeIo(), cancellation);
     }
 
     pub fn endCompleteSnapshotRead(self: *HBCIndex) void {
@@ -6131,6 +6118,13 @@ pub const HBCIndex = struct {
         };
     }
 
+    pub fn getVectorIntoUncached(self: *HBCIndex, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
+        return vectorindex_hbc_index.getVectorIntoUncached(self, txn, vector_id, scratch) catch |err| {
+            if (!isNotFound(err)) return err;
+            return try self.loadExternalVectorIntoScratch(txn, vector_id, scratch);
+        };
+    }
+
     pub fn getVectorViewOrScratch(self: *HBCIndex, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
         return try self.getVectorInto(txn, vector_id, scratch);
     }
@@ -6357,6 +6351,79 @@ pub const HBCIndex = struct {
         miss_distance_storage: []f32,
         profile: ?*SearchProfile,
     ) !bool {
+        return self.scoreExternalRerankVectorsSortedWithScratchCachePolicy(
+            txn,
+            ranked_items,
+            rerank_positions,
+            query,
+            query_measure,
+            distances,
+            vector_id_storage,
+            metadata_storage,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+            batch_scratch,
+            miss_distance_storage,
+            profile,
+            true,
+        );
+    }
+
+    pub fn scoreExternalRerankVectorsSortedWithScratchUncached(
+        self: *HBCIndex,
+        txn: anytype,
+        ranked_items: []const ApproxSearchResult,
+        rerank_positions: []const usize,
+        query: []const f32,
+        query_measure: f32,
+        distances: []f32,
+        vector_id_storage: []u64,
+        metadata_storage: []?[]const u8,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        batch_scratch: []f32,
+        miss_distance_storage: []f32,
+        profile: ?*SearchProfile,
+    ) !bool {
+        return self.scoreExternalRerankVectorsSortedWithScratchCachePolicy(
+            txn,
+            ranked_items,
+            rerank_positions,
+            query,
+            query_measure,
+            distances,
+            vector_id_storage,
+            metadata_storage,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+            batch_scratch,
+            miss_distance_storage,
+            profile,
+            false,
+        );
+    }
+
+    fn scoreExternalRerankVectorsSortedWithScratchCachePolicy(
+        self: *HBCIndex,
+        txn: anytype,
+        ranked_items: []const ApproxSearchResult,
+        rerank_positions: []const usize,
+        query: []const f32,
+        query_measure: f32,
+        distances: []f32,
+        vector_id_storage: []u64,
+        metadata_storage: []?[]const u8,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        batch_scratch: []f32,
+        miss_distance_storage: []f32,
+        profile: ?*SearchProfile,
+        comptime use_cache: bool,
+    ) !bool {
         const loader = self.external_vector_batch_distance_loader orelse return false;
         const ctx = self.external_vector_ctx orelse return false;
         if (distances.len < rerank_positions.len) return error.InvalidArgument;
@@ -6374,24 +6441,26 @@ pub const HBCIndex = struct {
         for (rerank_positions, 0..) |index, slot| {
             const vector_id = ranked_items[index].vector_id;
             distances[slot] = std.math.inf(f32);
-            if (self.borrowCachedVector(vector_id)) |cached_handle| {
-                var handle = cached_handle;
-                defer handle.deinit();
-                const distance_start = platform_time.monotonicNs();
-                distances[slot] = vectorindex_search_runtime.exactDistanceToStoredVector(
-                    self.config,
-                    query,
-                    query_measure,
-                    handle.view(),
-                );
-                if (profile) |p| {
-                    const elapsed = platform_time.monotonicNs() - distance_start;
-                    p.vector_cache_hits += 1;
-                    p.rerank_artifact_cache_hits += 1;
-                    p.rerank_artifact_distance_ns += elapsed;
-                    p.rerank_distance_ns += elapsed;
+            if (use_cache) {
+                if (self.borrowCachedVector(vector_id)) |cached_handle| {
+                    var handle = cached_handle;
+                    defer handle.deinit();
+                    const distance_start = platform_time.monotonicNs();
+                    distances[slot] = vectorindex_search_runtime.exactDistanceToStoredVector(
+                        self.config,
+                        query,
+                        query_measure,
+                        handle.view(),
+                    );
+                    if (profile) |p| {
+                        const elapsed = platform_time.monotonicNs() - distance_start;
+                        p.vector_cache_hits += 1;
+                        p.rerank_artifact_cache_hits += 1;
+                        p.rerank_artifact_distance_ns += elapsed;
+                        p.rerank_distance_ns += elapsed;
+                    }
+                    continue;
                 }
-                continue;
             }
             vector_id_storage[miss_count] = vector_id;
             miss_count += 1;
@@ -8498,7 +8567,7 @@ test "search publication wait uses runtime wakeups and honors cancellation" {
     try std.testing.expect(idx.published_spare_flight != null);
 }
 
-test "complete snapshot retries optimistic publication conflicts under a progress fence" {
+test "complete snapshot retry releases publication fence after durable txn capture" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -8522,11 +8591,11 @@ test "complete snapshot retries optimistic publication conflicts under a progres
         io: std.Io,
         captures: usize = 0,
         optimistic_capture_unfenced: bool = false,
-        retry_fenced: bool = false,
+        retry_capture_released_fence: bool = false,
         writer_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-        fn publishConcurrentInsert(index: *HBCIndex, failed: *std.atomic.Value(bool)) void {
-            index.insert(4, &.{ 1, 1 }) catch failed.store(true, .release);
+        fn publishConcurrentInsert(index: *HBCIndex, vector_id: u64, failed: *std.atomic.Value(bool)) void {
+            index.insert(vector_id, &.{ 1, 1 }) catch failed.store(true, .release);
         }
 
         fn onCapture(raw_ctx: ?*anyopaque, index: *HBCIndex) void {
@@ -8538,18 +8607,20 @@ test "complete snapshot retries optimistic publication conflicts under a progres
                 ctx.optimistic_capture_unfenced = true;
 
                 // Publish a real concurrent mutation after capture. The
-                // optimistic attempt must discard its result and retry while
-                // holding the shared side of the publication fence for
-                // progress.
-                var writer = std.Io.async(ctx.io, publishConcurrentInsert, .{ index, &ctx.writer_failed });
+                // optimistic attempt must discard its result and retry from a
+                // durable MVCC transaction.
+                var writer = std.Io.async(ctx.io, publishConcurrentInsert, .{ index, 4, &ctx.writer_failed });
                 writer.await(ctx.io);
                 return;
             }
-            if (index.published_snapshot_mu.tryLockExclusive()) {
-                index.published_snapshot_mu.unlockExclusive();
-                return;
-            }
-            ctx.retry_fenced = true;
+            // The retry hook runs immediately after transaction capture. The
+            // shared fence must already be released, and a second publisher
+            // must complete while the search continues on the older snapshot.
+            if (!index.published_snapshot_mu.tryLockExclusive()) return;
+            index.published_snapshot_mu.unlockExclusive();
+            ctx.retry_capture_released_fence = true;
+            var writer = std.Io.async(ctx.io, publishConcurrentInsert, .{ index, 5, &ctx.writer_failed });
+            writer.await(ctx.io);
         }
     };
     var hook_ctx = HookContext{ .io = io };
@@ -8562,17 +8633,18 @@ test "complete snapshot retries optimistic publication conflicts under a progres
 
     var results = try idx.searchWithRequest(.{
         .query = &.{ 0, 0 },
-        .k = 3,
+        .k = 4,
         .search_effort = 1,
         .load_metadata = false,
     });
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 2), hook_ctx.captures);
     try std.testing.expect(hook_ctx.optimistic_capture_unfenced);
-    try std.testing.expect(hook_ctx.retry_fenced);
+    try std.testing.expect(hook_ctx.retry_capture_released_fence);
     try std.testing.expect(!hook_ctx.writer_failed.load(.acquire));
-    try std.testing.expectEqual(@as(u64, 4), idx.stats().active_count);
-    try std.testing.expectEqual(@as(usize, 3), results.getHits().len);
+    try std.testing.expectEqual(@as(u64, 5), idx.stats().active_count);
+    try std.testing.expectEqual(@as(usize, 4), results.getHits().len);
+    for (results.getHits()) |hit| try std.testing.expect(hit.vector_id != 5);
     try std.testing.expect(!idx.generationRepairPending());
 }
 

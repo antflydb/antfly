@@ -360,17 +360,31 @@ pub fn loadNodeReadHandleProfiled(
     now_fn: fn () u64,
     elapsed_fn: fn (u64) u64,
 ) !CachedNodeReadHandle(@TypeOf(self)) {
+    return loadNodeReadHandleProfiledWithCachePolicy(self, txn, node_id, profile, true, now_fn, elapsed_fn);
+}
+
+fn loadNodeReadHandleProfiledWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    profile: *search_types.SearchProfile,
+    comptime use_cache: bool,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+) !CachedNodeReadHandle(@TypeOf(self)) {
     const lookup_start = now_fn();
-    if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| {
-        profile.node_cache_lookup_ns += elapsed_fn(lookup_start);
-        return cached;
+    if (use_cache) {
+        if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| {
+            profile.node_cache_lookup_ns += elapsed_fn(lookup_start);
+            return cached;
+        }
     }
     profile.node_cache_lookup_ns += elapsed_fn(lookup_start);
 
     const start = now_fn();
     var loaded = try loadSearchNodeFromStorage(self, txn, node_id);
     errdefer loaded.deinit(self.alloc);
-    try self.cacheSearchNode(&loaded);
+    if (use_cache) try self.cacheSearchNode(&loaded);
     profile.node_cache_miss_ns += elapsed_fn(start);
     profile.node_cache_misses += 1;
     return .{ .owned = loaded };
@@ -381,11 +395,22 @@ pub fn loadNodeReadHandle(
     txn: anytype,
     node_id: u64,
 ) !CachedNodeReadHandle(@TypeOf(self)) {
-    if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| return cached;
+    return loadNodeReadHandleWithCachePolicy(self, txn, node_id, true);
+}
+
+fn loadNodeReadHandleWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    comptime use_cache: bool,
+) !CachedNodeReadHandle(@TypeOf(self)) {
+    if (use_cache) {
+        if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| return cached;
+    }
 
     var loaded = try loadSearchNodeFromStorage(self, txn, node_id);
     errdefer loaded.deinit(self.alloc);
-    try self.cacheSearchNode(&loaded);
+    if (use_cache) try self.cacheSearchNode(&loaded);
     return .{ .owned = loaded };
 }
 
@@ -417,9 +442,35 @@ pub fn loadQuantizedReadHandleProfiled(
     elapsed_fn: fn (u64) u64,
     is_not_found: fn (anyerror) bool,
 ) !?CachedQuantizedReadHandle(@TypeOf(self)) {
+    return loadQuantizedReadHandleProfiledWithCachePolicy(
+        self,
+        txn,
+        node_id,
+        is_root,
+        expected_count,
+        profile,
+        true,
+        now_fn,
+        elapsed_fn,
+        is_not_found,
+    );
+}
+
+fn loadQuantizedReadHandleProfiledWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    is_root: bool,
+    expected_count: usize,
+    profile: *search_types.SearchProfile,
+    comptime use_cache: bool,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+    is_not_found: fn (anyerror) bool,
+) !?CachedQuantizedReadHandle(@TypeOf(self)) {
     const Index = comptime childType(@TypeOf(self));
     const lookup_start = now_fn();
-    if (comptime @hasDecl(Index, "borrowCachedQuantized")) {
+    if (use_cache and comptime @hasDecl(Index, "borrowCachedQuantized")) {
         if (self.borrowCachedQuantized(node_id)) |borrowed| {
             profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
             var handle = borrowed;
@@ -436,13 +487,16 @@ pub fn loadQuantizedReadHandleProfiled(
             return .{ .borrowed = borrowed };
         }
         profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
-    } else if (try self.getCachedQuantizedClone(node_id)) |cached| {
-        profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
-        validateQuantizedSet(self, &cached, expected_count) catch |err| switch (err) {
-            error.Corrupted => self.invalidateQuantizedCache(node_id),
-        };
-        if (try self.getCachedQuantizedClone(node_id)) |valid| return .{ .owned = valid };
     } else {
+        if (use_cache) {
+            if (try self.getCachedQuantizedClone(node_id)) |cached| {
+                profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
+                validateQuantizedSet(self, &cached, expected_count) catch |err| switch (err) {
+                    error.Corrupted => self.invalidateQuantizedCache(node_id),
+                };
+                if (try self.getCachedQuantizedClone(node_id)) |valid| return .{ .owned = valid };
+            }
+        }
         profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
     }
 
@@ -453,7 +507,7 @@ pub fn loadQuantizedReadHandleProfiled(
     };
     profile.quantized_cache_miss_ns += elapsed_fn(start);
     profile.quantized_cache_misses += 1;
-    if (self.cache_enabled) {
+    if (use_cache and self.cache_enabled) {
         self.cacheQuantized(node_id, &decoded) catch {};
     }
     return .{ .owned = decoded };
@@ -795,6 +849,12 @@ pub fn getVectorInto(self: anytype, txn: anytype, vector_id: u64, scratch: []f32
     return try cacheVectorAfterLoad(self, vector_id, view, fill);
 }
 
+pub fn getVectorIntoUncached(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
+    var key_buf: [10]u8 = undefined;
+    const data = try self.getNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, vector_id));
+    return try vectorViewFromRaw(data, scratch);
+}
+
 pub fn getVectorViewOrScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
     return getVectorInto(self, txn, vector_id, scratch);
 }
@@ -853,11 +913,21 @@ pub fn getVecLeaf(self: anytype, txn: anytype, vector_id: u64) !u64 {
 }
 
 pub fn loadMetadataRaw(self: anytype, txn: anytype, vector_id: u64, is_not_found: fn (anyerror) bool) !?[]const u8 {
+    return loadMetadataRawWithCachePolicy(self, txn, vector_id, true, is_not_found);
+}
+
+fn loadMetadataRawWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    vector_id: u64,
+    comptime use_cache: bool,
+    is_not_found: fn (anyerror) bool,
+) !?[]const u8 {
     const Index = comptime childType(@TypeOf(self));
     // Retained-cache implementations cannot return a raw cached slice: a
     // concurrent reclaimer may evict it immediately after the lookup lock is
     // released. Scalar callers receive the transaction-owned storage view.
-    if (comptime !@hasDecl(Index, "borrowCachedMetadata")) {
+    if (use_cache and comptime !@hasDecl(Index, "borrowCachedMetadata")) {
         if (self.getCachedMetadata(vector_id)) |cached| return cached;
     }
     var key_buf: [10]u8 = undefined;
@@ -865,7 +935,7 @@ pub fn loadMetadataRaw(self: anytype, txn: anytype, vector_id: u64, is_not_found
         if (is_not_found(err)) return null;
         return err;
     };
-    return try self.cacheMetadata(vector_id, data);
+    return if (use_cache) try self.cacheMetadata(vector_id, data) else data;
 }
 
 pub fn putMetadata(self: anytype, txn: anytype, vector_id: u64, metadata: []const u8) !void {
@@ -1826,7 +1896,7 @@ fn getMetadataManySortedInTxnWithScratchProfiled(
     lookup_storage: []FixedKeyLookup,
     key_views_storage: [][]const u8,
     values_storage: []?[]const u8,
-    use_cache: bool,
+    comptime use_cache: bool,
     profile: ?*search_types.SearchProfile,
     now_fn_u64: ?*const fn () u64,
     elapsed_fn_u64: ?*const fn (u64) u64,
@@ -2003,43 +2073,40 @@ pub fn searchProfiledRequest(
     elapsed_fn_u64: fn (u64) u64,
 ) !search_types.ProfiledSearchResults {
     if (!search_types.requiresExhaustiveCoverage(req)) {
-        return try searchProfiledRequestAttempt(self, req, null, now_fn_u64, elapsed_fn_u64);
+        return try searchProfiledRequestAttempt(self, req, null, false, now_fn_u64, elapsed_fn_u64);
     }
 
     const Index = comptime childType(@TypeOf(self));
     var pessimistic = false;
     while (true) {
-        var fence_held = false;
-        if (pessimistic and comptime @hasDecl(Index, "beginCompleteSnapshotRead")) {
-            try self.beginCompleteSnapshotRead(req.cancellation);
-            fence_held = true;
-        }
+        const capture_durable_snapshot = pessimistic and comptime @hasDecl(Index, "beginCompleteSnapshotRead");
         const token = CompleteSnapshotAttempt{
             .snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation),
             .mutation_epoch = publishedMutationEpoch(self),
         };
 
-        const profiled = searchProfiledRequestAttempt(self, req, token.snapshot, now_fn_u64, elapsed_fn_u64) catch |err| {
-            if (fence_held) self.endCompleteSnapshotRead();
+        const profiled = (if (capture_durable_snapshot)
+            searchProfiledRequestAttempt(self, req, token.snapshot, true, now_fn_u64, elapsed_fn_u64)
+        else
+            searchProfiledRequestAttempt(self, req, token.snapshot, false, now_fn_u64, elapsed_fn_u64)) catch |err| {
             const attempt_current = completeSnapshotAttemptStillCurrent(self, token);
             if (err == error.StalePublishedSnapshot or
-                (err == error.IncompletePublishedSnapshot and !attempt_current))
+                (err == error.IncompletePublishedSnapshot and !capture_durable_snapshot and !attempt_current))
             {
                 // The optimistic pass overlapped a publisher. Retry once under
-                // the reader fence so transient staged-cache observations are
-                // never mistaken for durable corruption and the request still
-                // makes progress under sustained writes.
+                // a short reader fence to capture a durable MVCC transaction.
+                // Traversal then runs cache-free after releasing the fence, so
+                // writers are not serialized behind the O(N) exhaustive pass.
                 pessimistic = true;
                 continue;
             }
-            if (err == error.IncompletePublishedSnapshot) noteIncompletePublishedSnapshotIfSupported(self);
+            if (err == error.IncompletePublishedSnapshot and (!capture_durable_snapshot or attempt_current)) {
+                noteIncompletePublishedSnapshotIfSupported(self);
+            }
             return err;
         };
 
-        if (fence_held) {
-            self.endCompleteSnapshotRead();
-            return profiled;
-        }
+        if (capture_durable_snapshot) return profiled;
         if (completeSnapshotAttemptStillCurrent(self, token)) return profiled;
 
         var stale = profiled;
@@ -2069,18 +2136,29 @@ fn searchProfiledRequestAttempt(
     self: anytype,
     req: search_types.SearchRequest,
     expected_snapshot: ?SearchPublishedSnapshot,
+    comptime capture_durable_snapshot: bool,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !search_types.ProfiledSearchResults {
     var profile = search_types.SearchProfile{};
     const Index = comptime childType(@TypeOf(self));
-    defer if (comptime @hasDecl(Index, "observeSearchCacheBenefit")) self.observeSearchCacheBenefit(&profile);
+    defer if (!capture_durable_snapshot and comptime @hasDecl(Index, "observeSearchCacheBenefit")) {
+        self.observeSearchCacheBenefit(&profile);
+    };
     const total_start = now_fn_u64();
     try search_types.checkCancelled(req);
     const coverage_policy = search_types.coveragePolicy(req);
     const exhaustive_coverage = coverage_policy == .complete_snapshot;
     var published_snapshot = expected_snapshot orelse try loadStableSearchPublishedSnapshot(self, req.cancellation);
     if (published_snapshot.active_count == 0) {
+        if (capture_durable_snapshot and comptime @hasDecl(Index, "beginCompleteSnapshotRead")) {
+            try self.beginCompleteSnapshotRead(req.cancellation);
+            defer self.endCompleteSnapshotRead();
+            if (!publishedSnapshotStillCurrent(self, published_snapshot)) return error.StalePublishedSnapshot;
+            const empty = search_results.SearchResults.init(self.alloc, req.k);
+            profile.total_ns = elapsed_fn_u64(total_start);
+            return .{ .results = empty, .profile = profile };
+        }
         if (!exhaustive_coverage or publishedSnapshotStillCurrent(self, published_snapshot)) {
             const empty = search_results.SearchResults.init(self.alloc, req.k);
             profile.total_ns = elapsed_fn_u64(total_start);
@@ -2104,11 +2182,19 @@ fn searchProfiledRequestAttempt(
     // retain an MVCC snapshot or request workspace while waiting, and honor a
     // disconnect before acquiring either resource.
     try search_types.checkCancelled(req);
-    hbc_runtime.beginSearchEpoch(self);
-    defer hbc_runtime.endSearchEpoch(self);
     const setup_start = total_start;
     const txn_start = now_fn_u64();
-    if (exhaustive_coverage) notifyCompleteSnapshotCapturedForTestIfSupported(self);
+    var snapshot_fence_held = false;
+    if (capture_durable_snapshot and comptime @hasDecl(Index, "beginCompleteSnapshotRead")) {
+        try self.beginCompleteSnapshotRead(req.cancellation);
+        snapshot_fence_held = true;
+        if (!publishedSnapshotStillCurrent(self, published_snapshot)) {
+            self.endCompleteSnapshotRead();
+            snapshot_fence_held = false;
+            return error.StalePublishedSnapshot;
+        }
+    }
+    errdefer if (snapshot_fence_held) self.endCompleteSnapshotRead();
     var txn = if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverage"))
         try self.beginRuntimeSearchTxnForCoverage(exhaustive_coverage)
     else
@@ -2117,8 +2203,16 @@ fn searchProfiledRequestAttempt(
     if (exhaustive_coverage and !publishedSnapshotStillCurrent(self, published_snapshot)) {
         return error.StalePublishedSnapshot;
     }
+    if (snapshot_fence_held) {
+        self.endCompleteSnapshotRead();
+        snapshot_fence_held = false;
+    }
+    if (exhaustive_coverage) notifyCompleteSnapshotCapturedForTestIfSupported(self);
+    hbc_runtime.beginSearchEpoch(self);
+    defer hbc_runtime.endSearchEpoch(self);
+    const use_search_cache = !capture_durable_snapshot;
     profile.runtime_txn_ns += elapsed_fn_u64(txn_start);
-    if (comptime @hasDecl(Index, "pinUpperTreeCache")) {
+    if (use_search_cache and comptime @hasDecl(Index, "pinUpperTreeCache")) {
         try self.pinUpperTreeCache(&txn);
     }
     var filter_state = try search_types.RequestFilterState.init(self.alloc, req);
@@ -2240,7 +2334,7 @@ fn searchProfiledRequestAttempt(
             }
             if (i % 64 == 0) try search_types.checkCancelled(req);
             profile.nodes_visited += 1;
-            var leaf_handle = loadNodeReadHandleProfiled(self, &txn, probe.posting_id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| {
+            var leaf_handle = loadNodeReadHandleProfiledWithCachePolicy(self, &txn, probe.posting_id, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| {
                 try handleTraversalNodeLoadError(err, coverage_policy);
                 continue;
             };
@@ -2261,7 +2355,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
             leaf_handle.deinit(self.alloc);
             leaf_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
             profile.leaves_explored += 1;
             flat_leaves_scored += 1;
         }
@@ -2277,7 +2371,7 @@ fn searchProfiledRequestAttempt(
         if (flat_leaves_scored > 0) {
             try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
             if (should_rerank) {
-                const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+                const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
                 profile.total_ns = elapsed_fn_u64(total_start);
                 return .{ .results = reranked, .profile = profile };
@@ -2286,14 +2380,14 @@ fn searchProfiledRequestAttempt(
             var results = try approx_results.toFinalResults();
             approx_results.deinit();
             results.sort();
-            if (req.load_metadata) try populateMetadata(self, &txn, &results);
+            if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{ .results = results, .profile = profile };
         }
     }
 
     const root_start = now_fn_u64();
-    var root_handle = loadNodeReadHandleProfiled(self, &txn, root_node_id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
+    var root_handle = loadNodeReadHandleProfiledWithCachePolicy(self, &txn, root_node_id, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
         error.NotFound => {
             if (exhaustive_coverage) return error.IncompletePublishedSnapshot;
             approx_results.deinit();
@@ -2324,7 +2418,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = root_posting.hasFreshStoredPayload();
             root_handle.deinit(self.alloc);
             root_handle_active = false;
-            @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
+            @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
                 error.NotFound => {
                     if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                     approx_results.deinit();
@@ -2339,7 +2433,7 @@ fn searchProfiledRequestAttempt(
             };
             try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
             if (should_rerank) {
-                const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+                const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
                 profile.total_ns = elapsed_fn_u64(total_start);
                 return .{ .results = reranked, .profile = profile };
@@ -2347,7 +2441,7 @@ fn searchProfiledRequestAttempt(
             var results = try approx_results.toFinalResults();
             approx_results.deinit();
             results.sort();
-            if (req.load_metadata) try populateMetadata(self, &txn, &results);
+            if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{ .results = results, .profile = profile };
         }
@@ -2359,7 +2453,7 @@ fn searchProfiledRequestAttempt(
         const root_uses_nonquantized_payload = usesNonQuantizedPayload(root);
         root_handle.deinit(self.alloc);
         root_handle_active = false;
-        try addChildCandidatesFromIds(self, &txn, root_id, root_uses_nonquantized_payload, root_child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, coverage_policy, now_fn_u64, elapsed_fn_u64);
+        try addChildCandidatesFromIds(self, &txn, root_id, root_uses_nonquantized_payload, root_child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, coverage_policy, use_search_cache, now_fn_u64, elapsed_fn_u64);
     }
 
     var beam_state = search_mod.BeamSearchState{};
@@ -2399,7 +2493,7 @@ fn searchProfiledRequestAttempt(
         }
         profile.nodes_visited += 1;
 
-        var node_handle = loadNodeReadHandleProfiled(self, &txn, candidate.id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| {
+        var node_handle = loadNodeReadHandleProfiledWithCachePolicy(self, &txn, candidate.id, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| {
             try handleTraversalNodeLoadError(err, coverage_policy);
             continue;
         };
@@ -2452,7 +2546,7 @@ fn searchProfiledRequestAttempt(
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
             node_handle.deinit(self.alloc);
             node_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
             search_mod.noteLeafExplored(&beam_state);
             profile.leaves_explored += 1;
         } else {
@@ -2463,14 +2557,14 @@ fn searchProfiledRequestAttempt(
             const node_uses_nonquantized_payload = usesNonQuantizedPayload(node);
             node_handle.deinit(self.alloc);
             node_handle_active = false;
-            try addChildCandidatesFromIds(self, &txn, node_id, node_uses_nonquantized_payload, child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, coverage_policy, now_fn_u64, elapsed_fn_u64);
+            try addChildCandidatesFromIds(self, &txn, node_id, node_uses_nonquantized_payload, child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, coverage_policy, use_search_cache, now_fn_u64, elapsed_fn_u64);
         }
     }
 
     try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
 
     if (should_rerank) {
-        const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+        const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
         approx_results.deinit();
         profile.total_ns = elapsed_fn_u64(total_start);
         return .{ .results = reranked, .profile = profile };
@@ -2479,7 +2573,7 @@ fn searchProfiledRequestAttempt(
     var results = try approx_results.toFinalResults();
     approx_results.deinit();
     results.sort();
-    if (req.load_metadata) try populateMetadata(self, &txn, &results);
+    if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
     profile.total_ns = elapsed_fn_u64(total_start);
     return .{ .results = results, .profile = profile };
 }
@@ -2777,7 +2871,7 @@ pub fn addChildCandidates(
     try scratch.ensureMemberIdCapacity(self.alloc, node.children.len);
     const child_ids = scratch.member_ids[0..node.children.len];
     @memcpy(child_ids, node.children);
-    return try addChildCandidatesFromIds(self, txn, node.id, usesNonQuantizedPayload(node), child_ids, query, query_measure, candidates, scratch, profile, .best_effort, now_fn_u64, elapsed_fn_u64);
+    return try addChildCandidatesFromIds(self, txn, node.id, usesNonQuantizedPayload(node), child_ids, query, query_measure, candidates, scratch, profile, .best_effort, true, now_fn_u64, elapsed_fn_u64);
 }
 
 fn addChildCandidatesFromIds(
@@ -2792,6 +2886,7 @@ fn addChildCandidatesFromIds(
     scratch: anytype,
     profile: *search_types.SearchProfile,
     coverage_policy: search_types.CoveragePolicy,
+    comptime use_search_cache: bool,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
@@ -2799,7 +2894,7 @@ fn addChildCandidatesFromIds(
     defer profile.child_expand_ns += elapsed_fn_u64(start);
     const child_count = child_ids.len;
     if (self.config.use_quantization) {
-        if (try loadQuantizedReadHandleProfiled(self, txn, node_id, uses_nonquantized_payload, child_count, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
+        if (try loadQuantizedReadHandleProfiledWithCachePolicy(self, txn, node_id, uses_nonquantized_payload, child_count, profile, use_search_cache, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
             defer {
                 var handle = quantized_handle;
                 handle.deinit(self.alloc);
@@ -2826,17 +2921,19 @@ fn addChildCandidatesFromIds(
     }
 
     for (child_ids) |child_id| {
-        if (try borrowSearchCachedNodeHandle(self, child_id)) |cached_handle| {
-            defer {
-                var handle = cached_handle;
-                handle.deinit(self.alloc);
+        if (use_search_cache) {
+            if (try borrowSearchCachedNodeHandle(self, child_id)) |cached_handle| {
+                defer {
+                    var handle = cached_handle;
+                    handle.deinit(self.alloc);
+                }
+                const dist = vec.distanceToQuery(query, query_measure, cached_handle.ptr().centroid, self.config.metric);
+                try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0, .bound_resolved = false });
+                continue;
             }
-            const dist = vec.distanceToQuery(query, query_measure, cached_handle.ptr().centroid, self.config.metric);
-            try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0, .bound_resolved = false });
-            continue;
         }
 
-        var child_handle = loadNodeReadHandle(self, txn, child_id) catch |err| {
+        var child_handle = loadNodeReadHandleWithCachePolicy(self, txn, child_id, use_search_cache) catch |err| {
             try handleTraversalNodeLoadError(err, coverage_policy);
             continue;
         };
@@ -2864,7 +2961,7 @@ pub fn scoreLeafMembers(
 ) !void {
     const leaf_posting = try posting.PostingStore.view(leaf);
     const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
-    return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, now_fn_u64, elapsed_fn_u64);
+    return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
 }
 
 fn scoreLeafMemberIds(
@@ -2883,6 +2980,7 @@ fn scoreLeafMemberIds(
     results: *search_results.ApproxSearchResults,
     scratch: anytype,
     profile: *search_types.SearchProfile,
+    comptime use_search_cache: bool,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
@@ -2918,7 +3016,7 @@ fn scoreLeafMemberIds(
             scratch.lookups[0..filtered_count],
             scratch.key_views[0..filtered_count],
             scratch.values[0..filtered_count],
-            true,
+            use_search_cache,
             profile,
             now_fn_u64,
             elapsed_fn_u64,
@@ -2954,7 +3052,7 @@ fn scoreLeafMemberIds(
     scoring_req.exclude_ids = &.{};
     const empty_filter_state = search_types.RequestFilterState{};
     if (self.config.use_quantization and leaf_has_fresh_stored_payload) {
-        if (try loadQuantizedReadHandleProfiled(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
+        if (try loadQuantizedReadHandleProfiledWithCachePolicy(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, use_search_cache, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
             defer {
                 var handle = quantized_handle;
                 handle.deinit(self.alloc);
@@ -2973,7 +3071,7 @@ fn scoreLeafMemberIds(
             } else {
                 for (scoring_member_ids, original_positions) |member_id, i| {
                     if (i % 256 == 0) try search_types.checkCancelled(req);
-                    if (!try memberMatchesRequest(self, txn, member_id, distances[i], error_bounds[i], scoring_req, &empty_filter_state, true)) continue;
+                    if (!try memberMatchesRequestWithCachePolicy(self, txn, member_id, distances[i], error_bounds[i], scoring_req, &empty_filter_state, true, use_search_cache)) continue;
                     results.addApproxResult(member_id, distances[i], error_bounds[i]);
                 }
             }
@@ -2994,17 +3092,19 @@ fn scoreLeafMemberIds(
     var fetch_count: usize = 0;
     for (scoring_member_ids, 0..) |member_id, i| {
         if (i % 256 == 0) try search_types.checkCancelled(req);
-        if (borrowCachedVectorHandle(self, member_id)) |cached_handle| {
-            profile.vector_cache_hits += 1;
-            var handle = cached_handle;
-            defer handle.deinit();
-            const dist = vec.distanceToQuery(exact_query, exact_query_measure, handle.view(), self.config.metric);
-            if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false)) {
+        if (use_search_cache) {
+            if (borrowCachedVectorHandle(self, member_id)) |cached_handle| {
+                profile.vector_cache_hits += 1;
+                var handle = cached_handle;
+                defer handle.deinit();
+                const dist = vec.distanceToQuery(exact_query, exact_query_measure, handle.view(), self.config.metric);
+                if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false, use_search_cache)) {
+                    continue;
+                }
+                results.addResult(member_id, dist, 0);
+                profile.exact_vectors_scored += 1;
                 continue;
             }
-            results.addResult(member_id, dist, 0);
-            profile.exact_vectors_scored += 1;
-            continue;
         }
         if (!indexHasExternalVectorLoader(self)) profile.vector_cache_misses += 1;
         fetch_member_ids[fetch_count] = member_id;
@@ -3038,7 +3138,7 @@ fn scoreLeafMemberIds(
                 if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                 continue;
             }
-            if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false)) {
+            if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false, use_search_cache)) {
                 continue;
             }
             results.addResult(member_id, dist, 0);
@@ -3048,7 +3148,7 @@ fn scoreLeafMemberIds(
     }
 
     const vector_views = scratch.vector_views[0..fetch_count];
-    try loadVectorIdsSortedWithScratch(
+    try loadVectorIdsSortedWithScratchWithCachePolicy(
         self,
         txn,
         fetch_member_ids[0..fetch_count],
@@ -3058,6 +3158,7 @@ fn scoreLeafMemberIds(
         scratch.values,
         scratch.vector,
         scratch.vector_batch,
+        use_search_cache,
     );
     const scored_positions = scratch.positions[0..fetch_count];
     var scored_count: usize = 0;
@@ -3085,7 +3186,7 @@ fn scoreLeafMemberIds(
         if (dist_index % 256 == 0) try search_types.checkCancelled(req);
         const member_id = fetch_member_ids[member_index];
         const dist = exact_distances[dist_index];
-        if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false)) {
+        if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false, use_search_cache)) {
             continue;
         }
         results.addResult(member_id, dist, 0);
@@ -3103,6 +3204,23 @@ pub fn rerankResults(
     filter_state: *const search_types.RequestFilterState,
     scratch: anytype,
     profile: *search_types.SearchProfile,
+    now_fn_u64: fn () u64,
+    elapsed_fn_u64: fn (u64) u64,
+) !search_results.SearchResults {
+    return rerankResultsWithCachePolicy(self, txn, approx_results, query, query_measure, req, filter_state, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
+}
+
+fn rerankResultsWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    approx_results: *search_results.ApproxSearchResults,
+    query: []const f32,
+    query_measure: f32,
+    req: search_types.SearchRequest,
+    filter_state: *const search_types.RequestFilterState,
+    scratch: anytype,
+    profile: *search_types.SearchProfile,
+    comptime use_search_cache: bool,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !search_results.SearchResults {
@@ -3160,22 +3278,40 @@ pub fn rerankResults(
                 const batch_positions = rerank_positions[offset..batch_end];
                 const batch_distances = exact_distances[0..batch_positions.len];
                 const score_start = now_fn_u64();
-                const handled = try self.scoreExternalRerankVectorsSortedWithScratch(
-                    txn,
-                    ranked_items,
-                    batch_positions,
-                    query,
-                    query_measure,
-                    batch_distances,
-                    scratch.vector_ids,
-                    scratch.metadata,
-                    scratch.lookups,
-                    scratch.key_views,
-                    scratch.values,
-                    scratch.vector_batch,
-                    scratch.error_bounds,
-                    profile,
-                );
+                const handled = if (!use_search_cache and comptime @hasDecl(Index, "scoreExternalRerankVectorsSortedWithScratchUncached"))
+                    try self.scoreExternalRerankVectorsSortedWithScratchUncached(
+                        txn,
+                        ranked_items,
+                        batch_positions,
+                        query,
+                        query_measure,
+                        batch_distances,
+                        scratch.vector_ids,
+                        scratch.metadata,
+                        scratch.lookups,
+                        scratch.key_views,
+                        scratch.values,
+                        scratch.vector_batch,
+                        scratch.error_bounds,
+                        profile,
+                    )
+                else
+                    try self.scoreExternalRerankVectorsSortedWithScratch(
+                        txn,
+                        ranked_items,
+                        batch_positions,
+                        query,
+                        query_measure,
+                        batch_distances,
+                        scratch.vector_ids,
+                        scratch.metadata,
+                        scratch.lookups,
+                        scratch.key_views,
+                        scratch.values,
+                        scratch.vector_batch,
+                        scratch.error_bounds,
+                        profile,
+                    );
                 const score_elapsed = elapsed_fn_u64(score_start);
                 profile.rerank_prefetch_ns += score_elapsed;
                 profile.rerank_vector_load_ns += score_elapsed;
@@ -3199,7 +3335,7 @@ pub fn rerankResults(
                         item.error_bound = 0;
                         continue;
                     }
-                    if (has_extra_filters and !try memberMatchesRequest(self, txn, item.vector_id, dist, 0, req, filter_state, false)) {
+                    if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, item.vector_id, dist, 0, req, filter_state, false, use_search_cache)) {
                         item.distance = std.math.inf(f32);
                         item.error_bound = 0;
                         continue;
@@ -3238,6 +3374,7 @@ pub fn rerankResults(
                 scratch.values,
                 scratch.vector,
                 scratch.vector_batch,
+                use_search_cache,
             );
             const preload_elapsed = elapsed_fn_u64(preload_start);
             profile.rerank_prefetch_ns += preload_elapsed;
@@ -3279,7 +3416,7 @@ pub fn rerankResults(
                     item.error_bound = 0;
                     continue;
                 }
-                if (has_extra_filters and !try memberMatchesRequest(self, txn, item.vector_id, dist, 0, req, filter_state, false)) {
+                if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, item.vector_id, dist, 0, req, filter_state, false, use_search_cache)) {
                     item.distance = std.math.inf(f32);
                     item.error_bound = 0;
                     continue;
@@ -3303,7 +3440,7 @@ pub fn rerankResults(
 
     if (req.load_metadata) {
         const metadata_start = now_fn_u64();
-        try populateMetadataWithScratch(self, txn, &exact_results, scratch);
+        try populateMetadataWithScratch(self, txn, &exact_results, scratch, use_search_cache);
         profile.rerank_metadata_ns += elapsed_fn_u64(metadata_start);
     }
     return exact_results;
@@ -3598,7 +3735,7 @@ fn loadRerankVectorsSorted(
     defer self.alloc.free(vector_ids);
     const batch_scratch = try self.alloc.alloc(f32, scratch.len * rerank_positions.len);
     defer self.alloc.free(batch_scratch);
-    try loadRerankVectorsSortedWithScratch(self, txn, ranked_items, rerank_positions, vector_views, vector_ids, lookups, key_views, values, scratch, batch_scratch);
+    try loadRerankVectorsSortedWithScratch(self, txn, ranked_items, rerank_positions, vector_views, vector_ids, lookups, key_views, values, scratch, batch_scratch, true);
 }
 
 fn loadRerankVectorsSortedWithScratch(
@@ -3613,11 +3750,12 @@ fn loadRerankVectorsSortedWithScratch(
     values_storage: []?[]const u8,
     scratch: []f32,
     batch_scratch: []f32,
+    comptime use_cache: bool,
 ) !void {
     if (vector_id_storage.len < rerank_positions.len) return error.InvalidArgument;
     const vector_ids = vector_id_storage[0..rerank_positions.len];
     for (rerank_positions, 0..) |index, slot| vector_ids[slot] = ranked_items[index].vector_id;
-    try loadVectorIdsSortedWithScratch(self, txn, vector_ids, vector_views, lookup_storage, key_views_storage, values_storage, scratch, batch_scratch);
+    try loadVectorIdsSortedWithScratchWithCachePolicy(self, txn, vector_ids, vector_views, lookup_storage, key_views_storage, values_storage, scratch, batch_scratch, use_cache);
 }
 
 fn loadVectorIdsSortedWithScratch(
@@ -3630,6 +3768,32 @@ fn loadVectorIdsSortedWithScratch(
     values_storage: []?[]const u8,
     scratch: []f32,
     batch_scratch: []f32,
+) !void {
+    return loadVectorIdsSortedWithScratchWithCachePolicy(
+        self,
+        txn,
+        vector_ids,
+        vector_views,
+        lookup_storage,
+        key_views_storage,
+        values_storage,
+        scratch,
+        batch_scratch,
+        true,
+    );
+}
+
+fn loadVectorIdsSortedWithScratchWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    vector_ids: []const u64,
+    vector_views: [][]const f32,
+    lookup_storage: []FixedKeyLookup,
+    key_views_storage: [][]const u8,
+    values_storage: []?[]const u8,
+    scratch: []f32,
+    batch_scratch: []f32,
+    comptime use_cache: bool,
 ) !void {
     const Index = comptime childType(@TypeOf(self));
     std.debug.assert(vector_views.len >= vector_ids.len);
@@ -3654,7 +3818,10 @@ fn loadVectorIdsSortedWithScratch(
         std.debug.assert(batch_scratch.len >= dims * vector_ids.len);
         for (vector_ids, 0..) |vector_id, slot| {
             const slot_scratch = batch_scratch[slot * dims ..][0..dims];
-            vector_views[slot] = self.getVectorInto(txn, vector_id, slot_scratch) catch &.{};
+            vector_views[slot] = if (!use_cache and comptime @hasDecl(Index, "getVectorIntoUncached"))
+                self.getVectorIntoUncached(txn, vector_id, slot_scratch) catch &.{}
+            else
+                self.getVectorInto(txn, vector_id, slot_scratch) catch &.{};
         }
         return;
     }
@@ -3664,25 +3831,30 @@ fn loadVectorIdsSortedWithScratch(
         std.debug.assert(batch_scratch.len >= dims * vector_ids.len);
         for (vector_ids, 0..) |vector_id, slot| {
             const slot_scratch = batch_scratch[slot * dims ..][0..dims];
-            vector_views[slot] = self.getVectorInto(txn, vector_id, slot_scratch) catch &.{};
+            vector_views[slot] = if (!use_cache and comptime @hasDecl(Index, "getVectorIntoUncached"))
+                self.getVectorIntoUncached(txn, vector_id, slot_scratch) catch &.{}
+            else
+                self.getVectorInto(txn, vector_id, slot_scratch) catch &.{};
         }
         return;
     }
 
     var lookup_count: usize = 0;
     for (vector_ids, 0..) |vector_id, slot| {
-        if (borrowCachedVectorHandle(self, vector_id)) |cached_handle| {
-            var handle = cached_handle;
-            defer handle.deinit();
-            const cached = handle.view();
-            const slot_scratch = batch_scratch[slot * scratch.len ..][0..scratch.len];
-            if (cached.len > slot_scratch.len) return error.BufferTooSmall;
-            @memcpy(slot_scratch[0..cached.len], cached);
-            if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
-                self.notifyVectorViewLoadForTest(vector_id);
+        if (use_cache) {
+            if (borrowCachedVectorHandle(self, vector_id)) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                const cached = handle.view();
+                const slot_scratch = batch_scratch[slot * scratch.len ..][0..scratch.len];
+                if (cached.len > slot_scratch.len) return error.BufferTooSmall;
+                @memcpy(slot_scratch[0..cached.len], cached);
+                if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
+                    self.notifyVectorViewLoadForTest(vector_id);
+                }
+                vector_views[slot] = slot_scratch[0..cached.len];
+                continue;
             }
-            vector_views[slot] = slot_scratch[0..cached.len];
-            continue;
         }
         var key: [10]u8 = undefined;
         _ = hbc.encodeVecKey(&key, vector_id);
@@ -3690,7 +3862,7 @@ fn loadVectorIdsSortedWithScratch(
             .item_index = slot,
             .vector_id = vector_id,
             .key = key,
-            .vector_cache_fill_epoch = beginVectorCacheFillIfSupported(self, vector_id).epoch,
+            .vector_cache_fill_epoch = if (use_cache) beginVectorCacheFillIfSupported(self, vector_id).epoch else 0,
         };
         lookup_count += 1;
     }
@@ -3709,18 +3881,20 @@ fn loadVectorIdsSortedWithScratch(
     try txn.getManySorted(vector_namespace, key_views, values);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
-        if (borrowCachedVectorHandle(self, lookups[i].vector_id)) |cached_handle| {
-            var handle = cached_handle;
-            defer handle.deinit();
-            const cached = handle.view();
-            const slot_scratch = batch_scratch[lookups[i].item_index * scratch.len ..][0..scratch.len];
-            if (cached.len > slot_scratch.len) return error.BufferTooSmall;
-            @memcpy(slot_scratch[0..cached.len], cached);
-            if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
-                self.notifyVectorViewLoadForTest(lookups[i].vector_id);
+        if (use_cache) {
+            if (borrowCachedVectorHandle(self, lookups[i].vector_id)) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                const cached = handle.view();
+                const slot_scratch = batch_scratch[lookups[i].item_index * scratch.len ..][0..scratch.len];
+                if (cached.len > slot_scratch.len) return error.BufferTooSmall;
+                @memcpy(slot_scratch[0..cached.len], cached);
+                if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
+                    self.notifyVectorViewLoadForTest(lookups[i].vector_id);
+                }
+                vector_views[lookups[i].item_index] = slot_scratch[0..cached.len];
+                continue;
             }
-            vector_views[lookups[i].item_index] = slot_scratch[0..cached.len];
-            continue;
         }
         // Cache admission is an optimization, not an ownership contract.
         // Decode into this result's stable batch slot so a rejected cache
@@ -3731,11 +3905,15 @@ fn loadVectorIdsSortedWithScratch(
         if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
             self.notifyVectorViewLoadForTest(lookups[i].vector_id);
         }
-        const guarded = comptime @hasDecl(Index, "beginVectorCacheFill");
-        vector_views[lookups[i].item_index] = try cacheVectorAfterLoad(self, lookups[i].vector_id, view, .{
-            .guarded = guarded,
-            .epoch = lookups[i].vector_cache_fill_epoch,
-        });
+        if (use_cache) {
+            const guarded = comptime @hasDecl(Index, "beginVectorCacheFill");
+            vector_views[lookups[i].item_index] = try cacheVectorAfterLoad(self, lookups[i].vector_id, view, .{
+                .guarded = guarded,
+                .epoch = lookups[i].vector_cache_fill_epoch,
+            });
+        } else {
+            vector_views[lookups[i].item_index] = view;
+        }
     }
 }
 
@@ -4428,35 +4606,39 @@ test "kmeans bulk builder packs bounded leaves" {
 }
 
 pub fn populateMetadata(self: anytype, txn: anytype, results: *search_results.SearchResults) !void {
+    return populateMetadataWithCachePolicy(self, txn, results, true);
+}
+
+fn populateMetadataWithCachePolicy(self: anytype, txn: anytype, results: *search_results.SearchResults, comptime use_cache: bool) !void {
     try self.bindTxnLike(txn);
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
-        try populateMetadataBatched(self, txn, results);
+        try populateMetadataBatched(self, txn, results, use_cache);
         return;
     }
     for (results.items.items) |*item| {
         if (item.metadata != null) continue;
-        const data = (try loadMetadataRaw(self, txn, item.vector_id, isNotFoundGeneric)) orelse continue;
+        const data = (try loadMetadataRawWithCachePolicy(self, txn, item.vector_id, use_cache, isNotFoundGeneric)) orelse continue;
         item.metadata = try self.alloc.dupe(u8, data);
     }
 }
 
-fn populateMetadataWithScratch(self: anytype, txn: anytype, results: *search_results.SearchResults, scratch: anytype) !void {
+fn populateMetadataWithScratch(self: anytype, txn: anytype, results: *search_results.SearchResults, scratch: anytype, comptime use_cache: bool) !void {
     try self.bindTxnLike(txn);
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
-        try populateMetadataBatchedWithScratch(self, txn, results, scratch.lookups, scratch.key_views, scratch.values);
+        try populateMetadataBatchedWithScratch(self, txn, results, scratch.lookups, scratch.key_views, scratch.values, use_cache);
         return;
     }
-    try populateMetadata(self, txn, results);
+    try populateMetadataWithCachePolicy(self, txn, results, use_cache);
 }
 
-fn populateMetadataBatched(self: anytype, txn: anytype, results: *search_results.SearchResults) !void {
+fn populateMetadataBatched(self: anytype, txn: anytype, results: *search_results.SearchResults, comptime use_cache: bool) !void {
     const lookups = try self.alloc.alloc(FixedKeyLookup, results.items.items.len);
     defer self.alloc.free(lookups);
     const key_views = try self.alloc.alloc([]const u8, results.items.items.len);
     defer self.alloc.free(key_views);
     const values = try self.alloc.alloc(?[]const u8, results.items.items.len);
     defer self.alloc.free(values);
-    try populateMetadataBatchedWithScratch(self, txn, results, lookups, key_views, values);
+    try populateMetadataBatchedWithScratch(self, txn, results, lookups, key_views, values, use_cache);
 }
 
 fn populateMetadataBatchedWithScratch(
@@ -4466,18 +4648,21 @@ fn populateMetadataBatchedWithScratch(
     lookup_storage: []FixedKeyLookup,
     key_views_storage: [][]const u8,
     values_storage: []?[]const u8,
+    comptime use_cache: bool,
 ) !void {
     var lookup_count: usize = 0;
     for (results.items.items, 0..) |item, index| {
         if (item.metadata != null) continue;
-        if (borrowCachedMetadataHandle(self, item.vector_id)) |cached_handle| {
-            var handle = cached_handle;
-            defer handle.deinit();
-            results.items.items[index].metadata = try self.alloc.dupe(u8, handle.view());
-            continue;
+        if (use_cache) {
+            if (borrowCachedMetadataHandle(self, item.vector_id)) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                results.items.items[index].metadata = try self.alloc.dupe(u8, handle.view());
+                continue;
+            }
         }
         const Index = comptime childType(@TypeOf(self));
-        if (comptime !@hasDecl(Index, "borrowCachedMetadata")) {
+        if (use_cache and comptime !@hasDecl(Index, "borrowCachedMetadata")) {
             if (self.getCachedMetadata(item.vector_id)) |cached| {
                 results.items.items[index].metadata = try self.alloc.dupe(u8, cached);
                 continue;
@@ -4503,7 +4688,7 @@ fn populateMetadataBatchedWithScratch(
     try txn.getManySorted(.vecs, key_views, values);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
-        _ = try self.cacheMetadata(lookups[i].vector_id, value);
+        if (use_cache) _ = try self.cacheMetadata(lookups[i].vector_id, value);
         results.items.items[lookups[i].item_index].metadata = try self.alloc.dupe(u8, value);
     }
 }
@@ -4518,6 +4703,20 @@ pub fn memberMatchesRequest(
     filter_state: *const search_types.RequestFilterState,
     approximate: bool,
 ) !bool {
+    return memberMatchesRequestWithCachePolicy(self, txn, vector_id, distance, error_bound, req, filter_state, approximate, true);
+}
+
+fn memberMatchesRequestWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    vector_id: u64,
+    distance: f32,
+    error_bound: f32,
+    req: search_types.SearchRequest,
+    filter_state: *const search_types.RequestFilterState,
+    approximate: bool,
+    comptime use_cache: bool,
+) !bool {
     try self.bindTxnLike(txn);
     if (filter_state.rejects(vector_id)) return false;
     if (req.distance_over) |threshold| {
@@ -4531,13 +4730,15 @@ pub fn memberMatchesRequest(
         } else if (distance >= threshold) return false;
     }
     if (req.filter_prefix.len > 0) {
-        if (borrowCachedMetadataHandle(self, vector_id)) |cached_handle| {
-            var handle = cached_handle;
-            defer handle.deinit();
-            if (!std.mem.startsWith(u8, handle.view(), req.filter_prefix)) return false;
-            return true;
+        if (use_cache) {
+            if (borrowCachedMetadataHandle(self, vector_id)) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                if (!std.mem.startsWith(u8, handle.view(), req.filter_prefix)) return false;
+                return true;
+            }
         }
-        const metadata = (try loadMetadataRaw(self, txn, vector_id, isNotFoundGeneric)) orelse return false;
+        const metadata = (try loadMetadataRawWithCachePolicy(self, txn, vector_id, use_cache, isNotFoundGeneric)) orelse return false;
         if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) return false;
     }
     return true;

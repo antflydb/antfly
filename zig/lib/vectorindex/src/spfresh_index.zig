@@ -147,9 +147,93 @@ fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
     return lhs.posting_id < rhs.posting_id;
 }
 
+fn sortFlatProbesCancellable(
+    probes: []FlatCentroidProbe,
+    cancellation: ?search_types.CancellationToken,
+) !void {
+    try checkCancellation(cancellation);
+    if (probes.len < 2) return;
+
+    // In-place heapsort keeps the full-frontier memory bound unchanged while
+    // adding deterministic cancellation points to the O(L log L) ordering
+    // pass. A comparator-based std sort cannot propagate cancellation.
+    var checks: usize = 0;
+    var start = probes.len / 2;
+    while (start > 0) {
+        start -= 1;
+        try siftFlatProbeHeapDown(probes, start, probes.len, cancellation, &checks);
+    }
+    var end = probes.len;
+    while (end > 1) {
+        end -= 1;
+        std.mem.swap(FlatCentroidProbe, &probes[0], &probes[end]);
+        try siftFlatProbeHeapDown(probes, 0, end, cancellation, &checks);
+    }
+    try checkCancellation(cancellation);
+}
+
+fn siftFlatProbeHeapDown(
+    probes: []FlatCentroidProbe,
+    root_start: usize,
+    end: usize,
+    cancellation: ?search_types.CancellationToken,
+    checks: *usize,
+) !void {
+    var root = root_start;
+    while (true) {
+        checks.* += 1;
+        if ((checks.* & 0xff) == 0) try checkCancellation(cancellation);
+        const left = root * 2 + 1;
+        if (left >= end) return;
+        var largest = left;
+        const right = left + 1;
+        if (right < end and flatProbeLess({}, probes[left], probes[right])) largest = right;
+        if (!flatProbeLess({}, probes[root], probes[largest])) return;
+        std.mem.swap(FlatCentroidProbe, &probes[root], &probes[largest]);
+        root = largest;
+    }
+}
+
+fn checkCancellation(cancellation: ?search_types.CancellationToken) !void {
+    if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+}
+
 pub fn flatProbeLessForTesting(lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
     if (!builtin.is_test) @compileError("test-only flat probe ordering seam");
     return flatProbeLess({}, lhs, rhs);
+}
+
+test "flat frontier cancellable heapsort preserves deterministic ordering" {
+    var probes = [_]FlatCentroidProbe{
+        .{ .posting_id = 9, .distance = 4, .error_bound = 1 },
+        .{ .posting_id = 7, .distance = 2, .error_bound = 0 },
+        .{ .posting_id = 3, .distance = 3, .error_bound = 1 },
+        .{ .posting_id = 1, .distance = 2, .error_bound = 0 },
+        .{ .posting_id = 5, .distance = 1, .error_bound = 0 },
+    };
+    try sortFlatProbesCancellable(&probes, null);
+    for (probes[0 .. probes.len - 1], probes[1..]) |lhs, rhs| {
+        try std.testing.expect(!flatProbeLess({}, rhs, lhs));
+    }
+    try std.testing.expectEqualSlices(u64, &.{ 5, 1, 3, 7, 9 }, &.{
+        probes[0].posting_id,
+        probes[1].posting_id,
+        probes[2].posting_id,
+        probes[3].posting_id,
+        probes[4].posting_id,
+    });
+}
+
+test "flat frontier scoring sort honors cancellation" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    var probes = [_]FlatCentroidProbe{
+        .{ .posting_id = 2, .distance = 2, .error_bound = 0 },
+        .{ .posting_id = 1, .distance = 1, .error_bound = 0 },
+    };
+    try std.testing.expectError(
+        error.Cancelled,
+        sortFlatProbesCancellable(&probes, search_types.CancellationToken.fromAtomic(&cancelled)),
+    );
 }
 
 fn flatL2MemberLowerBound(distance: f32, error_bound: f32, covering_radius: f32) ?f32 {
@@ -552,12 +636,14 @@ pub fn selectFlatRabitqPostingsAlloc(
     var probe_count: usize = 0;
 
     for (directory.blocks) |*block| {
+        try checkCancellation(cancellation);
         const count = block.posting_ids.len;
         try scratch.ensureVectorFetchCapacity(self.alloc, count);
         const distances = scratch.distances[0..count];
         const error_bounds = scratch.error_bounds[0..count];
         try self.quantizer.estimateDistancesWithScratch(&block.quantized, query, distances, error_bounds, &scratch.estimate);
         for (block.posting_ids, 0..) |posting_id, i| {
+            if ((i & 0xff) == 0) try checkCancellation(cancellation);
             const member_lower_bound = if (self.config.metric == .l2_squared)
                 flatL2MemberLowerBound(distances[i], error_bounds[i], block.covering_radii[i])
             else
@@ -573,7 +659,7 @@ pub fn selectFlatRabitqPostingsAlloc(
     }
 
     std.debug.assert(probe_count == posting_count);
-    std.mem.sort(FlatCentroidProbe, probes[0..probe_count], {}, flatProbeLess);
+    try sortFlatProbesCancellable(probes[0..probe_count], cancellation);
     profile.approx_nodes_expanded += @intCast(directory.blocks.len);
     return probes;
 }
