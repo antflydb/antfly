@@ -307,6 +307,60 @@ func TestDedicatedLeaseRenewalAdvancesOnlyExactCommittedHandoff(t *testing.T) {
 	}
 }
 
+func TestDedicatedLeaseRenewalKeepsCommittedHandoffAfterFormerControllerDemotion(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Spec.HighAvailability.Admin.ExecutePlannedActions = false
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRoleStandby
+	leaseRenewedAt := now.Add(-time.Second)
+	lease := haFenceLease(cluster, leaseRenewedAt, 30, 2, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+	lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+	lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+	lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
+	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] =
+		haFencingLeaseBootstrapReceipt("standby-a", 2, strings.Repeat("b", 64))
+	reconciler := testHAReconciler(t, cluster, lease)
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("demoted former-controller handoff renewal: %v", err)
+	}
+	observed := getOwnershipTestLease(t, reconciler)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(now) {
+		t.Fatalf("topology adoption stopped exact handoff renewal: %#v", observed.Spec.RenewTime)
+	}
+	if observed.Spec.HolderIdentity == nil || *observed.Spec.HolderIdentity != "standby-a" ||
+		observed.Spec.LeaseTransitions == nil || *observed.Spec.LeaseTransitions != 2 ||
+		observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" {
+		t.Fatalf("demoted former-controller renewal mutated authority: %#v", observed)
+	}
+}
+
+func TestDedicatedLeaseRenewalRejectsDemotedControllerWithoutCommittedHandoff(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Spec.HighAvailability.Admin.ExecutePlannedActions = false
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRoleStandby
+	leaseRenewedAt := now.Add(-time.Second)
+	lease := haFenceLease(cluster, leaseRenewedAt, 30, 1, "primary-a")
+	reconciler := testHAReconciler(t, cluster, lease)
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("disabled ordinary renewal: %v", err)
+	}
+	observed := getOwnershipTestLease(t, reconciler)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(leaseRenewedAt) {
+		t.Fatalf("demoted controller renewed without a committed handoff: %#v", observed.Spec.RenewTime)
+	}
+}
+
 func TestLeaseRenewalControllerKeepsCommittedHandoffWhenProofEndpointIsUnavailable(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {

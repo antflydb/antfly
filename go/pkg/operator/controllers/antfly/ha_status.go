@@ -635,7 +635,6 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 	ha := cluster.Spec.HighAvailability
 	if ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil ||
 		ha.AutomaticFailover == nil || !ha.AutomaticFailover.Enabled ||
-		!haAutomaticFailoverExecutionEnabled(ha) ||
 		ha.AutomaticFailover.FencingAuthority != antflyv1.HAFencingAuthorityKubernetesLease {
 		return nil
 	}
@@ -665,6 +664,14 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 		lease.Annotations[haFencingLeaseAnnotationFormerHolder] == localNodeID &&
 		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] == string(cluster.UID) &&
 		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10)
+	if !haAutomaticFailoverExecutionEnabled(ha) && !handoffRenewal {
+		// Colony demotes the former controller as part of adopting the promoted
+		// topology. That correctly revokes every ordinary action, but the exact
+		// committed handoff receipt must remain a time-only renewal capability
+		// until the successor binds and clears it. Otherwise declarative adoption
+		// itself opens a watchdog-expiry gap between the two controllers.
+		return nil
+	}
 	if currentHolder != localNodeID && !handoffRenewal {
 		return nil
 	}
