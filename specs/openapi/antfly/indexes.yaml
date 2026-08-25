@@ -3058,9 +3058,10 @@ components:
           $ref: '#/components/schemas/GraphDocumentFilter'
           description: >-
             Non-scoring structured stored-document predicate evaluated for this
-            alias. Serverless execution rejects document filters on
-            table-qualified aliases because its published snapshot contains
-            only the queried table; prefix-only alias filters remain supported.
+            alias. Serverless execution rejects document filters on aliases
+            qualified with a different table because its published snapshot
+            contains only the queried table. Explicitly qualifying an alias
+            with the queried table is equivalent to omitting `table`.
     GraphMatchEdge:
       type: object
       additionalProperties: false

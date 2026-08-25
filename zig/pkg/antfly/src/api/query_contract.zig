@@ -10115,8 +10115,13 @@ fn captureGraphQueriesWireAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u
         return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
-    const canonical = parsed.value.object.get("graph_queries");
-    const legacy = parsed.value.object.get("graph_searches");
+    const canonical_value = parsed.value.object.get("graph_queries");
+    const legacy_value = parsed.value.object.get("graph_searches");
+    // Generated serializers emit nullable optional fields as explicit nulls.
+    // Treat those exactly like omission, matching the typed request contract,
+    // while still rejecting two simultaneously populated graph dialects.
+    const canonical = if (canonical_value != null and canonical_value.? != .null) canonical_value else null;
+    const legacy = if (legacy_value != null and legacy_value.? != .null) legacy_value else null;
     if (canonical != null and legacy != null) return error.InvalidQueryRequest;
     const value = canonical orelse legacy orelse return error.InvalidQueryRequest;
     if (value != .object) return error.InvalidQueryRequest;
@@ -14246,7 +14251,8 @@ test "api query contract owns the admitted graph wire for exact proxying" {
         \\        "filter": {"term":"active","field":"status"}
         \\      }
         \\    }
-        \\  }
+        \\  },
+        \\  "graph_searches": null
         \\}
     ;
     var owned = try parseQueryRequest(alloc, null, "docs", body);

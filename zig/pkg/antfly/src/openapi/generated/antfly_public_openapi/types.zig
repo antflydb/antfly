@@ -1629,7 +1629,7 @@ pub const GraphQueryModeUnsupportedError = struct {
     operation: []const u8,
     /// Graph operation mode, or `graph_queries` for a request-wide constraint.
     mode: []const u8,
-    /// Stable machine-readable constraint that prevents exact cross-range execution.
+    /// Stable machine-readable constraint that prevents exact public execution.
     reason: []const u8,
 };
 

@@ -982,7 +982,7 @@ fn findReachableNodes(
     if (edge.reverse_from_declared_alias and max_hops > 1) {
         if (comptime @hasDecl(@TypeOf(edge_reader), "supportsReverseVariablePaths")) {
             if (!edge_reader.supportsReverseVariablePaths())
-                return error.UnsupportedQueryRequest;
+                return error.GraphReverseVariablePathUnsupported;
         }
     }
     const result_limit: usize = if (require_complete)
@@ -2941,7 +2941,7 @@ test "reverse variable expansion fails closed when the reader cannot prove inter
     };
     var work_budget = WorkBudget.init(default_max_explored_nodes, default_max_explored_edges);
     try std.testing.expectError(
-        error.UnsupportedQueryRequest,
+        error.GraphReverseVariablePathUnsupported,
         findReachableNodes(
             std.testing.allocator,
             Reader{},

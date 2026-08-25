@@ -1933,8 +1933,11 @@ components:
             - target_required
             - k_must_equal_one
             - pattern_required
+            - external_alias_document_filter_not_supported
+            - external_alias_source_not_supported
+            - reverse_variable_path_not_supported
             - unsupported_mode
-          description: Stable machine-readable constraint that prevents exact cross-range execution.
+          description: Stable machine-readable constraint that prevents exact public execution.
     GraphMatchOperationLimitExceededError:
       type: object
       additionalProperties: false

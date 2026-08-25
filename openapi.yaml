@@ -8404,8 +8404,11 @@ components:
             - target_required
             - k_must_equal_one
             - pattern_required
+            - external_alias_document_filter_not_supported
+            - external_alias_source_not_supported
+            - reverse_variable_path_not_supported
             - unsupported_mode
-          description: Stable machine-readable constraint that prevents exact cross-range execution.
+          description: Stable machine-readable constraint that prevents exact public execution.
     GraphMatchOperationLimitExceededError:
       type: object
       additionalProperties: false
@@ -22531,8 +22534,9 @@ components:
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
           description: Non-scoring structured stored-document predicate evaluated for this alias. Serverless
-            execution rejects document filters on table-qualified aliases because its published snapshot
-            contains only the queried table; prefix-only alias filters remain supported.
+            execution rejects document filters on aliases qualified with a different table because its
+            published snapshot contains only the queried table. Explicitly qualifying an alias with the
+            queried table is equivalent to omitting `table`.
     GraphMatchEdge:
       type: object
       additionalProperties: false

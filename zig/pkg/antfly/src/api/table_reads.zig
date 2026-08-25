@@ -5184,6 +5184,18 @@ fn graphMatchAnchorScanError(has_filter: bool, err: anyerror) anyerror {
     return err;
 }
 
+fn installCompleteGraphMatchAnchorFilter(
+    req: *db_mod.types.SearchRequest,
+    filter: ?[]const u8,
+) void {
+    const value = filter orelse return;
+    req.filter_query_json = value;
+    // Exact MATCH anchor enumeration must use a complete native predicate
+    // path. Never allow the controlled identity scan to fall through to a
+    // stored-document or text-index fallback.
+    req.require_algebraic_filter_resolution = true;
+}
+
 const ProvisionedMatchAnchorPager = struct {
     source: *ProvisionedTableReadSource,
     group_ids: []const u64,
@@ -5205,7 +5217,7 @@ const ProvisionedMatchAnchorPager = struct {
         anchor_req.filter_prefix = anchor.filter.filter_prefix;
         const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, self.request, graph_query);
         defer if (anchor_filter) |value| alloc.free(value);
-        if (anchor_filter) |value| anchor_req.filter_query_json = value;
+        installCompleteGraphMatchAnchorFilter(&anchor_req, anchor_filter);
         return queryProvisionedAcrossGroupsAtGenerations(
             self.source,
             alloc,
@@ -5245,7 +5257,7 @@ const HostedMatchAnchorPager = struct {
         anchor_req.filter_prefix = anchor.filter.filter_prefix;
         const anchor_filter = try completeGraphMatchAnchorFilterAlloc(alloc, self.request, graph_query);
         defer if (anchor_filter) |value| alloc.free(value);
-        if (anchor_filter) |value| anchor_req.filter_query_json = value;
+        installCompleteGraphMatchAnchorFilter(&anchor_req, anchor_filter);
         return queryHostedAcrossGroupsAtGenerations(
             self.source,
             alloc,
@@ -5324,6 +5336,11 @@ test "complete graph match anchors discard retrieval shaping" {
     try std.testing.expect(anchors.resolved_text_doc_filter == null);
     try std.testing.expectEqual(@as(?u64, 1234), anchors.execution_deadline_ns);
     try std.testing.expect(!anchors.require_algebraic_filter_resolution);
+
+    var filtered_anchors = anchors;
+    installCompleteGraphMatchAnchorFilter(&filtered_anchors, "{\"term\":{\"status\":\"active\"}}");
+    try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", filtered_anchors.filter_query_json);
+    try std.testing.expect(filtered_anchors.require_algebraic_filter_resolution);
 }
 
 test "complete graph match anchor scan is independent per named operation" {

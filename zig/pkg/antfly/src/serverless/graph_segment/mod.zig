@@ -16,10 +16,14 @@ pub const types = @import("types.zig");
 pub const codec = @import("codec.zig");
 
 pub const Edge = types.Edge;
+pub const EdgeLookup = types.EdgeLookup;
 pub const Adjacency = types.Adjacency;
 pub const Segment = types.Segment;
 pub const AdjacencyIndex = types.AdjacencyIndex;
 pub const freeSegment = types.freeSegment;
+pub const edgeLookupOrder = types.edgeLookupOrder;
+pub const edgesHaveCanonicalLookupOrder = types.edgesHaveCanonicalLookupOrder;
+pub const findEdgeByTypeAndNeighbor = types.findEdgeByTypeAndNeighbor;
 pub const encodeAlloc = codec.encodeAlloc;
 pub const encodedSize = codec.encodedSize;
 pub const decodeAlloc = codec.decodeAlloc;

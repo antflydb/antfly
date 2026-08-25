@@ -22,8 +22,8 @@ class GraphQueryModeUnsupportedError:
         retryable (bool):
         operation (str): Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
         mode (str): Graph operation mode, or `graph_queries` for a request-wide constraint.
-        reason (GraphQueryModeUnsupportedErrorReason): Stable machine-readable constraint that prevents exact cross-
-            range execution.
+        reason (GraphQueryModeUnsupportedErrorReason): Stable machine-readable constraint that prevents exact public
+            execution.
     """
 
     status: GraphQueryModeUnsupportedErrorStatus

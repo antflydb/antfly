@@ -472,7 +472,6 @@ def _wait_for_mention_hydration(
                 "traverse": {
                     "start": {"keys": [start_node]},
                     "edge_types": ["mentions"],
-                    "direction": "out",
                     "max_depth": 1,
                     "limit": 10,
                     "include_documents": True,

@@ -20,9 +20,14 @@ import time
 
 import pytest
 import requests
-
-from helpers import assert_created_index, json_doc, query_hits_total_value, upsert, wait_until
-
+from conftest import ready_index_status
+from helpers import (
+    assert_created_index,
+    json_doc,
+    query_hits_total_value,
+    upsert,
+    wait_until,
+)
 
 pytestmark = pytest.mark.reuse_antfly_process
 
@@ -1296,6 +1301,54 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
     created = _create_stateful_table(backup_api, table_name, num_shards=2)
     assert created["name"] == table_name
 
+    # Exact MATCH anchor filters deliberately require native predicate
+    # coverage. Install that coverage instead of letting this conformance test
+    # depend on an unbounded stored-document scan.
+    backup_api.update_schema(
+        table_name,
+        {
+            "default_type": "doc",
+            "document_schemas": {
+                "doc": {
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "properties": {
+                            "type": {
+                                "type": "keyword",
+                            }
+                        },
+                    }
+                }
+            },
+        },
+    )
+    assert_created_index(
+        _create_index(
+            backup_api,
+            table_name,
+            "social_predicates",
+            {
+                "name": "social_predicates",
+                "type": "algebraic",
+                "derive_from_schema": True,
+            },
+        ),
+        "social_predicates",
+        "algebraic",
+    )
+
+    def predicates_ready() -> dict | None:
+        try:
+            return ready_index_status(
+                backup_api.get_index(table_name, "social_predicates"),
+                require_query_fresh=True,
+            )
+        except requests.RequestException:
+            return None
+
+    assert wait_until(predicates_ready, timeout_s=120.0, interval_s=0.25) is not None
+
     edge_types = [
         "IS_PART_OF",
         "IS_LOCATED_IN",
@@ -1436,9 +1489,10 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
         sync_level="full_index",
     )
     assert batch["inserted"] == len(inserts)
+    assert wait_until(predicates_ready, timeout_s=120.0, interval_s=0.25) is not None
 
     def node(label: str) -> dict:
-        return {"filter": {"term": label, "field": "type"}}
+        return {"filter": {"term": label, "field": "/type"}}
 
     def count_query(nodes: dict, edges: list, *, where=None, optional=None) -> dict:
         match = {"anchor": next(iter(nodes)), "nodes": nodes, "edges": edges}

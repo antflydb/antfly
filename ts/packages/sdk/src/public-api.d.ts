@@ -3013,10 +3013,10 @@ export interface components {
             /** @description Graph operation mode, or `graph_queries` for a request-wide constraint. */
             mode: string;
             /**
-             * @description Stable machine-readable constraint that prevents exact cross-range execution.
+             * @description Stable machine-readable constraint that prevents exact public execution.
              * @enum {string}
              */
-            reason: "expand_strategy_not_supported" | "direction_must_be_out" | "deduplicate_nodes_must_be_true" | "weight_mode_must_be_min_hops" | "start_selector_not_supported" | "target_selector_not_supported" | "target_required" | "k_must_equal_one" | "pattern_required" | "unsupported_mode";
+            reason: "expand_strategy_not_supported" | "direction_must_be_out" | "deduplicate_nodes_must_be_true" | "weight_mode_must_be_min_hops" | "start_selector_not_supported" | "target_selector_not_supported" | "target_required" | "k_must_equal_one" | "pattern_required" | "external_alias_document_filter_not_supported" | "external_alias_source_not_supported" | "reverse_variable_path_not_supported" | "unsupported_mode";
         };
         GraphMatchOperationLimitExceededError: {
             /**
@@ -11924,7 +11924,7 @@ export interface components {
         GraphMatchNode: {
             /** @description Owning table for this alias. Omit for the queried table. */
             table?: string;
-            /** @description Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on table-qualified aliases because its published snapshot contains only the queried table; prefix-only alias filters remain supported. */
+            /** @description Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on aliases qualified with a different table because its published snapshot contains only the queried table. Explicitly qualifying an alias with the queried table is equivalent to omitting `table`. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
         /** @description Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */

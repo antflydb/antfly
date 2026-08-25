@@ -400,10 +400,8 @@ fn sortGraphEdges(edges: []graph_segment.Edge) void {
 }
 
 fn lessGraphEdge(_: void, lhs: graph_segment.Edge, rhs: graph_segment.Edge) bool {
-    const edge_type_order = std.mem.order(u8, lhs.edge_type, rhs.edge_type);
-    if (edge_type_order != .eq) return edge_type_order == .lt;
-    const neighbor_order = std.mem.order(u8, lhs.neighbor_id, rhs.neighbor_id);
-    if (neighbor_order != .eq) return neighbor_order == .lt;
+    const lookup_order = graph_segment.edgeLookupOrder(lhs.edge_type, lhs.neighbor_id, rhs.edge_type, rhs.neighbor_id);
+    if (lookup_order != .eq) return lookup_order == .lt;
     return lhs.weight < rhs.weight;
 }
 

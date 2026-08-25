@@ -1564,7 +1564,14 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        if (try self.handleTablePublicGraphQueryRequest(table_name, namespace, body, cancellation)) |owned_response| {
+        const graph_response = self.handleTablePublicGraphQueryRequest(table_name, namespace, body, cancellation) catch |err| switch (err) {
+            // Once the graph boundary has recognized the request, unsupported
+            // semantics are an exact-execution capability response, not a
+            // malformed request or an internal server failure.
+            error.UnsupportedQueryRequest => return error.GraphQueryModeUnsupported,
+            else => return err,
+        };
+        if (graph_response) |owned_response| {
             var response = owned_response;
             defer response.deinit(self.alloc);
             if (response.status == 200) return try self.alloc.dupe(u8, response.body);
@@ -3455,8 +3462,8 @@ pub const HttpHandler = struct {
             // the queried table. Reject the unsupported query shape up front
             // so its outcome never depends on whether an external candidate
             // happens to be present in the current graph.
-            if (conjunctivePatternHasExternalDocumentFilter(pattern))
-                return error.UnsupportedQueryRequest;
+            if (conjunctivePatternHasExternalDocumentFilter(source_table, pattern))
+                return error.GraphExternalAliasDocumentFilterUnsupported;
         }
         const target_keys = if (named_query.query.target_nodes) |selector|
             try public_graph_query.resolveGraphSelectorAlloc(self.alloc, source_table, selector, available_sets)
@@ -3489,7 +3496,11 @@ pub const HttpHandler = struct {
         defer self.alloc.free(start_key_refs);
 
         const cached = try request_cache.graphSegment(named_query.query.index_name);
-        const edge_reader = ServerlessPatternEdgeReader{ .cached = cached, .budget = request_graph_read_budget };
+        const edge_reader = ServerlessPatternEdgeReader{
+            .cached = cached,
+            .budget = request_graph_read_budget,
+            .source_table = source_table,
+        };
         const match_opts = graph_pattern_mod.MatchOptions{
             .max_results = if (named_query.query.return_limit > 0)
                 std.math.add(u32, named_query.query.return_limit, 1) catch named_query.query.return_limit
@@ -4800,6 +4811,10 @@ pub const HttpHandler = struct {
             error.GraphDistinctBudgetExceeded => return error.GraphDistinctBudgetExceeded,
             error.GraphAnchorFilterRequiresIndex => return error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded => return error.GraphMatchOperationLimitExceeded,
+            error.GraphQueryModeUnsupported => return error.GraphQueryModeUnsupported,
+            error.GraphExternalAliasDocumentFilterUnsupported => return error.GraphExternalAliasDocumentFilterUnsupported,
+            error.GraphExternalAliasSourceUnsupported => return error.GraphExternalAliasSourceUnsupported,
+            error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
             error.Canceled => return error.Canceled,
             else => {
                 std.log.err("serverless public table query failed table={s} err={}", .{ table_name, err });
@@ -5254,6 +5269,14 @@ const ServerlessPathEdgeReader = struct {
 const ServerlessPatternEdgeReader = struct {
     cached: *const CachedPublicGraphSegment,
     budget: *ServerlessGraphReadBudget,
+    source_table: []const u8,
+
+    /// MATCH represents nodes in the queried table with a null qualifier. Keep
+    /// explicit source-table spelling equivalent to omission in every runtime.
+    pub fn canonicalizeTable(self: @This(), table: ?[]const u8) ?[]const u8 {
+        const value = table orelse return null;
+        return if (std.mem.eql(u8, value, self.source_table)) null else value;
+    }
 
     pub fn getEdges(
         self: @This(),
@@ -5294,7 +5317,8 @@ const ServerlessPatternEdgeReader = struct {
         // A serverless snapshot contains only the queried table's source
         // segment. Treating an external alias as a local source would turn an
         // incomplete MATCH into an exact-looking empty relation.
-        if (table != null) return error.UnsupportedQueryRequest;
+        if (self.canonicalizeTable(table) != null)
+            return error.GraphExternalAliasSourceUnsupported;
         return try allocPublicSegmentEdgesBounded(
             alloc,
             self.cached,
@@ -5327,14 +5351,18 @@ const ServerlessPatternEdgeReader = struct {
             for (results) |maybe_edge| if (maybe_edge) |edge| freeOwnedGraphEdge(alloc, edge);
             alloc.free(results);
         }
-        if (table != null) return results;
+        if (self.canonicalizeTable(table) != null)
+            return error.GraphExternalAliasSourceUnsupported;
         var owned_bytes: usize = 0;
         for (probes, 0..) |probe, probe_index| {
             const adjacency = self.cached.adjacency_index.find(self.cached.segment, probe.source) orelse continue;
-            try self.budget.admitEdges(adjacency.out_edges.len);
-            for (adjacency.out_edges) |edge| {
-                if (!std.mem.eql(u8, edge.neighbor_id, probe.target) or
-                    !std.mem.eql(u8, edge.edge_type, probe.edge_type)) continue;
+            const lookup = graph_segment_mod.findEdgeByTypeAndNeighbor(
+                adjacency.out_edges,
+                probe.edge_type,
+                probe.target,
+            );
+            try self.budget.admitEdges(lookup.inspected);
+            if (lookup.edge) |edge| {
                 const metadata = self.cached.edgeMetadata(edge);
                 var edge_bytes: usize = @sizeOf(graph_mod.Edge);
                 edge_bytes = std.math.add(usize, edge_bytes, probe.source.len) catch
@@ -5356,7 +5384,6 @@ const ServerlessPatternEdgeReader = struct {
                     edge.weight,
                     metadata,
                 );
-                break;
             }
         }
         return results;
@@ -5538,17 +5565,18 @@ fn patternRequiresDocumentFilter(pattern: []const graph_pattern_mod.PatternStep)
     return false;
 }
 
-fn matchNodesHaveExternalDocumentFilter(nodes: []const graph_pattern_mod.MatchNode) bool {
+fn matchNodesHaveExternalDocumentFilter(source_table: []const u8, nodes: []const graph_pattern_mod.MatchNode) bool {
     for (nodes) |node| {
-        if (node.table != null and node.filter.filter_query_json != null) return true;
+        const external = if (node.table) |table| !std.mem.eql(u8, table, source_table) else false;
+        if (external and node.filter.filter_query_json != null) return true;
     }
     return false;
 }
 
-fn conjunctivePatternHasExternalDocumentFilter(pattern: graph_pattern_mod.ConjunctivePattern) bool {
-    if (matchNodesHaveExternalDocumentFilter(pattern.nodes)) return true;
+fn conjunctivePatternHasExternalDocumentFilter(source_table: []const u8, pattern: graph_pattern_mod.ConjunctivePattern) bool {
+    if (matchNodesHaveExternalDocumentFilter(source_table, pattern.nodes)) return true;
     for (pattern.optional) |optional_pattern| {
-        if (matchNodesHaveExternalDocumentFilter(optional_pattern.nodes)) return true;
+        if (matchNodesHaveExternalDocumentFilter(source_table, optional_pattern.nodes)) return true;
     }
     return false;
 }
@@ -5560,11 +5588,11 @@ test "serverless detects document filters on required and optional external alia
         .table = "entities",
         .filter = .{ .filter_query_json = "{\"term\":{\"kind\":\"person\"}}" },
     };
-    try std.testing.expect(conjunctivePatternHasExternalDocumentFilter(.{
+    try std.testing.expect(conjunctivePatternHasExternalDocumentFilter("docs", .{
         .nodes = &.{ local, external },
         .edges = &.{},
     }));
-    try std.testing.expect(conjunctivePatternHasExternalDocumentFilter(.{
+    try std.testing.expect(conjunctivePatternHasExternalDocumentFilter("docs", .{
         .nodes = &.{local},
         .edges = &.{},
         .optional = &.{.{
@@ -5572,11 +5600,20 @@ test "serverless detects document filters on required and optional external alia
             .edges = &.{},
         }},
     }));
-    try std.testing.expect(!conjunctivePatternHasExternalDocumentFilter(.{
+    try std.testing.expect(!conjunctivePatternHasExternalDocumentFilter("docs", .{
         .nodes = &.{
             local,
             .{ .alias = "external", .table = "entities", .filter = .{ .filter_prefix = "person:" } },
         },
+        .edges = &.{},
+    }));
+    const explicitly_local = graph_pattern_mod.MatchNode{
+        .alias = "local",
+        .table = "docs",
+        .filter = .{ .filter_query_json = "{\"term\":{\"kind\":\"document\"}}" },
+    };
+    try std.testing.expect(!conjunctivePatternHasExternalDocumentFilter("docs", .{
+        .nodes = &.{explicitly_local},
         .edges = &.{},
     }));
 }
@@ -5593,7 +5630,7 @@ fn publishedPatternNodeFilterEvaluator(ctx: ?*anyopaque, node: graph_node_identi
     const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
     if (filter.filter_prefix.len > 0 and !std.mem.startsWith(u8, node.key, filter.filter_prefix)) return false;
     if (filter.filter_query_json == null) return true;
-    if (node.table != null) return error.UnsupportedQueryRequest;
+    if (node.table != null) return error.GraphExternalAliasDocumentFilterUnsupported;
     const body = try active.documents.documentBody(node.key) orelse return false;
     const prepared = try active.cache.getOrPrepare(filter.filter_query_json.?);
     return try prepared.matchesStored(active.alloc, node.key, body);
@@ -11021,7 +11058,11 @@ test "serverless public graph reader preserves qualified endpoint identity" {
     try std.testing.expect(qualified_path == null);
 
     var pattern_budget = ServerlessGraphReadBudget{ .cancellation = .none };
-    const pattern_reader = ServerlessPatternEdgeReader{ .cached = &cached, .budget = &pattern_budget };
+    const pattern_reader = ServerlessPatternEdgeReader{
+        .cached = &cached,
+        .budget = &pattern_budget,
+        .source_table = "docs",
+    };
     const bounded = try pattern_reader.getEdgesBounded(
         alloc,
         null,
@@ -11033,6 +11074,17 @@ test "serverless public graph reader preserves qualified endpoint identity" {
     );
     defer pattern_reader.freeEdges(alloc, bounded);
     try std.testing.expectEqual(@as(usize, 1), bounded.len);
+    const explicitly_local = try pattern_reader.getEdgesBounded(
+        alloc,
+        "docs",
+        "doc:a",
+        &.{"mentions"},
+        .out,
+        1,
+        graph_pattern_mod.default_max_explored_edge_bytes,
+    );
+    defer pattern_reader.freeEdges(alloc, explicitly_local);
+    try std.testing.expectEqual(@as(usize, 1), explicitly_local.len);
     try std.testing.expectError(
         error.QueryCandidateBudgetExceeded,
         pattern_reader.getEdgesBounded(alloc, null, "doc:a", &.{"mentions"}, .out, 1, 1),
@@ -11061,7 +11113,7 @@ test "serverless public graph reader preserves qualified endpoint identity" {
     defer pattern_reader.freeProbedEdges(alloc, missing_probe_result);
     try std.testing.expect(missing_probe_result[0] == null);
     try std.testing.expectError(
-        error.UnsupportedQueryRequest,
+        error.GraphExternalAliasSourceUnsupported,
         pattern_reader.getEdgesBounded(
             alloc,
             "entities",

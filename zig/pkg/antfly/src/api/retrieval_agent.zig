@@ -5489,7 +5489,10 @@ fn encodeQueryValueForRetrievalQuery(
         );
     }
 
-    return try std.json.Stringify.valueAlloc(alloc, query_request, .{});
+    // This is an internal request hop, so keep the canonical wire compact and
+    // omit absent optional fields rather than serializing a page of nulls.
+    // Admission still treats explicit null as omission for external clients.
+    return try std.json.Stringify.valueAlloc(alloc, query_request, .{ .emit_null_optional_fields = false });
 }
 
 const MandatoryPredicates = struct {
@@ -5889,14 +5892,14 @@ fn buildTreeStartNodes(
         }
         if (trimmed[0] == '$') {
             if (treeSeedResultRef(query_request)) |result_ref|
-                return try makeTreeResultRefNodeSelector(alloc, result_ref);
+                return try makeTreeResultRefNodeSelector(alloc, result_ref, query_request.limit);
             return try makeTreeKeyNodeSelector(alloc, try buildTreeStartKeysFromHits(alloc, previous_query_hits));
         }
         return try makeTreeKeyNodeSelector(alloc, try buildTreeStartKeysFromCsv(alloc, trimmed));
     }
 
     if (treeSeedResultRef(query_request)) |result_ref|
-        return try makeTreeResultRefNodeSelector(alloc, result_ref);
+        return try makeTreeResultRefNodeSelector(alloc, result_ref, query_request.limit);
     return try makeTreeKeyNodeSelector(alloc, try buildTreeStartKeysFromHits(alloc, previous_query_hits));
 }
 
@@ -5912,9 +5915,10 @@ fn makeTreeKeyNodeSelector(
 fn makeTreeResultRefNodeSelector(
     alloc: std.mem.Allocator,
     result_ref: []const u8,
+    limit: ?i64,
 ) !indexes_openapi.GraphNodeSelector {
     const value = try alloc.create(indexes_openapi.GraphResultRefNodeSelector);
-    value.* = .{ .result_ref = result_ref };
+    value.* = .{ .result_ref = result_ref, .limit = limit };
     return .{ .graph_result_ref_node_selector = value };
 }
 
@@ -6496,11 +6500,14 @@ test "retrieval agent supports inline tree search" {
 
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_json: []const u8) !query_api.QueryResponse {
             try std.testing.expectEqualStrings("docs", table_name);
+            var admitted = try query_api.parsePublicQueryRequest(alloc, null, table_name, query_json);
+            defer admitted.deinit(alloc);
             var parsed_query = try parseJsonBody(QueryRequest, alloc, query_json);
             defer parsed_query.deinit();
             const graph_queries = parsed_query.value.graph_queries.?;
             const tree_query = graph_queries.map.get("tree_search").?;
             try std.testing.expectEqualStrings("$query_results", tree_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.result_ref);
+            try std.testing.expectEqual(@as(?i64, 5), tree_query.graph_traverse_query.traverse.start.graph_result_ref_node_selector.limit);
             try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_documents.?);
             try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_paths.?);
             return .{

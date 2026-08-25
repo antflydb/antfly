@@ -4909,7 +4909,7 @@ pub const GraphMatchEdge = struct {
 pub const GraphMatchNode = struct {
     /// Owning table for this alias. Omit for the queried table.
     table: ?[]const u8 = null,
-    /// Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on table-qualified aliases because its published snapshot contains only the queried table; prefix-only alias filters remain supported.
+    /// Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on aliases qualified with a different table because its published snapshot contains only the queried table. Explicitly qualifying an alias with the queried table is equivalent to omitting `table`.
     filter: ?GraphDocumentFilter = null,
 };
 
@@ -5120,7 +5120,7 @@ pub const GraphQueryModeUnsupportedError = struct {
     operation: []const u8,
     /// Graph operation mode, or `graph_queries` for a request-wide constraint.
     mode: []const u8,
-    /// Stable machine-readable constraint that prevents exact cross-range execution.
+    /// Stable machine-readable constraint that prevents exact public execution.
     reason: []const u8,
 };
 

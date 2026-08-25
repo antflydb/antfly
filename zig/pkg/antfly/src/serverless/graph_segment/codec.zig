@@ -193,6 +193,11 @@ fn decodeBoundedAlloc(alloc: Allocator, data: []const u8, budget: *bounded_decod
             for (in_edges) |*edge| edge.deinit(alloc);
             alloc.free(in_edges);
         }
+        // Exact public probes use binary lookup. Reject non-canonical artifacts
+        // at the trust boundary instead of risking an exact-looking false miss.
+        if (!graph_types.edgesHaveCanonicalLookupOrder(out_edges) or
+            !graph_types.edgesHaveCanonicalLookupOrder(in_edges))
+            return error.InvalidGraphSegment;
 
         adjacencies[idx] = .{
             .node_id = node_id,
@@ -346,6 +351,32 @@ test "serverless graph segment codec round-trips" {
     try std.testing.expectEqualStrings("doc-b", decoded.adjacencies[0].out_edges[0].neighbor_id);
     try std.testing.expectEqualStrings("cites", decoded.adjacencies[1].in_edges[0].edge_type);
     try std.testing.expectEqualStrings("entities", decoded.neighborTable(decoded.adjacencies[0].out_edges[0]).?);
+}
+
+test "serverless graph segment codec rejects non-canonical edge ordering" {
+    const alloc = std.testing.allocator;
+    var segment = graph_types.Segment{
+        .adjacencies = try alloc.alloc(graph_types.Adjacency, 1),
+    };
+    defer graph_types.freeSegment(alloc, &segment);
+    segment.adjacencies[0] = .{
+        .node_id = try alloc.dupe(u8, "doc-a"),
+        .out_edges = try alloc.alloc(graph_types.Edge, 2),
+        .in_edges = try alloc.alloc(graph_types.Edge, 0),
+    };
+    segment.adjacencies[0].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, "z"),
+        .edge_type = try alloc.dupe(u8, "mentions"),
+        .weight = 1,
+    };
+    segment.adjacencies[0].out_edges[1] = .{
+        .neighbor_id = try alloc.dupe(u8, "a"),
+        .edge_type = try alloc.dupe(u8, "cites"),
+        .weight = 1,
+    };
+    const encoded = try encodeAlloc(alloc, segment);
+    defer alloc.free(encoded);
+    try std.testing.expectError(error.InvalidGraphSegment, decodeAlloc(alloc, encoded));
 }
 
 test "serverless graph segment codec keeps local artifacts on v1" {

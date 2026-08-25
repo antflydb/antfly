@@ -129,6 +129,9 @@ pub const TableApi = struct {
         GraphAnchorFilterRequiresIndex,
         GraphMatchOperationLimitExceeded,
         GraphQueryModeUnsupported,
+        GraphExternalAliasDocumentFilterUnsupported,
+        GraphExternalAliasSourceUnsupported,
+        GraphReverseVariablePathUnsupported,
         HierarchyCursorStale,
         TopologyChanged,
         QueryEmbeddingInputTooLarge,
@@ -806,18 +809,37 @@ const GraphQueryModeDiagnostic = struct {
 };
 
 pub fn graphQueryModeUnsupportedBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    return try graphQueryCapabilityUnsupportedBody(alloc, body, null);
+}
+
+pub fn graphQueryCapabilityUnsupportedBody(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    reason: ?[]const u8,
+) ![]u8 {
     var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
     defer if (parsed) |*value| value.deinit();
-    const diagnostic = if (parsed) |value| graphQueryModeDiagnostic(value.value) else GraphQueryModeDiagnostic{};
+    var diagnostic = if (parsed) |value| graphQueryModeDiagnostic(value.value) else GraphQueryModeDiagnostic{};
+    if (reason) |value| diagnostic.reason = value;
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
         .@"error" = "graph_query_mode_unsupported",
-        .message = "this graph query mode is not supported by exact public execution; use graph_queries with outgoing, deduplicated traversal semantics",
+        .message = graphQueryModeUnsupportedMessage(diagnostic.reason),
         .retryable = false,
         .operation = diagnostic.operation,
         .mode = diagnostic.mode,
         .reason = diagnostic.reason,
     }, .{});
+}
+
+fn graphQueryModeUnsupportedMessage(reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, reason, "external_alias_document_filter_not_supported"))
+        return "this runtime snapshot cannot evaluate stored-document filters on aliases outside the queried table; remove that alias filter or use coordinator-backed execution";
+    if (std.mem.eql(u8, reason, "external_alias_source_not_supported"))
+        return "this runtime snapshot cannot expand relationships from an alias outside the queried table; use coordinator-backed execution or express table boundaries as terminal aliases";
+    if (std.mem.eql(u8, reason, "reverse_variable_path_not_supported"))
+        return "exact execution cannot prove a planner-required reverse variable-length expansion; use explicit single-hop relationships at table boundaries";
+    return "this graph query mode is not supported by exact public execution; use graph_queries with outgoing, deduplicated traversal semantics";
 }
 
 fn graphQueryModeDiagnostic(root: std.json.Value) GraphQueryModeDiagnostic {
@@ -1203,6 +1225,18 @@ pub fn handleTableQueryRequest(
             error.GraphQueryModeUnsupported => {
                 std.log.warn("public table graph mode lacks exact public execution table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphQueryModeUnsupportedBody(alloc, body), .json = true };
+            },
+            error.GraphExternalAliasDocumentFilterUnsupported => {
+                std.log.warn("public table graph external alias filter lacks exact runtime support table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphQueryCapabilityUnsupportedBody(alloc, body, "external_alias_document_filter_not_supported"), .json = true };
+            },
+            error.GraphExternalAliasSourceUnsupported => {
+                std.log.warn("public table graph external alias source lacks exact runtime support table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphQueryCapabilityUnsupportedBody(alloc, body, "external_alias_source_not_supported"), .json = true };
+            },
+            error.GraphReverseVariablePathUnsupported => {
+                std.log.warn("public table graph reverse variable path lacks exact runtime support table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphQueryCapabilityUnsupportedBody(alloc, body, "reverse_variable_path_not_supported"), .json = true };
             },
             error.HierarchyCursorStale => {
                 std.log.info("public hierarchy traversal cursor stale table={s}", .{table_name});
@@ -2367,9 +2401,10 @@ test "public create index returns normalized created resource" {
     try std.testing.expectEqualStrings("{\"name\":\"search\",\"type\":\"full_text\"}", resp.body);
 }
 
-test "public table batch handler rejects unsupported missing-document transform before execution" {
+test "public table batch handler forwards pull transforms" {
     const Backend = struct {
         called: bool = false,
+        op: ?db_mod.types.TransformOpType = null,
 
         fn iface(self: *@This()) TableApi {
             return .{
@@ -2393,12 +2428,14 @@ test "public table batch handler rejects unsupported missing-document transform 
             ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
-            _: db_mod.types.BatchRequest,
+            request: db_mod.types.BatchRequest,
             _: operation.RequestContext,
         ) TableApi.ExecuteBatchError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.called = true;
-            return error.InternalFailure;
+            if (request.transforms.len != 1 or request.transforms[0].operations.len != 1)
+                return error.InternalFailure;
+            self.op = request.transforms[0].operations[0].op;
         }
     };
 
@@ -2408,9 +2445,9 @@ test "public table batch handler rejects unsupported missing-document transform 
     , backend.iface());
     defer resp.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("invalid batch request", resp.body);
-    try std.testing.expect(!backend.called);
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expect(backend.called);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.pull, backend.op.?);
 }
 
 test "public table batch handler maps backend errors" {
@@ -3463,7 +3500,16 @@ test "public table query handler maps candidate budget exhaustion" {
 }
 
 test "public table query handler maps exact graph execution failures" {
-    const Kind = enum { distinct_budget, anchor_filter, match_operation_limit, graph_query_mode, topology_changed };
+    const Kind = enum {
+        distinct_budget,
+        anchor_filter,
+        match_operation_limit,
+        graph_query_mode,
+        external_alias_filter,
+        external_alias_source,
+        reverse_variable_path,
+        topology_changed,
+    };
     const Backend = struct {
         fn iface(kind: *Kind) TableApi {
             return .{
@@ -3497,6 +3543,9 @@ test "public table query handler maps exact graph execution failures" {
                 .anchor_filter => error.GraphAnchorFilterRequiresIndex,
                 .match_operation_limit => error.GraphMatchOperationLimitExceeded,
                 .graph_query_mode => error.GraphQueryModeUnsupported,
+                .external_alias_filter => error.GraphExternalAliasDocumentFilterUnsupported,
+                .external_alias_source => error.GraphExternalAliasSourceUnsupported,
+                .reverse_variable_path => error.GraphReverseVariablePathUnsupported,
                 .topology_changed => error.TopologyChanged,
             };
         }
@@ -3608,6 +3657,39 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expectEqualStrings("incoming", graph_mode_error.operation);
     try std.testing.expectEqualStrings("traverse", graph_mode_error.mode);
     try std.testing.expectEqualStrings("direction_must_be_out", graph_mode_error.reason);
+
+    const CapabilityCase = struct { kind: Kind, reason: []const u8 };
+    const capability_cases = [_]CapabilityCase{
+        .{ .kind = .external_alias_filter, .reason = "external_alias_document_filter_not_supported" },
+        .{ .kind = .external_alias_source, .reason = "external_alias_source_not_supported" },
+        .{ .kind = .reverse_variable_path, .reason = "reverse_variable_path_not_supported" },
+    };
+    for (capability_cases) |case| {
+        kind = case.kind;
+        var capability_resp = try handleTableQueryRequest(
+            std.testing.allocator,
+            "docs",
+            "{\"graph_queries\":{\"pattern\":{\"index\":\"relationships\",\"match\":{\"anchor\":\"a\",\"nodes\":{\"a\":{}},\"edges\":[]},\"return\":{\"bindings\":[\"a\"]}}}}",
+            null,
+            Backend.iface(&kind),
+        );
+        defer capability_resp.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u16, 422), capability_resp.status);
+        var capability = try ant_json.parseFromSlice(
+            metadata_openapi.QueryUnprocessableError,
+            std.testing.allocator,
+            capability_resp.body,
+            .{},
+        );
+        defer capability.deinit();
+        const capability_error = switch (capability.value) {
+            .graph_query_mode_unsupported_error => |value| value,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqualStrings(case.reason, capability_error.reason);
+        try std.testing.expectEqualStrings("pattern", capability_error.operation);
+        try std.testing.expectEqualStrings("match", capability_error.mode);
+    }
 
     kind = .topology_changed;
     var topology_resp = try handleTableQueryRequest(
