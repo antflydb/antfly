@@ -2557,6 +2557,7 @@ pub const IndexManager = struct {
         errdefer index.close();
 
         index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
+        index.setIo(self.io);
         if (self.hbc_cache) |cache| index.attachSharedCache(cache);
         if (self.resource_manager) |manager| {
             index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
@@ -4409,6 +4410,7 @@ pub const IndexManager = struct {
 
     pub fn setIo(self: *IndexManager, io: ?std.Io) void {
         self.io = io;
+        for (self.dense_indexes.items) |*entry| entry.index.setIo(io);
     }
 
     pub fn checkpointIo(self: *const IndexManager) std.Io {
@@ -10818,6 +10820,7 @@ pub const IndexManager = struct {
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                 });
+                index.setIo(self.io);
                 index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
                 if (self.hbc_cache) |cache| index.attachSharedCache(cache);
                 if (self.resource_manager) |manager| {

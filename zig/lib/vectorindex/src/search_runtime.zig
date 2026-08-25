@@ -51,7 +51,6 @@ pub const SearchScratch = struct {
     vector_views: [][]const f32,
     distances: []f32,
     error_bounds: []f32,
-    coverage_ids: []u64,
     coverage_members: []CoverageMember,
     coverage_visited_words: []usize,
 
@@ -92,8 +91,6 @@ pub const SearchScratch = struct {
         errdefer alloc.free(distances);
         const error_bounds = try alloc.alloc(f32, max_candidates);
         errdefer alloc.free(error_bounds);
-        const coverage_ids = try alloc.alloc(u64, 0);
-        errdefer alloc.free(coverage_ids);
         const coverage_members = try alloc.alloc(CoverageMember, 0);
         errdefer alloc.free(coverage_members);
         const coverage_visited_words = try alloc.alloc(usize, 0);
@@ -115,7 +112,6 @@ pub const SearchScratch = struct {
             .vector_views = vector_views,
             .distances = distances,
             .error_bounds = error_bounds,
-            .coverage_ids = coverage_ids,
             .coverage_members = coverage_members,
             .coverage_visited_words = coverage_visited_words,
         };
@@ -149,10 +145,6 @@ pub const SearchScratch = struct {
 
     pub fn ensureVectorIdCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.vector_ids.len < needed) self.vector_ids = try alloc.realloc(self.vector_ids, needed);
-    }
-
-    pub fn ensureCoverageIdCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
-        if (self.coverage_ids.len < needed) self.coverage_ids = try alloc.realloc(self.coverage_ids, needed);
     }
 
     pub fn ensureCoverageMemberCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -198,7 +190,6 @@ pub const SearchScratch = struct {
             byteLen(self.vector_views) +
             byteLen(self.distances) +
             byteLen(self.error_bounds) +
-            byteLen(self.coverage_ids) +
             byteLen(self.coverage_members) +
             byteLen(self.coverage_visited_words);
     }
@@ -220,7 +211,6 @@ pub const SearchScratch = struct {
         alloc.free(self.vector_views);
         alloc.free(self.distances);
         alloc.free(self.error_bounds);
-        alloc.free(self.coverage_ids);
         alloc.free(self.coverage_members);
         alloc.free(self.coverage_visited_words);
         self.* = undefined;
@@ -249,12 +239,10 @@ test "SearchScratch accounts coverage buffers and detects repeated nodes" {
     defer scratch.deinit(alloc);
 
     const bytes_before = scratch.bytes();
-    try scratch.ensureCoverageIdCapacity(alloc, 32);
     try scratch.ensureCoverageMemberCapacity(alloc, 8);
     try scratch.resetCoverageVisited(alloc, 130);
 
     try std.testing.expect(scratch.bytes() >= bytes_before +
-        32 * @sizeOf(u64) +
         8 * @sizeOf(CoverageMember) +
         3 * @sizeOf(usize));
     try std.testing.expect(scratch.markCoverageNodeVisited(130, 130));

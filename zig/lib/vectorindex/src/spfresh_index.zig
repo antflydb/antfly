@@ -228,6 +228,14 @@ fn directoryMatches(directory: *const FlatCentroidDirectory, root_node: u64, nod
         directory.publish_generation_snapshot == publish_generation;
 }
 
+fn snapshotStillPublished(self: anytype, snapshot: PublishedSnapshot) bool {
+    const generation = publishedGenerationSnapshot(self);
+    return (generation & 1) == 0 and
+        generation == snapshot.publish_generation and
+        publishedRootNodeSnapshot(self) == snapshot.root_node and
+        publishedNodeCountSnapshot(self) == snapshot.node_count;
+}
+
 fn appendFlatCentroidBlock(
     self: anytype,
     blocks: *std.ArrayListUnmanaged(FlatCentroidBlock),
@@ -279,8 +287,15 @@ fn buildFlatCentroidDirectory(
     var pending = std.ArrayListUnmanaged(u64).empty;
     defer pending.deinit(self.alloc);
     try pending.append(self.alloc, root_node);
-    var visited = std.AutoHashMapUnmanaged(u64, void).empty;
-    defer visited.deinit(self.alloc);
+    // Published node ids are bounded by node_count. A dense bitset is exact,
+    // has predictable resource use, and avoids an O(nodes) hash-table peak on
+    // cold large-index directory construction.
+    const visited_word_bits = @bitSizeOf(usize);
+    const visited_words_u64 = std.math.divCeil(u64, node_count, visited_word_bits) catch return error.OutOfMemory;
+    const visited_word_count = std.math.cast(usize, visited_words_u64) orelse return error.OutOfMemory;
+    const visited_words = try self.alloc.alloc(usize, visited_word_count);
+    defer self.alloc.free(visited_words);
+    @memset(visited_words, 0);
 
     var block_count: usize = 0;
     var posting_count: usize = 0;
@@ -297,14 +312,18 @@ fn buildFlatCentroidDirectory(
             invalid_posting_count += 1;
             continue;
         }
-        const visited_entry = try visited.getOrPut(self.alloc, node_id);
-        if (visited_entry.found_existing) {
+        const zero_based = node_id - 1;
+        const visited_word_index: usize = @intCast(zero_based / visited_word_bits);
+        const visited_bit_index: std.math.Log2Int(usize) = @intCast(zero_based % visited_word_bits);
+        const visited_mask = @as(usize, 1) << visited_bit_index;
+        if (visited_words[visited_word_index] & visited_mask != 0) {
             // A valid HBC topology is a strict tree. Reaching a node twice is
             // either a cycle or shared-child corruption; count it as invalid
             // and do not enqueue its descendants again.
             invalid_posting_count += 1;
             continue;
         }
+        visited_words[visited_word_index] |= visited_mask;
         var node = loadPublishedNode(self, txn, node_id) catch |err| {
             if (isNotFoundGeneric(err)) {
                 missing_node_count += 1;
@@ -365,10 +384,9 @@ fn acquireFlatCentroidDirectory(
     cancellation: ?search_types.CancellationToken,
 ) !*FlatCentroidDirectory {
     // Complete-snapshot callers already hold a generation-bound read txn. A
-    // matching shared directory is safe to reuse; otherwise build privately
-    // through that txn so a concurrent publication cannot mix topology from
-    // two generations. Full coverage is exceptional, so avoiding cache churn
-    // here also protects the best-effort search hot path.
+    // matching shared directory is safe to reuse; otherwise build through that
+    // txn so a concurrent publication cannot mix topology from two generations,
+    // then publish it only if the captured generation is still current.
     if (expected_snapshot) |snapshot| {
         lockAtomicMutex(&self.flat_centroid_mu);
         if (self.flat_centroid_directory) |directory| {
@@ -390,6 +408,32 @@ fn acquireFlatCentroidDirectory(
             snapshot.publish_generation,
             cancellation,
         );
+        errdefer built.deinit(self.alloc);
+
+        // Install a stable complete-search build into the same generation-keyed
+        // cache used by best-effort search. The publication path clears this
+        // cache while holding the same mutex after making generation odd, so a
+        // stale directory cannot be installed behind an invalidation.
+        var stale: ?*FlatCentroidDirectory = null;
+        lockAtomicMutex(&self.flat_centroid_mu);
+        if (!snapshotStillPublished(self, snapshot)) {
+            self.flat_centroid_mu.unlock();
+            return built;
+        }
+        if (self.flat_centroid_directory) |directory| {
+            if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
+                directory.retain();
+                self.flat_centroid_mu.unlock();
+                built.deinit(self.alloc);
+                self.alloc.destroy(built);
+                return directory;
+            }
+            stale = directory;
+        }
+        built.retain();
+        self.flat_centroid_directory = built;
+        self.flat_centroid_mu.unlock();
+        if (stale) |directory| directory.release(self.alloc);
         return built;
     }
 

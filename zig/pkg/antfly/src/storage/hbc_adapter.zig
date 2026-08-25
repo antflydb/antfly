@@ -2099,6 +2099,13 @@ fn claimLocalClockSlot(clock_keys: []u64, start_slot: usize, key: u64) ?usize {
 // HBC Index
 // ============================================================================
 
+const CompleteCoverageFlight = struct {
+    generation: u64,
+    io: std.Io,
+    ready: std.Io.Event = .unset,
+    refs: usize = 1,
+};
+
 pub const HBCIndex = struct {
     alloc: Allocator,
     env_owner: EnvOwner,
@@ -2122,11 +2129,12 @@ pub const HBCIndex = struct {
     /// Exact reachable-vector coverage is immutable within a published
     /// generation, so only the first complete search needs to validate it.
     complete_coverage_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64)),
-    /// Serializes the first exact coverage validation for a generation. A
-    /// waiter rechecks the generation after acquiring the lock, so concurrent
-    /// effort=1 searches share one validation instead of multiplying its I/O
-    /// and governed workspace.
-    complete_coverage_mu: apply_rw_lock_mod.ApplyRwLock = .{},
+    /// Short state lock for the generation validation flight. Long waits use
+    /// CompleteCoverageFlight.ready on the backend runtime's std.Io; they never
+    /// spin on an OS-thread mutex or retain a search transaction/workspace.
+    complete_coverage_state_mu: std.atomic.Mutex = .unlocked,
+    complete_coverage_flight: ?*CompleteCoverageFlight = null,
+    runtime_io: ?std.Io = null,
     rng: go_rand.GoPcg,
     // Set when a write path observes a tree-link inconsistency (stale parent
     // pointer, dangling node reference); background maintenance runs a
@@ -3082,20 +3090,111 @@ pub const HBCIndex = struct {
         return self.complete_coverage_generation.load(.acquire) == generation;
     }
 
-    /// Returns with complete_coverage_mu held exclusively when this caller is
-    /// responsible for validation. A false return never retains the lock.
-    pub fn beginCompleteCoverageValidation(self: *HBCIndex, generation: u64) bool {
-        self.complete_coverage_mu.lockExclusive();
-        if (self.completeCoverageAlreadyValidated(generation)) {
-            self.complete_coverage_mu.unlockExclusive();
-            return false;
+    pub fn setIo(self: *HBCIndex, io: ?std.Io) void {
+        // IndexManager binds this during construction/startup, before requests
+        // are admitted. Direct library users retain the threaded fallback.
+        self.runtime_io = io;
+    }
+
+    fn coverageIo(self: *const HBCIndex) std.Io {
+        return self.runtime_io orelse std.Io.Threaded.global_single_threaded.io();
+    }
+
+    fn releaseCompleteCoverageFlightRef(self: *HBCIndex, flight: *CompleteCoverageFlight) void {
+        lockAtomic(&self.complete_coverage_state_mu);
+        std.debug.assert(flight.refs > 0);
+        flight.refs -= 1;
+        const destroy = flight.refs == 0;
+        self.complete_coverage_state_mu.unlock();
+        if (destroy) self.alloc.destroy(flight);
+    }
+
+    fn waitForCompleteCoverageFlight(
+        self: *HBCIndex,
+        flight: *CompleteCoverageFlight,
+        cancellation: ?vectorindex_search_types.CancellationToken,
+    ) !void {
+        defer self.releaseCompleteCoverageFlightRef(flight);
+        while (!flight.ready.isSet()) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            flight.ready.waitTimeout(flight.io, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromMilliseconds(5),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return error.Cancelled,
+            };
         }
-        return true;
+        if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+    }
+
+    /// Elects one validator per publication generation. Contending callers
+    /// sleep on a runtime event and recheck after either success or failure;
+    /// cancellation only removes that waiter and never cancels the producer.
+    pub fn beginCompleteCoverageValidation(
+        self: *HBCIndex,
+        generation: u64,
+        cancellation: ?vectorindex_search_types.CancellationToken,
+    ) !bool {
+        while (true) {
+            if (self.completeCoverageAlreadyValidated(generation)) return false;
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+
+            lockAtomic(&self.complete_coverage_state_mu);
+            if (self.completeCoverageAlreadyValidated(generation)) {
+                self.complete_coverage_state_mu.unlock();
+                return false;
+            }
+            if (self.complete_coverage_flight) |flight| {
+                flight.refs += 1;
+                self.complete_coverage_state_mu.unlock();
+                try self.waitForCompleteCoverageFlight(flight, cancellation);
+                continue;
+            }
+
+            self.complete_coverage_state_mu.unlock();
+            const candidate = try self.alloc.create(CompleteCoverageFlight);
+            candidate.* = .{ .generation = generation, .io = self.coverageIo() };
+            if (cancellation) |token| if (token.isCancelled()) {
+                self.alloc.destroy(candidate);
+                return error.Cancelled;
+            };
+
+            // Allocation can involve an allocator lock or a system call, so do
+            // it outside the atomic state lock and repeat election afterward.
+            lockAtomic(&self.complete_coverage_state_mu);
+            if (self.completeCoverageAlreadyValidated(generation)) {
+                self.complete_coverage_state_mu.unlock();
+                self.alloc.destroy(candidate);
+                return false;
+            }
+            if (self.complete_coverage_flight) |flight| {
+                flight.refs += 1;
+                self.complete_coverage_state_mu.unlock();
+                self.alloc.destroy(candidate);
+                try self.waitForCompleteCoverageFlight(flight, cancellation);
+                continue;
+            }
+            self.complete_coverage_flight = candidate;
+            self.complete_coverage_state_mu.unlock();
+            return true;
+        }
     }
 
     pub fn finishCompleteCoverageValidation(self: *HBCIndex, generation: u64, validated: bool) void {
+        lockAtomic(&self.complete_coverage_state_mu);
+        const flight = self.complete_coverage_flight orelse unreachable;
+        std.debug.assert(flight.generation == generation);
+        self.complete_coverage_flight = null;
         if (validated) self.complete_coverage_generation.store(generation, .release);
-        self.complete_coverage_mu.unlockExclusive();
+        self.complete_coverage_state_mu.unlock();
+
+        // Waking runtime waiters can schedule work; keep it outside the atomic
+        // state lock. The producer's reference keeps the flight alive here.
+        flight.ready.set(flight.io);
+        self.releaseCompleteCoverageFlightRef(flight);
     }
 
     pub fn noteCompleteCoverageValidated(self: *HBCIndex, generation: u64) void {
@@ -8023,6 +8122,52 @@ test "complete snapshot rejects orphaned reachable coverage and schedules genera
     try std.testing.expect(idx.treeLinkRepairPending());
 }
 
+test "small quantized complete snapshot validates authoritative leaf assignments" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 4,
+        .branching_factor = 4,
+        .use_quantization = true,
+        .rerank_policy = .always,
+    });
+    defer idx.close();
+
+    for (0..128) |i| {
+        const value: f32 = @floatFromInt(i);
+        try idx.insert(@intCast(i + 1), &.{ value, 0 });
+    }
+    const near_leaf = (try idx.debugLeafForVector(1)) orelse return error.TestUnexpectedResult;
+    const far_leaf = (try idx.debugLeafForVector(128)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(near_leaf != far_leaf);
+
+    // Preserve the reachable, unique member set and all quantized payloads,
+    // but corrupt the authoritative assignment for a far-away vector that will
+    // not enter the k=1 rerank window. Count+uniqueness validation alone accepts
+    // this generation even though its membership publication is inconsistent.
+    {
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        try idx.putVecLeaf(&txn, 128, near_leaf);
+        try txn.commit();
+    }
+
+    try std.testing.expectError(
+        error.IncompletePublishedSnapshot,
+        idx.searchWithRequest(.{
+            .query = &.{ 0, 0 },
+            .k = 1,
+            .search_effort = 1,
+            .load_metadata = false,
+        }),
+    );
+    try std.testing.expect(idx.generationRepairPending());
+}
+
 test "complete coverage validation claim caches success and retries failure" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -8033,16 +8178,56 @@ test "complete coverage validation claim caches success and retries failure" {
     defer idx.close();
 
     const generation = idx.publishedGeneration();
-    try std.testing.expect(idx.beginCompleteCoverageValidation(generation));
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
     idx.finishCompleteCoverageValidation(generation, true);
-    try std.testing.expect(!idx.beginCompleteCoverageValidation(generation));
+    try std.testing.expect(!try idx.beginCompleteCoverageValidation(generation, null));
 
     const next_generation = generation + 2;
-    try std.testing.expect(idx.beginCompleteCoverageValidation(next_generation));
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(next_generation, null));
     idx.finishCompleteCoverageValidation(next_generation, false);
-    try std.testing.expect(idx.beginCompleteCoverageValidation(next_generation));
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(next_generation, null));
     idx.finishCompleteCoverageValidation(next_generation, true);
-    try std.testing.expect(!idx.beginCompleteCoverageValidation(next_generation));
+    try std.testing.expect(!try idx.beginCompleteCoverageValidation(next_generation, null));
+}
+
+test "complete coverage validation waiter honors cancellation without canceling owner" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    idx.setIo(io);
+
+    const generation = idx.publishedGeneration();
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
+    var owner_active = true;
+    defer if (owner_active) idx.finishCompleteCoverageValidation(generation, false);
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    const Waiter = struct {
+        fn run(index: *HBCIndex, signal: *const std.atomic.Value(bool), expected_generation: u64) !bool {
+            return try index.beginCompleteCoverageValidation(
+                expected_generation,
+                vectorindex_search_types.CancellationToken.fromAtomic(signal),
+            );
+        }
+    };
+    var waiter = std.Io.async(io, Waiter.run, .{ &idx, &cancelled, generation });
+    try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    cancelled.store(true, .release);
+    try std.testing.expectError(error.Cancelled, waiter.await(io));
+
+    // The canceled waiter only releases its reference. The elected producer
+    // still owns the flight and can publish a successful validation.
+    idx.finishCompleteCoverageValidation(generation, true);
+    owner_active = false;
+    try std.testing.expect(!try idx.beginCompleteCoverageValidation(generation, null));
 }
 
 test "complete snapshot retries optimistic publication conflicts under a progress fence" {
@@ -9828,6 +10013,18 @@ test "flat rabitq full effort exhausts an underfilled published directory" {
     try std.testing.expectEqual(stats.active_count, profiled.profile.approx_vectors_scored);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
     try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_frontier_remaining);
+
+    const published_directory = idx.flat_centroid_directory orelse return error.TestUnexpectedResult;
+    var repeated = try idx.searchProfiledRequest(.{
+        .query = &.{ 1, 1 },
+        .k = 3,
+        .search_effort = 1,
+        .search_width = estimated_leaves,
+        .load_metadata = false,
+    });
+    defer repeated.results.deinit();
+    try std.testing.expectEqual(published_directory, idx.flat_centroid_directory.?);
+    try std.testing.expectEqual(stats.active_count, repeated.profile.approx_vectors_scored);
 }
 
 test "tree full effort exhausts underfilled leaves beyond estimated width" {

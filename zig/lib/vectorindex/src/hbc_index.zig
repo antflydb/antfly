@@ -2081,8 +2081,6 @@ fn searchProfiledRequestAttempt(
     defer if (comptime @hasDecl(Index, "observeSearchCacheBenefit")) self.observeSearchCacheBenefit(&profile);
     const total_start = now_fn_u64();
     try search_types.checkCancelled(req);
-    hbc_runtime.beginSearchEpoch(self);
-    defer hbc_runtime.endSearchEpoch(self);
     const coverage_policy = search_types.coveragePolicy(req);
     const exhaustive_coverage = coverage_policy == .complete_snapshot;
     var published_snapshot = expected_snapshot orelse loadStableSearchPublishedSnapshot(self);
@@ -2097,6 +2095,21 @@ fn searchProfiledRequestAttempt(
         }
         published_snapshot = loadStableSearchPublishedSnapshot(self);
     }
+    var coverage_tracker = CompleteCoverageTracker.init(try beginCompleteCoverageValidationIfSupported(
+        self,
+        exhaustive_coverage,
+        published_snapshot.publish_generation,
+        req.cancellation,
+    ), published_snapshot.active_count);
+    defer if (coverage_tracker.claim_held) {
+        finishCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, false);
+    };
+    // A waiter may have spent time behind the generation validator. Do not
+    // retain an MVCC snapshot or request workspace while waiting, and honor a
+    // disconnect before acquiring either resource.
+    try search_types.checkCancelled(req);
+    hbc_runtime.beginSearchEpoch(self);
+    defer hbc_runtime.endSearchEpoch(self);
     const setup_start = total_start;
     const txn_start = now_fn_u64();
     if (exhaustive_coverage) notifyCompleteSnapshotCapturedForTestIfSupported(self);
@@ -2143,13 +2156,6 @@ fn searchProfiledRequestAttempt(
     const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
     const root_node_id = published_snapshot.root_node;
 
-    var coverage_tracker = CompleteCoverageTracker.init(
-        beginCompleteCoverageValidationIfSupported(self, exhaustive_coverage, published_snapshot.publish_generation),
-        published_snapshot.active_count,
-    );
-    defer if (coverage_tracker.claim_held) {
-        finishCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, false);
-    };
     try coverage_tracker.prepare(self, scratch);
     if (exhaustive_coverage) {
         try scratch.resetCoverageVisited(self.alloc, published_snapshot.node_count);
@@ -2596,11 +2602,12 @@ fn beginCompleteCoverageValidationIfSupported(
     self: anytype,
     exhaustive: bool,
     generation: u64,
-) CompleteCoverageValidationClaim {
+    cancellation: ?search_types.CancellationToken,
+) !CompleteCoverageValidationClaim {
     if (!exhaustive) return .{ .enabled = false, .held = false };
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "beginCompleteCoverageValidation")) {
-        const claimed = self.beginCompleteCoverageValidation(generation);
+        const claimed = try self.beginCompleteCoverageValidation(generation, cancellation);
         return .{ .enabled = claimed, .held = claimed };
     }
     if (comptime @hasDecl(Index, "completeCoverageAlreadyValidated")) {
@@ -2622,15 +2629,12 @@ fn finishCompleteCoverageValidationIfSupported(self: anytype, generation: u64, v
 }
 
 const CompleteCoverageTracker = struct {
-    const max_collected_ids: u64 = 262_144;
     const assignment_batch_size: usize = 8_192;
 
     enabled: bool,
     claim_held: bool,
     expected_count: u64,
     observed_count: u64 = 0,
-    collect_ids: bool,
-    collected_count: usize = 0,
     assignment_count: usize = 0,
 
     fn init(claim: CompleteCoverageValidationClaim, expected_count: u64) CompleteCoverageTracker {
@@ -2638,18 +2642,13 @@ const CompleteCoverageTracker = struct {
             .enabled = claim.enabled,
             .claim_held = claim.held,
             .expected_count = expected_count,
-            .collect_ids = claim.enabled and expected_count <= max_collected_ids,
         };
     }
 
     fn prepare(self: *CompleteCoverageTracker, index: anytype, scratch: anytype) !void {
         if (!self.enabled) return;
-        if (self.collect_ids) {
-            try scratch.ensureCoverageIdCapacity(index.alloc, @intCast(self.expected_count));
-        } else {
-            try scratch.ensureCoverageMemberCapacity(index.alloc, assignment_batch_size);
-            try scratch.ensureLookupCapacity(index.alloc, assignment_batch_size);
-        }
+        try scratch.ensureCoverageMemberCapacity(index.alloc, assignment_batch_size);
+        try scratch.ensureLookupCapacity(index.alloc, assignment_batch_size);
     }
 
     fn observe(
@@ -2665,15 +2664,6 @@ const CompleteCoverageTracker = struct {
             return error.IncompletePublishedSnapshot;
         if (self.observed_count > self.expected_count) return error.IncompletePublishedSnapshot;
         if (member_ids.len == 0) return;
-
-        if (self.collect_ids) {
-            const next = std.math.add(usize, self.collected_count, member_ids.len) catch
-                return error.IncompletePublishedSnapshot;
-            if (next > scratch.coverage_ids.len) return error.IncompletePublishedSnapshot;
-            @memcpy(scratch.coverage_ids[self.collected_count..next], member_ids);
-            self.collected_count = next;
-            return;
-        }
 
         // Detect same-posting duplicates exactly without coupling the global
         // validation batch size to a leaf's fanout.
@@ -2730,14 +2720,7 @@ const CompleteCoverageTracker = struct {
     fn validate(self: *CompleteCoverageTracker, txn: anytype, scratch: anytype) !void {
         if (!self.enabled) return;
         if (self.observed_count != self.expected_count) return error.IncompletePublishedSnapshot;
-        if (!self.collect_ids) return self.flushAssignments(txn, scratch);
-        if (self.collected_count != self.expected_count) return error.IncompletePublishedSnapshot;
-        const member_ids = scratch.coverage_ids[0..self.collected_count];
-        if (member_ids.len < 2) return;
-        std.mem.sort(u64, member_ids, {}, std.sort.asc(u64));
-        for (member_ids[1..], member_ids[0 .. member_ids.len - 1]) |current, previous| {
-            if (current == previous) return error.IncompletePublishedSnapshot;
-        }
+        return self.flushAssignments(txn, scratch);
     }
 };
 
