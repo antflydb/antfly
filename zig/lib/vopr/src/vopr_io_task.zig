@@ -35,6 +35,14 @@ pub const Status = enum {
     finished,
 };
 
+pub const TaskSnapshot = struct {
+    id: ids.StableId,
+    status: Status,
+    sleep_deadline_ns: ?i96,
+    waiting_on_futex: bool,
+    external_resource_id: ?ids.StableId,
+};
+
 pub const Sleep = struct {
     clock: std.Io.Clock,
     deadline_ns: i96,
@@ -211,6 +219,21 @@ pub const Kernel = struct {
 
     pub fn totalTaskCount(self: *const Kernel) usize {
         return self.tasks.items.len;
+    }
+
+    pub fn futureSnapshot(self: *const Kernel, any_future: *std.Io.AnyFuture) ?TaskSnapshot {
+        const target: *Task = @ptrCast(@alignCast(any_future));
+        for (self.tasks.items) |task| {
+            if (task != target) continue;
+            return .{
+                .id = task.id,
+                .status = task.status,
+                .sleep_deadline_ns = if (task.sleep) |sleep| sleep.deadline_ns else null,
+                .waiting_on_futex = task.futex_ptr != null,
+                .external_resource_id = task.external_id,
+            };
+        }
+        return null;
     }
 
     pub fn isQuiescent(self: *const Kernel) bool {

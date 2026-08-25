@@ -382,6 +382,15 @@ pub const VoprIo = struct {
         };
     }
 
+    /// Stable task evidence for debuggers and harness-health reports. The
+    /// Future remains owned by its caller; this method never awaits or reaps it.
+    pub fn futureTaskSnapshot(
+        self: *const VoprIo,
+        any_future: *std.Io.AnyFuture,
+    ) ?task_mod.TaskSnapshot {
+        return self.tasks.futureSnapshot(any_future);
+    }
+
     /// Standard health adapter for every scenario borrowing this runtime. It
     /// automatically supplies task, descriptor, and physical-storage evidence
     /// while leaving domain progress, recovery, and consistency semantics in

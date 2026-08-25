@@ -184,6 +184,18 @@ pub const MergeSourceTransitionMutation = struct {
     receiver_group_id: u64,
 };
 
+/// Replay identity for receiver-side merge copy batches. Unlike an ordinary
+/// write, these entries must reopen the already-provisioned receiver from its
+/// local manifest even while metadata publication is synchronously waiting on
+/// the merge. Carrying the identity in every command keeps follower and
+/// restart replay independent of the catalog.
+pub const MergeReplicationContext = struct {
+    transition_id: u64,
+    donor_group_id: u64,
+    receiver_group_id: u64,
+    identity_namespace: doc_identity_mod.Namespace,
+};
+
 /// Private receiver-side data-Raft checkpoint for a range merge. Document
 /// transfer batches are ordinary replicated writes; this record makes the
 /// structural phase, receiver range, and donor watermark durable on every
@@ -274,6 +286,9 @@ pub const BatchRequest = struct {
     merge_source_transition: ?MergeSourceTransitionMutation = null,
     /// Internal receiver merge lifecycle. Public batch parsing never sets it.
     merge_checkpoint: ?MergeReplicationCheckpoint = null,
+    /// Internal identity context for receiver-side merge copy and rollback
+    /// batches. Public batch parsing never sets it.
+    merge_replication: ?MergeReplicationContext = null,
     /// Internal 2PC phase. Public batch parsing never accepts this field.
     transaction: ?TransactionMutation = null,
 };

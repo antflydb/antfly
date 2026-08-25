@@ -252,6 +252,39 @@ test "raft batch round trips internal merge checkpoint" {
     try std.testing.expect(checkpoint.receiver_identity_reassignment_namespace.?.eql(namespace));
 }
 
+test "raft batch round trips merge replay identity with checkpoint" {
+    const namespace = db_mod.DocIdentityNamespace{ .table_id = 7, .shard_id = 42, .range_id = 420 };
+    const encoded = try encode(std.testing.allocator, "docs", .{
+        .merge_checkpoint = .{
+            .kind = .accept,
+            .transition_id = 40,
+            .donor_group_id = 41,
+            .receiver_group_id = 42,
+            .receiver_base_start = "doc:m",
+            .receiver_base_end = "",
+            .merged_start = "doc:a",
+            .merged_end = "",
+            .allow_doc_identity_reassignment = true,
+            .receiver_identity_reassignment_namespace = namespace,
+        },
+        .merge_replication = .{
+            .transition_id = 40,
+            .donor_group_id = 41,
+            .receiver_group_id = 42,
+            .identity_namespace = namespace,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    const replication = decoded.batch.req.merge_replication orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 40), replication.transition_id);
+    try std.testing.expectEqual(@as(u64, 41), replication.donor_group_id);
+    try std.testing.expectEqual(@as(u64, 42), replication.receiver_group_id);
+    try std.testing.expect(replication.identity_namespace.eql(namespace));
+}
+
 test "raft batch round trips merge source transition" {
     const encoded = try encode(std.testing.allocator, "docs", .{
         .merge_source_transition = .{

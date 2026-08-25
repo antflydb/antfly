@@ -8064,9 +8064,21 @@ pub const DataServer = struct {
                             };
                             if (leader_base_uri) |base_uri| {
                                 defer alloc.free(base_uri);
-                                var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
+                                // Forward through the DataServer's borrowed
+                                // transport authority. Constructing a native
+                                // executor here escapes VoprIo and gives this
+                                // request a different clock/socket owner than
+                                // the Raft process that selected the route.
+                                var executor = antfly.common.http.IoHttpExecutor.init(
+                                    alloc,
+                                    self.dataRaftIo() orelse return error.BackendRuntimeUnavailable,
+                                    .{},
+                                );
                                 defer executor.deinit();
-                                var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+                                var client = antfly.public_api.ApiHttpClient.init(
+                                    alloc,
+                                    executor.executor(),
+                                );
                                 const body = try antfly.public_api.batch.encodeBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
                                 const forwarding = self.nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse {
@@ -8238,6 +8250,7 @@ pub const DataServer = struct {
         last_target_node_id: *?u64,
     ) !bool {
         const remote_metadata = self.remote_metadata orelse return false;
+        _ = self.data_raft orelse return false;
         var snapshot = if (route.refresh_metadata)
             try remote_metadata.fetchSnapshotWithBudget(.{
                 .deadline_ns = deadline_ns,
@@ -8269,7 +8282,11 @@ pub const DataServer = struct {
         const target_store = findSnapshotStoreByNodeId(snapshot.stores, target_node_id) orelse return false;
         if (target_store.api_url.len == 0) return false;
 
-        var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
+        var executor = antfly.common.http.IoHttpExecutor.init(
+            alloc,
+            self.dataRaftIo() orelse return error.BackendRuntimeUnavailable,
+            .{},
+        );
         defer executor.deinit();
         var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
@@ -10714,14 +10731,35 @@ pub const DataServer = struct {
         };
     }
 
+    fn mergeReplicationContext(
+        transition_id: u64,
+        donor_group_id: u64,
+        receiver_group_id: u64,
+        table_contract: antfly.metadata.TransitionTableContract,
+    ) !antfly.db.types.MergeReplicationContext {
+        if (transition_id == 0 or donor_group_id == receiver_group_id) return error.InvalidBatchRequest;
+        return .{
+            .transition_id = transition_id,
+            .donor_group_id = donor_group_id,
+            .receiver_group_id = receiver_group_id,
+            .identity_namespace = identityNamespaceFromTransitionContract(table_contract, .target),
+        };
+    }
+
     fn replicateMergeReceiverCheckpoint(
         self: *DataServer,
         checkpoint: antfly.db.types.MergeReplicationCheckpoint,
-        table_name: []const u8,
+        table_contract: antfly.metadata.TransitionTableContract,
     ) !void {
-        try self.proposeRaftBatchGroup(self.alloc, checkpoint.receiver_group_id, table_name, .{
+        try self.proposeRaftBatchGroup(self.alloc, checkpoint.receiver_group_id, table_contract.table_name, .{
             .sync_level = .write,
             .merge_checkpoint = checkpoint,
+            .merge_replication = try mergeReplicationContext(
+                checkpoint.transition_id,
+                checkpoint.donor_group_id,
+                checkpoint.receiver_group_id,
+                table_contract,
+            ),
         }, .{ .refresh_metadata = false });
     }
 
@@ -10788,6 +10826,7 @@ pub const DataServer = struct {
         receiver_group_id: u64,
         donor_range: antfly.db.types.ByteRange,
         table_name: []const u8,
+        replication: antfly.db.types.MergeReplicationContext,
     ) !void {
         const entries = try source_store.appliedNormalEntries(self.alloc, donor_group_id);
         defer {
@@ -10802,6 +10841,7 @@ pub const DataServer = struct {
                         try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_name, .{
                             .deletes = &.{key},
                             .sync_level = .write,
+                            .merge_replication = replication,
                         }, .{ .refresh_metadata = false });
                     }
                 }
@@ -10819,6 +10859,7 @@ pub const DataServer = struct {
                 try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_name, .{
                     .deletes = deletes.items,
                     .sync_level = .write,
+                    .merge_replication = replication,
                 }, .{ .refresh_metadata = false });
             }
         }
@@ -10831,6 +10872,7 @@ pub const DataServer = struct {
         receiver_group_id: u64,
         donor_range: antfly.db.types.ByteRange,
         table_name: []const u8,
+        replication: antfly.db.types.MergeReplicationContext,
     ) !void {
         var after_key: ?[]u8 = null;
         defer if (after_key) |key| self.alloc.free(key);
@@ -10857,6 +10899,7 @@ pub const DataServer = struct {
             try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_name, .{
                 .writes = writes,
                 .sync_level = .write,
+                .merge_replication = replication,
             }, .{ .refresh_metadata = false });
             const next_after = try self.alloc.dupe(u8, page.entries[page.entries.len - 1].key);
             if (after_key) |key| self.alloc.free(key);
@@ -10890,6 +10933,12 @@ pub const DataServer = struct {
         const base_range = receiver_state.?.receiver_base_range;
         const merged_range = receiver_state.?.merged_range orelse
             return error.MergeReceiverProjectionNotReady;
+        const replication = try mergeReplicationContext(
+            transition_id,
+            donor_group_id,
+            receiver_group_id,
+            table_contract,
+        );
 
         // Deletes are replayed before the authoritative snapshot. A document
         // deleted and later recreated is therefore restored by the snapshot;
@@ -10900,6 +10949,7 @@ pub const DataServer = struct {
             receiver_group_id,
             donor_range,
             table_contract.table_name,
+            replication,
         );
         try self.replicateMergeSnapshotWrites(
             source_store,
@@ -10907,6 +10957,7 @@ pub const DataServer = struct {
             receiver_group_id,
             donor_range,
             table_contract.table_name,
+            replication,
         );
         try self.replicateMergeReceiverCheckpoint(
             mergeReceiverCheckpoint(
@@ -10920,21 +10971,29 @@ pub const DataServer = struct {
                 allow_doc_identity_reassignment,
                 table_contract,
             ),
-            table_contract.table_name,
+            table_contract,
         );
         return watermark.last_entry_index;
     }
 
     fn replicateMergeRollbackDeletes(
         self: *DataServer,
+        transition_id: u64,
+        donor_group_id: u64,
         receiver_group_id: u64,
         donor_range: antfly.db.types.ByteRange,
-        table_name: []const u8,
+        table_contract: antfly.metadata.TransitionTableContract,
     ) !void {
         const store = self.localTransitionApplyStore() orelse
             return error.MissingMergeReceiverStore;
         var after_key: ?[]u8 = null;
         defer if (after_key) |key| self.alloc.free(key);
+        const replication = try mergeReplicationContext(
+            transition_id,
+            donor_group_id,
+            receiver_group_id,
+            table_contract,
+        );
         while (true) {
             var page = try store.groupStatePageInRange(
                 self.alloc,
@@ -10952,9 +11011,10 @@ pub const DataServer = struct {
             const deletes = try self.alloc.alloc([]const u8, page.entries.len);
             defer self.alloc.free(deletes);
             for (page.entries, 0..) |entry, i| deletes[i] = entry.key;
-            try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_name, .{
+            try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_contract.table_name, .{
                 .deletes = deletes,
                 .sync_level = .write,
+                .merge_replication = replication,
             }, .{ .refresh_metadata = false });
             const next_after = try self.alloc.dupe(u8, page.entries[page.entries.len - 1].key);
             if (after_key) |key| self.alloc.free(key);
@@ -11019,6 +11079,27 @@ pub const DataServer = struct {
             status.receiver_identity_reassignment_namespace_range_id = namespace.range_id;
         };
         return .{ .donor = status, .receiver = status };
+    }
+
+    fn replicatedMergeAlreadyFinalized(
+        self: *DataServer,
+        transition_id: u64,
+        donor_group_id: u64,
+        receiver_group_id: u64,
+        allow_doc_identity_reassignment: bool,
+        table_contract: antfly.metadata.TransitionTableContract,
+    ) !bool {
+        const store = self.localTransitionApplyStore() orelse
+            return error.MissingMergeSourceStore;
+        const observation = try deriveReplicatedMergeObservation(self.alloc, store, .{
+            .transition_id = transition_id,
+            .donor_group_id = donor_group_id,
+            .receiver_group_id = receiver_group_id,
+            .allow_doc_identity_reassignment = allow_doc_identity_reassignment,
+            .table_contract = table_contract,
+        });
+        return observation.donor.phase == .finalized and
+            observation.receiver.phase == .finalized;
     }
 
     fn localAcceptMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "accept_merge_receiver")) !void {
@@ -11091,7 +11172,7 @@ pub const DataServer = struct {
                     op.allow_doc_identity_reassignment,
                     op.table_contract,
                 ),
-                op.table_contract.table_name,
+                op.table_contract,
             );
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
@@ -11132,6 +11213,16 @@ pub const DataServer = struct {
             var lane = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
                 return error.TransitionOperationBusy;
             defer lane.deinit();
+            // A terminal receipt is the idempotency boundary. Recopying after
+            // cutover can observe a larger donor Raft watermark and would turn
+            // an exact retry into a conflicting receiver checkpoint.
+            if (try self.replicatedMergeAlreadyFinalized(
+                op.transition_id,
+                op.donor_group_id,
+                op.receiver_group_id,
+                op.allow_doc_identity_reassignment,
+                op.table_contract,
+            )) return;
             const donor_lease = try self.leaseTransitionDbForTableGroup(
                 op.donor_group_id,
                 op.table_contract,
@@ -11186,6 +11277,13 @@ pub const DataServer = struct {
             var lane = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
                 return error.TransitionOperationBusy;
             defer lane.deinit();
+            if (try self.replicatedMergeAlreadyFinalized(
+                op.transition_id,
+                op.donor_group_id,
+                op.receiver_group_id,
+                op.allow_doc_identity_reassignment,
+                op.table_contract,
+            )) return;
             const donor_lease = try self.leaseTransitionDbForTableGroup(
                 op.donor_group_id,
                 op.table_contract,
@@ -11231,7 +11329,7 @@ pub const DataServer = struct {
                     op.allow_doc_identity_reassignment,
                     op.table_contract,
                 ),
-                op.table_contract.table_name,
+                op.table_contract,
             );
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
@@ -11305,9 +11403,11 @@ pub const DataServer = struct {
             const merged_range = receiver_state.merged_range orelse
                 return error.MergeReceiverProjectionNotReady;
             try self.replicateMergeRollbackDeletes(
+                op.transition_id,
+                op.donor_group_id,
                 op.receiver_group_id,
                 donor_range,
-                op.table_contract.table_name,
+                op.table_contract,
             );
             try self.replicateMergeReceiverCheckpoint(
                 mergeReceiverCheckpoint(
@@ -11321,7 +11421,7 @@ pub const DataServer = struct {
                     op.allow_doc_identity_reassignment,
                     op.table_contract,
                 ),
-                op.table_contract.table_name,
+                op.table_contract,
             );
         } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });
@@ -19704,7 +19804,7 @@ test "data raft merge observation derives from replicated source and receiver ma
     try std.testing.expectEqual(@as(u64, 2), observation.receiver.receiver_delta_sequence);
 }
 
-test "data raft source split lifecycle commands bypass document db apply" {
+test "data raft source lifecycle commands bypass document db apply while receiver checkpoints apply" {
     try std.testing.expectEqual(
         data_raft_batch.timestamp_protocol_version,
         DataServer.requiredRaftBatchProtocolVersion(.{}),
@@ -19723,6 +19823,18 @@ test "data raft source split lifecycle commands bypass document db apply" {
             .kind = .finalize,
             .transition_id = 7001,
             .receiver_group_id = 7002,
+        },
+    }));
+    try std.testing.expect(batchRequiresDocumentDbApply(.{
+        .merge_checkpoint = .{
+            .kind = .accept,
+            .transition_id = 7001,
+            .donor_group_id = 7001,
+            .receiver_group_id = 7002,
+            .receiver_base_start = "doc:m",
+            .receiver_base_end = "",
+            .merged_start = "doc:a",
+            .merged_end = "",
         },
     }));
     try std.testing.expectEqual(
@@ -28466,6 +28578,7 @@ test "production DataServer replicated merge actions run on VoprIo" {
             .start_optional_runtime_workers = false,
         });
         defer donor.close();
+        try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &donor, contract.schema_json);
         try donor.updateRange(.{ .start = "doc:a", .end = "doc:m" });
         try donor.batch(.{ .writes = &.{.{
             .key = "doc:b",
@@ -28487,6 +28600,7 @@ test "production DataServer replicated merge actions run on VoprIo" {
             .start_optional_runtime_workers = false,
         });
         defer receiver.close();
+        try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &receiver, contract.schema_json);
         try receiver.updateRange(.{ .start = "doc:m", .end = "" });
         try receiver.batch(.{ .writes = &.{.{
             .key = "doc:z",
@@ -28673,8 +28787,14 @@ test "production DataServer replicated merge actions run on VoprIo" {
         if (transitions > 50_000) return error.VoprDataServerMergeTransitionBudgetExceeded;
     }
     try std.testing.expect(shared.done);
-    if (shared.driver_failure) |err| return err;
-    if (shared.failure) |err| return err;
+    if (shared.driver_failure) |err| {
+        std.log.err("DataServer VOPR driver failed err={s}", .{@errorName(err)});
+        return err;
+    }
+    if (shared.failure) |err| {
+        std.log.err("DataServer VOPR action failed stage={} err={s}", .{ shared.stage, @errorName(err) });
+        return err;
+    }
     const rollback_observation = shared.rollback_observation orelse
         return error.MissingMergeRollbackObservation;
     try std.testing.expectEqual(.rolled_back, rollback_observation.donor.phase);
@@ -28706,6 +28826,875 @@ test "production DataServer replicated merge actions run on VoprIo" {
     defer alloc.free(receiver_doc);
     try std.testing.expectEqualStrings("{\"side\":\"receiver\"}", receiver_doc);
     try sim.ensureNoCapabilityViolation();
+}
+
+const MultiOwnerReplayStep = struct {
+    id: u64,
+    actor_id: ?u64,
+    resource_id: ?u64,
+    parameter: i64,
+    clock_only: bool,
+};
+
+fn runThreeDataServerReplicatedMergeVoprHistory(
+    trace_alloc: std.mem.Allocator,
+    replay_trace: ?[]const MultiOwnerReplayStep,
+    recorded_trace: *std.ArrayListUnmanaged(MultiOwnerReplayStep),
+) !void {
+    const vopr = @import("vopr");
+    var alloc_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    defer _ = alloc_state.deinit();
+    const alloc = alloc_state.allocator();
+    var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) the LSM and Raft image backends remain explicit differential boundaries
+    defer tmp.cleanup();
+
+    var roots: [3][:0]u8 = undefined;
+    var root_count: usize = 0;
+    defer for (roots[0..root_count]) |root| alloc.free(root);
+    for (0..roots.len) |i| {
+        var name_buf: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "node-{d}", .{i + 1});
+        try tmp.dir.createDirPath(std.testing.io, name);
+        roots[i] = try tmp.dir.realPathFileAlloc(std.testing.io, name, alloc); // vopr-audit: allow(host_filesystem) explicit physical-backend differential
+        root_count += 1;
+    }
+
+    var sim = try vopr.vopr_io.VoprIo.init(.{
+        .seed = 0x4d55_4c54_4944_4154,
+        .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+        .network = .{ .max_sockets = 16_384 },
+        .required = .of(&.{
+            .clock_read,
+            .sleep,
+            .task_scheduling,
+            .synchronization,
+            .deterministic_entropy,
+            .sockets,
+        }),
+    });
+    defer sim.deinit();
+    const io = sim.io();
+
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{
+            .general = io,
+            .raft_inbound = io,
+            .raft_outbound = io,
+            .api = io,
+            .inference = io,
+            .control = io,
+        },
+    });
+    defer runtime.deinit();
+
+    const Metadata = struct {
+        fn execute(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: antfly.common.http.HttpRequest,
+        ) !antfly.common.http.HttpResponse {
+            return .{ .status = 503 };
+        }
+    };
+    const metadata_executor = antfly.common.http.RequestExecutor{
+        .ptr = undefined,
+        .vtable = &.{ .execute = Metadata.execute },
+    };
+
+    var servers: [3]DataServer = undefined;
+    var initialized = [_]bool{false} ** 3;
+    defer for (&servers, &initialized) |*server, is_initialized| {
+        if (is_initialized) server.deinit();
+    };
+    for (&servers, 0..) |*server, i| {
+        server.* = try DataServer.initFromMetadataApiUrls(alloc, .{
+            .replica_root_dir = roots[i],
+            .replica_catalog_path = null,
+            .data_raft_state_backend = .file_image,
+            .store_registration = .{
+                .node_id = i + 1,
+                .store_id = i + 1,
+                .api_url = "http://pending.vopr",
+            },
+            .backend_runtime = runtime.ptr(),
+            .metadata_request_executors = &.{metadata_executor},
+        }, &.{"http://metadata.vopr"});
+        initialized[i] = true;
+    }
+
+    var raft_uris: [3][]u8 = undefined;
+    var raft_uri_count: usize = 0;
+    defer for (raft_uris[0..raft_uri_count]) |uri| alloc.free(uri);
+    var api_uris: [3][]u8 = undefined;
+    var api_uri_count: usize = 0;
+    defer for (api_uris[0..api_uri_count]) |uri| alloc.free(uri);
+    for (&servers, 0..) |*server, i| {
+        const raft = server.data_raft orelse return error.MissingDataRaft;
+        try raft.start();
+        raft_uris[i] = try raft.baseUri(alloc);
+        raft_uri_count += 1;
+        try server.startPublicHttp();
+        api_uris[i] = try server.baseUri(alloc);
+        api_uri_count += 1;
+    }
+
+    const incarnation: antfly.metadata_api.MetadataClusterIncarnation =
+        "22222222222222222222222222222222".*;
+    const contract: antfly.metadata.TransitionTableContract = .{
+        .table_id = 17,
+        .table_name = "docs",
+        .indexes_json = "{}",
+        .source_identity = .{ .shard_id = 171, .range_id = 1711 },
+        .target_identity = .{ .shard_id = 172, .range_id = 1721 },
+    };
+    const tables = [_]antfly.metadata.table_manager.TableRecord{.{
+        .table_id = contract.table_id,
+        .name = contract.table_name,
+        .placement_role = "data",
+    }};
+    const ranges = [_]antfly.metadata.table_manager.RangeRecord{
+        .{
+            .group_id = 171,
+            .range_id = contract.source_identity.range_id,
+            .table_id = contract.table_id,
+            .start_key = "doc:a",
+            .end_key = "doc:m",
+            .doc_identity_shard_id = contract.source_identity.shard_id,
+            .doc_identity_range_id = contract.source_identity.range_id,
+        },
+        .{
+            .group_id = 172,
+            .range_id = contract.target_identity.range_id,
+            .table_id = contract.table_id,
+            .start_key = "doc:m",
+            .end_key = null,
+            .doc_identity_shard_id = contract.target_identity.shard_id,
+            .doc_identity_range_id = contract.target_identity.range_id,
+        },
+    };
+    var stores: [3]antfly.metadata.table_manager.StoreRecord = undefined;
+    for (&stores, 0..) |*store, i| store.* = .{
+        .store_id = i + 1,
+        .node_id = i + 1,
+        .role = "data",
+        .live = true,
+        .health_class = "healthy",
+        .api_url = api_uris[i],
+        .raft_url = raft_uris[i],
+    };
+    var placements: [6]antfly.raft.reconciler.PlacementIntent = undefined;
+    for ([_]u64{ 171, 172 }, 0..) |group_id, group_index| {
+        for (0..3) |node_index| {
+            placements[group_index * 3 + node_index] = .{
+                .record = .{
+                    .group_id = group_id,
+                    .replica_id = group_id * 10 + node_index + 1,
+                    .local_node_id = node_index + 1,
+                },
+                .store_id = node_index + 1,
+                .peer_node_ids = &.{ 1, 2, 3 },
+            };
+        }
+    }
+    const record: antfly.metadata.MergeTransitionRecord = .{
+        .transition_id = 17_001,
+        .donor_group_id = 171,
+        .receiver_group_id = 172,
+        .allow_doc_identity_reassignment = true,
+        .table_contract = contract,
+    };
+    var snapshot = antfly.metadata_api.AdminSnapshot{
+        .status = .{
+            .metadata_group_id = 19,
+            .metadata_incarnation = incarnation,
+            .metadata_epoch = 1,
+            .metrics = .{},
+        },
+        .tables = @constCast(tables[0..]),
+        .ranges = @constCast(ranges[0..]),
+        .stores = stores[0..],
+        .placement_intents = placements[0..],
+        .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{record})[0..]),
+    };
+
+    const SnapshotPublisher = struct {
+        fn publish(server: *DataServer, current: antfly.metadata_api.AdminSnapshot) !void {
+            const remote = server.remote_metadata orelse return error.MissingRemoteMetadata;
+            const owned = try cloneAdminSnapshotOwned(server.alloc, current);
+            try std.testing.expectEqual(
+                RemoteMetadataSource.LinearizableSnapshotAcceptance.published,
+                try remote.acceptLinearizableSnapshot(owned, remote.beginLinearizableSnapshot()),
+            );
+        }
+    };
+    for (&servers) |*server| try SnapshotPublisher.publish(server, snapshot);
+
+    // Materialize the pre-existing replicated ranges on every physical owner.
+    // The transition must converge later mutations and protocol markers through
+    // ordinary Raft, not by sharing a DB or apply projection.
+    for (roots) |root| {
+        const donor_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, root, 171);
+        defer alloc.free(donor_path);
+        var donor = try antfly.db.DB.open(alloc, donor_path, .{
+            .identity_namespace = .{
+                .table_id = contract.table_id,
+                .shard_id = contract.source_identity.shard_id,
+                .range_id = contract.source_identity.range_id,
+            },
+            .backend_runtime = runtime.ptr(),
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .start_optional_runtime_workers = false,
+        });
+        try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &donor, contract.schema_json);
+        try donor.updateRange(.{ .start = "doc:a", .end = "doc:m" });
+        try donor.batch(.{ .writes = &.{.{
+            .key = "doc:b",
+            .value = "{\"side\":\"donor\"}",
+        }} });
+        donor.close();
+
+        const receiver_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, root, 172);
+        defer alloc.free(receiver_path);
+        var receiver = try antfly.db.DB.open(alloc, receiver_path, .{
+            .identity_namespace = .{
+                .table_id = contract.table_id,
+                .shard_id = contract.target_identity.shard_id,
+                .range_id = contract.target_identity.range_id,
+            },
+            .backend_runtime = runtime.ptr(),
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .start_optional_runtime_workers = false,
+        });
+        try antfly.public_api.table_writes.applyLocalTableSchemaJson(alloc, &receiver, contract.schema_json);
+        try receiver.updateRange(.{ .start = "doc:m", .end = "" });
+        try receiver.batch(.{ .writes = &.{.{
+            .key = "doc:z",
+            .value = "{\"side\":\"receiver\"}",
+        }} });
+        receiver.close();
+    }
+    for (&servers) |*server| try server.syncDataRaftFromSnapshot(&snapshot);
+    if (sim.firstCapabilityViolation()) |violation| {
+        std.log.err("multi-owner DataServer VOPR pre-schedule capability violation operation={s}", .{
+            @tagName(violation.operation),
+        });
+        return error.VoprIoCapabilityViolation;
+    }
+
+    const ClusterRouter = struct {
+        servers: *[3]DataServer,
+        api_uris: *[3][]u8,
+        local_node_id: u64,
+
+        fn iface(self: *@This()) antfly.public_api.table_router.HostedGroupRouter {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .group_node_ids = groupNodeIds,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                    .node_base_uri_for_group = nodeBaseUriForGroup,
+                },
+            };
+        }
+
+        fn localNodeId(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.local_node_id;
+        }
+
+        fn localStatus(ptr: *anyopaque, group_id: u64) antfly.raft.HostedReplicaStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.statusAt(self.local_node_id, group_id);
+        }
+
+        fn groupLeaderNodeId(ptr: *anyopaque, group_id: u64) ?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (self.servers, 0..) |*server, i| {
+                const raft = server.data_raft orelse continue;
+                const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
+                if (status.soft.role == .leader) return i + 1;
+            }
+            return null;
+        }
+
+        fn groupNodeIds(_: *anyopaque, candidate_alloc: std.mem.Allocator, _: u64) ![]u64 {
+            return try candidate_alloc.dupe(u64, &.{ 1, 2, 3 });
+        }
+
+        fn nodeStatus(ptr: *anyopaque, node_id: u64, group_id: u64) antfly.raft.HostedReplicaStatus {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.statusAt(node_id, group_id);
+        }
+
+        fn nodeBaseUri(ptr: *anyopaque, uri_alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (node_id == 0 or node_id > self.api_uris.len) return null;
+            return try uri_alloc.dupe(u8, self.api_uris[node_id - 1]);
+        }
+
+        fn nodeBaseUriForGroup(ptr: *anyopaque, uri_alloc: std.mem.Allocator, _: u64, node_id: u64) !?[]u8 {
+            return try nodeBaseUri(ptr, uri_alloc, node_id);
+        }
+
+        fn statusAt(self: *@This(), node_id: u64, group_id: u64) antfly.raft.HostedReplicaStatus {
+            if (node_id == 0 or node_id > self.servers.len) return .absent;
+            const raft = self.servers[node_id - 1].data_raft orelse return .absent;
+            return raft.host.http_host.host.status(group_id);
+        }
+    };
+    var router = ClusterRouter{
+        .servers = &servers,
+        .api_uris = &api_uris,
+        // Make the coordinator remote from the initial donor leader so the
+        // first command necessarily crosses the production public transport.
+        .local_node_id = 3,
+    };
+    const Readiness = struct {
+        fn get(_: *anyopaque, _: u64) !antfly.metadata.transition_state.StablePlacementReadiness {
+            return .ready;
+        }
+    };
+    var hosted = antfly.raft.HostedShardOperationAdapter.init(
+        alloc,
+        antfly.public_api.table_catalog.emptyCatalogSource(),
+        router.iface(),
+        servers[0].data_raft.?.host.http_host.request_executor,
+        .{ .ptr = undefined, .readiness = Readiness.get },
+        servers[2].localShardOperationAdapter(),
+    );
+
+    const Shared = struct {
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        runtime: *backend_runtime_mod.BackendRuntime,
+        metadata_executor: antfly.common.http.RequestExecutor,
+        roots: *[3][:0]u8,
+        servers: *[3]DataServer,
+        initialized: *[3]bool,
+        paused: [3]bool = .{ false, false, false },
+        api_uris: *[3][]u8,
+        raft_uris: *[3][]u8,
+        stores: *[3]antfly.metadata.table_manager.StoreRecord,
+        snapshot: *antfly.metadata_api.AdminSnapshot,
+        hosted: *antfly.raft.HostedShardOperationAdapter,
+        record: antfly.metadata.MergeTransitionRecord,
+        done: bool = false,
+        driver_done: [3]bool = .{ false, false, false },
+        driver_active: [3]bool = .{ false, false, false },
+        driver_rounds: [3]u64 = .{ 0, 0, 0 },
+        stop_driver: bool = false,
+        failure: ?anyerror = null,
+        driver_failure: ?anyerror = null,
+        observation: ?antfly.metadata.transition_state.MergeObservation = null,
+        stage: u8 = 0,
+
+        fn drive(self: *@This(), index: usize) void {
+            defer self.driver_done[index] = true;
+            while (!self.stop_driver) {
+                if (self.paused[index] or !self.initialized[index]) {
+                    self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                        self.driver_failure = err;
+                        self.stop_driver = true;
+                        return;
+                    };
+                    continue;
+                }
+                self.driver_active[index] = true;
+                self.servers[index].runRaftRoundOnly() catch |err| {
+                    self.driver_active[index] = false;
+                    self.driver_failure = err;
+                    self.stop_driver = true;
+                    return;
+                };
+                self.driver_active[index] = false;
+                self.driver_rounds[index] += 1;
+                self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                    self.driver_failure = err;
+                    self.stop_driver = true;
+                    return;
+                };
+            }
+        }
+
+        fn run(self: *@This()) void {
+            self.runInner() catch |err| {
+                self.failure = err;
+            };
+            self.stop_driver = true;
+            while (!std.mem.allEqual(bool, &self.driver_done, true)) {
+                self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                    if (self.failure == null) self.failure = err;
+                    break;
+                };
+            }
+            for (self.servers, 0..) |*server, i| {
+                if (!self.initialized[i]) continue;
+                server.deinit();
+                self.initialized[i] = false;
+            }
+            self.done = true;
+        }
+
+        fn runInner(self: *@This()) !void {
+            self.stage = 1;
+            try self.transferAndWait(171, 1);
+            try self.transferAndWait(172, 2);
+            var ops = self.servers[0].localShardOperationAdapter();
+            self.stage = 10;
+            try self.executeIdempotent(&ops, .{ .accept_merge_receiver = .{
+                .transition_id = self.record.transition_id,
+                .donor_group_id = self.record.donor_group_id,
+                .receiver_group_id = self.record.receiver_group_id,
+                .allow_doc_identity_reassignment = self.record.allow_doc_identity_reassignment,
+                .table_contract = self.record.table_contract,
+            } });
+            self.stage = 11;
+            try self.executeIdempotent(&ops, .{ .catch_up_merge_receiver = .{
+                .transition_id = self.record.transition_id,
+                .donor_group_id = self.record.donor_group_id,
+                .receiver_group_id = self.record.receiver_group_id,
+                .allow_doc_identity_reassignment = self.record.allow_doc_identity_reassignment,
+                .table_contract = self.record.table_contract,
+            } });
+
+            // Move both structural owners before cutover. The finalize command
+            // is routed to a different donor leader, which forwards receiver
+            // proposals to a third owner through the public API.
+            self.stage = 3;
+            try self.transferAndWait(171, 2);
+            try self.transferAndWait(172, 3);
+            ops = self.servers[1].localShardOperationAdapter();
+            self.stage = 30;
+            try self.executeIdempotent(&ops, .{ .finalize_merge = .{
+                .transition_id = self.record.transition_id,
+                .donor_group_id = self.record.donor_group_id,
+                .receiver_group_id = self.record.receiver_group_id,
+                .allow_doc_identity_reassignment = self.record.allow_doc_identity_reassignment,
+                .table_contract = self.record.table_contract,
+            } });
+            try self.waitForFinalizedEverywhere();
+
+            // Restart the receiver leader from its node-local durable image,
+            // publish its new endpoints, and require it to lead both groups.
+            self.stage = 4;
+            try self.restartNode(2);
+            try self.transferAndWait(171, 3);
+            try self.transferAndWait(172, 3);
+            ops = self.hosted.adapter();
+            self.stage = 40;
+            try self.executeIdempotent(&ops, .{ .finalize_merge = .{
+                .transition_id = self.record.transition_id,
+                .donor_group_id = self.record.donor_group_id,
+                .receiver_group_id = self.record.receiver_group_id,
+                .allow_doc_identity_reassignment = self.record.allow_doc_identity_reassignment,
+                .table_contract = self.record.table_contract,
+            } });
+            self.observation = try ops.observeMerge(self.record);
+            try self.waitForFinalizedEverywhere();
+            try self.verifyDocumentsEverywhere();
+            try self.waitForDurableWatermarkConvergence();
+        }
+
+        fn executeIdempotent(
+            self: *@This(),
+            ops: *antfly.raft.ShardOperationAdapter,
+            action: antfly.metadata.TransitionAction,
+        ) !void {
+            for (0..6) |_| {
+                ops.execute(action) catch |err| switch (err) {
+                    error.GroupLeaderUnavailable,
+                    error.LeaderUnavailable,
+                    error.RaftBatchWriteOutcomeUnknown,
+                    => {
+                        try self.io.sleep(.fromMilliseconds(10), .awake);
+                        continue;
+                    },
+                    else => return err,
+                };
+                return;
+            }
+            return error.RaftBatchWriteOutcomeUnknown;
+        }
+
+        fn leader(self: *@This(), group_id: u64) ?u64 {
+            for (self.servers, 0..) |*server, i| {
+                if (self.paused[i] or !self.initialized[i]) continue;
+                const raft = server.data_raft orelse continue;
+                const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
+                if (status.soft.role == .leader) return i + 1;
+            }
+            return null;
+        }
+
+        fn waitForLeader(self: *@This(), group_id: u64, expected: u64) !void {
+            for (0..20_000) |_| {
+                if (self.leader(group_id) == expected) return;
+                if (self.driver_failure) |err| return err;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.VoprDataServerLeaderTimeout;
+        }
+
+        fn transferAndWait(self: *@This(), group_id: u64, target: u64) !void {
+            for (0..20_000) |_| {
+                if (self.leader(group_id)) |current| {
+                    if (current == target) return;
+                    const raft = self.servers[current - 1].data_raft orelse
+                        return error.MissingDataRaft;
+                    try raft.host.http_host.transferLeader(group_id, target);
+                    return try self.waitForLeader(group_id, target);
+                }
+                if (self.driver_failure) |err| return err;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.VoprDataServerLeaderTimeout;
+        }
+
+        fn waitForFinalizedEverywhere(self: *@This()) !void {
+            for (0..30_000) |_| {
+                var converged = true;
+                for (self.servers, 0..) |*server, i| {
+                    if (self.paused[i] or !self.initialized[i]) {
+                        converged = false;
+                        break;
+                    }
+                    const store = server.localTransitionApplyStore() orelse {
+                        converged = false;
+                        break;
+                    };
+                    const source = try store.currentMergeSourceState(self.alloc, 171);
+                    var receiver = try store.currentMergeReceiverState(self.alloc, 172);
+                    defer if (receiver) |*state| state.deinit(self.alloc);
+                    if (source == null or source.?.phase != .finalized or
+                        receiver == null or receiver.?.phase != .finalized)
+                    {
+                        converged = false;
+                        break;
+                    }
+                }
+                if (converged) return;
+                if (self.driver_failure) |err| return err;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.VoprDataServerReplicaConvergenceTimeout;
+        }
+
+        fn verifyDocumentsEverywhere(self: *@This()) !void {
+            for (self.servers) |*server| {
+                const receiver = try server.leaseTransitionDbForTableGroup(
+                    self.record.receiver_group_id,
+                    self.record.table_contract,
+                    .target,
+                    .exact,
+                );
+                defer receiver.release();
+                const donor_doc = (try receiver.db.get(self.alloc, "doc:b")) orelse
+                    return error.MissingMergedDonorDocument;
+                defer self.alloc.free(donor_doc);
+                try std.testing.expectEqualStrings("{\"side\":\"donor\"}", donor_doc);
+                const receiver_doc = (try receiver.db.get(self.alloc, "doc:z")) orelse
+                    return error.MissingReceiverDocument;
+                defer self.alloc.free(receiver_doc);
+                try std.testing.expectEqualStrings("{\"side\":\"receiver\"}", receiver_doc);
+            }
+        }
+
+        fn waitForDurableWatermarkConvergence(self: *@This()) !void {
+            for (0..30_000) |_| {
+                const donor_applied = self.servers[0].localDataRaftAppliedIndex(self.record.donor_group_id) orelse
+                    return error.MissingDataRaft;
+                const receiver_applied = self.servers[0].localDataRaftAppliedIndex(self.record.receiver_group_id) orelse
+                    return error.MissingDataRaft;
+                var converged = true;
+                for (self.servers[1..]) |*server| {
+                    if (server.localDataRaftAppliedIndex(self.record.donor_group_id) != donor_applied or
+                        server.localDataRaftAppliedIndex(self.record.receiver_group_id) != receiver_applied)
+                    {
+                        converged = false;
+                        break;
+                    }
+                }
+                if (converged) return;
+                if (self.driver_failure) |err| return err;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.VoprDataServerWatermarkConvergenceTimeout;
+        }
+
+        fn restartNode(self: *@This(), index: usize) !void {
+            self.paused[index] = true;
+            while (self.driver_active[index]) {
+                if (self.driver_failure) |err| return err;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            self.servers[index].quiesceBackgroundWork();
+            self.servers[index].deinit();
+            self.initialized[index] = false;
+            self.alloc.free(self.api_uris[index]);
+            self.alloc.free(self.raft_uris[index]);
+
+            self.servers[index] = try DataServer.initFromMetadataApiUrls(self.alloc, .{
+                .replica_root_dir = self.roots[index],
+                .replica_catalog_path = null,
+                .data_raft_state_backend = .file_image,
+                .store_registration = .{
+                    .node_id = index + 1,
+                    .store_id = index + 1,
+                    .api_url = "http://pending.vopr",
+                },
+                .backend_runtime = self.runtime,
+                .metadata_request_executors = &.{self.metadata_executor},
+            }, &.{"http://metadata.vopr"});
+            self.initialized[index] = true;
+            const raft = self.servers[index].data_raft orelse return error.MissingDataRaft;
+            try raft.start();
+            self.raft_uris[index] = try raft.baseUri(self.alloc);
+            try self.servers[index].startPublicHttp();
+            self.api_uris[index] = try self.servers[index].baseUri(self.alloc);
+            self.stores[index].api_url = self.api_uris[index];
+            self.stores[index].raft_url = self.raft_uris[index];
+            self.snapshot.status.metadata_epoch +|= 1;
+            for (self.servers, 0..) |*server, i| {
+                if (!self.initialized[i]) continue;
+                try SnapshotPublisher.publish(server, self.snapshot.*);
+                try server.syncDataRaftFromSnapshot(self.snapshot);
+            }
+            self.paused[index] = false;
+        }
+    };
+    var shared = Shared{
+        .alloc = alloc,
+        .io = io,
+        .runtime = runtime.ptr(),
+        .metadata_executor = metadata_executor,
+        .roots = &roots,
+        .servers = &servers,
+        .initialized = &initialized,
+        .api_uris = &api_uris,
+        .raft_uris = &raft_uris,
+        .stores = &stores,
+        .snapshot = &snapshot,
+        .hosted = &hosted,
+        .record = record,
+    };
+    var driver_futures: [3]std.Io.Future(void) = undefined;
+    for (0..3) |index| driver_futures[index] = io.async(Shared.drive, .{ &shared, index });
+    const action_future = io.async(Shared.run, .{&shared});
+
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    var actor_selections: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+    defer actor_selections.deinit(alloc);
+    var transitions: usize = 0;
+    var replay_index: usize = 0;
+    var replay_stutters: usize = 0;
+    var replay_failure: ?anyerror = null;
+    while (!shared.done or !std.mem.allEqual(bool, &shared.driver_done, true)) {
+        enabled.items.clearRetainingCapacity();
+        try sim.scheduler().enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        if (enabled.items.items.len == 0) {
+            if (shared.driver_failure) |err| return err;
+            if (shared.failure) |err| {
+                std.log.err("multi-owner DataServer VOPR failed stage={} err={s}", .{ shared.stage, @errorName(err) });
+                return err;
+            }
+            return error.VoprDataServerClusterDeadlock;
+        }
+        // Listener accepts and transport workers are continuously ready in a
+        // real three-owner deployment. Give time a bounded turn without
+        // letting large deadline jumps outrun queued Raft and HTTP frames.
+        const selected = selection: {
+            if (replay_trace) |trace| if (replay_failure == null) {
+                const expected = if (replay_index < trace.len) trace[replay_index] else null;
+                for (enabled.items.items) |candidate| {
+                    const candidate_clock_only = std.mem.eql(u8, candidate.name, "sim-io.time_advance");
+                    if (expected != null and
+                        (candidate.id == expected.?.id or
+                            expected.?.clock_only and candidate_clock_only))
+                    {
+                        replay_index += 1;
+                        replay_stutters = 0;
+                        break :selection candidate;
+                    }
+                }
+                // Logical time advance is scheduler stutter, not an actor
+                // choice. Physical LSM work is an explicit differential
+                // boundary and can change how many clock-only turns precede
+                // the next runnable actor without changing the actor schedule.
+                // Normalize those turns without executing a different actor;
+                // fail closed if the recorded actor does not become ready
+                // within the bounded stutter allowance.
+                var time_only: ?vopr.transition.Transition = null;
+                for (enabled.items.items) |candidate| {
+                    if (std.mem.eql(u8, candidate.name, "sim-io.time_advance"))
+                        time_only = candidate;
+                }
+                if (time_only != null and replay_stutters < 50_000) {
+                    replay_stutters += 1;
+                    break :selection time_only.?;
+                }
+                std.log.err(
+                    "multi-owner DataServer VOPR replay divergence transition={} replay_index={} stage={} expected={any} enabled={}",
+                    .{ transitions, replay_index, shared.stage, expected, enabled.items.items.len },
+                );
+                for (enabled.items.items) |candidate| std.log.err(
+                    "multi-owner replay candidate id={} name={s} actor={?} resource={?} parameter={}",
+                    .{ candidate.id, candidate.name, candidate.actor_id, candidate.resource_id, candidate.parameter },
+                );
+                for (&driver_futures, 0..) |*future, i| {
+                    const task = sim.futureTaskSnapshot(future.any_future orelse continue) orelse continue;
+                    std.log.err("multi-owner replay driver={} task={} status={s} parameter_hint={}", .{
+                        i + 1,
+                        task.id,
+                        @tagName(task.status),
+                        shared.driver_rounds[i],
+                    });
+                }
+                if (action_future.any_future) |future| {
+                    if (sim.futureTaskSnapshot(future)) |task| std.log.err(
+                        "multi-owner replay action task={} status={s}",
+                        .{ task.id, @tagName(task.status) },
+                    );
+                }
+                replay_failure = if (expected == null)
+                    error.VoprDataServerReplayTraceExhausted
+                else
+                    error.VoprDataServerReplayDiverged;
+            };
+            var candidate_selected = enabled.items.items[0];
+            var selected_actor: u64 = 0;
+            var selected_count: u64 = std.math.maxInt(u64);
+            var time_candidate: ?vopr.transition.Transition = null;
+            for (enabled.items.items) |candidate| {
+                if (std.mem.eql(u8, candidate.name, "sim-io.time_advance")) {
+                    time_candidate = candidate;
+                    continue;
+                }
+                const actor = candidate.actor_id orelse candidate.resource_id orelse candidate.id;
+                const count = actor_selections.get(actor) orelse 0;
+                if (count < selected_count) {
+                    candidate_selected = candidate;
+                    selected_actor = actor;
+                    selected_count = count;
+                }
+            }
+            if (selected_count == std.math.maxInt(u64) and time_candidate != null) {
+                candidate_selected = time_candidate.?;
+            } else if (selected_count != std.math.maxInt(u64)) {
+                const entry = try actor_selections.getOrPut(alloc, selected_actor);
+                if (!entry.found_existing) entry.value_ptr.* = 0;
+                entry.value_ptr.* +|= 1;
+            }
+            if (replay_trace == null) {
+                try recorded_trace.append(trace_alloc, .{
+                    .id = candidate_selected.id,
+                    .actor_id = candidate_selected.actor_id,
+                    .resource_id = candidate_selected.resource_id,
+                    .parameter = candidate_selected.parameter,
+                    .clock_only = std.mem.eql(u8, candidate_selected.name, "sim-io.time_advance"),
+                });
+            }
+            break :selection candidate_selected;
+        };
+        try sim.scheduler().executeReady(selected.id, &events, alloc);
+        transitions += 1;
+        if (transitions > 200_000) {
+            std.log.err(
+                "multi-owner DataServer VOPR transition budget stage={} donor_leader={?} receiver_leader={?} now_ns={} rounds={any}",
+                .{
+                    shared.stage,
+                    shared.leader(171),
+                    shared.leader(172),
+                    std.Io.Clock.now(.awake, io).nanoseconds,
+                    shared.driver_rounds,
+                },
+            );
+            for (&servers, 0..) |*server, i| {
+                const raft = server.data_raft.?;
+                const raw_donor = raft.host.http_host.host.raftStatus(171);
+                const raw_receiver = raft.host.http_host.host.raftStatus(172);
+                std.log.err(
+                    "multi-owner node={} donor_raw_applied={} donor_app={} receiver_raw_applied={} receiver_app={}",
+                    .{
+                        i + 1,
+                        if (raw_donor) |status| status.applied_index else 0,
+                        server.data_raft_apply.?.appliedIndex(171),
+                        if (raw_receiver) |status| status.applied_index else 0,
+                        server.data_raft_apply.?.appliedIndex(172),
+                    },
+                );
+            }
+            for (enabled.items.items) |candidate| {
+                std.log.err("multi-owner enabled transition name={s} id={}", .{ candidate.name, candidate.id });
+            }
+            for (&driver_futures, 0..) |*future, i| {
+                const task = sim.futureTaskSnapshot(future.any_future orelse continue) orelse continue;
+                std.log.err("multi-owner driver={} task={} status={s} sleep={?} futex={} external={?}", .{
+                    i + 1,
+                    task.id,
+                    @tagName(task.status),
+                    task.sleep_deadline_ns,
+                    task.waiting_on_futex,
+                    task.external_resource_id,
+                });
+            }
+            if (action_future.any_future) |future| {
+                if (sim.futureTaskSnapshot(future)) |task| std.log.err(
+                    "multi-owner action task={} status={s} sleep={?} futex={} external={?}",
+                    .{ task.id, @tagName(task.status), task.sleep_deadline_ns, task.waiting_on_futex, task.external_resource_id },
+                );
+            }
+            return error.VoprDataServerClusterTransitionBudgetExceeded;
+        }
+    }
+    if (replay_trace) |trace| {
+        if (replay_failure == null and replay_index != trace.len) {
+            std.log.err(
+                "multi-owner DataServer VOPR replay ended early replay_index={} trace_len={}",
+                .{ replay_index, trace.len },
+            );
+            replay_failure = error.VoprDataServerReplayDiverged;
+        }
+    }
+    if (shared.driver_failure) |err| {
+        std.log.err("multi-owner DataServer VOPR driver failed err={s}", .{@errorName(err)});
+        return err;
+    }
+    if (shared.failure) |err| {
+        std.log.err("multi-owner DataServer VOPR action failed stage={} err={s}", .{ shared.stage, @errorName(err) });
+        return err;
+    }
+    if (replay_failure) |err| return err;
+    const observation = shared.observation orelse return error.MissingMergeObservation;
+    try std.testing.expectEqual(.finalized, observation.donor.phase);
+    try std.testing.expectEqual(.finalized, observation.receiver.phase);
+
+    if (sim.firstCapabilityViolation()) |violation| {
+        std.log.err("multi-owner DataServer VOPR capability violation operation={s} sequence={}", .{
+            @tagName(violation.operation),
+            violation.sequence,
+        });
+    }
+    try sim.ensureNoCapabilityViolation();
+}
+
+test "three production DataServers converge replicated merge across failover and restart on VoprIo" {
+    var trace: std.ArrayListUnmanaged(MultiOwnerReplayStep) = .empty;
+    defer trace.deinit(std.testing.allocator);
+    try runThreeDataServerReplicatedMergeVoprHistory(std.testing.allocator, null, &trace);
+    try std.testing.expect(trace.items.len > 0);
+    try runThreeDataServerReplicatedMergeVoprHistory(std.testing.allocator, trace.items, &trace);
 }
 
 test "data server mirrors managed primary writes into HA replication log" {

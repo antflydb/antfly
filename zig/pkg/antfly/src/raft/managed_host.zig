@@ -741,6 +741,7 @@ fn prepareHostDeps(
             owned_store.* = try data_storage.RaftApplyStore.init(alloc, .{
                 .root_dir = replica_root_dir,
                 .no_sync = replica_apply_store_no_sync,
+                .io = if (backend_runtime) |runtime| runtime.apiIo() else null,
                 .backend_runtime = backend_runtime,
             });
             prepared.owned_data_store = owned_store;

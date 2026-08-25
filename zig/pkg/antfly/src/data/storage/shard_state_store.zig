@@ -214,6 +214,17 @@ pub fn currentRange(store: *docstore.DocStore, alloc: std.mem.Allocator, group_i
     return try currentRangeTxn(&txn, alloc, group_id);
 }
 
+fn hasCurrentRange(store: *docstore.DocStore, alloc: std.mem.Allocator, group_id: u64) !bool {
+    const key = try groupRangeKeyAlloc(alloc, group_id);
+    defer alloc.free(key);
+    const raw = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    alloc.free(raw);
+    return true;
+}
+
 pub fn currentRaftBatchProtocolVersion(
     store: *docstore.DocStore,
     alloc: std.mem.Allocator,
@@ -2416,6 +2427,7 @@ pub fn appendOperationEffects(
     };
     var byte_range = try currentRange(store, alloc, group_id);
     defer range_state.freeRange(alloc, byte_range);
+    const range_initialized = try hasCurrentRange(store, alloc, group_id);
     var split_state = try currentSplitState(store, alloc, group_id);
     defer if (split_state) |state| freeSplitState(alloc, state);
     var needs_split_ack = false;
@@ -2853,9 +2865,24 @@ pub fn appendOperationEffects(
         .merge_receiver_checkpoint => |owned_checkpoint| {
             if (raft_batch_protocol_version < data_raft_protocol.batch_merge_transition_protocol_version)
                 return error.RaftBatchMergeProtocolNotActivated;
+            // Every replica owns an independent durable apply projection. A
+            // donor coordinator can reconcile only its local copy before it
+            // proposes the receiver checkpoint, so a freshly placed receiver
+            // replica has no range record yet. The first replicated accept is
+            // the authoritative initialization boundary for that pristine
+            // projection. Once any range has been published, exact base-range
+            // validation remains fail closed.
+            const checkpoint_range: AppliedDataRange = .{
+                .start = owned_checkpoint.checkpoint.receiver_base_start,
+                .end = owned_checkpoint.checkpoint.receiver_base_end,
+            };
             const plan = try merge_state.planCheckpointApply(
                 if (merge_receiver_state) |*state| state else null,
-                byte_range,
+                if (!range_initialized and merge_receiver_state == null and
+                    owned_checkpoint.checkpoint.kind == .accept)
+                    checkpoint_range
+                else
+                    byte_range,
                 owned_checkpoint.checkpoint,
             );
 

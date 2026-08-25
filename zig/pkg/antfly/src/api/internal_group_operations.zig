@@ -218,7 +218,14 @@ pub const Operations = struct {
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(table_name, input.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
-            else => return error.Internal,
+            else => {
+                std.log.err("group-local Raft batch validation failed group_id={} table={s} err={s}", .{
+                    group_id,
+                    table_name,
+                    @errorName(err),
+                });
+                return error.Internal;
+            },
         };
         _ = (writes.batchGroupLocal(alloc, group_id, table_name, input) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
@@ -229,7 +236,14 @@ pub const Operations = struct {
             error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
-            else => return error.Internal,
+            else => {
+                std.log.err("group-local Raft batch failed group_id={} table={s} err={s}", .{
+                    group_id,
+                    table_name,
+                    @errorName(err),
+                });
+                return error.Internal;
+            },
         }) orelse return error.NotFound;
         return .{
             .inserted = @intCast(input.writes.len),
@@ -251,7 +265,14 @@ pub const Operations = struct {
         const validator = self.batch_validator orelse return error.Unavailable;
         validator.validate(table_name, input.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
-            else => return error.Internal,
+            else => {
+                std.log.err("routed Raft batch validation failed group_id={} table={s} err={s}", .{
+                    group_id,
+                    table_name,
+                    @errorName(err),
+                });
+                return error.Internal;
+            },
         };
         const writer = self.routed_raft_batch_writer orelse return error.Unavailable;
         _ = (writer.write(alloc, group_id, table_name, input, forwarding, request.cancellation) catch |err| switch (err) {
@@ -263,7 +284,14 @@ pub const Operations = struct {
             error.EnrichmentRetryInProgress => return error.EnrichmentRetryInProgress,
             error.EnrichmentWorkerFailed => return error.EnrichmentWorkerFailed,
             error.LeaderUnavailable, error.GroupLeaderUnavailable, error.MetadataSnapshotUnavailable => return error.GroupLeaderUnavailable,
-            else => return error.Internal,
+            else => {
+                std.log.err("routed Raft batch failed group_id={} table={s} err={s}", .{
+                    group_id,
+                    table_name,
+                    @errorName(err),
+                });
+                return error.Internal;
+            },
         }) orelse return error.NotFound;
         return .{
             .inserted = @intCast(input.writes.len),
