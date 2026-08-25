@@ -13401,8 +13401,9 @@ var _ = Describe("AntflyCluster Controller", func() {
 			cluster := &antflyv1.AntflyCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: "cel-metadata-bypass", Namespace: "default"},
 				Spec: antflyv1.AntflyClusterSpec{
-					Mode:  antflyv1.ClusterModeDistributed,
-					Image: "antfly:latest",
+					Mode:                antflyv1.ClusterModeDistributed,
+					Image:               "antfly:latest",
+					InternalServiceAuth: testInternalServiceAuthSpec(),
 					MetadataNodes: antflyv1.MetadataNodesSpec{
 						Replicas:     1,
 						Resources:    antflyv1.ResourceSpec{CPU: "500m", Memory: "512Mi"},
