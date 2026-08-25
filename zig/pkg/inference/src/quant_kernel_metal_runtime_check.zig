@@ -1282,6 +1282,10 @@ const flash_prefill_shapes = [_]FlashPrefillShape{
     .{ .q_len = 8, .kv_tokens = 64, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 0, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 },
     .{ .q_len = 13, .kv_tokens = 50, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 37, .sliding_window = 0, .page_size = 16, .permuted_pages = true },
     .{ .q_len = 256, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 256, .sliding_window = 512, .page_size = 16, .permuted_pages = true },
+    // Production Gemma4 26B-A4B local attention (16Q/8KV, 2:1 GQA). The
+    // 1,040-token span crosses the first 1,024-token sliding-window boundary;
+    // page reversal plus a leading gap makes masked and mapped reads observable.
+    .{ .q_len = 16, .kv_tokens = 1040, .num_heads = 16, .num_kv_heads = 8, .head_dim = 256, .query_position_offset = 1024, .sliding_window = 1024, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 },
 };
 
 const flash_prefill_hd512_shapes = [_]FlashPrefillShape{

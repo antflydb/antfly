@@ -304,6 +304,13 @@ fn a4bHighMemoryFeatureEnabled(
         !getenvBool(disable_name);
 }
 
+fn a4bExplicitCandidateEnabled(
+    comptime enable_name: [*:0]const u8,
+    comptime disable_name: [*:0]const u8,
+) bool {
+    return getenvBool(enable_name) and !getenvBool(disable_name);
+}
+
 fn donatedSlotAttentionOnFrameEnabled() bool {
     return getenvBool("TERMITE_METAL_ENABLE_DONATED_SLOT_ATTENTION_ON_FRAME") and
         !getenvBool("TERMITE_METAL_DISABLE_DONATED_SLOT_ATTENTION_ON_FRAME");
@@ -984,6 +991,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     a4b_moe_checkpoint_layer_count: usize = 0,
     a4b_moe_checkpoint_top_k: usize = 0,
     a4b_moe_synchronized_replay: bool = false,
+    a4b_packed_qkv_reported: bool = false,
+    a4b_kv_direct_write_reported: bool = false,
+    a4b_ffn_interleave_reported: bool = false,
+    a4b_embed_scale_fuse_reported: bool = false,
     /// Immutable, model-scoped state for the high-memory A4B qLen=1 decoder.
     /// Packed descriptors alias the resident GGUF allocation; only the seven
     /// small f32 vectors per layer are separately retained.
@@ -1212,6 +1223,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.num_experts != config.geometry.expert_count or
             request.top_k != config.geometry.top_k or
             request.shared_intermediate_size == 0) return false;
+        if (request.layer_index == 0 and
+            !metal_runtime.configureA4bDagScheduler(self.provider_impl.raw_decode_runtime, true))
+        {
+            return false;
+        }
 
         if (self.a4b_prepared_moe_layers[request.layer_index]) |*existing| {
             if (existing.complete() and
@@ -21844,11 +21860,62 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
+    fn rooflineMul(values: []const usize) u64 {
+        var result: u64 = 1;
+        for (values) |value| result = std.math.mul(u64, result, @intCast(value)) catch return std.math.maxInt(u64);
+        return result;
+    }
+
+    fn rooflineAdd(values: []const u64) u64 {
+        var result: u64 = 0;
+        for (values) |value| result = std.math.add(u64, result, value) catch return std.math.maxInt(u64);
+        return result;
+    }
+
+    fn rooflineF32Bytes(elements: usize, buffer_count: usize) u64 {
+        return rooflineMul(&.{ elements, buffer_count, @sizeOf(f32) });
+    }
+
+    fn rooflineQ4LinearBytes(rows: usize, in_dim: usize, out_dim: usize) u64 {
+        const matrix = rooflineMul(&.{ out_dim, std.math.divCeil(usize, in_dim, 32) catch return std.math.maxInt(u64), 18 });
+        return rooflineAdd(&.{
+            rooflineF32Bytes(rows * in_dim, 1),
+            matrix,
+            rooflineF32Bytes(rows * out_dim, 1),
+        });
+    }
+
+    fn rooflineQ6KRowBytes(dim: usize) u64 {
+        if (dim == 0 or dim % 256 != 0) return std.math.maxInt(u64);
+        return rooflineMul(&.{ dim / 256, 210 });
+    }
+
+    fn beginA4bRooflineOp(
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+        op: metal_runtime.MetalRooflineOp,
+        layer: ?usize,
+        kv_position: usize,
+        shape: []const u32,
+        logical_bytes: u64,
+    ) void {
+        if (request.contract != .gemma4_a4b_shared_kv) return;
+        _ = metal_runtime.rooflineBeginOp(
+            self.provider_impl.raw_decode_runtime,
+            op,
+            layer,
+            kv_position,
+            shape,
+            logical_bytes,
+        );
+    }
+
     fn finishA4bMoeLayerFromAttentionOutputMt(
         self: *MetalCompute,
         request: *const ops.DecoderRuntimeDecodeRequest,
         layer: *const ops.DecoderRuntimeLayerSpec,
         layer_index: usize,
+        kv_position: usize,
         attn_out: MetalTensor,
         residual: MetalTensor,
         ple: ?MetalTensor,
@@ -21866,7 +21933,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             prepared_ptr.expert_intermediate_size != moe.expert_intermediate_size or
             prepared_ptr.num_experts != moe.num_experts or
             prepared_ptr.top_k != moe.top_k) return null;
+        if (ple != null) {
+            metal_runtime.rooflineInvalidate(self.provider_impl.raw_decode_runtime);
+        }
 
+        self.beginA4bRooflineOp(
+            request,
+            .attention_output_linear,
+            layer_index,
+            kv_position,
+            &.{ 1, @intCast(request.num_attention_heads * layer.head_dim), @intCast(request.hidden_size) },
+            rooflineQ4LinearBytes(1, request.num_attention_heads * layer.head_dim, request.hidden_size),
+        );
         var projected = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
             .slot = layer.attention_linear_slot,
             .input = attn_out,
@@ -21878,6 +21956,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // and residual are one fused reduction/epilogue.  Encoding these as
         // two kernels changes rounding before the sensitive MoE router and
         // costs an avoidable dispatch on every layer.
+        self.beginA4bRooflineOp(
+            request,
+            .attention_post_norm_residual,
+            layer_index,
+            kv_position,
+            &.{ 1, @intCast(request.hidden_size) },
+            rooflineF32Bytes(request.hidden_size, 4),
+        );
         var attn_residual = (try metal_runtime.decoderRuntimeApplyRmsNormAdd(self.provider_impl, .{
             .input = projected,
             .norm_slot = layer.attn_post_norm_slot,
@@ -21891,6 +21977,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         var ffn_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ffn);
         defer ffn_region.deinit();
+        const use_a4b_ffn_interleave = a4bExplicitCandidateEnabled(
+            "TERMITE_METAL_ENABLE_A4B_FFN_INTERLEAVE",
+            "TERMITE_METAL_DISABLE_A4B_FFN_INTERLEAVE",
+        );
+        var a4b_ffn_scope_active = false;
+        defer if (a4b_ffn_scope_active) {
+            metal_runtime.endA4bConcurrentFfnScope(self.provider_impl.raw_decode_runtime) catch {};
+        };
+        if (use_a4b_ffn_interleave) {
+            try metal_runtime.beginA4bConcurrentFfnScope(self.provider_impl.raw_decode_runtime);
+            a4b_ffn_scope_active = true;
+            if (!self.a4b_ffn_interleave_reported) {
+                std.debug.print(
+                    "metal_a4b_ffn_interleave: enabled=1 dispatch=concurrent class=A rollback=TERMITE_METAL_DISABLE_A4B_FFN_INTERLEAVE\n",
+                    .{},
+                );
+                self.a4b_ffn_interleave_reported = true;
+            }
+        }
+        self.beginA4bRooflineOp(
+            request,
+            .ffn_pre_norm_triple,
+            layer_index,
+            kv_position,
+            &.{ 3, 1, @intCast(request.hidden_size) },
+            rooflineF32Bytes(request.hidden_size, 7),
+        );
         var pre_norms = (try metal_runtime.decoderRuntimeApplyRmsNormTripleWeightDevice(
             self.provider_impl,
             attn_residual,
@@ -21907,23 +22020,69 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         try self.maybeDumpDecodeStageTensor("a4b-routed-pre", layer_index, pre_norms.second, request.hidden_size);
         try self.maybeDumpDecodeStageTensor("a4b-router-pre", layer_index, pre_norms.third, request.hidden_size);
 
-        var shared = (try metal_runtime.tryDeviceQuantizedGatedFfn(
-            self.provider_impl,
-            .{
-                .rows = 1,
-                .hidden_size = request.hidden_size,
-                .intermediate_size = layer.intermediate_size,
-                .activation = request.activation,
-                .gate_linear_slot = layer.gate_ffn_linear_slot,
-                .up_linear_slot = layer.up_ffn_linear_slot,
-                .down_linear_slot = layer.down_ffn_linear_slot,
-            },
-            pre_norms.first,
-            &self.timing_stats,
-        )) orelse return null;
-        defer shared.deinit();
-        try self.maybeDumpDecodeStageTensor("a4b-shared", layer_index, shared, request.hidden_size);
+        self.beginA4bRooflineOp(
+            request,
+            .shared_ffn,
+            layer_index,
+            kv_position,
+            &.{ 1, @intCast(request.hidden_size), @intCast(layer.intermediate_size) },
+            rooflineAdd(&.{
+                rooflineMul(&.{ layer.intermediate_size * 2, std.math.divCeil(usize, request.hidden_size, 32) catch return null, 18 }),
+                rooflineMul(&.{ request.hidden_size, std.math.divCeil(usize, layer.intermediate_size, 32) catch return null, 18 }),
+                rooflineF32Bytes(request.hidden_size, 2),
+                rooflineF32Bytes(layer.intermediate_size, 2),
+            }),
+        );
+        var shared_gated: ?MetalTensor = null;
+        defer if (shared_gated) |*tensor| tensor.deinit();
+        var shared: MetalTensor = undefined;
+        var have_shared = false;
+        defer if (have_shared) shared.deinit();
+        if (use_a4b_ffn_interleave) {
+            shared_gated = (try metal_runtime.tryDeviceQuantizedGatedFfnGateUp(
+                self.provider_impl,
+                .{
+                    .rows = 1,
+                    .hidden_size = request.hidden_size,
+                    .intermediate_size = layer.intermediate_size,
+                    .activation = request.activation,
+                    .gate_linear_slot = layer.gate_ffn_linear_slot,
+                    .up_linear_slot = layer.up_ffn_linear_slot,
+                },
+                pre_norms.first,
+                &self.timing_stats,
+            )) orelse return null;
+        } else {
+            shared = (try metal_runtime.tryDeviceQuantizedGatedFfn(
+                self.provider_impl,
+                .{
+                    .rows = 1,
+                    .hidden_size = request.hidden_size,
+                    .intermediate_size = layer.intermediate_size,
+                    .activation = request.activation,
+                    .gate_linear_slot = layer.gate_ffn_linear_slot,
+                    .up_linear_slot = layer.up_ffn_linear_slot,
+                    .down_linear_slot = layer.down_ffn_linear_slot,
+                },
+                pre_norms.first,
+                &self.timing_stats,
+            )) orelse return null;
+            have_shared = true;
+            try self.maybeDumpDecodeStageTensor("a4b-shared", layer_index, shared, request.hidden_size);
+        }
 
+        self.beginA4bRooflineOp(
+            request,
+            .router_linear,
+            layer_index,
+            kv_position,
+            &.{ 1, @intCast(request.hidden_size), @intCast(moe.num_experts) },
+            rooflineAdd(&.{
+                rooflineF32Bytes(request.hidden_size * moe.num_experts, 1),
+                rooflineF32Bytes(request.hidden_size, 1),
+                rooflineF32Bytes(moe.num_experts, 1),
+            }),
+        );
         var router_logits = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
             .slot = moe.router_linear_slot,
             .input = pre_norms.third,
@@ -21932,6 +22091,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         })) orelse return null;
         defer router_logits.deinit();
         try self.maybeDumpDecodeStageTensor("a4b-router-logits", layer_index, router_logits, moe.num_experts);
+        self.beginA4bRooflineOp(
+            request,
+            .router_topk,
+            layer_index,
+            kv_position,
+            &.{ 1, @intCast(moe.num_experts), @intCast(moe.top_k) },
+            rooflineAdd(&.{ rooflineF32Bytes(moe.num_experts, 1), rooflineF32Bytes(moe.top_k, 2) }),
+        );
         if (!metal_runtime.decoderRuntimeSelectMoeRoutesBufferedDevice(
             self.provider_impl,
             layer_index,
@@ -21941,6 +22108,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             moe.top_k,
             moe.router_logit_scale,
         )) return null;
+
+        if (use_a4b_ffn_interleave) {
+            // Route selection is hand-encoded and owns its output buffers
+            // outside the generic byte-range tracker. One scope barrier joins
+            // that dependency, then shared-down and routed gate/up can issue
+            // independently on the concurrent encoder.
+            try metal_runtime.plannedComputeBarrier(self.provider_impl.raw_decode_runtime);
+            shared = (try metal_runtime.tryDeviceQuantizedGatedFfnDown(
+                self.provider_impl,
+                .{
+                    .rows = 1,
+                    .hidden_size = request.hidden_size,
+                    .intermediate_size = layer.intermediate_size,
+                    .down_linear_slot = layer.down_ffn_linear_slot,
+                },
+                shared_gated.?,
+                &self.timing_stats,
+            )) orelse return null;
+            have_shared = true;
+            try self.maybeDumpDecodeStageTensor("a4b-shared", layer_index, shared, request.hidden_size);
+        }
 
         var routed = (try metal_runtime.decoderRuntimeMoeForwardQ4_0MappedDevice(
             self.provider_impl,
@@ -21963,6 +22151,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer routed.deinit();
         try self.maybeDumpDecodeStageTensor("a4b-routed", layer_index, routed, request.hidden_size);
 
+        self.beginA4bRooflineOp(
+            request,
+            .parallel_ffn_post_residual,
+            layer_index,
+            kv_position,
+            &.{ 1, @intCast(request.hidden_size) },
+            rooflineF32Bytes(request.hidden_size, 7),
+        );
         var current = (try metal_runtime.decoderRuntimeApplyParallelFfnPostResidualWeightDevice(
             self.provider_impl,
             shared,
@@ -21976,6 +22172,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         )) orelse return null;
         errdefer current.deinit();
         try self.maybeDumpDecodeStageTensor("a4b-ffn-result", layer_index, current, request.hidden_size);
+
+        if (use_a4b_ffn_interleave) {
+            try metal_runtime.endA4bConcurrentFfnScope(self.provider_impl.raw_decode_runtime);
+            a4b_ffn_scope_active = false;
+        }
 
         if (ple) |ple_input| {
             const ple_gate_slot = layer.ple_gate_linear_slot orelse return null;
@@ -21999,6 +22200,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (output_scale_value) |scale| {
             if (@abs(scale - 1.0) > 0.000001) {
+                self.beginA4bRooflineOp(
+                    request,
+                    .layer_output_scale,
+                    layer_index,
+                    kv_position,
+                    &.{ 1, @intCast(request.hidden_size) },
+                    rooflineF32Bytes(request.hidden_size, 2),
+                );
                 const scaled = (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, current, scale)) orelse return null;
                 current.deinit();
                 current = scaled;
@@ -22024,7 +22233,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (attention.mode != .paged_decode or attention.query_sequence_len != 1 or
             attention.attn_or_mask != null or attention.kv_cache == null or attention.kv_storage == null) return null;
         if (!q.isDevice() or !residual.isDevice()) return null;
+        const kv_position = attention.total_sequence_len - 1;
         if (!attention.skip_kv_write) {
+            self.beginA4bRooflineOp(
+                request,
+                .kv_write,
+                layer_index,
+                kv_position,
+                &.{ 1, 2, @intCast(layer.kv_heads * layer.head_dim) },
+                rooflineF32Bytes(layer.kv_heads * layer.head_dim, 3),
+            );
             if (!(try self.ensurePagedKvDevicePrefixFromBackendCache(attention, layer.kv_heads, layer.head_dim))) return null;
             const key = k orelse return null;
             const value = v orelse return null;
@@ -22053,6 +22271,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const block_offsets = (block_offsets_opt orelse return null).values();
         try q.retainForActiveFrame();
         try residual.retainForActiveFrame();
+        self.beginA4bRooflineOp(
+            request,
+            .paged_attention,
+            layer_index,
+            kv_position,
+            &.{ 1, @intCast(request.num_attention_heads), @intCast(attention.kv_sequence_len), @intCast(layer.head_dim) },
+            rooflineAdd(&.{
+                rooflineF32Bytes(request.num_attention_heads * layer.head_dim, 2),
+                rooflineMul(&.{ attention.kv_sequence_len, layer.kv_heads, layer.head_dim, 2, @sizeOf(f16) }),
+            }),
+        );
         var attn_out = (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlotOnActiveFrame(self.provider_impl, .{
             .q = q,
             .slot = paged_layer.slot,
@@ -22077,6 +22306,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request,
             layer,
             layer_index,
+            attention.total_sequence_len - 1,
             attn_out,
             residual,
             ple,
@@ -22112,6 +22342,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         }
         const source = try attentionKvSource(attention);
+        const kv_position = attention.total_sequence_len - 1;
         const head_dim = layer.head_dim;
         const attention_input_size = request.num_attention_heads * head_dim;
         const kv_dim = layer.kv_heads * head_dim;
@@ -22162,6 +22393,28 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 kv_dim,
                 attention.query_sequence_len,
             );
+        }
+        const use_a4b_packed_qkv = layer.moe != null and a4bExplicitCandidateEnabled(
+            "TERMITE_METAL_ENABLE_A4B_PACKED_QKV",
+            "TERMITE_METAL_DISABLE_A4B_PACKED_QKV",
+        );
+        const use_a4b_kv_direct_write = layer.moe != null and a4bExplicitCandidateEnabled(
+            "TERMITE_METAL_ENABLE_A4B_KV_DIRECT_WRITE",
+            "TERMITE_METAL_DISABLE_A4B_KV_DIRECT_WRITE",
+        );
+        if (use_a4b_packed_qkv and !self.a4b_packed_qkv_reported) {
+            std.debug.print(
+                "metal_a4b_packed_qkv: enabled=1 class=C rollback=TERMITE_METAL_DISABLE_A4B_PACKED_QKV\n",
+                .{},
+            );
+            self.a4b_packed_qkv_reported = true;
+        }
+        if (use_a4b_kv_direct_write and !self.a4b_kv_direct_write_reported) {
+            std.debug.print(
+                "metal_a4b_kv_direct_write: enabled=1 class=C rollback=TERMITE_METAL_DISABLE_A4B_KV_DIRECT_WRITE\n",
+                .{},
+            );
+            self.a4b_kv_direct_write_reported = true;
         }
 
         var q_projected: MetalTensor = undefined;
@@ -22323,6 +22576,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var projection_input_owned: ?MetalTensor = null;
         defer if (projection_input_owned) |*tensor| tensor.deinit();
         if (attention_pre_norm_slot) |slot| {
+            self.beginA4bRooflineOp(
+                request,
+                .attention_pre_norm,
+                layer_index,
+                kv_position,
+                &.{ 1, @intCast(request.hidden_size) },
+                rooflineF32Bytes(request.hidden_size, 3),
+            );
             _ = attention_setup_plan.beforeNext();
             projection_input_owned = (try self.applyDecodeRmsNormScratchDeviceMt(
                 attention_input_mt,
@@ -22336,6 +22597,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         if (layer.shares_kv) {
+            self.beginA4bRooflineOp(
+                request,
+                .attention_q_linear,
+                layer_index,
+                kv_position,
+                &.{ 1, @intCast(request.hidden_size), @intCast(attention_input_size) },
+                rooflineQ4LinearBytes(1, request.hidden_size, attention_input_size),
+            );
             const q_planned = attention_setup_plan.beforeNext();
             var q = if (q_planned)
                 try metal_runtime.tryApplyQuantizedRuntimeLinearScratch(
@@ -22378,12 +22647,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.timing_stats.active_decode_q_linear_ops += 1;
         } else {
             const qkv_planned = attention_setup_plan.beforeNext();
-            if (layer.moe != null) {
+            if (layer.moe != null and !use_a4b_packed_qkv) {
                 // Keep A4B's prepared decode numerically aligned with the
                 // qualified graph lane.  The paired K/V Q4_0 epilogue has a
                 // different reduction order from three standalone linears;
                 // the low-bit drift is enough to change later router choices.
                 if (qkv_planned) attention_setup_plan.disable();
+                self.beginA4bRooflineOp(
+                    request,
+                    .attention_q_linear,
+                    layer_index,
+                    kv_position,
+                    &.{ 1, @intCast(request.hidden_size), @intCast(attention_input_size) },
+                    rooflineQ4LinearBytes(1, request.hidden_size, attention_input_size),
+                );
                 q_projected = (try metal_runtime.tryApplyQuantizedRuntimeLinear(
                     self.provider_impl,
                     layer.q_linear_slot,
@@ -22400,6 +22677,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     attention_input_size,
                 )) orelse return null;
                 have_q_projected = true;
+                self.beginA4bRooflineOp(
+                    request,
+                    .attention_k_linear,
+                    layer_index,
+                    kv_position,
+                    &.{ 1, @intCast(request.hidden_size), @intCast(kv_dim) },
+                    rooflineQ4LinearBytes(1, request.hidden_size, kv_dim),
+                );
                 k_projected = (try metal_runtime.tryApplyQuantizedRuntimeLinear(
                     self.provider_impl,
                     layer.k_linear_slot,
@@ -22415,6 +22700,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     request.hidden_size,
                     kv_dim,
                 )) orelse return null;
+                self.beginA4bRooflineOp(
+                    request,
+                    .attention_v_linear,
+                    layer_index,
+                    kv_position,
+                    &.{ 1, @intCast(request.hidden_size), @intCast(kv_dim) },
+                    rooflineQ4LinearBytes(1, request.hidden_size, kv_dim),
+                );
                 v_projected = (try metal_runtime.tryApplyQuantizedRuntimeLinear(
                     self.provider_impl,
                     layer.v_linear_slot,
@@ -22493,6 +22786,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const q_norm_slot = layer.q_head_norm_slot orelse return null;
         const query_value_scale: f32 = @sqrt(@as(f32, @floatFromInt(head_dim)));
+        self.beginA4bRooflineOp(
+            request,
+            .q_head_norm_rope,
+            layer_index,
+            kv_position,
+            &.{ 1, @intCast(request.num_attention_heads), @intCast(head_dim) },
+            rooflineF32Bytes(attention_input_size, 3),
+        );
         const q_head_planned = attention_setup_plan.beforeNext();
         var q_for_block = (try self.applyDecodeHeadNormRopeScratchDeviceMt(
             q_projected,
@@ -22538,12 +22839,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer if (v_for_block) |*tensor| tensor.deinit();
         if (!layer.shares_kv) {
             const k_norm_slot = layer.k_head_norm_slot orelse return null;
+            self.beginA4bRooflineOp(
+                request,
+                .k_head_norm_rope,
+                layer_index,
+                kv_position,
+                &.{ 1, @intCast(layer.kv_heads), @intCast(head_dim) },
+                rooflineF32Bytes(kv_dim, 3),
+            );
             _ = attention_setup_plan.beforeNext();
             // The A4B parity lane must produce K with the same standalone
             // head-norm/RoPE kernel as the canonical graph before publishing
             // it to the F16 KV cache.  The direct-to-suffix variant differs by
             // a few low bits and that drift is amplified by later MoE routers.
-            if (layer.moe == null) {
+            if (layer.moe == null or use_a4b_kv_direct_write) {
                 if (kv_suffix_dest) |*dest| {
                     if (try self.applyDecodeHeadNormRopeIntoDeviceMt(
                         k_projected.?,
@@ -22563,7 +22872,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
             if (k_for_block == null) {
-                k_for_block = (if (layer.moe != null)
+                k_for_block = (if (layer.moe != null and !use_a4b_kv_direct_write)
                     null
                 else
                     try self.applyDecodeHeadNormRopeScratchDeviceMt(
@@ -22597,11 +22906,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.timing_stats.active_decode_head_norm_rope_fused_kernels += 1;
 
             if (request.global_head_dim != 0) {
+                self.beginA4bRooflineOp(
+                    request,
+                    .v_norm,
+                    layer_index,
+                    kv_position,
+                    &.{ 1, @intCast(layer.kv_heads), @intCast(head_dim) },
+                    // Value RMS normalization has no learned scale vector.
+                    rooflineF32Bytes(kv_dim, 2),
+                );
                 _ = attention_setup_plan.beforeNext();
                 // As with K above, preserve graph-equivalent V normalization
                 // for A4B and let the common suffix writer perform the cache
                 // publication afterwards.
-                if (layer.moe == null) {
+                if (layer.moe == null or use_a4b_kv_direct_write) {
                     if (kv_suffix_dest) |*dest| {
                         if (try self.applyDecodeValueNormIntoDeviceMt(
                             v_projected.?,
@@ -22616,7 +22934,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     }
                 }
                 if (v_for_block == null) {
-                    v_for_block = (if (layer.moe != null)
+                    v_for_block = (if (layer.moe != null and !use_a4b_kv_direct_write)
                         null
                     else
                         try self.applyDecodeValueNormScratchDeviceMt(
@@ -22806,6 +23124,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.timing_stats.active_decode_frame_tail_fallbacks += 1;
             if (trace) std.debug.print("decoder-runtime-decode: fallback reason=output-hidden-without-frame\n", .{});
             return false;
+        }
+        if (request.contract == .gemma4_a4b_shared_kv and request.output_hidden != null) {
+            metal_runtime.rooflineInvalidate(self.provider_impl.raw_decode_runtime);
         }
         var initial_tensors = (try prepareDecodeBatchInitialTensors(self, request, batch_inputs)) orelse {
             self.timing_stats.active_decode_frame_initial_tensor_fallbacks += 1;
@@ -23336,10 +23657,39 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         inputs: *const DecodeBatchHostInputs,
     ) !?DecodeBatchInitialTensors {
         const token_embedding_weight = request.token_embedding_weight orelse return null;
+        if (request.contract == .gemma4_a4b_shared_kv and request.ple_hidden_size != 0) {
+            metal_runtime.rooflineInvalidate(self.provider_impl.raw_decode_runtime);
+        }
+        if (request.items.len == 1) {
+            self.beginA4bRooflineOp(
+                request,
+                .token_embedding,
+                null,
+                request.items[0].attention.total_sequence_len - 1,
+                &.{ 1, @intCast(request.hidden_size) },
+                rooflineAdd(&.{
+                    rooflineQ6KRowBytes(request.hidden_size),
+                    rooflineF32Bytes(request.hidden_size, 3),
+                }),
+            );
+        }
         const embedding_scope = try self.beginPlannedGraphScopeForSelf(.embedding);
         defer self.endPlannedGraphScopeForSelf(embedding_scope) catch {};
         const device_token = request.phase == .step;
-        const fuse_token_embedding_scale = request.contract != .gemma4_a4b_shared_kv;
+        const fuse_a4b_token_embedding_scale = request.contract == .gemma4_a4b_shared_kv and
+            a4bExplicitCandidateEnabled(
+                "TERMITE_METAL_ENABLE_A4B_EMBED_SCALE_FUSE",
+                "TERMITE_METAL_DISABLE_A4B_EMBED_SCALE_FUSE",
+            );
+        const fuse_token_embedding_scale = request.contract != .gemma4_a4b_shared_kv or
+            fuse_a4b_token_embedding_scale;
+        if (fuse_a4b_token_embedding_scale and !self.a4b_embed_scale_fuse_reported) {
+            std.debug.print(
+                "metal_a4b_embed_scale_fuse: enabled=1 class=B rollback=TERMITE_METAL_DISABLE_A4B_EMBED_SCALE_FUSE\n",
+                .{},
+            );
+            self.a4b_embed_scale_fuse_reported = true;
+        }
         const hidden_raw = (if (device_token)
             try lookupDecodeEmbeddingTensorDeviceToken(
                 self,

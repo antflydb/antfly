@@ -2037,14 +2037,27 @@ fn envFlag(name: [:0]const u8) bool {
     return slice.len > 0 and !std.mem.eql(u8, slice, "0");
 }
 
-fn pipelinedDecodeFrameEnabledForFlags(enable_requested: bool, disable_requested: bool) bool {
-    return enable_requested and !disable_requested;
+fn pipelinedDecodeFrameEnabledForFlags(
+    enable_requested: bool,
+    disable_requested: bool,
+    a4b_high_memory_requested: bool,
+    qualified_a4b: bool,
+    prepared_a4b: bool,
+) bool {
+    if (disable_requested) return false;
+    if (!qualified_a4b) return enable_requested;
+    return prepared_a4b and (enable_requested or a4b_high_memory_requested);
 }
 
-fn pipelinedDecodeFrameEnabled() bool {
+fn pipelinedDecodeFrameEnabled(gpt_config: gpt_mod.Config) bool {
+    const qualified_a4b = gemma4_runtime.isQualifiedA4bArchitecture(gpt_config);
     return pipelinedDecodeFrameEnabledForFlags(
         platform.env.getenvBool("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
         platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
+        platform.env.getenvBool("TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH") and
+            !platform.env.getenvBool("TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH"),
+        qualified_a4b,
+        qualified_a4b and gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config),
     );
 }
 
@@ -2509,7 +2522,7 @@ fn runtimeDecodeGreedy(
 ) !model_runtime.GreedyDecodeOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
     timing_stats.decode_greedy_calls += 1;
-    if (pipelinedDecodeFrameEnabled()) {
+    if (pipelinedDecodeFrameEnabled(runtime_ctx.gpt_config)) {
         const pipelined_started_at = monotonicNowNs();
         if (try runtime_ctx.decodeGreedyPipelined(allocator, request)) |token_id| {
             timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - pipelined_started_at);
@@ -2704,8 +2717,11 @@ test "metal executor only enables split KV policy for mixed local and global Gem
 }
 
 test "metal executor keeps speculative decode frames opt in" {
-    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false));
-    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false));
-    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, true));
-    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(true, true));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, false, true, true));
+    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false, false, false, false));
+    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(false, false, true, true, true));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, true, true, false));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, true, false, false));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, true, true, true, true));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(true, true, false, false, false));
 }

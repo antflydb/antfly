@@ -121,6 +121,42 @@ const metal_tensor_bridge = struct {
 
 pub const RawMetalProvider = opaque {};
 pub const RawMetalDecodeRuntime = opaque {};
+
+/// Diagnostic-only A4B operation identities for the versioned Metal roofline
+/// ledger. Keep the numeric values synchronized with metal_kernels.m.
+pub const MetalRooflineOp = enum(u16) {
+    token_embedding = 1,
+    attention_pre_norm = 2,
+    attention_q_linear = 3,
+    attention_k_linear = 4,
+    attention_v_linear = 5,
+    q_head_norm_rope = 6,
+    k_head_norm_rope = 7,
+    v_norm = 8,
+    kv_write = 9,
+    paged_attention = 10,
+    attention_output_linear = 11,
+    attention_post_norm_residual = 12,
+    ffn_pre_norm_triple = 13,
+    shared_ffn = 14,
+    router_linear = 15,
+    router_topk = 16,
+    moe_gate_up = 17,
+    moe_activation = 18,
+    moe_down = 19,
+    moe_reduce = 20,
+    parallel_ffn_post_residual = 21,
+    tail_final_norm = 22,
+    tail_lm_head = 23,
+    tail_argmax = 24,
+    layer_output_scale = 25,
+};
+
+pub const MetalRooflineLayerKind = enum(u8) {
+    model = 0,
+    local = 1,
+    global = 2,
+};
 pub const RawMetalGeneratedPipeline = opaque {};
 
 pub const MetalDeviceInfo = extern struct {
@@ -10383,6 +10419,36 @@ test "Metal stage timing preserves the prepared frame topology" {
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->stage_timing_decode_selected = 0"));
 }
 
+test "A4B stage detail isolates one real routed layer and folds into FFN" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_STAGE_TIMING_A4B_DETAIL"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_STAGE_TIMING_A4B_LAYER"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_stage_timing_transition_a4b_detail"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_STAGE_DETAIL_MOE_GATE_UP"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_STAGE_DETAIL_MOE_ACTIVATION"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_STAGE_DETAIL_MOE_DOWN"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_STAGE_DETAIL_MOE_REDUCE"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "metal_stage_detail_ns: regime=%s layer=%llu"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "case TERMITE_METAL_STAGE_DETAIL_MOE_DOWN:"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "return TERMITE_METAL_STAGE_FFN"));
+}
+
+test "A4B exact-shape expert kernels have an umbrella gate and rollback" {
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_q4_0_linear_id_a4b_gate_up"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_q4_0_linear_id_a4b_down"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "hidden_size == 2816u && inter_size == 704u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "num_experts == 128u && top_k == 8u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_SPECIALIZED_ID"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_SPECIALIZED_ID"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_a4b_q4_0_id_replay"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint32_t route_values[8] = { 0u, 17u, 33u, 49u, 65u, 81u, 97u, 127u }"));
+}
+
 test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host dispatch" {
     const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
@@ -10443,6 +10509,13 @@ test "concurrent planned dispatch policy is fail closed and hazards share produc
     try std.testing.expectEqual(@as(c_int, 1), termite_metal_concurrent_planned_dispatch_policy_probe(1, 0, 0));
     try std.testing.expectEqual(@as(c_int, 1), termite_metal_concurrent_planned_dispatch_policy_probe(0, 1, 0));
     try std.testing.expectEqual(@as(c_int, 0), termite_metal_concurrent_planned_dispatch_policy_probe(1, 1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_a4b_dag_scheduler_policy_probe(0, 0));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_a4b_dag_scheduler_policy_probe(1, 0));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_a4b_dag_scheduler_policy_probe(1, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_a4b_dag_scheduler_effective_policy_probe(1, 0, 0, 0));
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_a4b_dag_scheduler_effective_policy_probe(1, 0, 0, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_a4b_dag_scheduler_effective_policy_probe(1, 1, 0, 1));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_a4b_dag_scheduler_effective_policy_probe(1, 0, 1, 1));
     try std.testing.expectEqual(@as(c_int, 0), termite_metal_planned_range_hazard_probe(0, 16, 0, 8, 24, 0, 1));
     try std.testing.expectEqual(@as(c_int, 1), termite_metal_planned_range_hazard_probe(0, 16, 0, 8, 24, 1, 1));
     try std.testing.expectEqual(@as(c_int, 1), termite_metal_planned_range_hazard_probe(0, 16, 1, 8, 24, 1, 1));
@@ -10456,6 +10529,13 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
     defer std.testing.allocator.free(source);
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "attention_decode_gqa_split_scratch_buffer_alt"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "submitted_frame_decode_gqa_split_scratch_slot ^ 1u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid ="));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid = 0u"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "scratch_runtime->submitted_frame_cb != nil || output_offset"));
 
     const variants = [_]struct {
         variant: DecodeGqaSplitVariant,
@@ -10595,6 +10675,18 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
         &auto_splits,
         &auto_scratch,
     ));
+}
+
+test "A4B local HD256 flash prefill has exact geometry admission and rollback" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(source);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "num_heads == 16u && num_kv_heads == 8u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "head_dim == 256u && sliding_window == 1024u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_FLASH_PREFILL_HD256"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_FLASH_PREFILL_HD256"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "metal_a4b_flash_prefill_hd256: enabled=1 heads=16 kv_heads=8 window=1024"));
 }
 
 test "Metal exact JIT pipeline lookup includes regime dispatch rows and both matrix dimensions" {
@@ -15737,6 +15829,17 @@ pub extern fn termite_metal_decode_runtime_flush_active_frame(runtime: ?*RawMeta
 pub extern fn termite_metal_decode_runtime_active_frame_has_work(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_has_active_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_has_submitted_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_roofline_begin_op(
+    runtime: ?*RawMetalDecodeRuntime,
+    op: u16,
+    layer: i32,
+    layer_kind: u8,
+    kv_position: u64,
+    shape: [*]const u32,
+    rank: usize,
+    logical_bytes: u64,
+) c_int;
+pub extern fn termite_metal_decode_runtime_roofline_invalidate(runtime: ?*RawMetalDecodeRuntime) void;
 pub extern fn termite_metal_decode_runtime_concat_rows_device(
     runtime: ?*RawMetalDecodeRuntime,
     a_handle: ?*anyopaque,
@@ -15757,7 +15860,12 @@ pub extern fn termite_metal_decode_runtime_push_planned_compute_barrier_suppress
 pub extern fn termite_metal_decode_runtime_pop_planned_compute_barrier_suppression(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_set_concurrent_planned_dispatch(runtime: ?*RawMetalDecodeRuntime, requested: c_int) c_int;
 pub extern fn termite_metal_decode_runtime_concurrent_planned_dispatch_enabled(runtime: ?*const RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_configure_a4b_dag_scheduler(runtime: ?*RawMetalDecodeRuntime, qualified_a4b_model: c_int) c_int;
+pub extern fn termite_metal_decode_runtime_begin_a4b_concurrent_ffn_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_end_a4b_concurrent_ffn_scope(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_concurrent_planned_dispatch_policy_probe(requested: c_int, force_enabled: c_int, force_disabled: c_int) c_int;
+pub extern fn termite_metal_a4b_dag_scheduler_policy_probe(force_enabled: c_int, force_disabled: c_int) c_int;
+pub extern fn termite_metal_a4b_dag_scheduler_effective_policy_probe(force_enabled: c_int, force_disabled: c_int, concurrent_force_disabled: c_int, qualified_a4b_model: c_int) c_int;
 pub extern fn termite_metal_planned_range_hazard_probe(a_begin: usize, a_end: usize, a_write: u32, b_begin: usize, b_end: usize, b_write: u32, same_buffer: u32) c_int;
 pub extern fn termite_metal_decode_runtime_frame_cb_count(runtime: ?*RawMetalDecodeRuntime) u64;
 pub extern fn termite_metal_decode_runtime_decode_gqa_split_calls(runtime: ?*const RawMetalDecodeRuntime) u64;
@@ -16058,6 +16166,36 @@ pub fn hasActiveFrame(runtime: ?*RawMetalDecodeRuntime) bool {
     return termite_metal_decode_runtime_has_active_frame(runtime) != 0;
 }
 
+pub fn rooflineBeginOp(
+    runtime: ?*RawMetalDecodeRuntime,
+    op: MetalRooflineOp,
+    layer: ?usize,
+    kv_position: usize,
+    shape: []const u32,
+    logical_bytes: u64,
+) bool {
+    if (shape.len < 2 or shape.len > 4) return false;
+    const layer_value: i32 = if (layer) |index| @intCast(index) else -1;
+    const layer_kind: MetalRooflineLayerKind = if (layer) |index|
+        (if (index % 6 == 5) .global else .local)
+    else
+        .model;
+    return termite_metal_decode_runtime_roofline_begin_op(
+        runtime,
+        @intFromEnum(op),
+        layer_value,
+        @intFromEnum(layer_kind),
+        @intCast(kv_position),
+        shape.ptr,
+        shape.len,
+        logical_bytes,
+    ) == 0;
+}
+
+pub fn rooflineInvalidate(runtime: ?*RawMetalDecodeRuntime) void {
+    termite_metal_decode_runtime_roofline_invalidate(runtime);
+}
+
 pub fn deviceConcatRow(
     self: anytype,
     a: MetalTensor,
@@ -16109,6 +16247,33 @@ pub fn pushComputeRegion(runtime: ?*RawMetalDecodeRuntime, region: ComputeRegion
         return .{ .runtime = runtime, .previous = previous, .active = false };
     }
     return .{ .runtime = runtime, .previous = previous, .active = true };
+}
+
+pub fn configureA4bDagScheduler(runtime: ?*RawMetalDecodeRuntime, qualified_a4b_model: bool) bool {
+    return termite_metal_decode_runtime_configure_a4b_dag_scheduler(
+        runtime,
+        @intFromBool(qualified_a4b_model),
+    ) == 0;
+}
+
+pub fn beginA4bConcurrentFfnScope(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
+    return switch (termite_metal_decode_runtime_begin_a4b_concurrent_ffn_scope(runtime)) {
+        0 => {},
+        -1 => FrameError.RuntimeUnavailable,
+        -2 => FrameError.FrameNotActive,
+        -3 => FrameError.PlannedScopeActive,
+        else => FrameError.SubmissionFailed,
+    };
+}
+
+pub fn endA4bConcurrentFfnScope(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
+    return switch (termite_metal_decode_runtime_end_a4b_concurrent_ffn_scope(runtime)) {
+        0 => {},
+        -1 => FrameError.RuntimeUnavailable,
+        -2 => FrameError.FrameNotActive,
+        -3 => FrameError.PlannedScopeNotActive,
+        else => FrameError.SubmissionFailed,
+    };
 }
 
 pub fn beginPlannedComputeScope(runtime: ?*RawMetalDecodeRuntime, source: usize, region: ComputeRegion) FrameError!void {
@@ -20326,6 +20491,30 @@ pub extern fn termite_metal_decode_runtime_apply_gated_ffn_q4_0_slots_device(
     down_linear_slot: usize,
     gated_handle: ?*anyopaque,
     gated_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_gated_ffn_q4_0_gate_up_slots_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    activation_kind: u32,
+    gate_linear_slot: usize,
+    up_linear_slot: usize,
+    gated_handle: ?*anyopaque,
+    gated_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_apply_gated_ffn_q4_0_down_slot_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    gated_handle: ?*anyopaque,
+    gated_offset: usize,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    down_linear_slot: usize,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;
@@ -24858,6 +25047,127 @@ pub fn tryDeviceQuantizedGatedFfn(
         request.down_linear_slot,
         gated.deviceHandle(),
         gated.deviceByteOffset(),
+        output.deviceHandle(),
+        output.deviceByteOffset(),
+    );
+    if (rc != 0) stats.quantized_gated_ffn_runtime_failures += 1;
+    return finishDeviceOutput(&output, rc);
+}
+
+pub fn tryDeviceQuantizedGatedFfnGateUp(
+    self: anytype,
+    request: anytype,
+    input: MetalTensor,
+    stats: anytype,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice() or request.rows != 1) return null;
+    if (request.gate_linear_slot >= decoder_runtime_linear_slot_capacity or
+        request.up_linear_slot >= decoder_runtime_linear_slot_capacity)
+    {
+        return null;
+    }
+    if (input.ndim() != 2 or
+        @as(usize, @intCast(input.dim(0))) != request.rows or
+        @as(usize, @intCast(input.dim(1))) != request.hidden_size)
+    {
+        return null;
+    }
+    if (!self.raw_linear_slots_prepared[request.gate_linear_slot] or
+        !self.raw_linear_slots_prepared[request.up_linear_slot])
+    {
+        return null;
+    }
+    if (self.raw_linear_slot_kinds[request.gate_linear_slot] != .quantized or
+        self.raw_linear_slot_kinds[request.up_linear_slot] != .quantized)
+    {
+        return null;
+    }
+    const gate_kind = ensureQuantizedRuntimeLinearSlotPrepared(
+        self,
+        request.gate_linear_slot,
+        request.hidden_size,
+        request.intermediate_size,
+    );
+    const up_kind = ensureQuantizedRuntimeLinearSlotPrepared(
+        self,
+        request.up_linear_slot,
+        request.hidden_size,
+        request.intermediate_size,
+    );
+    if (gate_kind != .q4_0 or up_kind != .q4_0) return null;
+
+    const gated_shape = [_]i32{ 1, @intCast(request.intermediate_size) };
+    var gated = MetalTensor.deviceAllocate(
+        @ptrCast(runtime),
+        request.intermediate_size * @sizeOf(f32),
+        .private,
+        &gated_shape,
+    ) catch return null;
+    errdefer gated.deinit();
+    const rc = termite_metal_decode_runtime_apply_gated_ffn_q4_0_gate_up_slots_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        request.rows,
+        request.hidden_size,
+        request.intermediate_size,
+        @intFromEnum(request.activation),
+        request.gate_linear_slot,
+        request.up_linear_slot,
+        gated.deviceHandle(),
+        gated.deviceByteOffset(),
+    );
+    if (rc != 0) stats.quantized_gated_ffn_runtime_failures += 1;
+    return finishDeviceOutput(&gated, rc);
+}
+
+pub fn tryDeviceQuantizedGatedFfnDown(
+    self: anytype,
+    request: anytype,
+    gated: MetalTensor,
+    stats: anytype,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!gated.isDevice() or request.rows != 1) return null;
+    if (request.down_linear_slot >= decoder_runtime_linear_slot_capacity) return null;
+    if (gated.ndim() != 2 or
+        @as(usize, @intCast(gated.dim(0))) != request.rows or
+        @as(usize, @intCast(gated.dim(1))) != request.intermediate_size)
+    {
+        return null;
+    }
+    if (!self.raw_linear_slots_prepared[request.down_linear_slot] or
+        self.raw_linear_slot_kinds[request.down_linear_slot] != .quantized)
+    {
+        return null;
+    }
+    const down_kind = ensureQuantizedRuntimeLinearSlotPrepared(
+        self,
+        request.down_linear_slot,
+        request.intermediate_size,
+        request.hidden_size,
+    );
+    if (down_kind != .q4_0) return null;
+
+    const shape = [_]i32{ 1, @intCast(request.hidden_size) };
+    var output = MetalTensor.deviceAllocate(
+        @ptrCast(runtime),
+        request.hidden_size * @sizeOf(f32),
+        .private,
+        &shape,
+    ) catch return null;
+    errdefer output.deinit();
+    const rc = termite_metal_decode_runtime_apply_gated_ffn_q4_0_down_slot_device(
+        runtime,
+        gated.deviceHandle(),
+        gated.deviceByteOffset(),
+        request.rows,
+        request.hidden_size,
+        request.intermediate_size,
+        request.down_linear_slot,
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
