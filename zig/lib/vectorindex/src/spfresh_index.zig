@@ -178,7 +178,7 @@ fn publishedGenerationSnapshot(self: anytype) u64 {
     return 0;
 }
 
-const PublishedSnapshot = struct {
+pub const PublishedSnapshot = struct {
     root_node: u64,
     node_count: u64,
     publish_generation: u64,
@@ -334,7 +334,39 @@ pub fn clearFlatCentroidDirectory(self: anytype) void {
     if (stale) |directory| directory.release(self.alloc);
 }
 
-fn acquireFlatCentroidDirectory(self: anytype, txn: anytype) !*FlatCentroidDirectory {
+fn acquireFlatCentroidDirectory(
+    self: anytype,
+    txn: anytype,
+    expected_snapshot: ?PublishedSnapshot,
+) !*FlatCentroidDirectory {
+    // Complete-snapshot callers already hold a generation-bound read txn. A
+    // matching shared directory is safe to reuse; otherwise build privately
+    // through that txn so a concurrent publication cannot mix topology from
+    // two generations. Full coverage is exceptional, so avoiding cache churn
+    // here also protects the best-effort search hot path.
+    if (expected_snapshot) |snapshot| {
+        lockAtomicMutex(&self.flat_centroid_mu);
+        if (self.flat_centroid_directory) |directory| {
+            if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
+                directory.retain();
+                self.flat_centroid_mu.unlock();
+                return directory;
+            }
+        }
+        self.flat_centroid_mu.unlock();
+
+        const built = try self.alloc.create(FlatCentroidDirectory);
+        errdefer self.alloc.destroy(built);
+        built.* = try buildFlatCentroidDirectory(
+            self,
+            txn,
+            snapshot.root_node,
+            snapshot.node_count,
+            snapshot.publish_generation,
+        );
+        return built;
+    }
+
     while (true) {
         const snapshot = loadStablePublishedSnapshot(self);
 
@@ -407,11 +439,12 @@ pub fn selectFlatRabitqPostingsAlloc(
     scratch: anytype,
     profile: *search_types.SearchProfile,
     coverage_policy: search_types.CoveragePolicy,
+    expected_snapshot: ?PublishedSnapshot,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) ![]FlatCentroidProbe {
     const start = now_fn_u64();
-    const directory = try acquireFlatCentroidDirectory(self, txn);
+    const directory = try acquireFlatCentroidDirectory(self, txn, expected_snapshot);
     defer directory.release(self.alloc);
     defer profile.child_expand_ns += elapsed_fn_u64(start);
     if (coverage_policy == .complete_snapshot and !directory.complete()) {

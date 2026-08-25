@@ -78,6 +78,10 @@ pub fn setTestGetVectorViewOrScratchHook(ctx: ?*anyopaque, hook: ?TestGetVectorV
     test_get_vector_view_or_scratch_hook = hook;
 }
 
+const TestCompleteSnapshotCaptureHook = *const fn (?*anyopaque, *HBCIndex) void;
+var test_complete_snapshot_capture_ctx: ?*anyopaque = null;
+var test_complete_snapshot_capture_hook: ?TestCompleteSnapshotCaptureHook = null;
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -2105,11 +2109,20 @@ pub const HBCIndex = struct {
     published_active_count: AtomicU64,
     published_node_count: AtomicU64,
     published_generation: AtomicU64,
+    // Complete-snapshot searches take the shared side for their lifetime;
+    // ordinary publications take the exclusive side before mutating topology
+    // or its caches. Best-effort searches remain lock-free.
+    published_snapshot_mu: apply_rw_lock_mod.ApplyRwLock = .{},
+    published_mutation_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     rng: go_rand.GoPcg,
     // Set when a write path observes a tree-link inconsistency (stale parent
     // pointer, dangling node reference); background maintenance runs a
     // bounded repairTreeLinks sweep and clears it on completion.
     link_repair_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // A complete-snapshot query found that the published generation cannot
+    // prove coverage. Link repair may make traversal safer, but only a shadow
+    // generation rebuild can recover orphaned or duplicate membership.
+    generation_repair_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     quantizer: quantizer_mod.RaBitQuantizer,
     rot: vec.RandomOrthogonalTransformer,
     node_cache: std.AutoHashMapUnmanaged(u64, *NodeCacheEntry),
@@ -2912,25 +2925,44 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginPublishedSearchStateRefresh(self: *HBCIndex) void {
+        self.published_snapshot_mu.lockExclusive();
+        self.published_mutation_active.store(true, .release);
+    }
+
+    pub fn markPublishedSearchStateCommitting(self: *HBCIndex) void {
+        std.debug.assert(self.published_mutation_active.load(.acquire));
         _ = self.published_generation.fetchAdd(1, .acq_rel);
         vectorindex_spfresh_index.clearFlatCentroidDirectory(self);
     }
 
     pub fn finishPublishedSearchStateRefresh(self: *HBCIndex) void {
+        // Legacy/manual transaction helpers begin their publication at the
+        // commit boundary. New mutation-fenced paths mark explicitly just
+        // before commit so readers cannot observe an odd generation early.
+        if ((self.published_generation.load(.acquire) & 1) == 0) {
+            self.markPublishedSearchStateCommitting();
+        }
         self.published_root_node.store(self.metadata.root_node, .release);
         self.published_active_count.store(self.metadata.active_count, .release);
         self.published_node_count.store(self.metadata.node_count, .release);
         _ = self.published_generation.fetchAdd(1, .acq_rel);
         self.finishVectorCacheMutations();
+        self.published_mutation_active.store(false, .release);
+        self.published_snapshot_mu.unlockExclusive();
     }
 
     pub fn abortPublishedSearchStateRefresh(self: *HBCIndex) void {
-        _ = self.published_generation.fetchAdd(1, .acq_rel);
+        if ((self.published_generation.load(.acquire) & 1) != 0) {
+            _ = self.published_generation.fetchAdd(1, .acq_rel);
+        }
         self.finishVectorCacheMutations();
+        self.published_mutation_active.store(false, .release);
+        self.published_snapshot_mu.unlockExclusive();
     }
 
     pub fn refreshPublishedSearchState(self: *HBCIndex) void {
         self.beginPublishedSearchStateRefresh();
+        self.markPublishedSearchStateCommitting();
         self.finishPublishedSearchStateRefresh();
     }
 
@@ -3952,6 +3984,36 @@ pub const HBCIndex = struct {
         return try self.store.beginProbeOrRead();
     }
 
+    pub fn beginRuntimeCompleteSearchTxn(self: *HBCIndex) !vectorindex_store.NamespaceReadTxn {
+        return try self.store.beginRead();
+    }
+
+    pub fn beginRuntimeSearchTxnForCoverage(self: *HBCIndex, complete_snapshot: bool) !vectorindex_store.NamespaceReadTxn {
+        return if (complete_snapshot)
+            try self.beginRuntimeCompleteSearchTxn()
+        else
+            try self.beginRuntimeSearchTxn();
+    }
+
+    pub fn beginCompleteSnapshotRead(self: *HBCIndex) void {
+        self.published_snapshot_mu.lockShared();
+    }
+
+    pub fn endCompleteSnapshotRead(self: *HBCIndex) void {
+        self.published_snapshot_mu.unlockShared();
+    }
+
+    fn publicationMutationActive(self: *const HBCIndex) bool {
+        return self.published_mutation_active.load(.acquire);
+    }
+
+    pub fn notifyCompleteSnapshotCapturedForTest(self: *HBCIndex) void {
+        if (!builtin.is_test) return;
+        if (test_complete_snapshot_capture_hook) |hook| {
+            hook(test_complete_snapshot_capture_ctx, self);
+        }
+    }
+
     pub fn beginRuntimeWriteTxn(self: *HBCIndex) !vectorindex_store.NamespaceWriteTxn {
         if (self.crossBatchPublicationActive()) self.bulk_publication_may_have_mutated = true;
         if (!self.crossBatchPublicationActive()) {
@@ -4469,11 +4531,12 @@ pub const HBCIndex = struct {
     }
 
     pub fn cacheSearchNode(self: *HBCIndex, node: *const Node) !void {
-        if (self.lsmSessionBatchingActive()) return;
+        if (self.lsmSessionBatchingActive() or self.publicationMutationActive()) return;
         try self.cacheNode(node);
     }
 
     pub fn cacheQuantized(self: *HBCIndex, node_id: u64, qs: *const QuantizedSet) !void {
+        if (self.publicationMutationActive()) return;
         if (!self.cache_enabled) return;
         {
             self.cache_mu.lockExclusive();
@@ -4713,7 +4776,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn borrowCachedNodeForSearch(self: *HBCIndex, node_id: u64) ?BorrowedNode {
-        if (self.lsmSessionBatchingActive()) return null;
+        if (self.lsmSessionBatchingActive() or self.publicationMutationActive()) return null;
         return self.borrowCachedNode(node_id);
     }
 
@@ -4745,6 +4808,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn borrowCachedQuantized(self: *HBCIndex, node_id: u64) ?BorrowedQuantized {
+        if (self.publicationMutationActive()) return null;
         if (!self.cache_enabled) return null;
         self.cache_mu.lockShared();
         if (self.pinned_quantized_cache.get(node_id)) |entry| {
@@ -5331,6 +5395,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn pinUpperTreeCache(self: *HBCIndex, txn: anytype) !void {
+        if (self.publicationMutationActive()) return;
         if (!self.cache_enabled) return;
         if (self.config.max_pinned_tree_nodes == 0) return;
         if (self.metadata.root_node == 0) return;
@@ -6987,19 +7052,31 @@ pub const HBCIndex = struct {
 
     /// Search for the k nearest vectors. Returns results sorted by distance.
     pub fn search(self: *HBCIndex, query: []const f32, k: usize) !SearchResults {
-        return try vectorindex_hbc_index.search(self, query, k, nowNs, elapsedSince);
+        return vectorindex_hbc_index.search(self, query, k, nowNs, elapsedSince) catch |err| {
+            if (err == error.IncompletePublishedSnapshot) self.noteIncompletePublishedSnapshot();
+            return err;
+        };
     }
 
     pub fn searchWithRequest(self: *HBCIndex, req: SearchRequest) !SearchResults {
-        return try vectorindex_hbc_index.searchWithRequest(self, req, nowNs, elapsedSince);
+        return vectorindex_hbc_index.searchWithRequest(self, req, nowNs, elapsedSince) catch |err| {
+            if (err == error.IncompletePublishedSnapshot) self.noteIncompletePublishedSnapshot();
+            return err;
+        };
     }
 
     pub fn searchProfiled(self: *HBCIndex, query: []const f32, k: usize) !ProfiledSearchResults {
-        return try vectorindex_hbc_index.searchProfiled(self, query, k, nowNs, elapsedSince);
+        return vectorindex_hbc_index.searchProfiled(self, query, k, nowNs, elapsedSince) catch |err| {
+            if (err == error.IncompletePublishedSnapshot) self.noteIncompletePublishedSnapshot();
+            return err;
+        };
     }
 
     pub fn searchProfiledRequest(self: *HBCIndex, req: SearchRequest) !ProfiledSearchResults {
-        return try vectorindex_hbc_index.searchProfiledRequest(self, req, nowNs, elapsedSince);
+        return vectorindex_hbc_index.searchProfiledRequest(self, req, nowNs, elapsedSince) catch |err| {
+            if (err == error.IncompletePublishedSnapshot) self.noteIncompletePublishedSnapshot();
+            return err;
+        };
     }
 
     fn routeRateEwma(previous: u64, sample: u64) u64 {
@@ -7247,6 +7324,15 @@ pub const HBCIndex = struct {
 
     pub fn noteTreeLinkInconsistency(self: *HBCIndex) void {
         self.link_repair_pending.store(true, .release);
+    }
+
+    pub fn noteIncompletePublishedSnapshot(self: *HBCIndex) void {
+        self.link_repair_pending.store(true, .release);
+        self.generation_repair_pending.store(true, .release);
+    }
+
+    pub fn generationRepairPending(self: *const HBCIndex) bool {
+        return self.generation_repair_pending.load(.acquire);
     }
 
     pub fn treeLinkRepairPending(self: *const HBCIndex) bool {
@@ -7675,6 +7761,120 @@ test "flat rabitq complete snapshot rejects a directory built with dangling node
             .load_metadata = false,
         }),
     );
+}
+
+test "complete snapshot rejects orphaned reachable coverage and schedules generation repair" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 4,
+        .leaf_size = 4,
+        .branching_factor = 4,
+        .use_quantization = false,
+    });
+    defer idx.close();
+
+    var prng = std.Random.DefaultPrng.init(0x0bad_c0de);
+    const random = prng.random();
+    var id: u64 = 1;
+    while (id <= 60) : (id += 1) {
+        var vector: [4]f32 = undefined;
+        for (&vector) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+        try idx.insert(id, &vector);
+    }
+
+    const victim_leaf = (try idx.debugLeafForVector(7)) orelse return error.TestUnexpectedResult;
+    {
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        var leaf = try idx.loadNode(&txn, victim_leaf);
+        defer leaf.deinit(alloc);
+        try std.testing.expect(leaf.parent != 0);
+        var parent = try idx.loadNode(&txn, leaf.parent);
+        defer parent.deinit(alloc);
+        try parent.ensureUnbacked(alloc);
+        const children = try alloc.alloc(u64, parent.children.len - 1);
+        var write_index: usize = 0;
+        for (parent.children) |child_id| {
+            if (child_id == victim_leaf) continue;
+            children[write_index] = child_id;
+            write_index += 1;
+        }
+        try std.testing.expectEqual(children.len, write_index);
+        alloc.free(parent.children);
+        parent.children = children;
+        try idx.saveNode(&txn, &parent);
+        try txn.commit();
+    }
+
+    try std.testing.expect(!idx.generationRepairPending());
+    try std.testing.expectError(
+        error.IncompletePublishedSnapshot,
+        idx.searchWithRequest(.{
+            .query = &.{ 0.1, 0.2, 0.3, 0.4 },
+            .k = 5,
+            .search_effort = 1,
+            .load_metadata = false,
+        }),
+    );
+    try std.testing.expect(idx.generationRepairPending());
+    try std.testing.expect(idx.treeLinkRepairPending());
+}
+
+test "complete snapshot fences publication from capture through read transaction" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 64,
+        .branching_factor = 4,
+        .use_quantization = false,
+    });
+    defer idx.close();
+    try idx.insert(1, &.{ 0, 0 });
+    try idx.insert(2, &.{ 1, 0 });
+    try idx.insert(3, &.{ 0, 1 });
+
+    const HookContext = struct {
+        fired: bool = false,
+        publication_fenced: bool = false,
+
+        fn onCapture(raw_ctx: ?*anyopaque, index: *HBCIndex) void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            if (ctx.fired) return;
+            ctx.fired = true;
+            if (index.published_snapshot_mu.tryLockExclusive()) {
+                index.published_snapshot_mu.unlockExclusive();
+            } else {
+                ctx.publication_fenced = true;
+            }
+        }
+    };
+    var hook_ctx = HookContext{};
+    test_complete_snapshot_capture_ctx = &hook_ctx;
+    test_complete_snapshot_capture_hook = HookContext.onCapture;
+    defer {
+        test_complete_snapshot_capture_ctx = null;
+        test_complete_snapshot_capture_hook = null;
+    }
+
+    var results = try idx.searchWithRequest(.{
+        .query = &.{ 0, 0 },
+        .k = 3,
+        .search_effort = 1,
+        .load_metadata = false,
+    });
+    defer results.deinit();
+    try std.testing.expect(hook_ctx.fired);
+    try std.testing.expect(hook_ctx.publication_fenced);
+    try std.testing.expectEqual(@as(usize, 3), results.getHits().len);
+    try std.testing.expect(!idx.generationRepairPending());
 }
 
 test "root leaf complete snapshot rejects a missing referenced vector" {

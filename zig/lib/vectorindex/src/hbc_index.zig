@@ -2009,8 +2009,17 @@ pub fn searchProfiledRequest(
     try search_types.checkCancelled(req);
     hbc_runtime.beginSearchEpoch(self);
     defer hbc_runtime.endSearchEpoch(self);
-    if (comptime @hasDecl(Index, "publishedActiveCount")) {
-        if (self.publishedActiveCount() == 0) {
+    const coverage_policy = search_types.coveragePolicy(req);
+    const exhaustive_coverage = coverage_policy == .complete_snapshot;
+    if (exhaustive_coverage and comptime @hasDecl(Index, "beginCompleteSnapshotRead")) {
+        self.beginCompleteSnapshotRead();
+    }
+    defer if (exhaustive_coverage and comptime @hasDecl(Index, "endCompleteSnapshotRead")) {
+        self.endCompleteSnapshotRead();
+    };
+    var published_snapshot = loadStableSearchPublishedSnapshot(self);
+    if (published_snapshot.active_count == 0) {
+        if (!exhaustive_coverage or publishedSnapshotStillCurrent(self, published_snapshot)) {
             const empty = search_results.SearchResults.init(self.alloc, req.k);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{
@@ -2018,10 +2027,25 @@ pub fn searchProfiledRequest(
                 .profile = profile,
             };
         }
+        published_snapshot = loadStableSearchPublishedSnapshot(self);
     }
     const setup_start = total_start;
     const txn_start = now_fn_u64();
-    var txn = try self.beginRuntimeSearchTxn();
+    if (exhaustive_coverage) notifyCompleteSnapshotCapturedForTestIfSupported(self);
+    var txn = if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverage"))
+        try self.beginRuntimeSearchTxnForCoverage(exhaustive_coverage)
+    else
+        try self.beginRuntimeSearchTxn();
+    while (exhaustive_coverage and !publishedSnapshotStillCurrent(self, published_snapshot)) {
+        txn.abort();
+        published_snapshot = loadStableSearchPublishedSnapshot(self);
+        notifyCompleteSnapshotCapturedForTestIfSupported(self);
+        txn = if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverage"))
+            try self.beginRuntimeSearchTxnForCoverage(true)
+        else
+            try self.beginRuntimeSearchTxn();
+        try search_types.checkCancelled(req);
+    }
     profile.runtime_txn_ns += elapsed_fn_u64(txn_start);
     defer txn.abort();
     if (comptime @hasDecl(Index, "pinUpperTreeCache")) {
@@ -2051,14 +2075,18 @@ pub fn searchProfiledRequest(
         .inner_product => 0,
     };
     const search_width = req.search_width orelse self.config.search_width;
-    const coverage_policy = search_types.coveragePolicy(req);
-    const exhaustive_coverage = coverage_policy == .complete_snapshot;
     const epsilon = req.epsilon orelse self.config.epsilon;
     const rerank_factor: usize = req.rerank_factor orelse search_mod.rerankFactor(epsilon);
     const should_rerank = self.config.use_quantization and self.config.rerank_policy != .never;
     const candidate_limit: usize = if (should_rerank) req.k * rerank_factor else req.k;
     const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
-    const root_node_id = searchRootNode(self);
+    const root_node_id = published_snapshot.root_node;
+
+    var coverage_tracker = CompleteCoverageTracker.init(
+        exhaustive_coverage,
+        published_snapshot.active_count,
+    );
+    defer coverage_tracker.deinit(self.alloc);
 
     var candidates = std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan).initContext({});
     defer candidates.deinit(self.alloc);
@@ -2085,6 +2113,11 @@ pub fn searchProfiledRequest(
             scratch,
             &profile,
             coverage_policy,
+            if (exhaustive_coverage) .{
+                .root_node = published_snapshot.root_node,
+                .node_count = published_snapshot.node_count,
+                .publish_generation = published_snapshot.publish_generation,
+            } else null,
             now_fn_u64,
             elapsed_fn_u64,
         );
@@ -2146,6 +2179,7 @@ pub fn searchProfiledRequest(
             }
             const leaf_posting = try posting.PostingStore.view(leaf);
             const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
+            try coverage_tracker.observe(self.alloc, member_ids);
             const leaf_id = leaf_posting.id;
             const leaf_uses_nonquantized_payload = leaf_posting.usesNonQuantizedPayload();
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
@@ -2165,6 +2199,7 @@ pub fn searchProfiledRequest(
         }
 
         if (flat_leaves_scored > 0) {
+            try validateCompleteCoverage(self, &coverage_tracker);
             if (should_rerank) {
                 const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
@@ -2204,6 +2239,7 @@ pub fn searchProfiledRequest(
         if (root.is_leaf) {
             const root_posting = try posting.PostingStore.view(root);
             const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, root_posting);
+            try coverage_tracker.observe(self.alloc, member_ids);
             const leaf_id = root_posting.id;
             const leaf_uses_nonquantized_payload = root_posting.usesNonQuantizedPayload();
             const leaf_has_fresh_stored_payload = root_posting.hasFreshStoredPayload();
@@ -2222,6 +2258,7 @@ pub fn searchProfiledRequest(
                 },
                 else => return err,
             };
+            try validateCompleteCoverage(self, &coverage_tracker);
             if (should_rerank) {
                 const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
@@ -2323,6 +2360,7 @@ pub fn searchProfiledRequest(
             }
             const leaf_posting = try posting.PostingStore.view(node);
             const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
+            try coverage_tracker.observe(self.alloc, member_ids);
             const leaf_id = leaf_posting.id;
             const leaf_uses_nonquantized_payload = leaf_posting.usesNonQuantizedPayload();
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
@@ -2342,6 +2380,8 @@ pub fn searchProfiledRequest(
             try addChildCandidatesFromIds(self, &txn, node_id, node_uses_nonquantized_payload, child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, coverage_policy, now_fn_u64, elapsed_fn_u64);
         }
     }
+
+    try validateCompleteCoverage(self, &coverage_tracker);
 
     if (should_rerank) {
         const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
@@ -2391,12 +2431,115 @@ fn finishPublishSearchStateIfSupported(self: anytype, publishing: bool) void {
     }
 }
 
+fn markPublishSearchStateCommittingIfSupported(self: anytype, publishing: bool) void {
+    if (!publishing) return;
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "markPublishedSearchStateCommitting")) {
+        self.markPublishedSearchStateCommitting();
+    }
+}
+
 fn abortPublishSearchStateIfSupported(self: anytype, publishing: bool) void {
     if (!publishing) return;
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "abortPublishedSearchStateRefresh")) {
         self.abortPublishedSearchStateRefresh();
     }
+}
+
+const SearchPublishedSnapshot = struct {
+    root_node: u64,
+    active_count: u64,
+    node_count: u64,
+    publish_generation: u64,
+};
+
+fn loadStableSearchPublishedSnapshot(self: anytype) SearchPublishedSnapshot {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime !@hasDecl(Index, "publishedGeneration")) {
+        return .{
+            .root_node = searchRootNode(self),
+            .active_count = self.metadata.active_count,
+            .node_count = self.metadata.node_count,
+            .publish_generation = 0,
+        };
+    }
+
+    while (true) {
+        const generation = self.publishedGeneration();
+        if ((generation & 1) != 0) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        const snapshot: SearchPublishedSnapshot = .{
+            .root_node = self.publishedRootNode(),
+            .active_count = self.publishedActiveCount(),
+            .node_count = self.publishedNodeCount(),
+            .publish_generation = generation,
+        };
+        const generation_after = self.publishedGeneration();
+        if (generation == generation_after and (generation_after & 1) == 0) return snapshot;
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn publishedSnapshotStillCurrent(self: anytype, snapshot: SearchPublishedSnapshot) bool {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime !@hasDecl(Index, "publishedGeneration")) return true;
+    return self.publishedGeneration() == snapshot.publish_generation;
+}
+
+fn notifyCompleteSnapshotCapturedForTestIfSupported(self: anytype) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "notifyCompleteSnapshotCapturedForTest")) {
+        self.notifyCompleteSnapshotCapturedForTest();
+    }
+}
+
+fn noteIncompletePublishedSnapshotIfSupported(self: anytype) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "noteIncompletePublishedSnapshot")) {
+        self.noteIncompletePublishedSnapshot();
+    }
+}
+
+const CompleteCoverageTracker = struct {
+    enabled: bool,
+    expected_count: u64,
+    member_ids: std.ArrayListUnmanaged(u64) = .empty,
+
+    fn init(enabled: bool, expected_count: u64) CompleteCoverageTracker {
+        return .{ .enabled = enabled, .expected_count = expected_count };
+    }
+
+    fn deinit(self: *CompleteCoverageTracker, alloc: std.mem.Allocator) void {
+        self.member_ids.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn observe(self: *CompleteCoverageTracker, alloc: std.mem.Allocator, member_ids: []const u64) !void {
+        if (!self.enabled) return;
+        try self.member_ids.appendSlice(alloc, member_ids);
+    }
+
+    fn validate(self: *CompleteCoverageTracker) !void {
+        if (!self.enabled) return;
+        if (@as(u64, @intCast(self.member_ids.items.len)) != self.expected_count) {
+            return error.IncompletePublishedSnapshot;
+        }
+        if (self.member_ids.items.len < 2) return;
+        std.mem.sort(u64, self.member_ids.items, {}, std.sort.asc(u64));
+        for (self.member_ids.items[1..], self.member_ids.items[0..self.member_ids.items.len -| 1]) |current, previous| {
+            if (current == previous) return error.IncompletePublishedSnapshot;
+        }
+    }
+};
+
+fn validateCompleteCoverage(self: anytype, tracker: *CompleteCoverageTracker) !void {
+    tracker.validate() catch |err| {
+        noteIncompletePublishedSnapshotIfSupported(self);
+        return err;
+    };
 }
 
 fn searchRootNode(self: anytype) u64 {
@@ -2471,7 +2614,7 @@ fn addChildCandidatesFromIds(
     }
 
     for (child_ids) |child_id| {
-        if (try borrowCachedNodeHandle(self, child_id)) |cached_handle| {
+        if (try borrowSearchCachedNodeHandle(self, child_id)) |cached_handle| {
             defer {
                 var handle = cached_handle;
                 handle.deinit(self.alloc);
@@ -4421,11 +4564,14 @@ pub fn delete(self: anytype, vector_id: u64) !void {
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
     errdefer abortVectorCacheMutationsIfSupported(self);
+    const publishing = beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     try deleteTxn(self, &txn, vector_id);
     try runAutoPostingMaintenanceTxn(self, &txn);
     try self.flushMetadata(&txn);
+    markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
-    publishSearchStateIfSupported(self);
+    finishPublishSearchStateIfSupported(self, publishing);
 }
 
 pub fn batchDelete(self: anytype, vector_ids: []const u64) !void {
@@ -4435,11 +4581,14 @@ pub fn batchDelete(self: anytype, vector_ids: []const u64) !void {
     var batch = try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
     errdefer abortVectorCacheMutationsIfSupported(self);
+    const publishing = beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     try batchDeleteTxn(self, &batch, vector_ids);
     try runAutoPostingMaintenanceTxn(self, &batch);
     try self.flushMetadata(&batch);
+    markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
-    publishSearchStateIfSupported(self);
+    finishPublishSearchStateIfSupported(self, publishing);
 }
 
 const PreparedBatchDelete = struct {
@@ -4838,10 +4987,13 @@ pub fn repairLinks(self: anytype, max_nodes: usize) !TreeLinkRepairReport {
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
     errdefer abortVectorCacheMutationsIfSupported(self);
+    const publishing = beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     const report = try repairTreeLinks(self, &txn, max_nodes);
     try self.flushMetadata(&txn);
+    markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
-    publishSearchStateIfSupported(self);
+    finishPublishSearchStateIfSupported(self, publishing);
     return report;
 }
 
@@ -5081,6 +5233,8 @@ pub fn insertWithMetadata(
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
     errdefer abortVectorCacheMutationsIfSupported(self);
+    const publishing = beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     const transformed_vector = try self.alloc.alloc(f32, self.config.dims);
     defer self.alloc.free(transformed_vector);
     try insertWithMetadataTxn(self, &txn, vector_id, vector_data, metadata_value, transformed_vector, now_fn_u64, elapsed_fn_u64);
@@ -5089,9 +5243,10 @@ pub fn insertWithMetadata(
     try self.flushMetadata(&txn);
     self.write_profile.insert_flush_metadata_ns += elapsed_fn_u64(flush_start);
     const commit_start = now_fn_u64();
+    markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
     self.write_profile.insert_commit_ns += elapsed_fn_u64(commit_start);
-    publishSearchStateIfSupported(self);
+    finishPublishSearchStateIfSupported(self, publishing);
 }
 
 pub fn insertWithMetadataTxn(
@@ -6316,11 +6471,12 @@ pub fn batchApplyOptions(
             try self.beginRuntimeBatchTxn();
         errdefer batch.abort();
         errdefer abortVectorCacheMutationsIfSupported(self);
+        const publishing = beginPublishSearchStateIfSupported(self);
+        errdefer abortPublishSearchStateIfSupported(self, publishing);
         try batchDeleteTxn(self, &batch, deletes);
         try finalizeWriteTxnOptions(self, &batch, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
-        const publishing = beginPublishSearchStateIfSupported(self);
-        errdefer abortPublishSearchStateIfSupported(self, publishing);
+        markPublishSearchStateCommittingIfSupported(self, publishing);
         try batch.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
         finishPublishSearchStateIfSupported(self, publishing);
@@ -6335,6 +6491,8 @@ pub fn batchApplyOptions(
         try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
     errdefer abortVectorCacheMutationsIfSupported(self);
+    const publishing = beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
 
     try batchDeleteTxn(self, &batch, deletes);
 
@@ -6351,8 +6509,7 @@ pub fn batchApplyOptions(
     if (!grouped) try batchInsertWithMetadataTxnOptions(self, &batch, writes, insert_options);
     try finalizeWriteTxnOptions(self, &batch, insert_options, now_fn, elapsed_fn);
     const commit_start = now_fn();
-    const publishing = beginPublishSearchStateIfSupported(self);
-    errdefer abortPublishSearchStateIfSupported(self, publishing);
+    markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
     finishPublishSearchStateIfSupported(self, publishing);
@@ -6376,6 +6533,8 @@ pub fn batchInsertWithMetadataOptions(
             try self.beginRuntimeBatchTxn();
         errdefer batch.abort();
         errdefer abortVectorCacheMutationsIfSupported(self);
+        const publishing = beginPublishSearchStateIfSupported(self);
+        errdefer abortPublishSearchStateIfSupported(self, publishing);
         const grouped = if (options.coalesce_leaf_writes)
             try batchInsertAssumeAbsentGroupedTxnOptions(self, &batch, items, options, now_fn, elapsed_fn)
         else
@@ -6383,8 +6542,7 @@ pub fn batchInsertWithMetadataOptions(
         if (!grouped) try batchInsertWithMetadataTxnOptions(self, &batch, items, options);
         try finalizeWriteTxnOptions(self, &batch, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
-        const publishing = beginPublishSearchStateIfSupported(self);
-        errdefer abortPublishSearchStateIfSupported(self, publishing);
+        markPublishSearchStateCommittingIfSupported(self, publishing);
         try batch.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
         finishPublishSearchStateIfSupported(self, publishing);
@@ -6393,11 +6551,12 @@ pub fn batchInsertWithMetadataOptions(
         var txn = try self.beginRuntimeWriteTxn();
         errdefer txn.abort();
         errdefer abortVectorCacheMutationsIfSupported(self);
+        const publishing = beginPublishSearchStateIfSupported(self);
+        errdefer abortPublishSearchStateIfSupported(self, publishing);
         try batchInsertWithMetadataTxnOptions(self, &txn, items, options);
         try finalizeWriteTxnOptions(self, &txn, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
-        const publishing = beginPublishSearchStateIfSupported(self);
-        errdefer abortPublishSearchStateIfSupported(self, publishing);
+        markPublishSearchStateCommittingIfSupported(self, publishing);
         try txn.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
         finishPublishSearchStateIfSupported(self, publishing);
@@ -7102,11 +7261,12 @@ pub fn bulkBuildWithMetadataOptions(
     var batch = try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
     errdefer abortVectorCacheMutationsIfSupported(self);
+    const publishing = beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     try bulkBuildWithMetadataTxnOptions(self, &batch, items, options, now_fn, elapsed_fn);
     try finalizeWriteTxnOptions(self, &batch, .{}, now_fn, elapsed_fn);
     const commit_start = now_fn();
-    const publishing = beginPublishSearchStateIfSupported(self);
-    errdefer abortPublishSearchStateIfSupported(self, publishing);
+    markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
     finishPublishSearchStateIfSupported(self, publishing);

@@ -19260,6 +19260,7 @@ pub const DB = struct {
 
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
             const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+            const generation_repair_pending = entry.index.generationRepairPending();
             const artifact_counter_required = try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, entry.config);
             const status_snapshot = try self.loadIndexStatusSnapshot(alloc, entry.config.name);
             const watermark_count = if (status_snapshot) |status_value|
@@ -19267,7 +19268,7 @@ pub const DB = struct {
             else
                 0;
             const watermark_regressed = watermark_count > entry.index.stats().active_count;
-            if (!artifact_backed and !watermark_regressed) continue;
+            if (!artifact_backed and !watermark_regressed and !generation_repair_pending) continue;
 
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
@@ -19298,6 +19299,7 @@ pub const DB = struct {
                 applied_sequence,
             );
             if (persisted_resume == null and
+                !generation_repair_pending and
                 !checkpoint_config_mismatch and
                 applied_sequence < target_sequence and
                 projection_checkpoint.status != .rebuilding and
@@ -19306,6 +19308,7 @@ pub const DB = struct {
                 continue;
             }
             const invalid_generation_error: ?[]const u8 = blk: {
+                if (generation_repair_pending) break :blk "dense_hbc_published_snapshot_incomplete";
                 if (checkpoint_config_mismatch) break :blk "dense_projection_config_mismatch";
                 if (projection_checkpoint.status == .repair_required) break :blk "dense_projection_checkpoint_repair_required";
                 if (entry.index.stats().active_count == 0) break :blk null;
@@ -23626,7 +23629,19 @@ pub const DB = struct {
         req: vectorindex_mod.SearchRequest,
     ) anyerror!vectorindex_mod.SearchResults {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.searchDenseEntryWithRequest(entry, req);
+        return self.core.index_manager.searchDenseEntryWithRequest(entry, req) catch |err| switch (err) {
+            error.IncompletePublishedSnapshot => {
+                // Quarantine immediately so later requests do not repeatedly
+                // rediscover the same broken generation. The maintenance plan
+                // observes generationRepairPending and persists a shadow-
+                // generation repair intent.
+                self.core.index_manager.markRepairUnavailable(entry.config.name) catch |gate_err| {
+                    std.log.err("failed to quarantine incomplete dense index name={s} err={}", .{ entry.config.name, gate_err });
+                };
+                return error.IndexRebuilding;
+            },
+            else => return err,
+        };
     }
 
     fn hbcSearchProfiledCallback(
@@ -23635,7 +23650,15 @@ pub const DB = struct {
         req: vectorindex_mod.SearchRequest,
     ) anyerror!vectorindex_mod.ProfiledSearchResults {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
+        return self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req) catch |err| switch (err) {
+            error.IncompletePublishedSnapshot => {
+                self.core.index_manager.markRepairUnavailable(entry.config.name) catch |gate_err| {
+                    std.log.err("failed to quarantine incomplete dense index name={s} err={}", .{ entry.config.name, gate_err });
+                };
+                return error.IndexRebuilding;
+            },
+            else => return err,
+        };
     }
 
     fn exactDenseSearchCallback(
@@ -74933,6 +74956,35 @@ test "db forced generation repair completion is crash idempotent before api ackn
     try std.testing.expectEqual(@as(u64, 1), replayed.repaired);
     try std.testing.expectEqual(@as(u64, 1), replayed.indexes_rebuilt);
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
+}
+
+test "db incomplete HBC snapshot schedules durable generation repair" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+    dense.index.noteIncompletePublishedSnapshot();
+
+    try std.testing.expect(try db.denseArtifactRebuildMaintenanceNeeded(alloc));
+    try std.testing.expect(try db.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null));
+    try std.testing.expect(db.core.index_manager.repairUnavailable("dense_idx"));
+    const repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
+    var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer repair.deinit(alloc);
+    try std.testing.expectEqual(index_repair_state.Trigger.projection_generation_invalid, repair.intent.trigger);
+    try std.testing.expectEqualStrings("dense_hbc_published_snapshot_incomplete", repair.intent.last_error.?);
 }
 
 test "db forced repair attaches to automatic generation intent idempotently" {
