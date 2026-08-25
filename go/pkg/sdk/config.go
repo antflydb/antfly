@@ -420,11 +420,8 @@ type ArtifactEmbeddingIndexConfig struct {
 	// ExpectedDims is optional when the embedder can be probed by the server.
 	ExpectedDims int
 	// Sparse creates a sparse token-space index. ExpectedDims must be zero.
-	Sparse bool
-	// VectorSpace optionally asserts model/token-space compatibility. When
-	// omitted, Antfly compares canonical semantic producer identities.
-	VectorSpace string
-	Embedder    EmbedderConfig
+	Sparse   bool
+	Embedder EmbedderConfig
 	// DistanceMetric defaults on the server when left empty.
 	DistanceMetric DistanceMetric
 }
@@ -473,7 +470,6 @@ func NewArtifactEmbeddingIndexConfig(name string, config ArtifactEmbeddingIndexC
 			Template:           source.SourceTemplate,
 			SourceArtifactName: source.SourceArtifactName,
 			ExpectedDims:       config.ExpectedDims,
-			VectorSpace:        config.VectorSpace,
 		})
 	}
 	sources, err := NewArtifactIndexSources(artifactNames...)

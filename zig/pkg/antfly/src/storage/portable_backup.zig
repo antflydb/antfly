@@ -1551,6 +1551,28 @@ fn graphArtifactValueFromPortableEdgeValueAlloc(alloc: Allocator, value: []const
     return try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(alloc, 1.0, 0, 0, value);
 }
 
+test "portable graph conversion accepts generation-less v1 edge artifacts" {
+    const alloc = std.testing.allocator;
+    const legacy =
+        "AFENRCH\x00" ++
+        "\x01\x00\x05\x00" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x23\x00\x00\x00" ++
+        "\x00\x00\x00\x00\x00\x00\xf8\x3f" ++
+        "\x0a\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x14\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x07\x00\x00\x00{\"k\":1}";
+
+    const portable = try graphArtifactValueFromPortableEdgeValueAlloc(alloc, legacy);
+    defer alloc.free(portable);
+    try std.testing.expect(enrichment_artifact_codec.isPortableUnboundGraphEdge(portable));
+    var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, portable);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 0), decoded.generation);
+    try std.testing.expectEqual(@as(f64, 1.5), decoded.weight);
+    try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
+}
+
 /// Decode an edge batch payload (mirrors backup_codec.encodeEdgeBatch).
 fn decodeEdgeBatch(alloc: Allocator, data: []const u8) !struct {
     index_name: []u8,

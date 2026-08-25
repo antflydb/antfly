@@ -60,6 +60,7 @@ def test_created_graph_index_exposes_artifact_mapping_and_planning() -> None:
         }
     )
 
+    assert isinstance(created.sources, list)
     assert len(created.sources) == 1
     source = created.sources[0]
     assert source.artifact == "relations_v1"

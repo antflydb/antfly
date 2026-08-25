@@ -9291,7 +9291,6 @@ export interface components {
             /**
              * @deprecated
              * @description Compatibility discriminator for the former graph source union. Omit it; artifact is the only public source kind.
-             * @default artifact
              * @enum {string}
              */
             kind?: "artifact";
@@ -10183,7 +10182,7 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** @description Configured graph artifact source projected in deterministic precedence order. New servers always populate artifact; it remains optional in the transition schema so new clients can read older servers. Deprecated aliases remain populated for rolling client compatibility. */
+        /** @description Configured graph artifact source projected in deterministic precedence order. During the rolling transition, identity is available as canonical artifact on new servers or deprecated name on older servers. New servers continue emitting deprecated aliases for old clients, but new clients must not require them. */
         GraphSourceArtifactStatus: {
             /** @description Canonical artifact source identity. New servers always populate this field; clients may fall back to the deprecated name alias when reading an older server. */
             artifact?: string;
@@ -10191,7 +10190,7 @@ export interface components {
              * @deprecated
              * @description Deprecated compatibility alias for artifact.
              */
-            name: string;
+            name?: string;
             path: string;
             /** @enum {string} */
             format: "extraction_relation" | "extraction_graph";
@@ -10199,7 +10198,7 @@ export interface components {
              * @deprecated
              * @description Deprecated aggregate compatibility projection. This mirrors enclosing index catch-up state and is not source-specific.
              */
-            materialization_pending: boolean;
+            materialization_pending?: boolean;
         };
         /** @description Statistics for graph index */
         GraphIndexStats: {
@@ -12100,6 +12099,20 @@ export interface components {
              */
             type: "embeddings";
         };
+        /** @description Canonical artifact stream materialized into graph edges. Request-only compatibility discriminators are omitted. */
+        CreatedGraphArtifactSourceConfig: {
+            artifact: string;
+            path?: string;
+            /**
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
+            mention_edge_type?: string;
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
+        };
         /** @description Credential-free graph artifact producer configuration returned after creation. */
         CreatedGraphArtifactProducerConfig: {
             name: string;
@@ -12115,7 +12128,7 @@ export interface components {
             template?: string;
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
             max_edges_per_document?: number;
-            sources?: components["schemas"]["GraphArtifactSourceConfig"][];
+            sources?: components["schemas"]["CreatedGraphArtifactSourceConfig"][];
             artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];

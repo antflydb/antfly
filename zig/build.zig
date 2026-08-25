@@ -2992,6 +2992,7 @@ pub fn build(b: *std.Build) void {
             "file import restores Go cross-backend portable fixture",
             "file import restores production Go portable fixture",
             "file import rejects oversized portable blocks before allocation",
+            "portable graph conversion accepts generation-less v1 edge artifacts",
             "document batch round-trip",
         },
         .test_runner = .{

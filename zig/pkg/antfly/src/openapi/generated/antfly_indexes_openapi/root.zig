@@ -20,6 +20,7 @@ pub const CreatedEnrichmentConfig = types.CreatedEnrichmentConfig;
 pub const CreatedFullTextIndex = types.CreatedFullTextIndex;
 pub const CreatedFullTextIndexConfig = types.CreatedFullTextIndexConfig;
 pub const CreatedGraphArtifactProducerConfig = types.CreatedGraphArtifactProducerConfig;
+pub const CreatedGraphArtifactSourceConfig = types.CreatedGraphArtifactSourceConfig;
 pub const CreatedGraphIndex = types.CreatedGraphIndex;
 pub const CreatedGraphIndexConfig = types.CreatedGraphIndexConfig;
 pub const CreatedIndex = types.CreatedIndex;

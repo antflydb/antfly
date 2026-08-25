@@ -12,10 +12,10 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.created_enrichment_config import CreatedEnrichmentConfig
     from ..models.created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
+    from ..models.created_graph_artifact_source_config import CreatedGraphArtifactSourceConfig
     from ..models.created_provider_config import CreatedProviderConfig
     from ..models.edge_type_config import EdgeTypeConfig
     from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
-    from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
     from ..models.graph_resolver_config import GraphResolverConfig
 
 
@@ -38,7 +38,7 @@ class CreatedGraphIndex:
         template (str | Unset):
         edge_types (list[EdgeTypeConfig] | Unset):
         max_edges_per_document (int | Unset):
-        sources (list[GraphArtifactSourceConfig] | Unset):
+        sources (list[CreatedGraphArtifactSourceConfig] | Unset):
         artifact (CreatedGraphArtifactProducerConfig | Unset): Credential-free graph artifact producer configuration
             returned after creation.
         algebraic_planning (GraphAlgebraicPlanningConfig | Unset): Optional algebraic planning features for graph
@@ -55,7 +55,7 @@ class CreatedGraphIndex:
     template: str | Unset = UNSET
     edge_types: list[EdgeTypeConfig] | Unset = UNSET
     max_edges_per_document: int | Unset = UNSET
-    sources: list[GraphArtifactSourceConfig] | Unset = UNSET
+    sources: list[CreatedGraphArtifactSourceConfig] | Unset = UNSET
     artifact: CreatedGraphArtifactProducerConfig | Unset = UNSET
     algebraic_planning: GraphAlgebraicPlanningConfig | Unset = UNSET
     resolvers: list[GraphResolverConfig] | Unset = UNSET
@@ -151,10 +151,10 @@ class CreatedGraphIndex:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.created_enrichment_config import CreatedEnrichmentConfig
         from ..models.created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
+        from ..models.created_graph_artifact_source_config import CreatedGraphArtifactSourceConfig
         from ..models.created_provider_config import CreatedProviderConfig
         from ..models.edge_type_config import EdgeTypeConfig
         from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
-        from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
         from ..models.graph_resolver_config import GraphResolverConfig
 
         d = dict(src_dict)
@@ -196,11 +196,11 @@ class CreatedGraphIndex:
         max_edges_per_document = d.pop("max_edges_per_document", UNSET)
 
         _sources = d.pop("sources", UNSET)
-        sources: list[GraphArtifactSourceConfig] | Unset = UNSET
+        sources: list[CreatedGraphArtifactSourceConfig] | Unset = UNSET
         if _sources is not UNSET:
             sources = []
             for sources_item_data in _sources:
-                sources_item = GraphArtifactSourceConfig.from_dict(sources_item_data)
+                sources_item = CreatedGraphArtifactSourceConfig.from_dict(sources_item_data)
 
                 sources.append(sources_item)
 

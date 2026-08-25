@@ -196,13 +196,8 @@ def artifact_embedding_index_config(
     dimension: int | None = None,
     sparse: bool = False,
     distance_metric: str | None = None,
-    vector_space: str | None = None,
 ) -> dict[str, Any]:
-    """Build one vector-index config plus its embedding enrichments.
-
-    Omitting ``vector_space`` selects Antfly's automatic semantic-producer
-    validation. Set it only to assert compatibility across distinct producers.
-    """
+    """Build one vector index plus same-producer embedding enrichments."""
 
     if not name:
         raise ValueError("index name is required")
@@ -238,10 +233,6 @@ def artifact_embedding_index_config(
             enrichment["source_artifact_name"] = source.source_artifact
         if dimension is not None:
             enrichment["expected_dims"] = dimension
-        if vector_space is not None:
-            if not vector_space:
-                raise ValueError("vector_space cannot be empty when provided")
-            enrichment["vector_space"] = vector_space
         enrichments.append(enrichment)
 
     result: dict[str, Any] = {

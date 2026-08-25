@@ -18137,7 +18137,6 @@ components:
           type: string
           enum:
             - artifact
-          default: artifact
           deprecated: true
           description: Compatibility discriminator for the former graph source union. Omit it; artifact
             is the only public source kind.
@@ -19588,13 +19587,12 @@ components:
       type: object
       additionalProperties: false
       required:
-        - name
         - path
         - format
-        - materialization_pending
-      description: Configured graph artifact source projected in deterministic precedence order. New servers
-        always populate artifact; it remains optional in the transition schema so new clients can read
-        older servers. Deprecated aliases remain populated for rolling client compatibility.
+      description: Configured graph artifact source projected in deterministic precedence order. During
+        the rolling transition, identity is available as canonical artifact on new servers or deprecated
+        name on older servers. New servers continue emitting deprecated aliases for old clients, but new
+        clients must not require them.
       properties:
         artifact:
           type: string
@@ -22737,6 +22735,33 @@ components:
               type: string
               enum:
                 - embeddings
+    CreatedGraphArtifactSourceConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+      description: Canonical artifact stream materialized into graph edges. Request-only compatibility
+        discriminators are omitted.
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+        path:
+          type: string
+        format:
+          type: string
+          enum:
+            - extraction_relation
+            - extraction_graph
+          default: extraction_relation
+        mention_edge_type:
+          type: string
+        nodes:
+          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
+        edge:
+          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
+        context:
+          $ref: '#/components/schemas/GraphArtifactContextConfig'
     CreatedGraphArtifactProducerConfig:
       type: object
       additionalProperties: false
@@ -22777,7 +22802,7 @@ components:
           type: array
           maxItems: 64
           items:
-            $ref: '#/components/schemas/GraphArtifactSourceConfig'
+            $ref: '#/components/schemas/CreatedGraphArtifactSourceConfig'
         artifact:
           $ref: '#/components/schemas/CreatedGraphArtifactProducerConfig'
         algebraic_planning:

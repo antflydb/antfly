@@ -4645,7 +4645,7 @@ fn expectCreatedObjectAllowlistCovers(
 test "created nested response allowlists cover generated schemas" {
     try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedProviderConfig, .provider);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedEnrichmentConfig, .enrichment);
-    try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphArtifactSourceConfig, .graph_source);
+    try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedGraphArtifactSourceConfig, .graph_source);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.CreatedGraphArtifactProducerConfig, .graph_artifact);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphArtifactProducerSourceConfig, .graph_artifact_producer_source);
     try expectCreatedObjectAllowlistCovers(indexes_openapi.GraphArtifactNodeMappingConfig, .graph_nodes);

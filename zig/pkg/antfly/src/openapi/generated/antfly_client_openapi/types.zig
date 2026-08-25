@@ -2126,6 +2126,17 @@ pub const CreatedGraphArtifactProducerConfig = struct {
     execution: ?ExecutionPolicy = null,
 };
 
+/// Canonical artifact stream materialized into graph edges. Request-only compatibility discriminators are omitted.
+pub const CreatedGraphArtifactSourceConfig = struct {
+    artifact: []const u8,
+    path: ?[]const u8 = null,
+    format: ?[]const u8 = null,
+    mention_edge_type: ?[]const u8 = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
+};
+
 /// Normalized effective graph index configuration returned after creation.
 pub const CreatedGraphIndex = struct {
     /// Name of the created index
@@ -2140,7 +2151,7 @@ pub const CreatedGraphIndex = struct {
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
-    sources: ?[]const GraphArtifactSourceConfig = null,
+    sources: ?[]const CreatedGraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
@@ -2153,7 +2164,7 @@ pub const CreatedGraphIndexConfig = struct {
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
-    sources: ?[]const GraphArtifactSourceConfig = null,
+    sources: ?[]const CreatedGraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
@@ -4633,16 +4644,16 @@ pub const GraphResultNode = struct {
     edges: ?[]const Edge = null,
 };
 
-/// Configured graph artifact source projected in deterministic precedence order. New servers always populate artifact; it remains optional in the transition schema so new clients can read older servers. Deprecated aliases remain populated for rolling client compatibility.
+/// Configured graph artifact source projected in deterministic precedence order. During the rolling transition, identity is available as canonical artifact on new servers or deprecated name on older servers. New servers continue emitting deprecated aliases for old clients, but new clients must not require them.
 pub const GraphSourceArtifactStatus = struct {
     /// Canonical artifact source identity. New servers always populate this field; clients may fall back to the deprecated name alias when reading an older server.
     artifact: ?[]const u8 = null,
     /// Deprecated compatibility alias for artifact.
-    name: []const u8,
+    name: ?[]const u8 = null,
     path: []const u8,
     format: []const u8,
     /// Deprecated aggregate compatibility projection. This mirrors enclosing index catch-up state and is not source-specific.
-    materialization_pending: bool,
+    materialization_pending: ?bool = null,
 };
 
 /// A literal numeric value or a Handlebars template evaluated for each materialized graph item.

@@ -1,10 +1,10 @@
 import type {
   ArtifactIndexSource,
+  EmbedderConfig,
   EmbeddingsIndexConfig,
   EnrichmentConfig,
   GraphIndexSource,
   IndexConfig,
-  EmbedderConfig,
 } from "./types.js";
 
 const MAX_ARTIFACT_SOURCES = 64;
@@ -38,7 +38,8 @@ function validateArtifactNames(artifacts: readonly string[]): void {
   const seen = new Set<string>();
   artifacts.forEach((artifact, index) => {
     if (artifact.length === 0) throw new TypeError(`artifacts[${index}] is required`);
-    if (seen.has(artifact)) throw new TypeError(`duplicate artifact source ${JSON.stringify(artifact)}`);
+    if (seen.has(artifact))
+      throw new TypeError(`duplicate artifact source ${JSON.stringify(artifact)}`);
     seen.add(artifact);
   });
 }
@@ -84,7 +85,9 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
     const docFields = source.context?.doc_fields;
     if (docFields !== undefined) {
       if (docFields.some((field) => typeof field !== "string" || field.length === 0)) {
-        throw new TypeError(`sources[${index}].context.doc_fields entries must be non-empty strings`);
+        throw new TypeError(
+          `sources[${index}].context.doc_fields entries must be non-empty strings`
+        );
       }
       if (new Set(docFields).size !== docFields.length) {
         throw new TypeError(`sources[${index}].context.doc_fields must be unique`);
@@ -103,8 +106,8 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
               source.edge.metadata === undefined
                 ? undefined
                 : (cloneJsonValue(
-                  source.edge.metadata,
-                  "graph source edge metadata"
+                    source.edge.metadata,
+                    "graph source edge metadata"
                   ) as NonNullable<GraphIndexSource["edge"]>["metadata"]),
           },
     context:
@@ -113,9 +116,7 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
         : {
             ...source.context,
             doc_fields:
-              source.context.doc_fields === undefined
-                ? undefined
-                : [...source.context.doc_fields],
+              source.context.doc_fields === undefined ? undefined : [...source.context.doc_fields],
           },
   }));
 }
@@ -138,11 +139,6 @@ export interface ArtifactEmbeddingIndexOptions {
   dimension?: number;
   sparse?: boolean;
   distanceMetric?: NonNullable<EmbeddingsIndexConfig["distance_metric"]>;
-  /**
-   * Optional compatibility assertion. When omitted, Antfly requires semantic
-   * equivalence of the effective producer models.
-   */
-  vectorSpace?: string;
 }
 
 /**
@@ -161,10 +157,10 @@ export function artifactEmbeddingIndexConfig(
   if (options.sparse && options.distanceMetric !== undefined) {
     throw new TypeError("distanceMetric must be omitted for sparse embedding indexes");
   }
-  if (options.vectorSpace !== undefined && options.vectorSpace.length === 0) {
-    throw new TypeError("vectorSpace cannot be empty when provided");
-  }
-  if (options.dimension !== undefined && (!Number.isInteger(options.dimension) || options.dimension <= 0)) {
+  if (
+    options.dimension !== undefined &&
+    (!Number.isInteger(options.dimension) || options.dimension <= 0)
+  ) {
     throw new RangeError("dimension must be a positive integer");
   }
   if (
@@ -200,7 +196,6 @@ export function artifactEmbeddingIndexConfig(
         ? { source_artifact_name: source.sourceArtifact }
         : {}),
       ...(options.dimension !== undefined ? { expected_dims: options.dimension } : {}),
-      ...(options.vectorSpace !== undefined ? { vector_space: options.vectorSpace } : {}),
     };
   });
 

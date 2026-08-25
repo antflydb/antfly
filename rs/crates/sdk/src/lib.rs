@@ -216,7 +216,6 @@ pub struct ArtifactEmbeddingIndexOptions {
     #[serde(default)]
     pub sparse: bool,
     pub distance_metric: Option<ArtifactEmbeddingDistanceMetric>,
-    pub vector_space: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -306,12 +305,6 @@ pub fn artifact_embedding_index_config(
             "dimension must be positive when provided".into(),
         ));
     }
-    if options.vector_space.as_deref() == Some("") {
-        return Err(IndexConfigError(
-            "vector_space cannot be empty when provided".into(),
-        ));
-    }
-
     let mut enrichments = Vec::with_capacity(options.sources.len());
     for (index, source) in options.sources.iter().enumerate() {
         if source.field.is_empty() && source.template.as_deref().unwrap_or_default().is_empty() {
@@ -331,7 +324,7 @@ pub fn artifact_embedding_index_config(
             template: source.template.clone(),
             source_artifact: source.source_artifact.clone(),
             expected_dims: options.dimension,
-            vector_space: options.vector_space.clone(),
+            vector_space: None,
         });
     }
 
@@ -526,7 +519,6 @@ mod tests {
                 dimension: Some(384),
                 sparse: false,
                 distance_metric: None,
-                vector_space: Some("searchaf:v1".into()),
             },
         )
         .expect("valid multi-source index");

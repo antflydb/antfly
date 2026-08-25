@@ -31,14 +31,13 @@ def test_builds_document_and_chunk_embedding_sources() -> None:
         ],
         embedder={"provider": "antfly", "model": "antflydb/clipclap"},
         dimension=384,
-        vector_space="searchaf:v1",
     )
     assert config["sources"] == [
         {"artifact": "document_dense_v1"},
         {"artifact": "document_chunk_dense_v1"},
     ]
     assert config["enrichments"][1]["source_artifact_name"] == "document_chunks_v1"
-    assert all(item["vector_space"] == "searchaf:v1" for item in config["enrichments"])
+    assert all("vector_space" not in item for item in config["enrichments"])
     assert "embedding_name" not in config
 
 

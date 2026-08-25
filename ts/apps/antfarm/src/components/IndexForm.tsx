@@ -47,9 +47,16 @@ const staticModelSuggestions: Record<EmbedderProvider, string[]> = {
 interface IndexFormProps {
   fieldPrefix?: string;
   schemaFields?: string[];
+  showName?: boolean;
+  allowArtifactSources?: boolean;
 }
 
-const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = [] }) => {
+const IndexForm: React.FC<IndexFormProps> = ({
+  fieldPrefix = "",
+  schemaFields = [],
+  showName = true,
+  allowArtifactSources = false,
+}) => {
   const { control, watch } = useFormContext();
   const prefix = fieldPrefix ? `${fieldPrefix}.` : "";
   const artifactSources = useFieldArray({
@@ -111,20 +118,21 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
           </FormItem>
         )}
       />
-      <FormField
-        control={control}
-        name={`${prefix}name`}
-        render={({ field }) => (
-          <FormItem>
-            <FormLabel>Index Name</FormLabel>
-            <FormControl>
-              <Input placeholder="Enter index name" {...field} />
-            </FormControl>
-            <FormMessage />
-          </FormItem>
-        )}
-      />
-
+      {showName && (
+        <FormField
+          control={control}
+          name={`${prefix}name`}
+          render={({ field }) => (
+            <FormItem>
+              <FormLabel>Index Name</FormLabel>
+              <FormControl>
+                <Input placeholder="Enter index name" {...field} />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+          )}
+        />
+      )}
       <FormField
         control={control}
         name={`${prefix}sourceType`}
@@ -150,12 +158,14 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
                   </FormControl>
                   <FormLabel className="font-normal">Template</FormLabel>
                 </FormItem>
-                <FormItem className="flex items-center space-x-3 space-y-0">
-                  <FormControl>
-                    <RadioGroupItem value="artifacts" />
-                  </FormControl>
-                  <FormLabel className="font-normal">Artifacts</FormLabel>
-                </FormItem>
+                {allowArtifactSources && (
+                  <FormItem className="flex items-center space-x-3 space-y-0">
+                    <FormControl>
+                      <RadioGroupItem value="artifacts" />
+                    </FormControl>
+                    <FormLabel className="font-normal">Artifacts</FormLabel>
+                  </FormItem>
+                )}
               </RadioGroup>
             </FormControl>
             <FormMessage />
@@ -272,22 +282,6 @@ const IndexForm: React.FC<IndexFormProps> = ({ fieldPrefix = "", schemaFields = 
           >
             Add artifact source
           </Button>
-          <FormField
-            control={control}
-            name={`${prefix}vectorSpace`}
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>Vector space override (optional)</FormLabel>
-                <FormControl>
-                  <Input placeholder="searchaf:v1" {...field} />
-                </FormControl>
-                <p className="text-xs text-muted-foreground">
-                  Use only to assert compatibility across intentionally distinct producers.
-                </p>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
         </div>
       )}
 

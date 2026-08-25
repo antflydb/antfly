@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const native_endian = builtin.target.cpu.arch.endian();
 
 pub const codec_version: u16 = 1;
+pub const graph_edge_codec_version: u16 = 2;
 pub const magic: [8]u8 = .{ 'A', 'F', 'E', 'N', 'R', 'C', 'H', 0 };
 pub const header_len: usize = magic.len + @sizeOf(u16) + @sizeOf(u8) + @sizeOf(u8) + @sizeOf(u64) + @sizeOf(u32);
 
@@ -278,7 +279,7 @@ pub fn encodeGraphEdgeAlloc(
     errdefer alloc.free(out);
 
     writeHeader(out[0..header_len], .{
-        .version = codec_version,
+        .version = graph_edge_codec_version,
         .kind = .graph_edge,
         .flags = .{ .has_source_hash = source_hash != null, .has_graph_generation = true },
         .source_hash = source_hash orelse 0,
@@ -321,11 +322,18 @@ pub fn isPortableUnboundGraphEdge(data: []const u8) bool {
     return std.mem.readInt(u64, data[header_len..][0..8], .little) == 0;
 }
 
-/// Bind a portable graph edge to the destination index incarnation. Portable
-/// edges deliberately omit their source cluster's generation; callers must
-/// persist the returned value before exposing the edge to an active index.
-pub fn bindPortableGraphEdgeGenerationAlloc(alloc: Allocator, data: []const u8, generation: u64) ![]u8 {
-    if (!isPortableUnboundGraphEdge(data)) return error.GraphGenerationAlreadyBound;
+/// Generation-less v1 records predate incarnation fencing. Treat them like
+/// portable records and bind them exactly once before exposing them to an
+/// active index. Version 2 makes new records self-describing and ensures an
+/// older binary rejects them instead of interpreting the generation as weight.
+pub fn needsGraphGenerationBinding(data: []const u8) bool {
+    const header = decodeHeader(data) catch return false;
+    if (header.kind != .graph_edge) return false;
+    return header.version == codec_version or isPortableUnboundGraphEdge(data);
+}
+
+pub fn bindGraphEdgeGenerationAlloc(alloc: Allocator, data: []const u8, generation: u64) ![]u8 {
+    if (!needsGraphGenerationBinding(data)) return error.GraphGenerationAlreadyBound;
 
     var decoded = try decodeGraphEdgeAlloc(alloc, data);
     defer decoded.deinit(alloc);
@@ -343,13 +351,18 @@ pub fn bindPortableGraphEdgeGenerationAlloc(alloc: Allocator, data: []const u8, 
 pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
     const header = try decodeHeader(data);
     if (header.kind != .graph_edge) return error.InvalidArtifactKind;
-    if (!header.flags.has_graph_generation) return error.InvalidArtifactPayload;
-    if (header.payload_len < @sizeOf(u64) * 4 + @sizeOf(u32)) return error.InvalidArtifactPayload;
 
     const payload = data[header_len..][0..header.payload_len];
     var pos: usize = 0;
-    const generation = std.mem.readInt(u64, payload[pos..][0..8], .little);
-    pos += @sizeOf(u64);
+    const generation: u64 = if (header.version == graph_edge_codec_version) blk: {
+        if (!header.flags.has_graph_generation or header.payload_len < @sizeOf(u64) * 4 + @sizeOf(u32)) return error.InvalidArtifactPayload;
+        const value = std.mem.readInt(u64, payload[pos..][0..8], .little);
+        pos += @sizeOf(u64);
+        break :blk value;
+    } else blk: {
+        if (header.flags.has_graph_generation or header.payload_len < @sizeOf(u64) * 3 + @sizeOf(u32)) return error.InvalidArtifactPayload;
+        break :blk 0;
+    };
     const weight = @as(f64, @bitCast(std.mem.readInt(u64, payload[pos..][0..8], .little)));
     pos += @sizeOf(u64);
     const created_at = std.mem.readInt(u64, payload[pos..][0..8], .little);
@@ -376,8 +389,6 @@ pub fn decodeHeader(data: []const u8) !Header {
     var pos: usize = magic.len;
     const version = std.mem.readInt(u16, data[pos..][0..2], .little);
     pos += @sizeOf(u16);
-    if (version != codec_version) return error.UnsupportedArtifactCodecVersion;
-
     const kind_raw = data[pos];
     pos += @sizeOf(u8);
     const kind: Kind = switch (kind_raw) {
@@ -388,6 +399,9 @@ pub fn decodeHeader(data: []const u8) !Header {
         @intFromEnum(Kind.graph_edge) => .graph_edge,
         else => return error.InvalidArtifactKind,
     };
+    if (version != codec_version and !(version == graph_edge_codec_version and kind == .graph_edge)) {
+        return error.UnsupportedArtifactCodecVersion;
+    }
 
     const flags: Flags = @bitCast(data[pos]);
     pos += @sizeOf(u8);
@@ -554,7 +568,7 @@ test "artifact codec encodes graph edge with version and source hash" {
     defer alloc.free(encoded);
 
     const header = try decodeHeader(encoded);
-    try std.testing.expectEqual(codec_version, header.version);
+    try std.testing.expectEqual(graph_edge_codec_version, header.version);
     try std.testing.expectEqual(Kind.graph_edge, header.kind);
     try std.testing.expect(header.flags.has_source_hash);
     try std.testing.expectEqual(hash, header.source_hash);
@@ -573,7 +587,7 @@ test "artifact codec binds portable graph edge generation exactly once" {
     const portable = try encodePortableUnboundGraphEdgeAlloc(alloc, 1.5, 10, 20, "{\"k\":1}");
     defer alloc.free(portable);
 
-    const bound = try bindPortableGraphEdgeGenerationAlloc(alloc, portable, 42);
+    const bound = try bindGraphEdgeGenerationAlloc(alloc, portable, 42);
     defer alloc.free(bound);
     try std.testing.expect(!isPortableUnboundGraphEdge(bound));
 
@@ -581,5 +595,32 @@ test "artifact codec binds portable graph edge generation exactly once" {
     defer decoded.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 42), decoded.generation);
     try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
-    try std.testing.expectError(error.GraphGenerationAlreadyBound, bindPortableGraphEdgeGenerationAlloc(alloc, bound, 43));
+    try std.testing.expectError(error.GraphGenerationAlreadyBound, bindGraphEdgeGenerationAlloc(alloc, bound, 43));
+}
+
+test "artifact codec reads and fences generation-less v1 graph edges" {
+    const alloc = std.testing.allocator;
+    const legacy =
+        "AFENRCH\x00" ++
+        "\x01\x00\x05\x00" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x23\x00\x00\x00" ++
+        "\x00\x00\x00\x00\x00\x00\xf8\x3f" ++
+        "\x0a\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x14\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x07\x00\x00\x00{\"k\":1}";
+
+    var decoded = try decodeGraphEdgeAlloc(alloc, legacy);
+    defer decoded.deinit(alloc);
+    try std.testing.expect(needsGraphGenerationBinding(legacy));
+    try std.testing.expectEqual(@as(u64, 0), decoded.generation);
+    try std.testing.expectEqual(@as(f64, 1.5), decoded.weight);
+    try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
+
+    const bound = try bindGraphEdgeGenerationAlloc(alloc, legacy, 42);
+    defer alloc.free(bound);
+    try std.testing.expect(!needsGraphGenerationBinding(bound));
+    var rebound = try decodeGraphEdgeAlloc(alloc, bound);
+    defer rebound.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 42), rebound.generation);
 }

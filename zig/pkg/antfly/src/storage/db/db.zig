@@ -41710,8 +41710,8 @@ fn collectGraphMutationsForArtifacts(
                     return err;
                 },
             };
-            const portable_unbound = enrichment_artifact_codec.isPortableUnboundGraphEdge(value);
-            if (decoded.generation != options.expected_generation and !portable_unbound) {
+            const generation_unbound = enrichment_artifact_codec.needsGraphGenerationBinding(value);
+            if (decoded.generation != options.expected_generation and !generation_unbound) {
                 decoded.deinit(alloc);
                 try deletes.append(alloc, .{
                     .index_name = try alloc.dupe(u8, parsed.index_name),
@@ -41721,8 +41721,8 @@ fn collectGraphMutationsForArtifacts(
                 });
                 continue;
             }
-            if (portable_unbound) {
-                const bound_value = try enrichment_artifact_codec.bindPortableGraphEdgeGenerationAlloc(
+            if (generation_unbound) {
+                const bound_value = try enrichment_artifact_codec.bindGraphEdgeGenerationAlloc(
                     alloc,
                     value,
                     options.expected_generation,
@@ -43040,13 +43040,13 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                     return .@"continue";
                 },
             };
-            const portable_unbound = enrichment_artifact_codec.isPortableUnboundGraphEdge(value);
-            if (decoded.generation != state.expected_generation and !portable_unbound) {
+            const generation_unbound = enrichment_artifact_codec.needsGraphGenerationBinding(value);
+            if (decoded.generation != state.expected_generation and !generation_unbound) {
                 decoded.deinit(state.ctx.alloc);
                 return .@"continue";
             }
-            if (portable_unbound) {
-                const bound_value = try enrichment_artifact_codec.bindPortableGraphEdgeGenerationAlloc(
+            if (generation_unbound) {
+                const bound_value = try enrichment_artifact_codec.bindGraphEdgeGenerationAlloc(
                     state.ctx.alloc,
                     value,
                     state.expected_generation,

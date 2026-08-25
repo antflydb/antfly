@@ -13,71 +13,73 @@ T = TypeVar("T", bound="GraphSourceArtifactStatus")
 
 @_attrs_define
 class GraphSourceArtifactStatus:
-    """Configured graph artifact source projected in deterministic precedence order. New servers always populate artifact;
-    it remains optional in the transition schema so new clients can read older servers. Deprecated aliases remain
-    populated for rolling client compatibility.
+    """Configured graph artifact source projected in deterministic precedence order. During the rolling transition,
+    identity is available as canonical artifact on new servers or deprecated name on older servers. New servers continue
+    emitting deprecated aliases for old clients, but new clients must not require them.
 
         Attributes:
-            name (str): Deprecated compatibility alias for artifact.
             path (str):
             format_ (GraphSourceArtifactStatusFormat):
-            materialization_pending (bool): Deprecated aggregate compatibility projection. This mirrors enclosing index
-                catch-up state and is not source-specific.
             artifact (str | Unset): Canonical artifact source identity. New servers always populate this field; clients may
                 fall back to the deprecated name alias when reading an older server.
+            name (str | Unset): Deprecated compatibility alias for artifact.
+            materialization_pending (bool | Unset): Deprecated aggregate compatibility projection. This mirrors enclosing
+                index catch-up state and is not source-specific.
     """
 
-    name: str
     path: str
     format_: GraphSourceArtifactStatusFormat
-    materialization_pending: bool
     artifact: str | Unset = UNSET
+    name: str | Unset = UNSET
+    materialization_pending: bool | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
-        name = self.name
-
         path = self.path
 
         format_ = self.format_.value
 
-        materialization_pending = self.materialization_pending
-
         artifact = self.artifact
+
+        name = self.name
+
+        materialization_pending = self.materialization_pending
 
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
             {
-                "name": name,
                 "path": path,
                 "format": format_,
-                "materialization_pending": materialization_pending,
             }
         )
         if artifact is not UNSET:
             field_dict["artifact"] = artifact
+        if name is not UNSET:
+            field_dict["name"] = name
+        if materialization_pending is not UNSET:
+            field_dict["materialization_pending"] = materialization_pending
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        name = d.pop("name")
-
         path = d.pop("path")
 
         format_ = GraphSourceArtifactStatusFormat(d.pop("format"))
 
-        materialization_pending = d.pop("materialization_pending")
-
         artifact = d.pop("artifact", UNSET)
 
+        name = d.pop("name", UNSET)
+
+        materialization_pending = d.pop("materialization_pending", UNSET)
+
         graph_source_artifact_status = cls(
-            name=name,
             path=path,
             format_=format_,
-            materialization_pending=materialization_pending,
             artifact=artifact,
+            name=name,
+            materialization_pending=materialization_pending,
         )
 
         return graph_source_artifact_status

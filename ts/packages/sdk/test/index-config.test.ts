@@ -29,7 +29,6 @@ describe("artifact embedding index configuration", () => {
       ],
       embedder: { provider: "antfly", model: "antflydb/clipclap" },
       dimension: 384,
-      vectorSpace: "searchaf:v1",
     });
 
     expect(config.sources).toEqual([
@@ -39,7 +38,6 @@ describe("artifact embedding index configuration", () => {
     expect(config.enrichments).toHaveLength(2);
     expect(config.enrichments?.[1]).toMatchObject({
       source_artifact_name: "document_chunks_v1",
-      vector_space: "searchaf:v1",
     });
     expect(config).not.toHaveProperty("embedding_name");
   });
@@ -74,7 +72,9 @@ describe("artifact embedding index configuration", () => {
   });
 
   it("rejects invalid graph source sets", () => {
-    expect(() => graphIndexSources({ artifact: "same" }, { artifact: "same" })).toThrow(/duplicate/);
+    expect(() => graphIndexSources({ artifact: "same" }, { artifact: "same" })).toThrow(
+      /duplicate/
+    );
     expect(() =>
       graphIndexSources({ artifact: "relations", edge: { weight: Number.NaN } })
     ).toThrow(/finite/);

@@ -244,7 +244,6 @@ func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	}
 
 	idx, err := NewArtifactEmbeddingIndexConfig("document_vectors", ArtifactEmbeddingIndexConfig{
-		VectorSpace: "docs:v1",
 		Sources: []ArtifactEmbeddingSource{{
 			ArtifactName:       "document_chunk_dense_v1",
 			SourceArtifactName: "document_chunks_v1",
@@ -304,8 +303,8 @@ func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	if enrichment["expected_dims"] != float64(768) {
 		t.Fatalf("enrichment expected_dims = %v, want 768", enrichment["expected_dims"])
 	}
-	if enrichment["vector_space"] != "docs:v1" {
-		t.Fatalf("enrichment vector_space = %v, want docs:v1", enrichment["vector_space"])
+	if _, exists := enrichment["vector_space"]; exists {
+		t.Fatalf("same-producer helper must not emit vector_space")
 	}
 }
 

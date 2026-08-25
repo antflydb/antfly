@@ -142,6 +142,8 @@ from .created_full_text_index_config import CreatedFullTextIndexConfig
 from .created_full_text_index_type import CreatedFullTextIndexType
 from .created_graph_artifact_producer_config import CreatedGraphArtifactProducerConfig
 from .created_graph_artifact_producer_config_kind import CreatedGraphArtifactProducerConfigKind
+from .created_graph_artifact_source_config import CreatedGraphArtifactSourceConfig
+from .created_graph_artifact_source_config_format import CreatedGraphArtifactSourceConfigFormat
 from .created_graph_index import CreatedGraphIndex
 from .created_graph_index_config import CreatedGraphIndexConfig
 from .created_graph_index_type import CreatedGraphIndexType
@@ -964,6 +966,8 @@ __all__ = (
     "CreatedFullTextIndexType",
     "CreatedGraphArtifactProducerConfig",
     "CreatedGraphArtifactProducerConfigKind",
+    "CreatedGraphArtifactSourceConfig",
+    "CreatedGraphArtifactSourceConfigFormat",
     "CreatedGraphIndex",
     "CreatedGraphIndexConfig",
     "CreatedGraphIndexType",
