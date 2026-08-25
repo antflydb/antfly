@@ -1453,7 +1453,7 @@ fn appendMinimalIndexRuntimeStatus(
 ) !void {
     try out.appendSlice(alloc, "{\"index_type\":");
     try appendJsonString(alloc, out, indexTypeName(index_type));
-    try out.appendSlice(alloc, ",\"readiness\":{\"state\":\"pending\",\"target_revision\":0,\"published_revision\":0,\"pending_reasons\":[\"runtime_unavailable\"]}}");
+    try out.appendSlice(alloc, ",\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"target_revision\":0,\"published_revision\":0,\"pending_reasons\":[\"runtime_unavailable\"]}}");
 }
 
 /// Collapse the durable repair state machine into the small vocabulary that is
@@ -2609,6 +2609,59 @@ test "complete partial embeddings coverage is ready after active generation proo
     try std.testing.expect(parsed.value.object.get("repair") == null);
 }
 
+test "progressive embeddings readiness exposes a queryable partial generation" {
+    const item = db_mod.types.DBIndexStats{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .replay_applied_sequence = 7,
+        .replay_target_sequence = 11,
+        .replay_catch_up_required = true,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 7,
+        .backfill_active = true,
+        .backfill_progress = 0.5,
+        .index_repair_status = .rebuilding,
+        .index_repair_active_generation_serviceable = true,
+    };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        item,
+        2,
+        .strict,
+        false,
+        42,
+        99,
+        null,
+        .{},
+        .{
+            .enabled = true,
+            .target_sequence = 11,
+            .applied_sequence = 7,
+        },
+        null,
+        null,
+        .{},
+        .{ .source = .live_writer_publish, .freshness = .fresh },
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"incarnation\":\"g-000000000000002a\",\"target_revision\":7,\"published_revision\":7},\"coverage\":{\"source_total\":2,\"covered\":1,\"complete\":false}}",
+        encoded.items,
+    );
+}
+
 test "repair-free embeddings aggregate retains live dense catch-up" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "thumbnail",
@@ -2631,8 +2684,8 @@ test "repair-free embeddings aggregate retains live dense catch-up" {
             .index_count = 1,
             .indexes = indexes[0..],
             // The table-level worker snapshot can lead the per-index replay
-            // overlay briefly. That fallback must fail closed for an ordinary
-            // aggregate even though no repair serviceability fact exists.
+            // overlay briefly. The already-published physical generation
+            // remains queryable while the later revision catches up.
             .async_indexing = .{ .dense_catch_up = .{
                 .active = true,
                 .phase = .replay,
@@ -2675,7 +2728,7 @@ test "repair-free embeddings aggregate retains live dense catch-up" {
     );
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"rebuilding\":true,\"backfill_active\":true,\"dense_replay_applied_sequence\":7,\"dense_replay_target_sequence\":11,\"replay_catch_up_required\":true,\"catch_up_phase\":\"replay\"}",
+        "{\"rebuilding\":true,\"backfill_active\":true,\"dense_replay_applied_sequence\":7,\"dense_replay_target_sequence\":11,\"replay_catch_up_required\":true,\"catch_up_phase\":\"replay\",\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false}}",
         encoded.items,
     );
 }
@@ -3840,6 +3893,7 @@ fn appendSingleIndexRuntimeStatus(
         replay_target_sequence,
         replay_catch_up_required,
         catch_up_active,
+        active_generation_serviceable,
     );
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
@@ -3864,6 +3918,7 @@ fn appendIndexReadinessStatus(
     replay_target_sequence: u64,
     replay_catch_up_required: bool,
     catch_up_active: bool,
+    active_generation_serviceable: bool,
 ) !void {
     const Item = @TypeOf(item);
     const observation_fresh = runtime_present and if (metadata) |md|
@@ -3890,9 +3945,26 @@ fn appendIndexReadinessStatus(
     const pending = !failed and (!observation_fresh or !topology_complete or !incarnation_current or
         backfill_active or repair_state != null or replay_catch_up_required or catch_up_active or
         publication_pending or coverage_pending);
+    const published_generation_has_results = index_type == .embeddings and repair_state == null and
+        if (@hasField(Item, "doc_count")) item.doc_count > 0 else false;
+    const queryable_partial = !failed and pending and index_type == .embeddings and
+        (active_generation_serviceable or published_generation_has_results) and
+        observation_fresh and topology_complete and incarnation_current;
+    const readiness_state = if (failed)
+        "failed"
+    else if (queryable_partial)
+        "queryable_partial"
+    else if (pending)
+        "pending"
+    else
+        "ready";
 
     try out.appendSlice(alloc, ",\"readiness\":{\"state\":");
-    try appendJsonString(alloc, out, if (failed) "failed" else if (pending) "pending" else "ready");
+    try appendJsonString(alloc, out, readiness_state);
+    try out.appendSlice(alloc, ",\"queryable\":");
+    try out.appendSlice(alloc, if (queryable_partial or !pending and !failed) "true" else "false");
+    try out.appendSlice(alloc, ",\"complete\":");
+    try out.appendSlice(alloc, if (!pending and !failed) "true" else "false");
     if (index_type == .embeddings and coverage_generation != 0) {
         const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
         defer alloc.free(incarnation);

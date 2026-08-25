@@ -99,7 +99,7 @@ fn parseRoute(iterator: std.process.Args.Iterator) Route {
             std.mem.eql(u8, arg, "--template") or std.mem.eql(u8, arg, "--embedder") or
             std.mem.eql(u8, arg, "--generator") or std.mem.eql(u8, arg, "--summarizer") or
             std.mem.eql(u8, arg, "--chunker") or std.mem.eql(u8, arg, "--dimension") or
-            std.mem.eql(u8, arg, "--coverage-policy"))
+            std.mem.eql(u8, arg, "--coverage-policy") or std.mem.eql(u8, arg, "--publication-policy"))
         {
             if (create_only_arg == null) create_only_arg = arg;
             _ = nextRouteValue(&args, arg, &route.missing_value_arg);
@@ -109,6 +109,8 @@ fn parseRoute(iterator: std.process.Args.Iterator) Route {
         } else if (std.mem.eql(u8, arg, "--timeout") or std.mem.eql(u8, arg, "--poll-interval")) {
             if (wait_only_arg == null) wait_only_arg = arg;
             _ = nextRouteValue(&args, arg, &route.missing_value_arg);
+        } else if (std.mem.eql(u8, arg, "--queryable") or std.mem.eql(u8, arg, "--complete")) {
+            if (wait_only_arg == null) wait_only_arg = arg;
         } else if (std.mem.eql(u8, arg, "create") or std.mem.eql(u8, arg, "drop") or
             std.mem.eql(u8, arg, "list") or std.mem.eql(u8, arg, "get") or std.mem.eql(u8, arg, "wait"))
         {
@@ -197,6 +199,7 @@ const IndexCreateConfigInput = struct {
     chunker_json: ?[]const u8 = null,
     dimension: ?i64 = null,
     coverage_policy: ?[]const u8 = null,
+    publication_policy: ?[]const u8 = null,
 };
 
 fn isValidJsonObject(allocator: std.mem.Allocator, raw: []const u8) !bool {
@@ -222,6 +225,9 @@ fn buildIndexCreateConfig(
     if (input.coverage_policy != null and !std.mem.eql(u8, input.index_type, "embeddings")) {
         return error.CoveragePolicyRequiresEmbeddingsIndex;
     }
+    if (input.publication_policy != null and !std.mem.eql(u8, input.index_type, "embeddings")) {
+        return error.PublicationPolicyRequiresEmbeddingsIndex;
+    }
     if (input.embedder_json) |raw| {
         if (!try isValidJsonObject(allocator, raw)) return error.InvalidEmbedderJson;
     }
@@ -244,6 +250,7 @@ fn buildIndexCreateConfig(
     if (input.chunker_json) |chunker| try writer.print(",\"chunker\":{s}", .{chunker});
     if (input.dimension) |dimension| try writer.print(",\"dimension\":{d}", .{dimension});
     if (input.coverage_policy) |policy| try writer.print(",\"coverage_policy\":{f}", .{std.json.fmt(policy, .{})});
+    if (input.publication_policy) |policy| try writer.print(",\"publication_policy\":{f}", .{std.json.fmt(policy, .{})});
     try writer.writeAll("}");
 
     return std.json.parseFromSlice(antfly_client.types.CreateIndexRequest, allocator, out.written(), .{
@@ -261,6 +268,7 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     var chunker_json: ?[]const u8 = null;
     var dimension: ?i64 = null;
     var coverage_policy: ?[]const u8 = null;
+    var publication_policy: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "create")) continue;
@@ -300,6 +308,13 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
                 cli.fatal("invalid --coverage-policy value: {s}; expected strict, partial, or best_effort", .{raw});
             }
             coverage_policy = raw;
+        } else if (std.mem.eql(u8, arg, "--publication-policy")) {
+            if (publication_policy != null) cli.fatal("--publication-policy may only be provided once", .{});
+            const raw = args.next() orelse cli.fatal("--publication-policy requires a value", .{});
+            if (!std.mem.eql(u8, raw, "progressive") and !std.mem.eql(u8, raw, "atomic")) {
+                cli.fatal("invalid --publication-policy value: {s}; expected progressive or atomic", .{raw});
+            }
+            publication_policy = raw;
         } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             _ = args.next() orelse cli.fatal("{s} requires a value", .{arg}); // already parsed
         } else {
@@ -312,6 +327,9 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     if (coverage_policy != null and !std.mem.eql(u8, index_type, "embeddings")) {
         cli.fatal("--coverage-policy is only valid for embeddings indexes", .{});
     }
+    if (publication_policy != null and !std.mem.eql(u8, index_type, "embeddings")) {
+        cli.fatal("--publication-policy is only valid for embeddings indexes", .{});
+    }
 
     var parsed = buildIndexCreateConfig(allocator, .{
         .index_type = index_type,
@@ -322,6 +340,7 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
         .chunker_json = chunker_json,
         .dimension = dimension,
         .coverage_policy = coverage_policy,
+        .publication_policy = publication_policy,
     }) catch |err| switch (err) {
         error.InvalidIndexType => cli.fatal("unsupported --type: {s}; expected full_text, embeddings, graph, or algebraic", .{index_type}),
         error.InvalidEmbedderJson => cli.fatal("--embedder must be a valid JSON object", .{}),
@@ -393,7 +412,7 @@ fn listIndexesMode(allocator: std.mem.Allocator, io: std.Io, client: *antfly_cli
     cli.expectHttpSuccess(resp);
     if (resp.data) |parsed| {
         if (output == .json) return cli.writeJson(allocator, io, parsed.value);
-        cli.writeStdout(io, "NAME\tTYPE\tSTATE\tPROGRESS\tINDEXED\tVISIBLE\n");
+        cli.writeStdout(io, "NAME\tTYPE\tSTATE\tPROGRESS\tSOURCE_COVERAGE\tINDEXED_ENTRIES\tVISIBLE_ENTRIES\n");
         for (parsed.value) |index| try writeIndexSummary(allocator, io, index);
     }
 }
@@ -428,9 +447,12 @@ fn getIndexByName(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
 const IndexSummary = struct {
     state: []const u8,
     progress: ?f64,
+    source_covered: ?i64 = null,
+    source_total: ?i64 = null,
     indexed: ?i64,
     visible: ?i64,
     ready: bool,
+    queryable: bool = false,
     failed: bool,
 };
 
@@ -479,6 +501,14 @@ fn summarizeStats(stats: anytype) IndexSummary {
     else
         "unknown";
     const progress: ?f64 = if (@hasField(Stats, "backfill_progress")) stats.backfill_progress else null;
+    const source_covered: ?i64 = if (@hasField(Stats, "coverage")) blk: {
+        const coverage = stats.coverage orelse break :blk null;
+        break :blk coverage.covered;
+    } else null;
+    const source_total: ?i64 = if (@hasField(Stats, "coverage")) blk: {
+        const coverage = stats.coverage orelse break :blk null;
+        break :blk coverage.source_total;
+    } else null;
     const indexed: ?i64 = if (@hasField(Stats, "total_indexed"))
         stats.total_indexed
     else if (@hasField(Stats, "doc_count"))
@@ -498,6 +528,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
     else
         !readiness_pending and !coverage_incomplete and (std.mem.eql(u8, state, "ready") or
             (reported_state == null and rebuilding == false and error_text == null and !config_mismatch));
+    const queryable = if (readiness) |value| value.queryable else ready;
     const failed = if (readiness) |value|
         value.state == .failed
     else
@@ -505,9 +536,12 @@ fn summarizeStats(stats: anytype) IndexSummary {
     return .{
         .state = state,
         .progress = progress,
+        .source_covered = source_covered,
+        .source_total = source_total,
         .indexed = indexed,
         .visible = visible,
         .ready = ready,
+        .queryable = queryable,
         .failed = failed,
     };
 }
@@ -532,15 +566,19 @@ fn printWaitProgress(index_name: []const u8, summary: IndexSummary) void {
     if (summary.progress) |progress| {
         std.debug.print(" {d:.1}%", .{@max(0.0, @min(1.0, progress)) * 100.0});
     }
-    if (summary.indexed) |indexed| std.debug.print(" indexed={d}", .{indexed});
-    if (summary.visible) |visible| std.debug.print(" visible={d}", .{visible});
+    if (summary.source_covered) |covered| {
+        if (summary.source_total) |total| std.debug.print(" source_coverage={d}/{d}", .{ covered, total });
+    }
+    if (summary.indexed) |indexed| std.debug.print(" indexed_entries={d}", .{indexed});
+    if (summary.visible) |visible| std.debug.print(" visible_entries={d}", .{visible});
     std.debug.print("\n", .{});
 }
 
+const WaitTarget = enum { complete, queryable };
 const WaitDisposition = enum { ready, waiting, failed };
 
-fn waitDisposition(summary: IndexSummary) WaitDisposition {
-    if (summary.ready) return .ready;
+fn waitDisposition(summary: IndexSummary, target: WaitTarget) WaitDisposition {
+    if (summary.ready or target == .queryable and summary.queryable) return .ready;
     if (summary.failed) return .failed;
     return .waiting;
 }
@@ -553,6 +591,16 @@ fn writeIndexSummary(allocator: std.mem.Allocator, io: std.Io, index: antfly_cli
     try writer.print("{s}\t{s}\t{s}\t", .{ index.config.name, @tagName(index.config.type), summary.state });
     if (summary.progress) |progress| {
         try writer.print("{d:.1}%", .{@max(0.0, @min(1.0, progress)) * 100.0});
+    } else {
+        try writer.writeAll("-");
+    }
+    try writer.writeAll("\t");
+    if (summary.source_covered) |covered| {
+        if (summary.source_total) |total| {
+            try writer.print("{d}/{d}", .{ covered, total });
+        } else {
+            try writer.print("{d}/?", .{covered});
+        }
     } else {
         try writer.writeAll("-");
     }
@@ -577,6 +625,8 @@ fn waitForIndex(
     var poll_ms = default_wait_poll_ms;
     var timeout_set = false;
     var poll_set = false;
+    var target: WaitTarget = .complete;
+    var target_set = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "wait")) continue;
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
@@ -595,6 +645,10 @@ fn waitForIndex(
             const raw = args.next() orelse cli.fatal("--poll-interval requires a duration", .{});
             poll_ms = parseDurationMs(raw) catch cli.fatal("invalid --poll-interval duration: {s}", .{raw});
             poll_set = true;
+        } else if (std.mem.eql(u8, arg, "--queryable") or std.mem.eql(u8, arg, "--complete")) {
+            if (target_set) cli.fatal("--queryable and --complete are mutually exclusive", .{});
+            target = if (std.mem.eql(u8, arg, "--queryable")) .queryable else .complete;
+            target_set = true;
         } else {
             cli.fatal("unknown index wait option: {s}", .{arg});
         }
@@ -610,6 +664,7 @@ fn waitForIndex(
         name,
         timeout_ms,
         poll_ms,
+        target,
     );
     switch (outcome) {
         .ready => {},
@@ -672,6 +727,7 @@ fn waitForIndexWithFetcher(
     name: []const u8,
     timeout_ms: u64,
     poll_ms: u64,
+    target: WaitTarget,
 ) !WaitOutcome {
     const started_ns = clock.now();
     const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
@@ -718,7 +774,7 @@ fn waitForIndexWithFetcher(
         consecutive_failures = 0;
         if (resp.data) |parsed| {
             const summary = summarizeIndex(parsed.value);
-            switch (waitDisposition(summary)) {
+            switch (waitDisposition(summary, target)) {
                 .ready => {
                     consecutive_ready +|= 1;
                     if (consecutive_ready >= ready_confirmation_observations) {
@@ -884,6 +940,7 @@ test "index create config preserves dimension escaping and summarizer" {
         .embedder_json = "{\"provider\":\"openai\",\"model\":\"embed\"}",
         .summarizer_json = "{\"provider\":\"openai\",\"model\":\"summary\"}",
         .coverage_policy = "partial",
+        .publication_policy = "atomic",
     });
     defer parsed.deinit();
 
@@ -896,6 +953,7 @@ test "index create config preserves dimension escaping and summarizer" {
     try std.testing.expectEqualStrings("{{title}}\n{{body}}", config.template.?);
     try std.testing.expectEqualStrings("summary", config.summarizer.?.model.?);
     try std.testing.expectEqual(antfly_client.types.DerivedCoveragePolicy.partial, config.coverage_policy.?);
+    try std.testing.expectEqual(antfly_client.types.IndexPublicationPolicy.atomic, config.publication_policy.?);
 }
 
 test "index create config rejects malformed nested JSON and unknown types" {
@@ -1022,6 +1080,8 @@ test "index wait prefers authoritative readiness contract" {
         .backfill_state = "ready",
         .readiness = .{
             .state = .pending,
+            .queryable = false,
+            .complete = false,
             .incarnation = "g-000000000000002a",
             .target_revision = 11,
             .published_revision = 10,
@@ -1036,9 +1096,31 @@ test "index wait prefers authoritative readiness contract" {
         .index_type = .embeddings,
         .rebuilding = true,
         .backfill_state = "running",
+        .readiness = .{
+            .state = .queryable_partial,
+            .queryable = true,
+            .complete = false,
+            .incarnation = "g-000000000000002a",
+            .target_revision = 11,
+            .published_revision = 7,
+            .pending_reasons = &.{ "coverage", "publication" },
+        },
+    });
+    try std.testing.expectEqualStrings("queryable_partial", summary.state);
+    try std.testing.expect(summary.queryable);
+    try std.testing.expect(!summary.ready);
+    try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, .complete));
+    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, .queryable));
+
+    summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = true,
+        .backfill_state = "running",
         .dense_publish_pending = true,
         .readiness = .{
             .state = .ready,
+            .queryable = true,
+            .complete = true,
             .incarnation = "g-000000000000002a",
             .target_revision = 11,
             .published_revision = 11,
@@ -1054,6 +1136,8 @@ test "index wait prefers authoritative readiness contract" {
         .backfill_state = "degraded",
         .readiness = .{
             .state = .failed,
+            .queryable = false,
+            .complete = false,
             .incarnation = "g-000000000000002a",
             .target_revision = 11,
             .published_revision = 11,
@@ -1063,7 +1147,7 @@ test "index wait prefers authoritative readiness contract" {
     try std.testing.expectEqualStrings("failed", summary.state);
     try std.testing.expect(!summary.ready);
     try std.testing.expect(summary.failed);
-    try std.testing.expectEqual(WaitDisposition.failed, waitDisposition(summary));
+    try std.testing.expectEqual(WaitDisposition.failed, waitDisposition(summary, .complete));
 }
 
 test "index wait progress reporting is immediate periodic and state sensitive" {
@@ -1083,7 +1167,7 @@ test "index wait disposition retries mismatch and fails only terminal states" {
         .visible = 0,
         .ready = false,
         .failed = false,
-    }));
+    }, .complete));
     try std.testing.expectEqual(WaitDisposition.failed, waitDisposition(.{
         .state = "degraded",
         .progress = 1,
@@ -1091,7 +1175,7 @@ test "index wait disposition retries mismatch and fails only terminal states" {
         .visible = 10,
         .ready = false,
         .failed = true,
-    }));
+    }, .complete));
     try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(.{
         .state = "ready",
         .progress = 1,
@@ -1099,7 +1183,7 @@ test "index wait disposition retries mismatch and fails only terminal states" {
         .visible = 10,
         .ready = true,
         .failed = false,
-    }));
+    }, .complete));
 }
 
 fn fakeExternalIndexStatusResponse(
@@ -1164,6 +1248,7 @@ test "index wait retries bounded HTTP and transport failures" {
         "external_idx",
         1000,
         1,
+        .complete,
     );
     try std.testing.expect(outcome == .ready);
     try std.testing.expectEqual(@as(usize, 3 + ready_confirmation_observations), fake.calls);
@@ -1201,6 +1286,7 @@ test "index wait rejects a transient ready snapshot" {
         "external_idx",
         2000,
         1,
+        .complete,
     );
     try std.testing.expect(outcome == .ready);
     // The late ready -> running edge must reset the full stability window.
@@ -1240,6 +1326,7 @@ test "index wait deadline rejects a response that arrives late" {
         "external_idx",
         1,
         1,
+        .complete,
     );
     try std.testing.expect(outcome == .timed_out);
     try std.testing.expectEqualStrings("unknown", outcome.timed_out);
@@ -1287,6 +1374,7 @@ test "index wait does not fetch after its deadline" {
         "external_idx",
         1,
         1,
+        .complete,
     );
     try std.testing.expect(outcome == .timed_out);
     try std.testing.expectEqualStrings("running", outcome.timed_out);
