@@ -19,6 +19,7 @@ package sdk
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -29,7 +30,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
@@ -740,7 +740,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventStepStarted:
 			if opt.OnStepStarted != nil {
 				var d SSEStepStarted
-				if json.UnmarshalString(data, &d) == nil {
+				if json.Unmarshal([]byte(data), &d) == nil {
 					if err := opt.OnStepStarted(&d); err != nil {
 						return nil, fmt.Errorf("step_started callback: %w", err)
 					}
@@ -749,7 +749,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventStepProgress:
 			if opt.OnStepProgress != nil {
 				var d map[string]any
-				if json.UnmarshalString(data, &d) == nil {
+				if json.Unmarshal([]byte(data), &d) == nil {
 					if err := opt.OnStepProgress(d); err != nil {
 						return nil, fmt.Errorf("step_progress callback: %w", err)
 					}
@@ -758,7 +758,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventStepCompleted:
 			if opt.OnStepCompleted != nil {
 				var step AgentStep
-				if json.UnmarshalString(data, &step) == nil {
+				if json.Unmarshal([]byte(data), &step) == nil {
 					if err := opt.OnStepCompleted(&step); err != nil {
 						return nil, fmt.Errorf("step_completed callback: %w", err)
 					}
@@ -767,7 +767,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventClassification:
 			if opt.OnClassification != nil {
 				var d ClassificationTransformationResult
-				if json.UnmarshalString(data, &d) == nil {
+				if json.Unmarshal([]byte(data), &d) == nil {
 					if err := opt.OnClassification(&d); err != nil {
 						return nil, fmt.Errorf("classification callback: %w", err)
 					}
@@ -776,7 +776,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventReasoning:
 			if opt.OnReasoning != nil {
 				var chunk string
-				if json.UnmarshalString(data, &chunk) == nil {
+				if json.Unmarshal([]byte(data), &chunk) == nil {
 					if err := opt.OnReasoning(chunk); err != nil {
 						return nil, fmt.Errorf("reasoning callback: %w", err)
 					}
@@ -785,7 +785,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventGeneration:
 			if opt.OnGeneration != nil {
 				var chunk string
-				if json.UnmarshalString(data, &chunk) == nil {
+				if json.Unmarshal([]byte(data), &chunk) == nil {
 					if err := opt.OnGeneration(chunk); err != nil {
 						return nil, fmt.Errorf("generation callback: %w", err)
 					}
@@ -794,7 +794,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventFollowup:
 			if opt.OnFollowup != nil {
 				var question string
-				if json.UnmarshalString(data, &question) == nil {
+				if json.Unmarshal([]byte(data), &question) == nil {
 					if err := opt.OnFollowup(question); err != nil {
 						return nil, fmt.Errorf("followup callback: %w", err)
 					}
@@ -803,7 +803,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventHit:
 			if opt.OnHit != nil {
 				var hitData Hit
-				if json.UnmarshalString(data, &hitData) == nil {
+				if json.Unmarshal([]byte(data), &hitData) == nil {
 					if err := opt.OnHit(&hitData); err != nil {
 						return nil, fmt.Errorf("hit callback: %w", err)
 					}
@@ -815,7 +815,7 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 					Mode       string `json:"mode"`
 					ToolsCount int    `json:"tools_count"`
 				}
-				if json.UnmarshalString(data, &d) == nil {
+				if json.Unmarshal([]byte(data), &d) == nil {
 					if err := opt.OnToolMode(d.Mode, d.ToolsCount); err != nil {
 						return nil, fmt.Errorf("tool_mode callback: %w", err)
 					}
@@ -824,17 +824,17 @@ func (c *AntflyClient) RetrievalAgent(ctx context.Context, req RetrievalAgentReq
 		case oapi.SSEEventEval:
 			if opt.OnEval != nil {
 				var d map[string]any
-				if json.UnmarshalString(data, &d) == nil {
+				if json.Unmarshal([]byte(data), &d) == nil {
 					if err := opt.OnEval(d); err != nil {
 						return nil, fmt.Errorf("eval callback: %w", err)
 					}
 				}
 			}
 		case oapi.SSEEventDone:
-			_ = json.UnmarshalString(data, result)
+			_ = json.Unmarshal([]byte(data), result)
 		case oapi.SSEEventError:
 			var agentErr RetrievalAgentError
-			if json.UnmarshalString(data, &agentErr) != nil {
+			if json.Unmarshal([]byte(data), &agentErr) != nil {
 				agentErr = RetrievalAgentError{Error: data}
 			}
 			if opt.OnError != nil {
