@@ -480,11 +480,13 @@ label.
 The index-level embedder is registered under every source artifact name, while
 each enrichment owns its source field or upstream chunk stream. Sources may mix
 embeddings produced directly from primary documents with embeddings produced
-from chunk artifacts. Query result shaping uses each member's artifact identity,
-so document return modes collapse chunk members to their parent while retaining
-direct document members in the same score-ordered result. `sources` cannot be
-combined with `external`, `field`, `template`, `chunker`, or the supported
-single-source artifact convenience forms.
+from chunk artifacts. Parent-level query results use each member's artifact
+identity to collapse chunk members to their parent while retaining direct
+document members in the same score-ordered result. Hierarchy-specific return
+modes (`chunk`, `parent_with_chunks`, `unit`, and `unit_with_chunks`) require a
+homogeneous source level and are rejected for mixed document/chunk indexes.
+`sources` cannot be combined with `external`, `field`, `template`, `chunker`, or
+the supported single-source artifact convenience forms.
 
 Embedder batching belongs on the matching embedding enrichment (or the shared
 index-level execution policy when the public shorthand is used).

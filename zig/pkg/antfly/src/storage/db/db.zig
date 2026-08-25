@@ -45166,6 +45166,28 @@ test "db vector indexes combine direct document and chunk-backed artifact source
     }
     try std.testing.expect(dense_has_direct and dense_has_chunk);
 
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .index_name = "mixed_dense",
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
+        .limit = 2,
+        .search_effort = 1.0,
+        .return_mode = .chunk,
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .index_name = "mixed_dense",
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
+        .limit = 2,
+        .search_effort = 1.0,
+        .return_mode = .unit,
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .index_name = "mixed_dense",
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
+        .limit = 2,
+        .search_effort = 1.0,
+        .return_mode = .parent_with_chunks,
+    }));
+
     var sparse = try db.search(alloc, .{
         .index_name = "mixed_sparse",
         .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 2 } },
@@ -45181,6 +45203,13 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         sparse_has_chunk = sparse_has_chunk or std.mem.eql(u8, hit.id, "doc:chunk");
     }
     try std.testing.expect(sparse_has_direct and sparse_has_chunk);
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .index_name = "mixed_sparse",
+        .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 2 } },
+        .limit = 2,
+        .search_effort = 1.0,
+        .return_mode = .unit_with_chunks,
+    }));
 }
 
 fn expectDenseEmbeddingArtifactValue(alloc: Allocator, value: []const u8, source_hash: ?u64, dims: usize) !void {

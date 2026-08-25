@@ -1685,8 +1685,12 @@ pub const IndexManager = struct {
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
         /// Terminal embedding artifact streams unioned into this index. This
-        /// is mutually exclusive with the legacy single `embedding_name`.
+        /// is mutually exclusive with the single-source `embedding_name` form.
         embedding_names: [][]u8 = &.{},
+        /// True when the union contains both document-level and artifact-level
+        /// members. Parent-level results are well-defined for this shape, while
+        /// hierarchy-specific result modes require a homogeneous source level.
+        heterogeneous_source_levels: bool = false,
         index: hbc_mod.HBCIndex,
         vector_loader_context: ?*DenseVectorLoadContext = null,
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,
@@ -2040,6 +2044,7 @@ pub const IndexManager = struct {
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
         embedding_names: [][]u8 = &.{},
+        heterogeneous_source_levels: bool = false,
         rebuild_root_path: []u8,
         index: sparse_mod.SparseIndex,
     };
@@ -5920,6 +5925,12 @@ pub const IndexManager = struct {
                 generator.deinit(self.alloc);
                 return true;
             }
+            if (entry.embedding_name) |embedding_name| {
+                if (self.getEnrichmentExcluding(.embedding, embedding_name, excluded_enrichment) != null) return true;
+            }
+            for (entry.embedding_names) |embedding_name| {
+                if (self.getEnrichmentExcluding(.embedding, embedding_name, excluded_enrichment) != null) return true;
+            }
         }
         for (self.text_indexes.items) |entry| {
             if (excluded_index_name) |index_name| {
@@ -5932,6 +5943,15 @@ pub const IndexManager = struct {
             for (entry.source_artifact_names) |artifact_name| {
                 if (self.getEnrichmentExcluding(.chunk, artifact_name, excluded_enrichment) != null or
                     self.getEnrichmentExcluding(.asset, artifact_name, excluded_enrichment) != null) return true;
+            }
+        }
+        for (self.graph_indexes.items) |entry| {
+            if (excluded_index_name) |index_name| {
+                if (std.mem.eql(u8, entry.config.name, index_name)) continue;
+            }
+            for (entry.artifact_sources) |source| {
+                if (self.getEnrichmentExcluding(.chunk, source.artifact_name, excluded_enrichment) != null or
+                    self.getEnrichmentExcluding(.asset, source.artifact_name, excluded_enrichment) != null) return true;
             }
         }
         for (self.enrichments.items) |entry| {
@@ -7187,6 +7207,7 @@ pub const IndexManager = struct {
             if (entry.chunk_name) |configured| {
                 if (std.mem.eql(u8, configured, chunk_name)) return true;
             }
+            if (containsOwnedString(entry.source_artifact_names, chunk_name)) return true;
         }
         for (self.dense_indexes.items) |entry| {
             if (std.mem.eql(u8, entry.config.name, exclude_index_name)) continue;
@@ -7198,6 +7219,12 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, entry.config.name, exclude_index_name)) continue;
             if (entry.chunk_name) |configured| {
                 if (std.mem.eql(u8, configured, chunk_name)) return true;
+            }
+        }
+        for (self.graph_indexes.items) |entry| {
+            if (std.mem.eql(u8, entry.config.name, exclude_index_name)) continue;
+            for (entry.artifact_sources) |source| {
+                if (std.mem.eql(u8, source.artifact_name, chunk_name)) return true;
             }
         }
         for (self.enrichments.items) |entry| {
@@ -7324,18 +7351,46 @@ pub const IndexManager = struct {
         if (self.chunkArtifactsReferencedElsewhere(exclude_index_name, chunk_name)) return true;
         for (self.status_only_index_configs) |cfg| {
             if (std.mem.eql(u8, cfg.name, exclude_index_name)) continue;
-            var refs = self.artifactRefsFromConfig(cfg) catch |err| {
-                std.log.warn("status-only chunk artifact reference check skipped name={s} kind={s} err={s}", .{
-                    cfg.name,
-                    @tagName(cfg.kind),
-                    @errorName(err),
-                });
-                return true;
-            };
-            defer refs.deinit(self.alloc);
-            if (refs.chunk_name) |configured| {
-                if (std.mem.eql(u8, configured, chunk_name)) return true;
-            }
+            if (try self.statusOnlyConfigReferencesChunkArtifact(cfg, chunk_name)) return true;
+        }
+        return false;
+    }
+
+    fn statusOnlyConfigReferencesChunkArtifact(self: *IndexManager, cfg: types.IndexConfig, chunk_name: []const u8) !bool {
+        switch (cfg.kind) {
+            .full_text => {
+                const text_cfg = try parseTextConfig(self.alloc, cfg.config_json);
+                defer text_cfg.deinit(self.alloc);
+                if (text_cfg.source_artifact_name) |configured| {
+                    if (std.mem.eql(u8, configured, chunk_name)) return true;
+                }
+                return containsOwnedString(text_cfg.source_artifact_names, chunk_name);
+            },
+            .graph => {
+                var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
+                defer graph_cfg.deinit(self.alloc);
+                for (graph_cfg.artifact_sources) |source| {
+                    if (std.mem.eql(u8, source.artifact_name, chunk_name)) return true;
+                }
+                return false;
+            },
+            else => {},
+        }
+
+        // The single-source vector forms already normalize their generated
+        // chunk reference through ArtifactRefs. Multi-source vector consumers
+        // are protected by their retained embedding enrichment configurations.
+        var refs = self.artifactRefsFromConfig(cfg) catch |err| {
+            std.log.warn("status-only chunk artifact reference check skipped name={s} kind={s} err={s}", .{
+                cfg.name,
+                @tagName(cfg.kind),
+                @errorName(err),
+            });
+            return true;
+        };
+        defer refs.deinit(self.alloc);
+        if (refs.chunk_name) |configured| {
+            return std.mem.eql(u8, configured, chunk_name);
         }
         return false;
     }
@@ -8160,7 +8215,7 @@ pub const IndexManager = struct {
                 }
             } else if (containsOwnedString(entry.source_artifact_names, chunk_name)) {
                 try names.append(alloc, try alloc.dupe(u8, entry.config.name));
-            } else if (include_default_full_text) {
+            } else if (entry.source_artifact_names.len == 0 and include_default_full_text) {
                 try names.append(alloc, try alloc.dupe(u8, entry.config.name));
             }
         }
@@ -10926,6 +10981,8 @@ pub const IndexManager = struct {
                     }
                 }
                 var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
+                var multi_source_has_document_level = false;
+                var multi_source_has_artifact_level = false;
                 var multi_source_vector_space: ?[]const u8 = null;
                 var multi_source_has_implicit_vector_space = false;
                 var multi_source_implicit_producer: ?[]const u8 = null;
@@ -10951,6 +11008,11 @@ pub const IndexManager = struct {
                     }
                     if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
                         first_multi_source_embedding = embedding_cfg;
+                    }
+                    if (embedding_cfg.source_artifact_name.len > 0) {
+                        multi_source_has_artifact_level = true;
+                    } else {
+                        multi_source_has_document_level = true;
                     }
                 }
                 // Compatibility is either fully automatic (all vector_space
@@ -11050,6 +11112,7 @@ pub const IndexManager = struct {
                     else
                         null,
                     .embedding_names = try cloneOwnedStrings(self.alloc, dense_cfg.embedding_names),
+                    .heterogeneous_source_levels = multi_source_has_document_level and multi_source_has_artifact_level,
                     .index = index,
                     .vector_loader_context = vector_loader_context,
                 };
@@ -11085,6 +11148,8 @@ pub const IndexManager = struct {
                 else
                     null;
                 var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
+                var multi_source_has_document_level = false;
+                var multi_source_has_artifact_level = false;
                 var multi_source_vector_space: ?[]const u8 = null;
                 var multi_source_has_implicit_vector_space = false;
                 var multi_source_implicit_producer: ?[]const u8 = null;
@@ -11110,6 +11175,11 @@ pub const IndexManager = struct {
                     }
                     if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
                         first_multi_source_embedding = embedding_cfg;
+                    }
+                    if (embedding_cfg.source_artifact_name.len > 0) {
+                        multi_source_has_artifact_level = true;
+                    } else {
+                        multi_source_has_document_level = true;
                     }
                 }
                 if (multi_source_has_implicit_vector_space and multi_source_vector_space != null) return error.InvalidIndexConfig;
@@ -11159,6 +11229,7 @@ pub const IndexManager = struct {
                             try self.alloc.dupe(u8, cfg.name);
                     } else try self.alloc.dupe(u8, cfg.name),
                     .embedding_names = try cloneOwnedStrings(self.alloc, sparse_cfg.embedding_names),
+                    .heterogeneous_source_levels = multi_source_has_document_level and multi_source_has_artifact_level,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
                 };
@@ -22139,6 +22210,134 @@ test "shorthand chunk and embedding enrichment compatibility includes source_tem
         .source_artifact_name = "body_chunks",
         .expected_dims = 384,
     }));
+}
+
+test "generated target cache detects sparse and graph artifact consumers independently" {
+    const alloc = std.testing.allocator;
+
+    {
+        var path_buf: [256]u8 = undefined;
+        const path = indexManagerTmpPathWithSuffix(&path_buf, "sparse-artifact-target-cache");
+        defer cleanupIndexManagerDir(path);
+        var store = try docstore_mod.DocStore.open(alloc, path, .{});
+        defer store.close();
+        var manager = try IndexManager.init(alloc, std.mem.span(path));
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+
+        try std.testing.expect(try manager.ensureEmbeddingEnrichment(.{
+            .name = "sparse_terms_v1",
+            .kind = .embedding,
+            .source_field = "title",
+            .vector_space = "test:sparse-terms-v1",
+        }));
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "sparse_union",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"sparse_terms_v1\"}]}",
+        }});
+        try std.testing.expect(manager.hasGeneratedEnrichmentTargets());
+        try std.testing.expect(!try manager.computeGeneratedEnrichmentTargetCacheExcluding("sparse_union", null));
+    }
+
+    {
+        var path_buf: [256]u8 = undefined;
+        const path = indexManagerTmpPathWithSuffix(&path_buf, "graph-artifact-target-cache");
+        defer cleanupIndexManagerDir(path);
+        var store = try docstore_mod.DocStore.open(alloc, path, .{});
+        defer store.close();
+        var manager = try IndexManager.init(alloc, std.mem.span(path));
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+
+        try std.testing.expect(try manager.ensureChunkEnrichment(.{
+            .name = "graph_chunks",
+            .kind = .chunk,
+            .source_field = "relations",
+            .chunk_size = 64,
+        }));
+        try manager.addAllNoBackfill(&store, &.{.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = "{\"sources\":[{\"artifact\":\"graph_chunks\",\"format\":\"extraction_relation\"}]}",
+        }});
+        try std.testing.expect(manager.hasGeneratedEnrichmentTargets());
+        try std.testing.expect(!try manager.computeGeneratedEnrichmentTargetCacheExcluding("relations_graph", null));
+    }
+}
+
+test "multi-source consumers participate in generation routing and preserve source isolation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "multi-source-routing");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    for ([_]enrichment_catalog.EnrichmentConfig{
+        .{ .name = "text_chunks", .kind = .chunk, .source_field = "body", .chunk_size = 64 },
+        .{ .name = "graph_chunks", .kind = .chunk, .source_field = "relations", .chunk_size = 64 },
+        .{ .name = "unrelated_chunks", .kind = .chunk, .source_field = "notes", .chunk_size = 64, .full_text_index = true },
+    }) |cfg| try std.testing.expect(try manager.ensureChunkEnrichment(cfg));
+    try std.testing.expect(try manager.ensureEmbeddingEnrichment(.{
+        .name = "sparse_terms_v1",
+        .kind = .embedding,
+        .source_field = "title",
+        .vector_space = "test:sparse-terms-v1",
+    }));
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "sparse_union",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"sparse_terms_v1\"}]}",
+        },
+        .{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = "{\"sources\":[{\"artifact\":\"graph_chunks\",\"format\":\"extraction_relation\"}]}",
+        },
+        .{
+            .name = "selected_text",
+            .kind = .full_text,
+            .config_json = "{\"sources\":[{\"artifact\":\"text_chunks\"}]}",
+        },
+        .{
+            .name = "default_text",
+            .kind = .full_text,
+            .config_json = "{}",
+        },
+    });
+
+    try std.testing.expect(manager.hasGeneratedEnrichmentTargets());
+    try std.testing.expect(try manager.computeGeneratedEnrichmentTargetCacheExcluding("sparse_union", null));
+    try std.testing.expect(try manager.computeGeneratedEnrichmentTargetCacheExcluding("relations_graph", null));
+
+    const unrelated_targets = try manager.textIndexesForChunk(alloc, "unrelated_chunks", true);
+    defer {
+        for (unrelated_targets) |name| alloc.free(name);
+        alloc.free(unrelated_targets);
+    }
+    try std.testing.expectEqual(@as(usize, 1), unrelated_targets.len);
+    try std.testing.expectEqualStrings("default_text", unrelated_targets[0]);
+
+    try std.testing.expect(manager.chunkArtifactsReferencedElsewhere("producer", "text_chunks"));
+    try std.testing.expect(manager.chunkArtifactsReferencedElsewhere("producer", "graph_chunks"));
+    try std.testing.expect(try manager.statusOnlyConfigReferencesChunkArtifact(.{
+        .name = "quarantined_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"text_chunks\"}]}",
+    }, "text_chunks"));
+    try std.testing.expect(try manager.statusOnlyConfigReferencesChunkArtifact(.{
+        .name = "quarantined_graph",
+        .kind = .graph,
+        .config_json = "{\"sources\":[{\"artifact\":\"graph_chunks\",\"format\":\"extraction_relation\"}]}",
+    }, "graph_chunks"));
 }
 
 test "asset registration validates document extraction OCR config" {

@@ -13003,6 +13003,9 @@ fn searchDenseInternal(
     const index_lookup_start = total_start;
     const entry = (try executor.dense_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
     profile.index_lookup_ns = platform_time.monotonicNs() - index_lookup_start;
+    if (entry.heterogeneous_source_levels and req.return_mode != .parent) {
+        return error.UnsupportedQueryRequest;
+    }
 
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
@@ -14730,6 +14733,9 @@ pub fn searchSparse(
     var page_ns: u64 = 0;
     var projected_source_profile = ProjectedSourceLoadProfile{};
     const entry = (try executor.sparse_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
+    if (entry.heterogeneous_source_levels and req.return_mode != .parent) {
+        return error.UnsupportedQueryRequest;
+    }
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
     const multi_source_members = entry.embedding_names.len > 0;
