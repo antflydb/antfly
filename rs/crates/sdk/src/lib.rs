@@ -434,13 +434,10 @@ impl Default for types::CreateGraphIndexRequest {
         Self {
             algebraic_planning: None,
             artifact: None,
-            context: None,
             description: None,
-            edge: None,
             edge_types: Vec::new(),
             enrichments: Vec::new(),
             max_edges_per_document: None,
-            nodes: None,
             resolvers: Vec::new(),
             source: None,
             sources: None,

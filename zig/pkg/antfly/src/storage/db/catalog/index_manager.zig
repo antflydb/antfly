@@ -5035,6 +5035,31 @@ pub const IndexManager = struct {
         return false;
     }
 
+    fn embeddingRefsContainName(refs: ArtifactRefs, candidate: []const u8) bool {
+        if (refs.embedding_name) |embedding_name| {
+            if (std.mem.eql(u8, embedding_name, candidate)) return true;
+        }
+        for (refs.embedding_names) |embedding_name| {
+            if (std.mem.eql(u8, embedding_name, candidate)) return true;
+        }
+        return false;
+    }
+
+    fn cleanupRecordConflictsWithEmbeddingRefs(record: GeneratedArtifactCleanupRecord, refs: ArtifactRefs) bool {
+        if (record.embedding_name) |embedding_name| {
+            if (embeddingRefsContainName(refs, embedding_name)) return true;
+        }
+        var offset: usize = 0;
+        for (0..record.embedding_name_count) |_| {
+            const value_len: usize = std.mem.readInt(u32, record.embedding_names_payload[offset..][0..4], .little);
+            offset += @sizeOf(u32);
+            const embedding_name = record.embedding_names_payload[offset .. offset + value_len];
+            offset += value_len;
+            if (embeddingRefsContainName(refs, embedding_name)) return true;
+        }
+        return false;
+    }
+
     fn prepareGeneratedArtifactCleanupPlan(
         self: *IndexManager,
         name: []const u8,
@@ -5395,7 +5420,7 @@ pub const IndexManager = struct {
                 const record = try decodeGeneratedArtifactCleanupRecord(row.value);
                 const conflicts = std.mem.eql(u8, retired_name, cfg.name) or
                     (refs.chunk_name != null and record.chunk_name != null and std.mem.eql(u8, refs.chunk_name.?, record.chunk_name.?)) or
-                    (refs.embedding_name != null and record.embedding_name != null and std.mem.eql(u8, refs.embedding_name.?, record.embedding_name.?));
+                    cleanupRecordConflictsWithEmbeddingRefs(record, refs);
                 if (conflicts) return retired_name;
                 self.alloc.free(retired_name);
             }
@@ -25751,6 +25776,18 @@ test "multi-source vector retirement durably removes every unshared embedding st
 
     try std.testing.expect(try manager.remove(&store, multi_cfg.name));
     try std.testing.expectError(error.IndexArtifactCleanupPending, manager.addManaged(&store, multi_cfg, null));
+    const differently_named_multi_cfg: types.IndexConfig = .{
+        .name = "body_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"body_dense_v1\"}]}",
+    };
+    try std.testing.expectError(error.IndexArtifactCleanupPending, manager.addManaged(&store, differently_named_multi_cfg, null));
+    const differently_named_single_cfg: types.IndexConfig = .{
+        .name = "summary_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"embedding_name\":\"summary_dense_v1\"}",
+    };
+    try std.testing.expectError(error.IndexArtifactCleanupPending, manager.addManaged(&store, differently_named_single_cfg, null));
 
     const cleanup_key = try internal_keys.indexArtifactCleanupKeyAlloc(alloc, multi_cfg.name, removed_generation);
     defer alloc.free(cleanup_key);
@@ -25785,6 +25822,8 @@ test "generated artifact cleanup upgrades v2 debt without losing its cursor or o
     var path_buf: [256]u8 = undefined;
     const path = indexManagerTmpPathWithSuffix(&path_buf, "artifact-cleanup-v2-upgrade");
     defer cleanupIndexManagerDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
     var manager = try IndexManager.init(alloc, std.mem.span(path));
     defer manager.deinit();
 
@@ -25819,6 +25858,27 @@ test "generated artifact cleanup upgrades v2 debt without losing its cursor or o
     try std.testing.expectEqualStrings(chunk_name, decoded.chunk_name.?);
     try std.testing.expectEqualStrings(embedding_name, decoded.embedding_name.?);
     try std.testing.expectEqualStrings("next", decoded.cursor.?);
+
+    const cleanup_key = try internal_keys.indexArtifactCleanupKeyAlloc(alloc, "legacy_vectors", 42);
+    defer alloc.free(cleanup_key);
+    try store.put(cleanup_key, raw);
+    const replacement_cfg: types.IndexConfig = .{
+        .name = "replacement_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"dense_v1\"}]}",
+    };
+    const retired_name = (try manager.pendingGeneratedArtifactCleanupIndexForConfigAlloc(&store, replacement_cfg)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(retired_name);
+    try std.testing.expectEqualStrings("legacy_vectors", retired_name);
+
+    const sparse_replacement_cfg: types.IndexConfig = .{
+        .name = "replacement_sparse",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"dense_v1\"}]}",
+    };
+    const sparse_retired_name = (try manager.pendingGeneratedArtifactCleanupIndexForConfigAlloc(&store, sparse_replacement_cfg)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(sparse_retired_name);
+    try std.testing.expectEqualStrings("legacy_vectors", sparse_retired_name);
 }
 
 test "graph retirement durably removes edge artifacts and source state before same-name recreation" {
