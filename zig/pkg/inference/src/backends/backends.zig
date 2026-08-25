@@ -129,8 +129,8 @@ const RequiredBackendConfig = struct {
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     preferred_backends: []const BackendType,
-    required_backend: ?BackendType,
-    required_backend_invalid: bool,
+    required_backend: ?BackendType = null,
+    required_backend_invalid: bool = false,
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     kernel_jit: kernel_jit_mod.Config = .{},
     kernel_jit_load_context: kernel_jit_mod.LoadContext = .dynamic,
@@ -187,7 +187,6 @@ pub const SessionManager = struct {
         model_path: []const u8,
         shared_backend_ctx: ?*imported_onnx_session.SharedBackendContext,
     ) !Session {
-        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
         var effective_buf: [backend_order_capacity]BackendType = undefined;
@@ -198,8 +197,7 @@ pub const SessionManager = struct {
             if (manifest) |m| m else null,
         );
         var required_buf: [1]BackendType = undefined;
-        const effective_backends = enforceRequiredBackend(
-            self.required_backend,
+        const effective_backends = try self.requiredBackendCandidates(
             fallback_backends,
             &required_buf,
         );
@@ -340,6 +338,17 @@ pub const SessionManager = struct {
         if (self.kernel_jit.mode.failClosed()) return error.KernelJitRequiredBackendUnavailable;
         // NoBackendAvailable only when no backend produced a real error.
         return first_err orelse error.NoBackendAvailable;
+    }
+
+    /// Apply the process-level fail-closed backend policy before callers make
+    /// backend-specific artifact, compatibility, or resource-admission choices.
+    pub fn requiredBackendCandidates(
+        self: *const SessionManager,
+        fallback_backends: []const BackendType,
+        required_buf: *[1]BackendType,
+    ) ![]const BackendType {
+        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        return enforceRequiredBackend(self.required_backend, fallback_backends, required_buf);
     }
 
     fn createImportedOnnxSession(
@@ -584,17 +593,21 @@ test "session manager reads required backend policy from environment" {
 }
 
 test "required backend replaces every fallback candidate" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = .cuda;
+    manager.required_backend_invalid = false;
     var required_buf: [1]BackendType = undefined;
     const fallback = [_]BackendType{ .native, .onnx, .metal };
     try std.testing.expectEqualSlices(
         BackendType,
         &.{.cuda},
-        enforceRequiredBackend(.cuda, &fallback, &required_buf),
+        try manager.requiredBackendCandidates(&fallback, &required_buf),
     );
+    manager.required_backend = null;
     try std.testing.expectEqualSlices(
         BackendType,
         &fallback,
-        enforceRequiredBackend(null, &fallback, &required_buf),
+        try manager.requiredBackendCandidates(&fallback, &required_buf),
     );
 }
 
