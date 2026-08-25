@@ -959,6 +959,8 @@ pub const AntflyApiHandler = struct {
     }
 
     fn healthz(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        if (self.api_server.cfg.internal_service_auth_capability) |capability|
+            try ctx.setHeader("X-Antfly-Internal-Service-Auth", capability);
         const status = self.probeOperations().health(operationContext(ctx, null)) catch |err| switch (err) {
             error.Canceled => return textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => return textResponse(ctx, 504, "request deadline exceeded"),

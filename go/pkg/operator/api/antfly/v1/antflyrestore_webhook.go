@@ -2,7 +2,6 @@ package v1
 
 import (
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 
@@ -32,38 +31,20 @@ func (r *AntflyRestore) ValidateUpdate(old runtime.Object) error {
 // ValidateRestoreUpdate checks phase-lock immutability and validates the new spec.
 // Shared by both the typed webhook validator and the deprecated fallback.
 func (r *AntflyRestore) ValidateRestoreUpdate(old *AntflyRestore) error {
-	connectionMigration := old.Status.Phase == RestorePhaseFailed &&
-		old.Spec.Source.Connection == "" && r.Spec.Source.Connection != "" &&
-		restoreSpecsEqualExceptConnection(old.Spec, r.Spec)
 	if old.Status.Phase == RestorePhaseRunning ||
 		old.Status.Phase == RestorePhaseCompleted ||
 		old.Status.Phase == RestorePhaseFailed {
-		if connectionMigration {
-			// A failed legacy restore may be made runnable by adding only its
-			// required connection.
-		} else {
-			//nolint:staticcheck // ST1005: intentionally capitalized user-facing webhook error
-			return fmt.Errorf(`AntflyRestore cannot be modified after it has started
+		//nolint:staticcheck // ST1005: intentionally capitalized user-facing webhook error
+		return fmt.Errorf(`AntflyRestore cannot be modified after it has started
 
 Problem: The restore operation is already in phase '%s'.
 
 Solution: Delete this AntflyRestore and create a new one if you need different settings.`, old.Status.Phase)
-		}
 	}
 	if err := r.ValidateAntflyRestore(); err != nil {
 		return err
 	}
 	return r.ValidateRestoreConnection()
-}
-
-func restoreSpecsEqualExceptConnection(oldSpec, newSpec AntflyRestoreSpec) bool {
-	oldCopy := oldSpec
-	newCopy := newSpec
-	oldCopy.Source.Connection = ""
-	newCopy.Source.Connection = ""
-	oldCopy.Source.CredentialsSecret = nil
-	newCopy.Source.CredentialsSecret = nil
-	return reflect.DeepEqual(oldCopy, newCopy)
 }
 
 // ValidateRestoreConnection enforces the network API's named-connection

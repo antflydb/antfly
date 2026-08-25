@@ -795,7 +795,12 @@ pub const ApiHttpServerConfig = struct {
     /// both values before opening a listener; they must never share the public
     /// trusted-principal signing domain.
     internal_service_secret: ?[]const u8 = null,
+    /// Optional overlap key used only while rotating the node-to-node signing
+    /// credential. Outbound requests are always signed by
+    /// internal_service_secret; inbound requests accept either key.
+    internal_service_verification_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    internal_service_auth_capability: ?[]const u8 = null,
     /// Explicit first-phase rolling-upgrade mode. Upgraded clients always sign;
     /// servers may temporarily accept old unsigned peers until enforcement is
     /// enabled cluster-wide. Defaults to fail closed.
@@ -4162,11 +4167,19 @@ pub const ApiHttpServer = struct {
         if (self.cfg.trusted_principal_secret) |trusted_secret| {
             if (std.mem.eql(u8, secret, trusted_secret)) return error.Unauthorized;
         }
-        return try self.authenticateTrustedPrincipalWithIssuer(
+        return self.authenticateTrustedPrincipalWithIssuer(
             token,
             secret,
             self.cfg.internal_service_issuer,
-        );
+        ) catch |primary_err| {
+            if (primary_err != error.Unauthorized) return primary_err;
+            const verification_secret = self.cfg.internal_service_verification_secret orelse return primary_err;
+            return try self.authenticateTrustedPrincipalWithIssuer(
+                token,
+                verification_secret,
+                self.cfg.internal_service_issuer,
+            );
+        };
     }
 
     fn authenticateTrustedPrincipalWithIssuer(
@@ -15776,18 +15789,19 @@ test "internal service credentials cannot authorize public inference routes" {
 test "api http server validates dedicated internal service runtime credentials" {
     try std.testing.expectError(
         error.InternalServiceSecretMissing,
-        internal_service_auth.validateRuntimeConfig(null, "cluster-a"),
+        internal_service_auth.validateRuntimeConfig(null, null, "cluster-a"),
     );
     try std.testing.expectError(
         error.InternalServiceSecretTooShort,
-        internal_service_auth.validateRuntimeConfig("short", "cluster-a"),
+        internal_service_auth.validateRuntimeConfig("short", null, "cluster-a"),
     );
     try std.testing.expectError(
         error.InternalServiceIssuerMissing,
-        internal_service_auth.validateRuntimeConfig("0123456789abcdef0123456789abcdef", null),
+        internal_service_auth.validateRuntimeConfig("0123456789abcdef0123456789abcdef", null, null),
     );
     try internal_service_auth.validateRuntimeConfig(
         "0123456789abcdef0123456789abcdef",
+        null,
         "cluster-a",
     );
     try std.testing.expectError(
@@ -15805,6 +15819,36 @@ test "api http server validates dedicated internal service runtime credentials" 
         internal_service_auth.RolloutMode.migration,
         try internal_service_auth.parseRolloutMode("migration"),
     );
+}
+
+test "api http server accepts the bounded rotation verification key" {
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const primary = "primary-internal-service-secret-v1";
+    const verification = "verification-service-secret-v2-xx";
+    var server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = primary,
+        .internal_service_verification_secret = verification,
+        .internal_service_issuer = "cluster-a",
+    }, FakeSource.iface(), null, null);
+    defer server.deinit();
+    const now_seconds: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = verification,
+        .issuer = "cluster-a",
+        .subject = "node:7",
+    }, now_seconds);
+    defer alloc.free(token);
+    var identity = try server.authenticateInternalServiceRequest(token);
+    defer identity.deinit(alloc);
+    try std.testing.expect(identity.is_internal_service);
 }
 
 fn tablePermission(alloc: std.mem.Allocator, encoded_table_name: []const u8, permission_type: usermgr.PermissionType) !RequiredPermission {

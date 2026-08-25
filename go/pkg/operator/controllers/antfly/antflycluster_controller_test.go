@@ -74,7 +74,7 @@ func TestInternalServiceAuthEnvUsesSecretSelectorWithoutReadingSecret(t *testing
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "tenant-a", UID: "cluster-uid"},
 		Spec:       antflyv1.AntflyClusterSpec{InternalServiceAuth: testInternalServiceAuthSpec()},
 	}
-	env := internalServiceAuthEnv(cluster, internalServiceAuthRolloutMigration)
+	env := internalServiceAuthEnv(cluster, internalServiceAuthRolloutMigration, internalServiceAuthKeyRolloutSteady)
 	if len(env) != 3 {
 		t.Fatalf("expected secret, issuer, and rollout environment, got %#v", env)
 	}
@@ -86,6 +86,22 @@ func TestInternalServiceAuthEnvUsesSecretSelectorWithoutReadingSecret(t *testing
 	}
 	if env[1].Value != "antfly-cluster:cluster-uid" || env[2].Value != "migration" {
 		t.Fatalf("unexpected derived non-secret environment: %#v", env)
+	}
+}
+
+func TestInternalServiceAuthEnvStagesRotationWithoutReadingSecrets(t *testing.T) {
+	cluster := &antflyv1.AntflyCluster{Spec: antflyv1.AntflyClusterSpec{InternalServiceAuth: testInternalServiceAuthSpec()}}
+	cluster.Spec.InternalServiceAuth.NextSecretKeyRef = &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "next-internal-service-auth"}, Key: "secret",
+	}
+	prepare := internalServiceAuthEnv(cluster, internalServiceAuthRolloutEnforce, internalServiceAuthKeyRolloutPrepare)
+	if prepare[0].ValueFrom.SecretKeyRef.Name != "test-internal-service-auth" ||
+		prepare[3].Name != antflyInternalServiceVerificationSecretEnvVar || prepare[3].ValueFrom.SecretKeyRef.Name != "next-internal-service-auth" {
+		t.Fatalf("prepare phase must sign old and verify next: %#v", prepare)
+	}
+	switching := internalServiceAuthEnv(cluster, internalServiceAuthRolloutEnforce, internalServiceAuthKeyRolloutSwitch)
+	if switching[0].ValueFrom.SecretKeyRef.Name != "next-internal-service-auth" || switching[3].ValueFrom.SecretKeyRef.Name != "test-internal-service-auth" {
+		t.Fatalf("switch phase must sign next and verify old: %#v", switching)
 	}
 }
 
@@ -175,6 +191,55 @@ func TestInternalServiceAuthUpgradeRequiresRuntimeCapabilityBeforeEnforcement(t 
 	mode, pending, err = missingCapabilityReconciler.desiredInternalServiceAuthRolloutMode(context.Background(), cluster)
 	if err != nil || mode != internalServiceAuthRolloutMigration || !pending {
 		t.Fatalf("missing runtime capability must remain in migration, mode=%q pending=%t err=%v", mode, pending, err)
+	}
+}
+
+func TestInternalServiceAuthKeyRotationRequiresEveryRuntimeOverlap(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = appsv1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			InternalServiceAuth: testInternalServiceAuthSpec(),
+			MetadataNodes:       antflyv1.MetadataNodesSpec{Replicas: 1, MetadataAPI: antflyv1.APISpec{Port: 12377}},
+			DataNodes:           antflyv1.DataNodesSpec{Replicas: 1, API: antflyv1.APISpec{Port: 12380}},
+		},
+	}
+	cluster.Spec.InternalServiceAuth.NextSecretKeyRef = &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "next-key"}, Key: "secret"}
+	target := internalServiceAuthKeyTarget(cluster.Spec.InternalServiceAuth)
+	complete := func(name string, keyMode internalServiceAuthKeyRolloutMode) *appsv1.StatefulSet {
+		return &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", Generation: 1},
+			Spec: appsv1.StatefulSetSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				internalServiceAuthRolloutAnnotation:    string(internalServiceAuthRolloutEnforce),
+				internalServiceAuthKeyRolloutAnnotation: string(keyMode),
+				internalServiceAuthKeyTargetAnnotation:  target,
+			}}}},
+			Status: appsv1.StatefulSetStatus{ObservedGeneration: 1, UpdatedReplicas: 1, ReadyReplicas: 1, CurrentRevision: "a", UpdateRevision: "a"},
+		}
+	}
+	newReconciler := func(metadata, data *appsv1.StatefulSet, capability string) *AntflyClusterReconciler {
+		r := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(metadata, data).Build()}
+		r.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			header := make(http.Header)
+			header.Set(internalServiceAuthCapabilityHeader, capability)
+			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(`{}`)), Request: req}, nil
+		})}
+		return r
+	}
+	mode, pending, phase, err := newReconciler(complete("example-metadata", internalServiceAuthKeyRolloutSteady), complete("example-data", internalServiceAuthKeyRolloutSteady), "").desiredInternalServiceAuthKeyRollout(context.Background(), cluster, internalServiceAuthRolloutEnforce)
+	if err != nil || mode != internalServiceAuthKeyRolloutPrepare || !pending || phase != antflyv1.InternalServiceAuthRotationPreparing {
+		t.Fatalf("rotation should begin with verifier preparation: mode=%s pending=%t phase=%s err=%v", mode, pending, phase, err)
+	}
+	capability := internalServiceAuthCapability(internalServiceAuthRolloutEnforce, true)
+	mode, pending, phase, err = newReconciler(complete("example-metadata", internalServiceAuthKeyRolloutPrepare), complete("example-data", internalServiceAuthKeyRolloutPrepare), capability).desiredInternalServiceAuthKeyRollout(context.Background(), cluster, internalServiceAuthRolloutEnforce)
+	if err != nil || mode != internalServiceAuthKeyRolloutSwitch || !pending || phase != antflyv1.InternalServiceAuthRotationSwitching {
+		t.Fatalf("prepared overlap should switch signing: mode=%s pending=%t phase=%s err=%v", mode, pending, phase, err)
+	}
+	mode, pending, phase, err = newReconciler(complete("example-metadata", internalServiceAuthKeyRolloutSwitch), complete("example-data", internalServiceAuthKeyRolloutSwitch), capability).desiredInternalServiceAuthKeyRollout(context.Background(), cluster, internalServiceAuthRolloutEnforce)
+	if err != nil || mode != internalServiceAuthKeyRolloutSwitch || pending || phase != antflyv1.InternalServiceAuthRotationSwitched {
+		t.Fatalf("fully switched overlap should complete: mode=%s pending=%t phase=%s err=%v", mode, pending, phase, err)
 	}
 }
 
@@ -15029,8 +15094,8 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce)).To(Succeed())
-	g.Expect(reconciler.reconcileDataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce)).To(Succeed())
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce, internalServiceAuthKeyRolloutSteady)).To(Succeed())
+	g.Expect(reconciler.reconcileDataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce, internalServiceAuthKeyRolloutSteady)).To(Succeed())
 
 	for _, component := range []string{"metadata", "data"} {
 		sts := &appsv1.StatefulSet{}
@@ -15260,7 +15325,7 @@ func TestPodTemplateLabelsUpdateWhenClusterLabelsChange(t *testing.T) {
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce)).To(Succeed())
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce, internalServiceAuthKeyRolloutSteady)).To(Succeed())
 
 	sts := &appsv1.StatefulSet{}
 	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
@@ -15272,7 +15337,7 @@ func TestPodTemplateLabelsUpdateWhenClusterLabelsChange(t *testing.T) {
 		"cloud.antfly.io/org-id":      "org-123",
 	}
 
-	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce)).To(Succeed())
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce, internalServiceAuthKeyRolloutSteady)).To(Succeed())
 	g.Expect(client.Get(context.Background(), key, sts)).To(Succeed())
 	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("cloud.antfly.io/instance-id", "instance-after"))
 	g.Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("cloud.antfly.io/org-id", "org-123"))
@@ -15317,7 +15382,7 @@ func TestMetadataStatefulSetPreparesPersistentStorageForNonRootRuntime(t *testin
 		Scheme: s,
 	}
 
-	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce)).To(Succeed())
+	g.Expect(reconciler.reconcileMetadataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce, internalServiceAuthKeyRolloutSteady)).To(Succeed())
 
 	sts := &appsv1.StatefulSet{}
 	key := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}

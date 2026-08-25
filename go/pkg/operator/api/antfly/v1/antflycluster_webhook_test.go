@@ -3889,6 +3889,25 @@ func TestValidateInternalServiceAuthDistributedContract(t *testing.T) {
 	}
 }
 
+func TestValidateInternalServiceAuthRotationTransition(t *testing.T) {
+	old := baseCluster()
+	old.Spec.Mode = ClusterModeDistributed
+	old.Spec.InternalServiceAuth = &InternalServiceAuthSpec{SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "key-v1"}, Key: "secret"}}
+	next := corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "key-v2"}, Key: "secret"}
+	old.Spec.InternalServiceAuth.NextSecretKeyRef = &next
+
+	promoted := old.DeepCopy()
+	promoted.Spec.InternalServiceAuth.SecretKeyRef = next
+	promoted.Spec.InternalServiceAuth.NextSecretKeyRef = nil
+	if err := promoted.ValidateUpdate(old); err == nil || !strings.Contains(err.Error(), "cannot advance") {
+		t.Fatalf("early promotion error = %v, want rotation gate", err)
+	}
+	old.Status.InternalServiceAuthRotation = &InternalServiceAuthRotationStatus{Phase: InternalServiceAuthRotationSwitched, TargetSecretName: next.Name, TargetSecretKey: next.Key}
+	if err := promoted.ValidateUpdate(old); err != nil {
+		t.Fatalf("completed atomic promotion rejected: %v", err)
+	}
+}
+
 func TestValidateInternalServiceAuthForbiddenForStandalone(t *testing.T) {
 	cluster := baseStandaloneCluster()
 	cluster.Spec.InternalServiceAuth = &InternalServiceAuthSpec{SecretKeyRef: corev1.SecretKeySelector{

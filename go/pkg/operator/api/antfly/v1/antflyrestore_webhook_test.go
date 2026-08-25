@@ -216,7 +216,7 @@ func TestValidateCreate_RestoreRequiresNamedConnection(t *testing.T) {
 	}
 }
 
-func TestValidateUpdate_FailedLegacyRestoreAllowsConnectionOnlyMigration(t *testing.T) {
+func TestValidateUpdate_FailedLegacyRestoreRequiresNewIdentity(t *testing.T) {
 	old := &AntflyRestore{
 		Spec: AntflyRestoreSpec{
 			ClusterRef: ClusterReference{Name: "cluster-a"},
@@ -226,8 +226,8 @@ func TestValidateUpdate_FailedLegacyRestoreAllowsConnectionOnlyMigration(t *test
 	}
 	migrated := old.DeepCopy()
 	migrated.Spec.Source.Connection = "archive-reader"
-	if err := migrated.ValidateUpdate(old); err != nil {
-		t.Fatalf("connection-only migration rejected: %v", err)
+	if err := migrated.ValidateUpdate(old); err == nil || !strings.Contains(err.Error(), "cannot be modified") {
+		t.Fatalf("failed restore connection migration error = %v, want immutable", err)
 	}
 
 	changed := migrated.DeepCopy()

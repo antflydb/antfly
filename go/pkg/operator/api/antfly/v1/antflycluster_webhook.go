@@ -244,36 +244,51 @@ func (r *AntflyCluster) validateInternalServiceAuth() error {
 	}
 
 	var validationErrors []string
-	ref := auth.SecretKeyRef
-	name := strings.TrimSpace(ref.Name)
-	key := strings.TrimSpace(ref.Key)
-	if name == "" {
-		validationErrors = append(validationErrors, "spec.internalServiceAuth.secretKeyRef.name is required")
-	} else {
-		if name != ref.Name {
-			validationErrors = append(validationErrors, "spec.internalServiceAuth.secretKeyRef.name must not have leading or trailing whitespace")
+	validationErrors = append(validationErrors, validateInternalServiceSecretKeySelector(auth.SecretKeyRef, "spec.internalServiceAuth.secretKeyRef")...)
+	if auth.NextSecretKeyRef != nil {
+		validationErrors = append(validationErrors, validateInternalServiceSecretKeySelector(*auth.NextSecretKeyRef, "spec.internalServiceAuth.nextSecretKeyRef")...)
+		if internalServiceSecretKeySelectorEqual(auth.SecretKeyRef, *auth.NextSecretKeyRef) {
+			validationErrors = append(validationErrors, "spec.internalServiceAuth.nextSecretKeyRef must select a different Secret key")
 		}
-		if errs := utilvalidation.IsDNS1123Subdomain(name); len(errs) > 0 {
-			validationErrors = append(validationErrors, fmt.Sprintf("spec.internalServiceAuth.secretKeyRef.name %q is invalid: %s", name, strings.Join(errs, "; ")))
-		}
-	}
-	if key == "" {
-		validationErrors = append(validationErrors, "spec.internalServiceAuth.secretKeyRef.key is required")
-	} else {
-		if key != ref.Key {
-			validationErrors = append(validationErrors, "spec.internalServiceAuth.secretKeyRef.key must not have leading or trailing whitespace")
-		}
-		if errs := utilvalidation.IsConfigMapKey(key); len(errs) > 0 {
-			validationErrors = append(validationErrors, fmt.Sprintf("spec.internalServiceAuth.secretKeyRef.key %q is invalid: %s", key, strings.Join(errs, "; ")))
-		}
-	}
-	if ref.Optional != nil && *ref.Optional {
-		validationErrors = append(validationErrors, "spec.internalServiceAuth.secretKeyRef.optional must be false")
 	}
 	if len(validationErrors) > 0 {
 		return fmt.Errorf("InternalServiceAuth validation failed:\n  - %s", strings.Join(validationErrors, "\n  - "))
 	}
 	return nil
+}
+
+func validateInternalServiceSecretKeySelector(ref corev1.SecretKeySelector, fieldPath string) []string {
+	var validationErrors []string
+	name := strings.TrimSpace(ref.Name)
+	key := strings.TrimSpace(ref.Key)
+	if name == "" {
+		validationErrors = append(validationErrors, fieldPath+".name is required")
+	} else {
+		if name != ref.Name {
+			validationErrors = append(validationErrors, fieldPath+".name must not have leading or trailing whitespace")
+		}
+		if errs := utilvalidation.IsDNS1123Subdomain(name); len(errs) > 0 {
+			validationErrors = append(validationErrors, fmt.Sprintf("%s.name %q is invalid: %s", fieldPath, name, strings.Join(errs, "; ")))
+		}
+	}
+	if key == "" {
+		validationErrors = append(validationErrors, fieldPath+".key is required")
+	} else {
+		if key != ref.Key {
+			validationErrors = append(validationErrors, fieldPath+".key must not have leading or trailing whitespace")
+		}
+		if errs := utilvalidation.IsConfigMapKey(key); len(errs) > 0 {
+			validationErrors = append(validationErrors, fmt.Sprintf("%s.key %q is invalid: %s", fieldPath, key, strings.Join(errs, "; ")))
+		}
+	}
+	if ref.Optional != nil && *ref.Optional {
+		validationErrors = append(validationErrors, fieldPath+".optional must be false")
+	}
+	return validationErrors
+}
+
+func internalServiceSecretKeySelectorEqual(a, b corev1.SecretKeySelector) bool {
+	return a.Name == b.Name && a.Key == b.Key
 }
 
 func (r *AntflyCluster) validateSecretStore() error {
@@ -949,6 +964,25 @@ Problem: PVC storage size cannot be reduced. Kubernetes only supports volume exp
 			oldRetryGeneration,
 			newRetryGeneration,
 		))
+	}
+
+	if oldAuth, newAuth := old.Spec.InternalServiceAuth, r.Spec.InternalServiceAuth; oldAuth != nil && newAuth != nil {
+		primaryChanged := !internalServiceSecretKeySelectorEqual(oldAuth.SecretKeyRef, newAuth.SecretKeyRef)
+		if oldAuth.NextSecretKeyRef == nil {
+			if primaryChanged {
+				errors = append(errors, "spec.internalServiceAuth.secretKeyRef cannot change directly; set nextSecretKeyRef and wait for the Switched status first")
+			}
+		} else {
+			nextChanged := newAuth.NextSecretKeyRef == nil || !internalServiceSecretKeySelectorEqual(*oldAuth.NextSecretKeyRef, *newAuth.NextSecretKeyRef)
+			if primaryChanged || nextChanged {
+				rotation := old.Status.InternalServiceAuthRotation
+				rotationComplete := rotation != nil && rotation.Phase == InternalServiceAuthRotationSwitched &&
+					rotation.TargetSecretName == oldAuth.NextSecretKeyRef.Name && rotation.TargetSecretKey == oldAuth.NextSecretKeyRef.Key
+				if !rotationComplete || !internalServiceSecretKeySelectorEqual(newAuth.SecretKeyRef, *oldAuth.NextSecretKeyRef) {
+					errors = append(errors, "internal-service key rotation cannot advance until status.internalServiceAuthRotation.phase is Switched; then promote nextSecretKeyRef atomically to secretKeyRef")
+				}
+			}
+		}
 	}
 
 	if len(errors) > 0 {

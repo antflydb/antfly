@@ -1924,6 +1924,7 @@ pub fn runFromIterator(
     if (internal_service_secret != null or internal_service_issuer != null) {
         internal_service_auth.validateRuntimeConfig(
             internal_service_secret,
+            null,
             internal_service_issuer,
         ) catch |err| {
             std.log.err(

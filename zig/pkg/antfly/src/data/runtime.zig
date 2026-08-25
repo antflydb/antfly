@@ -361,6 +361,7 @@ const DataRaftBatchForwardState = struct {
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 const internal_service_secret_key = "antfly.internal_service.secret";
+const internal_service_verification_secret_key = "antfly.internal_service.verification_secret";
 const internal_service_issuer_key = "antfly.internal_service.issuer";
 const internal_service_rollout_mode_key = "antfly.internal_service.rollout_mode";
 
@@ -17690,6 +17691,12 @@ pub fn runFromIterator(
         internal_service_secret_key,
     );
     defer if (internal_service_secret) |value| alloc.free(value);
+    const internal_service_verification_secret = try resolveTrustedPrincipalConfigValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_verification_secret_key,
+    );
+    defer if (internal_service_verification_secret) |value| alloc.free(value);
     const internal_service_issuer = try resolveTrustedPrincipalConfigValue(
         alloc,
         if (secret_store_initialized) &secret_store else null,
@@ -17710,6 +17717,7 @@ pub fn runFromIterator(
     };
     internal_service_auth.validateRuntimeConfig(
         internal_service_secret,
+        internal_service_verification_secret,
         internal_service_issuer,
     ) catch |err| {
         std.log.err(
@@ -17726,6 +17734,13 @@ pub fn runFromIterator(
             "data startup rejected reused signing material: {s} must differ from {s}",
             .{ internal_service_secret_key, trusted_principal_secret_key },
         );
+        return err;
+    };
+    internal_service_auth.validateCredentialIsolation(
+        internal_service_verification_secret,
+        trusted_principal_secret,
+    ) catch |err| {
+        std.log.err("data startup rejected reused verification signing material; err={s}", .{@errorName(err)});
         return err;
     };
     if (internal_service_rollout_mode == .migration) {
@@ -17808,7 +17823,12 @@ pub fn runFromIterator(
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
             .internal_service_secret = internal_service_secret,
+            .internal_service_verification_secret = internal_service_verification_secret,
             .internal_service_issuer = internal_service_issuer,
+            .internal_service_auth_capability = internal_service_auth.capability(
+                internal_service_rollout_mode,
+                internal_service_verification_secret != null,
+            ),
             .internal_service_accept_legacy_unauthenticated = internal_service_rollout_mode == .migration,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",

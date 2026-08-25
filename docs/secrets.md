@@ -152,6 +152,7 @@ kind: Secret
 metadata:
   name: antflydb-internal-service-auth
 type: Opaque
+immutable: true
 stringData:
   secret: REPLACE-WITH-AT-LEAST-32-RANDOM-BYTES
 ---
@@ -173,7 +174,7 @@ Kubelet injects the selected value directly into metadata and data containers;
 the operator never fetches it. The issuer is derived from the immutable cluster
 UID. New clusters start in enforcement mode. For an existing cluster, the
 operator first rolls every StatefulSet in migration mode, waits for all replicas
-to be updated and ready, and requires every metadata process to advertise the
+to be updated and ready, and requires every metadata and data process to advertise the
 new authentication capability. It then performs a second rollout in enforcement
 mode. A runtime that ignores the new environment can therefore never make the
 operator advance merely by reporting Ready.
@@ -184,6 +185,23 @@ fallback validation stop reconciliation before a fail-closed runtime can be
 rolled. If the referenced Secret or key is absent, Kubernetes keeps the new pod
 Pending and the rollout remains in migration; Secret values are never made
 optional to preserve availability.
+
+Treat each internal-service Secret as immutable. Changing bytes behind an
+existing reference is intentionally invisible to the operator and would give
+restarted and still-running pods different keys. Rotate with versioned Secrets:
+
+1. Create a new immutable Secret.
+2. Set `spec.internalServiceAuth.nextSecretKeyRef` to its name and key.
+3. Wait for `status.internalServiceAuthRotation.phase: Switched`. The operator
+   first rolls every metadata and data process with both verification keys,
+   requires each process to acknowledge the overlap, and only then switches
+   outbound signing.
+4. Promote `nextSecretKeyRef` atomically to `secretKeyRef` and remove
+   `nextSecretKeyRef`. Admission rejects an early or unsafe transition.
+
+The final rollout removes the retired verifier without an RPC interruption.
+The operator observes only Secret references throughout this protocol and does
+not require `get`, `list`, or `watch` permission on Secrets.
 
 ## Managing standalone secrets through the API
 

@@ -27,6 +27,19 @@ pub const RolloutMode = enum {
     migration,
 };
 
+pub fn capability(mode: RolloutMode, has_additional_verifier: bool) []const u8 {
+    return switch (mode) {
+        .enforce => if (has_additional_verifier)
+            "v1; mode=enforce; verification=additional"
+        else
+            "v1; mode=enforce",
+        .migration => if (has_additional_verifier)
+            "v1; mode=migration; verification=additional"
+        else
+            "v1; mode=migration",
+    };
+}
+
 pub const Config = struct {
     secret: []const u8,
     issuer: []const u8,
@@ -87,10 +100,16 @@ pub fn parseRolloutMode(raw: ?[]const u8) !RolloutMode {
     return error.InvalidInternalServiceRolloutMode;
 }
 
-pub fn validateRuntimeConfig(secret: ?[]const u8, issuer: ?[]const u8) !void {
+pub fn validateRuntimeConfig(secret: ?[]const u8, verification_secret: ?[]const u8, issuer: ?[]const u8) !void {
     const signing_secret = secret orelse return error.InternalServiceSecretMissing;
     if (signing_secret.len < minimum_secret_bytes)
         return error.InternalServiceSecretTooShort;
+    if (verification_secret) |additional| {
+        if (additional.len < minimum_secret_bytes)
+            return error.InternalServiceVerificationSecretTooShort;
+        if (std.mem.eql(u8, signing_secret, additional))
+            return error.InternalServiceVerificationSecretReused;
+    }
     const signing_issuer = issuer orelse return error.InternalServiceIssuerMissing;
     if (signing_issuer.len == 0 or signing_issuer.len > maximum_issuer_bytes)
         return error.InvalidInternalServiceIssuer;
@@ -158,17 +177,30 @@ test "internal service tokens carry a distinct bounded identity" {
 test "runtime config requires an isolated production-strength credential" {
     try std.testing.expectError(
         error.InternalServiceSecretMissing,
-        validateRuntimeConfig(null, "cluster-a"),
+        validateRuntimeConfig(null, null, "cluster-a"),
     );
     try std.testing.expectError(
         error.InternalServiceSecretTooShort,
-        validateRuntimeConfig("short", "cluster-a"),
+        validateRuntimeConfig("short", null, "cluster-a"),
     );
     try std.testing.expectError(
         error.InternalServiceIssuerMissing,
-        validateRuntimeConfig("0123456789abcdef0123456789abcdef", null),
+        validateRuntimeConfig("0123456789abcdef0123456789abcdef", null, null),
     );
-    try validateRuntimeConfig("0123456789abcdef0123456789abcdef", "cluster-a");
+    try validateRuntimeConfig("0123456789abcdef0123456789abcdef", null, "cluster-a");
+    try validateRuntimeConfig(
+        "0123456789abcdef0123456789abcdef",
+        "abcdef0123456789abcdef0123456789",
+        "cluster-a",
+    );
+    try std.testing.expectError(
+        error.InternalServiceVerificationSecretReused,
+        validateRuntimeConfig(
+            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef",
+            "cluster-a",
+        ),
+    );
     try std.testing.expectError(
         error.InternalServiceSecretReused,
         validateCredentialIsolation(

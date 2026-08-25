@@ -165,13 +165,7 @@ pub const MetadataServer = struct {
             admin_http_server.* = metadata_http_server.MetadataHttpServer.init(
                 alloc,
                 .{
-                    .internal_service_auth_capability = if (cfg.api_server_cfg.internal_service_secret != null)
-                        if (cfg.api_server_cfg.internal_service_accept_legacy_unauthenticated)
-                            "v1; mode=migration"
-                        else
-                            "v1; mode=enforce"
-                    else
-                        null,
+                    .internal_service_auth_capability = cfg.api_server_cfg.internal_service_auth_capability,
                 },
                 metadata_http_server.AdminSource.fromMetadataHttpService(svc),
             );
