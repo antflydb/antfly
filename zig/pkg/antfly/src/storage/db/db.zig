@@ -521,6 +521,15 @@ pub const HAPrimaryProgressSyncWait = struct {
             const gate = try ha_commit_gate_mod.evaluate(primary, target_lsn, policy);
             if (gate.shouldAcknowledge()) return;
             if (gate.action == .reject) return error.SyncPolicyUnsatisfied;
+            // A wait can only make progress when enough eligible slots exist.
+            // After promotion the former primary is intentionally absent or
+            // inactive until repair, so polling the full wait budget cannot
+            // produce a synchronous acknowledgement. Return the explicit
+            // post-commit pending outcome immediately instead of retaining the
+            // DB apply lock behind two bounded mirror waits. A present but
+            // lagging candidate still receives the ordinary bounded wait.
+            if (gate.decision.candidate_count < gate.decision.required_count)
+                return error.HASyncCommitWouldBlock;
             if (self.sleep_ns > 0) sleepNs(self.sleep_ns);
         }
 
@@ -67126,6 +67135,54 @@ test "storage.ha db primary progress sync wait observes reported remote apply ac
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+}
+
+test "storage.ha primary progress sync wait fast fails without enough eligible candidates" {
+    const alloc = std.testing.allocator;
+
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 260,
+        .shard_id = 4,
+        .table_id = 11,
+        .timeline_id = 2,
+        .epoch = 2,
+    }, .{});
+    defer primary.close();
+    const target_lsn = try primary.append(.{ .payload = "locally-committed-after-promotion" });
+
+    const Poll = struct {
+        calls: usize = 0,
+
+        fn poll(ctx: *anyopaque, _: *ha_primary_mod.Primary, _: u64, _: ha_primary_mod.SyncPolicy, round: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try std.testing.expectEqual(self.calls, round);
+            self.calls += 1;
+        }
+    };
+
+    var poll = Poll{};
+    var wait_state = HAPrimaryProgressSyncWait{
+        .max_rounds = 200,
+        .poll_ctx = &poll,
+        .poll_fn = Poll.poll,
+    };
+    const standby_names = [_][]const u8{"former-primary"};
+    try std.testing.expectError(
+        error.HASyncCommitWouldBlock,
+        HAPrimaryProgressSyncWait.wait(&wait_state, &primary, target_lsn, .{
+            .mode = .remote_apply,
+            .standby_names = &standby_names,
+            .failure_policy = .block,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), poll.calls);
 }
 
 test "storage.ha db primary progress sync wait returns would block without reported ack" {
