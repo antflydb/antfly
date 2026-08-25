@@ -1096,8 +1096,8 @@ pub const GraphIndex = struct {
         scan_cursor: ?EdgeScanCursor,
         limits: EdgePageLimits,
     ) !EdgePage {
-        if (limits.max_edges == 0 or limits.max_owned_bytes == 0)
-            return error.QueryCandidateBudgetExceeded;
+        if (limits.max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
+        if (limits.max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
 
         var results = std.ArrayListUnmanaged(Edge).empty;
         errdefer {
@@ -1228,11 +1228,11 @@ pub const GraphIndex = struct {
             errdefer page.deinit(alloc);
 
             const next_count = std.math.add(usize, results.items.len, page.edges.len) catch
-                return error.QueryCandidateBudgetExceeded;
+                return error.GraphExploredEdgesBudgetExceeded;
             const next_bytes = std.math.add(usize, total_bytes, page.owned_bytes) catch
-                return error.QueryCandidateBudgetExceeded;
-            if (next_count > max_edges or next_bytes > max_owned_bytes)
-                return error.QueryCandidateBudgetExceeded;
+                return error.GraphExploredEdgeBytesBudgetExceeded;
+            if (next_count > max_edges) return error.GraphExploredEdgesBudgetExceeded;
+            if (next_bytes > max_owned_bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
 
             try results.ensureUnusedCapacity(alloc, page.edges.len);
             for (page.edges) |edge| results.appendAssumeCapacity(edge);
@@ -1305,11 +1305,11 @@ pub const GraphIndex = struct {
                 const appended = results.items[results.items.len - 1];
                 const edge_bytes = edgeOwnedBytes(appended);
                 const next_bytes = std.math.add(usize, owned_bytes.*, edge_bytes) catch
-                    return error.QueryCandidateBudgetExceeded;
+                    return error.GraphExploredEdgeBytesBudgetExceeded;
                 if (next_bytes > limits.max_owned_bytes) {
                     _ = results.pop();
                     freeEdge(alloc, appended);
-                    if (results.items.len == 0) return error.QueryCandidateBudgetExceeded;
+                    if (results.items.len == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
                     if (results.items.len == phase_start_len)
                         return try edgeScanStartCursor(alloc, phase, type_index, requested_type);
                     return try edgeScanCursorFromPhysicalKey(alloc, phase, type_index, results.items[results.items.len - 1]);
@@ -1389,16 +1389,16 @@ pub const GraphIndex = struct {
             const probe = probes[item.result_index];
             var edge_bytes: usize = @sizeOf(Edge);
             edge_bytes = std.math.add(usize, edge_bytes, probe.source.len) catch
-                return error.QueryCandidateBudgetExceeded;
+                return error.GraphExploredEdgeBytesBudgetExceeded;
             edge_bytes = std.math.add(usize, edge_bytes, probe.target.len) catch
-                return error.QueryCandidateBudgetExceeded;
+                return error.GraphExploredEdgeBytesBudgetExceeded;
             edge_bytes = std.math.add(usize, edge_bytes, probe.edge_type.len) catch
-                return error.QueryCandidateBudgetExceeded;
+                return error.GraphExploredEdgeBytesBudgetExceeded;
             edge_bytes = std.math.add(usize, edge_bytes, decoded.metadata.len) catch
-                return error.QueryCandidateBudgetExceeded;
+                return error.GraphExploredEdgeBytesBudgetExceeded;
             owned_bytes = std.math.add(usize, owned_bytes, edge_bytes) catch
-                return error.QueryCandidateBudgetExceeded;
-            if (owned_bytes > max_owned_bytes) return error.QueryCandidateBudgetExceeded;
+                return error.GraphExploredEdgeBytesBudgetExceeded;
+            if (owned_bytes > max_owned_bytes) return error.GraphExploredEdgeBytesBudgetExceeded;
             const source = try alloc.dupe(u8, probe.source);
             errdefer alloc.free(source);
             const target = try alloc.dupe(u8, probe.target);
@@ -1966,7 +1966,7 @@ test "graph bounded adjacency pages preserve order and fail before budget overfl
     try std.testing.expectEqualStrings("doc-2", second.edges[0].target);
 
     try std.testing.expectError(
-        error.QueryCandidateBudgetExceeded,
+        error.GraphExploredEdgesBudgetExceeded,
         graph.getEdgesByTypesBounded(alloc, "root", &.{"cites"}, .out, 4, 4096),
     );
     const exact = try graph.getEdgesByTypesBounded(alloc, "root", &.{"cites"}, .out, 5, 4096);
@@ -2009,7 +2009,7 @@ test "graph bounded adjacency pages preserve order and fail before budget overfl
     defer GraphIndex.freeEdges(alloc, deduplicated_types);
     try std.testing.expectEqual(@as(usize, 5), deduplicated_types.len);
     try std.testing.expectError(
-        error.QueryCandidateBudgetExceeded,
+        error.GraphExploredEdgeBytesBudgetExceeded,
         graph.getEdgesByTypesBounded(alloc, "root", &.{"cites"}, .out, 5, 1),
     );
 }
@@ -2086,7 +2086,7 @@ test "graph exact edge probes stay aligned and preserve payloads" {
     defer GraphIndex.freeProbedEdges(alloc, bounded);
     try std.testing.expect(bounded[0] != null);
     try std.testing.expectError(
-        error.QueryCandidateBudgetExceeded,
+        error.GraphExploredEdgeBytesBudgetExceeded,
         graph.probeEdgesAllocBounded(alloc, &.{bounded_probe}, bounded_bytes - 1),
     );
 

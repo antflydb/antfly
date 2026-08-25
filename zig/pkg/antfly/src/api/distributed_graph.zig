@@ -29,6 +29,8 @@ const graph_node_identity = @import("../graph/node_identity.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
 const graph_traversal_mod = @import("../graph/traversal.zig");
+const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
+const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
 const graph_exec = @import("../storage/db/query/graph_exec.zig");
 const algebraic_ir = db_mod.algebraic.ir;
@@ -1023,6 +1025,14 @@ fn executeCrossRangeOnce(
             &request_work_budget,
             &request_distinct_budget,
         ) catch |err| {
+            if (graph_path_weight_diagnostic.isDomainError(err)) {
+                graph_path_weight_diagnostic.record(graph_query.name, err);
+            }
+            if (err == error.GraphWorkBudgetExceeded) {
+                if (request_work_budget.exhaustion()) |exhaustion| {
+                    graph_work_budget_diagnostic.record(graph_query.name, graph_query.query, exhaustion);
+                }
+            }
             if (graph_query_diagnostic.reasonForError(err)) |reason| {
                 graph_query_diagnostic.record(
                     graph_query.name,
@@ -1488,6 +1498,89 @@ const FrontierState = struct {
     }
 };
 
+const PathCostLabels = struct {
+    const Label = struct {
+        depth: u32,
+        cost: f64,
+    };
+
+    values: graph_node_identity.Map(std.ArrayListUnmanaged(Label)) = .{},
+    max_depth: u32,
+
+    fn init(max_depth: u32) PathCostLabels {
+        return .{ .max_depth = max_depth };
+    }
+
+    fn deinit(self: *PathCostLabels, alloc: std.mem.Allocator) void {
+        var it = self.values.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(alloc);
+        self.values.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn recordIfPareto(
+        self: *PathCostLabels,
+        alloc: std.mem.Allocator,
+        ref: graph_node_identity.Ref,
+        depth: u32,
+        cost: f64,
+    ) !bool {
+        if (depth > self.max_depth) return false;
+        if (self.values.getPtr(ref)) |labels| {
+            for (labels.items) |label| {
+                if (label.depth <= depth and label.cost <= cost) return false;
+            }
+
+            // Keep only the Pareto frontier. This is normally one label per
+            // node and avoids allocating max_depth slots for every identity.
+            var index: usize = 0;
+            while (index < labels.items.len) {
+                const label = labels.items[index];
+                if (depth <= label.depth and cost <= label.cost) {
+                    _ = labels.swapRemove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            try labels.append(alloc, .{ .depth = depth, .cost = cost });
+            return true;
+        }
+
+        var labels = std.ArrayListUnmanaged(Label).empty;
+        errdefer labels.deinit(alloc);
+        try labels.append(alloc, .{ .depth = depth, .cost = cost });
+        _ = try self.values.putIfAbsent(alloc, ref, labels);
+        return true;
+    }
+
+    fn isCurrentPareto(
+        self: *const PathCostLabels,
+        ref: graph_node_identity.Ref,
+        depth: u32,
+        cost: f64,
+    ) bool {
+        if (depth > self.max_depth) return false;
+        const labels = self.values.get(ref) orelse return false;
+        var exact = false;
+        for (labels.items) |label| {
+            if (label.depth == depth and label.cost == cost) exact = true;
+            if (label.depth < depth and label.cost <= cost) return false;
+        }
+        return exact;
+    }
+};
+
+test "distributed bounded paths retain non-dominated cost and depth labels" {
+    var labels = PathCostLabels.init(2);
+    defer labels.deinit(std.testing.allocator);
+    const node = graph_node_identity.Ref{ .table = "docs", .key = "X" };
+    try std.testing.expect(try labels.recordIfPareto(std.testing.allocator, node, 2, 0));
+    try std.testing.expect(try labels.recordIfPareto(std.testing.allocator, node, 1, 1));
+    try std.testing.expect(!try labels.recordIfPareto(std.testing.allocator, node, 2, 1));
+    try std.testing.expect(labels.isCurrentPareto(node, 2, 0));
+    try std.testing.expect(labels.isCurrentPareto(node, 1, 1));
+}
+
 fn graphNodeAdmissionRequest(
     req: db_mod.types.SearchRequest,
     graph_query: db_mod.types.NamedGraphQuery,
@@ -1620,7 +1713,7 @@ const DistributedEdgeReader = struct {
         edge_types: []const []const u8,
         direction: graph_mod.EdgeDirection,
     ) ![]graph_mod.Edge {
-        return try self.getEdgesBounded(
+        return self.getEdgesBounded(
             a,
             table,
             key,
@@ -1628,7 +1721,12 @@ const DistributedEdgeReader = struct {
             direction,
             graph_pattern_mod.default_max_explored_edges,
             graph_pattern_mod.default_max_explored_edge_bytes,
-        );
+        ) catch |err| switch (err) {
+            error.GraphExploredEdgesBudgetExceeded,
+            error.GraphExploredEdgeBytesBudgetExceeded,
+            => error.QueryCandidateBudgetExceeded,
+            else => err,
+        };
     }
 
     pub fn getEdgesBounded(
@@ -1664,7 +1762,8 @@ const DistributedEdgeReader = struct {
         max_owned_bytes: usize,
         source_table_declared: bool,
     ) ![]graph_mod.Edge {
-        if (max_edges == 0 or max_owned_bytes == 0) return error.QueryCandidateBudgetExceeded;
+        if (max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
+        if (max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
         const table_name = table orelse self.source_table;
         const table_state = try self.admission.ensureTable(table_name);
         if (!table_state.allowed) return try a.alloc(graph_mod.Edge, 0);
@@ -1740,9 +1839,9 @@ const DistributedEdgeReader = struct {
             ) !void {
                 for (input) |edge| {
                     if (deduplicate and seen.contains(graphEdgeIdentity(edge))) continue;
-                    if (output.items.len >= edge_limit) return error.QueryCandidateBudgetExceeded;
+                    if (output.items.len >= edge_limit) return error.GraphExploredEdgesBudgetExceeded;
                     const edge_bytes = graphEdgeOwnedBytes(edge);
-                    if (edge_bytes > byte_limit -| owned_bytes.*) return error.QueryCandidateBudgetExceeded;
+                    if (edge_bytes > byte_limit -| owned_bytes.*) return error.GraphExploredEdgeBytesBudgetExceeded;
                     const cloned = try cloneOwnedGraphEdge(alloc, edge);
                     var cloned_owned = true;
                     errdefer if (cloned_owned) graph_mod.GraphIndex.freeEdge(alloc, cloned);
@@ -1825,7 +1924,9 @@ const DistributedEdgeReader = struct {
                     // exactness without multiplying transient memory by fanout.
                     for (slots[0..wave_len]) |slot| {
                         if (slot.err) |err| switch (err) {
-                            error.QueryCandidateBudgetExceeded => continue,
+                            error.GraphExploredEdgesBudgetExceeded,
+                            error.GraphExploredEdgeBytesBudgetExceeded,
+                            => continue,
                             else => return err,
                         };
                         try Appender.appendCloned(
@@ -1841,7 +1942,8 @@ const DistributedEdgeReader = struct {
                     }
                     for (slots[0..wave_len], routed.group_ids[start..end]) |*slot, group_id| {
                         const slot_err = slot.err orelse continue;
-                        if (slot_err != error.QueryCandidateBudgetExceeded) continue;
+                        if (slot_err != error.GraphExploredEdgesBudgetExceeded and
+                            slot_err != error.GraphExploredEdgeBytesBudgetExceeded) continue;
                         var retry = try self.getEdgesFromGroup(
                             a,
                             table_name,
@@ -1913,10 +2015,11 @@ const DistributedEdgeReader = struct {
         max_edges: usize,
         max_owned_bytes: usize,
     ) !GraphEdgesResponse {
-        if (max_edges == 0 or max_owned_bytes == 0 or
-            max_edges > graph_pattern_mod.default_max_explored_edges or
+        if (max_edges == 0) return error.GraphExploredEdgesBudgetExceeded;
+        if (max_owned_bytes == 0) return error.GraphExploredEdgeBytesBudgetExceeded;
+        if (max_edges > graph_pattern_mod.default_max_explored_edges or
             max_owned_bytes > graph_pattern_mod.default_max_explored_edge_bytes)
-            return error.QueryCandidateBudgetExceeded;
+            return error.InvalidQueryRequest;
         var request_owns_fields = false;
         const index_name = try a.dupe(u8, self.index_name);
         errdefer if (!request_owns_fields) a.free(index_name);
@@ -3175,6 +3278,9 @@ fn executeDistributedKShortestPaths(
             spur_query.query.start_nodes = .{ .keys = &.{spur_start} };
             spur_query.query.query_type = .shortest_path;
             spur_query.query.k = 1;
+            const root_hops: u32 = @intCast(spur_idx);
+            if (root_hops >= graph_query.query.params.max_depth) continue;
+            spur_query.query.params.max_depth = graph_query.query.params.max_depth - root_hops;
 
             var spur = try findDistributedShortestPath(
                 alloc,
@@ -3203,6 +3309,11 @@ fn executeDistributedKShortestPaths(
             );
             var total_path_owned = true;
             errdefer if (total_path_owned) graph_paths_mod.freePath(alloc, total_path);
+            if (total_path.length > graph_query.query.params.max_depth) {
+                graph_paths_mod.freePath(alloc, total_path);
+                total_path_owned = false;
+                continue;
+            }
             const pkey = try graphPathToKey(alloc, total_path);
             if (!seen_paths.contains(pkey)) {
                 seen_paths.put(alloc, pkey, {}) catch |err| {
@@ -3320,7 +3431,8 @@ fn findDistributedShortestPath(
     const admitted_roots = try frontierAdmissionMaskAlloc(alloc, admission, roots);
     defer alloc.free(admitted_roots);
 
-    var best_cost = graph_node_identity.Map(f64){};
+    const max_depth = graph_query.query.params.max_depth;
+    var best_cost = PathCostLabels.init(max_depth);
     defer best_cost.deinit(alloc);
 
     for (roots, admitted_roots) |item, allowed| {
@@ -3339,28 +3451,24 @@ fn findDistributedShortestPath(
         );
         errdefer owned_item.deinit(alloc);
         try frontier.append(alloc, owned_item);
-        _ = try best_cost.putIfAbsent(
+        _ = try best_cost.recordIfPareto(
             alloc,
             .{ .table = item.table, .key = item.key },
+            item.depth,
             item.cost,
         );
     }
 
-    var settled = graph_node_identity.Map(void){};
-    defer settled.deinit(alloc);
-
-    const max_depth = graph_query.query.params.max_depth;
     while (frontier.items.len > 0) {
         const best_index = popBestFrontierIndex(frontier.items);
         var item = frontier.swapRemove(best_index);
         defer item.deinit(alloc);
 
         const item_ref = graph_node_identity.Ref{ .table = item.table, .key = item.key };
-        if (settled.contains(item_ref)) continue;
+        if (!best_cost.isCurrentPareto(item_ref, item.depth, item.cost)) continue;
         if (excluded_nodes) |set| {
             if (set.contains(item_ref) and item.depth > 0) continue;
         }
-        _ = try settled.putIfAbsent(alloc, item_ref, {});
 
         if (target_set.contains(item.table, item.key) and item.depth > 0) {
             const path_state_id = item.path_state_id orelse return error.InvalidQueryRequest;
@@ -3383,7 +3491,7 @@ fn findDistributedShortestPath(
             table_state.topology_epoch,
         )) orelse return error.TableNotFound;
         const frontier_ids = [_]u32{0};
-        const exclude_node_refs = try collectCombinedExcludeNodes(alloc, &settled, excluded_nodes);
+        const exclude_node_refs = try collectExcludedNodes(alloc, excluded_nodes);
         defer {
             for (exclude_node_refs) |*identity| identity.deinit(alloc);
             if (exclude_node_refs.len > 0) alloc.free(exclude_node_refs);
@@ -3417,19 +3525,17 @@ fn findDistributedShortestPath(
                 node.table,
             );
             const node_ref = graph_node_identity.Ref{ .table = node_table, .key = node.key };
-            if (settled.contains(node_ref)) continue;
             if (excluded_nodes) |set| {
                 if (set.contains(node_ref)) continue;
             }
 
-            const candidate_cost = item.cost + edgeCost(
+            const candidate_cost = item.cost + try edgeCost(
                 item,
                 node,
                 graph_query.query.params.weight_mode,
             );
-            if (best_cost.get(node_ref)) |cost| {
-                if (candidate_cost >= cost) continue;
-            }
+            const candidate_depth = item.depth + 1;
+            if (!try best_cost.recordIfPareto(alloc, node_ref, candidate_depth, candidate_cost)) continue;
             const path_state_id = try appendPathStateFromWeightedStep(
                 alloc,
                 &state,
@@ -3439,11 +3545,6 @@ fn findDistributedShortestPath(
                 graph_query.query.params.weight_mode,
             );
             const path_state = state.path_states.items[path_state_id];
-            if (best_cost.getPtr(node_ref)) |cost| {
-                cost.* = path_state.cost;
-            } else {
-                _ = try best_cost.putIfAbsent(alloc, node_ref, path_state.cost);
-            }
 
             var next_item = try initFrontierState(
                 alloc,
@@ -3661,28 +3762,18 @@ fn collectSeenNodes(
     return out;
 }
 
-fn collectCombinedExcludeNodes(
+fn collectExcludedNodes(
     alloc: std.mem.Allocator,
-    settled: *graph_node_identity.Map(void),
     excluded_nodes: ?*graph_node_identity.Map(void),
 ) ![]GraphNodeIdentity {
-    const extra_count = if (excluded_nodes) |set| set.count() else 0;
-    const out = try alloc.alloc(GraphNodeIdentity, settled.count() + extra_count);
+    const count = if (excluded_nodes) |set| set.count() else 0;
+    const out = try alloc.alloc(GraphNodeIdentity, count);
     var initialized: usize = 0;
     errdefer {
         for (out[0..initialized]) |*identity| identity.deinit(alloc);
         alloc.free(out);
     }
 
-    var settled_it = settled.iterator();
-    while (settled_it.next()) |entry| {
-        out[initialized] = try cloneGraphNodeIdentityParts(
-            alloc,
-            entry.key_ptr.key(),
-            entry.key_ptr.table(),
-        );
-        initialized += 1;
-    }
     if (excluded_nodes) |set| {
         var node_it = set.iterator();
         while (node_it.next()) |entry| {
@@ -5477,16 +5568,8 @@ test "distributed graph canonical MATCH admission excludes retrieval predicates"
     try std.testing.expect(admission.resolved_doc_filter_wire_context == null);
 }
 
-fn edgeCost(_: FrontierState, node: graph_query_mod.GraphResultNode, mode: graph_paths_mod.PathWeightMode) f64 {
-    return switch (mode) {
-        .min_hops => 1.0,
-        .min_weight => edgeWeightFromNode(node),
-        .max_weight => blk: {
-            const weight = edgeWeightFromNode(node);
-            if (weight <= 0.0) break :blk std.math.inf(f64);
-            break :blk -@log(weight);
-        },
-    };
+fn edgeCost(_: FrontierState, node: graph_query_mod.GraphResultNode, mode: graph_paths_mod.PathWeightMode) !f64 {
+    return try graph_paths_mod.pathEdgeCost(mode, edgeWeightFromNode(node));
 }
 
 fn appendPathStateFromWeightedStep(
@@ -5507,7 +5590,7 @@ fn appendPathStateFromWeightedStep(
         node_table,
         parent.depth + 1,
         parent.distance + edgeWeightFromNode(node),
-        parent.cost + edgeCost(parent, node, mode),
+        parent.cost + try edgeCost(parent, node, mode),
         parent_id,
         if (local_path_edges.len > 0) local_path_edges[0] else null,
     );
@@ -7002,7 +7085,7 @@ fn appendPathStateFromStep(
         node_table,
         parent.depth + 1,
         parent.distance + node.distance,
-        parent.cost + edgeCost(parent, node, .min_hops),
+        parent.cost + try edgeCost(parent, node, .min_hops),
         parent_id,
         if (local_path_edges.len > 0) local_path_edges[0] else null,
     );
@@ -8848,7 +8931,7 @@ test "distributed graph edge reader routes outgoing and fans out incoming adjace
     try std.testing.expectEqual(@as(u32, 5), state.calls);
 
     try std.testing.expectError(
-        error.QueryCandidateBudgetExceeded,
+        error.GraphExploredEdgesBudgetExceeded,
         reader.getEdgesBounded(
             alloc,
             null,

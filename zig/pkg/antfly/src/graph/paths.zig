@@ -16,13 +16,13 @@
 //!
 //! Matches Go antfly's graph_paths.go:
 //!   - BFS shortest path (min_hops)
-//!   - Dijkstra's algorithm (min_weight, max_weight)
+//!   - Depth-aware Dijkstra's algorithm (min_weight, max_weight)
 //!   - Yen's k-shortest-paths
 //!
 //! Three weight modes:
 //!   min_hops: unweighted BFS — hop count as distance
-//!   min_weight: Dijkstra sum — minimize sum of edge weights
-//!   max_weight: Dijkstra log — maximize product of edge weights via -log transform
+//!   min_weight: Dijkstra sum — minimize sum of non-negative edge weights
+//!   max_weight: Dijkstra log — maximize product of edge weights in [0, 1]
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -147,6 +147,26 @@ const EdgeIdentityContext = struct {
         hasher.update(value);
     }
 };
+
+const PathStateKey = struct {
+    node: []const u8,
+    hops: u32,
+};
+
+const PathStateKeyContext = struct {
+    pub fn hash(_: @This(), key: PathStateKey) u64 {
+        var hasher = std.hash.Wyhash.init(0x4146_5041_5448_5354);
+        hasher.update(key.node);
+        hasher.update(std.mem.asBytes(&key.hops));
+        return hasher.final();
+    }
+
+    pub fn eql(_: @This(), a: PathStateKey, b: PathStateKey) bool {
+        return a.hops == b.hops and std.mem.eql(u8, a.node, b.node);
+    }
+};
+
+const BestDistanceMap = std.HashMapUnmanaged(PathStateKey, f64, PathStateKeyContext, 80);
 
 const ExcludedEdgeSet = std.HashMapUnmanaged(EdgeIdentity, void, EdgeIdentityContext, 80);
 
@@ -464,13 +484,11 @@ fn dijkstraPath(
         node_pool.deinit(alloc);
     }
 
-    // Best distance seen per node
-    var best_dist = std.StringHashMapUnmanaged(f64).empty;
-    defer {
-        var it = best_dist.keyIterator();
-        while (it.next()) |k| alloc.free(k.*);
-        best_dist.deinit(alloc);
-    }
+    // A cheaper arrival with more hops must not suppress a shallower arrival:
+    // only a label with no greater cost and no greater hop count dominates a
+    // state in a bounded shortest-path query. Keys borrow node_pool storage.
+    var best_dist = BestDistanceMap.empty;
+    defer best_dist.deinit(alloc);
 
     // Priority queue
     var heap = std.PriorityQueue(*PathNode, void, pathNodeLessThan).initContext({});
@@ -486,20 +504,16 @@ fn dijkstraPath(
     };
     try node_pool.append(alloc, start);
     try heap.push(alloc, start);
-    try best_dist.put(alloc, try alloc.dupe(u8, source), 0.0);
+    try best_dist.put(alloc, .{ .node = start.key, .hops = 0 }, 0.0);
 
     while (heap.pop()) |current| {
-        // Found target
-        if (std.mem.eql(u8, current.key, target)) {
-            return try reconstructPath(alloc, current);
-        }
+        if (pathStateDominated(&best_dist, current.key, current.hops, current.distance, true)) continue;
+
+        // Dijkstra may return on settlement because pathEdgeCost guarantees a
+        // non-negative additive cost for every admitted edge.
+        if (std.mem.eql(u8, current.key, target)) return try reconstructPath(alloc, current);
 
         if (opts.max_depth > 0 and current.hops >= opts.max_depth) continue;
-
-        // Skip if we've already found a better path to this node
-        if (best_dist.get(current.key)) |bd| {
-            if (current.distance > bd) continue;
-        }
 
         const edges = try edge_reader.getEdges(alloc, current.key, opts.direction);
         defer edge_reader.freeEdges(alloc, edges);
@@ -563,28 +577,14 @@ fn dijkstraPath(
                 }
             }
 
-            const new_dist = switch (opts.weight_mode) {
-                .min_weight => current.distance + edge.weight,
-                .max_weight => blk: {
-                    if (edge.weight <= 0.0) continue; // log(0) undefined
-                    break :blk current.distance + (-@log(edge.weight));
-                },
-                .min_hops => unreachable,
-            };
-
-            const existing = best_dist.get(next_key);
-            if (existing == null or new_dist < existing.?) {
-                if (existing == null) {
-                    try best_dist.put(alloc, try alloc.dupe(u8, next_key), new_dist);
-                } else {
-                    best_dist.getPtr(next_key).?.* = new_dist;
-                }
-
+            const new_dist = current.distance + try pathEdgeCost(opts.weight_mode, edge.weight);
+            const next_hops = current.hops + 1;
+            if (!pathStateDominated(&best_dist, next_key, next_hops, new_dist, false)) {
                 const node = try alloc.create(PathNode);
                 node.* = .{
                     .key = try alloc.dupe(u8, next_key),
                     .distance = new_dist,
-                    .hops = current.hops + 1,
+                    .hops = next_hops,
                     .parent = current,
                     .parent_edge = .{
                         .source = try alloc.dupe(u8, edge.source),
@@ -595,6 +595,7 @@ fn dijkstraPath(
                     },
                 };
                 try node_pool.append(alloc, node);
+                try best_dist.put(alloc, .{ .node = node.key, .hops = next_hops }, new_dist);
                 try heap.push(alloc, node);
             }
         }
@@ -654,7 +655,7 @@ pub fn findKShortestPathsWithEdgeReader(
         return owned;
     }
 
-    // Candidates sorted by total_weight
+    // Candidate ordering follows the requested path objective.
     var candidates = std.ArrayListUnmanaged(Path).empty;
     defer {
         for (candidates.items) |p| freePath(alloc, p);
@@ -717,13 +718,20 @@ pub fn findKShortestPathsWithEdgeReader(
                 }
             }
 
-            // Find spur path
+            var spur_opts = opts;
+            if (opts.max_depth > 0) {
+                const root_hops: u32 = @intCast(spur_idx);
+                if (root_hops >= opts.max_depth) continue;
+                spur_opts.max_depth = opts.max_depth - root_hops;
+            }
+
+            // Find a spur path within the remaining end-to-end depth budget.
             const spur_path = try findShortestPathWithExclusionsAndEdgeReader(
                 alloc,
                 edge_reader,
                 spur_node,
                 target,
-                opts,
+                spur_opts,
                 &excluded_nodes,
                 &excluded_edges,
             );
@@ -732,6 +740,10 @@ pub fn findKShortestPathsWithEdgeReader(
                 // Build total path = root[0..spur_idx] + spur_path
                 const total_path = try joinPaths(alloc, prev_path, spur_idx, &sp);
                 freePath(alloc, sp);
+                if (opts.max_depth > 0 and total_path.length > opts.max_depth) {
+                    freePath(alloc, total_path);
+                    continue;
+                }
 
                 const pkey = try pathToKey(alloc, &total_path);
                 if (!seen_paths.contains(pkey)) {
@@ -746,10 +758,10 @@ pub fn findKShortestPathsWithEdgeReader(
 
         if (candidates.items.len == 0) break;
 
-        // Find best candidate (lowest total_weight)
+        // Find the best candidate under the same objective as the spur search.
         var best_idx: usize = 0;
         for (candidates.items[1..], 1..) |c, i| {
-            if (c.total_weight < candidates.items[best_idx].total_weight) {
+            if (comparePathScore(&c, &candidates.items[best_idx], opts.weight_mode) == .lt) {
                 best_idx = i;
             }
         }
@@ -780,6 +792,63 @@ fn shouldTraverseEdge(opts: PathFindOptions, edge: *const Edge) bool {
     return true;
 }
 
+pub fn pathEdgeCost(mode: PathWeightMode, weight: f64) !f64 {
+    if (!std.math.isFinite(weight)) return switch (mode) {
+        .min_weight => error.GraphMinWeightDomainViolation,
+        .max_weight => error.GraphMaxWeightDomainViolation,
+        .min_hops => 1.0,
+    };
+    return switch (mode) {
+        .min_hops => 1.0,
+        .min_weight => if (weight >= 0.0) weight else error.GraphMinWeightDomainViolation,
+        .max_weight => if (weight < 0.0 or weight > 1.0)
+            error.GraphMaxWeightDomainViolation
+        else if (weight == 0.0)
+            std.math.inf(f64)
+        else
+            -@log(weight),
+    };
+}
+
+fn pathStateDominated(
+    best_dist: *const BestDistanceMap,
+    node: []const u8,
+    hops: u32,
+    distance: f64,
+    exact_state_is_current: bool,
+) bool {
+    var candidate_hops: u32 = 0;
+    while (candidate_hops <= hops) : (candidate_hops += 1) {
+        const best = best_dist.get(.{ .node = node, .hops = candidate_hops }) orelse continue;
+        if (candidate_hops == hops and exact_state_is_current) {
+            if (best < distance) return true;
+        } else if (best <= distance) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn pathScore(path: *const Path, mode: PathWeightMode) f64 {
+    return switch (mode) {
+        .min_hops => @floatFromInt(path.length),
+        .min_weight => path.total_weight,
+        .max_weight => blk: {
+            var score: f64 = 0.0;
+            for (path.edges) |edge| {
+                score += pathEdgeCost(.max_weight, edge.weight) catch return std.math.inf(f64);
+            }
+            break :blk score;
+        },
+    };
+}
+
+fn comparePathScore(a: *const Path, b: *const Path, mode: PathWeightMode) std.math.Order {
+    const score_order = std.math.order(pathScore(a, mode), pathScore(b, mode));
+    if (score_order != .eq) return score_order;
+    return std.math.order(a.length, b.length);
+}
+
 test "path weight filters preserve explicit zero bounds" {
     const zero = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0, .created_at = 0, .updated_at = 0, .metadata = "" };
     const positive = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
@@ -788,6 +857,28 @@ test "path weight filters preserve explicit zero bounds" {
     try std.testing.expect(!shouldTraverseEdge(.{ .max_weight = 0 }, &positive));
     try std.testing.expect(shouldTraverseEdge(.{ .max_weight = 0 }, &negative));
     try std.testing.expect(!shouldTraverseEdge(.{ .min_weight = 0 }, &negative));
+}
+
+test "path scoring follows the selected objective" {
+    const one_edge = [_]PathEdge{.{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.5 }};
+    const two_edges = [_]PathEdge{
+        .{ .source = "a", .target = "c", .edge_type = "e", .weight = 0.9 },
+        .{ .source = "c", .target = "b", .edge_type = "e", .weight = 0.9 },
+    };
+    const one_hop = Path{ .nodes = &.{}, .edges = @constCast(one_edge[0..]), .total_weight = 0.5, .length = 1 };
+    const two_hops = Path{ .nodes = &.{}, .edges = @constCast(two_edges[0..]), .total_weight = 1.8, .length = 2 };
+
+    try std.testing.expectEqual(std.math.Order.lt, comparePathScore(&one_hop, &two_hops, .min_hops));
+    try std.testing.expectEqual(std.math.Order.lt, comparePathScore(&one_hop, &two_hops, .min_weight));
+    try std.testing.expectEqual(std.math.Order.gt, comparePathScore(&one_hop, &two_hops, .max_weight));
+}
+
+test "weighted path costs reject domains that violate Dijkstra invariants" {
+    try std.testing.expectError(error.GraphMinWeightDomainViolation, pathEdgeCost(.min_weight, -0.1));
+    try std.testing.expectError(error.GraphMaxWeightDomainViolation, pathEdgeCost(.max_weight, -0.1));
+    try std.testing.expectError(error.GraphMaxWeightDomainViolation, pathEdgeCost(.max_weight, 1.1));
+    try std.testing.expectEqual(@as(f64, 1.1), try pathEdgeCost(.min_weight, 1.1));
+    try std.testing.expect(std.math.isInf(try pathEdgeCost(.max_weight, 0.0)));
 }
 
 fn reconstructPath(alloc: Allocator, end_node: *PathNode) !Path {
@@ -879,6 +970,7 @@ fn joinPaths(alloc: Allocator, root: *const Path, spur_idx: usize, spur: *const 
             .target = try alloc.dupe(u8, root.edges[i].target),
             .edge_type = try alloc.dupe(u8, root.edges[i].edge_type),
             .weight = root.edges[i].weight,
+            .metadata = if (root.edges[i].metadata.len > 0) try alloc.dupe(u8, root.edges[i].metadata) else "",
         };
     }
 
@@ -892,6 +984,7 @@ fn joinPaths(alloc: Allocator, root: *const Path, spur_idx: usize, spur: *const 
             .target = try alloc.dupe(u8, e.target),
             .edge_type = try alloc.dupe(u8, e.edge_type),
             .weight = e.weight,
+            .metadata = if (e.metadata.len > 0) try alloc.dupe(u8, e.metadata) else "",
         };
     }
 
@@ -1085,6 +1178,35 @@ test "shortest path max_depth" {
     try std.testing.expectEqual(@as(u32, 3), path2.?.length);
 }
 
+test "bounded weighted shortest path preserves shallower Pareto labels" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const store_path = tmpPath(&sb, "weighted-depth-label-s");
+    defer cleanupTmp(store_path);
+    var rb: [256]u8 = undefined;
+    const reverse_path = tmpPath(&rb, "weighted-depth-label-r");
+    defer cleanupTmp(reverse_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, reverse_path, "test", .{});
+    defer graph.close();
+
+    try graph.addEdge("A", "X", "e", 1.0, 0, 0, "");
+    try graph.addEdge("A", "Y", "e", 0.0, 0, 0, "");
+    try graph.addEdge("Y", "X", "e", 0.0, 0, 0, "");
+    try graph.addEdge("X", "T", "e", 0.0, 0, 0, "");
+
+    const path = try findShortestPath(alloc, &graph, "A", "T", .{
+        .weight_mode = .min_weight,
+        .max_depth = 2,
+    });
+    try std.testing.expect(path != null);
+    defer freePath(alloc, path.?);
+    try std.testing.expectEqual(@as(u32, 2), path.?.length);
+    try std.testing.expectEqualStrings("X", path.?.nodes[1]);
+}
+
 test "shortest path edge type filter" {
     const alloc = std.testing.allocator;
     var sb1: [256]u8 = undefined;
@@ -1145,6 +1267,34 @@ test "k shortest paths" {
     try std.testing.expectEqual(@as(u32, 2), found_paths[0].length);
     try std.testing.expect(found_paths[0].total_weight <= found_paths[1].total_weight);
     try std.testing.expect(found_paths[1].total_weight <= found_paths[2].total_weight);
+}
+
+test "k shortest paths apply max_depth to the complete candidate" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const store_path = tmpPath(&sb, "k-path-depth-s");
+    defer cleanupTmp(store_path);
+    var rb: [256]u8 = undefined;
+    const reverse_path = tmpPath(&rb, "k-path-depth-r");
+    defer cleanupTmp(reverse_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, reverse_path, "test", .{});
+    defer graph.close();
+
+    try graph.addEdge("A", "B", "e", 1.0, 0, 0, "");
+    try graph.addEdge("B", "T", "e", 1.0, 0, 0, "");
+    try graph.addEdge("B", "C", "e", 1.0, 0, 0, "");
+    try graph.addEdge("C", "T", "e", 1.0, 0, 0, "");
+
+    const found = try findKShortestPaths(alloc, &graph, "A", "T", 2, .{
+        .weight_mode = .min_weight,
+        .max_depth = 2,
+    });
+    defer freePaths(alloc, found);
+    try std.testing.expectEqual(@as(usize, 1), found.len);
+    try std.testing.expectEqual(@as(u32, 2), found[0].length);
 }
 
 test "k shortest paths exclude stored edge orientation for incoming traversal" {

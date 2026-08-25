@@ -1050,6 +1050,8 @@ pub const AntflyApiHandler = struct {
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
             error.QueryCandidateBudgetExceeded => textResponse(ctx, 422, "query candidate budget exceeded"),
+            error.GraphExploredEdgesBudgetExceeded => textResponse(ctx, 422, "graph explored edges budget exceeded"),
+            error.GraphExploredEdgeBytesBudgetExceeded => textResponse(ctx, 422, "graph explored edge bytes budget exceeded"),
             else => textResponse(ctx, 500, "internal server error"),
         };
     }

@@ -21,6 +21,8 @@ const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_query_mod = @import("../graph/query.zig");
+const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
+const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
@@ -126,6 +128,9 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         QueryCandidateBudgetExceeded,
+        GraphWorkBudgetExceeded,
+        GraphMinWeightDomainViolation,
+        GraphMaxWeightDomainViolation,
         GraphDistinctBudgetExceeded,
         GraphAnchorFilterRequiresIndex,
         GraphMatchOperationLimitExceeded,
@@ -783,6 +788,45 @@ fn queryCandidateBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+pub fn graphWorkBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = graph_work_budget_diagnostic.take() orelse graph_work_budget_diagnostic.Diagnostic{
+        .operation = "$request",
+        .mode = "graph_queries",
+        .dimension = .explored_edges,
+        .maximum = graph_pattern_mod.default_max_explored_edges,
+    };
+    const dimension = graph_work_budget_diagnostic.dimensionName(diagnostic.dimension);
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_work_budget_exceeded",
+        .message = "exact graph execution exceeded its bounded work budget",
+        .retryable = false,
+        .operation = diagnostic.operation,
+        .mode = diagnostic.mode,
+        .dimension = dimension,
+        .maximum = diagnostic.maximum,
+        .remediation = "narrow the operation's anchor/filter, reduce path breadth or depth, or split the query",
+    }, .{});
+}
+
+pub fn graphPathWeightDomainErrorBody(alloc: std.mem.Allocator) ![]u8 {
+    const diagnostic = graph_path_weight_diagnostic.take() orelse graph_path_weight_diagnostic.Diagnostic{
+        .operation = "$request",
+        .mode = "weighted_path",
+        .allowed_range = "mode-dependent",
+    };
+    return try std.json.Stringify.valueAlloc(alloc, .{
+        .status = @as(u16, 422),
+        .@"error" = "graph_path_weight_domain_error",
+        .message = "an eligible edge weight is outside the path algorithm's exact domain",
+        .retryable = false,
+        .operation = diagnostic.operation,
+        .mode = diagnostic.mode,
+        .allowed_range = diagnostic.allowed_range,
+        .remediation = "normalize edge weights or select a compatible path weight mode",
+    }, .{});
+}
+
 pub fn graphDistinctBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
@@ -1154,6 +1198,8 @@ pub fn handleTableQueryRequest(
 
     db_mod.resetLastSortRejectionDiagnostic();
     graph_query_diagnostic.reset();
+    graph_work_budget_diagnostic.reset();
+    graph_path_weight_diagnostic.reset();
     query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
         error.InvalidQueryRequest => {
             std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
@@ -1225,6 +1271,14 @@ pub fn handleTableQueryRequest(
             error.QueryCandidateBudgetExceeded => {
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
                 return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc) };
+            },
+            error.GraphWorkBudgetExceeded => {
+                std.log.warn("public table graph work budget exceeded table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphWorkBudgetExceededBody(alloc), .json = true };
+            },
+            error.GraphMinWeightDomainViolation, error.GraphMaxWeightDomainViolation => {
+                std.log.warn("public table graph path weight domain violation table={s}", .{table_name});
+                return .{ .status = 422, .body = try graphPathWeightDomainErrorBody(alloc), .json = true };
             },
             error.GraphDistinctBudgetExceeded => {
                 std.log.warn("public table graph distinct budget exceeded table={s}", .{table_name});
@@ -3517,6 +3571,8 @@ test "public table query handler maps candidate budget exhaustion" {
 
 test "public table query handler maps exact graph execution failures" {
     const Kind = enum {
+        work_budget,
+        path_weight_domain,
         distinct_budget,
         anchor_filter,
         match_operation_limit,
@@ -3555,6 +3611,19 @@ test "public table query handler maps exact graph execution failures" {
         ) TableApi.ExecuteQueryError![]u8 {
             const kind: *Kind = @ptrCast(@alignCast(ptr));
             return switch (kind.*) {
+                .work_budget => {
+                    graph_work_budget_diagnostic.record("pattern", .{
+                        .query_type = .pattern,
+                        .index_name = "relationships",
+                        .start_nodes = .{ .keys = &.{} },
+                        .match_pattern = .{ .nodes = &.{}, .edges = &.{} },
+                    }, .{ .dimension = .intermediate_states, .maximum = 100_000 });
+                    return error.GraphWorkBudgetExceeded;
+                },
+                .path_weight_domain => {
+                    graph_path_weight_diagnostic.record("strongest", error.GraphMaxWeightDomainViolation);
+                    return error.GraphMaxWeightDomainViolation;
+                },
                 .distinct_budget => error.GraphDistinctBudgetExceeded,
                 .anchor_filter => error.GraphAnchorFilterRequiresIndex,
                 .match_operation_limit => error.GraphMatchOperationLimitExceeded,
@@ -3576,7 +3645,60 @@ test "public table query handler maps exact graph execution failures" {
         }
     };
 
-    var kind = Kind.distinct_budget;
+    var kind = Kind.work_budget;
+    var work_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"query\":{\"match_all\":{}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer work_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), work_resp.status);
+    var work = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        work_resp.body,
+        .{},
+    );
+    defer work.deinit();
+    const work_error = switch (work.value) {
+        .graph_work_budget_exceeded_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!work_error.retryable);
+    try std.testing.expectEqualStrings("pattern", work_error.operation);
+    try std.testing.expectEqualStrings("match", work_error.mode);
+    try std.testing.expectEqualStrings("intermediate_states", work_error.dimension);
+    try std.testing.expectEqual(@as(i64, 100_000), work_error.maximum);
+
+    kind = .path_weight_domain;
+    var weight_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{\"query\":{\"match_all\":{}}}",
+        null,
+        Backend.iface(&kind),
+    );
+    defer weight_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), weight_resp.status);
+    var weight = try ant_json.parseFromSlice(
+        metadata_openapi.QueryUnprocessableError,
+        std.testing.allocator,
+        weight_resp.body,
+        .{},
+    );
+    defer weight.deinit();
+    const weight_error = switch (weight.value) {
+        .graph_path_weight_domain_error => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(!weight_error.retryable);
+    try std.testing.expectEqualStrings("strongest", weight_error.operation);
+    try std.testing.expectEqualStrings("max_weight", weight_error.mode);
+    try std.testing.expectEqualStrings("[0,1]", weight_error.allowed_range);
+
+    kind = .distinct_budget;
     var resp = try handleTableQueryRequest(
         std.testing.allocator,
         "docs",

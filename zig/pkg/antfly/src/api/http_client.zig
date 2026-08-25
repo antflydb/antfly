@@ -3055,9 +3055,10 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
 
 fn remoteGraphEdgesError(body: []const u8) anyerror {
     const message = std.mem.trim(u8, body, " \t\r\n");
-    if (std.mem.eql(u8, message, "query candidate budget exceeded")) {
-        return error.QueryCandidateBudgetExceeded;
-    }
+    if (std.mem.eql(u8, message, "graph explored edges budget exceeded"))
+        return error.GraphExploredEdgesBudgetExceeded;
+    if (std.mem.eql(u8, message, "graph explored edge bytes budget exceeded"))
+        return error.GraphExploredEdgeBytesBudgetExceeded;
     return error.UnexpectedHttpStatus;
 }
 
@@ -3138,8 +3139,12 @@ test "api http client preserves remote storage read contention" {
 
 test "api http client preserves remote graph edge budget exhaustion" {
     try std.testing.expectEqual(
-        error.QueryCandidateBudgetExceeded,
-        remoteGraphEdgesError("query candidate budget exceeded\n"),
+        error.GraphExploredEdgesBudgetExceeded,
+        remoteGraphEdgesError("graph explored edges budget exceeded\n"),
+    );
+    try std.testing.expectEqual(
+        error.GraphExploredEdgeBytesBudgetExceeded,
+        remoteGraphEdgesError("graph explored edge bytes budget exceeded\n"),
     );
     try std.testing.expectEqual(
         error.UnexpectedHttpStatus,

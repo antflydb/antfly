@@ -2929,7 +2929,7 @@ pub const Edge = struct {
     target: []const u8,
     /// Edge type (e.g., "cites", "similar_to", "authored_by")
     type: []const u8,
-    /// Edge weight/confidence (0.0 to 1.0)
+    /// Finite non-negative edge cost or confidence. The max_weight path mode additionally requires values in [0,1].
     weight: f64,
     /// When the edge was created
     created_at: ?[]const u8 = null,
@@ -5040,6 +5040,7 @@ pub const GraphPath = struct {
     nodes: []const GraphPathEndpoint,
     /// Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
     edges: []const GraphPathEdge,
+    /// Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
     total_weight: f64,
     length: i64,
 };
@@ -5057,6 +5058,20 @@ pub const GraphPathEndpoint = struct {
     key: []const u8,
     /// Optional table qualifier for an exact cross-table node identity. Omit for the query table.
     table: ?[]const u8 = null,
+};
+
+pub const GraphPathWeightDomainError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Named shortest-path operation that encountered the incompatible edge weight.
+    operation: []const u8,
+    mode: []const u8,
+    /// Required edge-weight interval for exact execution in the selected mode.
+    allowed_range: []const u8,
+    /// Stable user-facing guidance for correcting the graph or query.
+    remediation: []const u8,
 };
 
 pub const GraphQuery = union(enum) {
@@ -5525,6 +5540,23 @@ pub const GraphWhereNotEqual = struct {
 
 pub const GraphWhereNotExists = struct {
     not_exists: GraphNotExistsPattern,
+};
+
+pub const GraphWorkBudgetExceededError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Named graph operation whose exact execution exhausted the request budget.
+    operation: []const u8,
+    /// Graph operation mode, such as match or pattern.
+    mode: []const u8,
+    /// Bounded resource exhausted by the operation.
+    dimension: []const u8,
+    /// Configured request ceiling for the exhausted resource.
+    maximum: i64,
+    /// Stable user-facing guidance for reducing graph work.
+    remediation: []const u8,
 };
 
 /// Ground truth data for evaluation
@@ -8146,6 +8178,7 @@ pub const Path = struct {
     /// Ordered list of node keys (base64-encoded)
     nodes: ?[]const []const u8 = null,
     edges: ?[]const PathEdge = null,
+    /// Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
     total_weight: ?f64 = null,
     length: ?i64 = null,
 };
@@ -8211,7 +8244,7 @@ pub const PathFindWeightMode = enum {
     }
 };
 
-/// Path weighting algorithm for pathfinding: - min_hops: Minimize number of edges - min_weight: Minimize sum of edge weights - max_weight: Maximize product of edge weights
+/// Path weighting algorithm for pathfinding: - min_hops: Minimize number of edges - min_weight: Minimize sum of finite non-negative edge weights - max_weight: Maximize product of finite edge weights in [0,1]
 pub const PathWeightMode = enum {
     min_hops,
     min_weight,
@@ -8972,6 +9005,8 @@ pub const QueryUnprocessableError = union(enum) {
     exact_sort_error: ExactSortError,
     query_candidate_budget_exceeded_error: QueryCandidateBudgetExceededError,
     graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
+    graph_work_budget_exceeded_error: GraphWorkBudgetExceededError,
+    graph_path_weight_domain_error: GraphPathWeightDomainError,
     graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
     graph_query_mode_unsupported_error: GraphQueryModeUnsupportedError,
     graph_match_operation_limit_exceeded_error: GraphMatchOperationLimitExceededError,
@@ -8992,6 +9027,12 @@ pub const QueryUnprocessableError = union(enum) {
         }
         if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
             return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromSliceLeaky(GraphDistinctBudgetExceededError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_work_budget_exceeded")) {
+            return .{ .graph_work_budget_exceeded_error = try std.json.parseFromSliceLeaky(GraphWorkBudgetExceededError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_path_weight_domain_error")) {
+            return .{ .graph_path_weight_domain_error = try std.json.parseFromSliceLeaky(GraphPathWeightDomainError, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
@@ -9028,6 +9069,12 @@ pub const QueryUnprocessableError = union(enum) {
         if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
             return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromValueLeaky(GraphDistinctBudgetExceededError, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "graph_work_budget_exceeded")) {
+            return .{ .graph_work_budget_exceeded_error = try std.json.parseFromValueLeaky(GraphWorkBudgetExceededError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_path_weight_domain_error")) {
+            return .{ .graph_path_weight_domain_error = try std.json.parseFromValueLeaky(GraphPathWeightDomainError, allocator, source, options) };
+        }
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
         }
@@ -9045,6 +9092,8 @@ pub const QueryUnprocessableError = union(enum) {
             .exact_sort_error => |v| try jw.write(v),
             .query_candidate_budget_exceeded_error => |v| try jw.write(v),
             .graph_distinct_budget_exceeded_error => |v| try jw.write(v),
+            .graph_work_budget_exceeded_error => |v| try jw.write(v),
+            .graph_path_weight_domain_error => |v| try jw.write(v),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
             .graph_query_mode_unsupported_error => |v| try jw.write(v),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v),
@@ -10791,7 +10840,7 @@ pub const TraversalResult = struct {
     path: ?[]const []const u8 = null,
     /// Sequence of edges from start to this node (if include_paths=true)
     path_edges: ?[]const Edge = null,
-    /// Product of edge weights along the path
+    /// Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
     total_weight: ?f64 = null,
 };
 

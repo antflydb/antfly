@@ -44,8 +44,8 @@ class GraphKShortestPaths:
         max_weight (float | Unset):
         weight_mode (PathWeightMode | Unset): Path weighting algorithm for pathfinding:
             - min_hops: Minimize number of edges
-            - min_weight: Minimize sum of edge weights
-            - max_weight: Maximize product of edge weights
+            - min_weight: Minimize sum of finite non-negative edge weights
+            - max_weight: Maximize product of finite edge weights in [0,1]
         filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
             GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
             GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |

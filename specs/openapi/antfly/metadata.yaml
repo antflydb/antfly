@@ -1881,6 +1881,69 @@ components:
           type: integer
           format: uint64
           description: Maximum identity payload bytes retained by one request.
+    GraphWorkBudgetExceededError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, retryable, operation, mode, dimension, maximum, remediation]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [graph_work_budget_exceeded]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+        operation:
+          type: string
+          description: Named graph operation whose exact execution exhausted the request budget.
+        mode:
+          type: string
+          description: Graph operation mode, such as match or pattern.
+        dimension:
+          type: string
+          enum: [explored_nodes, explored_edges, explored_edge_bytes, intermediate_states]
+          description: Bounded resource exhausted by the operation.
+        maximum:
+          type: integer
+          format: uint64
+          description: Configured request ceiling for the exhausted resource.
+        remediation:
+          type: string
+          description: Stable user-facing guidance for reducing graph work.
+    GraphPathWeightDomainError:
+      type: object
+      additionalProperties: false
+      required: [status, error, message, retryable, operation, mode, allowed_range, remediation]
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum: [422]
+        error:
+          type: string
+          enum: [graph_path_weight_domain_error]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [false]
+        operation:
+          type: string
+          description: Named shortest-path operation that encountered the incompatible edge weight.
+        mode:
+          type: string
+          enum: [min_weight, max_weight, weighted_path]
+        allowed_range:
+          type: string
+          description: Required edge-weight interval for exact execution in the selected mode.
+        remediation:
+          type: string
+          description: Stable user-facing guidance for correcting the graph or query.
     GraphAnchorFilterRequiresIndexError:
       type: object
       additionalProperties: false
@@ -1968,6 +2031,8 @@ components:
         - $ref: '#/components/schemas/ExactSortError'
         - $ref: '#/components/schemas/QueryCandidateBudgetExceededError'
         - $ref: '#/components/schemas/GraphDistinctBudgetExceededError'
+        - $ref: '#/components/schemas/GraphWorkBudgetExceededError'
+        - $ref: '#/components/schemas/GraphPathWeightDomainError'
         - $ref: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
         - $ref: '#/components/schemas/GraphQueryModeUnsupportedError'
         - $ref: '#/components/schemas/GraphMatchOperationLimitExceededError'
@@ -1977,6 +2042,8 @@ components:
           unsupported_exact_sort: '#/components/schemas/ExactSortError'
           query_candidate_budget_exceeded: '#/components/schemas/QueryCandidateBudgetExceededError'
           graph_distinct_budget_exceeded: '#/components/schemas/GraphDistinctBudgetExceededError'
+          graph_work_budget_exceeded: '#/components/schemas/GraphWorkBudgetExceededError'
+          graph_path_weight_domain_error: '#/components/schemas/GraphPathWeightDomainError'
           graph_anchor_filter_requires_index: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
           graph_query_mode_unsupported: '#/components/schemas/GraphQueryModeUnsupportedError'
           graph_match_operation_limit_exceeded: '#/components/schemas/GraphMatchOperationLimitExceededError'

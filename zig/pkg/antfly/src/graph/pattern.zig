@@ -20,6 +20,7 @@ const NodeRef = @import("node_admission.zig").NodeRef;
 const paths_mod = @import("paths.zig");
 const traversal_mod = @import("traversal.zig");
 const node_identity = @import("node_identity.zig");
+const work_budget_diagnostic = @import("work_budget_diagnostic.zig");
 
 pub const max_pattern_steps: usize = 64;
 pub const max_pattern_hops: u32 = 64;
@@ -228,12 +229,19 @@ pub const MatchOptions = struct {
 };
 
 pub const WorkBudget = struct {
+    max_nodes: usize,
+    max_edges: usize,
+    max_edge_bytes: usize,
     remaining_nodes: usize,
     remaining_edges: usize,
     remaining_edge_bytes: usize,
+    last_exhaustion: ?work_budget_diagnostic.Exhaustion = null,
 
     pub fn init(max_nodes: usize, max_edges: usize) WorkBudget {
         return .{
+            .max_nodes = max_nodes,
+            .max_edges = max_edges,
+            .max_edge_bytes = default_max_explored_edge_bytes,
             .remaining_nodes = max_nodes,
             .remaining_edges = max_edges,
             .remaining_edge_bytes = default_max_explored_edge_bytes,
@@ -249,18 +257,31 @@ pub const WorkBudget = struct {
     }
 
     fn consumeNode(self: *WorkBudget) !void {
-        if (self.remaining_nodes == 0) return error.QueryCandidateBudgetExceeded;
+        if (self.remaining_nodes == 0) return self.exhaust(.explored_nodes, self.max_nodes);
         self.remaining_nodes -= 1;
     }
 
     fn consumeEdges(self: *WorkBudget, count: usize) !void {
-        if (count > self.remaining_edges) return error.QueryCandidateBudgetExceeded;
+        if (count > self.remaining_edges) return self.exhaust(.explored_edges, self.max_edges);
         self.remaining_edges -= count;
     }
 
     fn consumeEdgeBytes(self: *WorkBudget, bytes: usize) !void {
-        if (bytes > self.remaining_edge_bytes) return error.QueryCandidateBudgetExceeded;
+        if (bytes > self.remaining_edge_bytes) return self.exhaust(.explored_edge_bytes, self.max_edge_bytes);
         self.remaining_edge_bytes -= bytes;
+    }
+
+    fn checkIntermediateStates(self: *WorkBudget, count: usize, maximum: usize) !void {
+        if (count > maximum) return self.exhaust(.intermediate_states, maximum);
+    }
+
+    fn exhaust(self: *WorkBudget, dimension: work_budget_diagnostic.Dimension, maximum: usize) error{GraphWorkBudgetExceeded} {
+        self.last_exhaustion = .{ .dimension = dimension, .maximum = maximum };
+        return error.GraphWorkBudgetExceeded;
+    }
+
+    pub fn exhaustion(self: WorkBudget) ?work_budget_diagnostic.Exhaustion {
+        return self.last_exhaustion;
     }
 };
 
@@ -310,7 +331,7 @@ fn getEdgesForBudget(
     source_table_declared: bool,
 ) ![]graph_mod.Edge {
     if (comptime @hasDecl(@TypeOf(edge_reader), "getEdgesBoundedForPattern")) {
-        return try edge_reader.getEdgesBoundedForPattern(
+        return edge_reader.getEdgesBoundedForPattern(
             alloc,
             table,
             key,
@@ -319,10 +340,19 @@ fn getEdgesForBudget(
             work_budget.edgeLimit(),
             work_budget.edgeByteLimit(),
             source_table_declared,
-        );
+        ) catch |err| {
+            const widened: anyerror = err;
+            if (widened == error.GraphExploredEdgesBudgetExceeded)
+                return work_budget.exhaust(.explored_edges, work_budget.max_edges);
+            if (widened == error.GraphExploredEdgeBytesBudgetExceeded)
+                return work_budget.exhaust(.explored_edge_bytes, work_budget.max_edge_bytes);
+            if (widened == error.QueryCandidateBudgetExceeded)
+                return work_budget.exhaust(.explored_edges, work_budget.max_edges);
+            return err;
+        };
     }
     if (comptime @hasDecl(@TypeOf(edge_reader), "getEdgesBounded")) {
-        return try edge_reader.getEdgesBounded(
+        return edge_reader.getEdgesBounded(
             alloc,
             table,
             key,
@@ -330,14 +360,24 @@ fn getEdgesForBudget(
             direction,
             work_budget.edgeLimit(),
             work_budget.edgeByteLimit(),
-        );
+        ) catch |err| {
+            const widened: anyerror = err;
+            if (widened == error.GraphExploredEdgesBudgetExceeded)
+                return work_budget.exhaust(.explored_edges, work_budget.max_edges);
+            if (widened == error.GraphExploredEdgeBytesBudgetExceeded)
+                return work_budget.exhaust(.explored_edge_bytes, work_budget.max_edge_bytes);
+            if (widened == error.QueryCandidateBudgetExceeded)
+                return work_budget.exhaust(.explored_edges, work_budget.max_edges);
+            return err;
+        };
     }
     return try edge_reader.getEdges(alloc, table, key, edge_types, direction);
 }
 
 fn consumeMaterializedEdges(work_budget: *WorkBudget, edges: []const graph_mod.Edge) !void {
     try work_budget.consumeEdges(edges.len);
-    try work_budget.consumeEdgeBytes(try edgeOwnedBytes(edges));
+    const bytes = edgeOwnedBytes(edges) catch return work_budget.exhaust(.explored_edge_bytes, work_budget.max_edge_bytes);
+    try work_budget.consumeEdgeBytes(bytes);
 }
 
 pub fn isValidIdentifier(value: []const u8) bool {
@@ -612,8 +652,7 @@ pub fn matchPatternFromRefsWithEdgeReader(
             alloc.free(bindings);
             return err;
         };
-        if (current.items.len > intermediate_limit)
-            return error.QueryCandidateBudgetExceeded;
+        try work_budget.checkIntermediateStates(current.items.len, intermediate_limit);
     }
 
     for (1..pattern.len) |step_idx| {
@@ -694,8 +733,7 @@ pub fn matchPatternFromRefsWithEdgeReader(
                 });
                 state_owned = false;
 
-                if (next.items.len > intermediate_limit)
-                    return error.QueryCandidateBudgetExceeded;
+                try work_budget.checkIntermediateStates(next.items.len, intermediate_limit);
             }
         }
 
@@ -833,8 +871,7 @@ fn matchExactTwoEdgePattern(
             .middle_key = middle_key,
             .forward_edge_index = edge_index,
         });
-        if (candidates.items.len > intermediate_limit)
-            return error.QueryCandidateBudgetExceeded;
+        try work_budget.checkIntermediateStates(candidates.items.len, intermediate_limit);
         // Keep the same deterministic first-hop window as generic expansion.
         // The optimizer must not make nodes beyond that window newly visible.
         if (candidates.items.len >= expansion_limit) break;
@@ -876,15 +913,23 @@ fn matchExactTwoEdgePattern(
                 .both => unreachable,
             };
         }
-        const probed_edges = try edge_reader.probeEdgesBounded(
+        const probed_edges = edge_reader.probeEdgesBounded(
             alloc,
             null,
             probes,
             work_budget.edgeByteLimit(),
-        );
+        ) catch |err| {
+            const widened: anyerror = err;
+            if (widened == error.GraphExploredEdgeBytesBudgetExceeded or
+                widened == error.QueryCandidateBudgetExceeded)
+                return work_budget.exhaust(.explored_edge_bytes, work_budget.max_edge_bytes);
+            return err;
+        };
         defer edge_reader.freeProbedEdges(alloc, probed_edges);
         if (probed_edges.len != probes.len) return error.InvalidGraphEdgeProbeResult;
-        try work_budget.consumeEdgeBytes(try probedEdgeOwnedBytes(probed_edges));
+        const probed_bytes = probedEdgeOwnedBytes(probed_edges) catch
+            return work_budget.exhaust(.explored_edge_bytes, work_budget.max_edge_bytes);
+        try work_budget.consumeEdgeBytes(probed_bytes);
 
         for (batch_candidates, probed_edges) |candidate, maybe_backward_edge| {
             // Generic expansion never traverses a self-loop. Keep the
@@ -1573,7 +1618,7 @@ fn buildConjunctiveStates(
             return err;
         };
         try current.append(alloc, .{ .bindings = bindings });
-        if (current.items.len > opts.max_intermediate_states) return error.QueryCandidateBudgetExceeded;
+        try work_budget.checkIntermediateStates(current.items.len, opts.max_intermediate_states);
     }
 
     try expandConjunctiveGroup(alloc, edge_reader, pattern.nodes, pattern.edges, pattern.predicates, &current, opts, work_budget);
@@ -1608,7 +1653,7 @@ fn buildConjunctiveStates(
                 correlated.items.len = 0;
             }
             correlated.deinit(alloc);
-            if (next.items.len > opts.max_intermediate_states) return error.QueryCandidateBudgetExceeded;
+            try work_budget.checkIntermediateStates(next.items.len, opts.max_intermediate_states);
         }
         freeConjunctiveStates(alloc, &current);
         current = next;
@@ -2387,7 +2432,7 @@ fn expandConjunctiveGroup(
         errdefer freeConjunctiveStates(alloc, &next);
         for (states.items) |state| {
             try expandConjunctiveEdge(alloc, edge_reader, group_nodes, edge, state, &next, opts, work_budget);
-            if (next.items.len > opts.max_intermediate_states) return error.QueryCandidateBudgetExceeded;
+            try work_budget.checkIntermediateStates(next.items.len, opts.max_intermediate_states);
         }
         freeConjunctiveStates(alloc, states);
         states.* = next;
@@ -3971,12 +4016,65 @@ test "pattern matching rejects unbounded hops and exploration" {
         }, .{}),
     );
     try std.testing.expectError(
-        error.QueryCandidateBudgetExceeded,
+        error.GraphWorkBudgetExceeded,
         matchPatternWithEdgeReader(std.testing.allocator, Reader{}, starts, &.{
             .{ .alias = "a" },
             .{ .alias = "b" },
         }, .{ .max_explored_edges = 1 }),
     );
+}
+
+test "pattern work budget preserves bounded adjacency exhaustion dimensions" {
+    const Reader = struct {
+        failure: anyerror,
+
+        pub fn getEdgesBounded(
+            self: @This(),
+            _: Allocator,
+            _: ?[]const u8,
+            _: []const u8,
+            _: []const []const u8,
+            _: graph_mod.EdgeDirection,
+            _: usize,
+            _: usize,
+        ) ![]graph_mod.Edge {
+            return self.failure;
+        }
+    };
+
+    var edge_budget = WorkBudget.init(3, 5);
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        getEdgesForBudget(
+            std.testing.allocator,
+            Reader{ .failure = error.GraphExploredEdgesBudgetExceeded },
+            null,
+            "A",
+            &.{},
+            .out,
+            &edge_budget,
+            false,
+        ),
+    );
+    try std.testing.expectEqual(work_budget_diagnostic.Dimension.explored_edges, edge_budget.exhaustion().?.dimension);
+    try std.testing.expectEqual(@as(usize, 5), edge_budget.exhaustion().?.maximum);
+
+    var byte_budget = WorkBudget.init(3, 5);
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        getEdgesForBudget(
+            std.testing.allocator,
+            Reader{ .failure = error.GraphExploredEdgeBytesBudgetExceeded },
+            null,
+            "A",
+            &.{},
+            .out,
+            &byte_budget,
+            false,
+        ),
+    );
+    try std.testing.expectEqual(work_budget_diagnostic.Dimension.explored_edge_bytes, byte_budget.exhaustion().?.dimension);
+    try std.testing.expectEqual(default_max_explored_edge_bytes, byte_budget.exhaustion().?.maximum);
 }
 
 test "pattern matching keeps equal keys from distinct tables" {

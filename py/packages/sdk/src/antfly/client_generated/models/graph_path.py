@@ -20,7 +20,8 @@ class GraphPath:
     Attributes:
         nodes (list[GraphPathEndpoint]): Ordered node identities. Table is omitted for nodes in the query table.
         edges (list[GraphPathEdge]): Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
-        total_weight (float):
+        total_weight (float): Sum of raw edge weights along the path. Path ordering still follows the selected weight
+            mode.
         length (int):
     """
 

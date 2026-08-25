@@ -387,6 +387,10 @@ from .graph_path import GraphPath
 from .graph_path_edge import GraphPathEdge
 from .graph_path_edge_metadata import GraphPathEdgeMetadata
 from .graph_path_endpoint import GraphPathEndpoint
+from .graph_path_weight_domain_error import GraphPathWeightDomainError
+from .graph_path_weight_domain_error_error import GraphPathWeightDomainErrorError
+from .graph_path_weight_domain_error_mode import GraphPathWeightDomainErrorMode
+from .graph_path_weight_domain_error_status import GraphPathWeightDomainErrorStatus
 from .graph_query_mode_unsupported_error import GraphQueryModeUnsupportedError
 from .graph_query_mode_unsupported_error_error import GraphQueryModeUnsupportedErrorError
 from .graph_query_mode_unsupported_error_reason import GraphQueryModeUnsupportedErrorReason
@@ -411,6 +415,10 @@ from .graph_traverse_query import GraphTraverseQuery
 from .graph_where_and import GraphWhereAnd
 from .graph_where_not_equal import GraphWhereNotEqual
 from .graph_where_not_exists import GraphWhereNotExists
+from .graph_work_budget_exceeded_error import GraphWorkBudgetExceededError
+from .graph_work_budget_exceeded_error_dimension import GraphWorkBudgetExceededErrorDimension
+from .graph_work_budget_exceeded_error_error import GraphWorkBudgetExceededErrorError
+from .graph_work_budget_exceeded_error_status import GraphWorkBudgetExceededErrorStatus
 from .ground_truth import GroundTruth
 from .hierarchy_ancestor import HierarchyAncestor
 from .hierarchy_ancestor_document import HierarchyAncestorDocument
@@ -1300,6 +1308,10 @@ __all__ = (
     "GraphPathEdge",
     "GraphPathEdgeMetadata",
     "GraphPathEndpoint",
+    "GraphPathWeightDomainError",
+    "GraphPathWeightDomainErrorError",
+    "GraphPathWeightDomainErrorMode",
+    "GraphPathWeightDomainErrorStatus",
     "GraphQueryModeUnsupportedError",
     "GraphQueryModeUnsupportedErrorError",
     "GraphQueryModeUnsupportedErrorReason",
@@ -1324,6 +1336,10 @@ __all__ = (
     "GraphWhereAnd",
     "GraphWhereNotEqual",
     "GraphWhereNotExists",
+    "GraphWorkBudgetExceededError",
+    "GraphWorkBudgetExceededErrorDimension",
+    "GraphWorkBudgetExceededErrorError",
+    "GraphWorkBudgetExceededErrorStatus",
     "GroundTruth",
     "HierarchyAncestor",
     "HierarchyAncestorDocument",

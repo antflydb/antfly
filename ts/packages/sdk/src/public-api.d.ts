@@ -2979,6 +2979,60 @@ export interface components {
              */
             max_distinct_identity_bytes: number;
         };
+        GraphWorkBudgetExceededError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_work_budget_exceeded";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+            /** @description Named graph operation whose exact execution exhausted the request budget. */
+            operation: string;
+            /** @description Graph operation mode, such as match or pattern. */
+            mode: string;
+            /**
+             * @description Bounded resource exhausted by the operation.
+             * @enum {string}
+             */
+            dimension: "explored_nodes" | "explored_edges" | "explored_edge_bytes" | "intermediate_states";
+            /**
+             * Format: uint64
+             * @description Configured request ceiling for the exhausted resource.
+             */
+            maximum: number;
+            /** @description Stable user-facing guidance for reducing graph work. */
+            remediation: string;
+        };
+        GraphPathWeightDomainError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            error: "graph_path_weight_domain_error";
+            message: string;
+            /** @enum {boolean} */
+            retryable: false;
+            /** @description Named shortest-path operation that encountered the incompatible edge weight. */
+            operation: string;
+            /** @enum {string} */
+            mode: "min_weight" | "max_weight" | "weighted_path";
+            /** @description Required edge-weight interval for exact execution in the selected mode. */
+            allowed_range: string;
+            /** @description Stable user-facing guidance for correcting the graph or query. */
+            remediation: string;
+        };
         GraphAnchorFilterRequiresIndexError: {
             /**
              * Format: int32
@@ -3043,7 +3097,7 @@ export interface components {
              */
             actual: number;
         };
-        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryModeUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphWorkBudgetExceededError"] | components["schemas"]["GraphPathWeightDomainError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryModeUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -7740,7 +7794,7 @@ export interface components {
             type: string;
             /**
              * Format: double
-             * @description Edge weight/confidence (0.0 to 1.0)
+             * @description Finite non-negative edge cost or confidence. The max_weight path mode additionally requires values in [0,1].
              */
             weight: number;
             /**
@@ -7824,7 +7878,7 @@ export interface components {
             path_edges?: components["schemas"]["Edge"][];
             /**
              * Format: double
-             * @description Product of edge weights along the path
+             * @description Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
              */
             total_weight?: number;
         };
@@ -7878,7 +7932,10 @@ export interface components {
             /** @description Ordered list of node keys (base64-encoded) */
             nodes?: string[];
             edges?: components["schemas"]["PathEdge"][];
-            /** Format: double */
+            /**
+             * Format: double
+             * @description Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
+             */
             total_weight?: number;
             length?: number;
         };
@@ -12084,8 +12141,8 @@ export interface components {
         /**
          * @description Path weighting algorithm for pathfinding:
          *     - min_hops: Minimize number of edges
-         *     - min_weight: Minimize sum of edge weights
-         *     - max_weight: Maximize product of edge weights
+         *     - min_weight: Minimize sum of finite non-negative edge weights
+         *     - max_weight: Maximize product of finite edge weights in [0,1]
          * @enum {string}
          */
         PathWeightMode: "min_hops" | "min_weight" | "max_weight";
@@ -12384,7 +12441,10 @@ export interface components {
             nodes: components["schemas"]["GraphPathEndpoint"][];
             /** @description Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1]. */
             edges: components["schemas"]["GraphPathEdge"][];
-            /** Format: double */
+            /**
+             * Format: double
+             * @description Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
+             */
             total_weight: number;
             length: number;
         };

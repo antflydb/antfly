@@ -23,6 +23,7 @@ const graph_paths_mod = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const graph_mod = @import("../graph/graph.zig");
 const graph_node_identity = @import("../graph/node_identity.zig");
+const rfc3339 = @import("../common/rfc3339.zig");
 const fusion_mod = @import("../search/fusion.zig");
 const aggregations_mod = @import("../storage/db/aggregations.zig");
 const public_search_request_mod = @import("public_search_request.zig");
@@ -8929,59 +8930,11 @@ fn parseBlevePrefixLength(value: ?i32) !u8 {
 
 fn parseDateTimeOptionalToNs(text: []const u8) !?u64 {
     if (try parseRfc3339ToNs(text)) |ts| return ts;
-    if (text.len != 10 or text[4] != '-' or text[7] != '-') return null;
-    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
-    return civilDateTimeToNs(year, month, day, 0, 0, 0, 0);
+    return rfc3339.parseDateToUnixNs(text);
 }
 
 fn parseRfc3339ToNs(text: []const u8) !?u64 {
-    if (text.len < 20) return null;
-    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
-
-    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, text[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, text[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, text[17..19], 10) catch return null;
-
-    var idx: usize = 19;
-    var nanos: u64 = 0;
-    if (idx < text.len and text[idx] == '.') {
-        idx += 1;
-        const frac_start = idx;
-        while (idx < text.len and text[idx] >= '0' and text[idx] <= '9') : (idx += 1) {}
-        const frac = text[frac_start..idx];
-        if (frac.len == 0 or frac.len > 9) return null;
-        var frac_ns = std.fmt.parseInt(u64, frac, 10) catch return null;
-        var scale: usize = frac.len;
-        while (scale < 9) : (scale += 1) frac_ns *= 10;
-        nanos = frac_ns;
-    }
-    if (idx >= text.len or text[idx] != 'Z' or idx + 1 != text.len) return null;
-
-    return civilDateTimeToNs(year, month, day, hour, minute, second, nanos);
-}
-
-fn civilDateTimeToNs(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, nanos: u64) ?u64 {
-    const days = daysFromCivil(year, month, day);
-    if (days < 0) return null;
-    const secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    if (secs < 0) return null;
-    return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
-}
-
-fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
-    var y = year;
-    y -= if (month <= 2) @as(i64, 1) else @as(i64, 0);
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe = y - era * 400;
-    const mp = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
-    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146_097 + doe - 719_468;
+    return rfc3339.parseToUnixNs(text);
 }
 
 fn buildSemanticVectorQueries(
@@ -9666,6 +9619,13 @@ test "canonical graph admission preserves and validates weight bounds" {
     try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(std.math.nan(f64), null));
     try std.testing.expectEqual(@as(?f64, null), legacyWeightBound(0));
     try std.testing.expectEqual(@as(?f64, 0.5), legacyWeightBound(0.5));
+}
+
+test "graph date filters accept RFC3339 offsets and reject normalized invalid dates" {
+    const utc = (try parseDateTimeOptionalToNs("2026-08-24T19:00:00Z")).?;
+    try std.testing.expectEqual(utc, (try parseDateTimeOptionalToNs("2026-08-24T12:00:00-07:00")).?);
+    try std.testing.expect((try parseDateTimeOptionalToNs("2026-02-29T00:00:00Z")) == null);
+    try std.testing.expect((try parseDateTimeOptionalToNs("2026-04-31")) == null);
 }
 
 test "canonical graph path endpoints reject empty identities before allocation" {

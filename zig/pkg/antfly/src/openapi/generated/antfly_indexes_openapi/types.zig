@@ -802,7 +802,7 @@ pub const Edge = struct {
     target: []const u8,
     /// Edge type (e.g., "cites", "similar_to", "authored_by")
     type: []const u8,
-    /// Edge weight/confidence (0.0 to 1.0)
+    /// Finite non-negative edge cost or confidence. The max_weight path mode additionally requires values in [0,1].
     weight: f64,
     /// When the edge was created
     created_at: ?[]const u8 = null,
@@ -1874,6 +1874,7 @@ pub const GraphPath = struct {
     nodes: []const GraphPathEndpoint,
     /// Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
     edges: []const GraphPathEdge,
+    /// Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
     total_weight: f64,
     length: i64,
 };
@@ -2824,6 +2825,7 @@ pub const Path = struct {
     /// Ordered list of node keys (base64-encoded)
     nodes: ?[]const []const u8 = null,
     edges: ?[]const PathEdge = null,
+    /// Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
     total_weight: ?f64 = null,
     length: ?i64 = null,
 };
@@ -2889,7 +2891,7 @@ pub const PathFindWeightMode = enum {
     }
 };
 
-/// Path weighting algorithm for pathfinding: - min_hops: Minimize number of edges - min_weight: Minimize sum of edge weights - max_weight: Maximize product of edge weights
+/// Path weighting algorithm for pathfinding: - min_hops: Minimize number of edges - min_weight: Minimize sum of finite non-negative edge weights - max_weight: Maximize product of finite edge weights in [0,1]
 pub const PathWeightMode = enum {
     min_hops,
     min_weight,
@@ -2972,7 +2974,7 @@ pub const TraversalResult = struct {
     path: ?[]const []const u8 = null,
     /// Sequence of edges from start to this node (if include_paths=true)
     path_edges: ?[]const Edge = null,
-    /// Product of edge weights along the path
+    /// Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
     total_weight: ?f64 = null,
 };
 

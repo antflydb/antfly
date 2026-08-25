@@ -301,6 +301,9 @@ pub const Detail = enum(c_int) {
     graph_anchor_filter_requires_index,
     graph_match_operation_limit_exceeded,
     graph_cross_range_mode_unsupported,
+    graph_work_budget_exceeded,
+    graph_min_weight_domain_violation,
+    graph_max_weight_domain_violation,
 };
 
 pub const Status = extern struct {
@@ -416,6 +419,9 @@ pub fn statusFromError(err: anyerror) Status {
         error.TemporaryNameServerFailure => status(.retryable, .temporary_name_server_failure),
         error.NameServerFailure => status(.unavailable, .name_server_failure),
         error.QueryCandidateBudgetExceeded => status(.unavailable, .query_candidate_budget_exceeded),
+        error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
+        error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
+        error.GraphMaxWeightDomainViolation => status(.invalid_argument, .graph_max_weight_domain_violation),
         error.GraphDistinctBudgetExceeded => status(.invalid_argument, .graph_distinct_budget_exceeded),
         error.GraphAnchorFilterRequiresIndex => status(.unsupported, .graph_anchor_filter_requires_index),
         error.GraphMatchOperationLimitExceeded => status(.invalid_argument, .graph_match_operation_limit_exceeded),
@@ -896,6 +902,9 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_anchor_filter_requires_index => "GraphAnchorFilterRequiresIndex",
         .graph_match_operation_limit_exceeded => "GraphMatchOperationLimitExceeded",
         .graph_cross_range_mode_unsupported => "GraphQueryModeUnsupported",
+        .graph_work_budget_exceeded => "GraphWorkBudgetExceeded",
+        .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
+        .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
     };
 }
 

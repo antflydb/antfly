@@ -1620,6 +1620,20 @@ pub const GraphMatchOperationLimitExceededError = struct {
     actual: i64,
 };
 
+pub const GraphPathWeightDomainError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Named shortest-path operation that encountered the incompatible edge weight.
+    operation: []const u8,
+    mode: []const u8,
+    /// Required edge-weight interval for exact execution in the selected mode.
+    allowed_range: []const u8,
+    /// Stable user-facing guidance for correcting the graph or query.
+    remediation: []const u8,
+};
+
 pub const GraphQueryModeUnsupportedError = struct {
     status: i32,
     @"error": []const u8,
@@ -1631,6 +1645,23 @@ pub const GraphQueryModeUnsupportedError = struct {
     mode: []const u8,
     /// Stable machine-readable constraint that prevents exact public execution.
     reason: []const u8,
+};
+
+pub const GraphWorkBudgetExceededError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Named graph operation whose exact execution exhausted the request budget.
+    operation: []const u8,
+    /// Graph operation mode, such as match or pattern.
+    mode: []const u8,
+    /// Bounded resource exhausted by the operation.
+    dimension: []const u8,
+    /// Configured request ceiling for the exhausted resource.
+    maximum: i64,
+    /// Stable user-facing guidance for reducing graph work.
+    remediation: []const u8,
 };
 
 pub const HierarchyAncestor = struct {
@@ -2623,6 +2654,8 @@ pub const QueryUnprocessableError = union(enum) {
     exact_sort_error: ExactSortError,
     query_candidate_budget_exceeded_error: QueryCandidateBudgetExceededError,
     graph_distinct_budget_exceeded_error: GraphDistinctBudgetExceededError,
+    graph_work_budget_exceeded_error: GraphWorkBudgetExceededError,
+    graph_path_weight_domain_error: GraphPathWeightDomainError,
     graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
     graph_query_mode_unsupported_error: GraphQueryModeUnsupportedError,
     graph_match_operation_limit_exceeded_error: GraphMatchOperationLimitExceededError,
@@ -2643,6 +2676,12 @@ pub const QueryUnprocessableError = union(enum) {
         }
         if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
             return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromSliceLeaky(GraphDistinctBudgetExceededError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_work_budget_exceeded")) {
+            return .{ .graph_work_budget_exceeded_error = try std.json.parseFromSliceLeaky(GraphWorkBudgetExceededError, allocator, input, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_path_weight_domain_error")) {
+            return .{ .graph_path_weight_domain_error = try std.json.parseFromSliceLeaky(GraphPathWeightDomainError, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
@@ -2679,6 +2718,12 @@ pub const QueryUnprocessableError = union(enum) {
         if (std.mem.eql(u8, disc_str, "graph_distinct_budget_exceeded")) {
             return .{ .graph_distinct_budget_exceeded_error = try std.json.parseFromValueLeaky(GraphDistinctBudgetExceededError, allocator, source, options) };
         }
+        if (std.mem.eql(u8, disc_str, "graph_work_budget_exceeded")) {
+            return .{ .graph_work_budget_exceeded_error = try std.json.parseFromValueLeaky(GraphWorkBudgetExceededError, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph_path_weight_domain_error")) {
+            return .{ .graph_path_weight_domain_error = try std.json.parseFromValueLeaky(GraphPathWeightDomainError, allocator, source, options) };
+        }
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
         }
@@ -2696,6 +2741,8 @@ pub const QueryUnprocessableError = union(enum) {
             .exact_sort_error => |v| try jw.write(v),
             .query_candidate_budget_exceeded_error => |v| try jw.write(v),
             .graph_distinct_budget_exceeded_error => |v| try jw.write(v),
+            .graph_work_budget_exceeded_error => |v| try jw.write(v),
+            .graph_path_weight_domain_error => |v| try jw.write(v),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
             .graph_query_mode_unsupported_error => |v| try jw.write(v),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v),

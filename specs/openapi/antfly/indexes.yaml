@@ -2174,7 +2174,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
-          description: Edge weight/confidence (0.0 to 1.0)
+          minimum: 0
+          description: Finite non-negative edge cost or confidence. The max_weight path mode additionally requires values in [0,1].
         created_at:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -2213,8 +2214,8 @@ components:
       description: |
         Path weighting algorithm for pathfinding:
         - min_hops: Minimize number of edges
-        - min_weight: Minimize sum of edge weights
-        - max_weight: Maximize product of edge weights
+        - min_weight: Minimize sum of finite non-negative edge weights
+        - max_weight: Maximize product of finite edge weights in [0,1]
     TraversalRules:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -2299,7 +2300,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
-          description: Product of edge weights along the path
+          description: Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
     PathFindWeightMode:
       x-go-type-skip-optional-pointer: true
       type: string
@@ -2401,6 +2402,7 @@ components:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
+          description: Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
         length:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -3005,6 +3007,7 @@ components:
         total_weight:
           type: number
           format: double
+          description: Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
         length:
           type: integer
     GraphShortestPath:

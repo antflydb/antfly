@@ -36,8 +36,8 @@ class GraphQueryParams:
         include_paths (bool | Unset):
         weight_mode (PathWeightMode | Unset): Path weighting algorithm for pathfinding:
             - min_hops: Minimize number of edges
-            - min_weight: Minimize sum of edge weights
-            - max_weight: Maximize product of edge weights
+            - min_weight: Minimize sum of finite non-negative edge weights
+            - max_weight: Maximize product of finite edge weights in [0,1]
         k (int | Unset):
         node_filter (NodeFilter | Unset): Filter nodes during graph traversal using existing query primitives
         algorithm (str | Unset):
