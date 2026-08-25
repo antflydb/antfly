@@ -693,13 +693,52 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 		return r.Update(ctx, lease)
 	}
 	if bootstrapReceipt != "" {
-		// The full reconciler owns the one-shot transition from a bound but
-		// pending process receipt to ordinary authority. Advancing renewTime here
-		// can continually outrun its next watchdog observation and make the two
-		// controllers wait on each other forever. The Lease duration is much
-		// longer than the watchdog observation cadence, so leave this compare
-		// boundary stable until the full path consumes the exact receipt.
-		return nil
+		// Successor takeover is a Lease-safety transition, not a topology action.
+		// It must not wait behind an unrelated failed seed, slot, or repair action
+		// in the full reconciler. Close only an exact cross-controller handoff:
+		// unchanged holder/generation/scope, exact bound process receipt, a fresh
+		// authoritative proof after the immutable transfer boundary, and the one
+		// live Pod incarnation authenticated by that proof.
+		identity := haReplicationIdentity(ha)
+		proof := cluster.Status.HAStatus.PrimaryWatchdogProof
+		successorScope := haFencingLeaseScope{}
+		if identity != nil {
+			successorScope = haFencingLeaseScopeWithMonotonicBoundary(
+				lease, haFencingLeaseScopeForIdentity(identity, 0),
+			)
+		}
+		boundSuccessor := identity != nil && cluster.UID != "" && currentHolder == localNodeID &&
+			strings.TrimSpace(identity.CurrentPrimaryID) == localNodeID &&
+			lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" &&
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) != "" &&
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) != localNodeID &&
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) != "" &&
+			lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] != string(cluster.UID) &&
+			lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10) &&
+			proof != nil && haWatchdogProcessBootIDValid(strings.TrimSpace(proof.ProcessBootID)) &&
+			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID]) == strings.TrimSpace(proof.ProcessBootID) &&
+			bootstrapReceipt == haFencingLeaseBootstrapReceipt(currentHolder, transitions, proof.ProcessBootID) &&
+			haLeaseFenceScopeMatches(lease, successorScope) &&
+			lease.Spec.AcquireTime != nil
+		if !boundSuccessor {
+			// Initial bootstrap and any incomplete or mismatched handoff remain on
+			// the full compare-and-swap path and cannot gain authority here.
+			return nil
+		}
+		ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
+			ctx, cluster, currentHolder, uint64(transitions), lease.Spec.AcquireTime.Time, true,
+		)
+		if err != nil || !ready {
+			return err
+		}
+		now := metav1.NewMicroTime(r.haNow())
+		lease.Spec.RenewTime = &now
+		delete(lease.Annotations, haFencingLeaseAnnotationBootstrapReceipt)
+		delete(lease.Annotations, haFencingLeaseAnnotationTransferCommitted)
+		delete(lease.Annotations, haFencingLeaseAnnotationFormerHolder)
+		delete(lease.Annotations, haFencingLeaseAnnotationTransferOriginUID)
+		delete(lease.Annotations, haFencingLeaseAnnotationCommittedTransition)
+		return r.Update(ctx, lease)
 	}
 	identity := haReplicationIdentity(ha)
 	if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) != localNodeID {
