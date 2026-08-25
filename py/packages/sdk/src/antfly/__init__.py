@@ -44,6 +44,7 @@ from .graph_identifier_policy_generated import (
     GRAPH_IDENTIFIER_UNICODE_VERSION,
     is_valid_graph_identifier,
 )
+from .graph_queries import GraphCountAggregate, count_graph_alias, count_graph_rows
 
 __version__ = "0.1.0"
 
@@ -80,6 +81,9 @@ __all__ = [
     "GRAPH_IDENTIFIER_POLICY_VERSION",
     "GRAPH_IDENTIFIER_UNICODE_VERSION",
     "is_valid_graph_identifier",
+    "GraphCountAggregate",
+    "count_graph_alias",
+    "count_graph_rows",
     "SparseEmbedding",
     "PackedSparseEmbedding",
     "__version__",

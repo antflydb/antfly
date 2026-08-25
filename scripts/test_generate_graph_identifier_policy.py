@@ -31,6 +31,16 @@ class GraphIdentifierPolicyTest(unittest.TestCase):
                 self.assertEqual(case["valid"], generator.valid_identifier(policy, ranges, case["value"]))
 
     def test_openapi_uses_the_shared_identifier_schema_everywhere(self) -> None:
+        generated = yaml.safe_load(generator.render_openapi(*generator.load_policy()))[
+            "components"
+        ]["schemas"]
+        identifier = generated["GraphIdentifier"]
+        self.assertEqual({"enum": ["*"]}, identifier["not"])
+        self.assertIn(
+            generated["GraphCountTarget"]["x-antfly-count-target"]["rowSentinel"],
+            identifier["not"]["enum"],
+        )
+
         indexes = yaml.safe_load(
             (generator.ROOT / "specs/openapi/antfly/indexes.yaml").read_text(encoding="utf-8")
         )["components"]["schemas"]

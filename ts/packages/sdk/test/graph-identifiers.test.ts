@@ -11,7 +11,11 @@ import {
   GRAPH_IDENTIFIER_CONFORMANCE_CASES,
   isValidGraphIdentifier,
 } from "../src/graph-identifier-policy.generated.js";
-import { validateGraphQueryIdentifiers } from "../src/graph-identifiers.js";
+import {
+  countGraphAlias,
+  countGraphRows,
+  validateGraphQueryIdentifiers,
+} from "../src/graph-identifiers.js";
 
 describe("graph identifier policy", () => {
   for (const testCase of GRAPH_IDENTIFIER_CONFORMANCE_CASES) {
@@ -75,5 +79,23 @@ describe("graph identifier policy", () => {
     expect(() => validateGraphQueryIdentifiers(graphQueries)).toThrow(
       "at most 64 named operations"
     );
+  });
+
+  it.each([false, true])("rejects distinct presence on count(*) (%s)", (distinct) => {
+    expect(() =>
+      validateGraphQueryIdentifiers({
+        people: {
+          match: { anchor: "person", nodes: { person: {} }, edges: [] },
+          return: { aggregates: { rows: { count: "*", distinct } } },
+        },
+      })
+    ).toThrow("distinct is only valid for alias counts");
+  });
+
+  it("constructs structurally valid graph counts", () => {
+    expect(countGraphRows()).toEqual({ count: "*" });
+    expect(countGraphAlias("person")).toEqual({ count: "person" });
+    expect(countGraphAlias("person", true)).toEqual({ count: "person", distinct: true });
+    expect(() => countGraphAlias("*")).toThrow("graph count alias");
   });
 });

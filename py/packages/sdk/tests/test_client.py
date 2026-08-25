@@ -16,6 +16,8 @@ from antfly import (  # noqa: E402
     CreateEmbeddingsIndexRequestType,
     StorageResourceExhaustedError,
     antfly_embedder,
+    count_graph_alias,
+    count_graph_rows,
 )
 from antfly.client import normalize_base_url  # noqa: E402
 from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E402
@@ -451,6 +453,31 @@ class TestAntflyClient:
                 }
             },
         )
+
+    def test_graph_count_helpers_construct_valid_generated_models(self) -> None:
+        assert count_graph_rows().to_dict() == {"count": "*"}
+        assert count_graph_alias("person").to_dict() == {
+            "count": "person",
+            "distinct": False,
+        }
+        assert count_graph_alias("person", distinct=True).to_dict() == {
+            "count": "person",
+            "distinct": True,
+        }
+        with pytest.raises(AntflyException, match="graph count alias"):
+            count_graph_alias("*")
+
+    @pytest.mark.parametrize("distinct", [False, True])
+    def test_query_rejects_distinct_presence_on_row_count(self, distinct: bool) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        graph_query = {
+            "index": "social",
+            "match": {"anchor": "a", "nodes": {"a": {}}, "edges": []},
+            "return": {"aggregates": {"rows": {"count": "*", "distinct": distinct}}},
+        }
+
+        with pytest.raises(AntflyException, match="distinct is only valid for alias counts"):
+            client.query(table="docs", graph_queries={"count_rows": graph_query})
 
     def test_query_rejects_invalid_graph_operation_values(self) -> None:
         client = AntflyClient(base_url="http://localhost:8080")

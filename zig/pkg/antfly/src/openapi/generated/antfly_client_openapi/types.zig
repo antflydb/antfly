@@ -4524,7 +4524,7 @@ pub const GraphBoundedTraversalConfig = struct {
     law: []const u8,
 };
 
-/// Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid in every generated SDK.
+/// Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid by schema and at runtime.
 pub const GraphCountAggregate = union(enum) {
     graph_row_count_aggregate: *GraphRowCountAggregate,
     graph_alias_count_aggregate: *GraphAliasCountAggregate,

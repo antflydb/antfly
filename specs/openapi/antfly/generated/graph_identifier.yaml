@@ -10,6 +10,12 @@ components:
       type: string
       minLength: 1
       maxLength: 128
+      # Keep reserved exact values machine-readable in the standard schema.
+      # GraphCountAggregate relies on `*` being disjoint from identifiers for
+      # standards-compliant oneOf validation; the vendor extension below
+      # carries the complete versioned policy for generated runtime validators.
+      not:
+        enum: ["*"]
       description: >-
         User-visible graph alias or named result under Antfly graph identifier
         policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings
@@ -22,8 +28,8 @@ components:
         version: 1
         unicodeVersion: "15.0.0"
         maxUtf8Bytes: 512
-        reservedExact: ['*']
-        reservedPrefixes: ['$']
+        reservedExact: ["*"]
+        reservedPrefixes: ["$"]
         disallowedCodePointRanges:
           - ['0000', '001F']
           - ['007F', '00A0']

@@ -53,7 +53,11 @@ export {
   GRAPH_IDENTIFIER_UNICODE_VERSION,
   isValidGraphIdentifier,
 } from "./graph-identifier-policy.generated.js";
-export { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
+export {
+  countGraphAlias,
+  countGraphRows,
+  validateGraphQueryIdentifiers,
+} from "./graph-identifiers.js";
 export {
   InferenceAPIError,
   InferenceCapacityError,
@@ -230,6 +234,7 @@ export type {
   GraphAggregateValue,
   GraphAliasCountAggregate,
   GraphAliasOperand,
+  GraphBindingNode,
   GraphBindingsResult,
   GraphBindingsReturn,
   GraphCountAggregate,
@@ -257,13 +262,12 @@ export type {
   GraphQueryStats,
   GraphQueryType,
   GraphResultBinding,
-  GraphBindingNode,
   GraphResultNode,
   GraphResultRefNodeSelector,
   GraphResultRow,
+  GraphReturn,
   GraphRowCountAggregate,
   GraphRowCountTarget,
-  GraphReturn,
   GraphShortestPath,
   GraphShortestPathQuery,
   GraphTraversal,

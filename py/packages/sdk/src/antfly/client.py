@@ -41,7 +41,7 @@ from antfly.client_generated.models import (
 from antfly.client_generated.types import UNSET
 
 from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError, StorageResourceExhaustedError
-from .graph_identifier_policy_generated import is_valid_graph_identifier
+from .graph_queries import require_graph_identifier as _require_graph_identifier
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
@@ -69,14 +69,6 @@ _CREATED_INDEX_TYPES = {
     "graph": CreatedGraphIndex,
     "algebraic": CreatedAlgebraicIndex,
 }
-
-
-def _require_graph_identifier(value: object, path: str) -> None:
-    if not isinstance(value, str) or not is_valid_graph_identifier(value):
-        raise AntflyException(
-            f"{path} must satisfy the versioned GraphIdentifier policy "
-            "(1-128 Unicode code points; no reserved, boundary-space, non-ASCII whitespace, control, or format characters)"
-        )
 
 
 def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, path: str) -> None:
@@ -153,7 +145,10 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
             if not isinstance(aggregate, Mapping):
                 continue
             count = aggregate.get("count")
-            if count != "*":
+            if count == "*":
+                if "distinct" in aggregate:
+                    raise AntflyException(f"{path}.return.aggregates[{name!r}].distinct is only valid for alias counts")
+            else:
                 _require_graph_identifier(count, f"{path}.return.aggregates[{name!r}].count")
 
 

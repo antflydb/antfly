@@ -12109,7 +12109,7 @@ export interface components {
              */
             distinct?: boolean;
         };
-        /** @description Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid in every generated SDK. */
+        /** @description Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid by schema and at runtime. */
         GraphCountAggregate: components["schemas"]["GraphRowCountAggregate"] | components["schemas"]["GraphAliasCountAggregate"];
         GraphAggregatesReturn: {
             /** @description Keys are GraphIdentifiers naming aggregate results. */

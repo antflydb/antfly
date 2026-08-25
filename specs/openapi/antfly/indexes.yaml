@@ -3292,7 +3292,7 @@ components:
         - $ref: '#/components/schemas/GraphAliasCountAggregate'
       description: >-
         Exact count(*) or count(alias). The distinct option exists only for
-        alias counts, making distinct count(*) invalid in every generated SDK.
+        alias counts, making distinct count(*) invalid by schema and at runtime.
     GraphBindingsReturn:
       type: object
       additionalProperties: false

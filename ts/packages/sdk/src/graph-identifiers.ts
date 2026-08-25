@@ -7,6 +7,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 import { isValidGraphIdentifier } from "./graph-identifier-policy.generated.js";
+import type { GraphCountAggregate } from "./types.js";
 
 type JSONObject = Record<string, unknown>;
 
@@ -109,7 +110,13 @@ function validateMatch(query: JSONObject, path: string): void {
     for (const [name, candidate] of Object.entries(aggregates)) {
       requireIdentifier(name, `${path}.return.aggregates key`);
       const aggregate = object(candidate);
-      if (aggregate?.count !== "*") {
+      if (aggregate?.count === "*") {
+        if ("distinct" in aggregate) {
+          throw new TypeError(
+            `${path}.return.aggregates[${JSON.stringify(name)}].distinct is only valid for alias counts`
+          );
+        }
+      } else {
         requireIdentifier(
           aggregate?.count,
           `${path}.return.aggregates[${JSON.stringify(name)}].count`
@@ -117,6 +124,17 @@ function validateMatch(query: JSONObject, path: string): void {
       }
     }
   }
+}
+
+/** Construct an exact count over complete graph bindings. */
+export function countGraphRows(): GraphCountAggregate {
+  return { count: "*" };
+}
+
+/** Construct an exact count over the non-null bindings of one alias. */
+export function countGraphAlias(alias: string, distinct = false): GraphCountAggregate {
+  requireIdentifier(alias, "graph count alias");
+  return distinct ? { count: alias, distinct: true } : { count: alias };
 }
 
 function validateTraverse(query: JSONObject, path: string): void {

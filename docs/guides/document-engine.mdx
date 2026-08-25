@@ -270,6 +270,11 @@ not run full-text analyzers. Range predicates use explicit `numeric_range` or
 }
 ```
 
+Use `CountGraphRows` and `CountGraphAlias` in Go, `countGraphRows` and
+`countGraphAlias` in TypeScript, or `count_graph_rows` and `count_graph_alias`
+in Python to construct validated count expressions. The alias helpers reject
+reserved or unsafe graph identifiers before a request is sent.
+
 Exact aggregation streams bindings without materializing a bounded row page.
 Row returns expose each alias as a compact `{key, table?, document?}` binding.
 Traversal-only metrics such as `depth`, `distance`, and `path` are intentionally
