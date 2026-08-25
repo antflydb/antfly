@@ -1,161 +1,75 @@
 ---
 title: Introduction
-description: Learn about AntflyDB - a modern distributed document database designed for AI-powered applications
+description: Install Antfly and run your first query, then learn what the engine is and where to go next
 ---
 
 <Questions>
-- What is AntflyDB?
-- What are the key features of Antfly?
-- How does Antfly compare to Elasticsearch?
-- What use cases is Antfly good for?
-- Does Antfly support vector search?
+- How do I install Antfly?
+- How do I run my first query?
+- What is Antfly?
+- What can I build with Antfly?
 </Questions>
 
-## What is AntflyDB?
+Antfly is a database with a complete inference and retrieval pipeline built in: full-text, vector, and graph indexes in one engine, with the models that chunk, embed, rerank, and extract running inside it. You insert documents; the engine does the rest. It runs as a single binary on your laptop, as a cluster on Kubernetes, or hosted in [Antfly Cloud](/cloud)
 
-AntflyDB is a distributed, horizontally scalable document database built from the ground up for the AI era. It combines the reliability of proven distributed systems technology with cutting-edge vector search capabilities, making it the ideal choice for modern applications that need both traditional database features and AI-powered semantic search.
+## Install and run your first query
 
-## Core values
+<Tabs defaultValue="macos">
+  <TabsList>
+    <TabsTrigger value="macos">macOS</TabsTrigger>
+    <TabsTrigger value="linux">Linux</TabsTrigger>
+  </TabsList>
 
-We're here to enable AI Engineers to experiment faster. From local development to deployment, Antfly is meant to scale with your needs. We're Platform Engineers with decades of experience maintaining databases, so we know Operational Simplicity is just as important to experimentation as local development. Thus Antfly prioritizes modern Operations practices with telemetry, autoscaling, and security as core to every feature. We built Antfly from the ground up to be a Kubernetes native deployment that you can run on your laptop or in your Cloud. For bigger teams, we imagine you'll be doing both!
+  <TabsContent value="macos">
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
+antfly standalone
+```
 
-For AI Engineers we're also prioritizing telemetry, scaling and security. We know AI Engineers need to monitor the efficacy of the models they're using and how their models perform in real world use cases. We believe these systems will need to be able to scale in terms of cost, size, latency and access patterns in many directions.
+Homebrew works too: `brew install antflydb/taps/antfly`.
+  </TabsContent>
 
-## Key Features
+  <TabsContent value="linux">
+```bash
+curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
+antfly standalone
+```
 
-### Hybrid Search
-- **BM25 + Vector Similarity**: Full-text search with vector embeddings using Reciprocal Rank Fusion (RRF)
-- **Multimodal**: Index and search text, images, audio, and video
-- **Embedding Providers**: Ollama, OpenAI, AWS Bedrock, Google Gemini, Anthropic
-- **Hardware Acceleration**: SIMD optimizations (AVX2/AVX-512 on x86, NEON on ARM) and SME (Scalable Matrix Extension) for ARM
+On Windows, run the same script inside WSL2.
+  </TabsContent>
+</Tabs>
 
-### Distributed Consensus
-- **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
-- **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication
-- **Distributed Transactions**: Atomic cross-shard writes using coordinator-based 2PC with intent-based locking
-- **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, full_index)
+In a second terminal, create a table (a full-text index comes with it), insert a document, and search it:
 
-### AI-Native Features
-- **RAG**: Streaming retrieval-augmented generation with Server-Sent Events
-- **Native Agents**: Retrieval and query-builder agents for bounded query planning, tool selection, and answer generation
-- **Document Chunking**: Semantic chunking service (Antfly inference) with multi-tier caching
-- **Async Enrichment**: Background embedding and summarization with leader-only processing
-- **Durable Document Extraction**: URL-backed artifacts persist PDF pages and chunks; pages without native text use local OCR when the configured model is installed
-- **Multimodal Remote Processing**: Template-time download and inference inputs for images and other media, with SSRF prevention and content validation
+```bash
+curl -X POST http://localhost:8080/db/v1/tables/knowledge \
+  -H "Content-Type: application/json" \
+  -d '{}'
 
-### Developer Experience
-- **Client Libraries**: Auto-generated SDKs for Go, TypeScript, and Python from OpenAPI spec
-- **Antfly Lite**: Embedded local-first Antfly with a single `.aflite` database file and portable `.afb` backups
-- **JSON Schema Extensions**: Custom `x-antfly-*` annotations for indexing
-- **MongoDB-Style Transforms**: In-place updates ($inc, $set, $push) without read-modify-write
-- **Linear Merge**: Stateless import of sorted records from external sources
-- **Template Rendering**: Handlebars templates for custom document rendering
-- **Graph Operations**: Declarative queries with traversals and pathfinding
-- **TTL Support**: Automatic expiration for documents (table-level) and edges (graph index-level)
+curl -X POST http://localhost:8080/db/v1/tables/knowledge/batch \
+  -H "Content-Type: application/json" \
+  -d '{"inserts":{"doc-1":{"content":"Antfly keeps the retrieval pipeline inside the engine."}},"sync_level":"full_text"}'
 
-### Operations & Scalability
-- **Online Shard Splitting**: Automatic reallocation and splitting of shards without downtime
-- **Kubernetes Operator**: Official `antfly-operator` with autoscaling and lifecycle management
-- **Prometheus Metrics**: Built-in monitoring endpoints for observability
-- **Zero-Downtime Upgrades**: Rolling upgrades across Raft consensus groups
+curl -X POST http://localhost:8080/db/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"table":"knowledge","full_text_search":{"query":"content:pipeline"},"fields":["content"],"limit":5}'
+```
 
-### Flexible Indexing
-- **Index Types**: `full_text` (BM25), `embeddings` (vector with RaBitQ), `graph` (relationship traversal)
-- **Enrichers**: summaries, embeddings, chunking (async background processing)
-- **Query Processors**: `chunker` (semantic document splitting), `pruner` (result filtering), `reranker` (relevance re-scoring)
-- **Multimodal**: Vision model + embedder or native multimodal embeddings (Gemini)
-- **Pluggable Architecture**: Easy to add custom index types via registry pattern
+That is the whole loop. The [Quickstart](/docs/guides/quickstart) does it with 10,000 Wikipedia articles and adds semantic search, hybrid search with reranking, [image search](/docs/guides/quickstart#image-search), and [RAG](/docs/guides/quickstart#rag-retrieval-augmented-generation). The web dashboard is at `http://localhost:8080` while the engine runs.
 
-## Use Cases
+## What Antfly is
 
-AntflyDB excels in scenarios where you need:
+- **One engine, several indexes.** `full_text` (BM25), `embeddings` (vector, RaBitQ-compressed), and `graph` (traversal and pathfinding) are index types on the same table and are fused in one query plan. See the [Document Engine guide](/docs/guides/document-engine) for how mappings, search modes, filters, sorting, and pagination compose.
+- **Inference inside the engine.** Chunking, embedding, reranking, summarization, and entity extraction run as background enrichers and query processors using [Antfly Inference](/docs/guides/inference), which ships quantized models in the binary. External providers (Ollama, OpenAI, Bedrock, Gemini, Anthropic) plug in the same way.
+- **Any shape of data.** Text, PDFs (with local OCR when needed), images, audio, and video, referenced by URL or inserted directly. See [Multimodal Embeddings](/docs/guides/multimodal).
+- **Built for agents.** Streaming RAG, retrieval and query-builder agents, evaluation metrics, and an MCP surface. See [RAG in the Quickstart](/docs/guides/quickstart#rag-retrieval-augmented-generation).
+- **Distributed by design.** Multi-Raft consensus, horizontal sharding with online splitting, cross-shard write transactions, and a Kubernetes [operator](/docs/operator) with autoscaling. [Architecture](/docs/architecture) explains how it fits together.
+- **Local-first too.** [Antfly Lite](/docs/guides/lite) embeds the engine in a single `.aflite` file for desktop and edge applications.
 
-- **Semantic Search Applications**: Build intelligent search experiences that understand context and meaning
-- **RAG (Retrieval-Augmented Generation)**: Power your LLM applications with relevant context retrieval
-- **Knowledge Management Systems**: Store and query large document collections with both keyword and conceptual search
-- **Content Recommendation Engines**: Find similar content based on semantic understanding
-- **Multi-Modal Search**: Combine traditional filters with AI-powered similarity matching
-- **Image Understanding**: Process and search images using vision models for summarization and embedding
+## Where to go next
 
-## Why AntflyDB?
-
-Unlike traditional databases that bolt on vector search as an afterthought, AntflyDB treats AI capabilities as first-class citizens. This means:
-
-- Embedding models are deeply integrated into the query engine
-- Vector indexes are as performant and reliable as traditional indexes
-- Hybrid queries are optimized at the core engine level
-- Scaling AI workloads is as simple as adding more nodes
-
-Antfly abstracts the management of embeddings and indexing from you. You insert your data and Antfly handles building and maintaining embeddings off that data for you. This allows you to build, test and manage models without having to build infrastructure to manage embedding lifecycle.
-
-- Upgrading embeddings to use a newer model
-- Migrating embeddings off of one model to another
-- Experimenting building different prompt context for embeddings
-- Comparing performance across different prompts, models and dimensions
-
-This also allows Antfly to offer cool features in the future [(see our roadmap)](/docs/changelog) like offering semantic extraction, text summarization, image summarization, and more from LLMs before embedding your documents (using our prompt templates feature with Handlebars) or building custom ML models to build your own embeddings.
-
-## Comparing AntflyDB to Alternatives
-
-### vs. Elasticsearch
-
-**Advantages of Antfly:**
-- **Hybrid Search Built-in**: Native BM25 + vector similarity with RRF (no plugins needed)
-- **Hardware Acceleration**: SIMD (AVX2/AVX-512, NEON) and SME for fast vector operations
-- **Distributed Transactions**: Atomic cross-shard writes with 2PC (Elasticsearch lacks this)
-- **Graph Operations**: Built-in graph traversal and pathfinding
-- **Online Shard Splitting**: Automatic reallocation without downtime
-- **Operational Simplicity**: Single binary, fewer moving parts
-- **Kubernetes Native**: Official `antfly-operator` with autoscaling
-
-**When to use Elasticsearch instead:**
-- Need mature ecosystem with extensive plugins
-- Require specific Elasticsearch features (percolator, suggester)
-- Team has deep Elasticsearch expertise
-
-### vs. Pinecone / Weaviate / Milvus (Vector Databases)
-
-**Advantages of Antfly:**
-- **Hybrid Search**: Combines keyword (BM25) and semantic search for better RAG accuracy
-- **CPU-Optimized SIMD**: Hardware-accelerated vector operations (AVX2/AVX-512, NEON, SME) without GPU requirement
-- **Full-Text Search**: Built-in Bleve for traditional search use cases
-- **No Separate Services**: All-in-one solution (no need for separate keyword search)
-- **Graph Relationships**: Graph index for connected data
-
-**When to use vector-only databases instead:**
-- Pure vector similarity is sufficient (no keyword search needed)
-- Need GPU acceleration for massive-scale vector search (billions of vectors)
-
-### vs. pgvector (Postgres Extension)
-
-**Advantages of Antfly:**
-- **Purpose-Built for Search**: Optimized for full-text and vector search workloads
-- **Hybrid Search**: Native RRF merging of BM25 and vector results
-- **Horizontal Scaling**: Multi-Raft sharding for distributed search
-- **RAG Optimizations**: Built-in reranking, pruning, document rendering
-
-**When to use pgvector instead:**
-- Data already in Postgres and hybrid search not critical
-- Need SQL joins and transactional guarantees
-- Simpler deployment model (single database)
-
-## Known Limitations
-
-Antfly is designed for high-performance search and retrieval workloads. Some features are intentionally not supported:
-
-**Not Supported:**
-- **Read-Write Transactions**: Only write-only transactions across shards (reads are not transactional)
-- **Distributed Joins**: Use graph queries or denormalize data instead
-- **SQL Interface**: Uses JSON API and Bleve query syntax instead
-- **ACID for Reads**: Reads are eventually consistent across shards
-
-**Use Cases Where Antfly May Not Be the Best Fit:**
-- Traditional OLTP workloads requiring ACID transactions
-- Complex analytical queries with joins and aggregations
-- Applications requiring strong consistency for reads
-
-## Getting Started
-
-Ready to dive in? Check out our [Quickstart Guide](/docs/guides/quickstart) to get AntflyDB running in minutes, use [Antfly Lite](/docs/guides/lite) for embedded local-first applications, or explore the [Architecture](/docs/architecture) to understand how it all works under the hood.
-
-For the query model itself, see the [Document Engine guide](/docs/guides/document-engine) for how mappings, full-text search, vector search, filters, graph search, sorting, and cursor pagination compose.
+- [Quickstart](/docs/guides/quickstart), with every step in the CLI, cURL, TypeScript, Python, Go, and Rust
+- [Guides](/docs/guides) for hybrid search, multimodal, inference, Lite, and replication
+- [API reference](/docs/api) for the CLI and REST surface
+- [Downloads](/docs/downloads) for every platform, checksums, and Docker Compose
+- [Antfly Cloud](/docs/cloud) for the hosted version

@@ -11,12 +11,9 @@ title: Downloads
 
 ## Download Antfly
 
-### Early-Access Release
+The reference for every platform archive, checksums, and container setup. For the short version (one command and a first query), see [antfly.io/download](/download).
 
-Antfly is currently in pre-alpha development.
-We are actively working on features and improvements, and we welcome your feedback.
-
-Antfly ships the native Zig runtime as the `antfly` binary.
+Antfly ships the native Zig runtime as the `antfly` binary; Antfly Inference is built into it.
 
 ### Back up before upgrading the Zig runtime
 
@@ -155,85 +152,23 @@ Native Windows archives are not currently published. Use the Linux container ima
   </TabsContent>
 
   <TabsContent value="docker">
-<Steps>
-### Create an `entrypoint.sh`
-
-```bash
-#!/bin/bash
-
-# Start Ollama in the background.
-/bin/ollama serve &
-# Record Process ID.
-pid=$!
-
-# Pause for Ollama to start.
-sleep 5
-
-echo "🔴 Retrieve ALL-MINILM model..."
-ollama pull all-minilm
-echo "🟢 Done!"
-
-# Wait for Ollama process to finish.
-wait $pid
-```
-
-### Create a `config.json`
-
-```json
-{
-  "metadata": {
-    "orchestration_urls": { "1": "http://127.0.0.1:12377" }
-  },
-  "replication_factor": 1,
-  "max_shards_per_table": 4
-}
-```
-
-### Create a `docker-compose.yml`
+Run a single node with Docker Compose, with the public API on port 8080 and data persisted in a named volume:
 
 ```yaml
 services:
   antfly:
     image: ghcr.io/antflydb/antfly:latest
-    command: ["standalone"]
+    command: ["standalone", "--host", "0.0.0.0"]
     ports:
-      - "8080:8080" # Public API port
-      - "9090:9090" # MCP port
+      - "8080:8080" # Public API
     volumes:
-      - ./antfly-data:/antflydb
-      - ./config.json:/config.json
-    container_name: antfly-standalone
-    environment:
-      - ANTFLY_LOG_LEVEL=info
+      - antfly-data:/antflydb
     restart: always
-    networks:
-      - antfly-network
-
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-    volumes:
-      - ./ollama-data:/root/.ollama
-      - ./entrypoint.sh:/entrypoint.sh
-    container_name: ollama
-    pull_policy: always
-    tty: true
-    restart: always
-    entrypoint: ["/usr/bin/bash", "/entrypoint.sh"]
-    networks:
-      - antfly-network
-
-networks:
-  antfly-network:
-    driver: bridge
 
 volumes:
   antfly-data:
-  ollama-data:
 ```
 
-### Run `docker-compose up -d`
-</Steps>
+Antfly Inference runs inside the same process, so no separate model server is needed. Pull models with `docker exec <container> antfly inference pull <model>`.
   </TabsContent>
 </PlatformTabs>
