@@ -320,6 +320,23 @@ pub const AntflyApiHandler = struct {
         return route_handler.invoke(ctx) catch |err| mapIngressError(ctx, err);
     }
 
+    /// Applies the kernel-owned internal-service boundary to a host-registered
+    /// route. Production metadata routes live outside the generated route
+    /// manifest, so the opaque host bridge calls this before their handlers.
+    /// `legacy_accepted` lets the host preserve the migration acknowledgement
+    /// header on the eventual application response.
+    pub fn authorizeHostInternalServiceRoute(
+        self: *AntflyApiHandler,
+        ctx: *httpx.Context,
+        legacy_accepted: *bool,
+    ) !?httpx.Response {
+        self.api_server.recordHandledRequest();
+        legacy_accepted.* = ctx.header(internal_service_auth.header_name) == null and
+            self.api_server.cfg.internal_service_accept_legacy_unauthenticated and
+            requiresInternalServicePrincipal(ctx.request.uri.path);
+        return self.internalServiceAuthRejection(ctx);
+    }
+
     fn haMutationRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
         const policy = self.api_server.haMutationPolicy();
         if (!policy.failover_safe_mutations_only) return null;

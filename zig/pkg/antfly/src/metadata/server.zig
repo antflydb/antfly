@@ -577,6 +577,11 @@ const MetadataAdminHttpRuntime = struct {
         try runtime.handler.initRuntime(alloc);
         runtime.listener_task = httpx.ListenerTask.init(&runtime.server);
         try runtime.server.use(httpx.Middleware.bind("metadata-authority", runtime, authorityMiddleware));
+        // Metadata owns contextual `/internal/v1` handlers that are registered
+        // outside the generated API-kernel manifest. Production uses an opaque
+        // kernel archive, so install its service-principal policy explicitly on
+        // the host server before either route set becomes reachable.
+        try public_api_kernel.installHostInternalServiceAuth(&runtime.handler, &runtime.server);
         try runtime.handler.registerGeneratedRoutesWithProbes(&runtime.server);
         try runtime.mux.admin.registerRoutes(&runtime.server);
         return runtime;

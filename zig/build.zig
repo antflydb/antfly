@@ -3819,6 +3819,7 @@ pub fn build(b: *std.Build) void {
         "table read source distinguishes unavailable physical capability observation",
         "generated route policy inventory is unique and describes wire modes",
         "linked API dispatch preserves kernel-owned ingress policy",
+        "opaque host middleware protects direct internal routes across the kernel ABI",
         "linked transport projects the universal request cancellation callback",
         "linked transport admits a streaming body before the kernel pulls it",
         "linked callbacks preserve streaming and cancellation semantics",
