@@ -1793,9 +1793,21 @@ was 0.98354 versus 0.98481, a 0.127 percentage-point delta. The live
 concurrency curve regressed under a noisier host interval, however, and disk
 rose from 3,773,788 to 3,857,468 KiB, mostly in native posting segments plus a
 smaller primary-boundary difference. Treat the policy as a checkpoint, not the
-final result. A recursive geometric stack can next seal the remaining 66 MB
-newer prefix above the 381.9 MB generation without rewriting either anchor;
-each tier must retain the same 2x growth proof.
+final result.
+
+A recursive geometric-stack extension was tested and rejected. It could
+theoretically seal a newer prefix above each successively dominant anchor while
+retaining the same 2x proof, but no recursive seal was legally eligible in its
+full 1M run: the two closest prefix ratios finished at approximately 400/241
+MB and 159/84 MB. The planner correctly left 44 L0 runs across 16 generations
+instead of forcing either low-growth rewrite. This run recovered the load
+baseline at 753.16 seconds ready with 0.9845 live recall, 14.18 GB compaction
+input, 94.85 seconds compaction time, zero overloads, and 2.02 GB demand.
+However, it was only another no-seal variance sample: live RSS was 3.21 GB and
+the warm detailed profile regressed to 52.15/104.59 ms mean/p95. The recursive
+planner and test were reverted; the validated anchor-preserving checkpoint is
+the retained policy. Do not weaken the 2x bound merely to force a prettier
+final manifest.
 
 ## Memory methodology
 
