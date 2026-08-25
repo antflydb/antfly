@@ -27,7 +27,10 @@ import requests
 from helpers import wait_until
 
 
-pytestmark = pytest.mark.reuse_antfly_process
+# Transaction commits can return while durable propagation and recovery continue.
+# Keep each test on a fresh runtime so that deferred work cannot cross a fixture
+# cleanup boundary and stall the next table lifecycle operation.
+pytestmark = pytest.mark.fresh_antfly_process
 
 
 NUM_SHARDS = 4

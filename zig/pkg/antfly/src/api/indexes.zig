@@ -2129,7 +2129,11 @@ fn aggregateTextMergeStats(dst: *db_mod.types.TextMergeStats, src: db_mod.types.
 fn aggregateHbcCacheKindStats(dst: *db_mod.types.HbcCacheKindStats, src: db_mod.types.HbcCacheKindStats) void {
     dst.used_bytes += src.used_bytes;
     dst.peak_bytes += src.peak_bytes;
+    dst.hits += src.hits;
+    dst.misses += src.misses;
     dst.insertions += src.insertions;
+    dst.replacements += src.replacements;
+    dst.sampled_admissions += src.sampled_admissions;
     dst.admission_skips += src.admission_skips;
     dst.evictions += src.evictions;
 }
@@ -2137,6 +2141,7 @@ fn aggregateHbcCacheKindStats(dst: *db_mod.types.HbcCacheKindStats, src: db_mod.
 fn aggregateHbcCacheStats(dst: *db_mod.types.HbcCacheStats, src: db_mod.types.HbcCacheStats) void {
     dst.total_bytes += src.total_bytes;
     dst.accounted_bytes += src.accounted_bytes;
+    dst.pinned_bytes += src.pinned_bytes;
     aggregateHbcCacheKindStats(&dst.node, src.node);
     aggregateHbcCacheKindStats(&dst.quantized, src.quantized);
     aggregateHbcCacheKindStats(&dst.vector, src.vector);
@@ -4209,8 +4214,16 @@ fn appendHbcCacheKindStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanag
     try appendIntValue(alloc, out, stats.used_bytes);
     try out.appendSlice(alloc, ",\"peak_bytes\":");
     try appendIntValue(alloc, out, stats.peak_bytes);
+    try out.appendSlice(alloc, ",\"hits\":");
+    try appendIntValue(alloc, out, stats.hits);
+    try out.appendSlice(alloc, ",\"misses\":");
+    try appendIntValue(alloc, out, stats.misses);
     try out.appendSlice(alloc, ",\"insertions\":");
     try appendIntValue(alloc, out, stats.insertions);
+    try out.appendSlice(alloc, ",\"replacements\":");
+    try appendIntValue(alloc, out, stats.replacements);
+    try out.appendSlice(alloc, ",\"sampled_admissions\":");
+    try appendIntValue(alloc, out, stats.sampled_admissions);
     try out.appendSlice(alloc, ",\"admission_skips\":");
     try appendIntValue(alloc, out, stats.admission_skips);
     try out.appendSlice(alloc, ",\"evictions\":");
@@ -4224,6 +4237,8 @@ fn appendHbcCacheStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u
     try appendIntValue(alloc, out, stats.total_bytes);
     try out.appendSlice(alloc, ",\"accounted_bytes\":");
     try appendIntValue(alloc, out, stats.accounted_bytes);
+    try out.appendSlice(alloc, ",\"pinned_bytes\":");
+    try appendIntValue(alloc, out, stats.pinned_bytes);
     try out.appendSlice(alloc, ",\"node\":");
     try appendHbcCacheKindStatus(alloc, out, stats.node);
     try out.appendSlice(alloc, ",\"quantized\":");

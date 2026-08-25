@@ -812,6 +812,14 @@ const LocalStandaloneMetadata = struct {
         self.* = undefined;
     }
 
+    fn setApiUrl(self: *LocalStandaloneMetadata, api_url: []const u8) !void {
+        const owned_api_url = try self.alloc.dupe(u8, api_url);
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.alloc.free(self.api_url);
+        self.api_url = owned_api_url;
+    }
+
     fn catalogSource(self: *LocalStandaloneMetadata) antfly.public_api.table_catalog.CatalogSource {
         return .{
             .ptr = self,
@@ -2347,6 +2355,7 @@ pub fn runFromIterator(
             &handler,
             antfly_node,
             api_server,
+            &local_metadata,
             &unified_api_ready,
             &unified_lifecycle,
             &http_runtime,
@@ -2360,6 +2369,7 @@ pub fn runFromIterator(
             &handler,
             antfly_node,
             api_server,
+            &local_metadata,
             &unified_api_ready,
             &unified_lifecycle,
             &http_runtime,
@@ -2497,11 +2507,12 @@ fn serveUnifiedWithInference(
     handler: *ApiKernelHandler,
     antfly_node: *anyopaque,
     api_server: *ApiHttpServer,
+    local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(true, alloc, io, public_http_config, cors_config, handler, antfly_node, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2519,11 +2530,12 @@ fn serveUnifiedWithLinkedInference(
     handler: *ApiKernelHandler,
     inference_handle: *anyopaque,
     api_server: *ApiHttpServer,
+    local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
 ) void {
-    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, api_server, unified_api_ready, lifecycle, http_runtime) catch |err| {
+    serveUnifiedInner(false, alloc, io, public_http_config, cors_config, handler, inference_handle, api_server, local_metadata, unified_api_ready, lifecycle, http_runtime) catch |err| {
         unified_api_ready.store(false, .release);
         lifecycle.publishFailure(err);
         std.debug.print("unified server error: {}\n", .{err});
@@ -2542,6 +2554,7 @@ fn serveUnifiedInner(
     handler: *ApiKernelHandler,
     antfly_node: *anyopaque,
     api_server: *ApiHttpServer,
+    local_metadata: *LocalStandaloneMetadata,
     unified_api_ready: *std.atomic.Value(bool),
     lifecycle: *UnifiedServerLifecycle,
     http_runtime: *httpx.HttpRuntime,
@@ -2615,6 +2628,20 @@ fn serveUnifiedInner(
         listener_task.requestStop();
         listener_task.join() catch {};
     };
+    if (public_http_config.port == 0) {
+        const bound_address = server.boundAddress() orelse return error.PublicListenerAddressUnavailable;
+        const bound_port = switch (bound_address) {
+            .ip4 => |address| address.port,
+            .ip6 => |address| address.port,
+        };
+        const bound_api_url = try std.fmt.allocPrint(
+            alloc,
+            "http://{s}:{d}",
+            .{ public_http_config.host, bound_port },
+        );
+        defer alloc.free(bound_api_url);
+        try local_metadata.setApiUrl(bound_api_url);
+    }
     unified_api_ready.store(true, .release);
     try lifecycle.publishReady();
 
@@ -7589,6 +7616,12 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     try std.testing.expectEqual(@as(u64, 9), snapshot.status.metadata_epoch);
     try std.testing.expectEqual(@as(usize, 1), snapshot.tables.len);
     try std.testing.expectEqualStrings("docs", snapshot.tables[0].name);
+
+    try metadata.setApiUrl("http://127.0.0.1:49152");
+    var rebound_snapshot = (try source.linearizableSnapshot(.{})) orelse return error.TestUnexpectedResult;
+    defer source.freeAdminSnapshot(&rebound_snapshot);
+    try std.testing.expectEqual(@as(usize, 1), rebound_snapshot.stores.len);
+    try std.testing.expectEqualStrings("http://127.0.0.1:49152", rebound_snapshot.stores[0].api_url);
 }
 
 test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {
