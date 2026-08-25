@@ -85,7 +85,7 @@ func (r *haLeaseRenewalReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// handoff can advance renewTime while the successor proof endpoint is
 	// intentionally transient during receipt binding.
 	_ = r.parent.observeHACurrentPrimaryWatchdogProof(proofCtx, cluster)
-	if err := r.parent.renewCurrentHAFencingLease(proofCtx, cluster); err != nil && !apierrors.IsConflict(err) {
+	if err := r.parent.renewCurrentHAFencingLease(ctx, cluster); err != nil && !apierrors.IsConflict(err) {
 		return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, err
 	}
 	return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, nil

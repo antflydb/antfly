@@ -309,10 +309,14 @@ func TestDedicatedLeaseRenewalAdvancesOnlyExactCommittedHandoff(t *testing.T) {
 
 func TestLeaseRenewalControllerKeepsCommittedHandoffWhenProofEndpointIsUnavailable(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) {
+		<-req.Context().Done()
+	}))
+	defer server.Close()
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Status.HAStatus = caughtUpHAStatus()
-	cluster.Spec.HighAvailability.Admin.PrimaryURL = "://invalid-proof-url"
-	cluster.Spec.HighAvailability.Admin.PrimaryActionURL = "://invalid-proof-url"
+	cluster.Spec.HighAvailability.Admin.PrimaryURL = server.URL
+	cluster.Spec.HighAvailability.Admin.PrimaryActionURL = server.URL
 	lease := haFenceLease(cluster, now.Add(-time.Second), 30, 2, "standby-a")
 	lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
 	lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
