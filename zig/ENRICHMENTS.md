@@ -82,7 +82,8 @@ maintenance, and generated enrichment have the same architectural boundary:
 
 - writes produce durable replay debt
 - indexes consume replay debt independently
-- queries see only fully published index state
+- queries see only durably published index checkpoints; a published checkpoint
+  may still have incomplete generation-scoped source coverage
 - status reports both accepted target and query-visible/published progress
 
 Without this boundary, background indexing can still behave like foreground
@@ -175,6 +176,21 @@ The sync boundary is:
 - `enrichments`: wait for generated enrichment artifacts to be produced.
 - `full_index`: drain enrichment work and downstream derived index publication
   until stable.
+
+These levels fence work caused by the write being acknowledged; they do not
+change the lifecycle of an independently created index. In particular,
+`sync_level=full_index` proves that the write's enrichment and configured
+derived-index fences have published. It does not, by itself, mean that an
+initial corpus-wide backfill for a newly admitted index is complete. Index
+readiness and source coverage are separate, generation-scoped observations.
+
+Consequently, `sync_level=write` provides durable source visibility with
+eventual derived-index consistency. Search may use the newest safely published
+checkpoint while later replay remains outstanding. Callers that need a write's
+derived effects before continuing use `full_index`; callers coordinating index
+creation use the index readiness waiter. The publication policies, readiness
+states, and managed-admission proofs are defined in
+[DB.md](DB.md#publication-policy-and-readiness).
 
 This means a write with `sync_level=full_text` may return before a newly
 configured OCR/transcription/chunk enrichment has produced text. After
