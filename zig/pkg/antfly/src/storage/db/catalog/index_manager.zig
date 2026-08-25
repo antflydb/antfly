@@ -397,11 +397,16 @@ const TextMergeBudgetAllocator = struct {
         return self.budget_denied.load(.acquire);
     }
 
-    /// Task-owned bytes which are live inside the admitted merge reservation.
-    /// Capture this before charging persistent publication work when reporting
-    /// the task allocator's overlapping publication peak.
+    /// Task-owned and externally charged bytes which are live inside the
+    /// admitted merge reservation.
     fn liveBytes(self: *const TextMergeBudgetAllocator) usize {
         return self.live_bytes.load(.acquire);
+    }
+
+    fn liveBytesExcludingExternal(self: *const TextMergeBudgetAllocator, external_bytes: usize) usize {
+        const live_bytes = self.liveBytes();
+        std.debug.assert(live_bytes >= external_bytes);
+        return live_bytes - external_bytes;
     }
 
     /// Account allocations which must be owned by the persistent index's
@@ -419,8 +424,11 @@ const TextMergeBudgetAllocator = struct {
     }
 
     fn reserveGrowth(self: *TextMergeBudgetAllocator, bytes: usize) bool {
-        if (bytes == 0 or self.reservation == null) return true;
-        const limit = std.math.cast(usize, self.reservation.?.bytes) orelse std.math.maxInt(usize);
+        if (bytes == 0) return true;
+        const limit = if (self.reservation) |reservation|
+            std.math.cast(usize, reservation.bytes) orelse std.math.maxInt(usize)
+        else
+            std.math.maxInt(usize);
         var live = self.live_bytes.load(.acquire);
         while (true) {
             if (bytes > limit -| live) {
@@ -432,7 +440,7 @@ const TextMergeBudgetAllocator = struct {
     }
 
     fn releaseBytes(self: *TextMergeBudgetAllocator, bytes: usize) void {
-        if (bytes == 0 or self.reservation == null) return;
+        if (bytes == 0) return;
         const previous = self.live_bytes.fetchSub(bytes, .acq_rel);
         std.debug.assert(previous >= bytes);
     }
@@ -504,6 +512,23 @@ test "text merge bounded task allocator enforces live reservation" {
     alloc.free(second);
     try std.testing.expectEqual(@as(usize, 40), stats.current_bytes);
     try std.testing.expectEqual(@as(usize, 64), stats.peak_bytes);
+}
+
+test "text merge task allocator tracks live and external bytes without reservation" {
+    var budget = TextMergeBudgetAllocator.init(std.testing.allocator, null);
+    defer budget.deinit();
+    const alloc = budget.allocator();
+
+    const task_bytes = try alloc.alloc(u8, 128);
+    defer alloc.free(task_bytes);
+    try std.testing.expectEqual(@as(usize, 128), budget.liveBytes());
+
+    const external_charge = try budget.chargeExternal(64);
+    try std.testing.expectEqual(@as(usize, 192), budget.liveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.liveBytesExcludingExternal(external_charge));
+
+    budget.releaseExternal(external_charge);
+    try std.testing.expectEqual(@as(usize, 128), budget.liveBytes());
 }
 
 pub const TextMemoryAttributionStats = struct {
@@ -11705,13 +11730,12 @@ pub const IndexManager = struct {
         }
         var merge_delta_locked = true;
         defer if (merge_delta_locked) entry.merge_delta_mutex.unlock();
-        const publication_task_live_bytes = task.deletion_state.budget.liveBytes();
         const publication_external_bytes = estimateTextMergePublicationExternalBytes(entry, task, result) catch |err| {
             return task.deletion_state.allocationError(err);
         };
         const publication_external_charge = try task.deletion_state.budget.chargeExternal(publication_external_bytes);
         defer task.deletion_state.budget.releaseExternal(publication_external_charge);
-        var publication_deletes = textMergePublicationDeletes(entry, task, result, publication_task_live_bytes, task.deletion_state.deltas) catch |err| {
+        var publication_deletes = textMergePublicationDeletes(entry, task, result, publication_external_charge, task.deletion_state.deltas) catch |err| {
             return task.deletion_state.allocationError(err);
         };
         defer publication_deletes.deinit(task.mergeAllocator());
@@ -12165,7 +12189,7 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         task: *const TextMergeTask,
         result: *TextMergeResult,
-        publication_task_live_bytes: usize,
+        publication_external_charge: usize,
         deletion_deltas: []const TextMergeDeletionDelta,
     ) !TextMergePublicationDeletes {
         if (deletion_deltas.len != task.source.len) return error.InvalidDeletionSnapshot;
@@ -12194,9 +12218,10 @@ pub const IndexManager = struct {
         }
         if (has_deletion_deltas) {
             // The merge output and task state remain live while publication
-            // constructs this lazy identity lookup. Seed the phase with that
-            // live baseline so telemetry reports the real overlapping peak,
-            // not merely the larger of two incorrectly disjoint phases.
+            // constructs this lazy identity lookup. Seed the phase after the
+            // output bitmap array is allocated, excluding only the persistent
+            // publication envelope charged to this same budget.
+            const publication_task_live_bytes = task.deletion_state.budget.liveBytesExcludingExternal(publication_external_charge);
             var lookup_alloc_stats = PhaseAllocStats{
                 .current_bytes = publication_task_live_bytes,
                 .peak_bytes = publication_task_live_bytes,
@@ -12240,6 +12265,15 @@ pub const IndexManager = struct {
                 try output_deleted[output_idx].?.add(output.doc);
             }
         }
+
+        // Roaring bitmaps retain the stable task allocator rather than the
+        // stack-scoped phase wrapper. Sample the exact task ledger after they
+        // are built so their live bytes overlap the retained identity lookup
+        // in the completed-merge peak, while excluding persistent publication.
+        result.peak_task_alloc_bytes = @max(
+            result.peak_task_alloc_bytes,
+            @as(u64, @intCast(task.deletion_state.budget.liveBytesExcludingExternal(publication_external_charge))),
+        );
 
         return .{
             .source_current = true,
