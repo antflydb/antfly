@@ -340,6 +340,11 @@ pub const Options = struct {
     // Zero disables it. The tier lane streams equal-sized publication
     // generations without repeatedly rewriting the overlapping lower level.
     bulk_ingest_tiered_l0_fan_in: usize = 0,
+    // Permit a leveled L0 promotion once L0 reaches 1/N of all lower-level
+    // bytes. Zero disables ratio promotion. This complements geometric L0
+    // carries: meaningful base growth may create the next level, while small
+    // deltas stay in L0 and cannot repeatedly rewrite the lower base.
+    bulk_ingest_l0_base_growth_ratio_denominator: usize = 0,
     level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
     level_target_bytes_base: usize = 1024 * 1024,
@@ -5558,6 +5563,20 @@ pub const Backend = struct {
         return pressure;
     }
 
+    fn bulkL0BaseGrowthDueLocked(self: *const Backend, l0_bytes: u64) bool {
+        const denominator = self.options.bulk_ingest_l0_base_growth_ratio_denominator;
+        if (denominator == 0 or l0_bytes == 0) return false;
+
+        var lower_bytes: u64 = 0;
+        var i = self.snapshotL0PressureLocked().runs;
+        while (i < self.runs.items.len) : (i += 1) {
+            lower_bytes +|= self.runs.items[i].size_bytes;
+        }
+        if (lower_bytes == 0) return false;
+        const threshold = lower_bytes / denominator + @intFromBool(lower_bytes % denominator != 0);
+        return l0_bytes >= threshold;
+    }
+
     fn enforceWritePressure(self: *Backend) anyerror!void {
         if (self.bulkIngestActive() and !self.writePressureDuringBulkIngestEnabled()) return;
         if (self.write_pressure_enforcing) return;
@@ -5584,7 +5603,8 @@ pub const Backend = struct {
         while (pressure.overHardLimit(hard_runs, hard_bytes) and steps < max_steps) {
             const before_step_compactions = self.compaction_stats.compactions;
             const byte_hard = hard_bytes > 0 and pressure.bytes > hard_bytes;
-            const tiered = if (!byte_hard and
+            const base_growth_due = self.bulkL0BaseGrowthDueLocked(pressure.bytes);
+            const tiered = if (!byte_hard and !base_growth_due and
                 hard_runs > 0 and pressure.runs > hard_runs and
                 self.options.bulk_ingest_tiered_l0_fan_in >= 2)
                 try compaction_mod.compactBulkL0Tier(
@@ -10854,6 +10874,58 @@ test "lsm backend hard run pressure prefers a complete geometric L0 carry" {
     try std.testing.expectEqual(@as(usize, 0), countLevelRuns(backend.runs.items, 1));
     try std.testing.expectEqual(@as(u64, 1), backend.write_stats.write_pressure_compactions);
     try std.testing.expectEqual(@as(u64, 0), backend.write_stats.write_pressure_overloads);
+}
+
+test "lsm backend hard run pressure promotes meaningful L0 base growth" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+        .bulk_ingest_l0_base_growth_ratio_denominator = 2,
+    });
+    defer backend.close();
+
+    // Establish an overlapping lower-level base through byte-hard pressure.
+    for (0..4) |_| {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:0", "base");
+        try txn.commit();
+    }
+    backend.options.l0_hard_limit_bytes = 1;
+    {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try backend.enforceWritePressure();
+    }
+    backend.options.l0_hard_limit_bytes = 0;
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(countLevelRuns(backend.runs.items, 1) > 0);
+    const setup_overloads = backend.write_stats.write_pressure_overloads;
+
+    // A same-sized overwrite generation is meaningful growth. At run-hard
+    // pressure it must promote and merge with L1 rather than remain in L0 as
+    // an otherwise valid four-way geometric carry.
+    for (0..4) |_| {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:0", "newer");
+        try txn.commit();
+    }
+    backend.options.l0_hard_limit_runs = 3;
+    {
+        const locked = runtime_mod.lockBackend(Backend, &backend);
+        defer runtime_mod.unlockBackend(Backend, &backend, locked);
+        try backend.enforceWritePressure();
+    }
+
+    // Generic promotion retains the newest precedence run. A same-level
+    // four-way carry would leave that run plus its L0 output (two total).
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expect(countLevelRuns(backend.runs.items, 1) > 0);
+    try std.testing.expectEqualStrings("newer", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:0"));
+    try std.testing.expectEqual(@as(u64, 2), backend.write_stats.write_pressure_compactions);
+    try std.testing.expectEqual(setup_overloads, backend.write_stats.write_pressure_overloads);
 }
 
 test "lsm backend defers soft compaction behind latency-sensitive derived replay" {

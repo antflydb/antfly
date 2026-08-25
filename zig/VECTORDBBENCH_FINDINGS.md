@@ -1747,6 +1747,24 @@ experiment should retain geometric carries but permit one justified base-growth
 merge when accumulated L0 is a substantial fraction of the lower base. That
 is bounded size-ratio leveling, not a return to repeated low-growth rewrites.
 
+A 50% base-growth promotion tested that hypothesis. The 50K gate remained
+healthy at 22.41 seconds ready, 0.9861 recall, and 1.96 GB peak RSS. At 1M the
+second promotion fired near 897K rows, reducing the query-visible primary from
+1.43 GB in L0 over a 2.09 GB base to 415 MB in L0 over 3.09 GB in lower
+levels. Live/restart demand improved from 3.15/2.18 GB to 1.97/1.52 GB, and
+cache-inclusive peaks improved from 3.94/2.19 GB to 3.33/2.06 GB.
+
+The leveled form is not the optimal endpoint. Load regressed from 759.03 to
+788.81 seconds, compaction input rose from 14.55 to 18.40 GB, and compaction
+time rose from 101.0 to 131.9 seconds. Warm p95 improved from 90.0 to 83.7 ms,
+but the public profile improved only from 89.92 to 88.04 ms and C30 fell from
+94.26 to 78.58 QPS. The 2.92 GB maximum job shows the ratio promotion merged
+the new delta with an existing L1 fragment. The next variant should use the
+same meaningful-growth threshold to seal all current L0 generations into one
+large L0 generation instead. That keeps the existing lower base untouched,
+removes fragmented L0 fan-out with roughly 1 GB of streaming input, and makes
+the geometric growth rule prevent repeated rewrites of the sealed generation.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
