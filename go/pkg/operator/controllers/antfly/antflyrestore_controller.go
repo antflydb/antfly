@@ -49,9 +49,20 @@ func (r *AntflyRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// If restore is already completed or failed, skip reconciliation
-	if restore.Status.Phase == antflyv1.RestorePhaseCompleted ||
-		restore.Status.Phase == antflyv1.RestorePhaseFailed {
+	// Completed restores are immutable. Failed legacy jobs may recover below
+	// after the user adds the newly required named connection.
+	if restore.Status.Phase == antflyv1.RestorePhaseCompleted {
+		log.Info("Restore already finished", "phase", restore.Status.Phase)
+		return ctrl.Result{}, nil
+	}
+	if restore.Status.Phase == antflyv1.RestorePhaseFailed {
+		recovered, err := r.recoverFailedLegacyRestore(ctx, restore)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if recovered {
+			return ctrl.Result{Requeue: true}, nil
+		}
 		log.Info("Restore already finished", "phase", restore.Status.Phase)
 		return ctrl.Result{}, nil
 	}
@@ -62,6 +73,26 @@ func (r *AntflyRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := restore.ValidateAntflyRestore(); err != nil {
 		log.Error(err, "AntflyRestore validation failed")
 		r.updateStatusWithError(ctx, restore, antflyv1.RestorePhaseFailed, antflyv1.TypeRestoreJobReady, antflyv1.ReasonRestoreValidationFailed, err.Error())
+		return ctrl.Result{}, nil
+	}
+	if strings.TrimSpace(restore.Spec.Source.Connection) == "" {
+		job := &batchv1.Job{}
+		jobKey := types.NamespacedName{Name: restore.Name + "-restore", Namespace: restore.Namespace}
+		if err := r.Get(ctx, jobKey, job); err != nil && !errors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		} else if err == nil {
+			// A pre-upgrade Job already owns the operation. Continue observing it;
+			// deleting or replacing a running restore would be unsafe.
+			if err := r.updateStatusFromJob(ctx, restore, job); err != nil {
+				return ctrl.Result{}, err
+			}
+			if restore.Status.Phase == antflyv1.RestorePhaseRunning {
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+			return ctrl.Result{}, nil
+		}
+		message := "A named external_io connection with restore.read is required. No restore Job was created; set spec.source.connection to continue."
+		r.updateStatusWithError(ctx, restore, antflyv1.RestorePhasePending, antflyv1.TypeRestoreJobReady, antflyv1.ReasonRestoreConnectionRequired, message)
 		return ctrl.Result{}, nil
 	}
 
@@ -127,6 +158,54 @@ func (r *AntflyRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// recoverFailedLegacyRestore retries only the upgrade failure mode: a Job
+// created without --connection followed by a spec migration that supplies one.
+// Jobs that already carried a connection retain their terminal result.
+func (r *AntflyRestoreReconciler) recoverFailedLegacyRestore(ctx context.Context, restore *antflyv1.AntflyRestore) (bool, error) {
+	if strings.TrimSpace(restore.Spec.Source.Connection) == "" {
+		return false, nil
+	}
+	job := &batchv1.Job{}
+	key := types.NamespacedName{Name: restore.Name + "-restore", Namespace: restore.Namespace}
+	err := r.Get(ctx, key, job)
+	if err != nil && !errors.IsNotFound(err) {
+		return false, err
+	}
+	if err == nil && restoreJobHasConnectionArg(job) {
+		return false, nil
+	}
+	if err == nil {
+		if err := r.Delete(ctx, job); err != nil && !errors.IsNotFound(err) {
+			return false, fmt.Errorf("delete failed legacy restore Job: %w", err)
+		}
+	}
+	restore.Status.Phase = antflyv1.RestorePhasePending
+	restore.Status.CompletionTime = nil
+	restore.Status.Message = "Named restore connection configured; recreating the legacy restore Job"
+	r.setCondition(restore, metav1.Condition{
+		Type:               antflyv1.TypeRestoreJobReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             antflyv1.ReasonRestoreConnectionRequired,
+		Message:            restore.Status.Message,
+		LastTransitionTime: metav1.Now(),
+	})
+	if err := r.Status().Update(ctx, restore); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func restoreJobHasConnectionArg(job *batchv1.Job) bool {
+	for _, container := range job.Spec.Template.Spec.Containers {
+		for i, arg := range container.Args {
+			if arg == "--connection" && i+1 < len(container.Args) && strings.TrimSpace(container.Args[i+1]) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // getReferencedCluster fetches the AntflyCluster referenced by the restore

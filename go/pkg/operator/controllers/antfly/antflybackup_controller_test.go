@@ -84,6 +84,42 @@ func TestShellQuote(t *testing.T) {
 	}
 }
 
+func TestSuspendCronJobForConnectionMigrationPreservesExistingSchedule(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := batchv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add batch scheme: %v", err)
+	}
+	cronJob := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "legacy-backup-backup", Namespace: "default"},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "0 2 * * *",
+			JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{
+				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers:    []corev1.Container{{Name: "backup", Image: "antfly:old"}},
+				}},
+			}},
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cronJob).Build()
+	r := &AntflyBackupReconciler{Client: client}
+	backup := &antflyv1.AntflyBackup{ObjectMeta: metav1.ObjectMeta{Name: "legacy-backup", Namespace: "default"}}
+
+	if err := r.suspendCronJobForConnectionMigration(context.Background(), backup); err != nil {
+		t.Fatalf("suspendCronJobForConnectionMigration: %v", err)
+	}
+	got := &batchv1.CronJob{}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: cronJob.Name, Namespace: cronJob.Namespace}, got); err != nil {
+		t.Fatalf("get CronJob: %v", err)
+	}
+	if got.Spec.Suspend == nil || !*got.Spec.Suspend {
+		t.Fatal("legacy CronJob was not suspended")
+	}
+	if got.Spec.Schedule != cronJob.Spec.Schedule || got.Spec.JobTemplate.Spec.Template.Spec.Containers[0].Image != "antfly:old" {
+		t.Fatalf("legacy CronJob workload was unexpectedly rewritten: %#v", got.Spec)
+	}
+}
+
 func TestUpdateBackupHistoryReportsLatestFailedJob(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := batchv1.AddToScheme(scheme); err != nil {

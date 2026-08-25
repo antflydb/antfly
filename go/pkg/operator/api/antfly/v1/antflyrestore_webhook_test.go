@@ -13,8 +13,9 @@ func TestValidateAntflyRestore_Valid(t *testing.T) {
 		Spec: AntflyRestoreSpec{
 			ClusterRef: ClusterReference{Name: "my-cluster"},
 			Source: RestoreSource{
-				BackupID: "backup-001",
-				Location: "s3://my-bucket/backups",
+				BackupID:   "backup-001",
+				Location:   "s3://my-bucket/backups",
+				Connection: "archive-reader",
 			},
 		},
 	}
@@ -186,8 +187,9 @@ func TestValidateUpdate_RestoreAllowsModificationWhenPending(t *testing.T) {
 		Spec: AntflyRestoreSpec{
 			ClusterRef: ClusterReference{Name: "my-cluster"},
 			Source: RestoreSource{
-				BackupID: "backup-001",
-				Location: "s3://my-bucket/backups",
+				BackupID:   "backup-001",
+				Location:   "s3://my-bucket/backups",
+				Connection: "archive-reader",
 			},
 		},
 		Status: AntflyRestoreStatus{Phase: RestorePhasePending},
@@ -196,5 +198,41 @@ func TestValidateUpdate_RestoreAllowsModificationWhenPending(t *testing.T) {
 
 	if err := new.ValidateUpdate(old); err != nil {
 		t.Errorf("expected no error for modifying restore in Pending phase, got: %v", err)
+	}
+}
+
+func TestValidateCreate_RestoreRequiresNamedConnection(t *testing.T) {
+	restore := &AntflyRestore{Spec: AntflyRestoreSpec{
+		ClusterRef: ClusterReference{Name: "cluster-a"},
+		Source: RestoreSource{
+			BackupID: "backup-001",
+			Location: "s3://archive/backups",
+		},
+	}}
+
+	err := restore.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "spec.source.connection is required") {
+		t.Fatalf("ValidateCreate() error = %v, want actionable connection requirement", err)
+	}
+}
+
+func TestValidateUpdate_FailedLegacyRestoreAllowsConnectionOnlyMigration(t *testing.T) {
+	old := &AntflyRestore{
+		Spec: AntflyRestoreSpec{
+			ClusterRef: ClusterReference{Name: "cluster-a"},
+			Source:     RestoreSource{BackupID: "backup-001", Location: "s3://archive/backups"},
+		},
+		Status: AntflyRestoreStatus{Phase: RestorePhaseFailed},
+	}
+	migrated := old.DeepCopy()
+	migrated.Spec.Source.Connection = "archive-reader"
+	if err := migrated.ValidateUpdate(old); err != nil {
+		t.Fatalf("connection-only migration rejected: %v", err)
+	}
+
+	changed := migrated.DeepCopy()
+	changed.Spec.Source.BackupID = "backup-002"
+	if err := changed.ValidateUpdate(old); err == nil || !strings.Contains(err.Error(), "cannot be modified") {
+		t.Fatalf("terminal restore mutation error = %v, want immutable", err)
 	}
 }

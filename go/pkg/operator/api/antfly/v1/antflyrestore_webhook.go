@@ -2,6 +2,7 @@ package v1
 
 import (
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -11,7 +12,10 @@ import (
 // ValidateCreate validates the restore configuration when creating a new restore.
 // Called by controller fallback when webhooks are disabled.
 func (r *AntflyRestore) ValidateCreate() error {
-	return r.ValidateAntflyRestore()
+	if err := r.ValidateAntflyRestore(); err != nil {
+		return err
+	}
+	return r.ValidateRestoreConnection()
 }
 
 // ValidateUpdate validates the restore configuration when updating an existing restore.
@@ -28,17 +32,50 @@ func (r *AntflyRestore) ValidateUpdate(old runtime.Object) error {
 // ValidateRestoreUpdate checks phase-lock immutability and validates the new spec.
 // Shared by both the typed webhook validator and the deprecated fallback.
 func (r *AntflyRestore) ValidateRestoreUpdate(old *AntflyRestore) error {
+	connectionMigration := old.Status.Phase == RestorePhaseFailed &&
+		old.Spec.Source.Connection == "" && r.Spec.Source.Connection != "" &&
+		restoreSpecsEqualExceptConnection(old.Spec, r.Spec)
 	if old.Status.Phase == RestorePhaseRunning ||
 		old.Status.Phase == RestorePhaseCompleted ||
 		old.Status.Phase == RestorePhaseFailed {
-		//nolint:staticcheck // ST1005: intentionally capitalized user-facing webhook error
-		return fmt.Errorf(`AntflyRestore cannot be modified after it has started
+		if connectionMigration {
+			// A failed legacy restore may be made runnable by adding only its
+			// required connection.
+		} else {
+			//nolint:staticcheck // ST1005: intentionally capitalized user-facing webhook error
+			return fmt.Errorf(`AntflyRestore cannot be modified after it has started
 
 Problem: The restore operation is already in phase '%s'.
 
 Solution: Delete this AntflyRestore and create a new one if you need different settings.`, old.Status.Phase)
+		}
 	}
-	return r.ValidateAntflyRestore()
+	if err := r.ValidateAntflyRestore(); err != nil {
+		return err
+	}
+	return r.ValidateRestoreConnection()
+}
+
+func restoreSpecsEqualExceptConnection(oldSpec, newSpec AntflyRestoreSpec) bool {
+	oldCopy := oldSpec
+	newCopy := newSpec
+	oldCopy.Source.Connection = ""
+	newCopy.Source.Connection = ""
+	oldCopy.Source.CredentialsSecret = nil
+	newCopy.Source.CredentialsSecret = nil
+	return reflect.DeepEqual(oldCopy, newCopy)
+}
+
+// ValidateRestoreConnection enforces the network API's named-connection
+// contract while the controller retains upgrade-safe handling for legacy CRs.
+func (r *AntflyRestore) ValidateRestoreConnection() error {
+	if strings.TrimSpace(r.Spec.Source.Connection) == "" {
+		return fmt.Errorf("spec.source.connection is required; configure an external_io connection with restore.read and migrate any legacy credentialsSecret before starting this restore")
+	}
+	if r.Spec.Source.CredentialsSecret != nil {
+		return fmt.Errorf("spec.source.credentialsSecret is deprecated and cannot be used with network restores; configure credentials on spec.source.connection")
+	}
+	return nil
 }
 
 // ValidateAntflyRestore performs all validation checks
@@ -106,10 +143,8 @@ in your credentials secret.`, source.Location)
 	if source.Connection != "" && source.CredentialsSecret != nil {
 		return fmt.Errorf("spec.source.connection and spec.source.credentialsSecret are mutually exclusive")
 	}
-	if source.Connection != "" && !strings.HasPrefix(source.Location, "s3://") {
-		return fmt.Errorf("spec.source.connection requires an s3:// location")
-	}
-
+	// Both object and filesystem locations are authorized by the named
+	// external_io connection at runtime.
 	return nil
 }
 

@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -65,5 +67,18 @@ func TestBuildRestoreJob_StandaloneStillUsesPublicAPIService(t *testing.T) {
 	}
 	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://standalone-cluster-public-api.default.svc.cluster.local" {
 		t.Fatalf("expected restore URL to continue using public-api service in standalone mode, got: %q", got)
+	}
+}
+
+func TestRestoreJobHasConnectionArg(t *testing.T) {
+	job := &batchv1.Job{Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "restore", Args: []string{"restore", "--connection", "archive-reader"}}},
+	}}}}
+	if !restoreJobHasConnectionArg(job) {
+		t.Fatal("named connection argument was not detected")
+	}
+	job.Spec.Template.Spec.Containers[0].Args = []string{"restore", "--connection", ""}
+	if restoreJobHasConnectionArg(job) {
+		t.Fatal("empty connection argument was treated as migrated")
 	}
 }
