@@ -6446,7 +6446,11 @@ test "httpx MCP route preserves protocol session headers" {
 test "httpx shared registrar keeps root probes and rejects removed data aliases" {
     const alloc = std.testing.allocator;
     var source = AuthStatusSource{};
-    var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    const service_secret = "httpx-shared-registrar-test-secret";
+    var api_server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = service_secret,
+        .internal_service_issuer = "httpx-test",
+    }, source.iface(), null, null);
     defer api_server.deinit();
 
     var e2e_server: HttpxE2eServer = undefined;
@@ -6486,7 +6490,16 @@ test "httpx shared registrar keeps root probes and rejects removed data aliases"
         .{ base_url, parsed_job.value.job_id, parsed_job.value.attempt_id },
     );
     defer alloc.free(cancel_state_url);
-    var cancel_state_response = try getWithRetry(&client, client_io.io(), cancel_state_url, null, 20);
+    const service_token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = service_secret,
+        .issuer = "httpx-test",
+        .subject = "node:test",
+    }, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    defer alloc.free(service_token);
+    const internal_headers = [_][2][]const u8{
+        .{ internal_service_auth.header_name, service_token },
+    };
+    var cancel_state_response = try getWithRetry(&client, client_io.io(), cancel_state_url, &internal_headers, 20);
     defer cancel_state_response.deinit();
     try std.testing.expectEqual(@as(u16, 200), cancel_state_response.status.code);
     try std.testing.expectEqualStrings("{\"cancel_requested\":false}", cancel_state_response.body.?);
