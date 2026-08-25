@@ -113,6 +113,11 @@ const ServerA4bTelemetry = struct {
     route_select_attempts: u64 = 0,
     route_select_successes: u64 = 0,
     route_select_fallbacks: u64 = 0,
+    cuda_resident_source_bytes: u64 = 0,
+    cuda_resident_source_count: u64 = 0,
+    cuda_route_calls: u64 = 0,
+    cuda_decode_calls: u64 = 0,
+    cuda_prefill_calls: u64 = 0,
     slot_lookup_attempts: u64 = 0,
     slot_route_hits: u64 = 0,
     slot_route_misses: u64 = 0,
@@ -150,7 +155,7 @@ const ServerA4bTelemetry = struct {
 fn serverA4bTelemetrySnapshot(cb: ?*const ops.ComputeBackend) ?ops.NativeQuantTimingStats {
     if (!serverA4bTelemetryEnabled()) return null;
     const backend = cb orelse return null;
-    if (backend.kind() != .metal) return null;
+    if (backend.kind() != .metal and backend.kind() != .cuda) return null;
     return backend.debugTimingSnapshot().provider;
 }
 
@@ -162,6 +167,11 @@ fn serverA4bTelemetryDelta(
         .route_select_attempts = after.a4b_moe_route_select_attempts -| before.a4b_moe_route_select_attempts,
         .route_select_successes = after.a4b_moe_route_select_successes -| before.a4b_moe_route_select_successes,
         .route_select_fallbacks = after.a4b_moe_route_select_fallbacks -| before.a4b_moe_route_select_fallbacks,
+        .cuda_resident_source_bytes = after.a4b_cuda_resident_source_bytes,
+        .cuda_resident_source_count = after.a4b_cuda_resident_source_count,
+        .cuda_route_calls = after.a4b_cuda_route_calls -| before.a4b_cuda_route_calls,
+        .cuda_decode_calls = after.a4b_cuda_decode_calls -| before.a4b_cuda_decode_calls,
+        .cuda_prefill_calls = after.a4b_cuda_prefill_calls -| before.a4b_cuda_prefill_calls,
         .slot_lookup_attempts = after.a4b_moe_slot_lookup_attempts -| before.a4b_moe_slot_lookup_attempts,
         .slot_route_hits = after.a4b_moe_slot_route_hits -| before.a4b_moe_slot_route_hits,
         .slot_route_misses = after.a4b_moe_slot_route_misses -| before.a4b_moe_slot_route_misses,
@@ -205,6 +215,21 @@ fn logServerA4bTelemetry(
     const start = before orelse return;
     const backend = cb orelse return;
     const delta = serverA4bTelemetryDelta(backend.debugTimingSnapshot().provider, start);
+    if (backend.kind() == .cuda) {
+        std.log.info(
+            "cuda_a4b_server_request: scope=process_delta model={s} resident_source_bytes={d} resident_source_count={d} route_calls={d} decode_calls={d} prefill_calls={d} route_fallbacks={d}",
+            .{
+                model_name,
+                delta.cuda_resident_source_bytes,
+                delta.cuda_resident_source_count,
+                delta.cuda_route_calls,
+                delta.cuda_decode_calls,
+                delta.cuda_prefill_calls,
+                delta.route_select_fallbacks,
+            },
+        );
+        return;
+    }
     std.log.info(
         "metal_a4b_server_request: scope=process_delta model={s} route_select_attempts={d} route_select_successes={d} route_select_fallbacks={d} slot_lookup_attempts={d} slot_route_hits={d} slot_route_misses={d} slot_all_hit_layers={d} slot_map_publications={d} slot_map_publish_failures={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} slot_uploads={d} slot_upload_bytes={d} mapped_attempts={d} mapped_fallbacks={d} mapped_failures={d} linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} frame_begins={d} frame_submits={d} compute_encoders={d} blit_encoders={d} bootstrap_misses={d}",
         .{
@@ -264,6 +289,11 @@ test "server A4B telemetry reports saturating request deltas" {
     var after = before;
     after.a4b_moe_route_select_attempts = 130;
     after.a4b_moe_route_select_successes = 120;
+    after.a4b_cuda_resident_source_bytes = 14_000_000_000;
+    after.a4b_cuda_resident_source_count = 60;
+    after.a4b_cuda_route_calls = 120;
+    after.a4b_cuda_decode_calls = 90;
+    after.a4b_cuda_prefill_calls = 30;
     after.a4b_moe_slot_lookup_attempts = 120;
     after.a4b_moe_slot_route_hits = 880;
     after.a4b_moe_slot_route_misses = 80;
@@ -291,6 +321,11 @@ test "server A4B telemetry reports saturating request deltas" {
     const delta = serverA4bTelemetryDelta(after, before);
     try std.testing.expectEqual(@as(u64, 120), delta.route_select_attempts);
     try std.testing.expectEqual(@as(u64, 120), delta.route_select_successes);
+    try std.testing.expectEqual(@as(u64, 14_000_000_000), delta.cuda_resident_source_bytes);
+    try std.testing.expectEqual(@as(u64, 60), delta.cuda_resident_source_count);
+    try std.testing.expectEqual(@as(u64, 120), delta.cuda_route_calls);
+    try std.testing.expectEqual(@as(u64, 90), delta.cuda_decode_calls);
+    try std.testing.expectEqual(@as(u64, 30), delta.cuda_prefill_calls);
     try std.testing.expectEqual(@as(u64, 120), delta.slot_lookup_attempts);
     try std.testing.expectEqual(@as(u64, 880), delta.slot_route_hits);
     try std.testing.expectEqual(@as(u64, 80), delta.slot_route_misses);
@@ -1053,12 +1088,13 @@ pub const WarmModel = struct {
 fn validatedWarmModelA4bRequest(model: WarmModel) !?ops.A4bInferenceRequest {
     const request = model.a4bRequest();
     if (request != null and model.kind != .generator) return error.A4bUnsupportedModelKind;
-    if (request != null and model.backend != null and model.backend.? != .metal)
-        return error.A4bRequiresMetal;
+    if (request != null and model.backend != null and
+        model.backend.? != .metal and model.backend.? != .cuda)
+        return error.A4bRequiresGpu;
     return request;
 }
 
-test "warm model A4B controls are Metal generator only" {
+test "warm model A4B controls are GPU generator only" {
     const request = (try validatedWarmModelA4bRequest(.{
         .name = "gemma4-a4b",
         .backend = .metal,
@@ -1067,7 +1103,14 @@ test "warm model A4B controls are Metal generator only" {
     })).?;
     try std.testing.expectEqual(ops.A4bResidencyMode.streamed, request.residency_mode);
     try std.testing.expectEqual(@as(u32, 4096), request.memory_budget_mb);
-    try std.testing.expectError(error.A4bRequiresMetal, validatedWarmModelA4bRequest(.{
+    const cuda_request = (try validatedWarmModelA4bRequest(.{
+        .name = "gemma4-a4b-cuda",
+        .backend = .cuda,
+        .residency_mode = .resident,
+        .memory_budget_mb = 16384,
+    })).?;
+    try std.testing.expectEqual(ops.A4bResidencyMode.resident, cuda_request.residency_mode);
+    try std.testing.expectError(error.A4bRequiresGpu, validatedWarmModelA4bRequest(.{
         .name = "gemma4-a4b",
         .backend = .native,
         .memory_budget_mb = 4096,

@@ -1836,6 +1836,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                         cuda_stats.device_allocated_bytes,
                     },
                 );
+                if (cuda_stats.a4b_resident_source_count != 0) {
+                    print(
+                        "cuda_a4b_runtime: resident_source_bytes={d} resident_source_count={d} route_calls={d} decode_calls={d} prefill_calls={d} fallbacks=0\n",
+                        .{
+                            cuda_stats.a4b_resident_source_bytes,
+                            cuda_stats.a4b_resident_source_count,
+                            cuda_stats.a4b_route_calls,
+                            cuda_stats.a4b_decode_calls,
+                            cuda_stats.a4b_prefill_calls,
+                        },
+                    );
+                }
                 print(
                     "cuda_cross_backend_copy: copies={d} bytes={d} event_records={d} event_waits={d} sync_fallbacks={d}\n",
                     .{
@@ -2889,6 +2901,24 @@ fn cudaStatsCompactJson(
             stats.cross_backend_event_records,
             stats.cross_backend_event_waits,
             stats.cross_backend_sync_fallbacks,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\"a4b_resident_source_bytes":{d},
+        \\"a4b_resident_source_count":{d},
+        \\"a4b_route_calls":{d},
+        \\"a4b_decode_calls":{d},
+        \\"a4b_prefill_calls":{d},
+        \\
+    ,
+        .{
+            stats.a4b_resident_source_bytes,
+            stats.a4b_resident_source_count,
+            stats.a4b_route_calls,
+            stats.a4b_decode_calls,
+            stats.a4b_prefill_calls,
         },
     );
     try appendFmt(
@@ -4347,6 +4377,18 @@ fn writeJsonTiming(
             try appendFmt(
                 allocator,
                 &cuda_out,
+                \\"a4b_resident_source_bytes":{d},
+                \\"a4b_resident_source_count":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.a4b_resident_source_bytes,
+                    cuda_stats.a4b_resident_source_count,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_out,
                 \\"temp_buffer_hits":{d},
                 \\"temp_buffer_misses":{d},
                 \\"temp_buffer_releases":{d},
@@ -5098,6 +5140,20 @@ fn writeJsonTiming(
                     cuda_stats.cross_backend_sync_fallbacks,
                     cuda_stats.to_float32_calls,
                     cuda_stats.to_float32_bytes,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"a4b_route_calls":{d},
+                \\"a4b_decode_calls":{d},
+                \\"a4b_prefill_calls":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.a4b_route_calls,
+                    cuda_stats.a4b_decode_calls,
+                    cuda_stats.a4b_prefill_calls,
                 },
             );
             try appendFmt(

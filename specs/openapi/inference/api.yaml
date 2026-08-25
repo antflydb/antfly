@@ -3001,7 +3001,7 @@ components:
         - fp16
     A4bResidencyMode:
       type: string
-      description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+      description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime.
       enum:
         - auto
         - streamed
@@ -3048,7 +3048,7 @@ components:
         residency_mode:
           $ref: '#/components/schemas/A4bResidencyMode'
           default: auto
-          description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
+          description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. Other model geometries reject this field. CUDA currently requires resident mode on an SM89 device.
         memory_budget_mb:
           type: integer
           format: uint32

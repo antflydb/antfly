@@ -7145,14 +7145,14 @@ fn estimateModelLoadAdmission(
     const weights = try estimateModelArtifactBytes(man, backend_runtime.backend);
     const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
     if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
-    if (backend_runtime.backend == .metal) {
+    if (backend_runtime.backend == .metal or backend_runtime.backend == .cuda) {
         if (try session_factory.resolveA4bInferenceConfigForModelListing(
             man.allocator,
             model_path,
             man,
             a4b_request,
         )) |config| {
-            return a4bMetalModelLoadAdmission(config);
+            return a4bGpuModelLoadAdmission(config, weights, backend_runtime.backend);
         }
     }
     const extra_backend_resident = if (backend_runtime.backend == .metal)
@@ -7162,7 +7162,11 @@ fn estimateModelLoadAdmission(
     return nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
 }
 
-fn a4bMetalModelLoadAdmission(config: backend_contracts.A4bInferenceConfig) ModelLoadAdmissionPlan {
+fn a4bGpuModelLoadAdmission(
+    config: backend_contracts.A4bInferenceConfig,
+    encoded_artifact_bytes: usize,
+    backend: backends.BackendType,
+) ModelLoadAdmissionPlan {
     const budget: usize = @intCast(config.memory_budget_bytes);
     const kv: usize = @intCast(config.kv_budget_bytes);
     const scratch: usize = @intCast(config.safety_reserve_bytes);
@@ -7172,17 +7176,26 @@ fn a4bMetalModelLoadAdmission(config: backend_contracts.A4bInferenceConfig) Mode
         .backend_kv_bytes = kv,
         .backend_scratch_bytes = scratch,
     };
-    return .{ .peak = resident, .resident = resident };
+    var peak = resident;
+    // CUDA constructs a temporary native GGUF session while uploading its
+    // resident representation. Metal maps the encoded artifact directly and
+    // does not retain a second host copy.
+    if (backend == .cuda) peak.host_weight_bytes = encoded_artifact_bytes;
+    return .{ .peak = peak, .resident = resident };
 }
 
-test "A4B Metal admission lease equals the configured memory envelope" {
+test "A4B GPU admission lease equals the configured memory envelope" {
     const config = try backend_contracts.buildA4bInferenceConfig(
         .{},
         backend_contracts.qualified_a4b_geometries[0],
     );
-    const plan = a4bMetalModelLoadAdmission(config);
-    try std.testing.expectEqual(@as(usize, @intCast(config.memory_budget_bytes)), plan.resident.backendTotalBytes());
-    try std.testing.expectEqual(plan.resident, plan.peak);
+    const metal_plan = a4bGpuModelLoadAdmission(config, 1234, .metal);
+    try std.testing.expectEqual(@as(usize, @intCast(config.memory_budget_bytes)), metal_plan.resident.backendTotalBytes());
+    try std.testing.expectEqual(metal_plan.resident, metal_plan.peak);
+    const cuda_plan = a4bGpuModelLoadAdmission(config, 1234, .cuda);
+    try std.testing.expectEqual(cuda_plan.resident.backendTotalBytes(), cuda_plan.peak.backendTotalBytes());
+    try std.testing.expectEqual(@as(usize, 1234), cuda_plan.peak.host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cuda_plan.resident.host_weight_bytes);
 }
 
 fn onnxModelLoadAdmission(
@@ -7297,8 +7310,10 @@ fn loadSessionForPreferredBackends(
     var first_err: ?anyerror = null;
     for (effective_backends) |backend| {
         if (!backend.supportsDirectSessionLoad()) continue;
-        if (source_session_manager.a4b_inference_request != null and backend != .metal) {
-            rememberPreferredLoadError(&first_err, error.A4bRequiresMetal);
+        if (source_session_manager.a4b_inference_request != null and
+            backend != .metal and backend != .cuda)
+        {
+            rememberPreferredLoadError(&first_err, error.A4bRequiresGpu);
             continue;
         }
         if (source_session_manager.kernel_jit.mode.failClosed() and

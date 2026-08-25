@@ -1183,9 +1183,10 @@ components:
       enum: [auto, streamed, resident]
       description: |
         Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0
-        Metal runtime. `auto` chooses full residency only when the complete
+        Metal or CUDA runtime. `auto` chooses full residency only when the complete
         expert set and safety reserves fit the configured budget; otherwise
-        it uses bounded streaming.
+        it uses bounded streaming. CUDA currently requires resident mode on
+        an SM89 device.
 
     ModelRef:
       type: object
@@ -1213,9 +1214,10 @@ components:
           default: auto
           description: |
             Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0
-            Metal runtime. `auto` chooses full residency only when the complete
+            Metal or CUDA runtime. `auto` chooses full residency only when the complete
             expert set and safety reserves fit the configured budget; otherwise
             it uses bounded streaming. Other model geometries reject this field.
+            CUDA currently requires resident mode on an SM89 device.
         memory_budget_mb:
           type: integer
           format: uint32

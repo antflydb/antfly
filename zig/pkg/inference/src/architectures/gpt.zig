@@ -394,7 +394,7 @@ fn maybePrepareCudaGemmaDecoderOverrides(
     decode_context: ?*const DecodeContext,
     trace_sink: ?*ActivationTraceSink,
 ) !Layer0DecoderOverrides {
-    if (cb.kind() != .cuda or config.family != .gemma or config.usesMoe()) return overrides;
+    if (cb.kind() != .cuda or config.family != .gemma) return overrides;
     if (!cudaPreparedDecoderSlotsEnabled() or trace_sink != null) return overrides;
     if (!layer0DecoderOverridesEmpty(overrides)) return overrides;
 
@@ -8373,7 +8373,8 @@ fn moeFeedForwardInner(
     // Move Gemma's positive 1/sqrt(hidden) factor through the bias-free router
     // projection and apply it inside route selection. This preserves routing
     // math while avoiding a separate device multiply in the framed decode path.
-    const defer_router_hidden_scale = config.family == .gemma and cb.kind() == .metal;
+    const defer_router_hidden_scale = config.family == .gemma and
+        (cb.kind() == .metal or cb.kind() == .cuda);
     const router_logit_scale: f32 = if (defer_router_hidden_scale)
         1.0 / @sqrt(@as(f32, @floatFromInt(hidden_size)))
     else

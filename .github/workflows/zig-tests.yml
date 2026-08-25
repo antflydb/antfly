@@ -40,6 +40,7 @@ jobs:
       trace_validate: ${{ steps.detect.outputs.trace_validate }}
       backup_s3: ${{ steps.detect.outputs.backup_s3 }}
       release_tooling: ${{ steps.detect.outputs.release_tooling }}
+      a4b_cuda: ${{ steps.detect.outputs.a4b_cuda }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -59,6 +60,7 @@ jobs:
                 echo "model_check=false"
                 echo "trace_validate=false"
                 echo "backup_s3=false"
+                echo "a4b_cuda=false"
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -69,6 +71,7 @@ jobs:
               echo "trace_validate=true"
               echo "backup_s3=true"
               echo "release_tooling=true"
+              echo "a4b_cuda=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -82,6 +85,7 @@ jobs:
                 echo "trace_validate=true"
                 echo "backup_s3=false"
                 echo "release_tooling=false"
+                echo "a4b_cuda=false"
               } >> "$GITHUB_OUTPUT"
             else
               {
@@ -90,6 +94,7 @@ jobs:
                 echo "trace_validate=false"
                 echo "backup_s3=true"
                 echo "release_tooling=false"
+                echo "a4b_cuda=false"
               } >> "$GITHUB_OUTPUT"
             fi
             exit 0
@@ -107,6 +112,7 @@ jobs:
               echo "trace_validate=true"
               echo "backup_s3=true"
               echo "release_tooling=true"
+              echo "a4b_cuda=true"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -123,6 +129,19 @@ jobs:
             echo "zig_tests=false" >> "$GITHUB_OUTPUT"
           else
             echo "zig_tests=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if git diff --quiet "$base" "${{ github.sha }}" -- \
+            ':(glob)zig/pkg/inference/src/**' \
+            zig/pkg/inference/build.zig \
+            ':(glob)zig/pkg/inference/scripts/*a4b*' \
+            zig/pkg/inference/PERF.md \
+            ':(glob)specs/openapi/inference/**' \
+            .github/workflows/zig-tests.yml
+          then
+            echo "a4b_cuda=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "a4b_cuda=true" >> "$GITHUB_OUTPUT"
           fi
 
           if git diff --quiet "$base" "${{ github.sha }}" -- \
@@ -357,6 +376,7 @@ jobs:
             scripts.test_benchmark_gemma4_long_e2e_server \
             scripts.test_benchmark_gemma4_cuda_batching \
             scripts.test_benchmark_gemma4_cuda_matrix \
+            scripts.test_benchmark_cuda_gemma4_a4b \
             scripts.test_benchmark_metal_gemma4_ab \
             scripts.test_benchmark_metal_gemma4_long_output \
             scripts.test_content_security_contract \
@@ -709,6 +729,91 @@ jobs:
           chaos-test
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
+
+  gemma4-a4b-cuda:
+    name: Gemma4 26B-A4B CUDA / SM89
+    needs: changes
+    if: needs.changes.outputs.a4b_cuda == 'true' && vars.ANTFLY_CUDA_RUNNER != ''
+    runs-on: ${{ vars.ANTFLY_CUDA_RUNNER }}
+    timeout-minutes: 120
+    env:
+      TERMITE_REQUIRE_CUDA_TESTS: "1"
+      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
+      ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Prepare cache and verify SM89 runner
+        run: |
+          mkdir -p "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+          nvidia-smi --query-gpu=name,compute_cap,uuid,driver_version --format=csv,noheader,nounits
+          test "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits | wc -l)" -eq 1
+          test "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits)" = "8.9"
+
+      - name: Test CUDA A4B qualification contract
+        working-directory: zig/pkg/inference
+        run: python3 -m unittest scripts.test_benchmark_cuda_gemma4_a4b
+
+      - name: Check CUDA generated artifacts
+        working-directory: zig/pkg/inference
+        run: zig build cuda-artifacts-check
+
+      - name: Test CUDA A4B load and admission contracts
+        working-directory: zig/pkg/inference
+        run: >-
+          zig build test -Dcuda=true -Dmetal=false -Donnx=false -Dpjrt=false -j2 --
+          --test-filter 'explicit A4B requests'
+          --test-filter 'server A4B telemetry'
+          --test-filter 'warm model A4B'
+          --test-filter 'A4B GPU admission'
+          --test-filter 'cuda A4B resident workspace'
+          --test-filter 'cuda A4B packed projection'
+
+      - name: Build CUDA inference release lane
+        working-directory: zig/pkg/inference
+        run: >-
+          zig build -Dcuda=true -Dmetal=false -Donnx=false -Dpjrt=false
+          -Doptimize=ReleaseSafe -j2
+
+      - name: Run strict CUDA A4B kernel smoke
+        working-directory: zig/pkg/inference
+        run: zig-out/bin/antfly-inference cuda-info --smoke
+
+      - name: Run exact-model paired CUDA qualification
+        if: >-
+          vars.GEMMA4_A4B_Q4_0_GGUF != '' &&
+          vars.LLAMA_CPP_CUDA_BIN != '' &&
+          vars.LLAMA_CPP_CUDA_SHA256 != '' &&
+          vars.GEMMA4_A4B_PROMPT != '' &&
+          vars.GEMMA4_A4B_PROMPT_TOKENS != '' &&
+          vars.GEMMA4_A4B_PROMPT_SHA256 != ''
+        working-directory: zig/pkg/inference
+        env:
+          A4B_MODEL: ${{ vars.GEMMA4_A4B_Q4_0_GGUF }}
+          LLAMA_BIN: ${{ vars.LLAMA_CPP_CUDA_BIN }}
+          LLAMA_SHA256: ${{ vars.LLAMA_CPP_CUDA_SHA256 }}
+          A4B_PROMPT: ${{ vars.GEMMA4_A4B_PROMPT }}
+          A4B_PROMPT_TOKENS: ${{ vars.GEMMA4_A4B_PROMPT_TOKENS }}
+          A4B_PROMPT_SHA256: ${{ vars.GEMMA4_A4B_PROMPT_SHA256 }}
+        run: |
+          python3 scripts/benchmark_cuda_gemma4_a4b.py \
+            --model "$A4B_MODEL" \
+            --antfly-bin zig-out/bin/antfly-inference \
+            --llama-bin "$LLAMA_BIN" \
+            --expected-llama-sha256 "$LLAMA_SHA256" \
+            --out-dir "$RUNNER_TEMP/gemma4-a4b-cuda" \
+            --prompt "$A4B_PROMPT" \
+            --expected-prompt-tokens "$A4B_PROMPT_TOKENS" \
+            --expected-prompt-sha256 "$A4B_PROMPT_SHA256"
 
   zig-base:
     name: zig-base

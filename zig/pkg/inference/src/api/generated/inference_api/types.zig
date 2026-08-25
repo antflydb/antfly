@@ -5,7 +5,7 @@ const std = @import("std");
 const antfly_chunking_api_openapi = @import("antfly_chunking_api_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
 
-/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime.
 pub const A4bResidencyMode = enum {
     auto,
     streamed,
@@ -946,7 +946,7 @@ pub const ModelRef = struct {
     backend: ?ModelBackend = null,
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
-    /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
+    /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. Other model geometries reject this field. CUDA currently requires resident mode on an SM89 device.
     residency_mode: ?A4bResidencyMode = null,
     /// Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
     memory_budget_mb: ?i64 = null,

@@ -106,6 +106,17 @@ const PosixC = struct {
 
 var mmap_temp_counter: std.atomic.Value(u64) = .init(0);
 
+/// Return the byte offset of a borrowed slice inside its complete mmap.
+/// Callers use this to order independent tensor reads by physical file order.
+pub fn mappedSliceOffset(full: []const u8, slice: []const u8) ?usize {
+    const full_start = @intFromPtr(full.ptr);
+    const slice_start = @intFromPtr(slice.ptr);
+    if (slice_start < full_start) return null;
+    const offset = slice_start - full_start;
+    if (offset > full.len or slice.len > full.len - offset) return null;
+    return offset;
+}
+
 /// Memory-mapped file region. The mapped bytes are valid until `deinit()` is called.
 pub const MmapRegion = struct {
     data: []align(std.heap.page_size_min) u8,
@@ -147,6 +158,15 @@ pub const MmapRegion = struct {
     /// Switch the entire region to random-access advice.
     pub fn adviseRandom(self: *MmapRegion) void {
         advise(self.data.ptr, self.data.len, .random);
+    }
+
+    /// Override a prior random-access hint for one borrowed mmap slice whose
+    /// consumer is about to scan every byte in ascending order. This is used
+    /// by resident GPU uploads: applying the hint to the exact tensor span
+    /// restores kernel readahead without faulting unrelated model weights.
+    pub fn adviseBytesSequential(bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        advise(@constCast(bytes.ptr), bytes.len, .sequential);
     }
 
     /// Release clean pages for a consumed file-backed range. The mapping stays

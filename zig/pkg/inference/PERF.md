@@ -1,5 +1,88 @@
 # Gemma 4 26B-A4B Performance Analysis
 
+## 2026-08-25 CUDA resident Q4_0 lane
+
+The CUDA backend now has a fail-closed resident qualification candidate for the same exact
+26B-A4B Q4_0 geometry qualified by the Metal lane: 30 MoE layers, 128
+experts, top-8 routing, hidden size 2816, and expert intermediate size 704.
+The first hardware target is NVIDIA SM89 (L4). Packed expert sources are
+uploaded once and deduplicated when gate/up projections alias the same GGUF
+storage. Routing, Q8_1 activation quantization, Q4_0 gate/up/down projections,
+GELU, and routed reduction stay on device for decode and prefill rows.
+
+CUDA intentionally supports only full residency for this qualification. A
+streamed request, a non-SM89 device, an inexact geometry/quantization, a
+missing kernel, or a resident footprint outside the configured envelope fails
+model load instead of falling back to host MoE execution. The initial command
+is:
+
+```sh
+TERMITE_SERVER_A4B_TELEMETRY=1 \
+  ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY=required \
+  ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY=192 \
+  ./zig-out/bin/antfly-inference generate "$MODEL" "$PROMPT" \
+  --backend cuda --a4b-residency-mode resident \
+  --a4b-memory-budget-mb 16384 --backend-budget-mb 16384 \
+  --combined-budget-mb 24576 --cache-dtype f16 \
+  --raw-prompt --temperature 0 --ignore-eos --max-tokens 128 \
+  --print-token-ids --print-prompt-token-ids --print-timing
+```
+
+`ANTFLY_INFERENCE_CUDA_DISABLE_A4B_FAST_PATH=1` is the load-time rollback.
+It deliberately rejects the qualified CUDA request rather than selecting a
+slower implementation.
+
+Server admission additionally charges the encoded GGUF as transient host
+memory while the native loader uploads CUDA residency. For the pinned artifact
+the peak combined envelope is about 30,154 MiB; after load the lease settles
+back to the 16,384 MiB CUDA resident envelope.
+
+The release gate remains the paired deterministic contract used above: the
+128-token SHA-256 must be
+`d4ee583f092062e7177069de1f35a9cefbaac24848d11d09b64237bc9209b68e`,
+every request must report positive CUDA A4B route/decode counters and zero
+fallbacks, and warmed decode throughput on the pinned L4 must be at least 80%
+of the pinned llama.cpp CUDA comparator. The benchmark requires the expected
+llama.cpp executable SHA-256 and a clean tracked checkout, then records both
+executables, the model, runner, revision, GPU UUID, and driver in its receipt.
+The forced KV capacity covers the 29 prompt tokens, 128 output tokens, and one
+32-token replay headroom block, rounded up to the 32-token paged-KV block size.
+
+A local `ReleaseSafe` functional guard on the L4 completed 128 greedy tokens
+at 42.61 decode tok/s after a 24-token chat-formatted prompt. It reported 60
+resident sources (12,846,366,720 bytes), 150 route calls, 120 decode calls, 30
+prefill calls, 124 graph replays, zero replay-capacity skips, and zero
+cross-backend copies. The local artifact's fragmented on-disk layout made the
+initial cold load take 1,745.7 seconds; generation itself took 3.36 seconds.
+The CUDA loader now groups weights by backing mmap, sorts uploads by file
+offset, and changes only the exact consumed ranges from random to sequential
+advice. On the same cold artifact, dense upload fell from about 197 seconds to
+13.6 seconds, the 12.25 GiB expert upload completed in 104.0 seconds, and total
+model load fell to 122.4 seconds: a 14.3x cold-load speedup. This is not the
+release throughput result because it used a different prompt and was not
+paired with the pinned llama.cpp comparator.
+
+An Nsight follow-up found that the A4B router projection was still taking the
+generic single-thread-per-output F32 path. For the exact single-row
+`2816 -> 128` router shape, that meant only 128 threads each serially walking
+the full hidden dimension. The CUDA backend now selects the existing
+256-thread tiled F32 reduction only when an A4B runtime is loaded and this
+exact decode shape is present. `ANTFLY_INFERENCE_CUDA_DISABLE_A4B_ROUTER_TILED=1`
+restores the scalar route for A/B and emergency rollback; prefill and other F32
+projections are unchanged.
+
+On the pinned L4 and exact GGUF, a paired 128-token raw-prompt A/B produced
+identical token arrays and identical graph behavior (124 replays, 123
+persistent replays, zero capacity skips). Scalar-router decode took 2,906 ms
+and reported 44.05 tok/s; tiled-router decode took 2,033 ms and reported
+62.96 tok/s, a **1.429x / 42.9%** improvement. Normalizing both measurements to
+the 127 timed decode transitions gives 43.70 and 62.47 tok/s respectively. A
+route-grouped MoE prototype was also measured but not retained: despite
+reducing CTA and combine-launch counts, it was 1.3% slower because it reduced
+the memory-level parallelism of the resident expert projections.
+
+---
+
 ## 2026-08-24 Q4_0 high-memory Metal qualification
 
 **Status**: correctness PASS; throughput improved substantially, but llama.cpp

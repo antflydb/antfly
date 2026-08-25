@@ -12677,7 +12677,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_2048(
     const unsigned char* q8_input,
     const unsigned char* weight
 ) {
-    const unsigned int cols = 4u;
+    const unsigned int cols = 8u;
     const unsigned int row_blocks = 64u;
     unsigned int col_tile = blockIdx.x * cols;
     unsigned int tid = threadIdx.x;
@@ -16058,6 +16058,253 @@ extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8
             }
         }
     }
+}
+
+// Qualified resident Gemma 4 26B-A4B Q4_0 path. The router and both expert
+// projections remain device-side for decode and prefill. Packed projection
+// bases may alias (fused gate/up); independent strides also support split GGUF
+// sources without copying either representation into a second arena.
+__device__ __forceinline__ bool termite_a4b_route_better(
+    float lhs_value,
+    unsigned int lhs_id,
+    float rhs_value,
+    unsigned int rhs_id
+) {
+    return lhs_value > rhs_value || (lhs_value == rhs_value && lhs_id < rhs_id);
+}
+
+__device__ __forceinline__ float termite_a4b_exp_approx_f32(float x_in) {
+    if (isnan(x_in)) return x_in;
+    if (x_in > 88.7228f) return __int_as_float(0x7f800000);
+    if (x_in < -87.34f) return 0.0f;
+    const float x = fminf(88.7228f, fmaxf(-87.34f, x_in));
+    const float biased = __fadd_rn(__fmul_rn(x, 1.4426950408889634074f), x < 0.0f ? -0.5f : 0.5f);
+    const int ki = __float2int_rz(biased);
+    const float k = (float)ki;
+    const float r = __fsub_rn(x, __fmul_rn(k, 0.69314718055994530942f));
+    float p = 0.0013888889f;
+    p = fmaf(p, r, 0.008333334f);
+    p = fmaf(p, r, 0.041666668f);
+    p = fmaf(p, r, 0.16666667f);
+    p = fmaf(p, r, 0.5f);
+    p = fmaf(p, r, 1.0f);
+    p = fmaf(p, r, 1.0f);
+    return __fmul_rn(p, __int_as_float((ki + 127) << 23));
+}
+
+extern "C" __global__ void termite_gemma4_a4b_topk_rows_f32(
+    unsigned int* route_ids,
+    float* route_weights,
+    const float* logits,
+    const float* expert_scale,
+    unsigned int rows,
+    unsigned int num_experts,
+    unsigned int top_k,
+    float logit_scale
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    if (row >= rows || num_experts == 0u || num_experts > 128u ||
+        top_k == 0u || top_k > 8u || top_k > num_experts || blockDim.x != 128u) return;
+    __shared__ float values[128];
+    __shared__ unsigned int ids[128];
+    __shared__ unsigned int selected_ids[8];
+    __shared__ float selected_logits[8];
+    const bool valid = tid < num_experts;
+    values[tid] = valid ? __fmul_rn(logits[(size_t)row * num_experts + tid], logit_scale) : -3.402823466e+38f;
+    ids[tid] = valid ? tid : 0xffffffffu;
+    __syncthreads();
+
+    for (unsigned int slot = 0u; slot < top_k; ++slot) {
+        bool already_selected = false;
+        for (unsigned int prior = 0u; prior < slot; ++prior) already_selected |= selected_ids[prior] == tid;
+        float candidate = valid && !already_selected ?
+            __fmul_rn(logits[(size_t)row * num_experts + tid], logit_scale) : -3.402823466e+38f;
+        values[tid] = candidate;
+        ids[tid] = valid && !already_selected ? tid : 0xffffffffu;
+        __syncthreads();
+        for (unsigned int stride = 64u; stride != 0u; stride >>= 1u) {
+            if (tid < stride && termite_a4b_route_better(values[tid + stride], ids[tid + stride], values[tid], ids[tid])) {
+                values[tid] = values[tid + stride];
+                ids[tid] = ids[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0u) {
+            selected_ids[slot] = ids[0];
+            selected_logits[slot] = values[0];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0u) {
+        float selected_sum = 0.0f;
+        float selected_exp[8];
+        const float max_selected = selected_logits[0];
+        for (unsigned int slot = 0u; slot < top_k; ++slot) {
+            selected_exp[slot] = termite_a4b_exp_approx_f32(__fsub_rn(selected_logits[slot], max_selected));
+            selected_sum = __fadd_rn(selected_sum, selected_exp[slot]);
+        }
+        for (unsigned int slot = 0u; slot < top_k; ++slot) {
+            const unsigned int expert = selected_ids[slot];
+            float weight = selected_sum > 0.0f ? selected_exp[slot] / selected_sum : 0.0f;
+            if (expert_scale != nullptr) weight = __fmul_rn(weight, expert_scale[expert]);
+            route_ids[(size_t)row * top_k + slot] = expert;
+            route_weights[(size_t)row * top_k + slot] = weight;
+        }
+    }
+}
+
+extern "C" __global__ void termite_gemma4_a4b_q4_0_gate_up_rows_q8_1_f32(
+    float* dst,
+    const unsigned char* q8_input,
+    const unsigned char* gate_base,
+    const unsigned char* up_base,
+    const unsigned int* route_ids,
+    unsigned long long gate_expert_stride,
+    unsigned long long up_expert_stride,
+    unsigned int rows,
+    unsigned int top_k,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int activation
+) {
+    const unsigned int cols = 4u;
+    const unsigned int tiles = (out_dim + cols - 1u) / cols;
+    const unsigned int route = blockIdx.x / tiles;
+    const unsigned int route_count = rows * top_k;
+    if (route >= route_count) return;
+    const unsigned int row = route / top_k;
+    const unsigned int expert = route_ids[route];
+    const unsigned int col_tile = (blockIdx.x - route * tiles) * cols;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned char* weight_gate = gate_base + (size_t)expert * gate_expert_stride;
+    const unsigned char* weight_up = up_base + (size_t)expert * up_expert_stride;
+    __shared__ float gate_partial[4][8];
+    __shared__ float up_partial[4][8];
+    float gate_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float up_acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const unsigned int row_blocks = in_dim / 32u;
+    const unsigned int iqs = (tid & 1u) * 2u;
+    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
+        const unsigned char* q8_bp = q8_input + ((size_t)row * row_blocks + block) * 36u;
+        const unsigned short q8_d_h = (unsigned short)q8_bp[0] | ((unsigned short)q8_bp[1] << 8);
+        const float q8_d = termite_half_to_float(q8_d_h);
+        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+        const unsigned int q8_base0 = iqs * 4u;
+        const unsigned int q8_base1 = q8_base0 + 4u;
+        const int q8_low0 = termite_load_i8x4_aligned(q8_values + q8_base0);
+        const int q8_high0 = termite_load_i8x4_aligned(q8_values + q8_base0 + 16u);
+        const int q8_low1 = termite_load_i8x4_aligned(q8_values + q8_base1);
+        const int q8_high1 = termite_load_i8x4_aligned(q8_values + q8_base1 + 16u);
+#pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                const unsigned char* gate_bp = weight_gate + ((size_t)col * row_blocks + block) * 18u;
+                const unsigned char* up_bp = weight_up + ((size_t)col * row_blocks + block) * 18u;
+                gate_acc[c] += termite_q4_0_q8_1_partial_mmvq2(gate_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+                up_acc[c] += termite_q4_0_q8_1_partial_mmvq2(up_bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+            }
+        }
+    }
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        const float gate_sum = termite_warp_reduce_sum(gate_acc[c]);
+        const float up_sum = termite_warp_reduce_sum(up_acc[c]);
+        if (lane == 0u && warp < 8u) {
+            gate_partial[c][warp] = gate_sum;
+            up_partial[c][warp] = up_sum;
+        }
+    }
+    __syncthreads();
+    if (tid == 0u) {
+#pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                float gate_y = 0.0f;
+                float up_y = 0.0f;
+#pragma unroll
+                for (unsigned int w = 0u; w < 8u; ++w) {
+                    gate_y += gate_partial[c][w];
+                    up_y += up_partial[c][w];
+                }
+                dst[(size_t)route * out_dim + col] = termite_decoder_activation_f32(gate_y, activation) * up_y;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void termite_gemma4_a4b_q4_0_down_rows_q8_1_f32(
+    float* expert_output,
+    const unsigned char* q8_activated,
+    const unsigned char* down_base,
+    const unsigned int* route_ids,
+    unsigned long long down_expert_stride,
+    unsigned int rows,
+    unsigned int top_k,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    const unsigned int cols = 8u;
+    const unsigned int col_tile = blockIdx.x * cols;
+    const unsigned int route = blockIdx.y;
+    const unsigned int route_count = rows * top_k;
+    if (route >= route_count) return;
+    const unsigned int expert = route_ids[route];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int row_blocks = in_dim / 32u;
+    const unsigned char* weight = down_base + (size_t)expert * down_expert_stride;
+    __shared__ float warp_partial[8][4];
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const unsigned int iqs = (tid & 1u) * 2u;
+    for (unsigned int block = tid >> 1u; block < row_blocks; block += (blockDim.x >> 1u)) {
+        const unsigned char* q8_bp = q8_activated + ((size_t)route * row_blocks + block) * 36u;
+        const unsigned short q8_d_h = (unsigned short)q8_bp[0] | ((unsigned short)q8_bp[1] << 8);
+        const float q8_d = termite_half_to_float(q8_d_h);
+        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+        const unsigned int q8_base0 = iqs * 4u;
+        const unsigned int q8_base1 = q8_base0 + 4u;
+        const int q8_low0 = termite_load_i8x4_aligned(q8_values + q8_base0);
+        const int q8_high0 = termite_load_i8x4_aligned(q8_values + q8_base0 + 16u);
+        const int q8_low1 = termite_load_i8x4_aligned(q8_values + q8_base1);
+        const int q8_high1 = termite_load_i8x4_aligned(q8_values + q8_base1 + 16u);
+#pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned int col = col_tile + c;
+            if (col < out_dim) {
+                const unsigned char* bp = weight + ((size_t)col * row_blocks + block) * 18u;
+                acc[c] += termite_q4_0_q8_1_partial_mmvq2(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+            }
+        }
+    }
+    termite_store_q4_0_cols_warp_sum_warps<8u, 4u>(expert_output, route, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
+}
+
+extern "C" __global__ void termite_gemma4_a4b_combine_rows_f32(
+    float* dst,
+    const float* expert_output,
+    const float* route_weights,
+    unsigned int rows,
+    unsigned int top_k,
+    unsigned int dim
+) {
+    const size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t count = (size_t)rows * dim;
+    if (index >= count) return;
+    const unsigned int row = (unsigned int)(index / dim);
+    const unsigned int col = (unsigned int)(index - (size_t)row * dim);
+    float value = 0.0f;
+    for (unsigned int slot = 0u; slot < top_k; ++slot) {
+        const size_t route = (size_t)row * top_k + slot;
+        value = __fadd_rn(value, __fmul_rn(route_weights[route], expert_output[route * dim + col]));
+    }
+    dst[index] = value;
 }
 
 extern "C" __global__ void termite_linear_q4_0_pair_activation_q8_1_f32_tile4_w8_e4b_ffn(

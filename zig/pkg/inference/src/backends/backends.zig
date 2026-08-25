@@ -196,7 +196,7 @@ pub const SessionManager = struct {
 
         for (effective_backends) |backend| {
             if (!backendAcceptsA4bRequest(backend, self.a4b_inference_request)) {
-                first_err = first_err orelse error.A4bRequiresMetal;
+                first_err = first_err orelse error.A4bRequiresGpu;
                 continue;
             }
             if (!backend.available()) continue;
@@ -267,11 +267,12 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_cuda)
-                    session_factory.createCudaSessionWithKernelJitAndLoadContext(
+                    session_factory.createCudaSessionWithKernelJitAndLoadContextAndA4bRequest(
                         self.allocator,
                         model_path,
                         self.kernel_jit,
                         self.kernel_jit_load_context,
+                        self.a4b_inference_request,
                     ) catch |err| {
                         std.log.err("CUDA session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (kernel_jit_mod.isRequiredFailure(self.kernel_jit.mode, err)) return err;
@@ -421,7 +422,7 @@ fn backendAcceptsA4bRequest(
     backend: BackendType,
     request: ?backend_contracts.A4bInferenceRequest,
 ) bool {
-    return request == null or backend == .metal;
+    return request == null or backend == .metal or backend == .cuda;
 }
 
 test "onnx artifact routes graph execution for direct compute backends" {
@@ -435,10 +436,10 @@ test "qualified workload profiles select direct Metal sessions only" {
     try std.testing.expect(!backendAcceptsQualifiedProfile(.cuda, "model.gguf"));
 }
 
-test "explicit A4B requests select Metal without generic backend fallback" {
+test "explicit A4B requests select GPU backends without generic fallback" {
     try std.testing.expect(backendAcceptsA4bRequest(.metal, .{}));
+    try std.testing.expect(backendAcceptsA4bRequest(.cuda, .{}));
     try std.testing.expect(!backendAcceptsA4bRequest(.native, .{}));
-    try std.testing.expect(!backendAcceptsA4bRequest(.cuda, .{}));
     try std.testing.expect(backendAcceptsA4bRequest(.native, null));
 }
 
