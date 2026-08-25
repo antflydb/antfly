@@ -916,6 +916,10 @@ pub fn loadMetadataRaw(self: anytype, txn: anytype, vector_id: u64, is_not_found
     return loadMetadataRawWithCachePolicy(self, txn, vector_id, true, is_not_found);
 }
 
+pub fn loadMetadataRawUncached(self: anytype, txn: anytype, vector_id: u64, is_not_found: fn (anyerror) bool) !?[]const u8 {
+    return loadMetadataRawWithCachePolicy(self, txn, vector_id, false, is_not_found);
+}
+
 fn loadMetadataRawWithCachePolicy(
     self: anytype,
     txn: anytype,
@@ -1888,6 +1892,30 @@ pub fn getMetadataManySortedInTxnWithScratch(
     );
 }
 
+pub fn getMetadataManySortedInTxnWithScratchUncached(
+    self: anytype,
+    txn: anytype,
+    vector_ids: []const u64,
+    out_metadata: []?[]const u8,
+    lookup_storage: []FixedKeyLookup,
+    key_views_storage: [][]const u8,
+    values_storage: []?[]const u8,
+) !void {
+    return try getMetadataManySortedInTxnWithScratchProfiled(
+        self,
+        txn,
+        vector_ids,
+        out_metadata,
+        lookup_storage,
+        key_views_storage,
+        values_storage,
+        false,
+        null,
+        null,
+        null,
+    );
+}
+
 fn getMetadataManySortedInTxnWithScratchProfiled(
     self: anytype,
     txn: anytype,
@@ -2578,20 +2606,26 @@ fn searchProfiledRequestAttempt(
     return .{ .results = results, .profile = profile };
 }
 
-fn publishSearchStateIfSupported(self: anytype) void {
+fn publishSearchStateIfSupported(self: anytype) !void {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "shouldPublishSearchStateAfterWrite")) {
         if (!self.shouldPublishSearchStateAfterWrite()) return;
     }
-    if (comptime @hasDecl(Index, "refreshPublishedSearchState")) {
+    if (comptime @hasDecl(Index, "refreshPublishedSearchStateIo")) {
+        try self.refreshPublishedSearchStateIo();
+    } else if (comptime @hasDecl(Index, "refreshPublishedSearchState")) {
         self.refreshPublishedSearchState();
     }
 }
 
-fn beginPublishSearchStateIfSupported(self: anytype) bool {
+fn beginPublishSearchStateIfSupported(self: anytype) !bool {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "shouldPublishSearchStateAfterWrite")) {
         if (!self.shouldPublishSearchStateAfterWrite()) return false;
+    }
+    if (comptime @hasDecl(Index, "beginPublishedSearchStateRefreshIo")) {
+        try self.beginPublishedSearchStateRefreshIo();
+        return true;
     }
     if (comptime @hasDecl(Index, "beginPublishedSearchStateRefresh")) {
         self.beginPublishedSearchStateRefresh();
@@ -2600,9 +2634,9 @@ fn beginPublishSearchStateIfSupported(self: anytype) bool {
     return false;
 }
 
-fn finishPublishSearchStateIfSupported(self: anytype, publishing: bool) void {
+fn finishPublishSearchStateIfSupported(self: anytype, publishing: bool) !void {
     if (!publishing) {
-        publishSearchStateIfSupported(self);
+        try publishSearchStateIfSupported(self);
         return;
     }
     const Index = comptime childType(@TypeOf(self));
@@ -3117,18 +3151,32 @@ fn scoreLeafMemberIds(
     var external_scored = false;
     const Index = comptime childType(@TypeOf(self));
     if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalVectorsSortedWithScratch")) {
-        external_scored = try self.scoreExternalVectorsSortedWithScratch(
-            txn,
-            fetch_member_ids[0..fetch_count],
-            exact_query,
-            exact_query_measure,
-            exact_distances,
-            scratch.metadata,
-            scratch.lookups,
-            scratch.key_views,
-            scratch.values,
-            scratch.vector_batch,
-        );
+        external_scored = if (!use_search_cache and comptime @hasDecl(Index, "scoreExternalVectorsSortedWithScratchUncached"))
+            try self.scoreExternalVectorsSortedWithScratchUncached(
+                txn,
+                fetch_member_ids[0..fetch_count],
+                exact_query,
+                exact_query_measure,
+                exact_distances,
+                scratch.metadata,
+                scratch.lookups,
+                scratch.key_views,
+                scratch.values,
+                scratch.vector_batch,
+            )
+        else
+            try self.scoreExternalVectorsSortedWithScratch(
+                txn,
+                fetch_member_ids[0..fetch_count],
+                exact_query,
+                exact_query_measure,
+                exact_distances,
+                scratch.metadata,
+                scratch.lookups,
+                scratch.key_views,
+                scratch.values,
+                scratch.vector_batch,
+            );
     }
 
     if (external_scored) {
@@ -3803,16 +3851,29 @@ fn loadVectorIdsSortedWithScratchWithCachePolicy(
     for (vector_views[0..vector_ids.len]) |*view| view.* = &.{};
     if (indexHasExternalVectorLoader(self)) {
         if (comptime @hasDecl(Index, "getExternalVectorViewsSortedWithScratch")) {
-            if (try self.getExternalVectorViewsSortedWithScratch(
-                txn,
-                vector_ids,
-                vector_views,
-                lookup_storage,
-                key_views_storage,
-                values_storage,
-                scratch,
-                batch_scratch,
-            )) return;
+            const loaded = if (!use_cache and comptime @hasDecl(Index, "getExternalVectorViewsSortedWithScratchUncached"))
+                try self.getExternalVectorViewsSortedWithScratchUncached(
+                    txn,
+                    vector_ids,
+                    vector_views,
+                    lookup_storage,
+                    key_views_storage,
+                    values_storage,
+                    scratch,
+                    batch_scratch,
+                )
+            else
+                try self.getExternalVectorViewsSortedWithScratch(
+                    txn,
+                    vector_ids,
+                    vector_views,
+                    lookup_storage,
+                    key_views_storage,
+                    values_storage,
+                    scratch,
+                    batch_scratch,
+                );
+            if (loaded) return;
         }
         const dims = scratch.len;
         std.debug.assert(batch_scratch.len >= dims * vector_ids.len);
@@ -4976,7 +5037,7 @@ pub fn collapseSingleChildParents(self: anytype, txn: anytype, start_node_id: u6
 }
 
 pub fn delete(self: anytype, vector_id: u64) !void {
-    const publishing = beginPublishSearchStateIfSupported(self);
+    const publishing = try beginPublishSearchStateIfSupported(self);
     errdefer abortPublishSearchStateIfSupported(self, publishing);
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
@@ -4986,14 +5047,14 @@ pub fn delete(self: anytype, vector_id: u64) !void {
     try self.flushMetadata(&txn);
     try markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
-    finishPublishSearchStateIfSupported(self, publishing);
+    try finishPublishSearchStateIfSupported(self, publishing);
 }
 
 pub fn batchDelete(self: anytype, vector_ids: []const u64) !void {
     if (vector_ids.len == 0) return;
     if (vector_ids.len == 1) return delete(self, vector_ids[0]);
 
-    const publishing = beginPublishSearchStateIfSupported(self);
+    const publishing = try beginPublishSearchStateIfSupported(self);
     errdefer abortPublishSearchStateIfSupported(self, publishing);
     var batch = try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
@@ -5003,7 +5064,7 @@ pub fn batchDelete(self: anytype, vector_ids: []const u64) !void {
     try self.flushMetadata(&batch);
     try markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
-    finishPublishSearchStateIfSupported(self, publishing);
+    try finishPublishSearchStateIfSupported(self, publishing);
 }
 
 const PreparedBatchDelete = struct {
@@ -5399,7 +5460,7 @@ pub fn repairTreeLinks(self: anytype, txn: anytype, max_nodes: usize) !TreeLinkR
 /// metadata (the sweep can change root/node bookkeeping via collapse), and
 /// republishes search state — mirroring delete()/batchDelete().
 pub fn repairLinks(self: anytype, max_nodes: usize) !TreeLinkRepairReport {
-    const publishing = beginPublishSearchStateIfSupported(self);
+    const publishing = try beginPublishSearchStateIfSupported(self);
     errdefer abortPublishSearchStateIfSupported(self, publishing);
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
@@ -5408,7 +5469,7 @@ pub fn repairLinks(self: anytype, max_nodes: usize) !TreeLinkRepairReport {
     try self.flushMetadata(&txn);
     try markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
-    finishPublishSearchStateIfSupported(self, publishing);
+    try finishPublishSearchStateIfSupported(self, publishing);
     return report;
 }
 
@@ -5645,7 +5706,7 @@ pub fn insertWithMetadata(
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
-    const publishing = beginPublishSearchStateIfSupported(self);
+    const publishing = try beginPublishSearchStateIfSupported(self);
     errdefer abortPublishSearchStateIfSupported(self, publishing);
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
@@ -5661,7 +5722,7 @@ pub fn insertWithMetadata(
     try markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
     self.write_profile.insert_commit_ns += elapsed_fn_u64(commit_start);
-    finishPublishSearchStateIfSupported(self, publishing);
+    try finishPublishSearchStateIfSupported(self, publishing);
 }
 
 pub fn insertWithMetadataTxn(
@@ -6880,7 +6941,7 @@ pub fn batchApplyOptions(
         if (deletes.len == 1) return self.delete(deletes[0]);
 
         const Index = comptime childType(@TypeOf(self));
-        const publishing = beginPublishSearchStateIfSupported(self);
+        const publishing = try beginPublishSearchStateIfSupported(self);
         errdefer abortPublishSearchStateIfSupported(self, publishing);
         var batch = if (options.bulk_ingest and comptime @hasDecl(Index, "beginRuntimeBatchTxnOptions"))
             try self.beginRuntimeBatchTxnOptions(options)
@@ -6894,13 +6955,13 @@ pub fn batchApplyOptions(
         try markPublishSearchStateCommittingIfSupported(self, publishing);
         try batch.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
-        finishPublishSearchStateIfSupported(self, publishing);
+        try finishPublishSearchStateIfSupported(self, publishing);
         return;
     }
     if (deletes.len == 0) return batchInsertWithMetadataOptions(self, writes, options, now_fn, elapsed_fn);
 
     const Index = comptime childType(@TypeOf(self));
-    const publishing = beginPublishSearchStateIfSupported(self);
+    const publishing = try beginPublishSearchStateIfSupported(self);
     errdefer abortPublishSearchStateIfSupported(self, publishing);
     var batch = if (options.bulk_ingest and comptime @hasDecl(Index, "beginRuntimeBatchTxnOptions"))
         try self.beginRuntimeBatchTxnOptions(options)
@@ -6927,7 +6988,7 @@ pub fn batchApplyOptions(
     try markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
-    finishPublishSearchStateIfSupported(self, publishing);
+    try finishPublishSearchStateIfSupported(self, publishing);
     seedRetainedVectorsAfterCommit(self, writes, insert_options);
 }
 
@@ -6942,7 +7003,7 @@ pub fn batchInsertWithMetadataOptions(
 
     if (items.len > 1) {
         const Index = comptime childType(@TypeOf(self));
-        const publishing = beginPublishSearchStateIfSupported(self);
+        const publishing = try beginPublishSearchStateIfSupported(self);
         errdefer abortPublishSearchStateIfSupported(self, publishing);
         var batch = if (options.bulk_ingest and comptime @hasDecl(Index, "beginRuntimeBatchTxnOptions"))
             try self.beginRuntimeBatchTxnOptions(options)
@@ -6960,10 +7021,10 @@ pub fn batchInsertWithMetadataOptions(
         try markPublishSearchStateCommittingIfSupported(self, publishing);
         try batch.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
-        finishPublishSearchStateIfSupported(self, publishing);
+        try finishPublishSearchStateIfSupported(self, publishing);
         seedRetainedVectorsAfterCommit(self, items, options);
     } else {
-        const publishing = beginPublishSearchStateIfSupported(self);
+        const publishing = try beginPublishSearchStateIfSupported(self);
         errdefer abortPublishSearchStateIfSupported(self, publishing);
         var txn = try self.beginRuntimeWriteTxn();
         errdefer txn.abort();
@@ -6974,7 +7035,7 @@ pub fn batchInsertWithMetadataOptions(
         try markPublishSearchStateCommittingIfSupported(self, publishing);
         try txn.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
-        finishPublishSearchStateIfSupported(self, publishing);
+        try finishPublishSearchStateIfSupported(self, publishing);
         seedRetainedVectorsAfterCommit(self, items, options);
     }
 }
@@ -7673,7 +7734,7 @@ pub fn bulkBuildWithMetadataOptions(
 ) !void {
     if (items.len == 0) return;
 
-    const publishing = beginPublishSearchStateIfSupported(self);
+    const publishing = try beginPublishSearchStateIfSupported(self);
     errdefer abortPublishSearchStateIfSupported(self, publishing);
     var batch = try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
@@ -7684,7 +7745,7 @@ pub fn bulkBuildWithMetadataOptions(
     try markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
-    finishPublishSearchStateIfSupported(self, publishing);
+    try finishPublishSearchStateIfSupported(self, publishing);
     seedRetainedVectorsAfterCommit(self, items, options);
 }
 

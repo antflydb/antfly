@@ -2690,7 +2690,7 @@ pub const HBCIndex = struct {
                 try options.checkAdmission();
                 publish_window += 1;
                 const window_start_ns = nowNs();
-                self.beginPublishedSearchStateRefresh();
+                try self.beginPublishedSearchStateRefreshIo();
                 errdefer self.abortPublishedSearchStateRefresh();
                 var batch = try self.store.beginBatch();
                 errdefer batch.abort();
@@ -2761,7 +2761,7 @@ pub const HBCIndex = struct {
             .lmdb => {},
         }
         self.write_session_depth -= 1;
-        if (finishing_outermost) self.refreshPublishedSearchState();
+        if (finishing_outermost) try self.refreshPublishedSearchStateIo();
         if (self.write_session_depth == 0) {
             self.write_session_kind = null;
             self.bulk_publication_may_have_mutated = false;
@@ -2799,7 +2799,11 @@ pub const HBCIndex = struct {
             }
             self.write_session_kind = null;
             self.bulk_publication_may_have_mutated = false;
-            self.refreshPublishedSearchState();
+            // Abort is a no-fail cleanup API, but it can still run on a
+            // backend-runtime worker while a complete-snapshot reader owns the
+            // fence. Yield cooperatively; cancellation here means the executor
+            // itself is shutting down, where cache republication is moot.
+            self.refreshPublishedSearchStateIo() catch {};
             self.releaseDeferredBulkWorkspaceCapacity();
         }
     }
@@ -3029,6 +3033,18 @@ pub const HBCIndex = struct {
 
     pub fn beginPublishedSearchStateRefresh(self: *HBCIndex) void {
         self.published_snapshot_mu.lockExclusive();
+        self.beginPublishedSearchStateRefreshLocked();
+    }
+
+    pub fn beginPublishedSearchStateRefreshIo(self: *HBCIndex) !void {
+        try self.published_snapshot_mu.lockExclusiveIo(
+            self.runtimeIo(),
+            @as(?vectorindex_search_types.CancellationToken, null),
+        );
+        self.beginPublishedSearchStateRefreshLocked();
+    }
+
+    fn beginPublishedSearchStateRefreshLocked(self: *HBCIndex) void {
         const previous = self.published_mutation_epoch.fetchAdd(1, .acq_rel);
         std.debug.assert((previous & 1) == 0);
         self.published_mutation_active.store(true, .release);
@@ -3182,6 +3198,15 @@ pub const HBCIndex = struct {
 
     pub fn refreshPublishedSearchState(self: *HBCIndex) void {
         self.beginPublishedSearchStateRefresh();
+        self.refreshPublishedSearchStateLocked();
+    }
+
+    pub fn refreshPublishedSearchStateIo(self: *HBCIndex) !void {
+        try self.beginPublishedSearchStateRefreshIo();
+        self.refreshPublishedSearchStateLocked();
+    }
+
+    fn refreshPublishedSearchStateLocked(self: *HBCIndex) void {
         // This path only republishes already-durable in-memory state. Its odd
         // window contains no storage I/O, so readers that observe it take the
         // cooperative no-flight wait in waitForPublishedSearchState.
@@ -5320,7 +5345,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginWriteTxn(self: *HBCIndex) !PublishedWriteTxn {
-        self.beginPublishedSearchStateRefresh();
+        try self.beginPublishedSearchStateRefreshIo();
         errdefer self.abortPublishedSearchStateRefresh();
         return .{
             .owner = self,
@@ -5329,7 +5354,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginBatchTxn(self: *HBCIndex) !PublishedBatchTxn {
-        self.beginPublishedSearchStateRefresh();
+        try self.beginPublishedSearchStateRefreshIo();
         errdefer self.abortPublishedSearchStateRefresh();
         return .{
             .owner = self,
@@ -6121,7 +6146,7 @@ pub const HBCIndex = struct {
     pub fn getVectorIntoUncached(self: *HBCIndex, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
         return vectorindex_hbc_index.getVectorIntoUncached(self, txn, vector_id, scratch) catch |err| {
             if (!isNotFound(err)) return err;
-            return try self.loadExternalVectorIntoScratch(txn, vector_id, scratch);
+            return try self.loadExternalVectorIntoScratchUncached(txn, vector_id, scratch);
         };
     }
 
@@ -6153,6 +6178,55 @@ pub const HBCIndex = struct {
         scratch: []f32,
         batch_scratch: []f32,
     ) !bool {
+        return self.getExternalVectorViewsSortedWithScratchCachePolicy(
+            txn,
+            vector_ids,
+            vector_views,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+            scratch,
+            batch_scratch,
+            true,
+        );
+    }
+
+    pub fn getExternalVectorViewsSortedWithScratchUncached(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        vector_views: [][]const f32,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        scratch: []f32,
+        batch_scratch: []f32,
+    ) !bool {
+        return self.getExternalVectorViewsSortedWithScratchCachePolicy(
+            txn,
+            vector_ids,
+            vector_views,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+            scratch,
+            batch_scratch,
+            false,
+        );
+    }
+
+    fn getExternalVectorViewsSortedWithScratchCachePolicy(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        vector_views: [][]const f32,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        scratch: []f32,
+        batch_scratch: []f32,
+        comptime use_cache: bool,
+    ) !bool {
         const loader = self.external_vector_batch_scratch_loader orelse return false;
         const ctx = self.external_vector_ctx orelse return false;
         if (vector_views.len < vector_ids.len) return error.InvalidArgument;
@@ -6160,14 +6234,25 @@ pub const HBCIndex = struct {
 
         const metadata = try self.alloc.alloc(?[]const u8, vector_ids.len);
         defer self.alloc.free(metadata);
-        try self.getMetadataManySortedInTxnWithScratch(
-            txn,
-            vector_ids,
-            metadata,
-            lookup_storage,
-            key_views_storage,
-            values_storage,
-        );
+        if (use_cache) {
+            try self.getMetadataManySortedInTxnWithScratch(
+                txn,
+                vector_ids,
+                metadata,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+            );
+        } else {
+            try self.getMetadataManySortedInTxnWithScratchUncached(
+                txn,
+                vector_ids,
+                metadata,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+            );
+        }
         loader(ctx, vector_ids, metadata, vector_views[0..vector_ids.len], batch_scratch, scratch.len) catch |err| switch (err) {
             error.Unsupported => return false,
             else => return err,
@@ -6257,7 +6342,7 @@ pub const HBCIndex = struct {
 
         const metadata = try self.alloc.alloc(?[]const u8, vector_ids.len);
         defer self.alloc.free(metadata);
-        try self.getMetadataManySortedInTxnWithScratch(
+        try self.getMetadataManySortedInTxnWithScratchUncached(
             txn,
             vector_ids,
             metadata,
@@ -6471,14 +6556,25 @@ pub const HBCIndex = struct {
         const metadata = metadata_storage[0..miss_count];
         if (profile) |p| p.rerank_metadata_vectors_loaded +|= @intCast(miss_count);
         const metadata_start = platform_time.monotonicNs();
-        try self.getMetadataManySortedInTxnWithScratch(
-            txn,
-            vector_ids,
-            metadata,
-            lookup_storage,
-            key_views_storage,
-            values_storage,
-        );
+        if (use_cache) {
+            try self.getMetadataManySortedInTxnWithScratch(
+                txn,
+                vector_ids,
+                metadata,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+            );
+        } else {
+            try self.getMetadataManySortedInTxnWithScratchUncached(
+                txn,
+                vector_ids,
+                metadata,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+            );
+        }
         if (profile) |p| p.rerank_metadata_lookup_ns += platform_time.monotonicNs() - metadata_start;
         const miss_distances = miss_distance_storage[0..miss_count];
         loader(
@@ -6528,6 +6624,63 @@ pub const HBCIndex = struct {
         values_storage: []?[]const u8,
         batch_scratch: []f32,
     ) !bool {
+        return self.scoreExternalVectorsSortedWithScratchCachePolicy(
+            txn,
+            vector_ids,
+            query,
+            query_measure,
+            distances,
+            metadata_storage,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+            batch_scratch,
+            true,
+        );
+    }
+
+    pub fn scoreExternalVectorsSortedWithScratchUncached(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        distances: []f32,
+        metadata_storage: []?[]const u8,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        batch_scratch: []f32,
+    ) !bool {
+        return self.scoreExternalVectorsSortedWithScratchCachePolicy(
+            txn,
+            vector_ids,
+            query,
+            query_measure,
+            distances,
+            metadata_storage,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+            batch_scratch,
+            false,
+        );
+    }
+
+    fn scoreExternalVectorsSortedWithScratchCachePolicy(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        query: []const f32,
+        query_measure: f32,
+        distances: []f32,
+        metadata_storage: []?[]const u8,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+        batch_scratch: []f32,
+        comptime use_cache: bool,
+    ) !bool {
         const loader = self.external_vector_batch_distance_loader orelse return false;
         const ctx = self.external_vector_ctx orelse return false;
         if (distances.len < vector_ids.len) return error.InvalidArgument;
@@ -6536,14 +6689,25 @@ pub const HBCIndex = struct {
 
         for (distances[0..vector_ids.len]) |*distance| distance.* = std.math.inf(f32);
         const metadata = metadata_storage[0..vector_ids.len];
-        try self.getMetadataManySortedInTxnWithScratch(
-            txn,
-            vector_ids,
-            metadata,
-            lookup_storage,
-            key_views_storage,
-            values_storage,
-        );
+        if (use_cache) {
+            try self.getMetadataManySortedInTxnWithScratch(
+                txn,
+                vector_ids,
+                metadata,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+            );
+        } else {
+            try self.getMetadataManySortedInTxnWithScratchUncached(
+                txn,
+                vector_ids,
+                metadata,
+                lookup_storage,
+                key_views_storage,
+                values_storage,
+            );
+        }
         loader(
             ctx,
             vector_ids,
@@ -6588,12 +6752,31 @@ pub const HBCIndex = struct {
     }
 
     fn loadExternalVectorIntoScratch(self: *HBCIndex, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
-        const metadata = (try self.loadMetadataRaw(txn, vector_id)) orelse return error.NotFound;
+        return try self.loadExternalVectorIntoScratchCachePolicy(txn, vector_id, scratch, true);
+    }
+
+    fn loadExternalVectorIntoScratchUncached(self: *HBCIndex, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
+        return try self.loadExternalVectorIntoScratchCachePolicy(txn, vector_id, scratch, false);
+    }
+
+    fn loadExternalVectorIntoScratchCachePolicy(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_id: u64,
+        scratch: []f32,
+        comptime use_cache: bool,
+    ) ![]const f32 {
+        const metadata = (if (use_cache)
+            try self.loadMetadataRaw(txn, vector_id)
+        else
+            try vectorindex_hbc_index.loadMetadataRawUncached(self, txn, vector_id, isNotFound)) orelse return error.NotFound;
         if (self.external_vector_scratch_loader) |loader| {
             const ctx = self.external_vector_ctx orelse return error.NotFound;
             return try loader(ctx, vector_id, metadata, scratch);
         }
-        const vector = try self.loadExternalVector(txn, vector_id);
+        const loader = self.external_vector_loader orelse return error.NotFound;
+        const ctx = self.external_vector_ctx orelse return error.NotFound;
+        const vector = try loader(ctx, self.alloc, vector_id, metadata);
         defer self.alloc.free(vector);
         if (vector.len > scratch.len) return error.BufferTooSmall;
         @memcpy(scratch[0..vector.len], vector);
@@ -6667,6 +6850,26 @@ pub const HBCIndex = struct {
         values_storage: []?[]const u8,
     ) !void {
         return try vectorindex_hbc_index.getMetadataManySortedInTxnWithScratch(
+            self,
+            txn,
+            vector_ids,
+            out_metadata,
+            lookup_storage,
+            key_views_storage,
+            values_storage,
+        );
+    }
+
+    pub fn getMetadataManySortedInTxnWithScratchUncached(
+        self: *HBCIndex,
+        txn: anytype,
+        vector_ids: []const u64,
+        out_metadata: []?[]const u8,
+        lookup_storage: []FixedKeyLookup,
+        key_views_storage: [][]const u8,
+        values_storage: []?[]const u8,
+    ) !void {
+        return try vectorindex_hbc_index.getMetadataManySortedInTxnWithScratchUncached(
             self,
             txn,
             vector_ids,
@@ -9586,6 +9789,140 @@ test "hbc external rerank loads metadata only for decoded vector misses" {
     try std.testing.expectEqual(@as(u64, 1), profile.vector_cache_hits);
     try std.testing.expectEqual(@as(u64, 1), profile.rerank_artifact_cache_hits);
     try std.testing.expectEqual(@as(u64, 1), profile.rerank_metadata_vectors_loaded);
+}
+
+test "hbc uncached external rerank does not publish snapshot metadata" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .max_cached_metadata = 8,
+    });
+    defer idx.close();
+    try idx.insertWithMetadata(1, &.{ 1, 0 }, "snapshot:old");
+    idx.invalidateMetadataCache(1);
+
+    const Loader = struct {
+        fn score(
+            _: *anyopaque,
+            vector_ids: []const u64,
+            metadata: []const ?[]const u8,
+            _: []const f32,
+            _: f32,
+            _: vec.DistanceMetric,
+            distances: []f32,
+            _: []f32,
+            _: usize,
+            _: HBCIndex.ExternalVectorBatchDistanceScratch,
+            _: ?*SearchProfile,
+        ) !void {
+            try std.testing.expectEqualSlices(u64, &.{1}, vector_ids);
+            try std.testing.expectEqualStrings("snapshot:old", metadata[0] orelse return error.TestUnexpectedResult);
+            distances[0] = 1;
+        }
+    };
+    var loader_context: u8 = 0;
+    idx.setExternalVectorBatchDistanceLoader(&loader_context, Loader.score);
+
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    const ranked = [_]ApproxSearchResult{.{ .vector_id = 1, .distance = 0.1 }};
+    var distances: [1]f32 = undefined;
+    var vector_ids: [1]u64 = undefined;
+    var metadata: [1]?[]const u8 = undefined;
+    var lookups: [1]FixedKeyLookup = undefined;
+    var key_views: [1][]const u8 = undefined;
+    var values: [1]?[]const u8 = undefined;
+    var batch_scratch: [2]f32 = undefined;
+    var miss_distances: [1]f32 = undefined;
+    try std.testing.expect(try idx.scoreExternalRerankVectorsSortedWithScratchUncached(
+        &txn,
+        &ranked,
+        &.{0},
+        &.{ 1, 0 },
+        1,
+        &distances,
+        &vector_ids,
+        &metadata,
+        &lookups,
+        &key_views,
+        &values,
+        &batch_scratch,
+        &miss_distances,
+        null,
+    ));
+    try std.testing.expectEqual(@as(f32, 1), distances[0]);
+    try std.testing.expect(idx.borrowCachedMetadata(1) == null);
+}
+
+test "hbc old snapshot metadata cannot poison the current cache generation" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .max_cached_metadata = 8,
+    });
+    defer idx.close();
+    try idx.insertWithMetadata(1, &.{ 1, 0 }, "snapshot:old");
+    idx.invalidateMetadataCache(1);
+
+    var old_txn = try idx.beginReadTxn();
+    defer old_txn.abort();
+    const ids = [_]u64{1};
+    var metadata: [1]?[]const u8 = undefined;
+    var lookups: [1]FixedKeyLookup = undefined;
+    var key_views: [1][]const u8 = undefined;
+    var values: [1]?[]const u8 = undefined;
+    try idx.getMetadataManySortedInTxnWithScratchUncached(
+        &old_txn,
+        &ids,
+        &metadata,
+        &lookups,
+        &key_views,
+        &values,
+    );
+    try std.testing.expectEqualStrings("snapshot:old", metadata[0] orelse return error.TestUnexpectedResult);
+    try expectMetadataNotCached(&idx, 1);
+
+    {
+        var write_txn = try idx.beginWriteTxn();
+        errdefer write_txn.abort();
+        try idx.putMetadata(&write_txn, 1, "snapshot:new");
+        try write_txn.commit();
+    }
+    try expectMetadataNotCached(&idx, 1);
+
+    try idx.getMetadataManySortedInTxnWithScratchUncached(
+        &old_txn,
+        &ids,
+        &metadata,
+        &lookups,
+        &key_views,
+        &values,
+    );
+    try std.testing.expectEqualStrings("snapshot:old", metadata[0] orelse return error.TestUnexpectedResult);
+    try expectMetadataNotCached(&idx, 1);
+
+    var current_txn = try idx.beginReadTxn();
+    defer current_txn.abort();
+    try idx.getMetadataManySortedInTxnWithScratch(
+        &current_txn,
+        &ids,
+        &metadata,
+        &lookups,
+        &key_views,
+        &values,
+    );
+    try std.testing.expectEqualStrings("snapshot:new", metadata[0] orelse return error.TestUnexpectedResult);
+    try expectCachedMetadata(&idx, 1, "snapshot:new");
 }
 
 test "hbc shared vector publication coalesces concurrent duplicate fills" {

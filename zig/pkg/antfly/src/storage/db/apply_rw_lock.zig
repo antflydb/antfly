@@ -109,6 +109,32 @@ pub const ApplyRwLock = struct {
         }
     }
 
+    /// Cooperatively acquire exclusive ownership from a backend-runtime task.
+    /// Publication readers register as priority waiters, so an async writer
+    /// must yield through std.Io while they take their short snapshot lease;
+    /// synchronously spinning here can prevent those reader tasks from ever
+    /// being scheduled on a single-worker runtime.
+    pub fn lockExclusiveIo(self: *@This(), io: std.Io, cancellation: anytype) !void {
+        const started_ns = monotonicNs();
+        _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
+
+        var contended = false;
+        var delay_us: i64 = 50 + @as(i64, @intCast((monotonicNs() >> 6) & 0x3f));
+        while (true) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            if (self.tryLockExclusive()) break;
+            contended = true;
+            io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake) catch |err| switch (err) {
+                error.Canceled => return error.Cancelled,
+            };
+            delay_us = @min(delay_us * 2, 1_000);
+        }
+        if (contended) {
+            _ = self.exclusive_contended_calls.fetchAdd(1, .monotonic);
+            noteWait(self, .exclusive, monotonicNs() -| started_ns);
+        }
+    }
+
     pub fn unlockShared(self: *@This()) void {
         _ = lockAtomic(&self.reader_mutex);
         defer self.reader_mutex.unlock();
@@ -133,7 +159,7 @@ pub const ApplyRwLock = struct {
     pub fn lockExclusive(self: *@This()) void {
         const started_ns = monotonicNs();
         _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
-        yieldToPriorityReaders(self);
+        yieldToPriorityReadersBounded(self);
         yieldToQueuedReaders(self);
         const gate_idle = lockAtomic(&self.reader_gate);
         errdefer self.reader_gate.unlock();
@@ -194,9 +220,10 @@ fn yieldToQueuedReaders(lock: *const ApplyRwLock) void {
     }
 }
 
-fn yieldToPriorityReaders(lock: *const ApplyRwLock) void {
+fn yieldToPriorityReadersBounded(lock: *const ApplyRwLock) void {
     if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
-    while (lock.priority_shared_waiters.load(.monotonic) > 0) {
+    var attempts: usize = 0;
+    while (attempts < 64 and lock.priority_shared_waiters.load(.monotonic) > 0) : (attempts += 1) {
         std.Thread.yield() catch {};
     }
 }
@@ -333,4 +360,67 @@ test "apply rw lock runtime shared wait cancellation clears priority handoff" {
     try std.testing.expectEqual(@as(u64, 0), lock.priority_shared_waiters.load(.acquire));
     try std.testing.expect(lock.tryLockExclusive());
     lock.unlockExclusive();
+}
+
+test "apply rw lock cooperative writer yields to priority reader on one worker" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const NeverCancelled = struct {
+        fn isCancelled(_: @This()) bool {
+            return false;
+        }
+    };
+    const Context = struct {
+        lock: *ApplyRwLock,
+        io: std.Io,
+        reader_done: std.atomic.Value(bool) = .init(false),
+        writer_done: std.atomic.Value(bool) = .init(false),
+
+        fn reader(ctx: *@This()) !void {
+            try ctx.lock.lockSharedIo(ctx.io, @as(?NeverCancelled, null));
+            ctx.reader_done.store(true, .release);
+            ctx.lock.unlockShared();
+        }
+
+        fn writer(ctx: *@This()) !void {
+            try ctx.lock.lockExclusiveIo(ctx.io, @as(?NeverCancelled, null));
+            ctx.writer_done.store(true, .release);
+            ctx.lock.unlockExclusive();
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .limited(1),
+    });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var lock: ApplyRwLock = .{};
+    lock.lockExclusive();
+    var exclusive_held = true;
+    defer if (exclusive_held) lock.unlockExclusive();
+
+    var ctx = Context{ .lock = &lock, .io = io };
+    var reader = std.Io.async(io, Context.reader, .{&ctx});
+    var reader_awaited = false;
+    defer if (!reader_awaited) {
+        _ = reader.await(io) catch {};
+    };
+    while (lock.priority_shared_waiters.load(.acquire) == 0) {
+        try io.sleep(.fromMicroseconds(50), .awake);
+    }
+
+    var writer = std.Io.async(io, Context.writer, .{&ctx});
+    var writer_awaited = false;
+    defer if (!writer_awaited) {
+        _ = writer.await(io) catch {};
+    };
+    lock.unlockExclusive();
+    exclusive_held = false;
+
+    try reader.await(io);
+    reader_awaited = true;
+    try writer.await(io);
+    writer_awaited = true;
+    try std.testing.expect(ctx.reader_done.load(.acquire));
+    try std.testing.expect(ctx.writer_done.load(.acquire));
 }
