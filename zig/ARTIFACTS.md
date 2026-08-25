@@ -390,34 +390,131 @@ the embedding batching policy applies to the producer that creates that
 artifact. Vector-index ingestion batching is not exposed here until it has a
 runtime consumer.
 
-For artifact-backed indexes that point at an existing embedding artifact,
-embedder batching belongs on the matching embedding enrichment:
+### Multi-source artifact indexes
+
+Full-text, vector, and graph indexes use `sources` to select terminal artifact
+streams. Full-text and vector sources have the minimal shape
+`{"artifact":"..."}`; graph sources additionally own their payload `path`,
+`format`, and optional node/edge/context mappings. Producer inputs such as
+`field`, `template`, and `source_artifact_name` remain on enrichments.
+
+The compatibility matrix is:
+
+- full-text sources resolve to chunk or textual/JSON asset enrichments;
+- dense and sparse vector sources resolve to embedding enrichments;
+- graph sources resolve to chunk or JSON asset enrichments.
+
+`sources` has union semantics. Every record in every selected stream is an
+independent member. The singular `artifact_name` (full-text) and `source`
+(graph) forms are supported single-source convenience inputs but cannot be
+combined with `sources`; normalized responses use `sources`.
+
+For example, one full-text index can search both extracted units and derived
+chunks:
+
+```json
+{
+  "type": "full_text",
+  "sources": [
+    { "artifact": "document_units_v1" },
+    { "artifact": "document_chunks_v1" }
+  ]
+}
+```
+
+An artifact-backed embeddings index can consume several embedding streams in
+one vector space. Each member is identified by `(artifact, source key)`, so a
+document vector and any number of chunk vectors can coexist in the same index:
 
 ```json
 {
   "type": "embeddings",
-  "field": "embedding",
-  "embedding_name": "document_chunk_dense_v1",
-  "source_artifact_name": "document_chunks_v1",
-  "dimension": 384
-}
-```
-
-```json
-{
-  "name": "document_chunk_dense_v1",
-  "kind": "embedding",
-  "field": "text",
-  "source_artifact_name": "document_chunks_v1",
-  "expected_dims": 384,
+  "dimension": 384,
+  "sources": [
+    { "artifact": "document_dense_v1" },
+    { "artifact": "document_chunk_dense_v1" }
+  ],
   "embedder": {
     "provider": "antfly",
     "model": "bge-base-en-v1.5"
   },
-  "execution": {
-    "batch_items": 32,
-    "batch_bytes": 524288
-  }
+  "enrichments": [
+    {
+      "name": "document_dense_v1",
+      "kind": "embedding",
+      "field": "semantic_content",
+      "expected_dims": 384
+    },
+    {
+      "name": "document_chunk_dense_v1",
+      "kind": "embedding",
+      "field": "text",
+      "source_artifact_name": "document_chunks_v1",
+      "expected_dims": 384
+    }
+  ]
+}
+```
+
+The Go, Python, TypeScript, and Rust SDKs expose
+`NewArtifactEmbeddingIndexConfig` / `artifact_embedding_index_config` /
+`artifactEmbeddingIndexConfig` helpers that build the `sources` array and its
+matching embedding enrichments together. They reject empty, duplicate, and
+oversized source sets locally.
+
+All sources in one index must have the same dense dimension and inhabit a
+compatible vector space. `vector_space` is optional. When every source omits
+it, Antfly compares the durable canonical semantic producer identity stored on
+every embedding enrichment: provider, model, effective normalized endpoint and
+region, dense/sparse mode, multimodal mode, input type, and truncation. Unknown
+or incompatible producers are rejected. Credentials, pacing, retries, and
+batch limits are execution settings and are excluded from that identity.
+
+To combine intentionally compatible but distinct or externally produced
+embeddings, every source must declare the same non-empty `vector_space` on its
+matching embedding enrichment. Explicit and implicit modes cannot be mixed,
+and dimensions are validated even when an explicit identifier matches. The
+identifier is an application-stable compatibility assertion, not a display
+label.
+
+The index-level embedder is registered under every source artifact name, while
+each enrichment owns its source field or upstream chunk stream. Sources may mix
+embeddings produced directly from primary documents with embeddings produced
+from chunk artifacts. Query result shaping uses each member's artifact identity,
+so document return modes collapse chunk members to their parent while retaining
+direct document members in the same score-ordered result. `sources` cannot be
+combined with `external`, `field`, `template`, `chunker`, or the legacy
+single-source artifact aliases.
+
+Embedder batching belongs on the matching embedding enrichment (or the shared
+index-level execution policy when the public shorthand is used).
+
+Graph source array order is deterministic precedence when sources emit the
+same logical edge key: the first source owns the visible payload. Antfly keeps
+the other self-contained manifests, so deleting the winner restores the next
+source without rescanning all edges. Batch reconciliation coalesces repeated
+artifact mutations, groups them by document and index, and scans each state
+prefix once. Graph manifests and edge payloads carry the index generation;
+retired generations are never replayed into a recreated index.
+
+```json
+{
+  "type": "graph",
+  "sources": [
+    {
+      "artifact": "title_relations_v1",
+      "path": "$.relations[*]",
+      "format": "extraction_relation"
+    },
+    {
+      "artifact": "entity_graph_v1",
+      "path": "$.graph",
+      "format": "extraction_graph",
+      "nodes": { "model": "external", "target": "{{ _item.id }}" },
+      "edge": { "type": "{{ _item.type }}", "weight": "{{ _item.score }}" },
+      "context": { "doc_fields": ["title"] }
+    }
+  ]
 }
 ```
 

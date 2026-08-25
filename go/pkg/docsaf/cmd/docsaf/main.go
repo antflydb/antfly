@@ -503,12 +503,14 @@ func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingProvider, embe
 		return nil, fmt.Errorf("build embedder config: %w", err)
 	}
 	vectorIndex, err := antfly.NewArtifactEmbeddingIndexConfig("document_vectors", antfly.ArtifactEmbeddingIndexConfig{
-		SourceArtifactName: documentChunks,
-		EmbeddingName:      documentEmbedding,
-		SourceField:        "text",
-		ExpectedDims:       embeddingDims,
-		Embedder:           *embedder,
-		DistanceMetric:     antfly.DistanceMetricCosine,
+		Sources: []antfly.ArtifactEmbeddingSource{{
+			ArtifactName:       documentEmbedding,
+			SourceArtifactName: documentChunks,
+			SourceField:        "text",
+		}},
+		ExpectedDims:   embeddingDims,
+		Embedder:       *embedder,
+		DistanceMetric: antfly.DistanceMetricCosine,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build vector index config: %w", err)

@@ -1535,10 +1535,10 @@ fn graphArtifactValueFromPortableEdgeValueAlloc(alloc: Allocator, value: []const
         const weight = @as(f64, @bitCast(std.mem.readInt(u64, value[0..][0..8], .little)));
         const created_at = std.mem.readInt(u64, value[8..][0..8], .little);
         const updated_at = std.mem.readInt(u64, value[16..][0..8], .little);
-        return try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, weight, created_at, updated_at, value[24..]);
+        return try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(alloc, weight, created_at, updated_at, value[24..]);
     }
 
-    return try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 1.0, 0, 0, value);
+    return try enrichment_artifact_codec.encodePortableUnboundGraphEdgeAlloc(alloc, 1.0, 0, 0, value);
 }
 
 /// Decode an edge batch payload (mirrors backup_codec.encodeEdgeBatch).
@@ -2327,7 +2327,7 @@ test "export and import graph edge artifacts round trip with arbitrary ids" {
 
     const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, source_doc, "social\x00idx", "follows:fast", target_doc);
     defer alloc.free(edge_key);
-    const edge_val = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 2.5, 11, 22, "{\"ok\":true}");
+    const edge_val = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 1, 2.5, 11, 22, "{\"ok\":true}");
     defer alloc.free(edge_val);
     try src.putBatch(&.{.{ .key = edge_key, .value = edge_val }}, &.{});
 

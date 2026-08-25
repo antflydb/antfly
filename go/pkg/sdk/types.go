@@ -66,6 +66,7 @@ type (
 
 	// Index config types
 	EmbeddingsIndexConfig = oapi.EmbeddingsIndexConfig
+	ArtifactIndexSource   = oapi.ArtifactIndexSource
 	DistanceMetric        = oapi.DistanceMetric
 	EmbeddingsIndexStats  = oapi.EmbeddingsIndexStats
 	EnrichmentConfig      = oapi.EnrichmentConfig

@@ -27,6 +27,7 @@ const internal_keys = @import("../../internal_keys.zig");
 const hierarchy_navigation = @import("../../hierarchy_navigation.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
+const graph_asset_state = @import("../graph_asset_state.zig");
 const replay_source_mod = @import("../derived/replay_source.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const enrichment_types = @import("enrichment_types.zig");
@@ -7336,8 +7337,7 @@ fn materializeGraphAssetForRuntime(
     const artifact_name = requestArtifactName(request);
 
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
-        const source = graph_entry.artifact_source orelse continue;
-        if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
+        const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc);
         defer runtimeFreeGraphWrites(runtime.alloc, graph_writes);
@@ -7350,17 +7350,19 @@ fn materializeGraphAssetForRuntime(
             }
             writes.deinit(runtime.alloc);
         }
+        var write_positions = RuntimeWritePositions.empty;
+        defer write_positions.deinit(runtime.alloc);
         for (graph_writes) |write| {
             const key = try internal_keys.graphEdgeArtifactKeyAlloc(runtime.alloc, write.source, write.index_name, write.edge_type, write.target);
             var key_owned = true;
             errdefer if (key_owned) runtime.alloc.free(key);
-            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, graph_entry.config.coverage_generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
             var payload_owned = true;
             errdefer if (payload_owned) runtime.alloc.free(payload);
-            try writes.append(runtime.alloc, .{ .key = key, .value = payload });
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+            try runtimeUpsertOwnedKVWrite(runtime.alloc, &writes, &write_positions, key, payload);
             key_owned = false;
             payload_owned = false;
-            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
         }
 
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
@@ -7371,14 +7373,9 @@ fn materializeGraphAssetForRuntime(
 
         const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, artifact_name);
         defer runtime.alloc.free(state_key);
-        if (try loadGraphAssetStateKeysAlloc(runtime, state_key)) |previous_keys| {
-            defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
-            for (previous_keys) |previous_key| {
-                if (runtimeContainsKVKey(writes.items, previous_key)) continue;
-                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-            }
-        } else {
+        const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key);
+        defer if (previous_keys) |keys| freeOwnedConstKeySlice(runtime.alloc, keys);
+        if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
             const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
@@ -7393,13 +7390,33 @@ fn materializeGraphAssetForRuntime(
             }
         }
 
-        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, writes.items);
+        const graph_write_count = writes.items.len;
+        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, graph_entry.config.coverage_generation, writes.items);
         var state_owned = true;
         defer if (state_owned) runtime.alloc.free(state_value);
-        try writes.append(runtime.alloc, .{
-            .key = try runtime.alloc.dupe(u8, state_key),
-            .value = state_value,
-        });
+
+        var winners = try runtimeLoadGraphEdgeWinners(runtime, request.doc_key, graph_entry.config.name, state_key, state_value);
+        defer winners.deinit(runtime.alloc);
+        var affected = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (affected.items) |key| runtime.alloc.free(key);
+            affected.deinit(runtime.alloc);
+        }
+        if (previous_keys) |keys| for (keys) |key| try appendUniqueDupeKey(runtime.alloc, &affected, key);
+        for (writes.items[0..graph_write_count]) |write| try appendUniqueDupeKey(runtime.alloc, &affected, write.key);
+        for (affected.items) |edge_key| {
+            if (winners.map.get(edge_key)) |winner| {
+                const payload = try runtime.alloc.dupe(u8, winner.payload);
+                var payload_owned = true;
+                errdefer if (payload_owned) runtime.alloc.free(payload);
+                try runtimeUpsertOwnedKVWriteDupeKey(runtime.alloc, &writes, &write_positions, edge_key, payload);
+                payload_owned = false;
+            } else if (!runtimeContainsConstKey(deletes.items, edge_key)) {
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, edge_key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, edge_key);
+            }
+        }
+        try runtimeUpsertOwnedKVWriteDupeKey(runtime.alloc, &writes, &write_positions, state_key, state_value);
         state_owned = false;
 
         if (writes.items.len > 0 or deletes.items.len > 0) {
@@ -7417,8 +7434,7 @@ fn materializeGraphAssetDeleteForRuntime(
     const artifact_name = requestArtifactName(request);
 
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
-        const source = graph_entry.artifact_source orelse continue;
-        if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
+        const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer {
@@ -7428,13 +7444,9 @@ fn materializeGraphAssetDeleteForRuntime(
 
         const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, artifact_name);
         defer runtime.alloc.free(state_key);
-        if (try loadGraphAssetStateKeysAlloc(runtime, state_key)) |previous_keys| {
-            defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
-            for (previous_keys) |previous_key| {
-                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-            }
-        } else {
+        const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key);
+        defer if (previous_keys) |keys| freeOwnedConstKeySlice(runtime.alloc, keys);
+        if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
             const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
@@ -7448,11 +7460,36 @@ fn materializeGraphAssetDeleteForRuntime(
             }
         }
 
-        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, &.{});
+        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, graph_entry.config.coverage_generation, &.{});
         defer runtime.alloc.free(state_value);
-        const writes = [_]KVPair{.{ .key = state_key, .value = state_value }};
-        if (writes.len > 0 or deletes.items.len > 0) {
-            try storePutBatchWithRetry(runtime, &writes, deletes.items);
+        var winners = try runtimeLoadGraphEdgeWinners(runtime, request.doc_key, graph_entry.config.name, state_key, state_value);
+        defer winners.deinit(runtime.alloc);
+        var writes = std.ArrayListUnmanaged(KVPair).empty;
+        defer {
+            for (writes.items) |write| {
+                runtime.alloc.free(@constCast(write.key));
+                runtime.alloc.free(@constCast(write.value));
+            }
+            writes.deinit(runtime.alloc);
+        }
+        if (previous_keys) |keys| for (keys) |edge_key| {
+            if (winners.map.get(edge_key)) |winner| {
+                const payload = try runtime.alloc.dupe(u8, winner.payload);
+                try writes.append(runtime.alloc, .{
+                    .key = try runtime.alloc.dupe(u8, edge_key),
+                    .value = payload,
+                });
+            } else if (!runtimeContainsConstKey(deletes.items, edge_key)) {
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, edge_key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, edge_key);
+            }
+        };
+        try writes.append(runtime.alloc, .{
+            .key = try runtime.alloc.dupe(u8, state_key),
+            .value = try runtime.alloc.dupe(u8, state_value),
+        });
+        if (writes.items.len > 0 or deletes.items.len > 0) {
+            try storePutBatchWithRetry(runtime, writes.items, deletes.items);
         }
     }
 }
@@ -7462,6 +7499,135 @@ fn runtimeContainsKVKey(items: []const KVPair, key: []const u8) bool {
         if (std.mem.eql(u8, item.key, key)) return true;
     }
     return false;
+}
+
+const RuntimeWritePositions = std.StringHashMapUnmanaged(usize);
+
+fn runtimeUpsertOwnedKVWrite(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(KVPair),
+    positions: *RuntimeWritePositions,
+    key: []u8,
+    value: []u8,
+) !void {
+    if (positions.get(key)) |position| {
+        alloc.free(key);
+        alloc.free(@constCast(writes.items[position].value));
+        writes.items[position].value = value;
+        return;
+    }
+    const position = writes.items.len;
+    try writes.append(alloc, .{ .key = key, .value = value });
+    errdefer _ = writes.pop();
+    try positions.put(alloc, key, position);
+}
+
+fn runtimeUpsertOwnedKVWriteDupeKey(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(KVPair),
+    positions: *RuntimeWritePositions,
+    key: []const u8,
+    value: []u8,
+) !void {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    try runtimeUpsertOwnedKVWrite(alloc, writes, positions, owned_key, value);
+}
+
+const RuntimeGraphEdgeWinner = struct {
+    owner_state_key: []u8,
+    payload: []u8,
+    source_priority: usize,
+};
+
+const RuntimeGraphEdgeWinners = struct {
+    map: std.StringHashMapUnmanaged(RuntimeGraphEdgeWinner) = .empty,
+
+    fn deinit(self: *RuntimeGraphEdgeWinners, alloc: Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            alloc.free(@constCast(entry.key_ptr.*));
+            alloc.free(entry.value_ptr.owner_state_key);
+            alloc.free(entry.value_ptr.payload);
+        }
+        self.map.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn runtimeAddGraphStateManifest(
+    alloc: Allocator,
+    winners: *RuntimeGraphEdgeWinners,
+    state_key: []const u8,
+    source_priority: usize,
+    raw: []const u8,
+) !void {
+    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
+    defer graph_asset_state.freeEntries(alloc, entries);
+    for (entries) |entry| {
+        if (winners.map.getPtr(entry.key)) |winner| {
+            if (source_priority > winner.source_priority or
+                (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt)) continue;
+            const owner = try alloc.dupe(u8, state_key);
+            errdefer alloc.free(owner);
+            const payload = try alloc.dupe(u8, entry.value);
+            alloc.free(winner.owner_state_key);
+            alloc.free(winner.payload);
+            winner.* = .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority };
+            continue;
+        }
+
+        const owned_key = try alloc.dupe(u8, entry.key);
+        errdefer alloc.free(owned_key);
+        const owner = try alloc.dupe(u8, state_key);
+        errdefer alloc.free(owner);
+        const payload = try alloc.dupe(u8, entry.value);
+        errdefer alloc.free(payload);
+        try winners.map.put(alloc, owned_key, .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority });
+    }
+}
+
+fn runtimeGraphStateSourcePriorityAlloc(
+    runtime: *EnrichmentRuntime,
+    state_key: []const u8,
+    state_prefix: []const u8,
+    index_name: []const u8,
+) !usize {
+    const sources = runtime.index_manager.graphArtifactSources(index_name);
+    if (!std.mem.startsWith(u8, state_key, state_prefix)) return sources.len;
+    const terminator = internal_keys.findComponentTerminator(state_key, state_prefix.len) orelse return sources.len;
+    const state_name = try internal_keys.decodeBodyAlloc(runtime.alloc, state_key[state_prefix.len..terminator]);
+    defer runtime.alloc.free(state_name);
+    const artifact_name = if (std.mem.indexOfScalar(u8, state_name, '\x1f')) |end| state_name[0..end] else state_name;
+    for (sources, 0..) |source, i| {
+        if (std.mem.eql(u8, source.artifact_name, artifact_name)) return i;
+    }
+    return sources.len;
+}
+
+fn runtimeLoadGraphEdgeWinners(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    index_name: []const u8,
+    current_state_key: []const u8,
+    current_state_value: []const u8,
+) !RuntimeGraphEdgeWinners {
+    var winners = RuntimeGraphEdgeWinners{};
+    errdefer winners.deinit(runtime.alloc);
+    const prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(runtime.alloc, doc_key, index_name);
+    defer runtime.alloc.free(prefix);
+    const existing = try backend_scan.scanPrefix(runtime.alloc, &runtime.store, prefix);
+    defer backend_scan.freeResults(runtime.alloc, existing);
+    var saw_current = false;
+    for (existing) |entry| {
+        const raw = if (std.mem.eql(u8, entry.key, current_state_key)) blk: {
+            saw_current = true;
+            break :blk current_state_value;
+        } else entry.value;
+        try runtimeAddGraphStateManifest(runtime.alloc, &winners, entry.key, try runtimeGraphStateSourcePriorityAlloc(runtime, entry.key, prefix, index_name), raw);
+    }
+    if (!saw_current) try runtimeAddGraphStateManifest(runtime.alloc, &winners, current_state_key, try runtimeGraphStateSourcePriorityAlloc(runtime, current_state_key, prefix, index_name), current_state_value);
+    return winners;
 }
 
 fn runtimeContainsConstKey(items: []const []const u8, key: []const u8) bool {
@@ -11349,15 +11515,8 @@ fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
     return try protected.toOwnedSlice(runtime.alloc);
 }
 
-fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const KVPair) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try appendU32Big(&out, alloc, @intCast(writes.len));
-    for (writes) |write| {
-        try appendU32Big(&out, alloc, @intCast(write.key.len));
-        try out.appendSlice(alloc, write.key);
-    }
-    return try out.toOwnedSlice(alloc);
+fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []const KVPair) ![]u8 {
+    return try graph_asset_state.encodeAlloc(alloc, generation, writes);
 }
 
 fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8) !?[][]const u8 {
@@ -11367,19 +11526,16 @@ fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const 
         else => return null,
     };
     defer alloc.free(raw);
-    var pos: usize = 0;
-    const count = readU32Big(raw, &pos) catch return null;
-    const keys = try alloc.alloc([]const u8, count);
+    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
+    defer graph_asset_state.freeEntries(alloc, entries);
+    const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};
     var initialized: usize = 0;
     errdefer {
         for (keys[0..initialized]) |key| alloc.free(@constCast(key));
         alloc.free(keys);
     }
-    for (keys) |*key| {
-        const len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-        if (len > raw.len - pos) return error.InvalidGraphAssetState;
-        key.* = try alloc.dupe(u8, raw[pos..][0..len]);
-        pos += len;
+    for (keys, entries) |*key, entry| {
+        key.* = try alloc.dupe(u8, entry.key);
         initialized += 1;
     }
     return keys;

@@ -34,6 +34,8 @@ class CreateGraphIndexRequest:
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
+        sources (list[GraphArtifactSourceConfig] | Unset): Chunk or JSON asset streams whose edge-like values are
+            unioned into this graph index.
         summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
              Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
         template (str | Unset): Handlebars template for generating summarizer input text.
@@ -59,6 +61,7 @@ class CreateGraphIndexRequest:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
+    sources: list[GraphArtifactSourceConfig] | Unset = UNSET
     summarizer: GeneratorConfig | Unset = UNSET
     template: str | Unset = UNSET
     edge_types: list[EdgeTypeConfig] | Unset = UNSET
@@ -85,6 +88,13 @@ class CreateGraphIndexRequest:
             for enrichments_item_data in self.enrichments:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
+
+        sources: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sources, Unset):
+            sources = []
+            for sources_item_data in self.sources:
+                sources_item = sources_item_data.to_dict()
+                sources.append(sources_item)
 
         summarizer: dict[str, Any] | Unset = UNSET
         if not isinstance(self.summarizer, Unset):
@@ -145,6 +155,8 @@ class CreateGraphIndexRequest:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
+        if sources is not UNSET:
+            field_dict["sources"] = sources
         if summarizer is not UNSET:
             field_dict["summarizer"] = summarizer
         if template is not UNSET:
@@ -198,6 +210,15 @@ class CreateGraphIndexRequest:
                 enrichments_item = EnrichmentConfig.from_dict(enrichments_item_data)
 
                 enrichments.append(enrichments_item)
+
+        _sources = d.pop("sources", UNSET)
+        sources: list[GraphArtifactSourceConfig] | Unset = UNSET
+        if _sources is not UNSET:
+            sources = []
+            for sources_item_data in _sources:
+                sources_item = GraphArtifactSourceConfig.from_dict(sources_item_data)
+
+                sources.append(sources_item)
 
         _summarizer = d.pop("summarizer", UNSET)
         summarizer: GeneratorConfig | Unset
@@ -275,6 +296,7 @@ class CreateGraphIndexRequest:
             description=description,
             version=version,
             enrichments=enrichments,
+            sources=sources,
             summarizer=summarizer,
             template=template,
             edge_types=edge_types,

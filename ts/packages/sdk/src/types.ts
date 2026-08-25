@@ -167,6 +167,9 @@ export type EnrichmentConfig = components["schemas"]["EnrichmentConfig"];
 
 // Index types
 export type IndexConfig = components["schemas"]["IndexConfig"];
+export type EmbeddingsIndexConfig = components["schemas"]["EmbeddingsIndexConfig"];
+export type ArtifactIndexSource = components["schemas"]["ArtifactIndexSource"];
+export type GraphIndexSource = components["schemas"]["GraphArtifactSourceConfig"];
 export type CreateIndexRequest = components["schemas"]["CreateIndexRequest"];
 export type CreateFullTextIndexRequest = components["schemas"]["CreateFullTextIndexRequest"];
 export type CreateEmbeddingsIndexRequest = components["schemas"]["CreateEmbeddingsIndexRequest"];

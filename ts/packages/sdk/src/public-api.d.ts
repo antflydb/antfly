@@ -8199,6 +8199,8 @@ export interface components {
             source_artifact_name?: string;
             /** @description Expected embedding dimension for embedding enrichments. */
             expected_dims?: number;
+            /** @description Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently. */
+            vector_space?: string;
             /** @description Chunk size for chunk enrichments. */
             chunk_size?: number;
             /** @description Chunk overlap for chunk enrichments. */
@@ -8212,7 +8214,7 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Write-only serialized asset producer configuration. It may contain provider credentials and is never returned. */
+            /** @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded. */
             producer_json?: string;
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
@@ -8229,12 +8231,19 @@ export interface components {
             /** @description Inline managed enrichment definitions required by this index. */
             enrichments?: components["schemas"]["EnrichmentConfig"][];
         };
+        /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
+        ArtifactIndexSource: {
+            /** @description Stable name of a generated chunk or asset artifact stream. */
+            artifact: string;
+        };
         FullTextIndexConfig: {
+            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
             /** @description Document field indexed as text. Omit for the table's default full-document text index. */
             field?: string;
-            /** @description Generated artifact stream indexed as text. Use with matching inline enrichments. */
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. */
             artifact_name?: string;
         };
         /** @description Create a full-text index. */
@@ -9194,6 +9203,8 @@ export interface components {
             dimension?: number;
             /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
+            /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
             /** @description Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings. */
             embedding_name?: string;
             /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
@@ -9242,6 +9253,50 @@ export interface components {
              */
             type: "embeddings";
         };
+        /** @description A literal numeric value or a Handlebars template evaluated for each materialized graph item. */
+        GraphTemplateValue: string | number;
+        /** @description Maps each artifact item to graph node identifiers. */
+        GraphArtifactNodeMappingConfig: {
+            /**
+             * @default document
+             * @enum {string}
+             */
+            model?: "document" | "external";
+            source?: components["schemas"]["GraphTemplateValue"];
+            target?: components["schemas"]["GraphTemplateValue"];
+        };
+        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
+        GraphArtifactEdgeMappingConfig: {
+            type?: components["schemas"]["GraphTemplateValue"];
+            weight?: components["schemas"]["GraphTemplateValue"];
+            /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
+            metadata?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Document fields made available to graph mapping templates through `_doc.value`. */
+        GraphArtifactContextConfig: {
+            doc_fields?: string[];
+        };
+        /** @description Artifact stream materialized into graph edges. */
+        GraphArtifactSourceConfig: {
+            /**
+             * @default artifact
+             * @enum {string}
+             */
+            kind?: "artifact";
+            artifact: string;
+            path?: string;
+            /**
+             * @default extraction_relation
+             * @enum {string}
+             */
+            format?: "extraction_relation" | "extraction_graph";
+            mention_edge_type?: string;
+            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
+            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
+            context?: components["schemas"]["GraphArtifactContextConfig"];
+        };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
             /** @description Edge type name (e.g., 'cites', 'similar_to') */
@@ -9280,19 +9335,6 @@ export interface components {
             /** @description Required metadata fields for this edge type */
             required_metadata?: string[];
         };
-        /** @description Artifact stream materialized into graph edges. */
-        GraphArtifactSourceConfig: {
-            /** @enum {string} */
-            kind: "artifact";
-            artifact: string;
-            path?: string;
-            /**
-             * @default extraction_relation
-             * @enum {string}
-             */
-            format?: "extraction_relation" | "extraction_graph";
-            mention_edge_type?: string;
-        };
         /** @description Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template. */
         GraphArtifactProducerSourceConfig: {
             /** @enum {string} */
@@ -9311,31 +9353,6 @@ export interface components {
             producer_json?: {
                 [key: string]: unknown;
             };
-        };
-        /** @description A literal numeric value or a Handlebars template evaluated for each materialized graph item. */
-        GraphTemplateValue: string | number;
-        /** @description Maps each artifact item to graph node identifiers. */
-        GraphArtifactNodeMappingConfig: {
-            /**
-             * @default document
-             * @enum {string}
-             */
-            model?: "document" | "external";
-            source?: components["schemas"]["GraphTemplateValue"];
-            target?: components["schemas"]["GraphTemplateValue"];
-        };
-        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
-        GraphArtifactEdgeMappingConfig: {
-            type?: components["schemas"]["GraphTemplateValue"];
-            weight?: components["schemas"]["GraphTemplateValue"];
-            /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
-            metadata?: {
-                [key: string]: unknown;
-            };
-        };
-        /** @description Document fields made available to graph mapping templates through `_doc.value`. */
-        GraphArtifactContextConfig: {
-            doc_fields?: string[];
         };
         /** @description Algebraic law used to combine bounded graph traversal provenance. */
         GraphBoundedTraversalConfig: {
@@ -9382,6 +9399,8 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
+            /** @description Chunk or JSON asset streams whose edge-like values are unioned into this graph index. */
+            sources?: components["schemas"]["GraphArtifactSourceConfig"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];
             /**
@@ -9396,6 +9415,7 @@ export interface components {
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
             /** @description Maximum number of edges per document (0 = unlimited) */
             max_edges_per_document?: number;
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. */
             source?: components["schemas"]["GraphArtifactSourceConfig"];
             artifact?: components["schemas"]["GraphArtifactProducerConfig"];
             nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
@@ -10141,6 +10161,13 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        GraphSourceArtifactStatus: {
+            name: string;
+            path: string;
+            /** @enum {string} */
+            format: "extraction_relation" | "extraction_graph";
+            materialization_pending: boolean;
+        };
         /** @description Statistics for graph index */
         GraphIndexStats: {
             /**
@@ -10160,6 +10187,8 @@ export interface components {
             edge_types?: {
                 [key: string]: number;
             };
+            /** @description Per-source materialization status in configured precedence order. */
+            source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;
             repair?: components["schemas"]["IndexRepairStatus"];
@@ -11926,6 +11955,8 @@ export interface components {
             template?: string;
             source_artifact_name?: string;
             expected_dims?: number;
+            /** @description Optional stable model/token-space identifier asserted for this embedding artifact. */
+            vector_space?: string;
             chunk_size?: number;
             chunk_overlap?: number;
             chunker_json?: string;
@@ -12001,6 +12032,8 @@ export interface components {
             dimension?: number;
             field?: string;
             embedding_name?: string;
+            /** @description Embedding artifact streams indexed together as independent vector members. */
+            sources?: components["schemas"]["ArtifactIndexSource"][];
             source_artifact_name?: string;
             template?: string;
             distance_metric?: components["schemas"]["DistanceMetric"];
@@ -12045,6 +12078,8 @@ export interface components {
             template?: string;
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
             max_edges_per_document?: number;
+            sources?: components["schemas"]["GraphArtifactSourceConfig"][];
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. */
             source?: components["schemas"]["GraphArtifactSourceConfig"];
             artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];
             nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];

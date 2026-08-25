@@ -118,6 +118,14 @@ export {
   term,
 } from "./query-helpers.js";
 export { Client, type SDKConfig } from "./sdk.js";
+export {
+  artifactEmbeddingIndexConfig,
+  artifactFullTextIndexConfig,
+  artifactIndexSources,
+  graphIndexSources,
+  type ArtifactEmbeddingIndexOptions,
+  type ArtifactEmbeddingSourceConfig,
+} from "./index-config.js";
 // Type exports
 export type {
   // Chat Agent types

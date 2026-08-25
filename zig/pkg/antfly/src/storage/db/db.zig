@@ -31,12 +31,14 @@ const segment_mod = @import("../../segment.zig");
 const backend_erased_mod = @import("../backend_erased.zig");
 const db_config = @import("config.zig");
 const generation_lifecycle = @import("generation_lifecycle.zig");
+const graph_asset_state = @import("graph_asset_state.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
 const doc_identity = @import("doc_identity.zig");
 const range_cardinality = @import("range_cardinality.zig");
+const replay_batcher_mod = @import("batcher.zig");
 pub const DocIdentityNamespace = doc_identity.Namespace;
 const doc_set = @import("doc_set.zig");
 const shard_mod = @import("../shard.zig");
@@ -2815,6 +2817,28 @@ fn lockApplyWithBackoffProfiled(rw_lock: *apply_rw_lock_mod.ApplyRwLock, stats: 
         .hold_start_ns = monotonicTimeNs(),
         .profiled = true,
     };
+}
+
+fn resolveMultiSourceDenseHitKeyAlloc(alloc: Allocator, artifact_key: []const u8) ![]u8 {
+    var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key)) orelse return error.InvalidInternalUserKey;
+    defer identity.deinit(alloc);
+    return try alloc.dupe(u8, identity.doc_key);
+}
+
+test "multi-source dense hit identity resolves to its source document" {
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(std.testing.allocator, "doc:multi", "title_dense_v1");
+    defer std.testing.allocator.free(artifact_key);
+    const source_key = try resolveMultiSourceDenseHitKeyAlloc(std.testing.allocator, artifact_key);
+    defer std.testing.allocator.free(source_key);
+    try std.testing.expectEqualStrings("doc:multi", source_key);
+}
+
+test "multi-source dense replay retains each artifact member" {
+    try replay_batcher_mod.testDenseReplayPreservesMultipleArtifactMembers();
+}
+
+test "multi-source sparse replay retains each artifact member" {
+    try replay_batcher_mod.testSparseReplayPreservesMultipleArtifactMembers();
 }
 
 fn denseLsmWriteStatsSnapshot(ctx: *AsyncContext, index_name: []const u8) ?hbc_mod.LsmWriteStats {
@@ -5989,7 +6013,8 @@ pub const DB = struct {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.extract_embedding_artifacts_ns, embedding_artifacts_start_ns);
             const graph_artifacts_start_ns = monotonicTimeNs();
             for (extracted[i].graph_writes) |graph_write| {
-                try appendGraphEdgeArtifactWrite(self.alloc, &explicit_graph_artifact_writes, graph_write);
+                const generation = (self.core.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
+                try appendGraphEdgeArtifactWrite(self.alloc, &explicit_graph_artifact_writes, graph_write, generation);
             }
             for (extracted[i].mentioned_graph_indexes) |index_name| {
                 try graph_artifact_clears.append(self.alloc, .{
@@ -6069,7 +6094,8 @@ pub const DB = struct {
         }
 
         for (effective_req.graph_writes) |graph_write| {
-            try appendGraphEdgeArtifactWrite(self.alloc, &explicit_graph_artifact_writes, graph_write);
+            const generation = (self.core.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
+            try appendGraphEdgeArtifactWrite(self.alloc, &explicit_graph_artifact_writes, graph_write, generation);
         }
 
         var changed_graph_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
@@ -11318,15 +11344,18 @@ pub const DB = struct {
         read_txn: *docstore_mod.DocStore.Txn,
         cancel_check: ?types.RepairCancelCheck,
     ) !u64 {
-        const artifact_name = try index_manager_mod.denseConfigArtifactNameAlloc(alloc, cfg);
-        defer alloc.free(artifact_name);
+        const artifact_names = try index_manager_mod.denseConfigArtifactNamesAlloc(alloc, cfg);
+        defer {
+            for (artifact_names) |name| alloc.free(name);
+            alloc.free(artifact_names);
+        }
         const dims = try index_manager_mod.denseConfigDimensions(alloc, cfg);
         const lower = try self.core.documentRangeLowerAlloc("");
         defer self.core.alloc.free(lower);
 
         const ScanState = struct {
             alloc: Allocator,
-            artifact_name: []const u8,
+            artifact_names: []const []const u8,
             dims: u32,
             cancel_check: ?types.RepairCancelCheck,
             scanned: usize = 0,
@@ -11341,11 +11370,15 @@ pub const DB = struct {
                 if (!internal_keys.isInternalUserKey(key)) return .@"continue";
                 var artifact_ref = (try decodeArtifactRefIfKnownAlloc(state.alloc, key)) orelse return .@"continue";
                 defer artifact_ref.deinit(state.alloc);
-                if (artifact_ref.kind != .embedding or
-                    !std.mem.eql(u8, artifact_ref.name, state.artifact_name))
-                {
-                    return .@"continue";
+                if (artifact_ref.kind != .embedding) return .@"continue";
+                var selected = false;
+                for (state.artifact_names) |name| {
+                    if (std.mem.eql(u8, artifact_ref.name, name)) {
+                        selected = true;
+                        break;
+                    }
                 }
+                if (!selected) return .@"continue";
                 const artifact_dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch |err| {
                     if (isRecoverableEmbeddingArtifactError(err)) return .@"continue";
                     return err;
@@ -11357,7 +11390,7 @@ pub const DB = struct {
 
         var scan_state = ScanState{
             .alloc = alloc,
-            .artifact_name = artifact_name,
+            .artifact_names = artifact_names,
             .dims = dims,
             .cancel_check = cancel_check,
         };
@@ -12407,15 +12440,21 @@ pub const DB = struct {
                 // A shadow rebuild consumes stored embedding artifacts and
                 // cannot repair one missing below its snapshot floor. Re-arm
                 // the managed producer from primary documents first.
-                const artifact_name = try index_manager_mod.denseConfigArtifactNameAlloc(alloc, cfg_ptr.*);
-                defer alloc.free(artifact_name);
-                const queued_refs = self.reprocessGeneratedEnrichmentFromStoredDocs(alloc, artifact_name) catch |reprocess_err| blk: {
-                    std.log.warn(
-                        "dense repair source recovery deferred index={s} err={s}",
-                        .{ entry.intent.index_name, @errorName(reprocess_err) },
-                    );
-                    break :blk 0;
-                };
+                const artifact_names = try index_manager_mod.denseConfigArtifactNamesAlloc(alloc, cfg_ptr.*);
+                defer {
+                    for (artifact_names) |name| alloc.free(name);
+                    alloc.free(artifact_names);
+                }
+                var queued_refs: usize = 0;
+                for (artifact_names) |artifact_name| {
+                    queued_refs +|= self.reprocessGeneratedEnrichmentFromStoredDocs(alloc, artifact_name) catch |reprocess_err| blk: {
+                        std.log.warn(
+                            "dense repair source recovery deferred index={s} artifact={s} err={s}",
+                            .{ entry.intent.index_name, artifact_name, @errorName(reprocess_err) },
+                        );
+                        break :blk 0;
+                    };
+                }
                 if (queued_refs != 0) {
                     const recovery_target = self.core.nextDerivedSequence();
                     const runtime = self.enrichment_runtime.?;
@@ -16665,56 +16704,57 @@ pub const DB = struct {
         changed: *std.ArrayListUnmanaged([]u8),
     ) !void {
         for (self.core.graphIndexes()) |graph_entry| {
-            const source = graph_entry.artifact_source orelse continue;
-            if (source.mention_edge_type.len == 0) continue;
-            if (!std.mem.eql(u8, source.artifact_name, cfg.source_artifact)) continue;
+            for (graph_entry.artifact_sources) |source| {
+                if (source.mention_edge_type.len == 0) continue;
+                if (!std.mem.eql(u8, source.artifact_name, cfg.source_artifact)) continue;
 
-            const state_name = try mentionGraphStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
-            defer self.alloc.free(state_name);
-            const state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, state_name);
-            var state_key_owned = true;
-            errdefer if (state_key_owned) self.alloc.free(state_key);
+                const state_name = try mentionGraphStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
+                defer self.alloc.free(state_name);
+                const state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, state_name);
+                var state_key_owned = true;
+                errdefer if (state_key_owned) self.alloc.free(state_key);
 
-            if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
-                defer freeOwnedConstKeySlice(self.alloc, previous_keys);
-                for (previous_keys) |previous_key| {
-                    if (containsDeleteKey(deletes.items, previous_key)) continue;
-                    const owned_key = try self.alloc.dupe(u8, previous_key);
-                    try deletes.append(self.alloc, owned_key);
-                    try appendUniqueOwnedKey(self.alloc, changed, previous_key);
+                if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
+                    defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+                    for (previous_keys) |previous_key| {
+                        if (containsDeleteKey(deletes.items, previous_key)) continue;
+                        const owned_key = try self.alloc.dupe(u8, previous_key);
+                        try deletes.append(self.alloc, owned_key);
+                        try appendUniqueOwnedKey(self.alloc, changed, previous_key);
+                    }
                 }
-            }
 
-            if (!containsDeleteKey(deletes.items, state_key)) {
-                try deletes.append(self.alloc, state_key);
-                state_key_owned = false;
-            } else {
-                self.alloc.free(state_key);
-                state_key_owned = false;
-            }
-
-            const mention_state_name = try mentionArtifactStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
-            defer self.alloc.free(mention_state_name);
-            const mention_state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, mention_state_name);
-            var mention_state_key_owned = true;
-            errdefer if (mention_state_key_owned) self.alloc.free(mention_state_key);
-
-            if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, mention_state_key)) |previous_keys| {
-                defer freeOwnedConstKeySlice(self.alloc, previous_keys);
-                for (previous_keys) |previous_key| {
-                    if (containsDeleteKey(deletes.items, previous_key)) continue;
-                    const owned_key = try self.alloc.dupe(u8, previous_key);
-                    try deletes.append(self.alloc, owned_key);
-                    try appendUniqueOwnedKey(self.alloc, changed, previous_key);
+                if (!containsDeleteKey(deletes.items, state_key)) {
+                    try deletes.append(self.alloc, state_key);
+                    state_key_owned = false;
+                } else {
+                    self.alloc.free(state_key);
+                    state_key_owned = false;
                 }
-            }
 
-            if (!containsDeleteKey(deletes.items, mention_state_key)) {
-                try deletes.append(self.alloc, mention_state_key);
-                mention_state_key_owned = false;
-            } else {
-                self.alloc.free(mention_state_key);
-                mention_state_key_owned = false;
+                const mention_state_name = try mentionArtifactStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
+                defer self.alloc.free(mention_state_name);
+                const mention_state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, mention_state_name);
+                var mention_state_key_owned = true;
+                errdefer if (mention_state_key_owned) self.alloc.free(mention_state_key);
+
+                if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, mention_state_key)) |previous_keys| {
+                    defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+                    for (previous_keys) |previous_key| {
+                        if (containsDeleteKey(deletes.items, previous_key)) continue;
+                        const owned_key = try self.alloc.dupe(u8, previous_key);
+                        try deletes.append(self.alloc, owned_key);
+                        try appendUniqueOwnedKey(self.alloc, changed, previous_key);
+                    }
+                }
+
+                if (!containsDeleteKey(deletes.items, mention_state_key)) {
+                    try deletes.append(self.alloc, mention_state_key);
+                    mention_state_key_owned = false;
+                } else {
+                    self.alloc.free(mention_state_key);
+                    mention_state_key_owned = false;
+                }
             }
         }
     }
@@ -18686,12 +18726,13 @@ pub const DB = struct {
 
     const DenseArtifactCounterTarget = struct {
         index_name: []u8,
-        artifact_name: []u8,
+        artifact_names: std.ArrayListUnmanaged([]u8) = .empty,
         dims: u32,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.index_name);
-            alloc.free(self.artifact_name);
+            for (self.artifact_names.items) |name| alloc.free(name);
+            self.artifact_names.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -18713,11 +18754,11 @@ pub const DB = struct {
             self.* = .{};
         }
 
-        fn containsIndex(self: *const @This(), index_name: []const u8) bool {
-            for (self.targets.items) |target| {
-                if (std.mem.eql(u8, target.index_name, index_name)) return true;
+        fn indexTarget(self: *const @This(), index_name: []const u8) ?usize {
+            for (self.targets.items, 0..) |target, i| {
+                if (std.mem.eql(u8, target.index_name, index_name)) return i;
             }
-            return false;
+            return null;
         }
 
         fn add(
@@ -18727,16 +18768,33 @@ pub const DB = struct {
             artifact_name: []const u8,
             dims: u32,
         ) !void {
-            if (self.containsIndex(index_name)) return;
+            if (self.indexTarget(index_name)) |target_idx| {
+                const target = &self.targets.items[target_idx];
+                for (target.artifact_names.items) |configured| {
+                    if (std.mem.eql(u8, configured, artifact_name)) return;
+                }
+                const owned_name = try alloc.dupe(u8, artifact_name);
+                errdefer alloc.free(owned_name);
+                try target.artifact_names.append(alloc, owned_name);
+                const key: DenseArtifactTargetKey = .{ .artifact_name = owned_name, .dims = dims };
+                var entry = try self.by_artifact.getOrPut(alloc, key);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(alloc, target_idx);
+                return;
+            }
             var owned_index_name: ?[]u8 = try alloc.dupe(u8, index_name);
             errdefer if (owned_index_name) |value| alloc.free(value);
             var owned_artifact_name: ?[]u8 = try alloc.dupe(u8, artifact_name);
             errdefer if (owned_artifact_name) |value| alloc.free(value);
+            var artifact_names = std.ArrayListUnmanaged([]u8).empty;
+            errdefer artifact_names.deinit(alloc);
+            try artifact_names.append(alloc, owned_artifact_name.?);
             try self.targets.append(alloc, .{
                 .index_name = owned_index_name.?,
-                .artifact_name = owned_artifact_name.?,
+                .artifact_names = artifact_names,
                 .dims = dims,
             });
+            artifact_names = .empty;
             owned_index_name = null;
             owned_artifact_name = null;
             var keep_target = false;
@@ -18748,7 +18806,7 @@ pub const DB = struct {
             const target_idx = self.targets.items.len - 1;
             const target = &self.targets.items[target_idx];
             const key: DenseArtifactTargetKey = .{
-                .artifact_name = target.artifact_name,
+                .artifact_name = target.artifact_names.items[0],
                 .dims = target.dims,
             };
             var entry = try self.by_artifact.getOrPut(alloc, key);
@@ -18769,17 +18827,16 @@ pub const DB = struct {
             errdefer catalog.deinit(alloc);
 
             for (index_manager.dense_indexes.items) |*entry| {
-                const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+                const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
                 if (!artifact_backed) continue;
-                try catalog.add(
-                    alloc,
-                    entry.config.name,
-                    denseArtifactNameForEntry(entry),
-                    entry.dims,
-                );
+                if (entry.embedding_names.len > 0) {
+                    for (entry.embedding_names) |artifact_name| try catalog.add(alloc, entry.config.name, artifact_name, entry.dims);
+                } else {
+                    try catalog.add(alloc, entry.config.name, denseArtifactNameForEntry(entry), entry.dims);
+                }
             }
             for (index_manager.status_only_index_configs) |cfg| {
-                if (cfg.kind != .dense_vector or catalog.containsIndex(cfg.name)) continue;
+                if (cfg.kind != .dense_vector or catalog.indexTarget(cfg.name) != null) continue;
                 const requires_coverage = index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, cfg) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     // Invalid/unsupported quarantined configs are deliberately
@@ -18788,21 +18845,19 @@ pub const DB = struct {
                     else => continue,
                 };
                 if (!requires_coverage) continue;
-                const artifact_name = index_manager_mod.denseConfigArtifactNameAlloc(alloc, cfg) catch |err| switch (err) {
+                const artifact_names = index_manager_mod.denseConfigArtifactNamesAlloc(alloc, cfg) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => continue,
                 };
-                defer alloc.free(artifact_name);
+                defer {
+                    for (artifact_names) |name| alloc.free(name);
+                    alloc.free(artifact_names);
+                }
                 const dims = index_manager_mod.denseConfigDimensions(alloc, cfg) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => continue,
                 };
-                try catalog.add(
-                    alloc,
-                    cfg.name,
-                    artifact_name,
-                    dims,
-                );
+                for (artifact_names) |artifact_name| try catalog.add(alloc, cfg.name, artifact_name, dims);
             }
             return catalog;
         }
@@ -19110,23 +19165,21 @@ pub const DB = struct {
             for (targets) |target| {
                 const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
                 try counts.per_target_index.put(alloc, target.dense_index_idx, 0);
-                try target_lookup.add(alloc, entry.config.name, entry.dims, target.dense_index_idx);
-                if (entry.embedding_name) |embedding_name| {
-                    if (!std.mem.eql(u8, embedding_name, entry.config.name)) {
-                        try target_lookup.add(alloc, embedding_name, entry.dims, target.dense_index_idx);
-                    }
+                if (entry.embedding_names.len > 0) {
+                    for (entry.embedding_names) |embedding_name| try target_lookup.add(alloc, embedding_name, entry.dims, target.dense_index_idx);
+                } else {
+                    try target_lookup.add(alloc, denseArtifactNameForEntry(entry), entry.dims, target.dense_index_idx);
                 }
             }
         } else {
             for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-                const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+                const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
                 if (!artifact_backed) continue;
                 try counts.per_target_index.put(alloc, dense_index_idx, 0);
-                try target_lookup.add(alloc, entry.config.name, entry.dims, dense_index_idx);
-                if (entry.embedding_name) |embedding_name| {
-                    if (!std.mem.eql(u8, embedding_name, entry.config.name)) {
-                        try target_lookup.add(alloc, embedding_name, entry.dims, dense_index_idx);
-                    }
+                if (entry.embedding_names.len > 0) {
+                    for (entry.embedding_names) |embedding_name| try target_lookup.add(alloc, embedding_name, entry.dims, dense_index_idx);
+                } else {
+                    try target_lookup.add(alloc, denseArtifactNameForEntry(entry), entry.dims, dense_index_idx);
                 }
             }
         }
@@ -19186,9 +19239,6 @@ pub const DB = struct {
         var counts: DenseArtifactTargetCounts = .{};
         errdefer counts.deinit(alloc);
 
-        var source_counts = std.HashMapUnmanaged(DenseArtifactTargetKey, u64, DenseArtifactTargetKeyContext, 80).empty;
-        defer source_counts.deinit(alloc);
-
         for (rebuild_targets) |target| {
             const entry = &self.core.index_manager.dense_indexes.items[target.dense_index_idx];
             // Startup planning and shadow activation must use the same
@@ -19198,16 +19248,12 @@ pub const DB = struct {
             try counts.per_target_index.put(alloc, target.dense_index_idx, count);
             if (maybe_count != null) try counts.authoritative_targets.put(alloc, target.dense_index_idx, {});
 
-            const source_key: DenseArtifactTargetKey = .{
-                .artifact_name = denseArtifactNameForEntry(entry),
-                .dims = entry.dims,
-            };
-            const gop = try source_counts.getOrPut(alloc, source_key);
-            if (!gop.found_existing or count > gop.value_ptr.*) gop.value_ptr.* = count;
+            // Per-index counters drive coverage decisions below. Their sum is
+            // only an upper bound when multiple indexes consume overlapping
+            // artifact streams, so the final rebuild plan computes its exact
+            // union after selecting the targets that actually need repair.
+            counts.total_target_artifacts +|= count;
         }
-
-        var source_it = source_counts.valueIterator();
-        while (source_it.next()) |count| counts.total_target_artifacts +|= count.*;
 
         return counts;
     }
@@ -19259,7 +19305,7 @@ pub const DB = struct {
         }
 
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
             const artifact_counter_required = try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, entry.config);
             const status_snapshot = try self.loadIndexStatusSnapshot(alloc, entry.config.name);
             const watermark_count = if (status_snapshot) |status_value|
@@ -19418,6 +19464,17 @@ pub const DB = struct {
             for (owned_targets) |*target| target.deinit(alloc);
             if (owned_targets.len > 0) alloc.free(owned_targets);
         }
+        const exact_target_sequence = if (owned_targets.len == 0) 0 else blk: {
+            // Rebuild progress counts source artifacts, not index applications.
+            // A repair already scans the artifact keyspace to rebuild vectors;
+            // this lightweight dimensions-only pass keeps its progress total
+            // exact for identical, partially overlapping, and disjoint source
+            // sets without burdening every foreground artifact mutation with
+            // another family of durable counters.
+            var exact_counts = try self.collectDenseArtifactTargetCounts(alloc, owned_targets);
+            defer exact_counts.deinit(alloc);
+            break :blk exact_counts.total_target_artifacts;
+        };
         const owned_generation_repairs = try generation_repairs.toOwnedSlice(alloc);
         errdefer if (owned_generation_repairs.len > 0) alloc.free(owned_generation_repairs);
         const owned_rebuild_state_cleanups = try rebuild_state_cleanups.toOwnedSlice(alloc);
@@ -19425,7 +19482,7 @@ pub const DB = struct {
             .targets = owned_targets,
             .generation_repairs = owned_generation_repairs,
             .rebuild_state_cleanups = owned_rebuild_state_cleanups,
-            .target_sequence = target_counts.total_target_artifacts,
+            .target_sequence = exact_target_sequence,
         };
     }
 
@@ -19714,7 +19771,7 @@ pub const DB = struct {
 
         var repaired: usize = 0;
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
-            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+            const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
             if (!artifact_backed) continue;
 
             const artifact_target_count = target_counts.per_target_index.get(dense_index_idx) orelse 0;
@@ -23629,6 +23686,17 @@ pub const DB = struct {
         return try self.core.index_manager.searchDenseEntryWithRequest(entry, req);
     }
 
+    fn resolveDenseHitKeyCallback(
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        key: []const u8,
+    ) anyerror![]u8 {
+        _ = ctx;
+        if (entry.embedding_names.len == 0) return try alloc.dupe(u8, key);
+        return try resolveMultiSourceDenseHitKeyAlloc(alloc, key);
+    }
+
     fn hbcSearchProfiledCallback(
         ctx: ?*anyopaque,
         entry: *index_manager_mod.IndexManager.DenseIndex,
@@ -23964,6 +24032,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
+            .resolve_hit_key = resolveDenseHitKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
             .all_docs_visible_fast = allDocsVisibleFastCallback,
@@ -24007,6 +24076,7 @@ pub const DB = struct {
             .text_index_entry = textIndexEntryCallback,
             .dense_index = denseIndexCallback,
             .lookup_doc_key = denseDocKeyCallback,
+            .resolve_hit_key = resolveDenseHitKeyCallback,
             .lookup_vector_id = denseVectorIdCallback,
             .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
             .all_docs_visible_fast = allDocsVisibleFastCallback,
@@ -25498,13 +25568,14 @@ pub const DB = struct {
             index_name: []const u8,
             node_filter: graph_pattern_mod.NodeFilter,
         ) GraphNodeAdmissionCache {
-            const artifact_source = db.core.index_manager.graphArtifactSource(index_name);
+            const artifact_sources = db.core.index_manager.graphArtifactSources(index_name);
             return .{
                 .db = db,
                 .req = req,
                 .alloc = alloc,
-                .external_targets = artifact_source != null and
-                    artifact_source.?.mapping.node_model == .external,
+                .external_targets = for (artifact_sources) |source| {
+                    if (source.mapping.node_model == .external) break true;
+                } else false,
                 .node_filter = node_filter,
                 .prepared_filters = db_query_graph.PreparedPatternFilterCache.init(alloc),
             };
@@ -30497,15 +30568,36 @@ fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []
     return try list.toOwnedSlice(alloc);
 }
 
-fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const docstore_mod.KVPair) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try appendU32Big(&out, alloc, @intCast(writes.len));
-    for (writes) |write| {
-        try appendU32Big(&out, alloc, @intCast(write.key.len));
-        try out.appendSlice(alloc, write.key);
-    }
-    return try out.toOwnedSlice(alloc);
+const graph_state_name_magic = "GSN1";
+
+fn appendGraphStateNameComponent(list: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: []const u8) !void {
+    if (value.len > std.math.maxInt(u32)) return error.GraphStateNameComponentTooLarge;
+    var len_bytes: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &len_bytes, @intCast(value.len), .big);
+    try list.appendSlice(alloc, &len_bytes);
+    try list.appendSlice(alloc, value);
+}
+
+fn initGraphStateName(alloc: Allocator, source_artifact: []const u8) !std.ArrayListUnmanaged(u8) {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    errdefer list.deinit(alloc);
+    try list.appendSlice(alloc, graph_state_name_magic);
+    try appendGraphStateNameComponent(&list, alloc, source_artifact);
+    return list;
+}
+
+fn graphStateNameSourceArtifact(state_name: []const u8) !?[]const u8 {
+    if (!std.mem.startsWith(u8, state_name, graph_state_name_magic)) return null;
+    var pos: usize = graph_state_name_magic.len;
+    if (state_name.len - pos < @sizeOf(u32)) return error.InvalidGraphStateName;
+    const name_len = std.mem.readInt(u32, state_name[pos..][0..@sizeOf(u32)], .big);
+    pos += @sizeOf(u32);
+    if (name_len > state_name.len - pos) return error.InvalidGraphStateName;
+    return state_name[pos..][0..name_len];
+}
+
+fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []const docstore_mod.KVPair) ![]u8 {
+    return try graph_asset_state.encodeAlloc(alloc, generation, writes);
 }
 
 fn loadGraphAssetStateKeysAlloc(alloc: Allocator, store: *docstore_mod.DocStore, state_key: []const u8) !?[][]const u8 {
@@ -30514,22 +30606,168 @@ fn loadGraphAssetStateKeysAlloc(alloc: Allocator, store: *docstore_mod.DocStore,
         else => return err,
     };
     defer alloc.free(raw);
-    var pos: usize = 0;
-    const count = readU32Big(raw, &pos) catch return null;
-    const keys = try alloc.alloc([]const u8, count);
+    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
+    defer graph_asset_state.freeEntries(alloc, entries);
+    const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};
     var initialized: usize = 0;
     errdefer {
         for (keys[0..initialized]) |key| alloc.free(@constCast(key));
         alloc.free(keys);
     }
-    for (keys) |*key| {
-        const len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-        if (len > raw.len - pos) return error.InvalidGraphAssetState;
-        key.* = try alloc.dupe(u8, raw[pos..][0..len]);
-        pos += len;
+    for (keys, entries) |*key, entry| {
+        key.* = try alloc.dupe(u8, entry.key);
         initialized += 1;
     }
     return keys;
+}
+
+fn pendingStoreWriteValue(writes: []const docstore_mod.KVPair, key: []const u8) ?[]const u8 {
+    var i = writes.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, writes[i].key, key)) return writes[i].value;
+    }
+    return null;
+}
+
+const GraphEdgeWinner = struct {
+    owner_state_key: []u8,
+    payload: []u8,
+    source_priority: usize,
+};
+
+const GraphEdgeWinners = struct {
+    map: std.StringHashMapUnmanaged(GraphEdgeWinner) = .empty,
+
+    fn deinit(self: *GraphEdgeWinners, alloc: Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            alloc.free(@constCast(entry.key_ptr.*));
+            alloc.free(entry.value_ptr.owner_state_key);
+            alloc.free(entry.value_ptr.payload);
+        }
+        self.map.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn addGraphStateManifest(
+    alloc: Allocator,
+    winners: *GraphEdgeWinners,
+    state_key: []const u8,
+    source_priority: usize,
+    raw: []const u8,
+) !void {
+    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
+    defer graph_asset_state.freeEntries(alloc, entries);
+    for (entries) |entry| {
+        if (winners.map.getPtr(entry.key)) |winner| {
+            if (source_priority > winner.source_priority or
+                (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt)) continue;
+            const owner = try alloc.dupe(u8, state_key);
+            errdefer alloc.free(owner);
+            const payload = try alloc.dupe(u8, entry.value);
+            alloc.free(winner.owner_state_key);
+            alloc.free(winner.payload);
+            winner.* = .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority };
+            continue;
+        }
+
+        const owned_key = try alloc.dupe(u8, entry.key);
+        errdefer alloc.free(owned_key);
+        const owner = try alloc.dupe(u8, state_key);
+        errdefer alloc.free(owner);
+        const payload = try alloc.dupe(u8, entry.value);
+        errdefer alloc.free(payload);
+        try winners.map.put(alloc, owned_key, .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority });
+    }
+}
+
+fn graphStateSourcePriorityAlloc(
+    alloc: Allocator,
+    state_key: []const u8,
+    state_prefix: []const u8,
+    sources: []const index_manager_mod.GraphArtifactSource,
+) !?usize {
+    if (!std.mem.startsWith(u8, state_key, state_prefix)) return null;
+    const terminator = internal_keys.findComponentTerminator(state_key, state_prefix.len) orelse return null;
+    const state_name = try internal_keys.decodeBodyAlloc(alloc, state_key[state_prefix.len..terminator]);
+    defer alloc.free(state_name);
+
+    if (try graphStateNameSourceArtifact(state_name)) |artifact_name| {
+        for (sources, 0..) |source, i| {
+            if (std.mem.eql(u8, source.artifact_name, artifact_name)) return i;
+        }
+        return null;
+    }
+
+    // Legacy separator-delimited state is read only for migration. Longest
+    // matching avoids prefix truncation until replay replaces it with GSN1.
+    var best: ?usize = null;
+    var best_len: usize = 0;
+    for (sources, 0..) |source, i| {
+        if (source.artifact_name.len < best_len or !std.mem.startsWith(u8, state_name, source.artifact_name)) continue;
+        const boundary_matches = source.artifact_name.len == state_name.len or
+            (source.artifact_name.len < state_name.len and state_name[source.artifact_name.len] == '\x1f');
+        if (!boundary_matches) continue;
+        if (best == null or source.artifact_name.len > best_len) {
+            best = i;
+            best_len = source.artifact_name.len;
+        }
+    }
+    return best;
+}
+
+fn loadGraphEdgeWinners(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    index_name: []const u8,
+    current_state_key: []const u8,
+    current_state_value: []const u8,
+    pending_writes: []const docstore_mod.KVPair,
+    sources: []const index_manager_mod.GraphArtifactSource,
+) !GraphEdgeWinners {
+    var overrides = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer overrides.deinit(alloc);
+    try overrides.append(alloc, .{ .key = current_state_key, .value = current_state_value });
+    try overrides.appendSlice(alloc, pending_writes);
+    return try loadGraphEdgeWinnersWithOverrides(alloc, store, doc_key, index_name, overrides.items, sources);
+}
+
+fn loadGraphEdgeWinnersWithOverrides(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    index_name: []const u8,
+    state_overrides: []const docstore_mod.KVPair,
+    sources: []const index_manager_mod.GraphArtifactSource,
+) !GraphEdgeWinners {
+    var winners = GraphEdgeWinners{};
+    errdefer winners.deinit(alloc);
+    const prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(alloc, doc_key, index_name);
+    defer alloc.free(prefix);
+    const existing = try store.scanPrefix(alloc, prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, existing);
+    var override_values = std.StringHashMapUnmanaged([]const u8).empty;
+    defer override_values.deinit(alloc);
+    for (state_overrides) |override| try override_values.put(alloc, override.key, override.value);
+    for (existing) |entry| {
+        var raw: []const u8 = entry.value;
+        if (override_values.get(entry.key)) |override| {
+            raw = override;
+            _ = override_values.remove(entry.key);
+        }
+        const source_priority = try graphStateSourcePriorityAlloc(alloc, entry.key, prefix, sources) orelse continue;
+        try addGraphStateManifest(alloc, &winners, entry.key, source_priority, raw);
+    }
+    var override_it = override_values.iterator();
+    while (override_it.next()) |override| {
+        if (!std.mem.startsWith(u8, override.key_ptr.*, prefix)) continue;
+        const source_priority = try graphStateSourcePriorityAlloc(alloc, override.key_ptr.*, prefix, sources) orelse continue;
+        try addGraphStateManifest(alloc, &winners, override.key_ptr.*, source_priority, override.value_ptr.*);
+    }
+    return winners;
 }
 
 fn readU32Big(bytes: []const u8, pos: *usize) !u32 {
@@ -30709,15 +30947,90 @@ fn appendGraphEdgeArtifactWrite(
     alloc: Allocator,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     write: types.GraphEdgeWrite,
+    generation: u64,
 ) !void {
     const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
     defer alloc.free(key);
-    const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+    const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
     const owned_key = try alloc.dupe(u8, key);
     try artifact_writes.append(alloc, .{
         .key = owned_key,
         .value = payload,
     });
+}
+
+const StoreWritePositions = std.StringHashMapUnmanaged(usize);
+
+fn upsertPendingStoreWrite(
+    alloc: Allocator,
+    list: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    positions: *StoreWritePositions,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (positions.get(key)) |position| {
+        list.items[position].value = value;
+        return;
+    }
+    const position = list.items.len;
+    try list.append(alloc, .{ .key = key, .value = value });
+    errdefer _ = list.pop();
+    try positions.put(alloc, key, position);
+}
+
+fn upsertOwnedStoreWrite(
+    alloc: Allocator,
+    list: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    positions: *StoreWritePositions,
+    key: []u8,
+    value: []u8,
+) !void {
+    if (positions.get(key)) |position| {
+        alloc.free(key);
+        alloc.free(@constCast(list.items[position].value));
+        list.items[position].value = value;
+        return;
+    }
+    const position = list.items.len;
+    try list.append(alloc, .{ .key = key, .value = value });
+    errdefer _ = list.pop();
+    try positions.put(alloc, key, position);
+}
+
+fn upsertOwnedStoreWriteDupeKey(
+    alloc: Allocator,
+    list: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    positions: *StoreWritePositions,
+    key: []const u8,
+    value: []u8,
+) !void {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    try upsertOwnedStoreWrite(alloc, list, positions, owned_key, value);
+}
+
+fn removePendingDeleteKey(
+    alloc: Allocator,
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+    key: []const u8,
+) void {
+    var i: usize = 0;
+    while (i < delete_keys.items.len) {
+        if (std.mem.eql(u8, delete_keys.items[i], key)) {
+            _ = delete_keys.orderedRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+    i = 0;
+    while (i < owned_delete_keys.items.len) {
+        if (std.mem.eql(u8, owned_delete_keys.items[i], key)) {
+            alloc.free(owned_delete_keys.orderedRemove(i));
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn containsBatchWriteKey(list: []const types.BatchWrite, key: []const u8) bool {
@@ -31065,7 +31378,7 @@ fn flushGeneratedDenseChunkBatch(
             embedding_name,
             request.source_field,
             source.key,
-            enrichment_artifact_codec.hashSource(source.text),
+            enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json),
             vector,
         );
         defer alloc.free(artifact_key);
@@ -31080,6 +31393,7 @@ fn flushGeneratedSparseChunkBatch(
     alloc: Allocator,
     sparse_embedder: embedder_mod.SparseEmbedder,
     embedding_name: []const u8,
+    semantic_producer: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
     sources: []const ChunkEmbeddingSource,
@@ -31100,7 +31414,7 @@ fn flushGeneratedSparseChunkBatch(
             artifact_writes,
             source.key,
             embedding_name,
-            enrichment_artifact_codec.hashSource(source.text),
+            enrichment_artifact_codec.hashEmbeddingSource(source.text, semantic_producer),
             sparse.indices,
             sparse.values,
         );
@@ -31136,7 +31450,7 @@ fn flushGeneratedDenseChunkSourceBatch(
     defer source_indexes.deinit(alloc);
 
     for (sources.items, 0..) |source, i| {
-        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
         const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
         defer alloc.free(artifact_key);
         if (skip_unchanged_artifacts) {
@@ -31159,6 +31473,7 @@ fn flushGeneratedSparseChunkSourceBatch(
     db: *DB,
     sparse_embedder: embedder_mod.SparseEmbedder,
     embedding_name: []const u8,
+    semantic_producer: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
     sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
@@ -31174,7 +31489,7 @@ fn flushGeneratedSparseChunkSourceBatch(
     defer source_indexes.deinit(alloc);
 
     for (sources.items, 0..) |source, i| {
-        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, semantic_producer);
         const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
         defer alloc.free(artifact_key);
         if (try storedOrPendingEmbeddingSourceHash(alloc, db, pending_lookup, artifact_key)) |existing_hash| {
@@ -31187,7 +31502,7 @@ fn flushGeneratedSparseChunkSourceBatch(
         try source_indexes.append(alloc, i);
     }
 
-    try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
+    try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, semantic_producer, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
 }
 
 fn appendMaterializedChunkSourceToBatch(
@@ -31400,7 +31715,7 @@ fn computeDenseRequestImpl(
         const max_batch_bytes = generatedEmbedBatchBytes();
         var batch_source_bytes: usize = 0;
         for (sources, 0..) |source, i| {
-            const source_hash = enrichment_artifact_codec.hashSource(source.text);
+            const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
             const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
             defer alloc.free(artifact_key);
             if (skip_unchanged_artifacts) {
@@ -31482,7 +31797,7 @@ fn computeDenseRequestImpl(
         embedding_name,
         request.source_field,
         null,
-        enrichment_artifact_codec.hashSource(source_text.?),
+        enrichment_artifact_codec.hashEmbeddingSource(source_text.?, request.producer_json),
         vector,
     );
     defer alloc.free(artifact_key);
@@ -31520,11 +31835,11 @@ fn computeSparseMaterializedChunkRequest(
         try pending_chunk_keys.put(alloc, write.key, {});
         _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
         if (sources.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-            try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+            try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
             batch_source_bytes = 0;
         }
     }
-    try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+    try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
     batch_source_bytes = 0;
 
     const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
@@ -31536,7 +31851,7 @@ fn computeSparseMaterializedChunkRequest(
     defer alloc.free(lower);
     while (true) {
         const next_lower = try scanMaterializedChunkSourceStoreBatch(alloc, db, prefix, upper_bound, lower, request.source_field, &pending_chunk_keys, &sources, &batch_source_bytes, max_batch_items, max_batch_bytes);
-        try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+        try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
         batch_source_bytes = 0;
         if (next_lower) |owned_next| {
             alloc.free(lower);
@@ -31588,7 +31903,7 @@ fn computeSparseRequestDerived(
         const max_batch_bytes = generatedEmbedBatchBytes();
         var batch_source_bytes: usize = 0;
         for (sources, 0..) |source, i| {
-            const source_hash = enrichment_artifact_codec.hashSource(source.text);
+            const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
             const artifact_key = try embeddingArtifactKeyForBaseAlloc(alloc, source.key, embedding_name);
             defer alloc.free(artifact_key);
             if (try storedOrPendingEmbeddingSourceHash(alloc, db, &pending_writes, artifact_key)) |existing_hash| {
@@ -31600,18 +31915,18 @@ fn computeSparseRequestDerived(
             if (chunk_texts.items.len > 0 and
                 (chunk_texts.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
             {
-                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                 batch_source_bytes = 0;
             }
             try chunk_texts.append(alloc, source.text);
             try source_indexes.append(alloc, i);
             batch_source_bytes += source.text.len;
             if (chunk_texts.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                 batch_source_bytes = 0;
             }
         }
-        try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+        try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, request.producer_json, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
         return;
     }
 
@@ -31635,7 +31950,7 @@ fn computeSparseRequestDerived(
         artifact_writes,
         request.doc_key,
         embedding_name,
-        null,
+        enrichment_artifact_codec.hashEmbeddingSource(source_text.?, request.producer_json),
         sparse.indices,
         sparse.values,
     );
@@ -32440,6 +32755,25 @@ fn partitionRemoteSparseEmbeddings(
     embeddings.* = local;
 }
 
+const PrecomputedGraphArtifactMutation = struct {
+    key: []const u8,
+    value: ?[]const u8,
+};
+
+const PrecomputedGraphStateUpdate = struct {
+    state_key: []const u8,
+    state_value: []const u8,
+    previous_keys: []const []const u8,
+    graph_writes: []const docstore_mod.KVPair,
+};
+
+const PrecomputedGraphReconcileGroup = struct {
+    doc_key: []const u8,
+    index_name: []const u8,
+    sources: []const index_manager_mod.GraphArtifactSource,
+    updates: std.ArrayListUnmanaged(PrecomputedGraphStateUpdate) = .empty,
+};
+
 fn appendPrecomputedGraphSourceArtifacts(
     self: *DB,
     artifact_writes: []const types.BatchWrite,
@@ -32452,74 +32786,107 @@ fn appendPrecomputedGraphSourceArtifacts(
 ) !void {
     if (!self.core.hasGraphIndexes()) return;
 
-    for (artifact_writes) |artifact_write| {
-        try appendPrecomputedGraphSourceArtifactKey(self, artifact_write.key, artifact_write.value, owned_graph_artifact_writes, store_writes, delete_keys, owned_delete_keys, changed_artifact_keys);
+    var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+    defer arena_state.deinit();
+    const scratch = arena_state.allocator();
+
+    // Coalesce before parsing. A batch is last-write-wins, and processing a
+    // source state more than once can otherwise leave an intermediate edge
+    // outside its final manifest.
+    var mutations = std.ArrayListUnmanaged(PrecomputedGraphArtifactMutation).empty;
+    var mutation_positions = std.StringHashMapUnmanaged(usize).empty;
+    for (artifact_writes) |write| {
+        if (mutation_positions.get(write.key)) |position| {
+            mutations.items[position].value = write.value;
+        } else {
+            const position = mutations.items.len;
+            try mutations.append(scratch, .{ .key = write.key, .value = write.value });
+            try mutation_positions.put(scratch, write.key, position);
+        }
     }
-    for (artifact_delete_keys) |artifact_key| {
-        try appendPrecomputedGraphSourceArtifactKey(self, artifact_key, null, owned_graph_artifact_writes, store_writes, delete_keys, owned_delete_keys, changed_artifact_keys);
+    for (artifact_delete_keys) |key| {
+        if (mutation_positions.get(key)) |position| {
+            mutations.items[position].value = null;
+        } else {
+            const position = mutations.items.len;
+            try mutations.append(scratch, .{ .key = key, .value = null });
+            try mutation_positions.put(scratch, key, position);
+        }
+    }
+
+    var groups = std.ArrayListUnmanaged(PrecomputedGraphReconcileGroup).empty;
+    var group_positions = std.StringHashMapUnmanaged(usize).empty;
+    for (mutations.items) |mutation| {
+        try preparePrecomputedGraphSourceArtifactMutation(
+            self,
+            scratch,
+            mutation,
+            &groups,
+            &group_positions,
+            store_writes,
+            delete_keys,
+            owned_delete_keys,
+        );
+    }
+
+    var pending_graph_positions = StoreWritePositions.empty;
+    defer pending_graph_positions.deinit(self.alloc);
+    for (groups.items) |group| {
+        try reconcilePrecomputedGraphGroup(
+            self,
+            scratch,
+            group,
+            owned_graph_artifact_writes,
+            store_writes,
+            &pending_graph_positions,
+            delete_keys,
+            owned_delete_keys,
+            changed_artifact_keys,
+        );
     }
 }
 
-fn appendPrecomputedGraphSourceArtifactKey(
+fn preparePrecomputedGraphSourceArtifactMutation(
     self: *DB,
-    artifact_key: []const u8,
-    artifact_value: ?[]const u8,
-    owned_graph_artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    scratch: Allocator,
+    mutation: PrecomputedGraphArtifactMutation,
+    groups: *std.ArrayListUnmanaged(PrecomputedGraphReconcileGroup),
+    group_positions: *std.StringHashMapUnmanaged(usize),
     store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
     delete_keys: *std.ArrayListUnmanaged([]const u8),
     owned_delete_keys: *std.ArrayListUnmanaged([]u8),
-    changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(self.alloc, artifact_key)) orelse return;
-    defer artifact_ref.deinit(self.alloc);
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(scratch, mutation.key)) orelse return;
+    defer artifact_ref.deinit(scratch);
 
     for (self.core.graphIndexes()) |graph_entry| {
-        const source = graph_entry.artifact_source orelse continue;
+        const source = self.core.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_ref.name) orelse continue;
         if (!graphArtifactSourceConsumesRef(self.core.index_manager, source, artifact_ref)) continue;
 
         var graph_store_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-        defer graph_store_writes.deinit(self.alloc);
+        var graph_write_positions = StoreWritePositions.empty;
 
-        if (artifact_value) |value| {
-            const raw_doc = try batchDocumentValueForGraphSource(self.alloc, self.core.store, store_writes.items, artifact_ref.document_id);
-            defer if (raw_doc) |doc_value| self.alloc.free(doc_value);
-            const graph_writes = try graphWritesFromArtifactValueAlloc(self.alloc, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
-            defer freeGraphWrites(self.alloc, graph_writes);
+        if (mutation.value) |value| {
+            const raw_doc = try batchDocumentValueForGraphSource(scratch, self.core.store, store_writes.items, artifact_ref.document_id);
+            defer if (raw_doc) |doc_value| scratch.free(doc_value);
+            const graph_writes = try graphWritesFromArtifactValueAlloc(scratch, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
+            defer freeGraphWrites(scratch, graph_writes);
             for (graph_writes) |write| {
-                const key = try internal_keys.graphEdgeArtifactKeyAlloc(self.alloc, write.source, write.index_name, write.edge_type, write.target);
-                var key_owned = true;
-                errdefer if (key_owned) self.alloc.free(key);
-                const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(self.alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
-                var payload_owned = true;
-                errdefer if (payload_owned) self.alloc.free(payload);
-                try owned_graph_artifact_writes.append(self.alloc, .{ .key = key, .value = payload });
-                key_owned = false;
-                payload_owned = false;
-                try graph_store_writes.append(self.alloc, .{ .key = key, .value = payload });
-                try store_writes.append(self.alloc, .{ .key = key, .value = payload });
-                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, key);
+                const key = try internal_keys.graphEdgeArtifactKeyAlloc(scratch, write.source, write.index_name, write.edge_type, write.target);
+                removePendingDeleteKey(self.alloc, delete_keys, owned_delete_keys, key);
+                const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(scratch, null, graph_entry.config.coverage_generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
+                try upsertPendingStoreWrite(scratch, &graph_store_writes, &graph_write_positions, key, payload);
             }
         }
 
-        const state_name = try graphArtifactStateNameAlloc(self.alloc, artifact_ref);
-        defer self.alloc.free(state_name);
-        const state_key = try graphAssetStateKeyAlloc(self.alloc, artifact_ref.document_id, graph_entry.config.name, state_name);
-        defer self.alloc.free(state_key);
-        if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
-            defer freeOwnedConstKeySlice(self.alloc, previous_keys);
-            for (previous_keys) |previous_key| {
-                if (containsStoreWriteKey(graph_store_writes.items, previous_key)) continue;
-                if (containsOwnedKey(owned_delete_keys.items, previous_key)) continue;
-                const owned_key = try self.alloc.dupe(u8, previous_key);
-                try owned_delete_keys.append(self.alloc, owned_key);
-                try delete_keys.append(self.alloc, owned_key);
-                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, previous_key);
-            }
-        } else if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
-            const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(self.alloc, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
-            defer freeOwnedConstKeySlice(self.alloc, protected_keys);
-            const existing = try collectGraphArtifactsForDocIndex(self.alloc, self.core.store, artifact_ref.document_id, graph_entry.config.name);
-            defer docstore_mod.DocStore.freeResults(self.alloc, existing);
+        const state_name = try graphArtifactStateNameAlloc(scratch, artifact_ref);
+        const state_key = try graphAssetStateKeyAlloc(scratch, artifact_ref.document_id, graph_entry.config.name, state_name);
+        const previous_keys = try loadGraphAssetStateKeysAlloc(scratch, self.core.store, state_key);
+        if (previous_keys == null and self.core.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
+            const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(scratch, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
+            defer freeOwnedConstKeySlice(scratch, protected_keys);
+            const existing = try collectGraphArtifactsForDocIndex(scratch, self.core.store, artifact_ref.document_id, graph_entry.config.name);
+            defer docstore_mod.DocStore.freeResults(scratch, existing);
             for (existing) |entry| {
                 if (containsStoreWriteKey(graph_store_writes.items, entry.key)) continue;
                 if (containsOwnedKey(owned_delete_keys.items, entry.key)) continue;
@@ -32527,20 +32894,87 @@ fn appendPrecomputedGraphSourceArtifactKey(
                 const owned_key = try self.alloc.dupe(u8, entry.key);
                 try owned_delete_keys.append(self.alloc, owned_key);
                 try delete_keys.append(self.alloc, owned_key);
-                try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, entry.key);
             }
         }
 
-        const state_value = try encodeGraphAssetStateKeysAlloc(self.alloc, graph_store_writes.items);
+        const group_key = try internal_keys.graphAssetStateIndexPrefixAlloc(scratch, artifact_ref.document_id, graph_entry.config.name);
+        const group_position = if (group_positions.get(group_key)) |position| position else blk: {
+            const position = groups.items.len;
+            try groups.append(scratch, .{
+                .doc_key = try scratch.dupe(u8, artifact_ref.document_id),
+                .index_name = graph_entry.config.name,
+                .sources = self.core.index_manager.graphArtifactSources(graph_entry.config.name),
+            });
+            try group_positions.put(scratch, group_key, position);
+            break :blk position;
+        };
+        const state_value = try encodeGraphAssetStateKeysAlloc(scratch, graph_entry.config.coverage_generation, graph_store_writes.items);
+        try groups.items[group_position].updates.append(scratch, .{
+            .state_key = state_key,
+            .state_value = state_value,
+            .previous_keys = previous_keys orelse &.{},
+            .graph_writes = try graph_store_writes.toOwnedSlice(scratch),
+        });
+    }
+}
+
+fn reconcilePrecomputedGraphGroup(
+    self: *DB,
+    scratch: Allocator,
+    group: PrecomputedGraphReconcileGroup,
+    owned_graph_artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    pending_graph_positions: *StoreWritePositions,
+    delete_keys: *std.ArrayListUnmanaged([]const u8),
+    owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+    changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const overrides = try scratch.alloc(docstore_mod.KVPair, group.updates.items.len);
+    var affected = std.ArrayListUnmanaged([]const u8).empty;
+    var affected_set = std.StringHashMapUnmanaged(void).empty;
+    for (group.updates.items, 0..) |update, i| {
+        overrides[i] = .{ .key = update.state_key, .value = update.state_value };
+        for (update.previous_keys) |key| {
+            if (try affected_set.fetchPut(scratch, key, {}) == null) try affected.append(scratch, key);
+        }
+        for (update.graph_writes) |write| {
+            if (try affected_set.fetchPut(scratch, write.key, {}) == null) try affected.append(scratch, write.key);
+        }
+    }
+
+    var winners = try loadGraphEdgeWinnersWithOverrides(scratch, self.core.store, group.doc_key, group.index_name, overrides, group.sources);
+    defer winners.deinit(scratch);
+    for (affected.items) |edge_key| {
+        try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, edge_key);
+        if (winners.map.get(edge_key)) |winner| {
+            removePendingDeleteKey(self.alloc, delete_keys, owned_delete_keys, edge_key);
+            const owned_key = try self.alloc.dupe(u8, edge_key);
+            var owned_key_owned = true;
+            errdefer if (owned_key_owned) self.alloc.free(owned_key);
+            const payload = try self.alloc.dupe(u8, winner.payload);
+            var payload_owned = true;
+            errdefer if (payload_owned) self.alloc.free(payload);
+            try owned_graph_artifact_writes.append(self.alloc, .{ .key = owned_key, .value = payload });
+            owned_key_owned = false;
+            payload_owned = false;
+            try upsertPendingStoreWrite(self.alloc, store_writes, pending_graph_positions, owned_key, payload);
+        } else if (!containsOwnedKey(owned_delete_keys.items, edge_key)) {
+            const owned_key = try self.alloc.dupe(u8, edge_key);
+            try owned_delete_keys.append(self.alloc, owned_key);
+            try delete_keys.append(self.alloc, owned_key);
+        }
+    }
+    for (group.updates.items) |update| {
+        const state_key = try self.alloc.dupe(u8, update.state_key);
+        var state_key_owned = true;
+        errdefer if (state_key_owned) self.alloc.free(state_key);
+        const state_value = try self.alloc.dupe(u8, update.state_value);
         var state_value_owned = true;
         errdefer if (state_value_owned) self.alloc.free(state_value);
-        const state_key_owned = try self.alloc.dupe(u8, state_key);
-        var state_key_owned_flag = true;
-        errdefer if (state_key_owned_flag) self.alloc.free(state_key_owned);
-        try owned_graph_artifact_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
+        try owned_graph_artifact_writes.append(self.alloc, .{ .key = state_key, .value = state_value });
+        state_key_owned = false;
         state_value_owned = false;
-        state_key_owned_flag = false;
-        try store_writes.append(self.alloc, .{ .key = state_key_owned, .value = state_value });
+        try upsertPendingStoreWrite(self.alloc, store_writes, pending_graph_positions, state_key, state_value);
     }
 }
 
@@ -32699,22 +33133,31 @@ fn graphArtifactRefUsesDocumentWideFallback(artifact_ref: types.ArtifactRef) boo
 }
 
 fn graphArtifactStateNameAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) ![]u8 {
-    if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) return try alloc.dupe(u8, artifact_ref.name);
-    var list = std.ArrayListUnmanaged(u8).empty;
+    var list = try initGraphStateName(alloc, artifact_ref.name);
     errdefer list.deinit(alloc);
-    try list.appendSlice(alloc, artifact_ref.name);
-    try list.append(alloc, '\x1f');
-    try list.appendSlice(alloc, @tagName(artifact_ref.kind));
+    try appendGraphStateNameComponent(&list, alloc, "artifact");
+    try appendGraphStateNameComponent(&list, alloc, @tagName(artifact_ref.kind));
     if (artifact_ref.unit_id) |unit_id| {
-        try list.append(alloc, '\x1f');
-        try list.appendSlice(alloc, "unit:");
-        try list.appendSlice(alloc, unit_id);
+        try appendGraphStateNameComponent(&list, alloc, "unit");
+        try appendGraphStateNameComponent(&list, alloc, unit_id);
     }
     if (artifact_ref.chunk_id) |chunk_id| {
-        const chunk_part = try std.fmt.allocPrint(alloc, "chunk:{d}", .{chunk_id});
-        defer alloc.free(chunk_part);
-        try list.append(alloc, '\x1f');
-        try list.appendSlice(alloc, chunk_part);
+        var chunk_bytes: [@sizeOf(u32)]u8 = undefined;
+        std.mem.writeInt(u32, &chunk_bytes, chunk_id, .big);
+        try appendGraphStateNameComponent(&list, alloc, "chunk");
+        try appendGraphStateNameComponent(&list, alloc, &chunk_bytes);
+    }
+    if (artifact_ref.source) |source| {
+        const source_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, .{
+            .document_id = artifact_ref.document_id,
+            .name = source.name,
+            .kind = source.kind,
+            .chunk_id = source.chunk_id,
+            .unit_id = source.unit_id,
+        });
+        defer alloc.free(source_key);
+        try appendGraphStateNameComponent(&list, alloc, "source");
+        try appendGraphStateNameComponent(&list, alloc, source_key);
     }
     return try list.toOwnedSlice(alloc);
 }
@@ -38719,6 +39162,7 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
                 const graph_artifact_keys = try concatArtifactKeyViews(ctx.alloc, batch.changed_artifact_keys, materialized_artifact_keys);
                 defer ctx.alloc.free(graph_artifact_keys);
                 var graph_mutations = try collectGraphMutationsForArtifacts(ctx.alloc, ctx.store, graph_artifact_keys, index_ref.name, .{
+                    .expected_generation = (ctx.index_manager.graphIndex(index_ref.name) orelse return error.IndexNotFound).config.coverage_generation,
                     .repair_ctx = ctx,
                     .sequence = batch.sequence,
                 });
@@ -38739,22 +39183,28 @@ fn batchHasEmbeddingArtifactForManagedIndex(
     artifact_keys: []const []const u8,
 ) bool {
     const alloc = index_manager.alloc;
-    const expected_embedding_name = switch (index_ref.kind) {
-        .dense_vector => index_manager.denseEmbeddingName(index_ref.name) orelse index_ref.name,
-        .sparse_vector => index_manager.sparseEmbeddingName(index_ref.name) orelse index_ref.name,
-        else => return false,
-    };
-
     for (artifact_keys) |artifact_key| {
         var identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
             error.InvalidInternalUserKey => continue,
             else => continue,
         } orelse continue;
         defer identity.deinit(alloc);
-        if (std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) return true;
+        if (managedIndexConsumesEmbeddingName(index_manager, index_ref, identity.embedding_name)) return true;
     }
 
     return false;
+}
+
+fn managedIndexConsumesEmbeddingName(
+    index_manager: *index_manager_mod.IndexManager,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    embedding_name: []const u8,
+) bool {
+    return switch (index_ref.kind) {
+        .dense_vector => index_manager.denseIndexConsumesEmbedding(index_ref.name, embedding_name),
+        .sparse_vector => index_manager.sparseIndexConsumesEmbedding(index_ref.name, embedding_name),
+        else => false,
+    };
 }
 
 const ManagedIndexBatchApplicability = enum {
@@ -38813,19 +39263,21 @@ fn managedIndexBatchApplicability(
             }
             for (batch.changed_artifact_keys) |artifact_key| {
                 if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
-                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
-                    if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                    for (index_manager.graphArtifactSources(index_ref.name)) |source| {
+                        if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                    }
                     continue;
                 }
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
-                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
-                    if (source.mention_edge_type.len == 0) continue;
                     const parsed = (internal_keys.parseResolutionArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
                     defer {
                         index_manager.alloc.free(parsed.doc_key);
                         index_manager.alloc.free(parsed.artifact_name);
                     }
-                    if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    for (index_manager.graphArtifactSources(index_ref.name)) |source| {
+                        if (source.mention_edge_type.len == 0) continue;
+                        if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    }
                     if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
                     return .missing_dependency;
                 }
@@ -38946,19 +39398,21 @@ fn managedIndexRecordApplicability(
             if (record.deleted_doc_keys.len > 0) return .relevant;
             for (record.changed_artifact_keys) |artifact_key| {
                 if (!internal_keys.isResolutionArtifactKey(artifact_key) and !internal_keys.isGraphEdgeArtifactKey(artifact_key)) {
-                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
-                    if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                    for (index_manager.graphArtifactSources(index_ref.name)) |source| {
+                        if (graphArtifactSourceConsumesArtifactKey(index_manager, source, artifact_key)) return .relevant;
+                    }
                     continue;
                 }
                 if (internal_keys.isResolutionArtifactKey(artifact_key)) {
-                    const source = index_manager.graphArtifactSource(index_ref.name) orelse continue;
-                    if (source.mention_edge_type.len == 0) continue;
                     const parsed = (internal_keys.parseResolutionArtifactKeyAlloc(index_manager.alloc, artifact_key) catch continue) orelse continue;
                     defer {
                         index_manager.alloc.free(parsed.doc_key);
                         index_manager.alloc.free(parsed.artifact_name);
                     }
-                    if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    for (index_manager.graphArtifactSources(index_ref.name)) |source| {
+                        if (source.mention_edge_type.len == 0) continue;
+                        if (resolverConfigForResolution(index_manager, source.artifact_name, parsed.artifact_name) != null) return .relevant;
+                    }
                     if (resolverConfigForResolutionArtifact(index_manager, parsed.artifact_name) != null) continue;
                     return .missing_dependency;
                 }
@@ -39076,6 +39530,34 @@ fn decodeEmbeddingArtifactWriteIdentityAlloc(
         };
     }
 
+    return null;
+}
+
+fn decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    artifact_key: []const u8,
+) !?OwnedEmbeddingArtifactWriteIdentity {
+    if (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key)) |maybe_identity| {
+        var identity = maybe_identity orelse return null;
+        defer identity.deinit(alloc);
+        if (!managedIndexConsumesEmbeddingName(index_manager, index_ref, identity.embedding_name)) return null;
+
+        const doc_key = try alloc.dupe(u8, identity.doc_key);
+        errdefer alloc.free(doc_key);
+        const parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
+        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
+        return .{ .doc_key = doc_key, .parent_doc_key = parent_doc_key };
+    } else |err| switch (err) {
+        error.InvalidInternalUserKey => {},
+        else => return err,
+    }
+
+    if (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) |identity| {
+        if (!managedIndexConsumesEmbeddingName(index_manager, index_ref, identity.artifact_name)) return null;
+        return .{ .doc_key = try alloc.dupe(u8, identity.doc_key) };
+    }
     return null;
 }
 
@@ -39650,9 +40132,9 @@ fn collectDenseEmbeddingWritesForArtifacts(
         filtered.deinit(alloc);
     }
 
-    const expected_embedding_name = index_manager.denseEmbeddingName(index_name) orelse index_name;
+    const index_ref = index_manager_mod.ManagedIndexRef{ .name = index_name, .kind = .dense_vector };
     for (artifact_keys) |artifact_key| {
-        var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, artifact_key, expected_embedding_name)) orelse continue;
+        var identity = (try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, index_manager, index_ref, artifact_key)) orelse continue;
         var identity_transferred = false;
         errdefer if (!identity_transferred) identity.deinit(alloc);
         try filtered.append(alloc, .{
@@ -39681,9 +40163,9 @@ fn appendDenseEmbeddingWritesForArtifacts(
     artifact_keys: []const []const u8,
     index_name: []const u8,
 ) !void {
-    const expected_embedding_name = index_manager.denseEmbeddingName(index_name) orelse index_name;
+    const index_ref = index_manager_mod.ManagedIndexRef{ .name = index_name, .kind = .dense_vector };
     for (artifact_keys) |artifact_key| {
-        var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, artifact_key, expected_embedding_name)) orelse continue;
+        var identity = (try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, index_manager, index_ref, artifact_key)) orelse continue;
         var identity_transferred = false;
         errdefer if (!identity_transferred) identity.deinit(alloc);
         try out.append(alloc, .{
@@ -39771,28 +40253,11 @@ fn collectSparseEmbeddingWritesForArtifacts(
         filtered.deinit(alloc);
     }
 
-    const expected_embedding_name = index_manager.sparseEmbeddingName(index_name) orelse index_name;
+    const index_ref = index_manager_mod.ManagedIndexRef{ .name = index_name, .kind = .sparse_vector };
     for (artifact_keys) |artifact_key| {
-        if (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) |identity| {
-            if (!std.mem.eql(u8, identity.artifact_name, expected_embedding_name)) continue;
-            try filtered.append(alloc, .{
-                .index_name = @constCast(index_name),
-                .doc_key = @constCast(identity.doc_key),
-                .artifact_key = @constCast(artifact_key),
-                .indices = &.{},
-                .values = &.{},
-            });
-            continue;
-        }
-
-        var identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
-            error.InvalidInternalUserKey => continue,
-            else => return err,
-        } orelse continue;
+        var identity = (try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, index_manager, index_ref, artifact_key)) orelse continue;
         defer identity.deinit(alloc);
-        if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
-        var doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer if (doc_key.len > 0) alloc.free(doc_key);
+        var doc_key = identity.doc_key;
         try filtered.append(alloc, .{
             .index_name = @constCast(index_name),
             .doc_key = doc_key,
@@ -39801,6 +40266,7 @@ fn collectSparseEmbeddingWritesForArtifacts(
             .values = &.{},
         });
         try owned_doc_keys.append(alloc, doc_key);
+        identity.doc_key = identity.doc_key[0..0];
         doc_key = doc_key[0..0];
     }
 
@@ -39823,28 +40289,11 @@ fn appendSparseEmbeddingWritesForArtifacts(
     artifact_keys: []const []const u8,
     index_name: []const u8,
 ) !void {
-    const expected_embedding_name = index_manager.sparseEmbeddingName(index_name) orelse index_name;
+    const index_ref = index_manager_mod.ManagedIndexRef{ .name = index_name, .kind = .sparse_vector };
     for (artifact_keys) |artifact_key| {
-        if (try internal_keys.parseEmbeddingArtifactKeyView(artifact_key)) |identity| {
-            if (!std.mem.eql(u8, identity.artifact_name, expected_embedding_name)) continue;
-            try out.append(alloc, .{
-                .index_name = @constCast(index_name),
-                .doc_key = @constCast(identity.doc_key),
-                .artifact_key = @constCast(artifact_key),
-                .indices = &.{},
-                .values = &.{},
-            });
-            continue;
-        }
-
-        var identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, artifact_key) catch |err| switch (err) {
-            error.InvalidInternalUserKey => continue,
-            else => return err,
-        } orelse continue;
+        var identity = (try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, index_manager, index_ref, artifact_key)) orelse continue;
         defer identity.deinit(alloc);
-        if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) continue;
-        var doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer if (doc_key.len > 0) alloc.free(doc_key);
+        var doc_key = identity.doc_key;
         try out.append(alloc, .{
             .index_name = @constCast(index_name),
             .doc_key = doc_key,
@@ -39853,6 +40302,7 @@ fn appendSparseEmbeddingWritesForArtifacts(
             .values = &.{},
         });
         try owned_doc_keys.append(alloc, doc_key);
+        identity.doc_key = identity.doc_key[0..0];
         doc_key = doc_key[0..0];
     }
 }
@@ -39954,19 +40404,29 @@ fn materializeGraphSourceArtifactsForIndex(
     index_name: []const u8,
     options: GraphMaterializationOptions,
 ) ![][]u8 {
-    const source = index_manager.graphArtifactSource(index_name) orelse return try alloc.alloc([]u8, 0);
+    const generation = (index_manager.graphIndex(index_name) orelse return error.IndexNotFound).config.coverage_generation;
+    const sources = index_manager.graphArtifactSources(index_name);
+    if (sources.len == 0) return try alloc.alloc([]u8, 0);
 
     var changed = std.ArrayListUnmanaged([]u8).empty;
     errdefer freeOwnedKeySlice(alloc, changed.items);
 
     for (changed_artifact_keys) |artifact_key| {
         if (internal_keys.isResolutionArtifactKey(artifact_key)) {
-            try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options);
+            for (sources) |source| {
+                if (source.mention_edge_type.len == 0) continue;
+                try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options);
+            }
             continue;
         }
         var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
         defer artifact_ref.deinit(alloc);
-        if (!graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) continue;
+        const source = blk: {
+            for (sources) |candidate| {
+                if (graphArtifactSourceConsumesRef(index_manager, candidate, artifact_ref)) break :blk candidate;
+            }
+            continue;
+        };
 
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer {
@@ -39988,6 +40448,8 @@ fn materializeGraphSourceArtifactsForIndex(
             }
             writes.deinit(alloc);
         }
+        var write_positions = StoreWritePositions.empty;
+        defer write_positions.deinit(alloc);
 
         if (raw) |value| {
             const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id);
@@ -40007,13 +40469,13 @@ fn materializeGraphSourceArtifactsForIndex(
                 const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
                 var key_owned = true;
                 errdefer if (key_owned) alloc.free(key);
-                const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+                const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
                 var payload_owned = true;
                 errdefer if (payload_owned) alloc.free(payload);
-                try writes.append(alloc, .{ .key = key, .value = payload });
+                try appendUniqueOwnedKey(alloc, &changed, key);
+                try upsertOwnedStoreWrite(alloc, &writes, &write_positions, key, payload);
                 key_owned = false;
                 payload_owned = false;
-                try appendUniqueOwnedKey(alloc, &changed, key);
             }
         }
 
@@ -40021,14 +40483,9 @@ fn materializeGraphSourceArtifactsForIndex(
         defer alloc.free(state_name);
         const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, state_name);
         defer alloc.free(state_key);
-        if (try loadGraphAssetStateKeysAlloc(alloc, store, state_key)) |previous_keys| {
-            defer freeOwnedConstKeySlice(alloc, previous_keys);
-            for (previous_keys) |previous_key| {
-                if (containsStoreWriteKey(writes.items, previous_key)) continue;
-                try deletes.append(alloc, try alloc.dupe(u8, previous_key));
-                try appendUniqueOwnedKey(alloc, &changed, previous_key);
-            }
-        } else if (graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
+        const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key);
+        defer if (previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
+        if (previous_keys == null and sources.len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
             defer freeOwnedConstKeySlice(alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(alloc, store, artifact_ref.document_id, index_name);
@@ -40041,13 +40498,32 @@ fn materializeGraphSourceArtifactsForIndex(
             }
         }
 
-        const state_value = try encodeGraphAssetStateKeysAlloc(alloc, writes.items);
+        const graph_write_count = writes.items.len;
+        const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
         var state_value_owned = true;
         defer if (state_value_owned) alloc.free(state_value);
-        try writes.append(alloc, .{
-            .key = try alloc.dupe(u8, state_key),
-            .value = state_value,
-        });
+        var winners = try loadGraphEdgeWinners(alloc, store, artifact_ref.document_id, index_name, state_key, state_value, &.{}, sources);
+        defer winners.deinit(alloc);
+        var affected = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (affected.items) |key| alloc.free(key);
+            affected.deinit(alloc);
+        }
+        if (previous_keys) |keys| for (keys) |key| try appendUniqueOwnedKey(alloc, &affected, key);
+        for (writes.items[0..graph_write_count]) |write| try appendUniqueOwnedKey(alloc, &affected, write.key);
+        for (affected.items) |edge_key| {
+            if (winners.map.get(edge_key)) |winner| {
+                const payload = try alloc.dupe(u8, winner.payload);
+                var payload_owned = true;
+                errdefer if (payload_owned) alloc.free(payload);
+                try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, edge_key, payload);
+                payload_owned = false;
+            } else if (!containsDeleteKey(deletes.items, edge_key)) {
+                try deletes.append(alloc, try alloc.dupe(u8, edge_key));
+                try appendUniqueOwnedKey(alloc, &changed, edge_key);
+            }
+        }
+        try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, state_key, state_value);
         state_value_owned = false;
 
         if (writes.items.len > 0 or deletes.items.len > 0) {
@@ -40073,6 +40549,7 @@ fn materializeMentionEdgesForResolutionKey(
     options: GraphMaterializationOptions,
 ) !void {
     if (source.mention_edge_type.len == 0) return;
+    const generation = (index_manager.graphIndex(index_name) orelse return error.IndexNotFound).config.coverage_generation;
     const parsed_key = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, resolution_key)) orelse return;
     defer alloc.free(parsed_key.doc_key);
     defer alloc.free(parsed_key.artifact_name);
@@ -40100,6 +40577,8 @@ fn materializeMentionEdgesForResolutionKey(
         }
         writes.deinit(alloc);
     }
+    var write_positions = StoreWritePositions.empty;
+    defer write_positions.deinit(alloc);
     var mention_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer {
         for (mention_writes.items) |write| {
@@ -40131,13 +40610,13 @@ fn materializeMentionEdgesForResolutionKey(
             const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
             var key_owned = true;
             errdefer if (key_owned) alloc.free(key);
-            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
-            try writes.append(alloc, .{ .key = key, .value = payload });
+            try appendUniqueOwnedKey(alloc, changed, key);
+            try upsertOwnedStoreWrite(alloc, &writes, &write_positions, key, payload);
             key_owned = false;
             payload_owned = false;
-            try appendUniqueOwnedKey(alloc, changed, key);
         }
         try appendMentionEvidenceArtifactsFromResolution(
             alloc,
@@ -40151,38 +40630,50 @@ fn materializeMentionEdgesForResolutionKey(
         );
     }
 
-    if (try loadGraphAssetStateKeysAlloc(alloc, store, state_key)) |previous_keys| {
-        defer freeOwnedConstKeySlice(alloc, previous_keys);
-        for (previous_keys) |previous_key| {
-            if (containsStoreWriteKey(writes.items, previous_key)) continue;
-            try deletes.append(alloc, try alloc.dupe(u8, previous_key));
-            try appendUniqueOwnedKey(alloc, changed, previous_key);
-        }
-    }
-
-    const state_value = try encodeGraphAssetStateKeysAlloc(alloc, writes.items);
+    const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key);
+    defer if (previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
+    const graph_write_count = writes.items.len;
+    const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
     var state_value_owned = true;
     defer if (state_value_owned) alloc.free(state_value);
-    try writes.append(alloc, .{
-        .key = try alloc.dupe(u8, state_key),
-        .value = state_value,
-    });
+    var winners = try loadGraphEdgeWinners(alloc, store, parsed_key.doc_key, index_name, state_key, state_value, &.{}, index_manager.graphArtifactSources(index_name));
+    defer winners.deinit(alloc);
+    var affected = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (affected.items) |key| alloc.free(key);
+        affected.deinit(alloc);
+    }
+    if (previous_keys) |keys| for (keys) |key| try appendUniqueOwnedKey(alloc, &affected, key);
+    for (writes.items[0..graph_write_count]) |write| try appendUniqueOwnedKey(alloc, &affected, write.key);
+    for (affected.items) |edge_key| {
+        if (winners.map.get(edge_key)) |winner| {
+            const payload = try alloc.dupe(u8, winner.payload);
+            var payload_owned = true;
+            errdefer if (payload_owned) alloc.free(payload);
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, edge_key, payload);
+            payload_owned = false;
+        } else if (!containsDeleteKey(deletes.items, edge_key)) {
+            try deletes.append(alloc, try alloc.dupe(u8, edge_key));
+            try appendUniqueOwnedKey(alloc, changed, edge_key);
+        }
+    }
+    try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, state_key, state_value);
     state_value_owned = false;
 
     const mention_state_name = try mentionArtifactStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
     defer alloc.free(mention_state_name);
     const mention_state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, mention_state_name);
     defer alloc.free(mention_state_key);
-    if (try loadGraphAssetStateKeysAlloc(alloc, store, mention_state_key)) |previous_keys| {
-        defer freeOwnedConstKeySlice(alloc, previous_keys);
-        for (previous_keys) |previous_key| {
+    if (try loadGraphAssetStateKeysAlloc(alloc, store, mention_state_key)) |previous_mention_keys| {
+        defer freeOwnedConstKeySlice(alloc, previous_mention_keys);
+        for (previous_mention_keys) |previous_key| {
             if (containsStoreWriteKey(mention_writes.items, previous_key)) continue;
             try deletes.append(alloc, try alloc.dupe(u8, previous_key));
             try appendUniqueOwnedKey(alloc, changed, previous_key);
         }
     }
 
-    const mention_state_value = try encodeGraphAssetStateKeysAlloc(alloc, mention_writes.items);
+    const mention_state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, mention_writes.items);
     var mention_state_value_owned = true;
     defer if (mention_state_value_owned) alloc.free(mention_state_value);
     try mention_writes.append(alloc, .{
@@ -40239,11 +40730,19 @@ fn resolverConfigForResolutionArtifact(
 }
 
 fn mentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
+    var list = try initGraphStateName(alloc, source_artifact);
+    errdefer list.deinit(alloc);
+    try appendGraphStateNameComponent(&list, alloc, "resolution_mentions");
+    try appendGraphStateNameComponent(&list, alloc, resolution_artifact);
+    return try list.toOwnedSlice(alloc);
 }
 
 fn mentionArtifactStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mention_artifacts\x1f{s}", .{ source_artifact, resolution_artifact });
+    var list = try initGraphStateName(alloc, source_artifact);
+    errdefer list.deinit(alloc);
+    try appendGraphStateNameComponent(&list, alloc, "resolution_mention_artifacts");
+    try appendGraphStateNameComponent(&list, alloc, resolution_artifact);
+    return try list.toOwnedSlice(alloc);
 }
 
 fn resolutionMentionArtifactNameAlloc(
@@ -41020,6 +41519,7 @@ const OwnedGraphMutations = struct {
 };
 
 const GraphMutationCollectionOptions = struct {
+    expected_generation: u64,
     repair_ctx: ?*const AsyncContext = null,
     sequence: u64 = 0,
 };
@@ -41096,6 +41596,18 @@ fn collectGraphMutationsForArtifacts(
                     return err;
                 },
             };
+            if (decoded.generation != options.expected_generation and
+                !enrichment_artifact_codec.isPortableUnboundGraphEdge(value))
+            {
+                decoded.deinit(alloc);
+                try deletes.append(alloc, .{
+                    .index_name = try alloc.dupe(u8, parsed.index_name),
+                    .source = try alloc.dupe(u8, parsed.doc_key),
+                    .target = try alloc.dupe(u8, parsed.target_doc_key),
+                    .edge_type = try alloc.dupe(u8, parsed.edge_type),
+                });
+                continue;
+            }
             errdefer decoded.deinit(alloc);
             try writes.append(alloc, .{
                 .index_name = try alloc.dupe(u8, parsed.index_name),
@@ -42218,7 +42730,7 @@ fn applySplitGraphArtifactsForIndex(
     artifact_keys: []const []const u8,
     index_name: []const u8,
 ) !usize {
-    _ = dest_indexes.graphIndex(index_name) orelse return error.IndexNotFound;
+    const graph_entry = dest_indexes.graphIndex(index_name) orelse return error.IndexNotFound;
     if (artifact_keys.len == 0) return 0;
 
     var graph_mutations = try collectGraphMutationsForArtifacts(
@@ -42226,7 +42738,7 @@ fn applySplitGraphArtifactsForIndex(
         dest_store,
         artifact_keys,
         index_name,
-        .{},
+        .{ .expected_generation = graph_entry.config.coverage_generation },
     );
     defer graph_mutations.deinit();
     const mutation_count = graph_mutations.writes.len + graph_mutations.deletes.len;
@@ -42309,7 +42821,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
     index_name: []const u8,
     batch_size: usize,
 ) !usize {
-    _ = ctx.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+    const graph_entry = ctx.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
     const store_lower = try documentRangeLowerAlloc(ctx.alloc, "");
     defer ctx.alloc.free(store_lower);
     const effective_batch_size = @max(batch_size, 1);
@@ -42318,6 +42830,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
         ctx: *AsyncContext,
         index_name: []const u8,
         batch_size: usize,
+        expected_generation: u64,
         writes: std.ArrayListUnmanaged(types.GraphEdgeWrite) = .empty,
         mutation_count: usize = 0,
 
@@ -42384,6 +42897,12 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                     return .@"continue";
                 },
             };
+            if (decoded.generation != state.expected_generation and
+                !enrichment_artifact_codec.isPortableUnboundGraphEdge(value))
+            {
+                decoded.deinit(state.ctx.alloc);
+                return .@"continue";
+            }
             errdefer decoded.deinit(state.ctx.alloc);
             try state.writes.append(state.ctx.alloc, .{
                 .index_name = try state.ctx.alloc.dupe(u8, parsed.index_name),
@@ -42406,6 +42925,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
         .ctx = ctx,
         .index_name = index_name,
         .batch_size = effective_batch_size,
+        .expected_generation = graph_entry.config.coverage_generation,
     };
     defer state.deinit();
 
@@ -43037,7 +43557,7 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
 }
 
 fn denseIndexIsArtifactBacked(entry: anytype) bool {
-    return entry.external or entry.chunk_name != null or entry.embedding_name != null;
+    return entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0;
 }
 
 fn denseCoverageMatchesTarget(active_count: u64, expected_count: u64) bool {
@@ -43108,7 +43628,6 @@ fn denseTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !
 
 fn denseArtifactTargetCountForIndexContext(ctx: *AsyncContext, index_name: []const u8) !u64 {
     const entry = ctx.index_manager.denseIndex(index_name) orelse return 0;
-    const expected_name = DB.denseArtifactNameForEntry(entry);
     const expected_dims = entry.dims;
 
     const lower = try documentRangeLowerAlloc(ctx.alloc, "");
@@ -43116,7 +43635,8 @@ fn denseArtifactTargetCountForIndexContext(ctx: *AsyncContext, index_name: []con
 
     const ScanState = struct {
         alloc: Allocator,
-        expected_name: []const u8,
+        ctx: *AsyncContext,
+        index_name: []const u8,
         expected_dims: u32,
         count: u64 = 0,
 
@@ -43127,7 +43647,7 @@ fn denseArtifactTargetCountForIndexContext(ctx: *AsyncContext, index_name: []con
             var artifact_ref = (try decodeArtifactRefIfKnownAlloc(state.alloc, key)) orelse return .@"continue";
             defer artifact_ref.deinit(state.alloc);
             if (artifact_ref.kind != .embedding) return .@"continue";
-            if (!std.mem.eql(u8, artifact_ref.name, state.expected_name)) return .@"continue";
+            if (!state.ctx.index_manager.denseIndexConsumesEmbedding(state.index_name, artifact_ref.name)) return .@"continue";
 
             const dims = enrichment_artifact_codec.decodeDenseEmbeddingDims(value) catch |err| {
                 if (DB.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
@@ -43142,7 +43662,8 @@ fn denseArtifactTargetCountForIndexContext(ctx: *AsyncContext, index_name: []con
 
     var state = ScanState{
         .alloc = ctx.alloc,
-        .expected_name = expected_name,
+        .ctx = ctx,
+        .index_name = index_name,
         .expected_dims = expected_dims,
     };
     try scanStoreForRebuildContext(ctx, lower, "", .{}, &state, ScanState.scanEntry);
@@ -43478,7 +43999,6 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(
     resume_key: ?[]const u8,
 ) !DenseRebuildSliceResult {
     const entry = ctx.index_manager.denseIndex(index_name) orelse return .{};
-    const expected_name = DB.denseArtifactNameForEntry(entry);
     const expected_dims = entry.dims;
 
     const lower = if (resume_key) |key| try ctx.alloc.dupe(u8, key) else try documentRangeLowerAlloc(ctx.alloc, "");
@@ -43502,7 +44022,6 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(
     const ScanState = struct {
         ctx: *AsyncContext,
         index_name: []const u8,
-        expected_name: []const u8,
         expected_dims: u32,
         rebuild_chunk_size: usize,
         writes: std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite) = .empty,
@@ -43557,7 +44076,8 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(
                 return .@"continue";
             }
 
-            var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(state.ctx.alloc, key, state.expected_name)) orelse {
+            const index_ref = index_manager_mod.ManagedIndexRef{ .name = state.index_name, .kind = .dense_vector };
+            var identity = (try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(state.ctx.alloc, state.ctx.index_manager, index_ref, key)) orelse {
                 if (state.scanned_since_yield_check >= 1024) {
                     state.scanned_since_yield_check = 0;
                     return try state.yieldAfter(key);
@@ -43593,7 +44113,6 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(
     var state = ScanState{
         .ctx = ctx,
         .index_name = index_name,
-        .expected_name = expected_name,
         .expected_dims = expected_dims,
         .rebuild_chunk_size = rebuild_chunk_size,
     };
@@ -43659,15 +44178,12 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
     index_name: []const u8,
     rebuild_chunk_size: usize,
 ) !usize {
-    const expected_name = ctx.index_manager.sparseEmbeddingName(index_name) orelse index_name;
-
     const lower = try documentRangeLowerAlloc(ctx.alloc, "");
     defer ctx.alloc.free(lower);
 
     const ScanState = struct {
         ctx: *AsyncContext,
         index_name: []const u8,
-        expected_name: []const u8,
         rebuild_chunk_size: usize,
         writes: std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite) = .empty,
         rebuilt: usize = 0,
@@ -43686,16 +44202,25 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
             try checkAsyncRepairCancelled(state.ctx);
 
-            const identity = (try internal_keys.parseEmbeddingArtifactKeyView(key)) orelse return .@"continue";
-            if (!std.mem.eql(u8, identity.artifact_name, state.expected_name)) return .@"continue";
-
             var sparse = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(state.ctx.alloc, value) catch |err| {
                 if (DB.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
                 return err;
             };
             errdefer sparse.deinit(state.ctx.alloc);
-            const doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key);
-            errdefer state.ctx.alloc.free(doc_key);
+            const index_ref = index_manager_mod.ManagedIndexRef{ .name = state.index_name, .kind = .sparse_vector };
+            var identity = (try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(
+                state.ctx.alloc,
+                state.ctx.index_manager,
+                index_ref,
+                key,
+            )) orelse {
+                sparse.deinit(state.ctx.alloc);
+                return .@"continue";
+            };
+            var write_transferred = false;
+            errdefer if (!write_transferred) identity.deinit(state.ctx.alloc);
+            const artifact_key = try state.ctx.alloc.dupe(u8, key);
+            errdefer state.ctx.alloc.free(artifact_key);
             const indices = sparse.indices;
             sparse.indices = &.{};
             errdefer state.ctx.alloc.free(indices);
@@ -43705,11 +44230,15 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
 
             try state.writes.append(state.ctx.alloc, .{
                 .index_name = @constCast(state.index_name),
-                .doc_key = doc_key,
-                .artifact_key = null,
+                .doc_key = identity.doc_key,
+                .artifact_key = artifact_key,
                 .indices = indices,
                 .values = values,
             });
+            write_transferred = true;
+            if (identity.parent_doc_key) |parent_doc_key| state.ctx.alloc.free(parent_doc_key);
+            identity.parent_doc_key = null;
+            identity.doc_key = identity.doc_key[0..0];
             state.rebuilt += 1;
 
             if (state.writes.items.len >= state.rebuild_chunk_size) try state.flush();
@@ -43720,7 +44249,6 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
     var state = ScanState{
         .ctx = ctx,
         .index_name = index_name,
-        .expected_name = expected_name,
         .rebuild_chunk_size = rebuild_chunk_size,
     };
     defer state.deinit();
@@ -44480,6 +45008,109 @@ fn putSparseEmbeddingArtifactForTest(
     defer alloc.free(payload);
     try db.core.store.put(artifact_key, payload);
     try markArtifactPresenceForTest(db);
+}
+
+test "db vector indexes combine direct document and chunk-backed artifact sources" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 64,
+    });
+    for ([_]types.EnrichmentConfig{
+        .{ .name = "title_dense_v1", .kind = .embedding, .field = "title", .expected_dims = 2, .vector_space = "test:mixed-dense-v1" },
+        .{ .name = "body_dense_v1", .kind = .embedding, .field = "text", .source_artifact_name = "body_chunks_v1", .expected_dims = 2, .vector_space = "test:mixed-dense-v1" },
+        .{ .name = "title_sparse_v1", .kind = .embedding, .field = "title", .vector_space = "test:mixed-sparse-v1" },
+        .{ .name = "body_sparse_v1", .kind = .embedding, .field = "text", .source_artifact_name = "body_chunks_v1", .vector_space = "test:mixed-sparse-v1" },
+    }) |cfg| try db.addEnrichment(cfg);
+
+    try db.addIndex(.{
+        .name = "mixed_dense",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"sources\":[{\"artifact\":\"title_dense_v1\"},{\"artifact\":\"body_dense_v1\"}]}",
+    });
+    try db.addIndex(.{
+        .name = "mixed_sparse",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"title_sparse_v1\"},{\"artifact\":\"body_sparse_v1\"}]}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:direct", .value = "{\"title\":\"direct\",\"body\":\"unused\"}" },
+            .{ .key = "doc:chunk", .value = "{\"title\":\"unused\",\"body\":\"chunk\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:chunk", "body_chunks_v1", 0);
+    defer alloc.free(chunk_key);
+    try db.core.store.put(chunk_key, "{\"_parent_doc_key\":\"doc:chunk\",\"text\":\"chunk\"}");
+
+    const direct_dense = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:direct", "title_dense_v1");
+    defer alloc.free(direct_dense);
+    const chunk_dense = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "body_dense_v1");
+    defer alloc.free(chunk_dense);
+    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, direct_dense, null, &.{ 0.0, 0.0 });
+    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, chunk_dense, null, &.{ 0.25, 0.0 });
+    try std.testing.expectEqual(
+        @as(?u64, 2),
+        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "mixed_dense"),
+    );
+
+    const direct_sparse = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:direct", "title_sparse_v1");
+    defer alloc.free(direct_sparse);
+    const chunk_sparse = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "body_sparse_v1");
+    defer alloc.free(chunk_sparse);
+    try putSparseEmbeddingArtifactForTest(&db, alloc, direct_sparse, null, &.{1}, &.{1.0});
+    try putSparseEmbeddingArtifactForTest(&db, alloc, chunk_sparse, null, &.{1}, &.{0.75});
+
+    try std.testing.expectEqual(@as(usize, 2), try rebuildDenseIndexFromStoredEmbeddingArtifactsContext(db.async_context, "mixed_dense", 16));
+    try std.testing.expectEqual(@as(usize, 2), try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(db.async_context, "mixed_sparse", 16));
+
+    var dense = try db.search(alloc, .{
+        .index_name = "mixed_dense",
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
+        .limit = 2,
+        .search_effort = 1.0,
+    });
+    defer dense.deinit();
+    try std.testing.expectEqual(@as(usize, 2), dense.hits.len);
+    var dense_has_direct = false;
+    var dense_has_chunk = false;
+    for (dense.hits) |hit| {
+        dense_has_direct = dense_has_direct or std.mem.eql(u8, hit.id, "doc:direct");
+        dense_has_chunk = dense_has_chunk or std.mem.eql(u8, hit.id, "doc:chunk");
+    }
+    try std.testing.expect(dense_has_direct and dense_has_chunk);
+
+    var sparse = try db.search(alloc, .{
+        .index_name = "mixed_sparse",
+        .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 2 } },
+        .limit = 2,
+        .search_effort = 1.0,
+    });
+    defer sparse.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sparse.hits.len);
+    var sparse_has_direct = false;
+    var sparse_has_chunk = false;
+    for (sparse.hits) |hit| {
+        sparse_has_direct = sparse_has_direct or std.mem.eql(u8, hit.id, "doc:direct");
+        sparse_has_chunk = sparse_has_chunk or std.mem.eql(u8, hit.id, "doc:chunk");
+    }
+    try std.testing.expect(sparse_has_direct and sparse_has_chunk);
 }
 
 fn expectDenseEmbeddingArtifactValue(alloc: Allocator, value: []const u8, source_hash: ?u64, dims: usize) !void {
@@ -53183,7 +53814,8 @@ test "db graph edge artifact replay catches up after reopen" {
 
         const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
         defer alloc.free(graph_key);
-        const graph_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 0.8, 0, 0, "");
+        const graph_generation = db.core.index_manager.graphIndex("relations_graph").?.config.coverage_generation;
+        const graph_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, graph_generation, 0.8, 0, 0, "");
         defer alloc.free(graph_value);
         var ctx = db.batchContext();
         const sequence = db.core.store.reserveNextReplaySequence(1);
@@ -57604,11 +58236,11 @@ test "db index repair targets one graph index per selected config" {
 
     const key_a = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_a", "mentions", "doc:b");
     defer alloc.free(key_a);
-    const value_a = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 0.7, 0, 0, "");
+    const value_a = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, db.core.index_manager.graphIndex("graph_a").?.config.coverage_generation, 0.7, 0, 0, "");
     defer alloc.free(value_a);
     const key_b = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_b", "mentions", "doc:c");
     defer alloc.free(key_b);
-    const value_b = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 0.9, 0, 0, "");
+    const value_b = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, db.core.index_manager.graphIndex("graph_b").?.config.coverage_generation, 0.9, 0, 0, "");
     defer alloc.free(value_b);
     try db.core.store.putBatch(&.{
         .{ .key = key_a, .value = value_a },
@@ -58392,7 +59024,7 @@ test "db index repair streams graph artifact rebuild in batches" {
         defer alloc.free(target);
         const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, source, "graph_stream", "links", target);
         errdefer alloc.free(key);
-        const value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 1.0, 0, 0, "");
+        const value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, db.core.index_manager.graphIndex("graph_stream").?.config.coverage_generation, 1.0, 0, 0, "");
         errdefer alloc.free(value);
         try writes.append(alloc, .{ .key = key, .value = value });
     }
@@ -73100,7 +73732,7 @@ test "db restart reconciles an activated graph repair without rebuilding" {
 
         const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
         defer alloc.free(edge_key);
-        const edge_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 0.75, 0, 0, "");
+        const edge_value = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, db.core.index_manager.graphIndex("graph_v1").?.config.coverage_generation, 0.75, 0, 0, "");
         defer alloc.free(edge_value);
         try db.core.store.put(edge_key, edge_value);
 

@@ -224,6 +224,10 @@ fn rewriteLocalTotalAfterObservedDrop(result: *types.SearchResult, source: types
 pub fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void {
     if (allHitsHaveDocOrdinals(result.hits)) return try dedupeSearchHitsByOrdinal(alloc, result);
 
+    return try dedupeSearchHitsByExactId(alloc, result);
+}
+
+fn dedupeSearchHitsByExactId(alloc: Allocator, result: *types.SearchResult) !void {
     const source = result.*;
     const original_hits_len = result.hits.len;
     var seen = std.StringHashMapUnmanaged(void).empty;
@@ -1401,7 +1405,14 @@ pub fn postprocessTextSearchResult(
         .resolve_doc_set_doc_ids = processor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = processor.resolve_doc_ids_to_doc_set,
     });
-    try dedupeSearchHitsById(alloc, &filtered);
+    if (chunk_backed) {
+        // Chunk members intentionally share their parent document ordinal.
+        // Preserve distinct source chunks until hierarchy grouping while still
+        // collapsing duplicate vectors for the same exact artifact member.
+        try dedupeSearchHitsByExactId(alloc, &filtered);
+    } else {
+        try dedupeSearchHitsById(alloc, &filtered);
+    }
     if (chunk_backed) {
         const reshaped = try reshapeChunkBackedResult(alloc, req, filtered, .{
             .ctx = processor.ctx,
@@ -1438,6 +1449,16 @@ pub fn postprocessVectorSearchResult(
         .filter_many = processor.filter_visible_many,
     });
     errdefer filtered.deinit();
+    // Artifact-backed vector indexes retain one independent member for every
+    // (artifact, source key), but document-level search returns each logical
+    // document once. Raw score order makes the first occurrence authoritative
+    // and preserves the winning source's artifact provenance. Chunk members
+    // share their parent ordinal, so they must remain distinct until grouping.
+    if (chunk_backed) {
+        try dedupeSearchHitsByExactId(alloc, &filtered);
+    } else {
+        try dedupeSearchHitsById(alloc, &filtered);
+    }
     if (chunk_backed) {
         filtered = try reshapeChunkBackedResult(alloc, req, filtered, .{
             .ctx = processor.ctx,
@@ -1505,8 +1526,10 @@ fn externalizeSearchHitIdentity(alloc: Allocator, hit: *types.SearchHit) !void {
 
     alloc.free(hit.id);
     hit.id = try alloc.dupe(u8, resolved.id);
-    if (hit.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
-    hit.artifact_ref = if (resolved.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+    if (resolved.artifact_ref) |artifact_ref| {
+        if (hit.artifact_ref) |*existing| existing.deinit(alloc);
+        hit.artifact_ref = try artifact_ref.clone(alloc);
+    }
 
     for (hit.chunk_hits) |*chunk_hit| {
         try externalizeChunkHitIdentity(alloc, chunk_hit);
@@ -1688,6 +1711,58 @@ test "dedupeSearchHitsById uses ordinals when hit page is complete" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), result.hits[0].doc_ordinal);
     try std.testing.expectEqualStrings("doc:b", result.hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 2), result.hits[1].doc_ordinal);
+}
+
+test "exact-id dedupe preserves distinct chunks sharing a parent ordinal" {
+    const alloc = std.testing.allocator;
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 3),
+        .total_hits = 3,
+    };
+    defer result.deinit();
+    result.hits[0] = .{ .id = try alloc.dupe(u8, "chunk:0"), .doc_ordinal = 1 };
+    result.hits[1] = .{ .id = try alloc.dupe(u8, "chunk:1"), .doc_ordinal = 1 };
+    result.hits[2] = .{ .id = try alloc.dupe(u8, "chunk:0"), .doc_ordinal = 1 };
+
+    try dedupeSearchHitsByExactId(alloc, &result);
+
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("chunk:0", result.hits[0].id);
+    try std.testing.expectEqualStrings("chunk:1", result.hits[1].id);
+}
+
+test "vector dedupe preserves the highest-ranked source artifact" {
+    const alloc = std.testing.allocator;
+    var result = types.SearchResult{
+        .alloc = alloc,
+        .hits = try alloc.alloc(types.SearchHit, 2),
+        .total_hits = 2,
+    };
+    defer result.deinit();
+    result.hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.9,
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "title_dense_v1"),
+            .kind = .embedding,
+        },
+    };
+    result.hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 0.8,
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "body_dense_v1"),
+            .kind = .embedding,
+        },
+    };
+
+    try dedupeSearchHitsById(alloc, &result);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("title_dense_v1", result.hits[0].artifact_ref.?.name);
 }
 
 test "applyStoredSearchPatternFilters skips stored loads for doc_id-only filters" {

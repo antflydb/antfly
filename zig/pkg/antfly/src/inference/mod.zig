@@ -94,6 +94,10 @@ test "managed embedder artifact backed embedding translation" {
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
 }
 
+test "managed embedder multi-source embedding contracts" {
+    try managed_embedder.testMultiSourceEmbeddingContracts();
+}
+
 test "managed embedder sends antfly media parts when local provider is configured" {
     try managed_embedder.testAntflyEmbedPartSelectionAndCardinality();
 }

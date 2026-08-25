@@ -3803,6 +3803,9 @@ pub fn build(b: *std.Build) void {
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "created index configs normalize single-source input forms",
+        "created graph index response projects closed nested schemas",
+        "index encoders expose graph artifact source materialization status",
         "api http client round-trips public status and internal capability routes",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
@@ -4764,6 +4767,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "dedupeSearchHitsById uses ordinals when hit page is complete",
+            "exact-id dedupe preserves distinct chunks sharing a parent ordinal",
             "applyStoredSearchPatternFilters reports lower-bound total for filtered page window",
             "applyStoredSearchPatternFilters resolves native doc id constraints to hit ordinals",
             "applyStoredSearchPatternFilters uses hit ordinals for resolved doc filters",
@@ -6089,6 +6093,7 @@ pub fn build(b: *std.Build) void {
             "derived coverage reasons deduplicate overlapping freshness signals",
             "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
             "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
+            "multi-source embedding enrichments receive a shared semantic producer identity",
             "managed embeddings skipped terminal sources complete backfill without fabricating replay debt",
             "repair-free embeddings aggregate retains live dense catch-up",
             "serviceable repair preserves sibling shard dense catch-up fallback",

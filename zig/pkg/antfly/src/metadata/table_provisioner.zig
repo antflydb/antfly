@@ -75,6 +75,7 @@ pub const ReconcileReplicaRootOptions = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
     restore_open_options: backups_api.OpenOptions = .{},
+    embedding_options: managed_embedder.InitOptions = .{},
 };
 
 fn provisioningDbOpenOptions() db_mod.OpenOptions {
@@ -236,7 +237,9 @@ pub fn reconcileReplicaRootWithOptions(
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;
-        const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
+        const index_summary = try reconcileDbIndexesWithOptions(alloc, &db, table.indexes_json, .{
+            .embedding_options = options.embedding_options,
+        });
         summary.merge(index_summary);
     }
     return summary;
@@ -259,6 +262,7 @@ pub fn reconcileDbIndexes(
 
 pub const ReconcileDbIndexOptions = struct {
     drain_resolver_backfill: bool = true,
+    embedding_options: managed_embedder.InitOptions = .{},
 };
 
 fn dbIndexReconciliationCanMutate(db: *const db_mod.DB) bool {
@@ -276,7 +280,7 @@ pub fn reconcileDbIndexesWithOptions(
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
         desired_enrichments.deinit(alloc);
     }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
@@ -329,6 +333,16 @@ pub fn reconcileDbIndexTarget(
     indexes_json: []const u8,
     index_name: []const u8,
 ) !ProvisionSummary {
+    return try reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, index_name, .{});
+}
+
+pub fn reconcileDbIndexTargetWithOptions(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    indexes_json: []const u8,
+    index_name: []const u8,
+    options: ReconcileDbIndexOptions,
+) !ProvisionSummary {
     if (!dbIndexReconciliationCanMutate(db)) return .{};
     if (index_name.len == 0 or
         std.mem.eql(u8, index_name, "resolvers") or
@@ -346,7 +360,7 @@ pub fn reconcileDbIndexTarget(
         for (desired_enrichments.items) |*cfg| cfg.deinit(alloc);
         desired_enrichments.deinit(alloc);
     }
-    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, &desired_enrichments);
+    try collectDesiredEnrichmentsFromJson(alloc, indexes_json, options.embedding_options, &desired_enrichments);
     try indexes_api.validateArtifactEnrichmentConfigs(alloc, desired_enrichments.items);
     dedupeDesiredEnrichments(alloc, &desired_enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(desired_enrichments.items);
@@ -382,7 +396,7 @@ pub fn reconcileDbIndexTarget(
     }
 
     if (target_value) |value| {
-        try indexes_api.collectArtifactEnrichmentsFromValue(alloc, value, &target_enrichments);
+        try indexes_api.collectArtifactEnrichmentsFromValueWithOptions(alloc, value, options.embedding_options, &target_enrichments);
         dedupeDesiredEnrichments(alloc, &target_enrichments);
         indexes_api.sortArtifactEnrichmentsByDependency(target_enrichments.items);
     }
@@ -1137,10 +1151,11 @@ fn jsonValuesEqualIgnoringTopLevelEnrichments(a: std.json.Value, b: std.json.Val
 fn collectDesiredEnrichmentsFromJson(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
+    embedding_options: managed_embedder.InitOptions,
     out: *std.ArrayListUnmanaged(db_mod.types.EnrichmentConfig),
 ) !void {
     {
-        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+        const collected = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, embedding_options);
         errdefer db_mod.types.freeEnrichmentConfigs(alloc, collected);
         try out.appendSlice(alloc, collected);
         alloc.free(collected);

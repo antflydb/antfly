@@ -188,6 +188,12 @@ pub const AntflyType = enum {
     }
 };
 
+/// Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment.
+pub const ArtifactIndexSource = struct {
+    /// Stable name of a generated chunk or asset artifact stream.
+    artifact: []const u8,
+};
+
 /// Create a schema-derived algebraic index.
 pub const CreateAlgebraicIndexRequest = struct {
     /// Optional description of the index and its purpose
@@ -219,6 +225,8 @@ pub const CreateEmbeddingsIndexRequest = struct {
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
+    /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name.
+    sources: ?[]const ArtifactIndexSource = null,
     /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
@@ -253,11 +261,13 @@ pub const CreateFullTextIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member.
+    sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
     /// Document field indexed as text. Omit for the table's default full-document text index.
     field: ?[]const u8 = null,
-    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     artifact_name: ?[]const u8 = null,
     type: []const u8,
 };
@@ -270,6 +280,8 @@ pub const CreateGraphIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Chunk or JSON asset streams whose edge-like values are unioned into this graph index.
+    sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
@@ -278,6 +290,7 @@ pub const CreateGraphIndexRequest = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
     nodes: ?GraphArtifactNodeMappingConfig = null,
@@ -373,6 +386,8 @@ pub const CreatedEmbeddingsIndex = struct {
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     embedding_name: ?[]const u8 = null,
+    /// Embedding artifact streams indexed together as independent vector members.
+    sources: ?[]const ArtifactIndexSource = null,
     source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
@@ -395,6 +410,8 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     dimension: ?i64 = null,
     field: ?[]const u8 = null,
     embedding_name: ?[]const u8 = null,
+    /// Embedding artifact streams indexed together as independent vector members.
+    sources: ?[]const ArtifactIndexSource = null,
     source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
@@ -416,6 +433,8 @@ pub const CreatedEnrichmentConfig = struct {
     template: ?[]const u8 = null,
     source_artifact_name: ?[]const u8 = null,
     expected_dims: ?i64 = null,
+    /// Optional stable model/token-space identifier asserted for this embedding artifact.
+    vector_space: ?[]const u8 = null,
     chunk_size: ?i64 = null,
     chunk_overlap: ?i64 = null,
     chunker_json: ?[]const u8 = null,
@@ -434,11 +453,13 @@ pub const CreatedFullTextIndex = struct {
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const CreatedEnrichmentConfig = null,
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member.
+    sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
     /// Document field indexed as text. Omit for the table's default full-document text index.
     field: ?[]const u8 = null,
-    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     artifact_name: ?[]const u8 = null,
     type: []const u8,
 };
@@ -466,6 +487,8 @@ pub const CreatedGraphIndex = struct {
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
+    sources: ?[]const GraphArtifactSourceConfig = null,
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
     nodes: ?GraphArtifactNodeMappingConfig = null,
@@ -482,6 +505,8 @@ pub const CreatedGraphIndexConfig = struct {
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
     max_edges_per_document: ?i64 = null,
+    sources: ?[]const GraphArtifactSourceConfig = null,
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
     nodes: ?GraphArtifactNodeMappingConfig = null,
@@ -820,6 +845,8 @@ pub const EmbeddingsIndexConfig = struct {
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
+    /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name.
+    sources: ?[]const ArtifactIndexSource = null,
     /// Generated embedding artifact name consumed by this vector index. Use with a matching embedding enrichment for artifact-backed managed embeddings.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
@@ -969,6 +996,8 @@ pub const EnrichmentConfig = struct {
     source_artifact_name: ?[]const u8 = null,
     /// Expected embedding dimension for embedding enrichments.
     expected_dims: ?i64 = null,
+    /// Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently.
+    vector_space: ?[]const u8 = null,
     /// Chunk size for chunk enrichments.
     chunk_size: ?i64 = null,
     /// Chunk overlap for chunk enrichments.
@@ -979,7 +1008,7 @@ pub const EnrichmentConfig = struct {
     full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
-    /// Write-only serialized asset producer configuration. It may contain provider credentials and is never returned.
+    /// Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
@@ -1071,11 +1100,13 @@ pub const ExecutionPolicy = struct {
 };
 
 pub const FullTextIndexConfig = struct {
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member.
+    sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
     /// Document field indexed as text. Omit for the table's default full-document text index.
     field: ?[]const u8 = null,
-    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     artifact_name: ?[]const u8 = null,
 };
 
@@ -1219,11 +1250,14 @@ pub const GraphArtifactProducerSourceConfig = struct {
 
 /// Artifact stream materialized into graph edges.
 pub const GraphArtifactSourceConfig = struct {
-    kind: []const u8,
+    kind: ?[]const u8 = null,
     artifact: []const u8,
     path: ?[]const u8 = null,
     format: ?[]const u8 = null,
     mention_edge_type: ?[]const u8 = null,
+    nodes: ?GraphArtifactNodeMappingConfig = null,
+    edge: ?GraphArtifactEdgeMappingConfig = null,
+    context: ?GraphArtifactContextConfig = null,
 };
 
 /// Algebraic law used to combine bounded graph traversal provenance.
@@ -1233,6 +1267,8 @@ pub const GraphBoundedTraversalConfig = struct {
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
+    /// Chunk or JSON asset streams whose edge-like values are unioned into this graph index.
+    sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Handlebars template for generating summarizer input text. Uses document fields as template variables. Same pattern as EmbeddingsConfig template.
@@ -1241,6 +1277,7 @@ pub const GraphIndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
     nodes: ?GraphArtifactNodeMappingConfig = null,
@@ -1284,6 +1321,8 @@ pub const GraphIndexStats = struct {
     total_edges: ?i64 = null,
     /// Count of edges per edge type
     edge_types: ?std.json.ArrayHashMap(i64) = null,
+    /// Per-source materialization status in configured precedence order.
+    source_artifacts: ?[]const GraphSourceArtifactStatus = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
     repair: ?IndexRepairStatus = null,
@@ -1507,6 +1546,13 @@ pub const GraphResultNode = struct {
     edges: ?[]const Edge = null,
 };
 
+pub const GraphSourceArtifactStatus = struct {
+    name: []const u8,
+    path: []const u8,
+    format: []const u8,
+    materialization_pending: bool,
+};
+
 /// A literal numeric value or a Handlebars template evaluated for each materialized graph item.
 pub const GraphTemplateValue = std.json.Value;
 
@@ -1521,11 +1567,13 @@ pub const IndexConfig = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member.
+    sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
     /// Document field indexed as text. Omit for the table's default full-document text index.
     field: ?[]const u8 = null,
-    /// Generated artifact stream indexed as text. Use with matching inline enrichments.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     artifact_name: ?[]const u8 = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
@@ -1560,6 +1608,7 @@ pub const IndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of edges per document (0 = unlimited)
     max_edges_per_document: ?i64 = null,
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
     nodes: ?GraphArtifactNodeMappingConfig = null,
@@ -1586,6 +1635,10 @@ pub const IndexConfig = struct {
         }
         if (self.enrichments) |value| {
             try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.sources) |value| {
+            try jw.objectField("sources");
             try jw.write(value);
         }
         if (self.mem_only) |value| {

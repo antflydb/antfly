@@ -82,6 +82,16 @@ components:
             $ref: "#/components/schemas/EnrichmentConfig"
           x-go-type-skip-optional-pointer: true
           description: "Inline managed enrichment definitions required by this index."
+    ArtifactIndexSource:
+      type: object
+      additionalProperties: false
+      required: [artifact]
+      description: "Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment."
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+          description: "Stable name of a generated chunk or asset artifact stream."
     CreateFullTextIndexRequest:
       description: "Create a full-text index."
       allOf:
@@ -118,12 +128,13 @@ components:
     GraphArtifactSourceConfig:
       type: object
       additionalProperties: false
-      required: [kind, artifact]
+      required: [artifact]
       description: "Artifact stream materialized into graph edges."
       properties:
         kind:
           type: string
           enum: [artifact]
+          default: artifact
         artifact: { type: string, minLength: 1 }
         path: { type: string }
         format:
@@ -131,6 +142,20 @@ components:
           enum: [extraction_relation, extraction_graph]
           default: extraction_relation
         mention_edge_type: { type: string }
+        nodes: { $ref: "#/components/schemas/GraphArtifactNodeMappingConfig" }
+        edge: { $ref: "#/components/schemas/GraphArtifactEdgeMappingConfig" }
+        context: { $ref: "#/components/schemas/GraphArtifactContextConfig" }
+    GraphSourceArtifactStatus:
+      type: object
+      additionalProperties: false
+      required: [name, path, format, materialization_pending]
+      properties:
+        name: { type: string }
+        path: { type: string }
+        format:
+          type: string
+          enum: [extraction_relation, extraction_graph]
+        materialization_pending: { type: boolean }
     GraphArtifactProducerSourceConfig:
       type: object
       additionalProperties: false
@@ -350,6 +375,10 @@ components:
         template: { type: string }
         source_artifact_name: { type: string }
         expected_dims: { type: integer, minimum: 0 }
+        vector_space:
+          type: string
+          minLength: 1
+          description: "Optional stable model/token-space identifier asserted for this embedding artifact."
         chunk_size: { type: integer, minimum: 0 }
         chunk_overlap: { type: integer, minimum: 0 }
         chunker_json: { type: string }
@@ -366,6 +395,13 @@ components:
         dimension: { type: integer, minimum: 1 }
         field: { type: string }
         embedding_name: { type: string }
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/ArtifactIndexSource" }
+          description: "Embedding artifact streams indexed together as independent vector members."
         source_artifact_name: { type: string }
         template: { type: string }
         distance_metric: { $ref: "#/components/schemas/DistanceMetric" }
@@ -387,7 +423,13 @@ components:
           type: array
           items: { $ref: "#/components/schemas/EdgeTypeConfig" }
         max_edges_per_document: { type: integer }
-        source: { $ref: "#/components/schemas/GraphArtifactSourceConfig" }
+        sources:
+          type: array
+          maxItems: 64
+          items: { $ref: "#/components/schemas/GraphArtifactSourceConfig" }
+        source:
+          description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources."
+          $ref: "#/components/schemas/GraphArtifactSourceConfig"
         artifact: { $ref: "#/components/schemas/CreatedGraphArtifactProducerConfig" }
         nodes: { $ref: "#/components/schemas/GraphArtifactNodeMappingConfig" }
         edge: { $ref: "#/components/schemas/GraphArtifactEdgeMappingConfig" }
@@ -517,6 +559,11 @@ components:
           type: integer
           minimum: 0
           description: "Expected embedding dimension for embedding enrichments."
+        vector_space:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          minLength: 1
+          description: "Optional stable model/token-space identifier for embedding artifacts. When omitted on every source, Antfly requires the effective producers to be semantically equivalent. To combine intentionally compatible but distinct producers, set the same identifier on every source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently."
         chunk_size:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -544,13 +591,22 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           writeOnly: true
-          description: "Write-only serialized asset producer configuration. It may contain provider credentials and is never returned."
+          description: "Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded."
         execution:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity."
     FullTextIndexConfig:
       type: object
       properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/ArtifactIndexSource"
+          x-go-type-skip-optional-pointer: true
+          description: "Chunk or textual asset streams indexed together; every artifact record is an independent full-text member."
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -562,7 +618,7 @@ components:
         artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Generated artifact stream indexed as text. Use with matching inline enrichments."
+          description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources."
     AlgebraicIndexConfig:
       type: object
       description: "Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned."
@@ -851,6 +907,19 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: "Field to extract embeddings from (managed indexes only; not allowed when external=true)"
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/ArtifactIndexSource"
+          x-go-type-skip-optional-pointer: true
+          description: >-
+            Embedding artifact streams indexed together. Each artifact record is an independent
+            vector member identified by (artifact name, source key). All sources must use the same
+            dense vector space or sparse token space. Not allowed with external, field, template,
+            chunker, embedding_name, or source_artifact_name.
         embedding_name:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -1839,6 +1908,15 @@ components:
       type: object
       description: "Configuration for graph index type"
       properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: "#/components/schemas/GraphArtifactSourceConfig"
+          x-go-type-skip-optional-pointer: true
+          description: "Chunk or JSON asset streams whose edge-like values are unioned into this graph index."
         summarizer:
           description: "Configuration for generating node summaries (enables tree navigation in Retrieval Agent)"
           $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
@@ -1860,6 +1938,7 @@ components:
           type: integer
           description: "Maximum number of edges per document (0 = unlimited)"
         source:
+          description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources."
           $ref: "#/components/schemas/GraphArtifactSourceConfig"
         artifact:
           $ref: "#/components/schemas/GraphArtifactProducerConfig"
@@ -1953,6 +2032,11 @@ components:
             type: integer
             format: uint64
           description: "Count of edges per edge type"
+        source_artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphSourceArtifactStatus"
+          description: "Per-source materialization status in configured precedence order."
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean

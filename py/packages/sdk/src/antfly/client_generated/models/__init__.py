@@ -41,6 +41,7 @@ from .anthropic_generator_config import AnthropicGeneratorConfig
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
+from .artifact_index_source import ArtifactIndexSource
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
 from .audio_chunk_options import AudioChunkOptions
@@ -340,6 +341,8 @@ from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourc
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
+from .graph_source_artifact_status import GraphSourceArtifactStatus
+from .graph_source_artifact_status_format import GraphSourceArtifactStatusFormat
 from .ground_truth import GroundTruth
 from .hierarchy_ancestor import HierarchyAncestor
 from .hierarchy_ancestor_document import HierarchyAncestorDocument
@@ -870,6 +873,7 @@ __all__ = (
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
+    "ArtifactIndexSource",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
     "AudioChunkOptions",
@@ -1167,6 +1171,8 @@ __all__ = (
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
+    "GraphSourceArtifactStatus",
+    "GraphSourceArtifactStatusFormat",
     "GroundTruth",
     "HierarchyAncestor",
     "HierarchyAncestorDocument",

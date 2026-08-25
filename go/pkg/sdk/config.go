@@ -17,7 +17,9 @@ limitations under the License.
 package sdk
 
 import (
+	stdjson "encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
@@ -286,24 +288,144 @@ func newCreateIndexRequestFromIndexConfig(data []byte, indexType IndexType) (*Cr
 	return request, nil
 }
 
-// ArtifactEmbeddingIndexConfig describes a managed vector index whose vectors
-// are generated from an existing generated artifact stream.
-type ArtifactEmbeddingIndexConfig struct {
-	// SourceArtifactName is the artifact stream to embed, for example
-	// "document_chunks_v1".
+const maxArtifactSources = 64
+
+// NewArtifactIndexSources builds the shared artifact-only source shape used by
+// full-text and embeddings indexes.
+func NewArtifactIndexSources(artifacts ...string) ([]ArtifactIndexSource, error) {
+	if len(artifacts) == 0 {
+		return nil, fmt.Errorf("at least one artifact source is required")
+	}
+	if len(artifacts) > maxArtifactSources {
+		return nil, fmt.Errorf("at most %d artifact sources are allowed", maxArtifactSources)
+	}
+	sources := make([]ArtifactIndexSource, 0, len(artifacts))
+	seen := make(map[string]struct{}, len(artifacts))
+	for i, artifact := range artifacts {
+		if artifact == "" {
+			return nil, fmt.Errorf("artifacts[%d] is required", i)
+		}
+		if _, ok := seen[artifact]; ok {
+			return nil, fmt.Errorf("duplicate artifact source %q", artifact)
+		}
+		seen[artifact] = struct{}{}
+		sources = append(sources, ArtifactIndexSource{Artifact: artifact})
+	}
+	return sources, nil
+}
+
+// NewArtifactFullTextIndexConfig builds a full-text index over one or more
+// generated chunk or textual asset streams.
+func NewArtifactFullTextIndexConfig(name string, artifacts ...string) (*IndexConfig, error) {
+	if name == "" {
+		return nil, fmt.Errorf("index name is required")
+	}
+	sources, err := NewArtifactIndexSources(artifacts...)
+	if err != nil {
+		return nil, err
+	}
+	return NewIndexConfig(name, FullTextIndexConfig{Sources: sources})
+}
+
+// NewGraphTemplateValue creates a string literal or Handlebars template value.
+func NewGraphTemplateValue(value string) (GraphTemplateValue, error) {
+	var result GraphTemplateValue
+	if err := result.FromGraphTemplateValue0(value); err != nil {
+		return GraphTemplateValue{}, fmt.Errorf("encode graph template value: %w", err)
+	}
+	return result, nil
+}
+
+// NewGraphNumericValue creates a finite numeric graph mapping value.
+func NewGraphNumericValue(value float64) (GraphTemplateValue, error) {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return GraphTemplateValue{}, fmt.Errorf("graph numeric value must be finite")
+	}
+	var result GraphTemplateValue
+	if err := result.FromGraphTemplateValue1(value); err != nil {
+		return GraphTemplateValue{}, fmt.Errorf("encode graph numeric value: %w", err)
+	}
+	return result, nil
+}
+
+// NewGraphIndexSources validates and defensively copies graph artifact sources.
+func NewGraphIndexSources(sources ...GraphArtifactSourceConfig) ([]GraphArtifactSourceConfig, error) {
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("at least one graph artifact source is required")
+	}
+	if len(sources) > maxArtifactSources {
+		return nil, fmt.Errorf("at most %d graph artifact sources are allowed", maxArtifactSources)
+	}
+	result := make([]GraphArtifactSourceConfig, len(sources))
+	seen := make(map[string]struct{}, len(sources))
+	for i, source := range sources {
+		if source.Artifact == "" {
+			return nil, fmt.Errorf("sources[%d].artifact is required", i)
+		}
+		if _, exists := seen[source.Artifact]; exists {
+			return nil, fmt.Errorf("duplicate graph artifact source %q", source.Artifact)
+		}
+		if source.Format != "" && source.Format != GraphArtifactSourceConfigFormatExtractionRelation && source.Format != GraphArtifactSourceConfigFormatExtractionGraph {
+			return nil, fmt.Errorf("sources[%d].format is invalid", i)
+		}
+		if source.Nodes.Model != "" && source.Nodes.Model != GraphArtifactNodeMappingConfigModelDocument && source.Nodes.Model != GraphArtifactNodeMappingConfigModelExternal {
+			return nil, fmt.Errorf("sources[%d].nodes.model is invalid", i)
+		}
+		fields := append([]string(nil), source.Context.DocFields...)
+		fieldSet := make(map[string]struct{}, len(fields))
+		for j, field := range fields {
+			if field == "" {
+				return nil, fmt.Errorf("sources[%d].context.doc_fields[%d] is required", i, j)
+			}
+			if _, exists := fieldSet[field]; exists {
+				return nil, fmt.Errorf("sources[%d].context.doc_fields contains duplicate %q", i, field)
+			}
+			fieldSet[field] = struct{}{}
+		}
+		result[i] = source
+		result[i].Context.DocFields = fields
+		if source.Edge.Metadata != nil {
+			encoded, err := stdjson.Marshal(source.Edge.Metadata)
+			if err != nil {
+				return nil, fmt.Errorf("sources[%d].edge.metadata must contain JSON values: %w", i, err)
+			}
+			result[i].Edge.Metadata = nil
+			if err := stdjson.Unmarshal(encoded, &result[i].Edge.Metadata); err != nil {
+				return nil, fmt.Errorf("copy sources[%d].edge.metadata: %w", i, err)
+			}
+		}
+		seen[source.Artifact] = struct{}{}
+	}
+	return result, nil
+}
+
+// ArtifactEmbeddingSource describes one generated embedding artifact stream
+// and the enrichment that produces it.
+type ArtifactEmbeddingSource struct {
+	// ArtifactName is the stable generated embedding artifact name.
+	ArtifactName string
+	// SourceArtifactName is an upstream artifact stream such as
+	// "document_chunks_v1". Leave it empty to read a document field directly.
 	SourceArtifactName string
-	// EmbeddingName is the generated embedding artifact name consumed by the
-	// vector index. It defaults to the index name.
-	EmbeddingName string
-	// SourceField is the text field inside each source artifact payload. It
-	// defaults to "text".
+	// SourceField defaults to "text" when SourceTemplate is empty.
 	SourceField string
-	// VectorField is the vector field exposed to the vector index. It defaults
-	// to "embedding".
-	VectorField string
+	// SourceTemplate optionally renders the embedding input.
+	SourceTemplate string
+}
+
+// ArtifactEmbeddingIndexConfig describes a managed vector index whose vectors
+// are generated from one or more document- or artifact-backed streams.
+type ArtifactEmbeddingIndexConfig struct {
+	// Sources contribute independent vector members to the index.
+	Sources []ArtifactEmbeddingSource
 	// ExpectedDims is optional when the embedder can be probed by the server.
 	ExpectedDims int
-	Embedder     EmbedderConfig
+	// Sparse creates a sparse token-space index. ExpectedDims must be zero.
+	Sparse bool
+	// VectorSpace optionally asserts model/token-space compatibility. When
+	// omitted, Antfly compares canonical semantic producer identities.
+	VectorSpace string
+	Embedder    EmbedderConfig
 	// DistanceMetric defaults on the server when left empty.
 	DistanceMetric DistanceMetric
 }
@@ -312,45 +434,63 @@ func NewArtifactEmbeddingIndexConfig(name string, config ArtifactEmbeddingIndexC
 	if name == "" {
 		return nil, fmt.Errorf("index name is required")
 	}
-	if config.SourceArtifactName == "" {
-		return nil, fmt.Errorf("source artifact name is required")
-	}
 	if config.Embedder.Provider == "" {
 		return nil, fmt.Errorf("embedder provider is required")
 	}
+	if len(config.Sources) == 0 {
+		return nil, fmt.Errorf("at least one artifact embedding source is required")
+	}
+	if len(config.Sources) > maxArtifactSources {
+		return nil, fmt.Errorf("at most %d artifact embedding sources are allowed", maxArtifactSources)
+	}
+	if config.ExpectedDims < 0 {
+		return nil, fmt.Errorf("expected dimensions cannot be negative")
+	}
+	if config.Sparse && config.ExpectedDims != 0 {
+		return nil, fmt.Errorf("expected dimensions must be zero for sparse embedding indexes")
+	}
+	if config.Sparse && config.DistanceMetric != "" {
+		return nil, fmt.Errorf("distance metric must be empty for sparse embedding indexes")
+	}
+	if config.DistanceMetric != "" && config.DistanceMetric != DistanceMetricL2Squared && config.DistanceMetric != DistanceMetricInnerProduct && config.DistanceMetric != DistanceMetricCosine {
+		return nil, fmt.Errorf("distance metric is invalid")
+	}
 
-	embeddingName := config.EmbeddingName
-	if embeddingName == "" {
-		embeddingName = name
+	artifactNames := make([]string, 0, len(config.Sources))
+	enrichments := make([]EnrichmentConfig, 0, len(config.Sources))
+	for i, source := range config.Sources {
+		if source.ArtifactName == "" {
+			return nil, fmt.Errorf("sources[%d].artifact name is required", i)
+		}
+		sourceField := source.SourceField
+		if sourceField == "" && source.SourceTemplate == "" {
+			sourceField = "text"
+		}
+		artifactNames = append(artifactNames, source.ArtifactName)
+		enrichments = append(enrichments, EnrichmentConfig{
+			Name:               source.ArtifactName,
+			Kind:               EnrichmentKindEmbedding,
+			Field:              sourceField,
+			Template:           source.SourceTemplate,
+			SourceArtifactName: source.SourceArtifactName,
+			ExpectedDims:       config.ExpectedDims,
+			VectorSpace:        config.VectorSpace,
+		})
 	}
-	sourceField := config.SourceField
-	if sourceField == "" {
-		sourceField = "text"
+	sources, err := NewArtifactIndexSources(artifactNames...)
+	if err != nil {
+		return nil, err
 	}
-	vectorField := config.VectorField
-	if vectorField == "" {
-		vectorField = "embedding"
-	}
-
 	idx, err := NewIndexConfig(name, EmbeddingsIndexConfig{
-		Field:              vectorField,
-		EmbeddingName:      embeddingName,
-		SourceArtifactName: config.SourceArtifactName,
-		Dimension:          config.ExpectedDims,
-		Embedder:           config.Embedder,
-		DistanceMetric:     config.DistanceMetric,
+		Sources:        sources,
+		Dimension:      config.ExpectedDims,
+		Sparse:         config.Sparse,
+		Embedder:       config.Embedder,
+		DistanceMetric: config.DistanceMetric,
 	})
 	if err != nil {
 		return nil, err
 	}
-	idx.Enrichments = []EnrichmentConfig{
-		{
-			Name:               embeddingName,
-			Kind:               EnrichmentKindEmbedding,
-			Field:              sourceField,
-			SourceArtifactName: config.SourceArtifactName,
-			ExpectedDims:       config.ExpectedDims,
-		},
-	}
+	idx.Enrichments = enrichments
 	return idx, nil
 }

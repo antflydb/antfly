@@ -244,12 +244,15 @@ func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	}
 
 	idx, err := NewArtifactEmbeddingIndexConfig("document_vectors", ArtifactEmbeddingIndexConfig{
-		SourceArtifactName: "document_chunks_v1",
-		EmbeddingName:      "document_chunk_dense_v1",
-		SourceField:        "text",
-		ExpectedDims:       768,
-		Embedder:           *embedder,
-		DistanceMetric:     DistanceMetricCosine,
+		VectorSpace: "docs:v1",
+		Sources: []ArtifactEmbeddingSource{{
+			ArtifactName:       "document_chunk_dense_v1",
+			SourceArtifactName: "document_chunks_v1",
+			SourceField:        "text",
+		}},
+		ExpectedDims:   768,
+		Embedder:       *embedder,
+		DistanceMetric: DistanceMetricCosine,
 	})
 	if err != nil {
 		t.Fatalf("NewArtifactEmbeddingIndexConfig failed: %v", err)
@@ -270,14 +273,12 @@ func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	if body["name"] != "document_vectors" {
 		t.Fatalf("name = %v, want document_vectors", body["name"])
 	}
-	if body["field"] != "embedding" {
-		t.Fatalf("field = %v, want embedding", body["field"])
+	if _, exists := body["embedding_name"]; exists {
+		t.Fatalf("embedding_name must be omitted for sources mode: %s", data)
 	}
-	if body["embedding_name"] != "document_chunk_dense_v1" {
-		t.Fatalf("embedding_name = %v, want document_chunk_dense_v1", body["embedding_name"])
-	}
-	if body["source_artifact_name"] != "document_chunks_v1" {
-		t.Fatalf("source_artifact_name = %v, want document_chunks_v1", body["source_artifact_name"])
+	sources, ok := body["sources"].([]any)
+	if !ok || len(sources) != 1 || sources[0].(map[string]any)["artifact"] != "document_chunk_dense_v1" {
+		t.Fatalf("sources = %#v, want document_chunk_dense_v1", body["sources"])
 	}
 
 	enrichments, ok := body["enrichments"].([]any)
@@ -302,5 +303,93 @@ func TestNewArtifactEmbeddingIndexConfig(t *testing.T) {
 	}
 	if enrichment["expected_dims"] != float64(768) {
 		t.Fatalf("enrichment expected_dims = %v, want 768", enrichment["expected_dims"])
+	}
+	if enrichment["vector_space"] != "docs:v1" {
+		t.Fatalf("enrichment vector_space = %v, want docs:v1", enrichment["vector_space"])
+	}
+}
+
+func TestNewArtifactEmbeddingIndexConfigSupportsDocumentAndChunkSources(t *testing.T) {
+	embedder, err := NewEmbedderConfig(AntflyEmbedderConfig{Model: "antflydb/clipclap"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := NewArtifactEmbeddingIndexConfig("document_vectors", ArtifactEmbeddingIndexConfig{
+		Sources: []ArtifactEmbeddingSource{
+			{ArtifactName: "document_dense_v1", SourceField: "semantic_content"},
+			{ArtifactName: "document_chunk_dense_v1", SourceArtifactName: "document_chunks_v1"},
+		},
+		ExpectedDims: 384,
+		Embedder:     *embedder,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body["sources"].([]any)) != 2 || len(body["enrichments"].([]any)) != 2 {
+		t.Fatalf("multi-source config lost members: %s", data)
+	}
+}
+
+func TestNewGraphIndexSourcesValidatesAndCopies(t *testing.T) {
+	typeValue, err := NewGraphTemplateValue("{{ _item.type }}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := map[string]any{"origin": "extractor", "nested": map[string]any{"score": float64(1)}}
+	sources, err := NewGraphIndexSources(
+		GraphArtifactSourceConfig{
+			Artifact: "relations_v1",
+			Path:     "$.relations[*]",
+			Format:   GraphArtifactSourceConfigFormatExtractionRelation,
+			Nodes: GraphArtifactNodeMappingConfig{
+				Model: GraphArtifactNodeMappingConfigModelExternal,
+			},
+			Edge:    GraphArtifactEdgeMappingConfig{Type: typeValue, Metadata: metadata},
+			Context: GraphArtifactContextConfig{DocFields: []string{"title", "url"}},
+		},
+		GraphArtifactSourceConfig{Artifact: "graph_v1", Format: GraphArtifactSourceConfigFormatExtractionGraph},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata["nested"].(map[string]any)["score"] = float64(2)
+	if got := sources[0].Edge.Metadata["nested"].(map[string]any)["score"]; got != float64(1) {
+		t.Fatalf("metadata was not defensively copied: %v", got)
+	}
+	if len(sources[0].Context.DocFields) != 2 || sources[1].Format != GraphArtifactSourceConfigFormatExtractionGraph {
+		t.Fatalf("graph sources lost configuration: %#v", sources)
+	}
+
+	if _, err := NewGraphIndexSources(
+		GraphArtifactSourceConfig{Artifact: "same"},
+		GraphArtifactSourceConfig{Artifact: "same"},
+	); err == nil {
+		t.Fatal("duplicate graph sources must be rejected")
+	}
+}
+
+func TestNewArtifactFullTextIndexConfig(t *testing.T) {
+	config, err := NewArtifactFullTextIndexConfig("document_text", "document_text_v1", "document_chunks_v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["name"] != "document_text" || len(body["sources"].([]any)) != 2 {
+		t.Fatalf("multi-source full-text config lost members: %s", data)
 	}
 }

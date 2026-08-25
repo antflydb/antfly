@@ -12,6 +12,7 @@ from ..models.distance_metric import DistanceMetric
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.artifact_index_source import ArtifactIndexSource
     from ..models.chunker_config import ChunkerConfig
     from ..models.created_enrichment_config import CreatedEnrichmentConfig
     from ..models.created_provider_config import CreatedProviderConfig
@@ -39,6 +40,8 @@ class CreatedEmbeddingsIndex:
         dimension (int | Unset):
         field (str | Unset):
         embedding_name (str | Unset):
+        sources (list[ArtifactIndexSource] | Unset): Embedding artifact streams indexed together as independent vector
+            members.
         source_artifact_name (str | Unset):
         template (str | Unset):
         distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
@@ -69,6 +72,7 @@ class CreatedEmbeddingsIndex:
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
     embedding_name: str | Unset = UNSET
+    sources: list[ArtifactIndexSource] | Unset = UNSET
     source_artifact_name: str | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
@@ -111,6 +115,13 @@ class CreatedEmbeddingsIndex:
         field = self.field
 
         embedding_name = self.embedding_name
+
+        sources: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sources, Unset):
+            sources = []
+            for sources_item_data in self.sources:
+                sources_item = sources_item_data.to_dict()
+                sources.append(sources_item)
 
         source_artifact_name = self.source_artifact_name
 
@@ -170,6 +181,8 @@ class CreatedEmbeddingsIndex:
             field_dict["field"] = field
         if embedding_name is not UNSET:
             field_dict["embedding_name"] = embedding_name
+        if sources is not UNSET:
+            field_dict["sources"] = sources
         if source_artifact_name is not UNSET:
             field_dict["source_artifact_name"] = source_artifact_name
         if template is not UNSET:
@@ -197,6 +210,7 @@ class CreatedEmbeddingsIndex:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.artifact_index_source import ArtifactIndexSource
         from ..models.chunker_config import ChunkerConfig
         from ..models.created_enrichment_config import CreatedEnrichmentConfig
         from ..models.created_provider_config import CreatedProviderConfig
@@ -236,6 +250,15 @@ class CreatedEmbeddingsIndex:
         field = d.pop("field", UNSET)
 
         embedding_name = d.pop("embedding_name", UNSET)
+
+        _sources = d.pop("sources", UNSET)
+        sources: list[ArtifactIndexSource] | Unset = UNSET
+        if _sources is not UNSET:
+            sources = []
+            for sources_item_data in _sources:
+                sources_item = ArtifactIndexSource.from_dict(sources_item_data)
+
+                sources.append(sources_item)
 
         source_artifact_name = d.pop("source_artifact_name", UNSET)
 
@@ -296,6 +319,7 @@ class CreatedEmbeddingsIndex:
             dimension=dimension,
             field=field,
             embedding_name=embedding_name,
+            sources=sources,
             source_artifact_name=source_artifact_name,
             template=template,
             distance_metric=distance_metric,

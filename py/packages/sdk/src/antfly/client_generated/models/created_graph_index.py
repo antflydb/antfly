@@ -41,6 +41,7 @@ class CreatedGraphIndex:
         template (str | Unset):
         edge_types (list[EdgeTypeConfig] | Unset):
         max_edges_per_document (int | Unset):
+        sources (list[GraphArtifactSourceConfig] | Unset):
         source (GraphArtifactSourceConfig | Unset): Artifact stream materialized into graph edges.
         artifact (CreatedGraphArtifactProducerConfig | Unset): Credential-free graph artifact producer configuration
             returned after creation.
@@ -63,6 +64,7 @@ class CreatedGraphIndex:
     template: str | Unset = UNSET
     edge_types: list[EdgeTypeConfig] | Unset = UNSET
     max_edges_per_document: int | Unset = UNSET
+    sources: list[GraphArtifactSourceConfig] | Unset = UNSET
     source: GraphArtifactSourceConfig | Unset = UNSET
     artifact: CreatedGraphArtifactProducerConfig | Unset = UNSET
     nodes: GraphArtifactNodeMappingConfig | Unset = UNSET
@@ -102,6 +104,13 @@ class CreatedGraphIndex:
                 edge_types.append(edge_types_item)
 
         max_edges_per_document = self.max_edges_per_document
+
+        sources: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sources, Unset):
+            sources = []
+            for sources_item_data in self.sources:
+                sources_item = sources_item_data.to_dict()
+                sources.append(sources_item)
 
         source: dict[str, Any] | Unset = UNSET
         if not isinstance(self.source, Unset):
@@ -156,6 +165,8 @@ class CreatedGraphIndex:
             field_dict["edge_types"] = edge_types
         if max_edges_per_document is not UNSET:
             field_dict["max_edges_per_document"] = max_edges_per_document
+        if sources is not UNSET:
+            field_dict["sources"] = sources
         if source is not UNSET:
             field_dict["source"] = source
         if artifact is not UNSET:
@@ -224,6 +235,15 @@ class CreatedGraphIndex:
 
         max_edges_per_document = d.pop("max_edges_per_document", UNSET)
 
+        _sources = d.pop("sources", UNSET)
+        sources: list[GraphArtifactSourceConfig] | Unset = UNSET
+        if _sources is not UNSET:
+            sources = []
+            for sources_item_data in _sources:
+                sources_item = GraphArtifactSourceConfig.from_dict(sources_item_data)
+
+                sources.append(sources_item)
+
         _source = d.pop("source", UNSET)
         source: GraphArtifactSourceConfig | Unset
         if isinstance(_source, Unset):
@@ -285,6 +305,7 @@ class CreatedGraphIndex:
             template=template,
             edge_types=edge_types,
             max_edges_per_document=max_edges_per_document,
+            sources=sources,
             source=source,
             artifact=artifact,
             nodes=nodes,

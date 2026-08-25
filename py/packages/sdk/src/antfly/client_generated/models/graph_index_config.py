@@ -28,6 +28,8 @@ class GraphIndexConfig:
     """Configuration for graph index type
 
     Attributes:
+        sources (list[GraphArtifactSourceConfig] | Unset): Chunk or JSON asset streams whose edge-like values are
+            unioned into this graph index.
         summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
              Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
         template (str | Unset): Handlebars template for generating summarizer input text.
@@ -49,6 +51,7 @@ class GraphIndexConfig:
         resolvers (list[GraphResolverConfig] | Unset):
     """
 
+    sources: list[GraphArtifactSourceConfig] | Unset = UNSET
     summarizer: GeneratorConfig | Unset = UNSET
     template: str | Unset = UNSET
     edge_types: list[EdgeTypeConfig] | Unset = UNSET
@@ -63,6 +66,13 @@ class GraphIndexConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        sources: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sources, Unset):
+            sources = []
+            for sources_item_data in self.sources:
+                sources_item = sources_item_data.to_dict()
+                sources.append(sources_item)
+
         summarizer: dict[str, Any] | Unset = UNSET
         if not isinstance(self.summarizer, Unset):
             summarizer = self.summarizer.to_dict()
@@ -112,6 +122,8 @@ class GraphIndexConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if sources is not UNSET:
+            field_dict["sources"] = sources
         if summarizer is not UNSET:
             field_dict["summarizer"] = summarizer
         if template is not UNSET:
@@ -150,6 +162,15 @@ class GraphIndexConfig:
         from ..models.graph_resolver_config import GraphResolverConfig
 
         d = dict(src_dict)
+        _sources = d.pop("sources", UNSET)
+        sources: list[GraphArtifactSourceConfig] | Unset = UNSET
+        if _sources is not UNSET:
+            sources = []
+            for sources_item_data in _sources:
+                sources_item = GraphArtifactSourceConfig.from_dict(sources_item_data)
+
+                sources.append(sources_item)
+
         _summarizer = d.pop("summarizer", UNSET)
         summarizer: GeneratorConfig | Unset
         if isinstance(_summarizer, Unset):
@@ -222,6 +243,7 @@ class GraphIndexConfig:
                 resolvers.append(resolvers_item)
 
         graph_index_config = cls(
+            sources=sources,
             summarizer=summarizer,
             template=template,
             edge_types=edge_types,

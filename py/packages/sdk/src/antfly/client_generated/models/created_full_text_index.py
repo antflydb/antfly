@@ -10,6 +10,7 @@ from ..models.created_full_text_index_type import CreatedFullTextIndexType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.artifact_index_source import ArtifactIndexSource
     from ..models.created_enrichment_config import CreatedEnrichmentConfig
 
 
@@ -27,9 +28,12 @@ class CreatedFullTextIndex:
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[CreatedEnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required
             by this index.
+        sources (list[ArtifactIndexSource] | Unset): Chunk or textual asset streams indexed together; every artifact
+            record is an independent full-text member.
         mem_only (bool | Unset): Whether to use memory-only storage
         field (str | Unset): Document field indexed as text. Omit for the table's default full-document text index.
-        artifact_name (str | Unset): Generated artifact stream indexed as text. Use with matching inline enrichments.
+        artifact_name (str | Unset): Single-source convenience form. Mutually exclusive with sources; normalized
+            responses use sources.
     """
 
     name: str
@@ -37,6 +41,7 @@ class CreatedFullTextIndex:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
+    sources: list[ArtifactIndexSource] | Unset = UNSET
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
     artifact_name: str | Unset = UNSET
@@ -58,6 +63,13 @@ class CreatedFullTextIndex:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
 
+        sources: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sources, Unset):
+            sources = []
+            for sources_item_data in self.sources:
+                sources_item = sources_item_data.to_dict()
+                sources.append(sources_item)
+
         mem_only = self.mem_only
 
         field = self.field
@@ -78,6 +90,8 @@ class CreatedFullTextIndex:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
+        if sources is not UNSET:
+            field_dict["sources"] = sources
         if mem_only is not UNSET:
             field_dict["mem_only"] = mem_only
         if field is not UNSET:
@@ -89,6 +103,7 @@ class CreatedFullTextIndex:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.artifact_index_source import ArtifactIndexSource
         from ..models.created_enrichment_config import CreatedEnrichmentConfig
 
         d = dict(src_dict)
@@ -109,6 +124,15 @@ class CreatedFullTextIndex:
 
                 enrichments.append(enrichments_item)
 
+        _sources = d.pop("sources", UNSET)
+        sources: list[ArtifactIndexSource] | Unset = UNSET
+        if _sources is not UNSET:
+            sources = []
+            for sources_item_data in _sources:
+                sources_item = ArtifactIndexSource.from_dict(sources_item_data)
+
+                sources.append(sources_item)
+
         mem_only = d.pop("mem_only", UNSET)
 
         field = d.pop("field", UNSET)
@@ -121,6 +145,7 @@ class CreatedFullTextIndex:
             description=description,
             version=version,
             enrichments=enrichments,
+            sources=sources,
             mem_only=mem_only,
             field=field,
             artifact_name=artifact_name,
