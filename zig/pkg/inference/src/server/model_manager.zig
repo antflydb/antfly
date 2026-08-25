@@ -6467,6 +6467,8 @@ fn sessionManagerForPreferredBackends(
     return .{
         .allocator = allocator,
         .preferred_backends = preferred_backends,
+        .required_backend = source.required_backend,
+        .required_backend_invalid = source.required_backend_invalid,
         .graph_runtime_strategy = source.graph_runtime_strategy,
         .kernel_jit = source.kernel_jit,
         .kernel_jit_load_context = source.kernel_jit_load_context,
