@@ -18,6 +18,8 @@ const backend_erased = @import("../../storage/backend_erased.zig");
 const docstore = @import("../../storage/docstore.zig");
 const internal_keys = @import("../../storage/internal_keys.zig");
 const range_state = @import("../../storage/db/range_state.zig");
+const db_types = @import("../../storage/db/types.zig");
+const merge_state = @import("../../storage/db/merge_state.zig");
 const shard_mod = @import("../../storage/shard.zig");
 
 pub const AppliedDataKV = struct {
@@ -36,6 +38,22 @@ pub const AppliedSplitState = struct {
     split_key: []const u8,
     new_shard_id: u64,
     original_range_end: []const u8,
+};
+
+pub const MergeSourcePhase = enum(u8) {
+    accepting = 1,
+    finalized = 2,
+    rolled_back = 3,
+};
+
+/// Durable donor-side range-merge fence. `applied_index` is the exact Raft
+/// index of the lifecycle command, and therefore the receiver watermark that
+/// must be covered before metadata can retire a finalized donor.
+pub const AppliedMergeSourceState = struct {
+    transition_id: u64,
+    receiver_group_id: u64,
+    phase: MergeSourcePhase,
+    applied_index: u64,
 };
 
 pub const SplitHandoff = struct {
@@ -76,6 +94,8 @@ pub const DataOperation = union(enum) {
     acknowledge_split: SplitAcknowledgement,
     finalize_split: SplitTransition,
     rollback_split: SplitTransition,
+    merge_source_transition: MergeSourceTransition,
+    merge_receiver_checkpoint: MergeReceiverCheckpoint,
     /// Irreversibly activates a Raft batch log format for this group.
     set_raft_batch_protocol: u16,
     /// Internal apply boundary. Split deltas use the committed Raft index as
@@ -88,6 +108,24 @@ pub const SplitTransition = struct {
     attempt_epoch: u64,
     new_shard_id: u64,
     split_key: []u8,
+};
+
+pub const MergeSourceTransition = struct {
+    kind: enum { prepare, finalize, rollback },
+    transition_id: u64,
+    receiver_group_id: u64,
+    raft_index: u64,
+};
+
+pub const MergeReceiverCheckpoint = struct {
+    checkpoint: db_types.MergeReplicationCheckpoint,
+
+    pub fn deinit(self: MergeReceiverCheckpoint, alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.checkpoint.receiver_base_start));
+        alloc.free(@constCast(self.checkpoint.receiver_base_end));
+        alloc.free(@constCast(self.checkpoint.merged_start));
+        alloc.free(@constCast(self.checkpoint.merged_end));
+    }
 };
 
 pub const SplitAcknowledgement = struct {
@@ -190,7 +228,7 @@ pub fn currentRaftBatchProtocolVersion(
     defer alloc.free(value);
     if (value.len != @sizeOf(u16)) return error.InvalidRaftBatchProtocolVersion;
     const version = std.mem.readInt(u16, value[0..2], .little);
-    if (version == 0 or version > data_raft_protocol.batch_timestamp_protocol_version)
+    if (version == 0 or version > data_raft_protocol.batch_protocol_version)
         return error.InvalidRaftBatchProtocolVersion;
     return version;
 }
@@ -369,6 +407,36 @@ pub fn currentSplitState(store: *docstore.DocStore, alloc: std.mem.Allocator, gr
 pub fn freeSplitState(alloc: std.mem.Allocator, state: AppliedSplitState) void {
     if (state.split_key.len > 0) alloc.free(@constCast(state.split_key));
     if (state.original_range_end.len > 0) alloc.free(@constCast(state.original_range_end));
+}
+
+pub fn currentMergeSourceState(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+) !?AppliedMergeSourceState {
+    const key = try groupMergeSourceStateKeyAlloc(alloc, group_id);
+    defer alloc.free(key);
+    const raw = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return try decodeMergeSourceState(raw);
+}
+
+pub fn currentMergeReceiverState(
+    store: *docstore.DocStore,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+) !?merge_state.State {
+    const key = try groupMergeReceiverStateKeyAlloc(alloc, group_id);
+    defer alloc.free(key);
+    const raw = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return try merge_state.decodeAlloc(alloc, raw);
 }
 
 pub fn freeGroupStateEntries(alloc: std.mem.Allocator, entries: []AppliedDataKV) void {
@@ -999,10 +1067,12 @@ fn validateGroupStateSnapshotEntryBounds(
             .delta_sequence => 2,
             .acknowledgement => 3,
             .terminal => 4,
-            .delta => 5,
+            .merge_source => 5,
+            .merge_receiver => 6,
+            .delta => 7,
         };
         if (previous_control_order) |previous| {
-            if (control_order < previous or (control_order == previous and control_order != 5))
+            if (control_order < previous or (control_order == previous and control_order != 7))
                 return error.InvalidGroupStateSnapshot;
         }
         previous_control_order = control_order;
@@ -1012,6 +1082,8 @@ fn validateGroupStateSnapshotEntryBounds(
             .delta_sequence => sequence = std.mem.readInt(u64, control.value[0..8], .little),
             .acknowledgement => acknowledgement_entry = control,
             .terminal => terminal_entry = control,
+            .merge_source => {},
+            .merge_receiver => {},
             .delta => |delta_sequence| {
                 if (delta_sequence == 0 or delta_sequence <= previous_delta_sequence)
                     return error.InvalidGroupStateSnapshot;
@@ -1111,6 +1183,8 @@ const GroupControlKind = union(enum) {
     delta_sequence,
     acknowledgement,
     terminal,
+    merge_source,
+    merge_receiver,
     delta: u64,
 };
 
@@ -1126,6 +1200,10 @@ fn groupControlKind(group_id: u64, key: []const u8) ?GroupControlKind {
     if (std.mem.eql(u8, acknowledgement_key, key)) return .acknowledgement;
     const terminal_key = std.fmt.bufPrint(&buf, "\x00\x00__metadata__:data_group_split_terminal:{d}", .{group_id}) catch return null;
     if (std.mem.eql(u8, terminal_key, key)) return .terminal;
+    const merge_source_key = std.fmt.bufPrint(&buf, "\x00\x00__metadata__:data_group_merge_source:{d}", .{group_id}) catch return null;
+    if (std.mem.eql(u8, merge_source_key, key)) return .merge_source;
+    const merge_receiver_key = std.fmt.bufPrint(&buf, "\x00\x00__metadata__:data_group_merge_receiver:{d}", .{group_id}) catch return null;
+    if (std.mem.eql(u8, merge_receiver_key, key)) return .merge_receiver;
     return if (parseSplitDeltaSeq(group_id, key)) |sequence| .{ .delta = sequence } else null;
 }
 
@@ -1135,7 +1213,7 @@ fn validateGroupControlEntry(alloc: std.mem.Allocator, group_id: u64, entry: App
         .raft_batch_protocol => {
             if (entry.value.len != @sizeOf(u16)) return error.InvalidGroupStateSnapshot;
             const version = std.mem.readInt(u16, entry.value[0..2], .little);
-            if (version == 0 or version > data_raft_protocol.batch_timestamp_protocol_version)
+            if (version == 0 or version > data_raft_protocol.batch_protocol_version)
                 return error.InvalidGroupStateSnapshot;
         },
         .split_state => {
@@ -1158,6 +1236,13 @@ fn validateGroupControlEntry(alloc: std.mem.Allocator, group_id: u64, entry: App
             {
                 return error.InvalidGroupStateSnapshot;
             }
+        },
+        .merge_source => _ = decodeMergeSourceState(entry.value) catch
+            return error.InvalidGroupStateSnapshot,
+        .merge_receiver => {
+            var state = merge_state.decodeAlloc(alloc, entry.value) catch
+                return error.InvalidGroupStateSnapshot;
+            state.deinit(alloc);
         },
         .delta => |sequence| {
             var delta = shard_mod.decodeSplitDeltaAlloc(alloc, sequence, entry.value) catch return error.InvalidGroupStateSnapshot;
@@ -1262,7 +1347,7 @@ fn groupControlStateTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, g
         out.deinit(alloc);
     }
 
-    var point_keys: [5][]u8 = undefined;
+    var point_keys: [7][]u8 = undefined;
     var initialized: usize = 0;
     defer for (point_keys[0..initialized]) |key| alloc.free(key);
     point_keys[initialized] = try groupRaftBatchProtocolKeyAlloc(alloc, group_id);
@@ -1274,6 +1359,10 @@ fn groupControlStateTxn(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, g
     point_keys[initialized] = try groupSplitAcknowledgementKeyAlloc(alloc, group_id);
     initialized += 1;
     point_keys[initialized] = try groupSplitTerminalKeyAlloc(alloc, group_id);
+    initialized += 1;
+    point_keys[initialized] = try groupMergeSourceStateKeyAlloc(alloc, group_id);
+    initialized += 1;
+    point_keys[initialized] = try groupMergeReceiverStateKeyAlloc(alloc, group_id);
     initialized += 1;
     for (point_keys) |key| {
         const borrowed = txn.get(key) catch |err| switch (err) {
@@ -2230,7 +2319,7 @@ fn appendRaftBatchProtocolEffect(
     writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
     deletes: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    if (version == 0 or version > data_raft_protocol.batch_timestamp_protocol_version)
+    if (version == 0 or version > data_raft_protocol.batch_protocol_version)
         return error.InvalidRaftBatchProtocolVersion;
     const current = try currentRaftBatchProtocolVersion(store, alloc, group_id);
     if (version < current) return error.RaftBatchProtocolVersionRegression;
@@ -2243,6 +2332,68 @@ fn appendRaftBatchProtocolEffect(
     errdefer alloc.free(value);
     std.mem.writeInt(u16, value[0..2], version, .little);
     try writes.append(alloc, .{ .key = key, .value = value });
+}
+
+fn validateMergeSourceIdentity(
+    state: AppliedMergeSourceState,
+    transition: MergeSourceTransition,
+) !void {
+    if (state.transition_id != transition.transition_id or
+        state.receiver_group_id != transition.receiver_group_id)
+        return error.ConflictingMergeTransition;
+}
+
+fn appendMergeSourceStateWrite(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    state: AppliedMergeSourceState,
+    writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    deletes: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const key = try groupMergeSourceStateKeyAlloc(alloc, group_id);
+    errdefer alloc.free(key);
+    removeOwnedWriteByKey(alloc, writes, key);
+    removeDeleteByKey(alloc, deletes, key);
+    const encoded = encodeMergeSourceState(state);
+    const value = try alloc.dupe(u8, &encoded);
+    errdefer alloc.free(value);
+    try writes.append(alloc, .{ .key = key, .value = value });
+}
+
+fn appendGroupRangeWrite(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    byte_range: AppliedDataRange,
+    writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    deletes: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const key = try groupRangeKeyAlloc(alloc, group_id);
+    errdefer alloc.free(key);
+    removeOwnedWriteByKey(alloc, writes, key);
+    removeDeleteByKey(alloc, deletes, key);
+    const value = try range_state.encodeRangeAlloc(alloc, byte_range);
+    errdefer alloc.free(value);
+    try writes.append(alloc, .{ .key = key, .value = value });
+}
+
+fn appendMergeReceiverStateWrite(
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    state: merge_state.State,
+    writes: *std.ArrayListUnmanaged(docstore.OwnedKVPair),
+    deletes: *std.ArrayListUnmanaged([]u8),
+) ![]const u8 {
+    const key = try groupMergeReceiverStateKeyAlloc(alloc, group_id);
+    errdefer alloc.free(key);
+    removeOwnedWriteByKey(alloc, writes, key);
+    removeDeleteByKey(alloc, deletes, key);
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    errdefer encoded.deinit(alloc);
+    try merge_state.encode(&encoded, alloc, state);
+    const value = try encoded.toOwnedSlice(alloc);
+    errdefer alloc.free(value);
+    try writes.append(alloc, .{ .key = key, .value = value });
+    return value;
 }
 
 pub fn appendOperationEffects(
@@ -2285,6 +2436,18 @@ pub fn appendOperationEffects(
         0;
     var split_terminal = try currentSplitTerminal(store, alloc, group_id);
     defer if (split_terminal) |terminal| freeSplitTerminal(alloc, terminal);
+    var merge_source_state = try currentMergeSourceState(store, alloc, group_id);
+    var merge_receiver_state = try currentMergeReceiverState(store, alloc, group_id);
+    defer if (merge_receiver_state) |*state| state.deinit(alloc);
+    var needs_raft_batch_protocol = false;
+    for (operations) |op| switch (op) {
+        .set_raft_batch_protocol, .merge_source_transition, .merge_receiver_checkpoint => needs_raft_batch_protocol = true,
+        else => {},
+    };
+    var raft_batch_protocol_version: u16 = if (needs_raft_batch_protocol)
+        try currentRaftBatchProtocolVersion(store, alloc, group_id)
+    else
+        0;
     var delta_writes = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
     defer {
         for (delta_writes.items) |write| {
@@ -2300,15 +2463,22 @@ pub fn appendOperationEffects(
     }
 
     for (operations) |op| switch (op) {
-        .set_raft_batch_protocol => |version| try appendRaftBatchProtocolEffect(
-            store,
-            alloc,
-            group_id,
-            version,
-            writes,
-            deletes,
-        ),
+        .set_raft_batch_protocol => |version| {
+            if (version < raft_batch_protocol_version)
+                return error.RaftBatchProtocolVersionRegression;
+            try appendRaftBatchProtocolEffect(
+                store,
+                alloc,
+                group_id,
+                version,
+                writes,
+                deletes,
+            );
+            raft_batch_protocol_version = version;
+        },
         .put => |put| {
+            if (merge_source_state != null and merge_source_state.?.phase == .finalized)
+                return error.MergeSourceFenced;
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
                 .split_key = state.split_key,
@@ -2334,6 +2504,8 @@ pub fn appendOperationEffects(
             }
         },
         .delete => |key_to_delete| {
+            if (merge_source_state != null and merge_source_state.?.phase == .finalized)
+                return error.MergeSourceFenced;
             const shard_split_state: ?shard_mod.SplitState = if (split_state) |state| .{
                 .phase = state.phase,
                 .split_key = state.split_key,
@@ -2620,6 +2792,92 @@ pub fn appendOperationEffects(
             freeSplitState(alloc, split_state.?);
             split_state = null;
         },
+        .merge_source_transition => |transition| {
+            if (raft_batch_protocol_version < data_raft_protocol.batch_merge_transition_protocol_version)
+                return error.RaftBatchMergeProtocolNotActivated;
+            if (transition.transition_id == 0 or transition.receiver_group_id == 0 or
+                transition.receiver_group_id == group_id or transition.raft_index == 0)
+                return error.InvalidMergeSourceTransition;
+            switch (transition.kind) {
+                .prepare => if (merge_source_state) |current| switch (current.phase) {
+                    .accepting => {
+                        try validateMergeSourceIdentity(current, transition);
+                        continue;
+                    },
+                    .finalized => return error.ConflictingMergeTransition,
+                    .rolled_back => {
+                        if (current.transition_id == transition.transition_id) {
+                            try validateMergeSourceIdentity(current, transition);
+                            continue;
+                        }
+                    },
+                },
+                .finalize => {
+                    const current = merge_source_state orelse return error.MergeTransitionNotReady;
+                    try validateMergeSourceIdentity(current, transition);
+                    switch (current.phase) {
+                        .accepting => {},
+                        .finalized => continue,
+                        .rolled_back => return error.ConflictingMergeTransition,
+                    }
+                },
+                .rollback => if (merge_source_state) |current| switch (current.phase) {
+                    .accepting => try validateMergeSourceIdentity(current, transition),
+                    .finalized => return error.ConflictingMergeTransition,
+                    .rolled_back => {
+                        if (current.transition_id == transition.transition_id) {
+                            try validateMergeSourceIdentity(current, transition);
+                            continue;
+                        }
+                    },
+                },
+            }
+            merge_source_state = .{
+                .transition_id = transition.transition_id,
+                .receiver_group_id = transition.receiver_group_id,
+                .phase = switch (transition.kind) {
+                    .prepare => .accepting,
+                    .finalize => .finalized,
+                    .rollback => .rolled_back,
+                },
+                .applied_index = transition.raft_index,
+            };
+            try appendMergeSourceStateWrite(
+                alloc,
+                group_id,
+                merge_source_state.?,
+                writes,
+                deletes,
+            );
+        },
+        .merge_receiver_checkpoint => |owned_checkpoint| {
+            if (raft_batch_protocol_version < data_raft_protocol.batch_merge_transition_protocol_version)
+                return error.RaftBatchMergeProtocolNotActivated;
+            const plan = try merge_state.planCheckpointApply(
+                if (merge_receiver_state) |*state| state else null,
+                byte_range,
+                owned_checkpoint.checkpoint,
+            );
+
+            const next_start = try alloc.dupe(u8, plan.range.start);
+            const next_end = alloc.dupe(u8, plan.range.end) catch |err| {
+                alloc.free(next_start);
+                return err;
+            };
+            range_state.freeRange(alloc, byte_range);
+            byte_range = .{ .start = next_start, .end = next_end };
+            try appendGroupRangeWrite(alloc, group_id, byte_range, writes, deletes);
+
+            const encoded_state = try appendMergeReceiverStateWrite(
+                alloc,
+                group_id,
+                plan.state,
+                writes,
+                deletes,
+            );
+            if (merge_receiver_state) |*state| state.deinit(alloc);
+            merge_receiver_state = try merge_state.decodeAlloc(alloc, encoded_state);
+        },
         .flush_split_delta => |raft_index| {
             if (split_state != null and split_state.?.phase == .splitting and
                 (delta_writes.items.len > 0 or delta_deletes.items.len > 0))
@@ -2797,6 +3055,45 @@ fn groupSplitAcknowledgementKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![
 
 fn groupSplitTerminalKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_split_terminal:{d}", .{group_id});
+}
+
+fn groupMergeSourceStateKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_merge_source:{d}", .{group_id});
+}
+
+fn groupMergeReceiverStateKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_merge_receiver:{d}", .{group_id});
+}
+
+const merge_source_state_format_version: u8 = 1;
+const merge_source_state_encoded_len = 1 + 1 + 8 + 8 + 8;
+
+fn encodeMergeSourceState(state: AppliedMergeSourceState) [merge_source_state_encoded_len]u8 {
+    var encoded: [merge_source_state_encoded_len]u8 = undefined;
+    encoded[0] = merge_source_state_format_version;
+    encoded[1] = @intFromEnum(state.phase);
+    std.mem.writeInt(u64, encoded[2..10], state.transition_id, .little);
+    std.mem.writeInt(u64, encoded[10..18], state.receiver_group_id, .little);
+    std.mem.writeInt(u64, encoded[18..26], state.applied_index, .little);
+    return encoded;
+}
+
+fn decodeMergeSourceState(encoded: []const u8) !AppliedMergeSourceState {
+    if (encoded.len != merge_source_state_encoded_len or
+        encoded[0] != merge_source_state_format_version)
+        return error.InvalidMergeSourceState;
+    const phase = std.enums.fromInt(MergeSourcePhase, encoded[1]) orelse
+        return error.InvalidMergeSourceState;
+    const state: AppliedMergeSourceState = .{
+        .phase = phase,
+        .transition_id = std.mem.readInt(u64, encoded[2..10], .little),
+        .receiver_group_id = std.mem.readInt(u64, encoded[10..18], .little),
+        .applied_index = std.mem.readInt(u64, encoded[18..26], .little),
+    };
+    if (state.transition_id == 0 or state.receiver_group_id == 0 or
+        state.applied_index == 0)
+        return error.InvalidMergeSourceState;
+    return state;
 }
 
 fn groupSplitDeltaPrefixAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {

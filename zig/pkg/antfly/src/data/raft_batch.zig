@@ -20,6 +20,7 @@ const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig"
 pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_version;
 pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
 pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;
+pub const merge_transition_protocol_version = internal_batch_forwarding.raft_batch_merge_transition_protocol_version;
 
 pub const OwnedReplicatedBatch = struct {
     table_name: []u8,
@@ -43,7 +44,7 @@ pub fn encodeProtocolBarrier(
     table_name: []const u8,
     version: u16,
 ) ![]u8 {
-    if (version == 0 or version > timestamp_protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
+    if (version == 0 or version > protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
     return try std.fmt.allocPrint(
         alloc,
         "{{\"table\":{f},\"protocol_barrier\":{d},\"batch\":null}}",
@@ -89,7 +90,7 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
             return error.InvalidReplicatedBatch;
         }
         const version: u16 = @intCast(barrier_value.integer);
-        if (version > timestamp_protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
+        if (version > protocol_version) return error.UnsupportedRaftBatchProtocolVersion;
         if (batch_value != .null) return error.InvalidReplicatedBatch;
         return .{
             .table_name = table_name,
@@ -133,7 +134,7 @@ test "raft protocol barrier rejects unsupported future versions" {
     const encoded = try std.fmt.allocPrint(
         std.testing.allocator,
         "{{\"table\":\"docs\",\"protocol_barrier\":{d},\"batch\":null}}",
-        .{timestamp_protocol_version + 1},
+        .{protocol_version + 1},
     );
     defer std.testing.allocator.free(encoded);
     try std.testing.expectError(
@@ -249,6 +250,25 @@ test "raft batch round trips internal merge checkpoint" {
     try std.testing.expectEqualStrings("doc:z", checkpoint.merged_end);
     try std.testing.expectEqual(@as(u64, 19), checkpoint.bootstrap_applied_index);
     try std.testing.expect(checkpoint.receiver_identity_reassignment_namespace.?.eql(namespace));
+}
+
+test "raft batch round trips merge source transition" {
+    const encoded = try encode(std.testing.allocator, "docs", .{
+        .merge_source_transition = .{
+            .kind = .finalize,
+            .transition_id = 40,
+            .receiver_group_id = 42,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = try decode(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    const transition = decoded.batch.req.merge_source_transition orelse
+        return error.TestExpectedEqual;
+    try std.testing.expectEqual(db_mod.types.MergeSourceTransitionMutation.Kind.finalize, transition.kind);
+    try std.testing.expectEqual(@as(u64, 40), transition.transition_id);
+    try std.testing.expectEqual(@as(u64, 42), transition.receiver_group_id);
 }
 
 test "raft batch round trips deterministic transaction begin" {

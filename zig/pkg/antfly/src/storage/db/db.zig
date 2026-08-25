@@ -88950,7 +88950,7 @@ test "db replicated merge checkpoints persist phase range and watermark across r
         defer db.close();
         try db.updateRange(base_range);
         try db.batchReplicatedApply(.{ .merge_checkpoint = checkpoint_base });
-        try std.testing.expectEqualStrings("doc:m", db.getRange().start);
+        try std.testing.expectEqualStrings("doc:a", db.getRange().start);
 
         var premature_finalize = checkpoint_base;
         premature_finalize.kind = .finalize;

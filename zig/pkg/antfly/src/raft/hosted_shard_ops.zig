@@ -156,22 +156,22 @@ pub const HostedShardOperationAdapter = struct {
 
     fn acceptMergeReceiver(ptr: *anyopaque, _: u64, op: AcceptMergeReceiver) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
-        try self.executeRouted(self.data_router, op.receiver_group_id, .{ .accept_merge_receiver = op });
+        try self.executeRouted(self.data_router, op.donor_group_id, .{ .accept_merge_receiver = op });
     }
 
     fn catchUpMergeReceiver(ptr: *anyopaque, _: u64, op: CatchUpMergeReceiver) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
-        try self.executeRouted(self.data_router, op.receiver_group_id, .{ .catch_up_merge_receiver = op });
+        try self.executeRouted(self.data_router, op.donor_group_id, .{ .catch_up_merge_receiver = op });
     }
 
     fn finalizeMerge(ptr: *anyopaque, _: u64, op: FinalizeMerge) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
-        try self.executeRouted(self.data_router, op.receiver_group_id, .{ .finalize_merge = op });
+        try self.executeRouted(self.data_router, op.donor_group_id, .{ .finalize_merge = op });
     }
 
     fn rollbackMerge(ptr: *anyopaque, _: u64, op: RollbackMerge) !void {
         const self: *HostedShardOperationAdapter = @ptrCast(@alignCast(ptr));
-        try self.executeRouted(self.data_router, op.receiver_group_id, .{ .rollback_merge = op });
+        try self.executeRouted(self.data_router, op.donor_group_id, .{ .rollback_merge = op });
     }
 
     fn observeSplitRouted(self: *HostedShardOperationAdapter, record: metadata_transition_state.SplitTransitionRecord) !metadata_transition_state.SplitObservation {
@@ -206,7 +206,7 @@ pub const HostedShardOperationAdapter = struct {
     }
 
     fn observeMergeRouted(self: *HostedShardOperationAdapter, record: metadata_transition_state.MergeTransitionRecord) !metadata_transition_state.MergeObservation {
-        var route = (try api_table_router.resolveGroupRoute(self.alloc, self.catalog, self.data_router, record.receiver_group_id, .prefer_leader)) orelse return error.UnknownGroup;
+        var route = (try api_table_router.resolveGroupRoute(self.alloc, self.catalog, self.data_router, record.donor_group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(self.alloc);
         const attempted_node_id = switch (route) {
             .local => self.data_router.localNodeId(),
@@ -219,12 +219,12 @@ pub const HostedShardOperationAdapter = struct {
                     if (!isLeaderRediscoveryError(err)) return err;
                     break :preferred err;
                 };
-                observation.receiver_local_leader = true;
+                observation.donor_local_leader = true;
                 return observation;
             },
             .remote => |remote| {
                 var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
-                return client.fetchGroupShardObserveMerge(remote.base_uri, record.receiver_group_id, record) catch |err| {
+                return client.fetchGroupShardObserveMerge(remote.base_uri, record.donor_group_id, record) catch |err| {
                     if (!isLeaderRediscoveryError(err)) return err;
                     break :preferred err;
                 };
@@ -307,7 +307,7 @@ pub const HostedShardOperationAdapter = struct {
         record: metadata_transition_state.MergeTransitionRecord,
         attempted_node_id: u64,
     ) !metadata_transition_state.MergeObservation {
-        const node_ids = (try self.data_router.groupNodeIds(self.alloc, record.receiver_group_id)) orelse
+        const node_ids = (try self.data_router.groupNodeIds(self.alloc, record.donor_group_id)) orelse
             return error.GroupLeaderUnavailable;
         defer self.alloc.free(node_ids);
         for (node_ids) |node_id| {
@@ -327,20 +327,20 @@ pub const HostedShardOperationAdapter = struct {
         node_id: u64,
     ) !metadata_transition_state.MergeObservation {
         if (node_id == self.data_router.localNodeId()) {
-            if (self.data_router.localStatus(record.receiver_group_id) != .active) return error.UnknownGroup;
+            if (self.data_router.localStatus(record.donor_group_id) != .active) return error.UnknownGroup;
             const local_ops = self.local_ops orelse return error.UnsupportedOperation;
             var observation = try local_ops.observeMerge(record);
-            observation.receiver_local_leader = true;
+            observation.donor_local_leader = true;
             return observation;
         }
-        if (self.data_router.nodeStatus(node_id, record.receiver_group_id)) |status| {
+        if (self.data_router.nodeStatus(node_id, record.donor_group_id)) |status| {
             if (status != .active) return error.UnknownGroup;
         }
-        const base_uri = (try self.data_router.nodeBaseUriForGroup(self.alloc, record.receiver_group_id, node_id)) orelse
+        const base_uri = (try self.data_router.nodeBaseUriForGroup(self.alloc, record.donor_group_id, node_id)) orelse
             return error.UnknownGroup;
         defer self.alloc.free(base_uri);
         var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
-        return try client.fetchGroupShardObserveMerge(base_uri, record.receiver_group_id, record);
+        return try client.fetchGroupShardObserveMerge(base_uri, record.donor_group_id, record);
     }
 
     fn executeFromCandidates(
@@ -639,12 +639,12 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
             return 1;
         }
 
-        fn localStatus(_: *anyopaque, _: u64) @import("host.zig").HostedReplicaStatus {
-            return .active;
+        fn localStatus(_: *anyopaque, group_id: u64) @import("host.zig").HostedReplicaStatus {
+            return if (group_id == 77) .active else .absent;
         }
 
-        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
-            return 1;
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 77) 1 else 2;
         }
 
         fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) @import("host.zig").HostedReplicaStatus {
@@ -658,6 +658,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
 
     const FakeShardOps = struct {
         execute_called: bool = false,
+        merge_called: bool = false,
 
         fn adapter(self: *@This()) shard_ops.ShardOperationAdapter {
             return .{
@@ -671,7 +672,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
                     .catch_up_split_destination = noopCatchUpSplitDestination,
                     .finalize_split_source = noopFinalizeSplitSource,
                     .rollback_split = noopRollbackSplit,
-                    .accept_merge_receiver = noopAcceptMergeReceiver,
+                    .accept_merge_receiver = acceptMergeReceiver,
                     .catch_up_merge_receiver = noopCatchUpMergeReceiver,
                     .finalize_merge = noopFinalizeMerge,
                     .rollback_merge = noopRollbackMerge,
@@ -721,7 +722,10 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
         fn noopCatchUpSplitDestination(_: *anyopaque, _: u64, _: CatchUpSplitDestination) !void {}
         fn noopFinalizeSplitSource(_: *anyopaque, _: u64, _: FinalizeSplitSource) !void {}
         fn noopRollbackSplit(_: *anyopaque, _: u64, _: RollbackSplit) !void {}
-        fn noopAcceptMergeReceiver(_: *anyopaque, _: u64, _: AcceptMergeReceiver) !void {}
+        fn acceptMergeReceiver(ptr: *anyopaque, _: u64, _: AcceptMergeReceiver) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.merge_called = true;
+        }
         fn noopCatchUpMergeReceiver(_: *anyopaque, _: u64, _: CatchUpMergeReceiver) !void {}
         fn noopFinalizeMerge(_: *anyopaque, _: u64, _: FinalizeMerge) !void {}
         fn noopRollbackMerge(_: *anyopaque, _: u64, _: RollbackMerge) !void {}
@@ -758,6 +762,24 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
         },
     });
     try std.testing.expect(fake_ops.execute_called);
+
+    const merge_record: metadata_transition_state.MergeTransitionRecord = .{
+        .transition_id = 2,
+        .donor_group_id = 77,
+        .receiver_group_id = 78,
+        .table_contract = test_transition_table_contract,
+    };
+    const merge_observation = try hosted.adapter().observeMerge(merge_record);
+    try std.testing.expect(merge_observation.donor_local_leader);
+    try hosted.adapter().execute(.{
+        .accept_merge_receiver = .{
+            .transition_id = 2,
+            .donor_group_id = 77,
+            .receiver_group_id = 78,
+            .table_contract = test_transition_table_contract,
+        },
+    });
+    try std.testing.expect(fake_ops.merge_called);
 }
 
 test "hosted shard operation adapter rediscovers leader across placed replicas" {

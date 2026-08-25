@@ -22,6 +22,8 @@ const background_runtime = @import("../../storage/background_runtime.zig");
 const docstore = @import("../../storage/docstore.zig");
 const generation_lifecycle = @import("../../storage/db/generation_lifecycle.zig");
 const range_state = @import("../../storage/db/range_state.zig");
+const db_types = @import("../../storage/db/types.zig");
+const merge_state = @import("../../storage/db/merge_state.zig");
 const lsm_backend = @import("../../storage/lsm_backend.zig");
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
@@ -1170,6 +1172,34 @@ pub const RaftApplyStore = struct {
         return try shard_state_store.currentSplitState(&group_store.store, alloc, group_id);
     }
 
+    pub fn currentMergeSourceState(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !?shard_state_store.AppliedMergeSourceState {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.requireTransitionReadyLocked(shard, group_id);
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return null;
+        return try shard_state_store.currentMergeSourceState(&group_store.store, alloc, group_id);
+    }
+
+    pub fn currentMergeReceiverState(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+    ) !?merge_state.State {
+        const io = self.io_impl.io();
+        const shard = self.batchShard(group_id);
+        shard.mutex.lockUncancelable(io);
+        defer shard.mutex.unlock(io);
+        try self.requireTransitionReadyLocked(shard, group_id);
+        const group_store = (try self.readableGroupStoreLocked(shard, group_id)) orelse return null;
+        return try shard_state_store.currentMergeReceiverState(&group_store.store, alloc, group_id);
+    }
+
     /// Reads all source split control fields under one apply-store shard lock.
     /// Unlike the general state accessors, observation fails fast while a new
     /// generation is staging so control-plane polling cannot wedge serving
@@ -1497,7 +1527,8 @@ pub const RaftApplyStore = struct {
                     self.alloc.free(range.end);
                 },
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| self.alloc.free(transition.split_key),
-                .acknowledge_split, .set_raft_batch_protocol, .flush_split_delta => {},
+                .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(self.alloc),
+                .acknowledge_split, .merge_source_transition, .set_raft_batch_protocol, .flush_split_delta => {},
             };
             self.alloc.free(metadata.operations);
         }
@@ -1644,7 +1675,8 @@ pub const RaftApplyStore = struct {
                     alloc.free(range.end);
                 },
                 .prepare_split, .start_split, .finalize_split, .rollback_split => |transition| alloc.free(transition.split_key),
-                .acknowledge_split, .set_raft_batch_protocol, .flush_split_delta => {},
+                .merge_receiver_checkpoint => |checkpoint| checkpoint.deinit(alloc),
+                .acknowledge_split, .merge_source_transition, .set_raft_batch_protocol, .flush_split_delta => {},
             };
             operations.deinit(alloc);
         }
@@ -1878,7 +1910,37 @@ pub const RaftApplyStore = struct {
                 } });
             }
         }
+        if (decoded.batch.req.merge_source_transition) |transition| {
+            try operations.append(alloc, .{ .merge_source_transition = .{
+                .kind = switch (transition.kind) {
+                    .prepare => .prepare,
+                    .finalize => .finalize,
+                    .rollback => .rollback,
+                },
+                .transition_id = transition.transition_id,
+                .receiver_group_id = transition.receiver_group_id,
+                .raft_index = raft_index,
+            } });
+        }
         if (operations.items.len != operation_start) try operations.append(alloc, .{ .flush_split_delta = raft_index });
+        if (decoded.batch.req.merge_checkpoint) |checkpoint| {
+            const receiver_base_start = try alloc.dupe(u8, checkpoint.receiver_base_start);
+            errdefer alloc.free(receiver_base_start);
+            const receiver_base_end = try alloc.dupe(u8, checkpoint.receiver_base_end);
+            errdefer alloc.free(receiver_base_end);
+            const merged_start = try alloc.dupe(u8, checkpoint.merged_start);
+            errdefer alloc.free(merged_start);
+            const merged_end = try alloc.dupe(u8, checkpoint.merged_end);
+            errdefer alloc.free(merged_end);
+            var owned = checkpoint;
+            owned.receiver_base_start = receiver_base_start;
+            owned.receiver_base_end = receiver_base_end;
+            owned.merged_start = merged_start;
+            owned.merged_end = merged_end;
+            try operations.append(alloc, .{ .merge_receiver_checkpoint = .{
+                .checkpoint = owned,
+            } });
+        }
     }
 };
 
@@ -1949,7 +2011,7 @@ test "data raft protocol barrier persists and transfers in snapshots" {
     const barrier = try data_raft_batch.encodeProtocolBarrier(
         std.testing.allocator,
         "docs",
-        data_raft_batch.timestamp_protocol_version,
+        data_raft_batch.merge_transition_protocol_version,
     );
     defer std.testing.allocator.free(barrier);
     const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
@@ -1965,7 +2027,7 @@ test "data raft protocol barrier persists and transfers in snapshots" {
         .entries_bytes = entries,
     });
     try std.testing.expectEqual(
-        data_raft_batch.timestamp_protocol_version,
+        data_raft_batch.merge_transition_protocol_version,
         try source.raftBatchProtocolVersionForRequest(45),
     );
 
@@ -1984,7 +2046,7 @@ test "data raft protocol barrier persists and transfers in snapshots" {
         snapshot,
     ));
     try std.testing.expectEqual(
-        data_raft_batch.timestamp_protocol_version,
+        data_raft_batch.merge_transition_protocol_version,
         try target.raftBatchProtocolVersionForRequest(45),
     );
 }
@@ -2528,6 +2590,394 @@ test "data raft apply store persists split destination acknowledgements" {
     try std.testing.expectEqual(@as(u64, 201), acknowledgement.transition_id);
     try std.testing.expectEqual(@as(u64, 202), acknowledgement.destination_group_id);
     try std.testing.expectEqual(@as(u64, 1), acknowledgement.delta_sequence);
+}
+
+test "data raft merge source fence persists and transfers in snapshots" {
+    const alloc = std.testing.allocator;
+    const group_id: u64 = 401;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-source", .{tmp.sub_path});
+    defer alloc.free(source_root);
+    const target_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-target", .{tmp.sub_path});
+    defer alloc.free(target_root);
+
+    const Apply = struct {
+        fn barrier(
+            allocator: std.mem.Allocator,
+            store: *RaftApplyStore,
+            group: u64,
+            index: u64,
+        ) !void {
+            const payload = try data_raft_batch.encodeProtocolBarrier(
+                allocator,
+                "docs",
+                data_raft_batch.merge_transition_protocol_version,
+            );
+            defer allocator.free(payload);
+            const entries = try raft_state_machine.encodeCommittedEntries(allocator, &.{.{
+                .term = 1,
+                .index = index,
+                .entry_type = .normal,
+                .data = payload,
+            }});
+            defer allocator.free(entries);
+            try store.snapshotBuilder().applyBatch(.{
+                .group_id = group,
+                .commit_index = index,
+                .entries_bytes = entries,
+            });
+        }
+
+        fn command(
+            allocator: std.mem.Allocator,
+            store: *RaftApplyStore,
+            group: u64,
+            index: u64,
+            req: db_types.BatchRequest,
+        ) !void {
+            const batch = try data_raft_batch.encode(allocator, "docs", req);
+            defer allocator.free(batch);
+            const entries = try raft_state_machine.encodeCommittedEntries(allocator, &.{.{
+                .term = 1,
+                .index = index,
+                .entry_type = .normal,
+                .data = batch,
+            }});
+            defer allocator.free(entries);
+            try store.snapshotBuilder().applyBatch(.{
+                .group_id = group,
+                .commit_index = index,
+                .entries_bytes = entries,
+            });
+        }
+    };
+
+    var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
+    defer source.deinit();
+    try std.testing.expectError(error.RaftBatchMergeProtocolNotActivated, Apply.command(alloc, &source, group_id, 1, .{
+        .merge_source_transition = .{
+            .kind = .prepare,
+            .transition_id = 400,
+            .receiver_group_id = 402,
+        },
+    }));
+    try Apply.barrier(alloc, &source, group_id, 1);
+    try Apply.command(alloc, &source, group_id, 2, .{
+        .merge_source_transition = .{
+            .kind = .prepare,
+            .transition_id = 400,
+            .receiver_group_id = 402,
+        },
+    });
+    try Apply.command(alloc, &source, group_id, 3, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"v\":1}" }},
+    });
+    try Apply.command(alloc, &source, group_id, 4, .{
+        .merge_source_transition = .{
+            .kind = .finalize,
+            .transition_id = 400,
+            .receiver_group_id = 402,
+        },
+    });
+    const finalized = (try source.currentMergeSourceState(alloc, group_id)) orelse
+        return error.MissingMergeSourceState;
+    try std.testing.expectEqual(shard_state_store.MergeSourcePhase.finalized, finalized.phase);
+    try std.testing.expectEqual(@as(u64, 4), finalized.applied_index);
+    try std.testing.expectError(error.MergeSourceFenced, Apply.command(alloc, &source, group_id, 5, .{
+        .writes = &.{.{ .key = "doc:b", .value = "{}" }},
+    }));
+
+    const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group_id);
+    defer alloc.free(snapshot);
+    var target = try RaftApplyStore.init(alloc, .{ .root_dir = target_root });
+    defer target.deinit();
+    try target.installSnapshot(alloc, group_id, 4, snapshot);
+    const restored = (try target.currentMergeSourceState(alloc, group_id)) orelse
+        return error.MissingMergeSourceState;
+    try std.testing.expectEqual(shard_state_store.MergeSourcePhase.finalized, restored.phase);
+    try std.testing.expectEqual(@as(u64, 4), restored.applied_index);
+    try std.testing.expectError(error.ConflictingMergeTransition, Apply.command(alloc, &target, group_id, 5, .{
+        .merge_source_transition = .{
+            .kind = .rollback,
+            .transition_id = 400,
+            .receiver_group_id = 402,
+        },
+    }));
+}
+
+test "data raft merge receiver checkpoint expands monotonically and snapshots" {
+    const alloc = std.testing.allocator;
+    const group_id: u64 = 502;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-receiver", .{tmp.sub_path});
+    defer alloc.free(source_root);
+    const target_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-receiver-target", .{tmp.sub_path});
+    defer alloc.free(target_root);
+
+    const Apply = struct {
+        fn barrier(
+            allocator: std.mem.Allocator,
+            store: *RaftApplyStore,
+            group: u64,
+            index: u64,
+        ) !void {
+            const payload = try data_raft_batch.encodeProtocolBarrier(
+                allocator,
+                "docs",
+                data_raft_batch.merge_transition_protocol_version,
+            );
+            defer allocator.free(payload);
+            const entries = try raft_state_machine.encodeCommittedEntries(allocator, &.{.{
+                .term = 1,
+                .index = index,
+                .entry_type = .normal,
+                .data = payload,
+            }});
+            defer allocator.free(entries);
+            try store.snapshotBuilder().applyBatch(.{
+                .group_id = group,
+                .commit_index = index,
+                .entries_bytes = entries,
+            });
+        }
+
+        fn command(
+            allocator: std.mem.Allocator,
+            store: *RaftApplyStore,
+            group: u64,
+            index: u64,
+            req: db_types.BatchRequest,
+        ) !void {
+            const batch = try data_raft_batch.encode(allocator, "docs", req);
+            defer allocator.free(batch);
+            const entries = try raft_state_machine.encodeCommittedEntries(allocator, &.{.{
+                .term = 1,
+                .index = index,
+                .entry_type = .normal,
+                .data = batch,
+            }});
+            defer allocator.free(entries);
+            try store.snapshotBuilder().applyBatch(.{
+                .group_id = group,
+                .commit_index = index,
+                .entries_bytes = entries,
+            });
+        }
+    };
+    const base_range: AppliedDataRange = .{ .start = "doc:m", .end = "" };
+    const checkpoint: db_types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 500,
+        .donor_group_id = 501,
+        .receiver_group_id = group_id,
+        .receiver_base_start = base_range.start,
+        .receiver_base_end = base_range.end,
+        .merged_start = "doc:a",
+        .merged_end = "",
+    };
+
+    var source = try RaftApplyStore.init(alloc, .{ .root_dir = source_root });
+    defer source.deinit();
+    try std.testing.expect(try source.seedGroupSnapshotIfAbsent(
+        alloc,
+        group_id,
+        1,
+        base_range,
+        &.{.{ .key = "doc:z", .value = "{\"side\":\"receiver\"}" }},
+    ));
+    try Apply.barrier(alloc, &source, group_id, 1);
+    try Apply.command(alloc, &source, group_id, 2, .{ .merge_checkpoint = checkpoint });
+    var current_range = try source.currentRange(alloc, group_id);
+    try std.testing.expectEqualStrings("doc:a", current_range.start);
+    range_state.freeRange(alloc, current_range);
+    try Apply.command(alloc, &source, group_id, 3, .{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"side\":\"donor\"}" }},
+    });
+    var complete = checkpoint;
+    complete.kind = .bootstrap_complete;
+    complete.bootstrap_applied_index = 3;
+    try Apply.command(alloc, &source, group_id, 4, .{ .merge_checkpoint = complete });
+    var finalized = complete;
+    finalized.kind = .finalize;
+    try Apply.command(alloc, &source, group_id, 5, .{ .merge_checkpoint = finalized });
+    try Apply.command(alloc, &source, group_id, 6, .{ .merge_checkpoint = checkpoint });
+
+    var receiver_state = (try source.currentMergeReceiverState(alloc, group_id)) orelse
+        return error.MissingMergeReceiverState;
+    defer receiver_state.deinit(alloc);
+    try std.testing.expectEqual(merge_state.Phase.finalized, receiver_state.phase);
+    try std.testing.expectEqual(@as(u64, 3), receiver_state.bootstrap_applied_index);
+
+    const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group_id);
+    defer alloc.free(snapshot);
+    var target = try RaftApplyStore.init(alloc, .{ .root_dir = target_root });
+    defer target.deinit();
+    try target.installSnapshot(alloc, group_id, 6, snapshot);
+    current_range = try target.currentRange(alloc, group_id);
+    defer range_state.freeRange(alloc, current_range);
+    try std.testing.expectEqualStrings("doc:a", current_range.start);
+    var restored = (try target.currentMergeReceiverState(alloc, group_id)) orelse
+        return error.MissingMergeReceiverState;
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(merge_state.Phase.finalized, restored.phase);
+    try std.testing.expectEqual(@as(u64, 500), restored.transition_id);
+    const entries = try target.groupState(alloc, group_id);
+    defer shard_state_store.freeGroupStateEntries(alloc, entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+}
+
+test "data raft merge controls converge across three replicas" {
+    const alloc = std.testing.allocator;
+    const donor_group_id: u64 = 601;
+    const receiver_group_id: u64 = 602;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var roots: [3][]u8 = undefined;
+    var roots_initialized: usize = 0;
+    defer for (roots[0..roots_initialized]) |root| alloc.free(root);
+    for (&roots, 0..) |*root, i| {
+        root.* = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-replica-{d}", .{ tmp.sub_path, i });
+        roots_initialized += 1;
+    }
+    var stores = [3]RaftApplyStore{
+        try RaftApplyStore.init(alloc, .{ .root_dir = roots[0] }),
+        try RaftApplyStore.init(alloc, .{ .root_dir = roots[1] }),
+        try RaftApplyStore.init(alloc, .{ .root_dir = roots[2] }),
+    };
+    defer for (&stores) |*store| store.deinit();
+    for (&stores) |*store| {
+        try std.testing.expect(try store.seedGroupSnapshotIfAbsent(
+            alloc,
+            donor_group_id,
+            1,
+            .{ .start = "doc:a", .end = "doc:m" },
+            &.{.{ .key = "doc:b", .value = "{\"owner\":\"donor\"}" }},
+        ));
+        try std.testing.expect(try store.seedGroupSnapshotIfAbsent(
+            alloc,
+            receiver_group_id,
+            1,
+            .{ .start = "doc:m", .end = "" },
+            &.{.{ .key = "doc:z", .value = "{\"owner\":\"receiver\"}" }},
+        ));
+    }
+    const Apply = struct {
+        fn barrier(
+            allocator: std.mem.Allocator,
+            replicas: *[3]RaftApplyStore,
+            group_id: u64,
+            index: u64,
+        ) !void {
+            const payload = try data_raft_batch.encodeProtocolBarrier(
+                allocator,
+                "docs",
+                data_raft_batch.merge_transition_protocol_version,
+            );
+            defer allocator.free(payload);
+            const entries = try raft_state_machine.encodeCommittedEntries(allocator, &.{.{
+                .term = 2,
+                .index = index,
+                .entry_type = .normal,
+                .data = payload,
+            }});
+            defer allocator.free(entries);
+            for (replicas) |*store| try store.snapshotBuilder().applyBatch(.{
+                .group_id = group_id,
+                .commit_index = index,
+                .entries_bytes = entries,
+            });
+        }
+
+        fn all(
+            allocator: std.mem.Allocator,
+            replicas: *[3]RaftApplyStore,
+            group_id: u64,
+            index: u64,
+            req: db_types.BatchRequest,
+        ) !void {
+            const batch = try data_raft_batch.encode(allocator, "docs", req);
+            defer allocator.free(batch);
+            const entries = try raft_state_machine.encodeCommittedEntries(allocator, &.{.{
+                .term = 2,
+                .index = index,
+                .entry_type = .normal,
+                .data = batch,
+            }});
+            defer allocator.free(entries);
+            for (replicas) |*store| try store.snapshotBuilder().applyBatch(.{
+                .group_id = group_id,
+                .commit_index = index,
+                .entries_bytes = entries,
+            });
+        }
+    };
+    try Apply.barrier(alloc, &stores, donor_group_id, 1);
+    try Apply.barrier(alloc, &stores, receiver_group_id, 1);
+    try Apply.all(alloc, &stores, donor_group_id, 2, .{
+        .merge_source_transition = .{
+            .kind = .prepare,
+            .transition_id = 600,
+            .receiver_group_id = receiver_group_id,
+        },
+    });
+    const accept: db_types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = 600,
+        .donor_group_id = donor_group_id,
+        .receiver_group_id = receiver_group_id,
+        .receiver_base_start = "doc:m",
+        .receiver_base_end = "",
+        .merged_start = "doc:a",
+        .merged_end = "",
+    };
+    try Apply.all(alloc, &stores, receiver_group_id, 2, .{ .merge_checkpoint = accept });
+    try Apply.all(alloc, &stores, donor_group_id, 3, .{
+        .writes = &.{.{ .key = "doc:c", .value = "{\"generation\":2}" }},
+    });
+    try Apply.all(alloc, &stores, receiver_group_id, 3, .{
+        .writes = &.{
+            .{ .key = "doc:b", .value = "{\"owner\":\"donor\"}" },
+            .{ .key = "doc:c", .value = "{\"generation\":2}" },
+        },
+    });
+    var complete = accept;
+    complete.kind = .bootstrap_complete;
+    complete.bootstrap_applied_index = 3;
+    try Apply.all(alloc, &stores, receiver_group_id, 4, .{ .merge_checkpoint = complete });
+    try Apply.all(alloc, &stores, donor_group_id, 4, .{
+        .merge_source_transition = .{
+            .kind = .finalize,
+            .transition_id = 600,
+            .receiver_group_id = receiver_group_id,
+        },
+    });
+    var finalized = complete;
+    finalized.kind = .finalize;
+    finalized.bootstrap_applied_index = 4;
+    try Apply.all(alloc, &stores, receiver_group_id, 5, .{ .merge_checkpoint = finalized });
+
+    for (&stores) |*store| {
+        const source = (try store.currentMergeSourceState(alloc, donor_group_id)) orelse
+            return error.MissingMergeSourceState;
+        try std.testing.expectEqual(shard_state_store.MergeSourcePhase.finalized, source.phase);
+        try std.testing.expectEqual(@as(u64, 4), source.applied_index);
+        var receiver = (try store.currentMergeReceiverState(alloc, receiver_group_id)) orelse
+            return error.MissingMergeReceiverState;
+        defer receiver.deinit(alloc);
+        try std.testing.expectEqual(merge_state.Phase.finalized, receiver.phase);
+        try std.testing.expectEqual(@as(u64, 4), receiver.bootstrap_applied_index);
+        const byte_range = try store.currentRange(alloc, receiver_group_id);
+        defer range_state.freeRange(alloc, byte_range);
+        try std.testing.expectEqualStrings("doc:a", byte_range.start);
+        const documents = try store.groupState(alloc, receiver_group_id);
+        defer shard_state_store.freeGroupStateEntries(alloc, documents);
+        try std.testing.expectEqual(@as(usize, 3), documents.len);
+        try std.testing.expectEqualStrings("doc:b", documents[0].key);
+        try std.testing.expectEqualStrings("doc:c", documents[1].key);
+        try std.testing.expectEqualStrings("doc:z", documents[2].key);
+    }
 }
 
 test "data raft apply store skips persisted split commands in overlapping replay" {

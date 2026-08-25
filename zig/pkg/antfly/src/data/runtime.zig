@@ -1365,6 +1365,7 @@ const RaftTableApplyStateMachine = struct {
 
 fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
     if (req.split_transition != null) return false;
+    if (req.merge_source_transition != null) return false;
     if (req.split_checkpoint) |checkpoint| {
         if (checkpoint.kind == .source_ack and
             req.writes.len == 0 and req.deletes.len == 0 and req.transforms.len == 0 and
@@ -1375,6 +1376,11 @@ fn batchRequiresDocumentDbApply(req: antfly.db.types.BatchRequest) bool {
         }
     }
     return true;
+}
+
+fn batchMutatesDocuments(req: antfly.db.types.BatchRequest) bool {
+    return req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+        req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.transaction != null;
 }
 
 /// Backs the standalone data server's health/metrics endpoints. Readiness is
@@ -2601,6 +2607,7 @@ const DataRaftProtocolActivationEntry = struct {
     /// entries in that term, but is not reusable after leadership changes
     /// until the durable apply-store marker is visible.
     pending_term: std.atomic.Value(u64) = .init(0),
+    pending_version: std.atomic.Value(u16) = .init(0),
 
     fn retain(self: *@This()) void {
         const previous = self.ref_count.fetchAdd(1, .monotonic);
@@ -2616,8 +2623,7 @@ const DataRaftProtocolActivationEntry = struct {
 
 const DataRaftBatchProtocolPreflight = struct {
     conf_state_fingerprint: u64 = 0,
-    timestamp_supported: bool = false,
-    barrier_supported: bool = false,
+    activatable_version: u16 = 0,
 };
 
 const DataRaftProtocolPeer = struct {
@@ -7256,6 +7262,12 @@ pub const DataServer = struct {
         return legacy_req;
     }
 
+    fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (req.merge_source_transition != null or req.merge_checkpoint != null)
+            return data_raft_batch.merge_transition_protocol_version;
+        return data_raft_batch.timestamp_protocol_version;
+    }
+
     fn dataRaftConfStateFingerprint(conf_state: raft_engine.core.ConfState) u64 {
         var hasher = std.hash.Wyhash.init(0xd8e4d9c9735c54a1);
         const replica_sets = [_][]const u64{
@@ -7406,12 +7418,15 @@ pub const DataServer = struct {
         return try store.raftBatchProtocolVersionForRequest(group_id);
     }
 
-    fn dataRaftTimestampProtocolUsable(
+    fn dataRaftProtocolUsable(
         entry: *const DataRaftProtocolActivationEntry,
         leader_term: u64,
+        required_version: u16,
     ) bool {
-        return entry.protocol_version.load(.acquire) >= data_raft_batch.timestamp_protocol_version or
-            (leader_term != 0 and entry.pending_term.load(.acquire) == leader_term);
+        return entry.protocol_version.load(.acquire) >= required_version or
+            (leader_term != 0 and
+                entry.pending_term.load(.acquire) == leader_term and
+                entry.pending_version.load(.acquire) >= required_version);
     }
 
     fn reusableDataRaftProtocolCapability(
@@ -7573,10 +7588,15 @@ pub const DataServer = struct {
         self: *DataServer,
         alloc: std.mem.Allocator,
         plan: DataRaftProtocolProbePlan,
+        required_version: u16,
         deadline_ns: u64,
         cancellation: ?*const antfly.raft.transport.http_common.RequestCancellation,
     ) DataRaftBatchProtocolPreflight {
         if (!plan.routes_complete) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+        const minimum_peer_version = if (required_version >= data_raft_batch.merge_transition_protocol_version)
+            required_version
+        else
+            data_raft_batch.activation_barrier_protocol_version;
         for (plan.peers) |peer| {
             if (self.probeDataRaftBatchProtocolVersion(
                 alloc,
@@ -7584,11 +7604,11 @@ pub const DataServer = struct {
                 peer.raft_url,
                 deadline_ns,
                 cancellation,
-            ) < data_raft_batch.activation_barrier_protocol_version) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
+            ) < minimum_peer_version) return .{ .conf_state_fingerprint = plan.conf_state_fingerprint };
         }
         return .{
             .conf_state_fingerprint = plan.conf_state_fingerprint,
-            .barrier_supported = true,
+            .activatable_version = required_version,
         };
     }
 
@@ -7603,6 +7623,7 @@ pub const DataServer = struct {
     ) !void {
         const raft = self.data_raft orelse return error.UnsupportedOperation;
         var proposal_req = req;
+        const required_protocol_version = requiredRaftBatchProtocolVersion(req);
         const deadline_ns = platform_time.monotonicNs() +| leader_wait_ns;
         try ensureDataRaftBatchRouteActive(route);
         try self.reachDataRequestLifecycle(.{
@@ -7640,10 +7661,17 @@ pub const DataServer = struct {
             defer if (protocol_activation_entry) |entry| entry.release(self.alloc);
             defer if (protocol_activation_lock_owned) protocol_activation_entry.?.activation_mutex.unlock();
             if (preflighted_local_leader) {
+                if (batchMutatesDocuments(req)) {
+                    const source_store = self.localTransitionApplyStore() orelse
+                        return error.RaftBatchWriteOutcomeUnknown;
+                    if (try source_store.currentMergeSourceState(alloc, group_id)) |merge_source| {
+                        if (merge_source.phase == .finalized) return error.MergeSourceFenced;
+                    }
+                }
                 const activation_entry = try self.dataRaftProtocolActivationEntry(group_id);
                 protocol_activation_entry = activation_entry;
-                if (activation_entry.protocol_version.load(.acquire) >= data_raft_batch.timestamp_protocol_version) {
-                    protocol_preflight.timestamp_supported = true;
+                if (activation_entry.protocol_version.load(.acquire) >= required_protocol_version) {
+                    protocol_preflight.activatable_version = activation_entry.protocol_version.load(.acquire);
                 } else if (activation_entry.activation_mutex.tryLock()) {
                     protocol_activation_lock_owned = true;
                     const durable_version = self.durableDataRaftBatchProtocolVersion(group_id) catch |err| switch (err) {
@@ -7668,10 +7696,11 @@ pub const DataServer = struct {
                         // their identity for diagnostics.
                         else => return err,
                     };
-                    if (durable_version >= data_raft_batch.timestamp_protocol_version) {
+                    if (durable_version >= required_protocol_version) {
                         activation_entry.protocol_version.store(durable_version, .release);
                         activation_entry.pending_term.store(0, .release);
-                        protocol_preflight.timestamp_supported = true;
+                        activation_entry.pending_version.store(0, .release);
+                        protocol_preflight.activatable_version = durable_version;
                     } else {
                         var protocol_plan: DataRaftProtocolProbePlan = preflight: {
                             lockAtomic(&self.data_raft_mutex);
@@ -7681,8 +7710,13 @@ pub const DataServer = struct {
                             // accepted barrier orders every later proposal.
                             // Until that barrier applies, concurrent requests
                             // use legacy encoding without repeating probes.
-                            if (activation_entry.pending_term.load(.acquire) == status.hard.current_term) break :preflight .{};
+                            if (activation_entry.pending_term.load(.acquire) == status.hard.current_term and
+                                activation_entry.pending_version.load(.acquire) >= required_protocol_version)
+                            {
+                                break :preflight .{};
+                            }
                             activation_entry.pending_term.store(0, .release);
+                            activation_entry.pending_version.store(0, .release);
                             break :preflight try self.dataRaftProtocolProbePlanLocked(
                                 alloc,
                                 raft,
@@ -7695,6 +7729,7 @@ pub const DataServer = struct {
                         protocol_preflight = self.dataRaftBatchProtocolPreflight(
                             alloc,
                             protocol_plan,
+                            required_protocol_version,
                             deadline_ns,
                             route.cancellation,
                         );
@@ -7733,16 +7768,21 @@ pub const DataServer = struct {
                         // barrier after this request skipped its singleflight
                         // probe; in that case this entry must use the new
                         // format because it will follow the barrier.
-                        var timestamp_supported = protocol_preflight.timestamp_supported or
-                            dataRaftTimestampProtocolUsable(protocol_activation_entry.?, status.hard.current_term);
-                        if (!timestamp_supported and
-                            protocol_preflight.barrier_supported and
+                        var active_protocol_version = protocol_activation_entry.?.protocol_version.load(.acquire);
+                        if (protocol_activation_entry.?.pending_term.load(.acquire) == status.hard.current_term) {
+                            active_protocol_version = @max(
+                                active_protocol_version,
+                                protocol_activation_entry.?.pending_version.load(.acquire),
+                            );
+                        }
+                        if (active_protocol_version < required_protocol_version and
+                            protocol_preflight.activatable_version >= required_protocol_version and
                             protocol_preflight.conf_state_fingerprint == dataRaftConfStateFingerprint(status.conf_state))
                         {
                             const barrier = try data_raft_batch.encodeProtocolBarrier(
                                 alloc,
                                 table_name,
-                                data_raft_batch.timestamp_protocol_version,
+                                required_protocol_version,
                             );
                             defer alloc.free(barrier);
                             var barrier_index: ?u64 = null;
@@ -7765,13 +7805,19 @@ pub const DataServer = struct {
                                 }
                             };
                             if (barrier_index != null) {
-                                timestamp_supported = true;
+                                active_protocol_version = required_protocol_version;
+                                protocol_activation_entry.?.pending_version.store(required_protocol_version, .release);
                                 protocol_activation_entry.?.pending_term.store(status.hard.current_term, .release);
                             }
                         }
+                        if (required_protocol_version >= data_raft_batch.merge_transition_protocol_version and
+                            active_protocol_version < required_protocol_version)
+                        {
+                            return error.RaftBatchMergeProtocolUnavailable;
+                        }
                         proposal_req = raftBatchRequestForProtocol(
                             req,
-                            timestamp_supported,
+                            active_protocol_version >= data_raft_batch.timestamp_protocol_version,
                         );
                         const proposal_term = status.hard.current_term;
                         const encoded = try data_raft_batch.encode(alloc, table_name, proposal_req);
@@ -9210,15 +9256,8 @@ pub const DataServer = struct {
         try record.table_contract.validateForMerge(
             record.allow_doc_identity_reassignment,
         );
+        if (self.data_raft != null) return try self.observeReplicatedMerge(record);
         if (self.local_transition_runtime) |runtime| return try runtime.shardOperationAdapter().observeMerge(record);
-        // MergeCoordinator mutates a receiver DB directly. That is correct for
-        // the legacy single-copy runtime, but it is not a replicated data-Raft
-        // command: running it only on the selected leader would acknowledge a
-        // transition that followers cannot recover after failover. Until the
-        // merge transfer and its durable control markers are carried in the
-        // receiver Raft log, fail closed instead of silently publishing a
-        // leader-local merge.
-        if (self.data_raft != null) return error.ReplicatedMergeTransitionUnavailable;
         self.lockLocalTransition();
         defer self.unlockLocalTransition();
         var runtime = try self.initLocalMergeRuntime(
@@ -10594,15 +10633,448 @@ pub const DataServer = struct {
         )) .reconciled else .advanced;
     }
 
+    fn replicateMergeSourceTransition(
+        self: *DataServer,
+        transition_id: u64,
+        donor_group_id: u64,
+        receiver_group_id: u64,
+        kind: antfly.db.types.MergeSourceTransitionMutation.Kind,
+        table_name: []const u8,
+    ) !void {
+        try self.proposeRaftBatchGroup(self.alloc, donor_group_id, table_name, .{
+            .sync_level = .write,
+            .merge_source_transition = .{
+                .kind = kind,
+                .transition_id = transition_id,
+                .receiver_group_id = receiver_group_id,
+            },
+        }, .{ .refresh_metadata = false });
+    }
+
+    fn mergeTransitionRange(
+        donor: antfly.db.types.ByteRange,
+        receiver: antfly.db.types.ByteRange,
+    ) !antfly.db.types.ByteRange {
+        if (std.mem.eql(u8, donor.end, receiver.start)) {
+            return .{ .start = donor.start, .end = receiver.end };
+        }
+        if (std.mem.eql(u8, receiver.end, donor.start)) {
+            return .{ .start = receiver.start, .end = donor.end };
+        }
+        return error.NonAdjacentMergeRanges;
+    }
+
+    fn mergeReceiverCheckpoint(
+        transition_id: u64,
+        donor_group_id: u64,
+        receiver_group_id: u64,
+        base_range: antfly.db.types.ByteRange,
+        merged_range: antfly.db.types.ByteRange,
+        kind: antfly.db.types.MergeReplicationCheckpoint.Kind,
+        donor_applied_index: u64,
+        allow_doc_identity_reassignment: bool,
+        table_contract: antfly.metadata.TransitionTableContract,
+    ) antfly.db.types.MergeReplicationCheckpoint {
+        return .{
+            .kind = kind,
+            .transition_id = transition_id,
+            .donor_group_id = donor_group_id,
+            .receiver_group_id = receiver_group_id,
+            .receiver_base_start = base_range.start,
+            .receiver_base_end = base_range.end,
+            .merged_start = merged_range.start,
+            .merged_end = merged_range.end,
+            .bootstrap_applied_index = donor_applied_index,
+            .allow_doc_identity_reassignment = allow_doc_identity_reassignment,
+            .receiver_identity_reassignment_namespace = if (allow_doc_identity_reassignment)
+                identityNamespaceFromTransitionContract(table_contract, .target)
+            else
+                null,
+        };
+    }
+
+    fn replicateMergeReceiverCheckpoint(
+        self: *DataServer,
+        checkpoint: antfly.db.types.MergeReplicationCheckpoint,
+        table_name: []const u8,
+    ) !void {
+        try self.proposeRaftBatchGroup(self.alloc, checkpoint.receiver_group_id, table_name, .{
+            .sync_level = .write,
+            .merge_checkpoint = checkpoint,
+        }, .{ .refresh_metadata = false });
+    }
+
+    fn reconcileMergeSourceUnderLease(
+        self: *DataServer,
+        source_store: *antfly.data.RaftApplyStore,
+        donor_group_id: u64,
+        donor_db: *antfly.db.DB,
+    ) !antfly.data.AppliedDataBatch {
+        const max_attempts: usize = 4;
+        for (0..max_attempts) |_| {
+            const watermark = (try source_store.latestBatchForTransition(donor_group_id)) orelse
+                return error.MergeSourceProjectionNotReady;
+            if (self.localDataRaftAppliedIndex(donor_group_id)) |applied_index| {
+                if (applied_index < watermark.last_entry_index)
+                    return error.MergeSourceProjectionNotReady;
+            }
+            switch (try reconcileSplitSourceApplyStoreFromDb(
+                self.alloc,
+                source_store,
+                donor_group_id,
+                donor_db,
+                watermark,
+                false,
+            )) {
+                .advanced => continue,
+                .reconciled => return (try source_store.latestBatchForTransition(donor_group_id)) orelse
+                    return error.MergeSourceProjectionNotReady,
+                .handoff => unreachable,
+            }
+        }
+        return error.MergeSourceProjectionAdvanced;
+    }
+
+    fn reconcileMergeReceiverUnderLease(
+        self: *DataServer,
+        store: *antfly.data.RaftApplyStore,
+        receiver_group_id: u64,
+        receiver_db: *antfly.db.DB,
+    ) !void {
+        const max_attempts: usize = 4;
+        for (0..max_attempts) |_| {
+            const watermark = try store.latestBatchForTransition(receiver_group_id);
+            switch (try reconcileSplitSourceApplyStoreFromDb(
+                self.alloc,
+                store,
+                receiver_group_id,
+                receiver_db,
+                watermark,
+                false,
+            )) {
+                .advanced => continue,
+                .reconciled => return,
+                .handoff => unreachable,
+            }
+        }
+        return error.MergeReceiverProjectionAdvanced;
+    }
+
+    fn replicateMergeDeleteHistory(
+        self: *DataServer,
+        source_store: *antfly.data.RaftApplyStore,
+        donor_group_id: u64,
+        receiver_group_id: u64,
+        donor_range: antfly.db.types.ByteRange,
+        table_name: []const u8,
+    ) !void {
+        const entries = try source_store.appliedNormalEntries(self.alloc, donor_group_id);
+        defer {
+            for (entries) |entry| self.alloc.free(@constCast(entry.data));
+            self.alloc.free(entries);
+        }
+        for (entries) |entry| {
+            if (!data_raft_batch.looksLikeEnvelope(entry.data)) {
+                if (std.mem.startsWith(u8, entry.data, "del:")) {
+                    const key = entry.data["del:".len..];
+                    if (donor_range.contains(key)) {
+                        try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_name, .{
+                            .deletes = &.{key},
+                            .sync_level = .write,
+                        }, .{ .refresh_metadata = false });
+                    }
+                }
+                continue;
+            }
+            var decoded = try data_raft_batch.decode(self.alloc, entry.data);
+            defer decoded.deinit(self.alloc);
+            var deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer deletes.deinit(self.alloc);
+            try deletes.ensureTotalCapacity(self.alloc, decoded.batch.req.deletes.len);
+            for (decoded.batch.req.deletes) |key| {
+                if (donor_range.contains(key)) deletes.appendAssumeCapacity(key);
+            }
+            if (deletes.items.len != 0) {
+                try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_name, .{
+                    .deletes = deletes.items,
+                    .sync_level = .write,
+                }, .{ .refresh_metadata = false });
+            }
+        }
+    }
+
+    fn replicateMergeSnapshotWrites(
+        self: *DataServer,
+        source_store: *antfly.data.RaftApplyStore,
+        donor_group_id: u64,
+        receiver_group_id: u64,
+        donor_range: antfly.db.types.ByteRange,
+        table_name: []const u8,
+    ) !void {
+        var after_key: ?[]u8 = null;
+        defer if (after_key) |key| self.alloc.free(key);
+        while (true) {
+            var page = try source_store.groupStatePageInRange(
+                self.alloc,
+                donor_group_id,
+                donor_range,
+                after_key,
+                128,
+                1024 * 1024,
+            );
+            defer page.deinit(self.alloc);
+            if (page.entries.len == 0) {
+                if (!page.exhausted) return error.MergeSourceProjectionNotReady;
+                break;
+            }
+            const writes = try self.alloc.alloc(antfly.db.types.BatchWrite, page.entries.len);
+            defer self.alloc.free(writes);
+            for (page.entries, 0..) |entry, i| writes[i] = .{
+                .key = entry.key,
+                .value = entry.value,
+            };
+            try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_name, .{
+                .writes = writes,
+                .sync_level = .write,
+            }, .{ .refresh_metadata = false });
+            const next_after = try self.alloc.dupe(u8, page.entries[page.entries.len - 1].key);
+            if (after_key) |key| self.alloc.free(key);
+            after_key = next_after;
+            if (page.exhausted) break;
+        }
+    }
+
+    fn replicateMergeCopyUnderLease(
+        self: *DataServer,
+        transition_id: u64,
+        donor_group_id: u64,
+        receiver_group_id: u64,
+        allow_doc_identity_reassignment: bool,
+        table_contract: antfly.metadata.TransitionTableContract,
+        donor_db: *antfly.db.DB,
+    ) !u64 {
+        const source_store = self.localTransitionApplyStore() orelse
+            return error.MissingMergeSourceStore;
+        const watermark = try self.reconcileMergeSourceUnderLease(
+            source_store,
+            donor_group_id,
+            donor_db,
+        );
+        const donor_range = try source_store.currentRange(self.alloc, donor_group_id);
+        defer range_state_mod.freeRange(self.alloc, donor_range);
+        var receiver_state = try source_store.currentMergeReceiverState(self.alloc, receiver_group_id);
+        defer if (receiver_state) |*state| state.deinit(self.alloc);
+        if (receiver_state == null or receiver_state.?.transition_id != transition_id)
+            return error.MergeReceiverProjectionNotReady;
+        const base_range = receiver_state.?.receiver_base_range;
+        const merged_range = receiver_state.?.merged_range orelse
+            return error.MergeReceiverProjectionNotReady;
+
+        // Deletes are replayed before the authoritative snapshot. A document
+        // deleted and later recreated is therefore restored by the snapshot;
+        // a document deleted after an earlier copy remains absent.
+        try self.replicateMergeDeleteHistory(
+            source_store,
+            donor_group_id,
+            receiver_group_id,
+            donor_range,
+            table_contract.table_name,
+        );
+        try self.replicateMergeSnapshotWrites(
+            source_store,
+            donor_group_id,
+            receiver_group_id,
+            donor_range,
+            table_contract.table_name,
+        );
+        try self.replicateMergeReceiverCheckpoint(
+            mergeReceiverCheckpoint(
+                transition_id,
+                donor_group_id,
+                receiver_group_id,
+                base_range,
+                merged_range,
+                .bootstrap_complete,
+                watermark.last_entry_index,
+                allow_doc_identity_reassignment,
+                table_contract,
+            ),
+            table_contract.table_name,
+        );
+        return watermark.last_entry_index;
+    }
+
+    fn replicateMergeRollbackDeletes(
+        self: *DataServer,
+        receiver_group_id: u64,
+        donor_range: antfly.db.types.ByteRange,
+        table_name: []const u8,
+    ) !void {
+        const store = self.localTransitionApplyStore() orelse
+            return error.MissingMergeReceiverStore;
+        var after_key: ?[]u8 = null;
+        defer if (after_key) |key| self.alloc.free(key);
+        while (true) {
+            var page = try store.groupStatePageInRange(
+                self.alloc,
+                receiver_group_id,
+                donor_range,
+                after_key,
+                128,
+                512 * 1024,
+            );
+            defer page.deinit(self.alloc);
+            if (page.entries.len == 0) {
+                if (!page.exhausted) return error.MergeReceiverProjectionNotReady;
+                break;
+            }
+            const deletes = try self.alloc.alloc([]const u8, page.entries.len);
+            defer self.alloc.free(deletes);
+            for (page.entries, 0..) |entry, i| deletes[i] = entry.key;
+            try self.proposeRaftBatchGroup(self.alloc, receiver_group_id, table_name, .{
+                .deletes = deletes,
+                .sync_level = .write,
+            }, .{ .refresh_metadata = false });
+            const next_after = try self.alloc.dupe(u8, page.entries[page.entries.len - 1].key);
+            if (after_key) |key| self.alloc.free(key);
+            after_key = next_after;
+            if (page.exhausted) break;
+        }
+    }
+
+    fn observeReplicatedMerge(
+        self: *DataServer,
+        record: antfly.metadata.MergeTransitionRecord,
+    ) !antfly.metadata.transition_state.MergeObservation {
+        const store = self.localTransitionApplyStore() orelse
+            return error.MissingMergeSourceStore;
+        return try deriveReplicatedMergeObservation(self.alloc, store, record);
+    }
+
+    fn deriveReplicatedMergeObservation(
+        alloc: std.mem.Allocator,
+        store: *antfly.data.RaftApplyStore,
+        record: antfly.metadata.MergeTransitionRecord,
+    ) !antfly.metadata.transition_state.MergeObservation {
+        const source_state = try store.currentMergeSourceState(alloc, record.donor_group_id);
+        var receiver_state = try store.currentMergeReceiverState(alloc, record.receiver_group_id);
+        defer if (receiver_state) |*state| state.deinit(alloc);
+        if (source_state) |state| {
+            if (state.transition_id != record.transition_id or
+                state.receiver_group_id != record.receiver_group_id)
+                return error.ConflictingMergeTransition;
+        }
+        if (receiver_state) |state| {
+            if (state.transition_id != record.transition_id or
+                state.donor_group_id != record.donor_group_id or
+                state.receiver_group_id != record.receiver_group_id or
+                state.allow_doc_identity_reassignment != record.allow_doc_identity_reassignment)
+                return error.ConflictingMergeTransition;
+        }
+        const donor_batch = try store.latestBatchForTransition(record.donor_group_id);
+        const donor_index = if (donor_batch) |batch| batch.last_entry_index else 0;
+        const receiver_index = if (receiver_state) |state| state.bootstrap_applied_index else 0;
+        const receiver_accepts = if (receiver_state) |state|
+            state.phase == .accepting or state.phase == .finalized or state.phase == .rolling_back
+        else
+            false;
+        const bootstrapped = if (receiver_state) |state| state.bootstrap_complete else false;
+        const source_finalized = if (source_state) |state| state.phase == .finalized else false;
+        var status = antfly.data.storage.range_transition.deriveMergeStatus(
+            record.donor_group_id,
+            record.receiver_group_id,
+            receiver_accepts,
+            bootstrapped,
+            donor_index,
+            receiver_index,
+            if (receiver_state) |state| state.phase == .rolling_back else false,
+            source_finalized and if (receiver_state) |state| state.phase == .finalized else false,
+            if (receiver_state) |state| state.phase == .rolled_back else false,
+        );
+        status.allow_doc_identity_reassignment = record.allow_doc_identity_reassignment;
+        if (receiver_state) |state| if (state.receiver_identity_reassignment_namespace) |namespace| {
+            status.receiver_identity_reassignment_namespace_table_id = namespace.table_id;
+            status.receiver_identity_reassignment_namespace_shard_id = namespace.shard_id;
+            status.receiver_identity_reassignment_namespace_range_id = namespace.range_id;
+        };
+        return .{ .donor = status, .receiver = status };
+    }
+
     fn localAcceptMergeReceiver(ptr: *anyopaque, _: u64, op: @FieldType(antfly.metadata.TransitionAction, "accept_merge_receiver")) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try op.table_contract.validateForMerge(
             op.allow_doc_identity_reassignment,
         );
-        if (self.local_transition_runtime) |runtime| {
+        if (self.data_raft != null) {
+            try self.requireLocalDataRaftLeader(op.donor_group_id);
+            var lane = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
+                return error.TransitionOperationBusy;
+            defer lane.deinit();
+            const donor_root = try antfly.metadata.groupDbPathFromReplicaRoot(
+                self.alloc,
+                self.write_source.replica_root_dir,
+                op.donor_group_id,
+            );
+            defer self.alloc.free(donor_root);
+            try self.reconcileSplitSourceApplyStore(
+                donor_root,
+                op.donor_group_id,
+                op.table_contract,
+            );
+            const store = self.localTransitionApplyStore() orelse
+                return error.MissingMergeSourceStore;
+            {
+                const receiver_lease = try self.leaseTransitionDbForTableGroup(
+                    op.receiver_group_id,
+                    op.table_contract,
+                    .target,
+                    if (op.allow_doc_identity_reassignment) .reassign_same_table else .exact,
+                );
+                defer receiver_lease.release();
+                try self.reconcileMergeReceiverUnderLease(
+                    store,
+                    op.receiver_group_id,
+                    receiver_lease.db,
+                );
+            }
+            try self.replicateMergeSourceTransition(
+                op.transition_id,
+                op.donor_group_id,
+                op.receiver_group_id,
+                .prepare,
+                op.table_contract.table_name,
+            );
+            const donor_range = try store.currentRange(self.alloc, op.donor_group_id);
+            defer range_state_mod.freeRange(self.alloc, donor_range);
+            const current_receiver_range = try store.currentRange(self.alloc, op.receiver_group_id);
+            defer range_state_mod.freeRange(self.alloc, current_receiver_range);
+            var existing_receiver = try store.currentMergeReceiverState(self.alloc, op.receiver_group_id);
+            defer if (existing_receiver) |*state| state.deinit(self.alloc);
+            const base_range = if (existing_receiver) |state|
+                state.receiver_base_range
+            else
+                current_receiver_range;
+            const merged_range = if (existing_receiver) |state|
+                state.merged_range orelse return error.MergeReceiverProjectionNotReady
+            else
+                try mergeTransitionRange(donor_range, base_range);
+            try self.replicateMergeReceiverCheckpoint(
+                mergeReceiverCheckpoint(
+                    op.transition_id,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    base_range,
+                    merged_range,
+                    .accept,
+                    0,
+                    op.allow_doc_identity_reassignment,
+                    op.table_contract,
+                ),
+                op.table_contract.table_name,
+            );
+        } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .accept_merge_receiver = op });
         } else {
-            if (self.data_raft != null) return error.ReplicatedMergeTransitionUnavailable;
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
             var runtime = try self.initLocalMergeRuntime(
@@ -10634,10 +11106,29 @@ pub const DataServer = struct {
         try op.table_contract.validateForMerge(
             op.allow_doc_identity_reassignment,
         );
-        if (self.local_transition_runtime) |runtime| {
+        if (self.data_raft != null) {
+            try self.requireLocalDataRaftLeader(op.donor_group_id);
+            var lane = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
+                return error.TransitionOperationBusy;
+            defer lane.deinit();
+            const donor_lease = try self.leaseTransitionDbForTableGroup(
+                op.donor_group_id,
+                op.table_contract,
+                .source,
+                .exact,
+            );
+            defer donor_lease.release();
+            _ = try self.replicateMergeCopyUnderLease(
+                op.transition_id,
+                op.donor_group_id,
+                op.receiver_group_id,
+                op.allow_doc_identity_reassignment,
+                op.table_contract,
+                donor_lease.db,
+            );
+        } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .catch_up_merge_receiver = op });
         } else {
-            if (self.data_raft != null) return error.ReplicatedMergeTransitionUnavailable;
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
             var runtime = try self.initLocalMergeRuntime(
@@ -10669,10 +11160,61 @@ pub const DataServer = struct {
         try op.table_contract.validateForMerge(
             op.allow_doc_identity_reassignment,
         );
-        if (self.local_transition_runtime) |runtime| {
+        if (self.data_raft != null) {
+            try self.requireLocalDataRaftLeader(op.donor_group_id);
+            var lane = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
+                return error.TransitionOperationBusy;
+            defer lane.deinit();
+            const donor_lease = try self.leaseTransitionDbForTableGroup(
+                op.donor_group_id,
+                op.table_contract,
+                .source,
+                .exact,
+            );
+            defer donor_lease.release();
+            _ = try self.replicateMergeCopyUnderLease(
+                op.transition_id,
+                op.donor_group_id,
+                op.receiver_group_id,
+                op.allow_doc_identity_reassignment,
+                op.table_contract,
+                donor_lease.db,
+            );
+            try self.replicateMergeSourceTransition(
+                op.transition_id,
+                op.donor_group_id,
+                op.receiver_group_id,
+                .finalize,
+                op.table_contract.table_name,
+            );
+            const store = self.localTransitionApplyStore() orelse
+                return error.MissingMergeSourceStore;
+            const source_state = (try store.currentMergeSourceState(self.alloc, op.donor_group_id)) orelse
+                return error.MergeSourceProjectionNotReady;
+            if (source_state.phase != .finalized or source_state.transition_id != op.transition_id)
+                return error.MergeSourceProjectionNotReady;
+            var receiver_state = (try store.currentMergeReceiverState(self.alloc, op.receiver_group_id)) orelse
+                return error.MergeReceiverProjectionNotReady;
+            defer receiver_state.deinit(self.alloc);
+            const merged_range = receiver_state.merged_range orelse
+                return error.MergeReceiverProjectionNotReady;
+            try self.replicateMergeReceiverCheckpoint(
+                mergeReceiverCheckpoint(
+                    op.transition_id,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    receiver_state.receiver_base_range,
+                    merged_range,
+                    .finalize,
+                    source_state.applied_index,
+                    op.allow_doc_identity_reassignment,
+                    op.table_contract,
+                ),
+                op.table_contract.table_name,
+            );
+        } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .finalize_merge = op });
         } else {
-            if (self.data_raft != null) return error.ReplicatedMergeTransitionUnavailable;
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
             var runtime = try self.initLocalMergeRuntime(
@@ -10720,10 +11262,49 @@ pub const DataServer = struct {
         try op.table_contract.validateForMerge(
             op.allow_doc_identity_reassignment,
         );
-        if (self.local_transition_runtime) |runtime| {
+        if (self.data_raft != null) {
+            try self.requireLocalDataRaftLeader(op.donor_group_id);
+            var lane = self.replicated_transition_action_lanes.tryAcquire(op.donor_group_id) orelse
+                return error.TransitionOperationBusy;
+            defer lane.deinit();
+            try self.replicateMergeSourceTransition(
+                op.transition_id,
+                op.donor_group_id,
+                op.receiver_group_id,
+                .rollback,
+                op.table_contract.table_name,
+            );
+            const store = self.localTransitionApplyStore() orelse
+                return error.MissingMergeSourceStore;
+            const donor_range = try store.currentRange(self.alloc, op.donor_group_id);
+            defer range_state_mod.freeRange(self.alloc, donor_range);
+            var receiver_state = (try store.currentMergeReceiverState(self.alloc, op.receiver_group_id)) orelse
+                return error.MergeReceiverProjectionNotReady;
+            defer receiver_state.deinit(self.alloc);
+            const merged_range = receiver_state.merged_range orelse
+                return error.MergeReceiverProjectionNotReady;
+            try self.replicateMergeRollbackDeletes(
+                op.receiver_group_id,
+                donor_range,
+                op.table_contract.table_name,
+            );
+            try self.replicateMergeReceiverCheckpoint(
+                mergeReceiverCheckpoint(
+                    op.transition_id,
+                    op.donor_group_id,
+                    op.receiver_group_id,
+                    receiver_state.receiver_base_range,
+                    merged_range,
+                    .rollback,
+                    0,
+                    op.allow_doc_identity_reassignment,
+                    op.table_contract,
+                ),
+                op.table_contract.table_name,
+            );
+        } else if (self.local_transition_runtime) |runtime| {
             try runtime.shardOperationAdapter().execute(.{ .rollback_merge = op });
         } else {
-            if (self.data_raft != null) return error.ReplicatedMergeTransitionUnavailable;
             self.lockLocalTransition();
             defer self.unlockLocalTransition();
             var runtime = try self.initLocalMergeRuntime(
@@ -18981,12 +19562,14 @@ test "data runtime live writer source follows raft apply ownership" {
     );
 }
 
-test "data raft merge actions fail closed until their mutations are replicated" {
-    var raft_stub: antfly.raft.ManagedHttpHostService = undefined;
-    var server: DataServer = undefined;
-    server.data_raft = &raft_stub;
-    server.local_transition_runtime = null;
-
+test "data raft merge observation derives from replicated source and receiver markers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-observation", .{tmp.sub_path});
+    defer alloc.free(root);
+    var store = try antfly.data.RaftApplyStore.init(alloc, .{ .root_dir = root });
+    defer store.deinit();
     const contract: antfly.metadata.TransitionTableContract = .{
         .table_id = 7,
         .table_name = "docs",
@@ -18998,51 +19581,112 @@ test "data raft merge actions fail closed until their mutations are replicated" 
         .transition_id = 7001,
         .donor_group_id = 71,
         .receiver_group_id = 72,
-        .allow_doc_identity_reassignment = true,
         .table_contract = contract,
     };
-    var adapter = server.localShardOperationAdapter();
-    try std.testing.expectError(
-        error.ReplicatedMergeTransitionUnavailable,
-        adapter.observeMerge(record),
-    );
+    try std.testing.expect(try store.seedGroupSnapshotIfAbsent(
+        alloc,
+        record.donor_group_id,
+        1,
+        .{ .start = "doc:a", .end = "doc:m" },
+        &.{.{ .key = "doc:b", .value = "{}" }},
+    ));
+    try std.testing.expect(try store.seedGroupSnapshotIfAbsent(
+        alloc,
+        record.receiver_group_id,
+        1,
+        .{ .start = "doc:m", .end = "" },
+        &.{.{ .key = "doc:z", .value = "{}" }},
+    ));
+    const Apply = struct {
+        fn barrier(
+            allocator: std.mem.Allocator,
+            target: *antfly.data.RaftApplyStore,
+            group_id: u64,
+            index: u64,
+        ) !void {
+            const payload = try data_raft_batch.encodeProtocolBarrier(
+                allocator,
+                "docs",
+                data_raft_batch.merge_transition_protocol_version,
+            );
+            defer allocator.free(payload);
+            const entries = try antfly.raft.state_machine.encodeCommittedEntries(allocator, &.{.{
+                .term = 1,
+                .index = index,
+                .entry_type = .normal,
+                .data = payload,
+            }});
+            defer allocator.free(entries);
+            try target.snapshotBuilder().applyBatch(.{
+                .group_id = group_id,
+                .commit_index = index,
+                .entries_bytes = entries,
+            });
+        }
 
-    inline for (.{
-        antfly.metadata.TransitionAction{ .accept_merge_receiver = .{
+        fn command(
+            allocator: std.mem.Allocator,
+            target: *antfly.data.RaftApplyStore,
+            group_id: u64,
+            index: u64,
+            req: antfly.db.types.BatchRequest,
+        ) !void {
+            const batch = try data_raft_batch.encode(allocator, "docs", req);
+            defer allocator.free(batch);
+            const entries = try antfly.raft.state_machine.encodeCommittedEntries(allocator, &.{.{
+                .term = 1,
+                .index = index,
+                .entry_type = .normal,
+                .data = batch,
+            }});
+            defer allocator.free(entries);
+            try target.snapshotBuilder().applyBatch(.{
+                .group_id = group_id,
+                .commit_index = index,
+                .entries_bytes = entries,
+            });
+        }
+    };
+    try Apply.barrier(alloc, &store, record.donor_group_id, 1);
+    try Apply.barrier(alloc, &store, record.receiver_group_id, 1);
+    try Apply.command(alloc, &store, record.donor_group_id, 2, .{
+        .merge_source_transition = .{
+            .kind = .prepare,
             .transition_id = record.transition_id,
-            .donor_group_id = record.donor_group_id,
             .receiver_group_id = record.receiver_group_id,
-            .allow_doc_identity_reassignment = true,
-            .table_contract = contract,
-        } },
-        antfly.metadata.TransitionAction{ .catch_up_merge_receiver = .{
-            .transition_id = record.transition_id,
-            .donor_group_id = record.donor_group_id,
-            .receiver_group_id = record.receiver_group_id,
-            .allow_doc_identity_reassignment = true,
-            .table_contract = contract,
-        } },
-        antfly.metadata.TransitionAction{ .finalize_merge = .{
-            .transition_id = record.transition_id,
-            .donor_group_id = record.donor_group_id,
-            .receiver_group_id = record.receiver_group_id,
-            .allow_doc_identity_reassignment = true,
-            .table_contract = contract,
-        } },
-        antfly.metadata.TransitionAction{ .rollback_merge = .{
-            .transition_id = record.transition_id,
-            .donor_group_id = record.donor_group_id,
-            .receiver_group_id = record.receiver_group_id,
-            .allow_doc_identity_reassignment = true,
-            .table_contract = contract,
-        } },
-    }) |action| try std.testing.expectError(
-        error.ReplicatedMergeTransitionUnavailable,
-        adapter.execute(action),
-    );
+        },
+    });
+    const base_checkpoint: antfly.db.types.MergeReplicationCheckpoint = .{
+        .kind = .accept,
+        .transition_id = record.transition_id,
+        .donor_group_id = record.donor_group_id,
+        .receiver_group_id = record.receiver_group_id,
+        .receiver_base_start = "doc:m",
+        .receiver_base_end = "",
+        .merged_start = "doc:a",
+        .merged_end = "",
+    };
+    try Apply.command(alloc, &store, record.receiver_group_id, 2, .{
+        .merge_checkpoint = base_checkpoint,
+    });
+    var complete = base_checkpoint;
+    complete.kind = .bootstrap_complete;
+    complete.bootstrap_applied_index = 2;
+    try Apply.command(alloc, &store, record.receiver_group_id, 3, .{
+        .merge_checkpoint = complete,
+    });
+    const observation = try DataServer.deriveReplicatedMergeObservation(alloc, &store, record);
+    try std.testing.expectEqual(antfly.data.storage.range_transition.TransitionPhase.cutover_ready, observation.receiver.phase);
+    try std.testing.expect(observation.receiver.bootstrapped);
+    try std.testing.expectEqual(@as(u64, 2), observation.receiver.donor_delta_sequence);
+    try std.testing.expectEqual(@as(u64, 2), observation.receiver.receiver_delta_sequence);
 }
 
 test "data raft source split lifecycle commands bypass document db apply" {
+    try std.testing.expectEqual(
+        data_raft_batch.timestamp_protocol_version,
+        DataServer.requiredRaftBatchProtocolVersion(.{}),
+    );
     try std.testing.expect(!batchRequiresDocumentDbApply(.{
         .split_transition = .{
             .kind = .prepare,
@@ -19052,6 +19696,38 @@ test "data raft source split lifecycle commands bypass document db apply" {
             .split_key = "doc:m",
         },
     }));
+    try std.testing.expect(!batchRequiresDocumentDbApply(.{
+        .merge_source_transition = .{
+            .kind = .finalize,
+            .transition_id = 7001,
+            .receiver_group_id = 7002,
+        },
+    }));
+    try std.testing.expectEqual(
+        data_raft_batch.merge_transition_protocol_version,
+        DataServer.requiredRaftBatchProtocolVersion(.{
+            .merge_source_transition = .{
+                .kind = .finalize,
+                .transition_id = 7001,
+                .receiver_group_id = 7002,
+            },
+        }),
+    );
+    try std.testing.expectEqual(
+        data_raft_batch.merge_transition_protocol_version,
+        DataServer.requiredRaftBatchProtocolVersion(.{
+            .merge_checkpoint = .{
+                .kind = .accept,
+                .transition_id = 7001,
+                .donor_group_id = 7001,
+                .receiver_group_id = 7002,
+                .receiver_base_start = "doc:m",
+                .receiver_base_end = "",
+                .merged_start = "doc:a",
+                .merged_end = "",
+            },
+        }),
+    );
     try std.testing.expect(!batchRequiresDocumentDbApply(.{
         .split_checkpoint = .{
             .kind = .source_ack,
@@ -27449,14 +28125,36 @@ test "raft batch protocol cache reuses only short lived negative evidence" {
 
 test "raft batch protocol activation is reusable only in its accepted leader term" {
     var entry: DataRaftProtocolActivationEntry = .{};
-    try std.testing.expect(!DataServer.dataRaftTimestampProtocolUsable(&entry, 7));
+    try std.testing.expect(!DataServer.dataRaftProtocolUsable(
+        &entry,
+        7,
+        data_raft_batch.timestamp_protocol_version,
+    ));
 
+    entry.pending_version.store(data_raft_batch.timestamp_protocol_version, .release);
     entry.pending_term.store(7, .release);
-    try std.testing.expect(DataServer.dataRaftTimestampProtocolUsable(&entry, 7));
-    try std.testing.expect(!DataServer.dataRaftTimestampProtocolUsable(&entry, 8));
+    try std.testing.expect(DataServer.dataRaftProtocolUsable(
+        &entry,
+        7,
+        data_raft_batch.timestamp_protocol_version,
+    ));
+    try std.testing.expect(!DataServer.dataRaftProtocolUsable(
+        &entry,
+        8,
+        data_raft_batch.timestamp_protocol_version,
+    ));
+    try std.testing.expect(!DataServer.dataRaftProtocolUsable(
+        &entry,
+        7,
+        data_raft_batch.merge_transition_protocol_version,
+    ));
 
     entry.protocol_version.store(data_raft_batch.timestamp_protocol_version, .release);
-    try std.testing.expect(DataServer.dataRaftTimestampProtocolUsable(&entry, 8));
+    try std.testing.expect(DataServer.dataRaftProtocolUsable(
+        &entry,
+        8,
+        data_raft_batch.timestamp_protocol_version,
+    ));
 }
 
 test "raft batch protocol activation cleanup preserves in flight references" {
@@ -27483,7 +28181,11 @@ test "raft batch protocol activation cleanup preserves in flight references" {
     try std.testing.expect(server.data_raft_protocol_activations.get(12) == retained);
     // Cleanup released only the map reference. The request can safely finish
     // its lock-free activation read before releasing the final reference.
-    try std.testing.expect(DataServer.dataRaftTimestampProtocolUsable(retired, 99));
+    try std.testing.expect(DataServer.dataRaftProtocolUsable(
+        retired,
+        99,
+        data_raft_batch.timestamp_protocol_version,
+    ));
 
     // A stale request must not unlink a replacement installed for the same
     // group after exact-placement cleanup.

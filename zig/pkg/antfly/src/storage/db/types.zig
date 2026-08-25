@@ -169,6 +169,21 @@ pub const SplitTransitionMutation = struct {
     split_key: []const u8 = "",
 };
 
+/// Private donor-side merge lifecycle mutation. The command is ordered with
+/// ordinary data writes in the donor Raft log. A finalized donor is a durable
+/// write fence; rollback permits a later transition to start.
+pub const MergeSourceTransitionMutation = struct {
+    pub const Kind = enum {
+        prepare,
+        finalize,
+        rollback,
+    };
+
+    kind: Kind,
+    transition_id: u64,
+    receiver_group_id: u64,
+};
+
 /// Private receiver-side data-Raft checkpoint for a range merge. Document
 /// transfer batches are ordinary replicated writes; this record makes the
 /// structural phase, receiver range, and donor watermark durable on every
@@ -254,6 +269,9 @@ pub const BatchRequest = struct {
     split_replication: ?SplitReplicationContext = null,
     /// Internal source lifecycle mutation. It must be ordered with data writes.
     split_transition: ?SplitTransitionMutation = null,
+    /// Internal merge-donor lifecycle mutation. It must be ordered with data
+    /// writes so finalize creates an exact replicated source fence.
+    merge_source_transition: ?MergeSourceTransitionMutation = null,
     /// Internal receiver merge lifecycle. Public batch parsing never sets it.
     merge_checkpoint: ?MergeReplicationCheckpoint = null,
     /// Internal 2PC phase. Public batch parsing never accepts this field.

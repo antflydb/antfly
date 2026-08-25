@@ -226,7 +226,10 @@ pub fn planCheckpointApply(
             return error.MergeTransitionNotReady;
         return .{
             .state = stateFromCheckpoint(checkpoint, .accepting, false, 0),
-            .range = base,
+            // Public routing remains on the metadata-owned base range, while
+            // the private receiver generation must accept donor writes as soon
+            // as bootstrap begins.
+            .range = merged,
         };
     }
 
@@ -244,7 +247,7 @@ pub fn planCheckpointApply(
         return error.ConflictingMergeTransition;
 
     const expected_current = switch (prior.phase) {
-        .accepting => if (prior.bootstrap_complete) merged else base,
+        .accepting => merged,
         .finalized => merged,
         .rolling_back, .rolled_back => base,
         .none => return error.InvalidMergeState,
