@@ -27322,6 +27322,22 @@ test "data server block sync policy waits for standby acknowledgement before com
     var found = (try server.read_source.source().lookup(alloc, "docs", "doc:block", .{}, .read_index)) orelse return error.TestExpectedEqual;
     defer found.deinit(alloc);
     try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
+
+    // The next write commits locally but cannot reach the same RemoteApply
+    // boundary. This error crosses the independently generated storage
+    // archive before the public API classifies it as pending durability; its
+    // exact identity must never collapse to RuntimeBoundaryFailure.
+    server.ha_primary_sync_wait.max_rounds = 1;
+    server.ha_primary_sync_wait.poll_ctx = null;
+    server.ha_primary_sync_wait.poll_fn = null;
+    try std.testing.expectError(error.HASyncCommitWouldBlock, server.write_source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:pending", .value = "{\"title\":\"pending\"}" }},
+        .timestamp_ns = 124,
+        .sync_level = .write,
+    }));
+    var pending = (try server.read_source.source().lookup(alloc, "docs", "doc:pending", .{}, .read_index)) orelse return error.TestExpectedEqual;
+    defer pending.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"pending\"}", pending.json);
 }
 
 test "data server propagates standby HA write gate into provisioned write sources" {
