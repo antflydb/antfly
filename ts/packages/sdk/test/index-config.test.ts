@@ -57,6 +57,10 @@ describe("artifact embedding index configuration", () => {
   it("rejects duplicate sources and invalid sparse options", () => {
     expect(() => artifactIndexSources("same", "same")).toThrow(/duplicate/);
     expect(() =>
+      // @ts-expect-error JavaScript callers still require runtime validation.
+      artifactIndexSources(42)
+    ).toThrow(/non-empty string/);
+    expect(() =>
       // @ts-expect-error Sparse configurations reject dense-only dimensions.
       artifactEmbeddingIndexConfig("sparse", {
         sources: [{ artifact: "tokens_v1" }],
@@ -93,6 +97,12 @@ describe("artifact embedding index configuration", () => {
     ).toThrow(/finite/);
     expect(() => graphIndexSources({ artifact: "relations", path: "$.relations[0]" })).toThrow(
       /path/
+    );
+    expect(() =>
+      graphIndexSources({ artifact: "relations", edge: { type: true } } as never)
+    ).toThrow(/string or finite number/);
+    expect(() => graphIndexSources({ artifact: "relations", kind: "artifact" } as never)).toThrow(
+      /not supported/
     );
   });
 });

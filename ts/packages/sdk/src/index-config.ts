@@ -9,6 +9,32 @@ import type {
 
 const MAX_ARTIFACT_SOURCES = 64;
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateRequiredString(value: unknown, path: string): asserts value is string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError(`${path} must be a non-empty string`);
+  }
+}
+
+function validateOptionalString(value: unknown, path: string): asserts value is string | undefined {
+  if (value !== undefined && typeof value !== "string") {
+    throw new TypeError(`${path} must be a string`);
+  }
+}
+
+function validateOnlyKeys(
+  value: Record<string, unknown>,
+  allowed: readonly string[],
+  path: string
+): void {
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) throw new TypeError(`${path}.${key} is not supported`);
+  }
+}
+
 function cloneJsonValue(value: unknown, path: string): unknown {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") {
@@ -30,14 +56,16 @@ function cloneJsonValue(value: unknown, path: string): unknown {
   throw new TypeError(`${path} must contain only JSON values`);
 }
 
-function validateArtifactNames(artifacts: readonly string[]): void {
+function validateArtifactNames(
+  artifacts: readonly unknown[]
+): asserts artifacts is readonly string[] {
   if (artifacts.length === 0) throw new TypeError("at least one artifact source is required");
   if (artifacts.length > MAX_ARTIFACT_SOURCES) {
     throw new RangeError(`at most ${MAX_ARTIFACT_SOURCES} artifact sources are allowed`);
   }
   const seen = new Set<string>();
   artifacts.forEach((artifact, index) => {
-    if (artifact.length === 0) throw new TypeError(`artifacts[${index}] is required`);
+    validateRequiredString(artifact, `artifacts[${index}]`);
     if (seen.has(artifact))
       throw new TypeError(`duplicate artifact source ${JSON.stringify(artifact)}`);
     seen.add(artifact);
@@ -68,9 +96,17 @@ export function artifactFullTextIndexConfig(
   name: string,
   ...args: [ArtifactFullTextIndexOptions] | string[]
 ): IndexConfig {
-  if (name.length === 0) throw new TypeError("index name is required");
+  validateRequiredString(name, "index name");
   const options: ArtifactFullTextIndexOptions =
-    args.length === 1 && typeof args[0] === "object" ? args[0] : { artifacts: args as string[] };
+    args.length === 1 && isRecord(args[0])
+      ? (args[0] as unknown as ArtifactFullTextIndexOptions)
+      : { artifacts: args as string[] };
+  if (isRecord(options)) validateOnlyKeys(options, ["artifacts", "field", "memOnly"], "options");
+  if (!Array.isArray(options.artifacts)) throw new TypeError("artifacts must be an array");
+  validateOptionalString(options.field, "field");
+  if (options.memOnly !== undefined && typeof options.memOnly !== "boolean") {
+    throw new TypeError("memOnly must be a boolean");
+  }
   const field = options.field?.trim();
   if (options.field !== undefined && !field) throw new TypeError("field must not be empty");
   return {
@@ -87,8 +123,17 @@ export function artifactFullTextIndexConfig(
  * than one source materializes the same edge identity.
  */
 export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSource[] {
+  sources.forEach((source, index) => {
+    if (!isRecord(source)) throw new TypeError(`sources[${index}] must be an object`);
+    validateOnlyKeys(
+      source,
+      ["artifact", "path", "format", "mention_edge_type", "nodes", "edge", "context"],
+      `sources[${index}]`
+    );
+  });
   validateArtifactNames(sources.map((source) => source.artifact));
   sources.forEach((source, index) => {
+    validateOptionalString(source.path, `sources[${index}].path`);
     if (
       source.path !== undefined &&
       !/^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$/.test(source.path)
@@ -104,6 +149,11 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
     ) {
       throw new TypeError(`sources[${index}].format is invalid`);
     }
+    validateOptionalString(source.mention_edge_type, `sources[${index}].mention_edge_type`);
+    if (source.nodes !== undefined) {
+      if (!isRecord(source.nodes)) throw new TypeError(`sources[${index}].nodes must be an object`);
+      validateOnlyKeys(source.nodes, ["model", "source", "target"], `sources[${index}].nodes`);
+    }
     if (
       source.nodes?.model !== undefined &&
       source.nodes.model !== "document" &&
@@ -111,16 +161,52 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
     ) {
       throw new TypeError(`sources[${index}].nodes.model is invalid`);
     }
+    if (source.edge !== undefined) {
+      if (!isRecord(source.edge)) throw new TypeError(`sources[${index}].edge must be an object`);
+      validateOnlyKeys(source.edge, ["type", "weight", "metadata"], `sources[${index}].edge`);
+    }
+    for (const [fieldName, value] of [
+      ["source", source.nodes?.source],
+      ["target", source.nodes?.target],
+    ] as const) {
+      if (
+        value !== undefined &&
+        typeof value !== "string" &&
+        (typeof value !== "number" || !Number.isFinite(value))
+      ) {
+        throw new TypeError(
+          `sources[${index}].nodes.${fieldName} must be a string or finite number`
+        );
+      }
+    }
     for (const [fieldName, value] of [
       ["type", source.edge?.type],
       ["weight", source.edge?.weight],
     ] as const) {
-      if (typeof value === "number" && !Number.isFinite(value)) {
-        throw new TypeError(`sources[${index}].edge.${fieldName} must be finite`);
+      if (
+        value !== undefined &&
+        typeof value !== "string" &&
+        (typeof value !== "number" || !Number.isFinite(value))
+      ) {
+        throw new TypeError(
+          `sources[${index}].edge.${fieldName} must be a string or finite number`
+        );
       }
+    }
+    if (source.edge?.metadata !== undefined && !isRecord(source.edge.metadata)) {
+      throw new TypeError(`sources[${index}].edge.metadata must be an object`);
+    }
+    if (source.context !== undefined) {
+      if (!isRecord(source.context)) {
+        throw new TypeError(`sources[${index}].context must be an object`);
+      }
+      validateOnlyKeys(source.context, ["doc_fields"], `sources[${index}].context`);
     }
     const docFields = source.context?.doc_fields;
     if (docFields !== undefined) {
+      if (!Array.isArray(docFields)) {
+        throw new TypeError(`sources[${index}].context.doc_fields must be an array`);
+      }
       if (docFields.some((field) => typeof field !== "string" || field.length === 0)) {
         throw new TypeError(
           `sources[${index}].context.doc_fields entries must be non-empty strings`
@@ -206,9 +292,30 @@ export function artifactEmbeddingIndexConfig(
 ): IndexConfig {
   // Keep runtime checks for JavaScript consumers and values crossing an
   // untyped boundary even though TypeScript callers get a discriminated union.
+  validateRequiredString(name, "index name");
+  if (!isRecord(options)) throw new TypeError("options must be an object");
+  validateOnlyKeys(
+    options,
+    ["sources", "embedder", "dimension", "sparse", "distanceMetric"],
+    "options"
+  );
   const runtimeOptions: RuntimeArtifactEmbeddingIndexOptions = options;
-  if (name.length === 0) throw new TypeError("index name is required");
+  if (!Array.isArray(runtimeOptions.sources)) throw new TypeError("sources must be an array");
+  runtimeOptions.sources.forEach((source, index) => {
+    if (!isRecord(source)) throw new TypeError(`sources[${index}] must be an object`);
+    validateOnlyKeys(
+      source,
+      ["artifact", "sourceArtifact", "field", "template"],
+      `sources[${index}]`
+    );
+    validateOptionalString(source.sourceArtifact, `sources[${index}].sourceArtifact`);
+    validateOptionalString(source.field, `sources[${index}].field`);
+    validateOptionalString(source.template, `sources[${index}].template`);
+  });
   validateArtifactNames(runtimeOptions.sources.map((source) => source.artifact));
+  if (runtimeOptions.sparse !== undefined && typeof runtimeOptions.sparse !== "boolean") {
+    throw new TypeError("sparse must be a boolean");
+  }
   if (runtimeOptions.sparse && runtimeOptions.dimension !== undefined) {
     throw new TypeError("dimension must be omitted for sparse embedding indexes");
   }
@@ -221,9 +328,10 @@ export function artifactEmbeddingIndexConfig(
   ) {
     throw new RangeError("dimension must be a positive integer");
   }
+  if (!isRecord(runtimeOptions.embedder)) throw new TypeError("embedder must be an object");
   if (
-    typeof (runtimeOptions.embedder as { provider?: unknown }).provider !== "string" ||
-    (runtimeOptions.embedder as { provider: string }).provider.length === 0
+    typeof runtimeOptions.embedder.provider !== "string" ||
+    runtimeOptions.embedder.provider.length === 0
   ) {
     throw new TypeError("embedder.provider is required");
   }

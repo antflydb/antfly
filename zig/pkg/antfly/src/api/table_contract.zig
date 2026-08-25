@@ -1161,6 +1161,8 @@ test "table contract rejects unknown fields in closed nested index objects" {
         ,
         \\{"type":"graph","source":{"kind":"document_field","artifact":"relations_v1"}}
         ,
+        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1"}}
+        ,
         \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","client_value":"private"}]}
         ,
         \\{"type":"graph","edge_types":[{"name":"mentions","client_value":"private"}]}

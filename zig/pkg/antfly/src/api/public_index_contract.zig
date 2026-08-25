@@ -392,8 +392,6 @@ fn graphEdgeMappingFieldValueMatches(field: []const u8, value: std.json.Value) b
 }
 
 fn graphArtifactSourceFieldValueMatches(field: []const u8, value: std.json.Value) bool {
-    if (std.mem.eql(u8, field, "kind"))
-        return value == .string and std.mem.eql(u8, value.string, "artifact");
     if (std.mem.eql(u8, field, "format"))
         return value == .string and
             (std.mem.eql(u8, value.string, "extraction_relation") or
@@ -501,8 +499,7 @@ pub fn isAllowedEdgeTypeField(field: []const u8) bool {
 }
 
 pub fn isAllowedGraphArtifactSourceField(field: []const u8) bool {
-    return std.mem.eql(u8, field, "kind") or
-        std.mem.eql(u8, field, "artifact") or
+    return std.mem.eql(u8, field, "artifact") or
         std.mem.eql(u8, field, "path") or
         std.mem.eql(u8, field, "format") or
         std.mem.eql(u8, field, "mention_edge_type") or

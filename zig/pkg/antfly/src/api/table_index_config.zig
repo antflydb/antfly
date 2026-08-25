@@ -228,6 +228,7 @@ test "graph index validation runs the runtime parser before catalog admission" {
         "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
         "{\"type\":\"graph\",\"edge_types\":[{\"name\":\"mentions\",\"topology\":\"dag\"}]}",
         "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":\"{{ _doc.value.tenant }}\"}}}",
+        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"}}",
         "{\"type\":\"graph\",\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"document\",\"value\":\"relations\"}}}",
     };
     for (invalid_configs) |config| {

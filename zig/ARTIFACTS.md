@@ -409,16 +409,16 @@ independent member. The singular `artifact_name` (full-text) and `source`
 (graph) forms are supported single-source convenience inputs but cannot be
 combined with `sources`; normalized responses use `sources`. A graph
 `source` owns its `nodes`, `edge`, and `context` mappings just like one item in
-`sources`. The former root-level graph mappings and the redundant graph-source
-`kind: "artifact"` discriminator remain accepted compatibility inputs, but are
-deprecated and omitted from normalized output. Conflicting root and nested
-mappings are rejected.
+`sources`. Graph mappings are source-scoped. Root-level mappings and the
+redundant graph-source `kind: "artifact"` discriminator were not part of the
+v0.2.0 public API and are rejected rather than introduced as compatibility
+surface area.
 
-The embeddings root fields `embedding_name` and `source_artifact_name` are
-deprecated single-source compatibility inputs. New artifact-backed vector
-indexes use `sources` to select embedding outputs and put
-`source_artifact_name` only on the matching embedding enrichment. Normalized
-responses represent the consumed embedding through `sources`.
+The embeddings root field `embedding_name` is a supported single-source
+convenience input. The index-level `source_artifact_name` field is deprecated:
+new artifact-backed vector indexes use `sources` to select embedding outputs
+and put `source_artifact_name` only on the matching embedding enrichment.
+Normalized responses represent the consumed embedding through `sources`.
 
 For example, one full-text index can search both extracted units and derived
 chunks:
