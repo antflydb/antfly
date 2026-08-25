@@ -916,7 +916,6 @@ def test_public_managed_chunked_semantic_full_index_pipeline(
     assert any(chunk["body"].startswith("beta") for chunk in chunks)
 
 
-@pytest.mark.slow
 def test_progressive_index_is_semantically_queryable_before_full_coverage(
     single_item_enrichment_batches,
     backup_api,
