@@ -6875,11 +6875,8 @@ export interface components {
              *     familiar scalar syntax with document queries but deliberately excludes
              *     analyzer-backed and index-only clauses. A request may contain at most
              *     64 named graph operations, of which at most 8 may be named `match`
-             *     operations. Operation names must be 1-128 Unicode characters and
-             *     must not begin with `$`, have leading or trailing spaces, contain
-             *     non-ASCII whitespace, or contain Unicode control or format code
-             *     points. Ordinary internal ASCII spaces are allowed. `$` is reserved
-             *     for result namespaces.
+             *     operations. Each operation key is a GraphIdentifier under the
+             *     versioned policy published in the GraphIdentifier schema.
              *     Put multiple counts over one pattern in the same `match` return
              *     object so they share one complete anchor scan.
              */
@@ -11884,6 +11881,8 @@ export interface components {
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        /** @description User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes. */
+        GraphIdentifier: string;
         GraphDocumentFuzzyFilter: {
             term: string;
             /** @description RFC 6901 JSON Pointer to the stored-document value. */
@@ -11998,8 +11997,8 @@ export interface components {
         };
         /** @description Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
         GraphMatchEdge: {
-            from: string;
-            to: string;
+            from: components["schemas"]["GraphIdentifier"];
+            to: components["schemas"]["GraphIdentifier"];
             /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
             types?: string[];
             /** @default 1 */
@@ -12015,7 +12014,7 @@ export interface components {
             and: components["schemas"]["GraphWhereExpression"][];
         };
         GraphAliasOperand: {
-            alias: string;
+            alias: components["schemas"]["GraphIdentifier"];
         };
         GraphNotEqualPredicate: {
             left: components["schemas"]["GraphAliasOperand"];
@@ -12033,17 +12032,17 @@ export interface components {
         };
         GraphWhereExpression: components["schemas"]["GraphWhereAnd"] | components["schemas"]["GraphWhereNotEqual"] | components["schemas"]["GraphWhereNotExists"];
         GraphOptionalMatch: {
-            /** @description Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format code points are rejected. */
+            /** @description Keys are GraphIdentifiers naming aliases introduced by this optional match. */
             nodes?: {
                 [key: string]: components["schemas"]["GraphMatchNode"];
             };
             edges: components["schemas"]["GraphMatchEdge"][];
             where?: components["schemas"]["GraphWhereExpression"];
         };
+        /** @description `anchor` names the alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on the anchor must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`. */
         GraphMatch: {
-            /** @description Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on this alias must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`. */
-            anchor: string;
-            /** @description Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format code points are rejected. */
+            anchor: components["schemas"]["GraphIdentifier"];
+            /** @description Keys are GraphIdentifiers naming aliases in the required match. */
             nodes: {
                 [key: string]: components["schemas"]["GraphMatchNode"];
             };
@@ -12052,7 +12051,7 @@ export interface components {
             optional?: components["schemas"]["GraphOptionalMatch"][];
         };
         GraphBindingsReturn: {
-            bindings: string[];
+            bindings: components["schemas"]["GraphIdentifier"][];
             /** @default 100 */
             limit?: number;
             /**
@@ -12063,9 +12062,10 @@ export interface components {
             /** @description Document fields to hydrate. Requires include_documents=true; omit to include all fields. */
             fields?: string[];
         };
+        /** @description Use the reserved token `*` to count rows, or a GraphIdentifier under Antfly graph identifier policy v1 to count non-null bindings. */
+        GraphCountTarget: string;
         GraphCountAggregate: {
-            /** @description Use the reserved token `*` to count rows, or an alias to count non-null bindings. Graph aliases cannot be `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII whitespace, or contain Unicode control or format code points. Ordinary internal ASCII spaces are allowed. The `$` namespace is reserved for result references. */
-            count: string;
+            count: components["schemas"]["GraphCountTarget"];
             /**
              * @description Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
              * @default false
@@ -12073,7 +12073,7 @@ export interface components {
             distinct?: boolean;
         };
         GraphAggregatesReturn: {
-            /** @description Aggregate names are limited to 128 Unicode code points. */
+            /** @description Keys are GraphIdentifiers naming aggregate results. */
             aggregates: {
                 [key: string]: components["schemas"]["GraphCountAggregate"];
             };

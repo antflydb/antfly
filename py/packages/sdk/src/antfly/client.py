@@ -41,6 +41,7 @@ from antfly.client_generated.models import (
 from antfly.client_generated.types import UNSET
 
 from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError, StorageResourceExhaustedError
+from .graph_identifier_policy_generated import is_valid_graph_identifier
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
@@ -70,6 +71,92 @@ _CREATED_INDEX_TYPES = {
 }
 
 
+def _require_graph_identifier(value: object, path: str) -> None:
+    if not isinstance(value, str) or not is_valid_graph_identifier(value):
+        raise AntflyException(
+            f"{path} must satisfy the versioned GraphIdentifier policy "
+            "(1-128 Unicode code points; no reserved, boundary-space, non-ASCII whitespace, control, or format characters)"
+        )
+
+
+def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, path: str) -> None:
+    _require_graph_identifier(match.get("anchor"), f"{path}.match.anchor")
+
+    nodes = match.get("nodes")
+    if isinstance(nodes, Mapping):
+        for alias in nodes:
+            _require_graph_identifier(alias, f"{path}.match.nodes key")
+
+    edge_groups: list[tuple[object, str]] = [(match.get("edges"), f"{path}.match.edges")]
+    where_groups: list[tuple[object, str, int]] = [(match.get("where"), f"{path}.match.where", 0)]
+    optional = match.get("optional")
+    if isinstance(optional, list):
+        for index, optional_match in enumerate(optional):
+            if not isinstance(optional_match, Mapping):
+                continue
+            optional_path = f"{path}.match.optional[{index}]"
+            optional_nodes = optional_match.get("nodes")
+            if isinstance(optional_nodes, Mapping):
+                for alias in optional_nodes:
+                    _require_graph_identifier(alias, f"{optional_path}.nodes key")
+            edge_groups.append((optional_match.get("edges"), f"{optional_path}.edges"))
+            where_groups.append((optional_match.get("where"), f"{optional_path}.where", 0))
+
+    for edges, edges_path in edge_groups:
+        if not isinstance(edges, list):
+            continue
+        for index, edge in enumerate(edges):
+            if not isinstance(edge, Mapping):
+                continue
+            _require_graph_identifier(edge.get("from"), f"{edges_path}[{index}].from")
+            _require_graph_identifier(edge.get("to"), f"{edges_path}[{index}].to")
+
+    while where_groups:
+        where, where_path, depth = where_groups.pop()
+        if where is None or not isinstance(where, Mapping):
+            continue
+        if depth >= 16:
+            raise AntflyException(f"{where_path} exceeds the maximum graph predicate depth")
+        conjunction = where.get("and")
+        if isinstance(conjunction, list):
+            where_groups.extend(
+                (child, f"{where_path}.and[{index}]", depth + 1) for index, child in enumerate(conjunction)
+            )
+        not_equal = where.get("not_equal")
+        if isinstance(not_equal, Mapping):
+            for side in ("left", "right"):
+                operand = not_equal.get(side)
+                if isinstance(operand, Mapping):
+                    _require_graph_identifier(operand.get("alias"), f"{where_path}.not_equal.{side}.alias")
+        not_exists = where.get("not_exists")
+        if isinstance(not_exists, Mapping):
+            edge_groups = [(not_exists.get("edges"), f"{where_path}.not_exists.edges")]
+            for edges, edges_path in edge_groups:
+                if not isinstance(edges, list):
+                    continue
+                for index, edge in enumerate(edges):
+                    if not isinstance(edge, Mapping):
+                        continue
+                    _require_graph_identifier(edge.get("from"), f"{edges_path}[{index}].from")
+                    _require_graph_identifier(edge.get("to"), f"{edges_path}[{index}].to")
+
+    if not isinstance(result, Mapping):
+        return
+    bindings = result.get("bindings")
+    if isinstance(bindings, list):
+        for index, alias in enumerate(bindings):
+            _require_graph_identifier(alias, f"{path}.return.bindings[{index}]")
+    aggregates = result.get("aggregates")
+    if isinstance(aggregates, Mapping):
+        for name, aggregate in aggregates.items():
+            _require_graph_identifier(name, f"{path}.return.aggregates key")
+            if not isinstance(aggregate, Mapping):
+                continue
+            count = aggregate.get("count")
+            if count != "*":
+                _require_graph_identifier(count, f"{path}.return.aggregates[{name!r}].count")
+
+
 def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]:
     """Serialize typed canonical graph operations while preserving raw-map compatibility."""
     operations = graph_queries.to_dict() if isinstance(graph_queries, QueryRequestGraphQueries) else graph_queries
@@ -79,14 +166,17 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
     encoded: dict[str, Any] = {}
     typed_queries = (GraphMatchQuery, GraphTraverseQuery, GraphShortestPathQuery, GraphKShortestPathsQuery)
     for name, query in operations.items():
-        if not name or len(name) > 128 or name.startswith("$"):
-            raise AntflyException("graph query names must contain 1-128 Unicode characters and must not begin with '$'")
+        _require_graph_identifier(name, "graph_queries key")
         if isinstance(query, typed_queries):
-            encoded[name] = query.to_dict()
+            encoded_query = query.to_dict()
         elif isinstance(query, Mapping):
-            encoded[name] = dict(query)
+            encoded_query = dict(query)
         else:
             raise AntflyException(f"graph query {name!r} must be a generated graph query model or mapping")
+        match = encoded_query.get("match")
+        if isinstance(match, Mapping):
+            _validate_graph_match_identifiers(match, encoded_query.get("return"), f"graph_queries[{name!r}]")
+        encoded[name] = encoded_query
     return encoded
 
 

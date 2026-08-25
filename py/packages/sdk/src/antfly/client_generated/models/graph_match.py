@@ -21,20 +21,21 @@ T = TypeVar("T", bound="GraphMatch")
 
 @_attrs_define
 class GraphMatch:
-    """
-    Attributes:
-        anchor (str): Alias enumerated from the query table as the source relation. Every other alias is reached through
-            graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of
-            `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field
-            predicates and row-level authorization filters on this alias must have native index coverage so Antfly can
-            enumerate the complete relation in `_id` order; otherwise the request fails with
-            `graph_anchor_filter_requires_index`.
-        nodes (GraphMatchNodes): Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces are
-            allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format code points are
-            rejected.
-        edges (list[GraphMatchEdge]):
-        where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):
-        optional (list[GraphOptionalMatch] | Unset):
+    """`anchor` names the alias enumerated from the query table as the source relation. Every other alias is reached
+    through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made
+    only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field
+    predicates and row-level authorization filters on the anchor must have native index coverage so Antfly can enumerate
+    the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
+
+        Attributes:
+            anchor (str): User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0).
+                Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The
+                value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode
+                White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
+            nodes (GraphMatchNodes): Keys are GraphIdentifiers naming aliases in the required match.
+            edges (list[GraphMatchEdge]):
+            where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):
+            optional (list[GraphOptionalMatch] | Unset):
     """
 
     anchor: str

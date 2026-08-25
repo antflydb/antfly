@@ -290,11 +290,8 @@ class RetrievalQueryRequest:
                 familiar scalar syntax with document queries but deliberately excludes
                 analyzer-backed and index-only clauses. A request may contain at most
                 64 named graph operations, of which at most 8 may be named `match`
-                operations. Operation names must be 1-128 Unicode characters and
-                must not begin with `$`, have leading or trailing spaces, contain
-                non-ASCII whitespace, or contain Unicode control or format code
-                points. Ordinary internal ASCII spaces are allowed. `$` is reserved
-                for result namespaces.
+                operations. Each operation key is a GraphIdentifier under the
+                versioned policy published in the GraphIdentifier schema.
                 Put multiple counts over one pattern in the same `match` return
                 object so they share one complete anchor scan.
             graph_searches (QueryRequestGraphSearches | Unset): Deprecated compatibility alias for the v0.2 graph query

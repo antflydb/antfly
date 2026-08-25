@@ -4420,7 +4420,7 @@ pub const GraphAggregatesResult = struct {
 };
 
 pub const GraphAggregatesReturn = struct {
-    /// Aggregate names are limited to 128 Unicode code points.
+    /// Keys are GraphIdentifiers naming aggregate results.
     aggregates: std.json.ArrayHashMap(GraphCountAggregate),
 };
 
@@ -4430,7 +4430,7 @@ pub const GraphAlgebraicPlanningConfig = struct {
 };
 
 pub const GraphAliasOperand = struct {
-    alias: []const u8,
+    alias: GraphIdentifier,
 };
 
 pub const GraphAnchorFilterRequiresIndexError = struct {
@@ -4495,7 +4495,7 @@ pub const GraphBindingsResult = struct {
 };
 
 pub const GraphBindingsReturn = struct {
-    bindings: []const []const u8,
+    bindings: []const GraphIdentifier,
     limit: ?i64 = null,
     /// Hydrate documents for projected non-null bindings. The product of `limit` and the number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated by coordinator-backed deployments; runtimes with only a source-table snapshot reject such requests instead of silently omitting the document.
     include_documents: ?bool = null,
@@ -4509,11 +4509,13 @@ pub const GraphBoundedTraversalConfig = struct {
 };
 
 pub const GraphCountAggregate = struct {
-    /// Use the reserved token `*` to count rows, or an alias to count non-null bindings. Graph aliases cannot be `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII whitespace, or contain Unicode control or format code points. Ordinary internal ASCII spaces are allowed. The `$` namespace is reserved for result references.
-    count: []const u8,
+    count: GraphCountTarget,
     /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
 };
+
+/// Use the reserved token `*` to count rows, or a GraphIdentifier under Antfly graph identifier policy v1 to count non-null bindings.
+pub const GraphCountTarget = []const u8;
 
 pub const GraphDistinctBudgetExceededError = struct {
     status: i32,
@@ -4789,6 +4791,9 @@ pub const GraphDocumentWildcardFilter = struct {
     path: []const u8,
 };
 
+/// User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
+pub const GraphIdentifier = []const u8;
+
 pub const GraphIdentityNodeSelector = struct {
     /// Exact node identities. Omitted table means the query table.
     identities: []const GraphPathEndpoint,
@@ -4940,10 +4945,10 @@ pub const GraphKeyNodeSelector = struct {
     keys: []const []const u8,
 };
 
+/// `anchor` names the alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on the anchor must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
 pub const GraphMatch = struct {
-    /// Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on this alias must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
-    anchor: []const u8,
-    /// Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format code points are rejected.
+    anchor: GraphIdentifier,
+    /// Keys are GraphIdentifiers naming aliases in the required match.
     nodes: std.json.ArrayHashMap(GraphMatchNode),
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,
@@ -4952,8 +4957,8 @@ pub const GraphMatch = struct {
 
 /// Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
 pub const GraphMatchEdge = struct {
-    from: []const u8,
-    to: []const u8,
+    from: GraphIdentifier,
+    to: GraphIdentifier,
     /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
     types: ?[]const []const u8 = null,
     min_hops: ?i64 = null,
@@ -5069,7 +5074,7 @@ pub const GraphNotExistsPattern = struct {
 };
 
 pub const GraphOptionalMatch = struct {
-    /// Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format code points are rejected.
+    /// Keys are GraphIdentifiers naming aliases introduced by this optional match.
     nodes: ?std.json.ArrayHashMap(GraphMatchNode) = null,
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,
@@ -8992,7 +8997,7 @@ pub const QueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Operation names must be 1-128 Unicode characters and must not begin with `$`, have leading or trailing spaces, contain non-ASCII whitespace, or contain Unicode control or format code points. Ordinary internal ASCII spaces are allowed. `$` is reserved for result namespaces. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Names beginning with `$` are reserved for result namespaces.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
@@ -9659,7 +9664,7 @@ pub const RetrievalQueryRequest = struct {
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
     analyses: ?Analyses = null,
-    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Operation names must be 1-128 Unicode characters and must not begin with `$`, have leading or trailing spaces, contain non-ASCII whitespace, or contain Unicode control or format code points. Ordinary internal ASCII spaces are allowed. `$` is reserved for result namespaces. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
+    /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
     /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Names beginning with `$` are reserved for result namespaces.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,

@@ -39,6 +39,11 @@ from .exceptions import (
     InferenceCapacityError,
     StorageResourceExhaustedError,
 )
+from .graph_identifier_policy_generated import (
+    GRAPH_IDENTIFIER_POLICY_VERSION,
+    GRAPH_IDENTIFIER_UNICODE_VERSION,
+    is_valid_graph_identifier,
+)
 
 __version__ = "0.1.0"
 
@@ -72,6 +77,9 @@ __all__ = [
     "InferenceAPIError",
     "InferenceCapacityError",
     "StorageResourceExhaustedError",
+    "GRAPH_IDENTIFIER_POLICY_VERSION",
+    "GRAPH_IDENTIFIER_UNICODE_VERSION",
+    "is_valid_graph_identifier",
     "SparseEmbedding",
     "PackedSparseEmbedding",
     "__version__",

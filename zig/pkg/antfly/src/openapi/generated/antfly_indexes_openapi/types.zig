@@ -5,6 +5,7 @@ const std = @import("std");
 const antfly_chunking_openapi = @import("antfly_chunking_openapi");
 const antfly_embeddings_openapi = @import("antfly_embeddings_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
+const antfly_graph_identifier_openapi = @import("antfly_graph_identifier_openapi");
 const antfly_query_openapi = @import("antfly_query_openapi");
 const antfly_sort_openapi = @import("antfly_sort_openapi");
 
@@ -1262,7 +1263,7 @@ pub const GraphAggregatesResult = struct {
 };
 
 pub const GraphAggregatesReturn = struct {
-    /// Aggregate names are limited to 128 Unicode code points.
+    /// Keys are GraphIdentifiers naming aggregate results.
     aggregates: std.json.ArrayHashMap(GraphCountAggregate),
 };
 
@@ -1272,7 +1273,7 @@ pub const GraphAlgebraicPlanningConfig = struct {
 };
 
 pub const GraphAliasOperand = struct {
-    alias: []const u8,
+    alias: antfly_graph_identifier_openapi.GraphIdentifier,
 };
 
 /// Document fields made available to graph mapping templates through `_doc.value`.
@@ -1330,7 +1331,7 @@ pub const GraphBindingsResult = struct {
 };
 
 pub const GraphBindingsReturn = struct {
-    bindings: []const []const u8,
+    bindings: []const antfly_graph_identifier_openapi.GraphIdentifier,
     limit: ?i64 = null,
     /// Hydrate documents for projected non-null bindings. The product of `limit` and the number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated by coordinator-backed deployments; runtimes with only a source-table snapshot reject such requests instead of silently omitting the document.
     include_documents: ?bool = null,
@@ -1344,8 +1345,7 @@ pub const GraphBoundedTraversalConfig = struct {
 };
 
 pub const GraphCountAggregate = struct {
-    /// Use the reserved token `*` to count rows, or an alias to count non-null bindings. Graph aliases cannot be `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII whitespace, or contain Unicode control or format code points. Ordinary internal ASCII spaces are allowed. The `$` namespace is reserved for result references.
-    count: []const u8,
+    count: antfly_graph_identifier_openapi.GraphCountTarget,
     /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
 };
@@ -1764,10 +1764,10 @@ pub const GraphKeyNodeSelector = struct {
     keys: []const []const u8,
 };
 
+/// `anchor` names the alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on the anchor must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
 pub const GraphMatch = struct {
-    /// Alias enumerated from the query table as the source relation. Every other alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary index. Stored-field predicates and row-level authorization filters on this alias must have native index coverage so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
-    anchor: []const u8,
-    /// Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format code points are rejected.
+    anchor: antfly_graph_identifier_openapi.GraphIdentifier,
+    /// Keys are GraphIdentifiers naming aliases in the required match.
     nodes: std.json.ArrayHashMap(GraphMatchNode),
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,
@@ -1776,8 +1776,8 @@ pub const GraphMatch = struct {
 
 /// Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
 pub const GraphMatchEdge = struct {
-    from: []const u8,
-    to: []const u8,
+    from: antfly_graph_identifier_openapi.GraphIdentifier,
+    to: antfly_graph_identifier_openapi.GraphIdentifier,
     /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
     types: ?[]const []const u8 = null,
     min_hops: ?i64 = null,
@@ -1882,7 +1882,7 @@ pub const GraphNotExistsPattern = struct {
 };
 
 pub const GraphOptionalMatch = struct {
-    /// Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format code points are rejected.
+    /// Keys are GraphIdentifiers naming aliases introduced by this optional match.
     nodes: ?std.json.ArrayHashMap(GraphMatchNode) = null,
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,

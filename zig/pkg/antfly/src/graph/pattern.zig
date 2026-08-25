@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const graph_mod = @import("graph.zig");
+const identifier_policy = @import("identifier_policy_generated.zig");
 const NodeAdmission = @import("node_admission.zig").NodeAdmission;
 const NodeRef = @import("node_admission.zig").NodeRef;
 const paths_mod = @import("paths.zig");
@@ -31,8 +32,8 @@ pub const max_optional_patterns: usize = 64;
 pub const max_match_predicates: usize = 64;
 pub const max_match_predicate_depth: usize = 16;
 pub const max_count_aggregates: usize = 64;
-pub const max_identifier_codepoints: usize = 128;
-pub const max_identifier_bytes: usize = max_identifier_codepoints * 4;
+pub const max_identifier_codepoints = identifier_policy.max_codepoints;
+pub const max_identifier_bytes = identifier_policy.max_utf8_bytes;
 pub const default_max_explored_nodes = work_budget_mod.default_max_explored_nodes;
 pub const default_max_explored_edges = work_budget_mod.default_max_explored_edges;
 pub const default_max_explored_edge_bytes = work_budget_mod.default_max_explored_edge_bytes;
@@ -330,86 +331,15 @@ fn consumeMaterializedEdges(work_budget: *WorkBudget, edges: []const graph_mod.E
 }
 
 pub fn isValidIdentifier(value: []const u8) bool {
-    if (value.len == 0 or value.len > max_identifier_bytes) return false;
-    // `*` is the count-rows sentinel and `$...` is reserved for result/control
-    // references. Keeping both out of the alias namespace makes every parsed
-    // identifier unambiguous throughout admission and execution.
-    if (std.mem.eql(u8, value, "*") or value[0] == '$') return false;
-    var iterator = (std.unicode.Utf8View.init(value) catch return false).iterator();
-    var codepoints: usize = 0;
-    var first: u21 = undefined;
-    var last: u21 = undefined;
-    while (iterator.nextCodepoint()) |codepoint| {
-        if (codepoints == 0) first = codepoint;
-        last = codepoint;
-        codepoints += 1;
-        if (codepoints > max_identifier_codepoints) return false;
-        if (isUnicodeControl(codepoint) or isUnicodeFormat(codepoint)) return false;
-        // Ordinary internal ASCII spaces are readable and unambiguous. Other
-        // Unicode whitespace can be invisible or change line layout, so it is
-        // never admitted in an identifier.
-        if (codepoint != ' ' and isUnicodeWhitespace(codepoint)) return false;
+    return identifier_policy.isValid(value);
+}
+
+test "graph identifiers match the versioned wire-policy conformance cases" {
+    try std.testing.expectEqualStrings("15.0.0", identifier_policy.unicode_version);
+    for (identifier_policy.conformance_cases) |case| {
+        errdefer std.log.err("graph identifier conformance case failed: {s}", .{case.name});
+        try std.testing.expectEqual(case.valid, isValidIdentifier(case.value));
     }
-    // Never normalize identifiers: doing so can silently retarget aliases and
-    // named-result dependencies. Reject ambiguous boundary spaces instead.
-    if (first == ' ' or last == ' ') return false;
-    return codepoints >= 1;
-}
-
-/// Unicode White_Space is a stable property. Keep this allocation-free table
-/// aligned with the Go SDK's unicode.IsSpace admission check.
-fn isUnicodeWhitespace(codepoint: u21) bool {
-    return switch (codepoint) {
-        0x0009...0x000d,
-        0x0020,
-        0x0085,
-        0x00a0,
-        0x1680,
-        0x2000...0x200a,
-        0x2028,
-        0x2029,
-        0x202f,
-        0x205f,
-        0x3000,
-        => true,
-        else => false,
-    };
-}
-
-fn isUnicodeControl(codepoint: u21) bool {
-    return codepoint <= 0x001f or (codepoint >= 0x007f and codepoint <= 0x009f);
-}
-
-/// Unicode 15 General_Category=Cf. Format controls include bidi overrides,
-/// zero-width controls, directional isolates, and interlinear annotation
-/// controls. They are valid text but unsafe in user-visible identifiers.
-fn isUnicodeFormat(codepoint: u21) bool {
-    return switch (codepoint) {
-        0x00ad,
-        0x0600...0x0605,
-        0x061c,
-        0x06dd,
-        0x070f,
-        0x0890,
-        0x0891,
-        0x08e2,
-        0x180e,
-        0x200b...0x200f,
-        0x202a...0x202e,
-        0x2060...0x2064,
-        0x2066...0x206f,
-        0xfeff,
-        0xfff9...0xfffb,
-        0x110bd,
-        0x110cd,
-        0x13430...0x1343f,
-        0x1bca0...0x1bca3,
-        0x1d173...0x1d17a,
-        0xe0001,
-        0xe0020...0xe007f,
-        => true,
-        else => false,
-    };
 }
 
 pub const DistinctBudget = struct {

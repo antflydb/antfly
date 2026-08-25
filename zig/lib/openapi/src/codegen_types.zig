@@ -994,7 +994,7 @@ pub const TypeGenerator = struct {
         try self.w.line("}}", .{});
     }
 
-    const GenError = error{OutOfMemory};
+    const GenError = error{ OutOfMemory, MissingExternalImportMapping };
 
     /// Get the Zig type string for a SchemaOrRef.
     pub fn zigTypeForSchemaOrRef(self: *TypeGenerator, sor: types.SchemaOrRef) GenError![]const u8 {
@@ -1016,9 +1016,45 @@ pub const TypeGenerator = struct {
                     return std.fmt.allocPrint(self.arena, "{s}.{s}", .{ module_name, type_name });
                 }
             }
+            return error.MissingExternalImportMapping;
         }
 
         return type_name;
+    }
+
+    test "external schema refs require an explicit import mapping" {
+        const alloc = std.testing.allocator;
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
+        defer arena_impl.deinit();
+        const arena = arena_impl.allocator();
+
+        var properties = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+        try properties.put(arena, "alias", .{
+            .ref = .{ .ref_string = "generated/identifier.yaml#/components/schemas/Identifier" },
+        });
+        var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+        try schemas.put(arena, "Holder", .{ .schema = .{
+            .schema_type = .{ .single = "object" },
+            .properties = properties,
+            .required = &.{"alias"},
+        } });
+        const doc = types.OpenApiDoc{
+            .openapi = "3.0.3",
+            .info = .{ .title = "Test", .version = "1.0" },
+            .components = .{ .schemas = schemas },
+        };
+
+        var resolver = Resolver.init(arena, &doc);
+        var unmapped_writer = SourceWriter.init(arena);
+        var unmapped = TypeGenerator.init(arena, &unmapped_writer, &resolver);
+        try std.testing.expectError(error.MissingExternalImportMapping, unmapped.generateAll(&doc));
+
+        var mapped_writer = SourceWriter.init(arena);
+        var mapped = TypeGenerator.init(arena, &mapped_writer, &resolver);
+        try mapped.import_mapping.put(arena, "generated/identifier.yaml", "identifier_openapi");
+        try mapped.generateAll(&doc);
+        try std.testing.expect(std.mem.indexOf(u8, mapped_writer.toSlice(), "alias: identifier_openapi.Identifier,") != null);
+        try std.testing.expect(mapped.used_imports.contains("identifier_openapi"));
     }
 
     /// Get the Zig type string for an inline schema.

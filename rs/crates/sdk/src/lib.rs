@@ -2,6 +2,12 @@
 
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 
+mod graph_identifier_policy_generated;
+pub use graph_identifier_policy_generated::{
+    GRAPH_IDENTIFIER_POLICY_VERSION, GRAPH_IDENTIFIER_UNICODE_VERSION,
+    MAX_GRAPH_IDENTIFIER_CODE_POINTS, MAX_GRAPH_IDENTIFIER_UTF8_BYTES, is_valid_graph_identifier,
+};
+
 pub fn normalize_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     ["/db/v1", "/auth/v1", "/ai/v1", "/api/v1"]

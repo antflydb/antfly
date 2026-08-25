@@ -25,7 +25,12 @@ class GraphMatchQuery:
 
         Attributes:
             index (str):
-            match (GraphMatch):
+            match (GraphMatch): `anchor` names the alias enumerated from the query table as the source relation. Every other
+                alias is reached through graph edges and may resolve to a table-qualified target identity. An `ids` filter, or a
+                disjunction made only of `ids` filters, uses the table's primary identity access path and needs no secondary
+                index. Stored-field predicates and row-level authorization filters on the anchor must have native index coverage
+                so Antfly can enumerate the complete relation in `_id` order; otherwise the request fails with
+                `graph_anchor_filter_requires_index`.
             return_ (GraphAggregatesReturn | GraphBindingsReturn): Return bindings or exact aggregates. Bindings and
                 aggregates are mutually exclusive.
     """

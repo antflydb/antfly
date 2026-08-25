@@ -452,6 +452,19 @@ func TestGraphResultBindingSelector(t *testing.T) {
 	}
 }
 
+func TestGraphIdentifiersMatchVersionedWirePolicy(t *testing.T) {
+	if GraphIdentifierUnicodeVersion != "15.0.0" || GraphIdentifierPolicyVersion != 1 {
+		t.Fatalf("unexpected graph identifier policy %d / Unicode %s", GraphIdentifierPolicyVersion, GraphIdentifierUnicodeVersion)
+	}
+	for _, tc := range graphIdentifierConformanceCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsValidGraphIdentifier(tc.value); got != tc.valid {
+				t.Fatalf("IsValidGraphIdentifier(%q) = %t, want %t", tc.value, got, tc.valid)
+			}
+		})
+	}
+}
+
 func TestGraphMatchEdgeValidationMatchesServerDefaultsAndBudgets(t *testing.T) {
 	zero := 0.0
 	negative := -1.0

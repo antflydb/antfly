@@ -16,7 +16,7 @@ T = TypeVar("T", bound="GraphAggregatesReturn")
 class GraphAggregatesReturn:
     """
     Attributes:
-        aggregates (GraphAggregatesReturnAggregates): Aggregate names are limited to 128 Unicode code points.
+        aggregates (GraphAggregatesReturnAggregates): Keys are GraphIdentifiers naming aggregate results.
     """
 
     aggregates: GraphAggregatesReturnAggregates

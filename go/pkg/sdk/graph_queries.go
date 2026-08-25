@@ -13,8 +13,6 @@ import (
 	"fmt"
 	"math"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
 )
@@ -34,8 +32,6 @@ const (
 	maxGraphMatchPredicates     = 64
 	maxGraphMatchPredicateDepth = 16
 	maxGraphCountAggregates     = 64
-	maxGraphIdentifierRunes     = 128
-	maxGraphIdentifierBytes     = maxGraphIdentifierRunes * utf8.UTFMax
 	maxGraphEdgeTypes           = 64
 	maxGraphEdgeTypeBytes       = 64 * 1024
 )
@@ -1066,40 +1062,6 @@ func validateNonEmptyUnique(kind string, values []string) error {
 		seen[value] = struct{}{}
 	}
 	return nil
-}
-
-func validGraphIdentifier(value string) bool {
-	if value == "" || len(value) > maxGraphIdentifierBytes || !utf8.ValidString(value) {
-		return false
-	}
-	// Keep aliases disjoint from the count(*) sentinel and result/control refs.
-	if value == "*" || value[0] == '$' {
-		return false
-	}
-	count := 0
-	var first, last rune
-	for _, codepoint := range value {
-		if count == 0 {
-			first = codepoint
-		}
-		last = codepoint
-		count++
-		if count > maxGraphIdentifierRunes {
-			return false
-		}
-		if unicode.IsControl(codepoint) || unicode.Is(unicode.Cf, codepoint) {
-			return false
-		}
-		// Preserve ordinary internal ASCII spaces, but reject whitespace that
-		// can be invisible or alter line layout.
-		if codepoint != ' ' && unicode.IsSpace(codepoint) {
-			return false
-		}
-	}
-	if first == ' ' || last == ' ' {
-		return false
-	}
-	return count >= 1
 }
 
 func invalidGraphIdentifier(kind string) error {

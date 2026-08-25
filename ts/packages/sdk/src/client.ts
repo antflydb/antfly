@@ -4,6 +4,7 @@
  */
 
 import createClient, { type Client } from "openapi-fetch";
+import { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
 import type { paths } from "./public-api.js";
 import type {
   AntflyAuth,
@@ -531,6 +532,7 @@ export class AntflyClient {
     tableName?: string,
     options?: QueryExecutionOptions
   ): Promise<QueryResponses | undefined> {
+    validateGraphQueryIdentifiers(request.graph_queries);
     if (path === "/db/v1/tables/{tableName}/query" && tableName) {
       const { data, error, response } = await this.client.POST("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName } },
@@ -557,6 +559,7 @@ export class AntflyClient {
     requests: QueryRequest[],
     tableName?: string
   ): Promise<QueryResponses | undefined> {
+    for (const request of requests) validateGraphQueryIdentifiers(request.graph_queries);
     const ndjson = `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`;
 
     if (path === "/db/v1/tables/{tableName}/query" && tableName) {

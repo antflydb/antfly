@@ -458,6 +458,46 @@ class TestAntflyClient:
         with pytest.raises(AntflyException, match="generated graph query model or mapping"):
             client.query(table="docs", graph_queries={"bad": 1})  # type: ignore[dict-item]
 
+    @pytest.mark.parametrize("name", [" bad", "bad\u00a0name", "bad\u200bname", "bad\u202ename", "*"])
+    def test_query_rejects_unsafe_graph_operation_names(self, name: str) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(AntflyException, match="GraphIdentifier policy"):
+            client.query(table="docs", graph_queries={name: {"traverse": {}}})
+
+    def test_query_rejects_unsafe_nested_graph_aliases(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        query = {
+            "index": "social",
+            "match": {
+                "anchor": "person",
+                "nodes": {"person": {}, "post\u200bauthor": {}},
+                "edges": [{"from": "person", "to": "post\u200bauthor"}],
+            },
+            "return": {"bindings": ["person"]},
+        }
+
+        with pytest.raises(AntflyException, match="match.nodes key"):
+            client.query(table="docs", graph_queries={"people": query})
+
+    def test_query_identifier_preflight_matches_graph_predicate_depth_limit(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        where: dict[str, object] = {"not_equal": {"left": {"alias": "person"}, "right": {"alias": "author"}}}
+        for _ in range(16):
+            where = {"and": [where]}
+        query = {
+            "match": {
+                "anchor": "person",
+                "nodes": {"person": {}, "author": {}},
+                "edges": [{"from": "person", "to": "author"}],
+                "where": where,
+            },
+            "return": {"bindings": ["person"]},
+        }
+
+        with pytest.raises(AntflyException, match="maximum graph predicate depth"):
+            client.query(table="docs", graph_queries={"people": query})
+
     @patch("antfly.client.Client")
     @patch("antfly.client.lookup_key")
     def test_get_record(self, mock_lookup_key: MagicMock, mock_client_class: MagicMock) -> None:

@@ -3135,8 +3135,8 @@ components:
         cross-table multi-hop patterns as explicit single-hop edges with a
         table-qualified alias at each table boundary.
       properties:
-        from: { type: string, minLength: 1, maxLength: 128 }
-        to: { type: string, minLength: 1, maxLength: 128 }
+        from: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
+        to: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
         types:
           type: array
           maxItems: 64
@@ -3160,7 +3160,7 @@ components:
       additionalProperties: false
       required: [alias]
       properties:
-        alias: { type: string, minLength: 1, maxLength: 128 }
+        alias: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
     GraphNotEqualPredicate:
       type: object
       additionalProperties: false
@@ -3217,7 +3217,8 @@ components:
           type: object
           maxProperties: 64
           additionalProperties: { $ref: '#/components/schemas/GraphMatchNode' }
-          description: Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format code points are rejected.
+          x-antfly-property-name-schema: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
+          description: Keys are GraphIdentifiers naming aliases introduced by this optional match.
         edges:
           type: array
           minItems: 1
@@ -3228,27 +3229,26 @@ components:
       type: object
       additionalProperties: false
       required: [anchor, nodes, edges]
+      description: >-
+        `anchor` names the alias enumerated from the query table as the source
+        relation. Every other alias is reached through graph edges and may
+        resolve to a table-qualified target identity. An `ids` filter, or a
+        disjunction made only of `ids` filters, uses the table's primary
+        identity access path and needs no secondary index. Stored-field
+        predicates and row-level authorization filters on the anchor must have
+        native index coverage so Antfly can enumerate the complete relation in
+        `_id` order; otherwise the request fails with
+        `graph_anchor_filter_requires_index`.
       properties:
         anchor:
-          type: string
-          minLength: 1
-          maxLength: 128
-          description: >-
-            Alias enumerated from the query table as the source relation. Every
-            other alias is reached through graph edges and may resolve to a
-            table-qualified target identity. An `ids` filter, or a disjunction
-            made only of `ids` filters, uses the table's primary identity access
-            path and needs no secondary index. Stored-field predicates and
-            row-level authorization filters on this alias must have native index
-            coverage so Antfly can enumerate the complete relation in `_id`
-            order; otherwise the request fails with
-            `graph_anchor_filter_requires_index`.
+          $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier'
         nodes:
           type: object
           minProperties: 1
           maxProperties: 64
           additionalProperties: { $ref: '#/components/schemas/GraphMatchNode' }
-          description: Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format code points are rejected.
+          x-antfly-property-name-schema: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
+          description: Keys are GraphIdentifiers naming aliases in the required match.
         edges:
           type: array
           maxItems: 64
@@ -3264,16 +3264,7 @@ components:
       required: [count]
       properties:
         count:
-          type: string
-          minLength: 1
-          maxLength: 128
-          description: >-
-            Use the reserved token `*` to count rows, or an alias to count
-            non-null bindings. Graph aliases cannot be `*`, begin with `$`,
-            have leading or trailing spaces, contain non-ASCII whitespace, or
-            contain Unicode control or format code points. Ordinary internal
-            ASCII spaces are allowed. The `$` namespace is reserved for result
-            references.
+          $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphCountTarget'
         distinct:
           type: boolean
           default: false
@@ -3291,7 +3282,7 @@ components:
           minItems: 1
           maxItems: 64
           uniqueItems: true
-          items: { type: string, minLength: 1, maxLength: 128 }
+          items: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
         limit:
           type: integer
           minimum: 1
@@ -3320,7 +3311,8 @@ components:
           minProperties: 1
           maxProperties: 64
           additionalProperties: { $ref: '#/components/schemas/GraphCountAggregate' }
-          description: Aggregate names are limited to 128 Unicode code points.
+          x-antfly-property-name-schema: { $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier' }
+          description: Keys are GraphIdentifiers naming aggregate results.
     GraphReturn:
       oneOf:
         - $ref: '#/components/schemas/GraphBindingsReturn'

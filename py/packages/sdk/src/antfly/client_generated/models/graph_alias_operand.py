@@ -12,7 +12,10 @@ T = TypeVar("T", bound="GraphAliasOperand")
 class GraphAliasOperand:
     """
     Attributes:
-        alias (str):
+        alias (str): User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0).
+            Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The
+            value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode
+            White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
     """
 
     alias: str

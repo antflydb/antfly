@@ -14714,6 +14714,8 @@ components:
           maxProperties: 64
           additionalProperties:
             $ref: '#/components/schemas/GraphQuery'
+          x-antfly-property-name-schema:
+            $ref: '#/components/schemas/GraphIdentifier'
           description: >
             Declarative graph matching, traversal, and path queries. A nested node
 
@@ -14725,15 +14727,9 @@ components:
 
             64 named graph operations, of which at most 8 may be named `match`
 
-            operations. Operation names must be 1-128 Unicode characters and
+            operations. Each operation key is a GraphIdentifier under the
 
-            must not begin with `$`, have leading or trailing spaces, contain
-
-            non-ASCII whitespace, or contain Unicode control or format code
-
-            points. Ordinary internal ASCII spaces are allowed. `$` is reserved
-
-            for result namespaces.
+            versioned policy published in the GraphIdentifier schema.
 
             Put multiple counts over one pattern in the same `match` return
 
@@ -22366,6 +22362,76 @@ components:
         provider: ollama
         model: dengcao/Qwen3-Reranker-0.6B:F16
         field: content
+    GraphIdentifier:
+      type: string
+      minLength: 1
+      maxLength: 128
+      description: User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode
+        15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces
+        are allowed. The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain
+        non-ASCII Unicode White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding
+        is limited to 512 bytes.
+      x-antfly-identifier-policy:
+        version: 1
+        unicodeVersion: 15.0.0
+        maxUtf8Bytes: 512
+        reservedExact:
+          - '*'
+        reservedPrefixes:
+          - $
+        disallowedCodePointRanges:
+          - - '0000'
+            - 001F
+          - - 007F
+            - 00A0
+          - - 00AD
+            - 00AD
+          - - '0600'
+            - '0605'
+          - - 061C
+            - 061C
+          - - 06DD
+            - 06DD
+          - - 070F
+            - 070F
+          - - 0890
+            - 0891
+          - - 08E2
+            - 08E2
+          - - '1680'
+            - '1680'
+          - - 180E
+            - 180E
+          - - '2000'
+            - 200F
+          - - '2028'
+            - 202F
+          - - 205F
+            - '2064'
+          - - '2066'
+            - 206F
+          - - '3000'
+            - '3000'
+          - - D800
+            - DFFF
+          - - FEFF
+            - FEFF
+          - - FFF9
+            - FFFB
+          - - 110BD
+            - 110BD
+          - - 110CD
+            - 110CD
+          - - '13430'
+            - 1343F
+          - - 1BCA0
+            - 1BCA3
+          - - 1D173
+            - 1D17A
+          - - E0001
+            - E0001
+          - - E0020
+            - E007F
     GraphDocumentFuzzyFilter:
       type: object
       additionalProperties: false
@@ -22689,13 +22755,9 @@ components:
         table boundary.'
       properties:
         from:
-          type: string
-          minLength: 1
-          maxLength: 128
+          $ref: '#/components/schemas/GraphIdentifier'
         to:
-          type: string
-          minLength: 1
-          maxLength: 128
+          $ref: '#/components/schemas/GraphIdentifier'
         types:
           type: array
           maxItems: 64
@@ -22743,9 +22805,7 @@ components:
         - alias
       properties:
         alias:
-          type: string
-          minLength: 1
-          maxLength: 128
+          $ref: '#/components/schemas/GraphIdentifier'
     GraphNotEqualPredicate:
       type: object
       additionalProperties: false
@@ -22803,9 +22863,9 @@ components:
           maxProperties: 64
           additionalProperties:
             $ref: '#/components/schemas/GraphMatchNode'
-          description: Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces
-            are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format
-            code points are rejected.
+          x-antfly-property-name-schema:
+            $ref: '#/components/schemas/GraphIdentifier'
+          description: Keys are GraphIdentifiers naming aliases introduced by this optional match.
         edges:
           type: array
           minItems: 1
@@ -22821,26 +22881,24 @@ components:
         - anchor
         - nodes
         - edges
+      description: '`anchor` names the alias enumerated from the query table as the source relation. Every
+        other alias is reached through graph edges and may resolve to a table-qualified target identity.
+        An `ids` filter, or a disjunction made only of `ids` filters, uses the table''s primary identity
+        access path and needs no secondary index. Stored-field predicates and row-level authorization
+        filters on the anchor must have native index coverage so Antfly can enumerate the complete relation
+        in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.'
       properties:
         anchor:
-          type: string
-          minLength: 1
-          maxLength: 128
-          description: Alias enumerated from the query table as the source relation. Every other alias
-            is reached through graph edges and may resolve to a table-qualified target identity. An `ids`
-            filter, or a disjunction made only of `ids` filters, uses the table's primary identity access
-            path and needs no secondary index. Stored-field predicates and row-level authorization filters
-            on this alias must have native index coverage so Antfly can enumerate the complete relation
-            in `_id` order; otherwise the request fails with `graph_anchor_filter_requires_index`.
+          $ref: '#/components/schemas/GraphIdentifier'
         nodes:
           type: object
           minProperties: 1
           maxProperties: 64
           additionalProperties:
             $ref: '#/components/schemas/GraphMatchNode'
-          description: Aliases are limited to 128 Unicode code points. Ordinary internal ASCII spaces
-            are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format
-            code points are rejected.
+          x-antfly-property-name-schema:
+            $ref: '#/components/schemas/GraphIdentifier'
+          description: Keys are GraphIdentifiers naming aliases in the required match.
         edges:
           type: array
           maxItems: 64
@@ -22865,9 +22923,7 @@ components:
           maxItems: 64
           uniqueItems: true
           items:
-            type: string
-            minLength: 1
-            maxLength: 128
+            $ref: '#/components/schemas/GraphIdentifier'
         limit:
           type: integer
           minimum: 1
@@ -22886,6 +22942,15 @@ components:
             type: string
           description: Document fields to hydrate. Requires include_documents=true; omit to include all
             fields.
+    GraphCountTarget:
+      type: string
+      minLength: 1
+      maxLength: 128
+      description: Use the reserved token `*` to count rows, or a GraphIdentifier under Antfly graph identifier
+        policy v1 to count non-null bindings.
+      x-antfly-count-target:
+        rowSentinel: '*'
+        identifierSchema: '#/components/schemas/GraphIdentifier'
     GraphCountAggregate:
       type: object
       additionalProperties: false
@@ -22893,13 +22958,7 @@ components:
         - count
       properties:
         count:
-          type: string
-          minLength: 1
-          maxLength: 128
-          description: Use the reserved token `*` to count rows, or an alias to count non-null bindings.
-            Graph aliases cannot be `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII
-            whitespace, or contain Unicode control or format code points. Ordinary internal ASCII spaces
-            are allowed. The `$` namespace is reserved for result references.
+          $ref: '#/components/schemas/GraphCountTarget'
         distinct:
           type: boolean
           default: false
@@ -22917,7 +22976,9 @@ components:
           maxProperties: 64
           additionalProperties:
             $ref: '#/components/schemas/GraphCountAggregate'
-          description: Aggregate names are limited to 128 Unicode code points.
+          x-antfly-property-name-schema:
+            $ref: '#/components/schemas/GraphIdentifier'
+          description: Keys are GraphIdentifiers naming aggregate results.
     GraphReturn:
       oneOf:
         - $ref: '#/components/schemas/GraphBindingsReturn'

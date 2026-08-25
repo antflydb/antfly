@@ -21,8 +21,14 @@ class GraphMatchEdge:
     boundary.
 
         Attributes:
-            from_ (str):
-            to (str):
+            from_ (str): User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0).
+                Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The
+                value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode
+                White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
+            to (str): User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0).
+                Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The
+                value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode
+                White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
             types (list[str] | Unset): Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
                 at most 64 KiB.
             min_hops (int | Unset):  Default: 1.
