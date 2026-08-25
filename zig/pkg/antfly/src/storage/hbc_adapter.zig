@@ -5879,14 +5879,20 @@ pub const HBCIndex = struct {
         return self.pinned_quantized_cache.contains(node_id);
     }
 
-    fn ensurePinnedNode(self: *HBCIndex, node: *const Node) !void {
+    fn ensurePinnedNode(self: *HBCIndex, node: *const Node, fill_epoch: u64) !void {
         if (self.config.max_pinned_tree_nodes == 0) return;
         self.cache_mu.lockExclusive();
         defer self.cache_mu.unlockExclusive();
+        // The epoch check and admission share the invalidation lock. If a
+        // publisher invalidated this node before we acquired the lock, an old
+        // MVCC reader cannot put the pre-publication value back. If publication
+        // starts after this check, its invalidation waits for this lock and
+        // removes the entry before the new generation becomes visible.
+        if (!self.searchCacheFillCurrent(fill_epoch)) return;
         try self.cachePinnedNodeLocked(node, false);
     }
 
-    fn ensurePinnedQuantized(self: *HBCIndex, txn: anytype, node: *const Node) !void {
+    fn ensurePinnedQuantized(self: *HBCIndex, txn: anytype, node: *const Node, fill_epoch: u64) !void {
         if (!self.config.use_quantization) return;
         if (self.config.max_pinned_tree_nodes == 0) return;
         const expected_count = if (node.is_leaf) node.members.len else node.children.len;
@@ -5896,23 +5902,37 @@ pub const HBCIndex = struct {
         if (self.borrowCachedQuantized(node.id)) |borrowed| {
             var handle = borrowed;
             defer handle.deinit();
-            const cloned = try handle.ptr().clone(self.alloc);
+            var cloned = try handle.ptr().clone(self.alloc);
             self.cache_mu.lockExclusive();
             defer self.cache_mu.unlockExclusive();
+            if (!self.searchCacheFillCurrent(fill_epoch)) {
+                cloned.deinit(self.alloc);
+                return;
+            }
             try self.cachePinnedQuantizedOwnedLocked(node.id, cloned, false);
             return;
         }
 
-        const loaded = self.loadQuantized(txn, node.id, node.parent == 0, expected_count) catch |err| {
+        var loaded = self.loadQuantized(txn, node.id, node.parent == 0, expected_count) catch |err| {
             if (isNotFound(err) or err == error.Corrupted) return;
             return err;
         };
         self.cache_mu.lockExclusive();
         defer self.cache_mu.unlockExclusive();
+        if (!self.searchCacheFillCurrent(fill_epoch)) {
+            loaded.deinit(self.alloc);
+            return;
+        }
         try self.cachePinnedQuantizedOwnedLocked(node.id, loaded, false);
     }
 
     pub fn pinUpperTreeCache(self: *HBCIndex, txn: anytype) !void {
+        // Pinning is a search-cache fill just like an ordinary node miss. Bind
+        // every admission to the epoch captured immediately before this read
+        // transaction opened; a miss-time token would permit an old MVCC
+        // snapshot to repopulate the current generation after invalidation.
+        const fill_epoch = txn.cache_fill_epoch orelse return;
+        if (!self.searchCacheFillCurrent(fill_epoch)) return;
         if (self.publicationMutationActive()) return;
         if (!self.cache_enabled) return;
         if (self.config.max_pinned_tree_nodes == 0) return;
@@ -5930,6 +5950,7 @@ pub const HBCIndex = struct {
         var index: usize = 0;
         var visited: usize = 0;
         while (index < pending.items.len and visited < self.config.max_pinned_tree_nodes) : (index += 1) {
+            if (!self.searchCacheFillCurrent(fill_epoch)) return;
             const item = pending.items[index];
             visited += 1;
 
@@ -5937,8 +5958,8 @@ pub const HBCIndex = struct {
                 var handle = borrowed;
                 defer handle.deinit();
                 const node = handle.ptr();
-                if (!self.pinnedNodeCached(item.node_id)) try self.ensurePinnedNode(node);
-                try self.ensurePinnedQuantized(txn, node);
+                if (!self.pinnedNodeCached(item.node_id)) try self.ensurePinnedNode(node, fill_epoch);
+                try self.ensurePinnedQuantized(txn, node, fill_epoch);
                 if (!node.is_leaf and item.depth < self.config.pinned_tree_depth) {
                     for (node.children) |child_id| {
                         if (pending.items.len >= self.config.max_pinned_tree_nodes) break;
@@ -5953,8 +5974,8 @@ pub const HBCIndex = struct {
                 return err;
             };
             defer node.deinit(self.alloc);
-            try self.ensurePinnedNode(&node);
-            try self.ensurePinnedQuantized(txn, &node);
+            try self.ensurePinnedNode(&node, fill_epoch);
+            try self.ensurePinnedQuantized(txn, &node, fill_epoch);
             if (!node.is_leaf and item.depth < self.config.pinned_tree_depth) {
                 for (node.children) |child_id| {
                     if (pending.items.len >= self.config.max_pinned_tree_nodes) break;
@@ -10103,6 +10124,69 @@ test "hbc old snapshot metadata cannot poison the current cache generation" {
     );
     try std.testing.expectEqualStrings("snapshot:new", metadata[0] orelse return error.TestUnexpectedResult);
     try expectCachedMetadata(&idx, 1, "snapshot:new");
+}
+
+test "hbc old snapshot cannot repopulate pinned upper tree after publication" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .leaf_size = 64,
+        .branching_factor = 4,
+        .use_quantization = true,
+        .max_pinned_tree_nodes = 8,
+        .pinned_tree_depth = 1,
+    });
+    defer idx.close();
+    try idx.insert(1, &.{ 0, 0 });
+    try idx.insert(2, &.{ 1, 0 });
+    idx.clearNodeCache();
+    idx.clearQuantizedCache();
+
+    // Establish an old MVCC snapshot and materialize its root before the
+    // writer invalidates the corresponding pinned-cache keys.
+    var old_txn = try idx.beginRuntimeSearchTxn();
+    defer old_txn.abort();
+    const old_fill_epoch = old_txn.cache_fill_epoch orelse return error.TestUnexpectedResult;
+    const root_id = idx.publishedRootNode();
+    var old_root = try idx.loadNodeFromStorage(&old_txn, root_id);
+    defer old_root.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), old_root.members.len);
+
+    // Publish a new root payload after the old read. Delayed node and
+    // quantized admissions from the old transaction must both fail closed,
+    // including the upper-tree walk itself.
+    try idx.insert(3, &.{ 0, 1 });
+    try std.testing.expect(idx.publishedMutationEpoch() != old_fill_epoch);
+    try idx.ensurePinnedNode(&old_root, old_fill_epoch);
+    try idx.ensurePinnedQuantized(&old_txn, &old_root, old_fill_epoch);
+    try idx.pinUpperTreeCache(&old_txn);
+
+    {
+        idx.cache_mu.lockShared();
+        defer idx.cache_mu.unlockShared();
+        try std.testing.expect(!idx.pinned_node_cache.contains(root_id));
+        try std.testing.expect(!idx.pinned_quantized_cache.contains(root_id));
+    }
+
+    // A transaction bound to the live publication can still warm the pinned
+    // caches, proving that stale rejection does not disable the fast path.
+    var current_txn = try idx.beginRuntimeSearchTxn();
+    defer current_txn.abort();
+    try idx.pinUpperTreeCache(&current_txn);
+
+    {
+        idx.cache_mu.lockShared();
+        defer idx.cache_mu.unlockShared();
+        const pinned_node = idx.pinned_node_cache.get(root_id) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 3), pinned_node.node.members.len);
+        const pinned_quantized = idx.pinned_quantized_cache.get(root_id) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 3), pinned_quantized.quantized.getCount());
+    }
 }
 
 test "hbc shared vector publication coalesces concurrent duplicate fills" {
