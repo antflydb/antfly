@@ -8470,6 +8470,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.document_query.",
             "storage.db.generation_lifecycle.",
             "storage.db.lease.",
+            "storage.db.merge_state.",
             "storage.db.mod.",
             "storage.db.ownership.",
             "storage.db.planning_stats.",

@@ -1326,9 +1326,22 @@ pub const Client = struct {
     fn applyTimeouts(socket: *Socket, recv_ms: u64, send_ms: u64, deadline_ms: ?i64) !void {
         // Always reset pooled sockets so a prior request's shorter absolute
         // deadline cannot leak into the next request.
+        //
+        // An absolute deadline means the outer request watchdog owns this
+        // attempt. It cancels the task and shuts down the published socket,
+        // waking blocking I/O. Per-operation Select timers would duplicate
+        // that watchdog, consume two executor tasks for every read/write, and
+        // can run eagerly before a completed operation is observed when the
+        // async lane is saturated.
+        if (deadline_ms != null) {
+            try socket.setRecvTimeout(0);
+            try socket.setSendTimeout(0);
+            socket.setRequestDeadline(null);
+            return;
+        }
         try socket.setRecvTimeout(recv_ms);
         try socket.setSendTimeout(send_ms);
-        socket.setRequestDeadline(deadline_ms);
+        socket.setRequestDeadline(null);
     }
 
     fn connectHost(self: *Self, host: []const u8, port: u16) !Socket {
@@ -4152,6 +4165,7 @@ const python_bounded_response_server_script =
     "listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n" ++
     "listener.bind(('127.0.0.1', port))\n" ++
     "listener.listen(4)\n" ++
+    "print(listener.getsockname()[1], flush=True)\n" ++
     "for _ in range(4):\n" ++
     "    conn, _ = listener.accept()\n" ++
     "    with conn:\n" ++
@@ -4227,25 +4241,25 @@ test "buffered H1 timeout evicts an interrupted pooled connection" {
 test "per-request response limit rejects the body before allocation" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const port = try reserveEphemeralPort(io);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_bounded_response_server_script });
-    var port_buf: [16]u8 = undefined;
-    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
     var child = std.process.spawn(io, .{
-        .argv = &.{ "python3", "server.py", port_arg },
+        .argv = &.{ "python3", "server.py", "0" },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
-        .stdout = .inherit,
+        .stdout = .pipe,
         .stderr = .inherit,
     }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
     defer child.kill(io);
-    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
+    const port_line = (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited;
+    const port = try std.fmt.parseUnsigned(u16, port_line, 10);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);
@@ -4283,25 +4297,25 @@ test "successful H1 requests do not wait for their timeout deadline" {
     var io_impl = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
     defer io_impl.deinit();
     const io = io_impl.io();
-    const port = try reserveEphemeralPort(io);
-
+    const fixture_io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_bounded_response_server_script });
-    var port_buf: [16]u8 = undefined;
-    const port_arg = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
-    var child = std.process.spawn(io, .{
-        .argv = &.{ "python3", "server.py", port_arg },
+    try tmp.dir.writeFile(fixture_io, .{ .sub_path = "server.py", .data = python_bounded_response_server_script });
+    var child = std.process.spawn(fixture_io, .{
+        .argv = &.{ "python3", "server.py", "0" },
         .cwd = .{ .dir = tmp.dir },
         .stdin = .ignore,
-        .stdout = .inherit,
+        .stdout = .pipe,
         .stderr = .inherit,
     }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer child.kill(io);
-    io.sleep(Io.Duration.fromMilliseconds(500), .awake) catch {};
+    defer child.kill(fixture_io);
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout_reader = child.stdout.?.readerStreaming(fixture_io, &stdout_buffer);
+    const port_line = (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited;
+    const port = try std.fmt.parseUnsigned(u16, port_line, 10);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/", .{port});
     defer allocator.free(url);

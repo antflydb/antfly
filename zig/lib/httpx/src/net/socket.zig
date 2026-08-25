@@ -137,6 +137,14 @@ fn readAtLeastOne(reader: *Io.Reader, buf: []u8) Io.Reader.Error!usize {
     }
 }
 
+/// True only for handles owned by Zig's host-network Threaded backend. This
+/// identity check keeps raw socket options away from deterministic/custom Io
+/// implementations whose handles are virtual rather than OS descriptors.
+fn isThreadedNetworkIo(io: Io) bool {
+    if (comptime builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return false;
+    return io.vtable.netListenIp == Io.Threaded.global_single_threaded.io().vtable.netListenIp;
+}
+
 /// TCP socket abstraction backed by std.Io.net.
 pub const Socket = struct {
     handle: net.Socket.Handle,
@@ -1133,22 +1141,24 @@ pub const TcpListener = struct {
 };
 
 fn listenWithOptions(addr: Address, io: Io, options: TcpListener.ListenOptions) !net.Server {
-    // Ordinary listeners must remain on the supplied std.Io backend. Besides
-    // making the abstraction honest, this lets deterministic backends model
-    // bind, accept, shutdown, descriptor pressure, and packet delivery. Keep
-    // the native POSIX path only for the non-portable SO_REUSEPORT extension.
-    if (options.reuse_port) {
+    // Custom std.Io backends must retain ownership of listener creation so
+    // deterministic transports can model bind, accept, shutdown, descriptor
+    // pressure, and packet delivery. Zig 0.16's *threaded POSIX* backend maps
+    // `reuse_address` to both SO_REUSEADDR and SO_REUSEPORT, but HTTPX promises
+    // restart-only reuse unless callers explicitly opt into shared live
+    // listeners. Use the native seam only for that host backend.
+    if (isThreadedNetworkIo(io) and (options.reuse_address or options.reuse_port)) {
         if (comptime is_windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
-            return error.OptionUnsupported;
+            if (options.reuse_port) return error.OptionUnsupported else return try addr.listen(io, .{
+                .kernel_backlog = options.kernel_backlog,
+                .reuse_address = false,
+            });
         return try listenPosix(addr, io, options);
     }
+    if (options.reuse_port) return error.OptionUnsupported;
     return try addr.listen(io, .{
         .kernel_backlog = options.kernel_backlog,
-        // Windows SO_REUSEADDR permits a second live bind and is not the
-        // POSIX restart-only semantic promised by this API. std.Io does not
-        // expose SO_EXCLUSIVEADDRUSE for its AFD listener, so retain the secure
-        // Windows default by never enabling address reuse.
-        .reuse_address = if (comptime is_windows) false else options.reuse_address,
+        .reuse_address = options.reuse_address,
     });
 }
 

@@ -7143,14 +7143,13 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
         left_group_id,
     });
     defer std.testing.allocator.free(split_body);
-    try metadata_client.requestTableSplit(metadata_api, "docs", split_body);
-
     // Transition callbacks run while the metadata control round is waiting
     // synchronously. Bypass the normal remote cache and reject any fetch to
     // prove shard observation/open consumes the pinned snapshot instead of
     // re-entering the metadata API and deadlocking behind that control round.
     data_server.setRemoteMetadataFetchErrorForTest(error.NotLeader);
     defer data_server.setRemoteMetadataFetchErrorForTest(null);
+    try metadata_client.requestTableSplit(metadata_api, "docs", split_body);
 
     var finalized = false;
     rounds = 0;

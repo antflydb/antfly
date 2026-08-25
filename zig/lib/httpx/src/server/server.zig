@@ -4651,15 +4651,23 @@ test "HTTP/1 and h2c request saturation reject before application work" {
         task.requestStop();
         task.join() catch {};
     }
-    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!server.listen_started.load(.acquire))
+        io_impl.io().sleep(.fromMilliseconds(1), .awake) catch {};
     defer State.release_first.store(true, .release);
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    // Give the network clients their own concurrency domain. The timeout
+    // implementation races reads against a deadline, so the process-global
+    // single-threaded backend is deliberately the wrong fixture here and can
+    // turn a valid rejection response into a timeout EOF after other tests.
+    var client_io_impl = std.Io.Threaded.init(allocator, .{});
+    defer client_io_impl.deinit();
+    const client_io = client_io_impl.io();
     var first_client = try Socket.connect(server.boundAddress().?, client_io);
     defer first_client.close();
     try first_client.setRecvTimeout(5_000);
     try first_client.sendAll("GET /work HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
-    while (!State.first_started.load(.acquire)) std.Thread.yield() catch {};
+    while (!State.first_started.load(.acquire))
+        client_io.sleep(.fromMilliseconds(1), .awake) catch {};
 
     var second_client = try Socket.connect(server.boundAddress().?, client_io);
     defer second_client.close();

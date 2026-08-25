@@ -84,6 +84,7 @@ comptime {
     _ = @import("db/lease.zig");
     _ = @import("db/maintenance/transaction_runtime.zig");
     _ = @import("db/maintenance/ttl_runtime.zig");
+    _ = @import("db/merge_state.zig");
     _ = @import("db/mod.zig");
     _ = @import("db/ownership.zig");
     _ = @import("db/planning_stats.zig");

@@ -2838,7 +2838,7 @@ export interface components {
              * @description Stable machine-readable retry classification.
              * @enum {string}
              */
-            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable";
+            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "distributed_query_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable";
             /** @description Human-readable error summary. */
             message: string;
             /**

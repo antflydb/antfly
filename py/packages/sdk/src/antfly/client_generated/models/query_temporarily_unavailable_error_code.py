@@ -2,6 +2,7 @@ from enum import Enum
 
 
 class QueryTemporarilyUnavailableErrorCode(str, Enum):
+    DISTRIBUTED_QUERY_UNAVAILABLE = "distributed_query_unavailable"
     DOC_IDENTITY_UNAVAILABLE = "doc_identity_unavailable"
     INDEX_REBUILDING = "index_rebuilding"
     QUERY_EMBEDDING_TEMPORARILY_UNAVAILABLE = "query_embedding_temporarily_unavailable"

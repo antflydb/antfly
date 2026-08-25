@@ -1150,8 +1150,8 @@ pub const UserManager = struct {
 
     pub fn validateApiKey(self: *const UserManager, key_id: []const u8, key_secret: []const u8) !ValidatedApiKey {
         const mutable: *UserManager = @constCast(self);
-        lockMutationMutex(&mutable.mutation_mutex);
-        defer mutable.mutation_mutex.unlock();
+        mutable.mutation_mutex.lockUncancelable(self.io);
+        defer mutable.mutation_mutex.unlock(self.io);
         const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
         const secret_size = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(key_secret) catch {
             return error.ApiKeyInvalid;
@@ -1194,15 +1194,15 @@ pub const UserManager = struct {
     /// closed on the next worker authorization check.
     pub fn effectiveApiKeyPermissions(self: *const UserManager, key_id: []const u8) ![]Permission {
         const mutable: *UserManager = @constCast(self);
-        lockMutationMutex(&mutable.mutation_mutex);
-        defer mutable.mutation_mutex.unlock();
+        mutable.mutation_mutex.lockUncancelable(self.io);
+        defer mutable.mutation_mutex.unlock(self.io);
         return try self.effectiveApiKeyPermissionsUnlocked(key_id);
     }
 
     fn effectiveApiKeyPermissionsUnlocked(self: *const UserManager, key_id: []const u8) ![]Permission {
         const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
         if (record.key.expires_at_ns) |expires_at_ns| {
-            if (nowNs() > expires_at_ns) return error.ApiKeyExpired;
+            if (nowNs(self.io) > expires_at_ns) return error.ApiKeyExpired;
         }
         const owner_permissions = try self.getPermissionsForUser(record.key.username);
         defer {
@@ -1226,8 +1226,8 @@ pub const UserManager = struct {
         payload: []const u8,
     ) ![std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 {
         const mutable: *UserManager = @constCast(self);
-        lockMutationMutex(&mutable.mutation_mutex);
-        defer mutable.mutation_mutex.unlock();
+        mutable.mutation_mutex.lockUncancelable(self.io);
+        defer mutable.mutation_mutex.unlock(self.io);
         const key = if (std.mem.startsWith(u8, principal, "basic:")) blk: {
             const username = principal["basic:".len..];
             if (username.len == 0) return error.InvalidDestinationGrantPrincipal;
@@ -1237,7 +1237,7 @@ pub const UserManager = struct {
             if (key_id.len == 0) return error.InvalidDestinationGrantPrincipal;
             const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
             if (record.key.expires_at_ns) |expires_at_ns| {
-                if (nowNs() > expires_at_ns) return error.ApiKeyExpired;
+                if (nowNs(self.io) > expires_at_ns) return error.ApiKeyExpired;
             }
             break :blk record.secret_hash;
         } else return error.InvalidDestinationGrantPrincipal;
