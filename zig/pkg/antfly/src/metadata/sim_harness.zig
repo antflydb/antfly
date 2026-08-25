@@ -31,6 +31,7 @@ const api_http_client = @import("../api/http_client.zig");
 const api_http_test_runtime = @import("../api/http_test_runtime.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
+const api_distributed_graph = @import("../api/distributed_graph.zig");
 const api_operation = @import("../api/operation.zig");
 const backups_api = @import("../api/backups.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
@@ -5918,7 +5919,7 @@ fn PublicApiTestRig(comptime N: usize) type {
 /// explicit-step transport while every public listener, forwarding request,
 /// client, timeout, and shutdown task borrows the caller's single VoprIo.
 pub const VoprPublicClusterFixture = struct {
-    pub const FaultMode = enum { clean, metadata_partition, node_restart, partial_http_write, resource_pressure };
+    pub const FaultMode = enum { clean, metadata_partition, node_restart, graph_inflight_restart, partial_http_write, resource_pressure };
     const node_count = 3;
     const metadata_group_id: u64 = 6840;
     const table_id: u64 = 6841;
@@ -5971,10 +5972,14 @@ pub const VoprPublicClusterFixture = struct {
     client: api_http_client.ApiHttpClient = undefined,
     metadata_leader_index: usize = 0,
     client_index: usize = 0,
+    graph_restart_node_index: usize = 0,
     actual_host_count: usize = 0,
     write_done: std.Io.Event = .unset,
     tenant_write_done: std.Io.Event = .unset,
     resource_recovered: std.Io.Event = .unset,
+    graph_round_paused: std.Io.Event = .unset,
+    graph_fault_recovered: std.Io.Event = .unset,
+    fault_mode: FaultMode = .clean,
     write_finished: bool = false,
     read_finished: bool = false,
     tenant_write_finished: bool = false,
@@ -5987,6 +5992,8 @@ pub const VoprPublicClusterFixture = struct {
     tenant_read_sound: bool = false,
     table_isolation_sound: bool = false,
     graph_query_sound: bool = false,
+    graph_inflight_restart_observed: bool = false,
+    graph_inflight_restart_recovered: bool = false,
     topology_sound: bool = false,
     resource_denial_sound: bool = false,
     resource_recovery_sound: bool = false,
@@ -6136,6 +6143,8 @@ pub const VoprPublicClusterFixture = struct {
         self.actual_host_count = placement.active_count;
         self.client_index = placement.non_host_index orelse return error.FullClusterNonHostMissing;
         try std.testing.expect(try self.cluster.waitForGroupStatusCount(graph_data_group_id, .active, 2, 192));
+        self.graph_restart_node_index = currentGroupLeaderIndex(&self.cluster, graph_data_group_id) orelse
+            return error.FullClusterGraphLeaderMissing;
         try ensureGroupGraphIndexOnActiveReplicas(
             &self.cluster,
             self.roots[0..],
@@ -6230,6 +6239,11 @@ pub const VoprPublicClusterFixture = struct {
             .{ .resource_managers = &self.resource_managers },
             &self.api_base_uris,
         );
+        const graph_hook = api_distributed_graph.LifecycleHook{
+            .ptr = self,
+            .reach_fn = reachDistributedGraphLifecycle,
+        };
+        for (&self.read_sources) |*source| _ = source.withDistributedGraphLifecycleHook(graph_hook);
         self.uri_count = node_count;
         self.stack_live = true;
         self.client = api_http_client.ApiHttpClient.init(alloc, self.client_http_executor.executor());
@@ -6238,6 +6252,7 @@ pub const VoprPublicClusterFixture = struct {
     }
 
     pub fn start(self: *VoprPublicClusterFixture, mode: FaultMode) !void {
+        self.fault_mode = mode;
         switch (mode) {
             .clean => {
                 self.resource_recovered.set(self.sim.io());
@@ -6252,6 +6267,10 @@ pub const VoprPublicClusterFixture = struct {
             .node_restart => {
                 self.resource_recovered.set(self.sim.io());
                 _ = self.sim.io().async(restartNonHost, .{self});
+            },
+            .graph_inflight_restart => {
+                self.resource_recovered.set(self.sim.io());
+                _ = self.sim.io().async(restartGraphLeaderDuringQuery, .{self});
             },
             .partial_http_write => {
                 self.resource_recovered.set(self.sim.io());
@@ -6363,7 +6382,8 @@ pub const VoprPublicClusterFixture = struct {
         defer self.graph_read_finished = true;
         if (!self.write_sound) return;
 
-        while (!self.fault_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
+        if (self.fault_mode != .graph_inflight_restart)
+            while (!self.fault_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
         const query_body = test_contract_helpers.encodeGraphTraverseQueryRequest(
             self.alloc,
             "walk",
@@ -6408,6 +6428,17 @@ pub const VoprPublicClusterFixture = struct {
         self.graph_query_sound = walk.total == 2 and nodes.len == 2 and found_z and found_y;
     }
 
+    fn reachDistributedGraphLifecycle(ptr: *anyopaque, event: api_distributed_graph.LifecycleEvent) void {
+        const self: *VoprPublicClusterFixture = @ptrCast(@alignCast(ptr));
+        if (self.fault_mode != .graph_inflight_restart or
+            event.phase != .expand_round_completed or event.depth != 1 or
+            self.graph_inflight_restart_observed)
+            return;
+        self.graph_inflight_restart_observed = true;
+        self.graph_round_paused.set(self.sim.io());
+        self.graph_fault_recovered.waitUncancelable(self.sim.io());
+    }
+
     fn healMetadataPartition(self: *VoprPublicClusterFixture, node_id: u64) void {
         self.sim.io().sleep(.fromNanoseconds(10), .awake) catch {
             self.request_errors +|= 1;
@@ -6432,40 +6463,64 @@ pub const VoprPublicClusterFixture = struct {
             self.fault_finished = true;
             return;
         };
-        self.cluster.restartNode(self.client_index) catch {
+        const recovered = self.restartNodeAndWait(self.client_index) catch {
             self.request_errors +|= 1;
             self.fault_finished = true;
             return;
         };
-        self.raft_wire_runtimes[self.client_index].setTarget(
-            self.cluster.cluster.node(self.client_index).serverRequestExecutor(),
+        self.topology_sound = recovered;
+        self.fault_finished = true;
+    }
+
+    fn restartGraphLeaderDuringQuery(self: *VoprPublicClusterFixture) void {
+        self.graph_round_paused.waitUncancelable(self.sim.io());
+        while (!self.read_finished or !self.tenant_read_finished) self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+        const leader_index = currentGroupLeaderIndex(&self.cluster, graph_data_group_id) orelse {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+        const recovered = self.restartNodeAndWait(leader_index) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            self.graph_fault_recovered.set(self.sim.io());
+            return;
+        };
+        self.graph_inflight_restart_recovered = recovered;
+        self.topology_sound = recovered;
+        self.fault_finished = true;
+        self.graph_fault_recovered.set(self.sim.io());
+    }
+
+    fn restartNodeAndWait(self: *VoprPublicClusterFixture, node_index: usize) !bool {
+        try self.cluster.restartNode(node_index);
+        self.raft_wire_runtimes[node_index].setTarget(
+            self.cluster.cluster.node(node_index).serverRequestExecutor(),
         );
-        self.read_sources[self.client_index].requester =
-            self.cluster.cluster.node(self.client_index).runtime.svc.readableLeaseRequester();
-        const restarted_node_id = self.cluster.cluster.configs[self.client_index].host.http.host.local_node_id;
-        self.cluster.virtual_network.registerNode(
+        self.read_sources[node_index].requester =
+            self.cluster.cluster.node(node_index).runtime.svc.readableLeaseRequester();
+        const restarted_node_id = self.cluster.cluster.configs[node_index].host.http.host.local_node_id;
+        try self.cluster.virtual_network.registerNode(
             restarted_node_id,
-            self.raft_wire_targets[self.client_index].executor(),
-        ) catch {
-            self.request_errors +|= 1;
-            self.fault_finished = true;
-            return;
-        };
+            self.raft_wire_targets[node_index].executor(),
+        );
         var recovered = false;
         var rounds: usize = 0;
         while (rounds < 192) : (rounds += 1) {
-            self.cluster.stepAll() catch {
-                self.request_errors +|= 1;
-                self.fault_finished = true;
-                return;
-            };
+            try self.cluster.stepAll();
             if (currentMetadataLeaderIndex(&self.cluster) == null or
                 currentGroupLeaderIndex(&self.cluster, data_group_id) == null or
                 currentGroupLeaderIndex(&self.cluster, graph_data_group_id) == null)
                 continue;
 
-            const ranges = self.cluster.node(self.client_index).listProjectedRanges(self.alloc) catch continue;
-            defer self.cluster.node(self.client_index).freeProjectedRanges(self.alloc, ranges);
+            const ranges = self.cluster.node(node_index).listProjectedRanges(self.alloc) catch continue;
+            defer self.cluster.node(node_index).freeProjectedRanges(self.alloc, ranges);
             var docs_ranges: usize = 0;
             for (ranges) |range| if (range.table_id == table_id) {
                 docs_ranges += 1;
@@ -6475,8 +6530,7 @@ pub const VoprPublicClusterFixture = struct {
                 break;
             }
         }
-        self.topology_sound = recovered;
-        self.fault_finished = true;
+        return recovered;
     }
 
     /// Model a node-local background owner (for example, resident inference
@@ -6649,6 +6703,8 @@ pub const VoprPublicClusterFixture = struct {
         resource_pressure_observed: bool,
         resource_denial_error_code: u64,
         graph_query_ok: bool,
+        graph_inflight_restart_observed: bool,
+        graph_inflight_restart_recovered: bool,
     } {
         return .{
             .hosts = self.actual_host_count,
@@ -6664,6 +6720,8 @@ pub const VoprPublicClusterFixture = struct {
             .resource_pressure_observed = self.resource_pressure_observed,
             .resource_denial_error_code = self.resource_denial_error_code,
             .graph_query_ok = self.graph_query_sound,
+            .graph_inflight_restart_observed = self.graph_inflight_restart_observed,
+            .graph_inflight_restart_recovered = self.graph_inflight_restart_recovered,
         };
     }
 

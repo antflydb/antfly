@@ -44,11 +44,44 @@ const indexes_api = @import("indexes.zig");
 const query_contract = @import("query_contract.zig");
 const tables_api = @import("tables.zig");
 
+/// Production-neutral semantic boundaries in a distributed graph request.
+/// Callers may use these to observe or suspend a request without coupling the
+/// query engine to a particular scheduler or test harness. Hooks run only
+/// after an owned intermediate result is internally consistent and hold no
+/// catalog or database lease.
+pub const LifecyclePhase = enum {
+    snapshot_validated,
+    expand_round_completed,
+    hydration_started,
+    hydration_completed,
+    attempt_failed,
+};
+
+pub const LifecycleEvent = struct {
+    phase: LifecyclePhase,
+    query_name: []const u8 = "",
+    depth: u32 = 0,
+    group_count: usize = 0,
+    result_count: usize = 0,
+    attempt: u32 = 0,
+    error_code: u16 = 0,
+};
+
+pub const LifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (ptr: *anyopaque, event: LifecycleEvent) void,
+
+    pub fn reach(self: LifecycleHook, event: LifecycleEvent) void {
+        self.reach_fn(self.ptr, event);
+    }
+};
+
 pub const Worker = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+    lifecycle_hook: ?LifecycleHook = null,
 
     pub const VTable = struct {
         execute_graph_expand: *const fn (
@@ -144,18 +177,29 @@ pub const Worker = struct {
         return func(self.ptr);
     }
 
+    pub fn reachLifecycle(self: Worker, event: LifecycleEvent) void {
+        if (self.lifecycle_hook) |hook| hook.reach(event);
+    }
+
+    fn monotonicNs(self: Worker) u64 {
+        if (self.fanoutIo()) |io| {
+            return @intCast(std.Io.Clock.now(.awake, io).nanoseconds);
+        }
+        return platform_time.monotonicNs();
+    }
+
     fn ensureActive(self: Worker) !void {
         if (self.cancellation) |value| {
             if (value.isCancelled()) return error.Cancelled;
         }
         if (self.execution_deadline_ns) |deadline_ns| {
-            if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+            if (self.monotonicNs() >= deadline_ns) return error.Timeout;
         }
     }
 
     fn remainingTimeoutMs(self: Worker) !?u32 {
         const deadline_ns = self.execution_deadline_ns orelse return null;
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.monotonicNs();
         if (now_ns >= deadline_ns) return error.Timeout;
         const remaining_ns = deadline_ns - now_ns;
         const rounded_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1);
@@ -819,15 +863,22 @@ pub fn executeCrossRange(
     request_worker.cancellation = req.cancellation;
     try request_worker.ensureActive();
 
-    var attempts: u32 = 0;
-    while (true) : (attempts += 1) {
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
         try request_worker.ensureActive();
-        return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, consistency) catch |err| switch (err) {
-            error.TopologyChanged, error.UnknownGroup => {
-                if (attempts == 0) continue;
-                return err;
-            },
-            else => return err,
+        return executeCrossRangeOnce(alloc, catalog, request_worker, table_name, req, base_result, consistency) catch |err| {
+            request_worker.reachLifecycle(.{
+                .phase = .attempt_failed,
+                .attempt = attempt,
+                .error_code = @intFromError(err),
+            });
+            switch (err) {
+                error.TopologyChanged, error.UnknownGroup => {
+                    if (attempt == 0) continue;
+                    return err;
+                },
+                else => return err,
+            }
         };
     }
 }
@@ -844,6 +895,10 @@ fn executeCrossRangeOnce(
     if (!supportsCrossRange(req)) return error.UnsupportedQueryRequest;
     try table_catalog.validateDocIdentityReadyForTableStrict(alloc, catalog, table_name);
     try validateSourceSnapshotGroupSet(alloc, catalog, table_name, base_result);
+    worker.reachLifecycle(.{
+        .phase = .snapshot_validated,
+        .group_count = base_result.shard_identity_read_generations.len,
+    });
 
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, req.graph_queries.len);
     var initialized: usize = 0;
@@ -1676,6 +1731,8 @@ fn executeDistributedTraverse(
     }
 
     while (frontier.len > 0) {
+        var completed_depth: u32 = 0;
+        for (frontier) |item| completed_depth = @max(completed_depth, item.depth);
         var next_frontier = std.ArrayListUnmanaged(FrontierState).empty;
         defer {
             for (next_frontier.items) |*item| item.deinit(alloc);
@@ -1934,16 +1991,34 @@ fn executeDistributedTraverse(
             }
         }
 
+        worker.reachLifecycle(.{
+            .phase = .expand_round_completed,
+            .query_name = graph_query.name,
+            .depth = completed_depth +| 1,
+            .group_count = batch_entries.len,
+            .result_count = state.nodes.items.len,
+        });
+
         freeFrontier(alloc, frontier);
         frontier = try next_frontier.toOwnedSlice(alloc);
     }
 
     if (graph_query.query.include_documents) {
+        worker.reachLifecycle(.{
+            .phase = .hydration_started,
+            .query_name = graph_query.name,
+            .result_count = state.nodes.items.len,
+        });
         state.hits = try adoptHydratedHits(
             alloc,
             state.hits,
             try hydrateHitsForResultNodes(alloc, admission, state.nodes.items),
         );
+        worker.reachLifecycle(.{
+            .phase = .hydration_completed,
+            .query_name = graph_query.name,
+            .result_count = state.hits.items.len,
+        });
     }
 
     const total_hits: u32 = @intCast(state.nodes.items.len);
@@ -8173,6 +8248,9 @@ test "distributed graph retries once on topology change and succeeds" {
         phase: u32 = 0,
         expand_calls: u32 = 0,
         hydrate_calls: u32 = 0,
+        lifecycle_counts: [@typeInfo(LifecyclePhase).@"enum".fields.len]u32 =
+            .{0} ** @typeInfo(LifecyclePhase).@"enum".fields.len,
+        lifecycle_valid: bool = true,
     };
 
     const FakeCatalog = struct {
@@ -8221,11 +8299,30 @@ test "distributed graph retries once on topology change and succeeds" {
         fn iface(state: *TestState) Worker {
             return .{
                 .ptr = state,
+                .lifecycle_hook = .{ .ptr = state, .reach_fn = reachLifecycle },
                 .vtable = &.{
                     .execute_graph_expand = executeGraphExpand,
                     .execute_graph_hydrate = executeGraphHydrate,
                 },
             };
+        }
+
+        fn reachLifecycle(ptr: *anyopaque, event: LifecycleEvent) void {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.lifecycle_counts[@intFromEnum(event.phase)] += 1;
+            switch (event.phase) {
+                .snapshot_validated => {},
+                .expand_round_completed => {
+                    state.lifecycle_valid = state.lifecycle_valid and
+                        std.mem.eql(u8, "walk", event.query_name) and
+                        event.depth == 1 and event.result_count == 1;
+                },
+                .hydration_started, .hydration_completed => state.lifecycle_valid = state.lifecycle_valid and std.mem.eql(u8, "walk", event.query_name),
+                .attempt_failed => {
+                    state.lifecycle_valid = state.lifecycle_valid and event.attempt == 0 and
+                        event.error_code == @intFromError(error.TopologyChanged);
+                },
+            }
         }
 
         fn executeGraphExpand(
@@ -8301,6 +8398,7 @@ test "distributed graph retries once on topology change and succeeds" {
                     .query_type = .neighbors,
                     .index_name = "graph_idx",
                     .start_nodes = .{ .keys = &[_][]const u8{"doc:a"} },
+                    .include_documents = true,
                     .params = .{},
                 },
             },
@@ -8335,6 +8433,12 @@ test "distributed graph retries once on topology change and succeeds" {
     try std.testing.expectEqualStrings("doc:b", results[0].nodes[0].key);
     try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
     try std.testing.expectEqualStrings("doc:b", results[0].hits[0].id);
+    try std.testing.expectEqual(@as(u32, 2), state.lifecycle_counts[@intFromEnum(LifecyclePhase.snapshot_validated)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.attempt_failed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.expand_round_completed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_started)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_completed)]);
+    try std.testing.expect(state.lifecycle_valid);
 }
 
 test "distributed graph stops after single retry on repeated topology churn" {

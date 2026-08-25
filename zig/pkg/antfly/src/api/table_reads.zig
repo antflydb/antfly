@@ -3835,6 +3835,7 @@ pub const HostedProvisionedTableReadSource = struct {
     io_impl: ?FanoutIo = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
+    distributed_graph_lifecycle_hook: ?distributed_graph.LifecycleHook = null,
 
     pub fn init(
         replica_root_dir: []const u8,
@@ -3873,6 +3874,14 @@ pub const HostedProvisionedTableReadSource = struct {
 
     pub fn withGroupVisibleRootGeneration(self: *HostedProvisionedTableReadSource, generation_source: ?GroupVisibleRootGenerationSource) *HostedProvisionedTableReadSource {
         self.group_visible_root_generation = generation_source;
+        return self;
+    }
+
+    pub fn withDistributedGraphLifecycleHook(
+        self: *HostedProvisionedTableReadSource,
+        hook: ?distributed_graph.LifecycleHook,
+    ) *HostedProvisionedTableReadSource {
+        self.distributed_graph_lifecycle_hook = hook;
         return self;
     }
 
@@ -7790,6 +7799,7 @@ const ProvisionedGraphWorkerContext = struct {
 fn hostedGraphWorker(self: *HostedProvisionedTableReadSource) distributed_graph.Worker {
     return .{
         .ptr = self,
+        .lifecycle_hook = self.distributed_graph_lifecycle_hook,
         .vtable = &.{
             .execute_graph_expand = executeHostedGraphExpand,
             .execute_graph_hydrate = executeHostedGraphHydrate,

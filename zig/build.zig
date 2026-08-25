@@ -6119,6 +6119,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
+            "distributed graph retries once on topology change and succeeds",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
