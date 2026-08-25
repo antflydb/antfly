@@ -280,15 +280,11 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		cluster.Status.HAStatus.PrimaryWatchdogProof.Active &&
 		!cluster.Status.HAStatus.PrimaryWatchdogProof.AuthorityGranted
 	holder := haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus)
+	inactivePrimaryWatchdog := false
 	if holder == "" {
-		if !cluster.Status.HAStatus.PrimaryAdminReachable &&
+		inactivePrimaryWatchdog = !cluster.Status.HAStatus.PrimaryAdminReachable &&
 			strings.Contains(cluster.Status.HAStatus.PrimaryAdminLastError, "HA Lease watchdog") &&
-			!pendingWatchdogAuthority {
-			// Never renew authority for an authenticated runtime that reports
-			// itself inactive (or cannot prove the capability). Let the old
-			// generation remain fenced while failover debounce selects a candidate.
-			return nil
-		}
+			!pendingWatchdogAuthority
 		identity := haReplicationIdentity(ha)
 		if identity == nil || strings.TrimSpace(identity.CurrentPrimaryID) == "" {
 			return nil
@@ -377,6 +373,20 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 	}
 	if currentHolder == "" || transitions <= 0 ||
 		lease.Annotations[haFencingLeaseAnnotationTopologyID] != haFencingLeaseTopologyID(cluster) {
+		return nil
+	}
+	committedHandoffRenewal := lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" &&
+		currentHolder != localNodeID &&
+		lease.Annotations[haFencingLeaseAnnotationFormerHolder] == localNodeID &&
+		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] == string(cluster.UID) &&
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10)
+	if inactivePrimaryWatchdog && !committedHandoffRenewal {
+		// Never renew authority for an authenticated runtime that reports
+		// itself inactive (or cannot prove the capability). The sole exception
+		// is the exact, durable former-controller bridge created by the atomic
+		// holder transfer above: it renews the already-selected successor while
+		// Colony publishes that successor's declarative CR, and cannot be reused
+		// by a stale controller or a different Lease generation.
 		return nil
 	}
 	if bootstrapUnknownBoundary {

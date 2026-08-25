@@ -92,11 +92,21 @@ func TestReconcileHAFencingLeaseRejectsStaleControllersAcrossSuccessiveTransfers
 	assertLeaseHolderAndTransition(t, reconciler, "standby-a", 2)
 
 	// A may keep B alive only through the exact committed handoff bridge.
+	// The bridge must survive B's transient inactive proof while Colony is
+	// publishing B's successor CR; otherwise the Lease expires during an
+	// otherwise successful failover and B self-fences.
+	clusterA.Status.HAStatus.PrimaryAdminLastError = "HA Lease watchdog is not active for node standby-a"
+	beforeHandoff := getOwnershipTestLease(t, reconciler).Spec.RenewTime.DeepCopy()
 	now = now.Add(time.Second)
 	if err := reconciler.reconcileHAFencingLease(context.Background(), clusterA); err != nil {
 		t.Fatalf("A handoff renewal for B: %v", err)
 	}
 	assertLeaseHolderAndTransition(t, reconciler, "standby-a", 2)
+	afterHandoff := getOwnershipTestLease(t, reconciler)
+	if afterHandoff.Spec.RenewTime == nil || !afterHandoff.Spec.RenewTime.Time.Equal(now) ||
+		afterHandoff.Spec.RenewTime.Equal(beforeHandoff) {
+		t.Fatalf("exact inactive-successor handoff did not advance renewTime: before=%s after=%s", beforeHandoff, afterHandoff.Spec.RenewTime)
+	}
 
 	clusterB := clusterA.DeepCopy()
 	clusterB.UID = types.UID("cluster-b-uid")
