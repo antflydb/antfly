@@ -50,6 +50,23 @@ const RetryPolicy = enum {
 pub const RequestBudget = struct {
     deadline_ns: u64,
     cancellation: ?*const http_common.RequestCancellation = null,
+    /// Clock and sleep authority for this deadline. Deterministic callers must
+    /// supply the same borrowed `std.Io` that created `deadline_ns`; native
+    /// callers retain the platform-clock fallback for compatibility.
+    io: ?std.Io = null,
+
+    pub fn nowNs(self: RequestBudget) u64 {
+        const io = self.io orelse return platform_time.monotonicNs();
+        return @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds));
+    }
+
+    pub fn sleepNs(self: RequestBudget, duration_ns: u64) !void {
+        const io = self.io orelse {
+            platform_time.sleepNs(duration_ns);
+            return;
+        };
+        try io.sleep(.fromNanoseconds(duration_ns), .awake);
+    }
 };
 
 fn isUriUnreserved(ch: u8) bool {
@@ -837,7 +854,7 @@ pub const MetadataHttpClient = struct {
         budget: ?RequestBudget,
         cancellation: ?*const http_common.RequestCancellation,
     ) !void {
-        const started_ns = platform_time.monotonicNs();
+        const started_ns = if (budget) |value| value.nowNs() else platform_time.monotonicNs();
         var delay_ns = requested_delay_ns;
         if (budget) |value| {
             if (started_ns >= value.deadline_ns) return error.Timeout;
@@ -850,7 +867,10 @@ pub const MetadataHttpClient = struct {
                 if (signal.isCancelled()) return error.Cancelled;
             }
             const slice_ns = @min(remaining_ns, mutation_authority_retry_cancellation_slice_ns);
-            platform_time.sleepNs(slice_ns);
+            if (budget) |value|
+                try value.sleepNs(slice_ns)
+            else
+                platform_time.sleepNs(slice_ns);
             remaining_ns -= slice_ns;
         }
     }
@@ -871,7 +891,7 @@ fn applyRequestBudget(req: http_common.HttpRequest, budget: ?RequestBudget) !htt
     if (cancellation) |signal| {
         if (signal.isCancelled()) return error.Cancelled;
     }
-    const now_ns = platform_time.monotonicNs();
+    const now_ns = value.nowNs();
     if (now_ns >= value.deadline_ns) return error.Timeout;
     const remaining_ns = value.deadline_ns - now_ns;
     const remaining_ms = (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms;

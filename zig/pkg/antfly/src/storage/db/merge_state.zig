@@ -234,6 +234,22 @@ pub fn planCheckpointApply(
     }
 
     const prior = existing.?;
+    // A rollback is terminal for one transition, not a permanent fence on the
+    // receiver range. Metadata may admit a fresh transition after observing
+    // the rollback. Replace the old terminal receipt only with that new
+    // transition's accept checkpoint and only after the live range is back at
+    // the newly declared base. Same-transition replays continue through the
+    // monotonic checks below; every other phase remains fail closed.
+    if (prior.phase == .rolled_back and
+        prior.transition_id != checkpoint.transition_id)
+    {
+        if (checkpoint.kind != .accept or !rangesEqual(current_range, base))
+            return error.ConflictingMergeTransition;
+        return .{
+            .state = stateFromCheckpoint(checkpoint, .accepting, false, 0),
+            .range = merged,
+        };
+    }
     if ((prior.transition_id != 0 and prior.transition_id != checkpoint.transition_id) or
         prior.donor_group_id != checkpoint.donor_group_id or
         prior.receiver_group_id != checkpoint.receiver_group_id or
@@ -314,6 +330,49 @@ pub fn planCheckpointApply(
             .none => unreachable,
         },
     }
+}
+
+test "rolled back merge receiver admits only a fresh accept transition" {
+    const prior = State{
+        .transition_id = 500,
+        .donor_group_id = 501,
+        .receiver_group_id = 502,
+        .phase = .rolled_back,
+        .receiver_base_range = .{ .start = "doc:m", .end = "" },
+        .merged_range = .{ .start = "doc:a", .end = "" },
+    };
+    const fresh = db_types.MergeReplicationCheckpoint{
+        .kind = .accept,
+        .transition_id = 600,
+        .donor_group_id = 601,
+        .receiver_group_id = 502,
+        .receiver_base_start = "doc:m",
+        .receiver_base_end = "",
+        .merged_start = "doc:a",
+        .merged_end = "",
+    };
+
+    const accepted = try planCheckpointApply(
+        &prior,
+        .{ .start = "doc:m", .end = "" },
+        fresh,
+    );
+    try std.testing.expectEqual(Phase.accepting, accepted.state.phase);
+    try std.testing.expectEqual(@as(u64, 600), accepted.state.transition_id);
+    try std.testing.expectEqual(@as(u64, 601), accepted.state.donor_group_id);
+    try std.testing.expectEqualStrings("doc:a", accepted.range.start);
+
+    var not_accept = fresh;
+    not_accept.kind = .bootstrap_complete;
+    not_accept.bootstrap_applied_index = 7;
+    try std.testing.expectError(
+        error.ConflictingMergeTransition,
+        planCheckpointApply(&prior, .{ .start = "doc:m", .end = "" }, not_accept),
+    );
+    try std.testing.expectError(
+        error.ConflictingMergeTransition,
+        planCheckpointApply(&prior, .{ .start = "doc:n", .end = "" }, fresh),
+    );
 }
 
 fn stateFromCheckpoint(

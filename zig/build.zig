@@ -4415,6 +4415,8 @@ pub fn build(b: *std.Build) void {
         "raft batch protocol cache reuses only short lived negative evidence",
         "raft batch protocol activation is reusable only in its accepted leader term",
         "raft batch protocol activation cleanup preserves in flight references",
+        "data raft retry clock and sleep borrow VoprIo",
+        "production DataServer replicated merge actions run on VoprIo",
         "data raft forwarding distinguishes safe retries from ambiguous outcomes",
         "expired data raft deadline snapshots never wait and release before returning",
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",
@@ -4484,6 +4486,7 @@ pub fn build(b: *std.Build) void {
         "data raft apply store persists split destination acknowledgements",
         "data raft merge source fence persists and transfers in snapshots",
         "data raft merge receiver checkpoint expands monotonically and snapshots",
+        "rolled back merge receiver admits only a fresh accept transition",
         "data raft merge controls converge across three replicas",
         "data raft split cursors are stable across apply batching and acknowledge same-batch writes",
         "data raft apply store seeds pre-raft snapshots once at reserved index zero",
@@ -6965,12 +6968,13 @@ pub fn build(b: *std.Build) void {
             "production HTTP lifecycle runs chunked keep-alive pipeline and stream on VoprIo",
             "DataServer LSM maintenance owner runs on borrowed VoprIo",
             "DataServer VOPR background owner executes and cancels maintenance on VoprIo",
+            "production DataServer replicated merge actions run on VoprIo",
         },
     });
     const run_data_server_vopr_tests = b.addRunArtifact(data_server_vopr_tests);
     const data_server_vopr_test_step = b.step(
         "data-server-vopr-test",
-        "Run the production DataServer public HTTP transport on VoprIo",
+        "Run production DataServer HTTP, ownership, and replicated merge actions on VoprIo",
     );
     data_server_vopr_test_step.dependOn(&run_data_server_vopr_tests.step);
     data_server_vopr_test_step.dependOn(&run_request_lifecycle_vopr_tests.step);

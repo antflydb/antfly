@@ -3,8 +3,10 @@
 Status (2026-08-25): the common VOPR engine and deterministic `std.Io` runtime
 are integrated with independent metadata, transaction, Raft, storage, HA,
 data-plane, derived-workflow, backup/restore, and clock-fault scenarios. The
-production DataServer now serves public HTTP on
-borrowed `VoprIo`; background-owner lifecycle, serverless object-store faults,
+production DataServer now serves public HTTP on borrowed `VoprIo`; a focused
+single-owner composition also runs two production data-Raft groups and the
+merge accept/catch-up/rollback/retry/finalize actions on that same scheduler.
+Background-owner lifecycle, serverless object-store faults,
 resource admission, datagrams, corpus quarantine, multiverse artifacts, and a
 scriptable/interactive debugger are executable. Replication backfill,
 supervision, authentication, complete serverless orchestration, DB/index races,
@@ -26,11 +28,14 @@ request, performs a cross-root range merge through the production merge
 coordinator using the actual donor and receiver leader writers, requires
 topology-retry exhaustion to return that typed 503 without partial graph data,
 finalizes the merge, and requires the complete graph from the recovered route.
-That mode does not yet route the transition through production `DataServer`
-owners or replicate its structural actions through receiver data Raft; this is
-the principal distributed-composition gap tracked below. The reusable deployment
-composer registers role dependencies, instances, directional links,
-process/storage/resource domains, fault scopes, and quiet-suffix evidence;
+That full-cluster mode does not yet route the transition through production
+`DataServer` owners or replicate its structural actions through every receiver
+replica. The focused single-owner composition closes the action/proposal/apply
+seam, while multi-owner placement, failover, restart, and derived-state
+convergence remain the principal distributed-composition gap tracked below.
+The reusable deployment composer registers role dependencies, instances,
+directional links, process/storage/resource domains, fault scopes, and
+quiet-suffix evidence;
 full-cluster v9 is its first production-shaped consumer. The same campaign now
 serves the worker-owned object catalog through the production serverless HTTP
 handler, queries the published version through the real public client, and
@@ -51,14 +56,18 @@ Verification audit (2026-08-25): full-cluster v9 passes all nine recorded
 histories and their exact replays, including leak and strict error-log checks.
 The Raft transport, determinism, serverless-workflow, focused distributed-query,
 and graph lifecycle gates also pass at this checkpoint. The current
-merge/data-Raft checkpoint passes `lib-data-storage-test` 65/65 and
-`lib-data-runtime-test` 121/121 with no leaks. It includes production-envelope
+merge/data-Raft checkpoint passes `lib-data-storage-test` 66/66 and
+`lib-data-runtime-test` 123/123 with no leaks. It includes production-envelope
 replay, pre-covering-receiver bootstrap evidence, finalize/reopen persistence,
 the version-3 capability barrier, rejection of merge controls before durable
 activation, source fencing and receiver-checkpoint snapshot transfer, and
 identical apply results across three replica stores. This proves the production
-protocol and projection seams, not the still-missing full-cluster `DataServer`
-VOPR composition or leader-failover history. The
+protocol and projection seams. A focused `data-server-vopr-test` history now
+additionally drives the real `DataServer` adapter, two local data-Raft groups,
+source fencing, receiver checkpoints, document copy, finalization, and
+observation using only the borrowed `VoprIo` clock and scheduler. It is not the
+still-missing multi-owner full-cluster composition or a leader-failover/restart
+history. The
 focused distributed availability-normalization test passes with no leaks. Its
 broader API HTTP gate passed 48/49; the unrelated 128-abandoned-query admission
 test missed its minimum-rejection threshold, so that aggregate is not cited as
@@ -145,7 +154,7 @@ following boundaries:
 | Metadata, Raft, HA, transaction, data-plane, storage, backfill, supervision, authentication, serverless, cache, provider, generation/reranking, and query suites | Implemented at each row's named production seam and fault vocabulary | The suites are not all co-resident in one deployment history |
 | Distributed graph | Focused production coordinator paths plus the public hosted-source composition are implemented | Public split churn, public cancellation/auth/hydration composition, joins, and global query are not complete |
 | Full-cluster v9 | The documented metadata/placement Raft, hosted data roots, public/serverless HTTP, graph-fanout, resource, merge-coordinator, replay, and cleanup behaviors are implemented | It is not yet a cluster of production `DataServer` owners. Data writes and merge structural actions are not proven through replicated DataServer apply on every replica |
-| Replicated data-Raft merge protocol | Executable production seam: v3 capability/barrier activation, source fencing, receiver checkpoints, copied-document proposals, snapshot transfer, replicated observation, and three-store convergence are implemented and pass the broad storage/runtime gates | No shared-`VoprIo` production `DataServer` cluster drives the actions yet; leader failover/restart, derived-state equivalence, disjoint donor/receiver placement, bounded transfer paging, and snapshot rehydration into every live DB owner remain unproven |
+| Replicated data-Raft merge protocol | Executable production seam: v3 capability/barrier activation, source fencing, receiver checkpoints, copied-document proposals, snapshot transfer, replicated observation, three-store convergence, and a focused production `DataServer` owner driving accept/catch-up/rollback/fresh-transition retry/finalize across two local groups on `VoprIo` are implemented | No shared-`VoprIo` multi-owner `DataServer` cluster drives the actions yet; every-replica convergence, leader failover/restart, derived-state equivalence, disjoint donor/receiver placement, bounded transfer paging, and snapshot rehydration into every live DB owner remain unproven |
 | Antithesis-style distributed execution | Registered in-process node/process/storage/resource/link domains and exact replay are implemented | Arbitrary separate-address-space binaries, sidecars, DNS, kernels, and live mixed binaries require the conditional federated-agent or native differential modes described below |
 
 Therefore “integrated” must never be shortened in release notes or reviews to
@@ -181,6 +190,7 @@ state machine, or follower recovery participated.
 | HA lifecycle | replication, fencing, promotion, retention, restart, and rejoin | `zig build ha-vopr-test ha-chaos-test` |
 | Independent application domains | distributed transaction, data plane, derived workflow, backup/restore, and clock faults | their five focused `*-vopr-test` gates |
 | Production public HTTP on deterministic I/O | `vopr/data_server.zig`, `vopr/http_lifecycle.zig`, borrowed `HttpRuntime` and `BackendRuntime` lanes, transport-neutral metadata executor; chunked upload, keep-alive pipeline, streaming response, and half-close | `zig build data-server-vopr-test` |
+| Production DataServer replicated merge action seam | `data/runtime.zig`; one real `DataServer`, two production local data-Raft groups, the real shard-operation adapter, durable v3 activation, source/receiver proposals, document copy, final observation, and cleanup share one `VoprIo`; the physical LSM byte store remains an explicit differential boundary | `zig build data-server-vopr-test` |
 | Production background ownership and admission | `background_runtime.zig`, `vopr_durable_job_lane.zig`; transaction recovery, TTL, enrichment, text merge, sparse compaction, resolution, promotion, LSM maintenance, quarantine retry, repair, DataServer warmup/catch-up/root/status refresh, and auto-bulk finish work on borrowed `std.Io`/shared owners; `vopr/admission.zig` | `zig build storage-vopr-runtime-test vopr-runtime-test data-server-vopr-test admission-vopr-test` |
 | Real serverless object-store protocols under deterministic provider faults | `objectstore/scripted_fault.zig`, Antfly `vopr/object_store.zig` | `zig build lib-objectstore-test serverless-object-store-vopr-test` |
 | P0/P1 orchestration boundaries | Antfly `vopr/replication_backfill.zig`, `supervision.zig`, `auth_lifecycle.zig`, `serverless_workflow.zig`, `db_index_races.zig` | their focused `*-vopr-test` gates |
@@ -782,8 +792,12 @@ production `DataServer`: ordinary writes and structural merge steps do not
 cross `DataServer` data Raft in this composition yet. Outside this composition,
 the production data-Raft merge protocol and follower projection are now
 implemented behind a durable v3 capability barrier and pass focused
-three-replica apply tests; that lower seam must not be described as a
-deployment history until the owner/action/failover work below executes it.
+three-replica apply tests. The focused DataServer campaign additionally runs
+the production accept/catch-up/rollback/retry/finalize adapter across donor and
+receiver Raft groups on one owner and one `VoprIo`. Neither focused seam is a
+multi-owner deployment history: transport partitions, every-replica apply,
+leader
+failover/restart, and disjoint placement remain the work below.
 
 ### Derived Workflows
 
@@ -1087,6 +1101,16 @@ VOPR work has found concrete production and harness defects:
   exhausted. The distributed graph coordinator now normalizes both terminal
   topology outcomes to `DistributedQueryUnavailable`, preserving the typed,
   retryable 503 contract and never publishing a partial success body.
+- The production data-Raft leader/proposal path measured deadlines with host
+  monotonic time, materialized replicated document timestamps from the host
+  realtime clock, and retried with POSIX `nanosleep`. A `DataServer` borrowing
+  `VoprIo` could therefore neither control nor replay the waits or timestamps;
+  its action fiber could be parked while logical time had no authority over
+  progress. Data-Raft capability probes, campaigns, forwarding, apply waits,
+  deadlines, retry sleeps, and timestamp materialization now borrow the
+  backend runtime's `std.Io` clocks and sleep. The host clocks remain only the
+  explicit fallback for a server with no injected runtime, and a focused
+  regression proves the retry/action path on `VoprIo`.
 - Production merge catch-up parsed only legacy `put:`/`del:` entries, while
   current DataServer Raft logs retain JSON batch envelopes. A merge could
   therefore finalize without replaying current writes. Merge replay now
@@ -1098,6 +1122,15 @@ VOPR work has found concrete production and harness defects:
   an explicit bootstrap-complete marker and applied-index watermark; status and
   catch-up require that evidence, while a pre-covering receiver can advance
   once the marker is durable.
+- A rolled-back receiver checkpoint permanently conflicted with every later
+  transition ID, even after rollback restored the exact base range. Metadata
+  could legitimately admit a fresh merge, but its accept command then stopped
+  receiver Raft apply with `ConflictingMergeTransition`. Receiver checkpoint
+  planning now replaces a terminal rolled-back receipt only for a different
+  transition's `accept` at the restored base range. Same-transition reopening,
+  non-accept starts, wrong ranges, and active/finalized conflicts still fail
+  closed. The production `DataServer` VOPR regression proves rollback followed
+  by a fresh transition and finalization.
 - The authoritative Raft apply projection contains primary documents, not all
   materialized graph and embedding state. A primary-only merge lost live graph
   edges after cutover. Bootstrap now imports graph and embedding artifacts from
@@ -1126,9 +1159,12 @@ VOPR work has found concrete production and harness defects:
   controls that do not follow it. This closes a second audit defect in which an
   older replica could otherwise ignore an unknown private JSON field and apply
   an empty command. Three independent apply stores converge in the focused
-  regression, and the broad storage/runtime gates pass. The result is still an
-  implemented production protocol seam rather than an integrated distributed
-  VOPR claim: a production `DataServer` cluster history, failover/restart, and
+  regression, and the broad storage/runtime gates pass. A focused VOPR
+  regression now drives accept/catch-up/rollback/fresh-transition
+  retry/finalize through one production `DataServer` and two local data-Raft
+  groups, which closes the owner/action seam without overstating cluster
+  coverage. A multi-owner production
+  `DataServer` history, every-replica convergence, failover/restart, and
   disjoint donor/receiver placement remain required below.
 
 The bounded independent-domain model campaigns completed without an additional
@@ -1397,7 +1433,7 @@ implements the analogous application-level fault domains inside a registered
 | Requirement | Current status | Remaining work |
 | --- | --- | --- |
 | Deterministic multi-node runtime, clocks, links, storage, restart, resources, replay, and quiet suffix | **Integrated foundation.** The reusable deployment composer registers node/role/domain/fault/quiet obligations; metadata, Raft, HA, transaction, data-plane, and full-cluster gates exercise complementary real owners | Adopt the manifest in the remaining distributed suites and maintain fail-closed audits as new owners appear |
-| Metadata quorum, production `DataServer` replicas, public clients, and real HTTP/Raft transport in one history | **Partially integrated.** Full-cluster v9 sends serialized metadata/placement Raft frames through deterministic link policy and real `httpx`/`VoprIo` sockets, drives three production public API listeners over hosted node-local roots plus the serverless catalog listener, injects three distinct production resource managers, exact-replays aggregate node-memory denial/recovery, public graph requests across an in-flight range-leader restart and range merge, and a real fanout transport failure with fail-closed 503/recovery, and proves registered cluster quiescence. It does not instantiate `DataServer` or its data-Raft apply owner. Separately, the production merge protocol now has v3 activation, replicated source/receiver controls, snapshot transfer, and three-store convergence tests | Replace the hosted data rig with three production `DataServer` owners on the shared `VoprIo`; drive the implemented data-Raft merge actions and ordinary writes through real leaders; prove every active replica, disjoint placement, restart/failover durability, derived-state equality, disk/socket pressure, and richer overlapping failures |
+| Metadata quorum, production `DataServer` replicas, public clients, and real HTTP/Raft transport in one history | **Partially integrated.** Full-cluster v9 sends serialized metadata/placement Raft frames through deterministic link policy and real `httpx`/`VoprIo` sockets, drives three production public API listeners over hosted node-local roots plus the serverless catalog listener, injects three distinct production resource managers, exact-replays aggregate node-memory denial/recovery, public graph requests across an in-flight range-leader restart and range merge, and a real fanout transport failure with fail-closed 503/recovery, and proves registered cluster quiescence. It does not instantiate `DataServer` or its data-Raft apply owner. Separately, the production merge protocol has v3 activation, replicated source/receiver controls, snapshot transfer, and three-store convergence; a focused production `DataServer` owner now drives those actions across two local Raft groups on `VoprIo` | Replace the hosted data rig with three production `DataServer` owners on the shared `VoprIo`; drive ordinary writes and the proven action seam through networked leaders; prove every active replica, disjoint placement, restart/failover durability, derived-state equality, disk/socket pressure, and richer overlapping failures |
 | Serverless worker output through its production public catalog and ownership graph | **Integrated at the stated seam.** The production worker, durable lease, object stores, catalog service, HTTP handler/listener, and public client share one `VoprIo`. Every mode lists the worker-created table and queries the published head/documents; stale generation remains fenced. This correctly retains the distinct serverless object and metadata placement catalogs | Overlap serverless lease/object-store failures with metadata topology and node-resource faults, then add multi-worker placement when production owns that topology |
 | HA, data-plane, metadata, public API, and serverless owners all co-resident | **Ongoing.** Each domain has an integrated exact-replay suite; they do not yet all coexist in one history | Build one bounded deployment composition and cluster-wide recovery oracle without duplicating business logic |
 | Public distributed graph request from HTTP planning through fanout/hydration | **Partially integrated.** Full-cluster v9 executes a public depth-two graph traversal across two ranges through real HTTP, planning, internal expansion fanout, and canonical response assembly. Production-neutral lifecycle events pause after the first consistent round. One mode restarts the actual second-range leader and requires the resumed request's complete result; another cuts the real internal transport and requires a typed retryable 503 before a complete retry; the ninth runs a production `MergeCoordinator` across the actual donor/receiver leader roots, requires topology churn to fail closed, finalizes the merge, and requires the recovered route's complete graph. The focused distributed suite separately covers optional hydration, topology retry/exhaustion, cancellation, stale generations, and authorization | Add public range-split churn and fully replicated DataServer transition execution, then compose cancellation, authorization changes, and public hydration; add distributed joins and global queries with the same fail-closed publication rule |
@@ -1425,7 +1461,12 @@ acceptance, persistence observation, apply confirmation, visibility
 confirmation, and response-ack readiness with stable group/table/log
 identities. Persistence is observed safely from the production apply watermark,
 which Raft cannot publish before Ready storage completes, rather than adding a
-suspension inside Raft storage ownership. Split and merge prepare,
+suspension inside Raft storage ownership. Data-Raft proposal deadlines,
+capability probes, campaigns, forwarding retries, apply waits, and replicated
+timestamps use the borrowed `std.Io` clocks and sleep rather than host time.
+A focused production composition now advances two local Raft groups while the
+real shard-operation adapter performs merge accept/catch-up/rollback/retry/
+finalize and observes the durable result. Split and merge prepare,
 copy, cutover, and rollback completions carry stable transition identities;
 synchronous paths reach them after transition locks and writer leases are
 released, durable split-copy jobs explicitly release their per-source lane
@@ -1734,7 +1775,7 @@ ownership is released.
 | P0 integrated | User and authentication lifecycle | `auth-lifecycle-vopr-test` covers password, API-key, permission, and row-filter changes; deterministic seed capture; revoke and rotate; durable reload; partial persistence rollback; and stale-reader behavior through the production manager. |
 | P1 integrated | Complete serverless workflow | `serverless-workflow-vopr-test` covers durable claim/fencing, build, compaction, publication, and query-visible catalog cutover with duplicate workers, lease takeover, ambiguous completion, retry, cancellation, crash recovery, stale-enricher generation rejection, and progress-conflict fencing under exact replay through production orchestration. In full-cluster v9 the same fixture borrows the cluster `VoprIo`, serves its worker-owned object catalog through the production serverless HTTP stack, and proves public table/head/document visibility. Cross-domain fault overlap and multi-worker placement remain follow-up depth. |
 | P1 integrated | DB and index request races | `db-index-race-vopr-test` exact-replays cross-index admission, same-index FIFO fairness, delete/materialize linearizations, published-reader/catalog-writer capture, cancellation, shutdown, and cleanup through production-safe seams rather than native test threads. |
-| P0 partially integrated | Full-cluster distributed composition | `full-cluster-vopr-test` exact-replays a three-node metadata quorum, two-placement hosted ranges on node-local roots, three production public API HTTP listeners plus a production serverless catalog listener, non-host and cross-node clients, two tables, three distinct production resource managers, and a serverless workflow fixture on one `VoprIo`. Serialized metadata/placement Raft frames and public requests pass through real `httpx`/VOPR sockets. Nine modes cover clean operation, metadata partition/heal, non-host restart, in-flight graph range-leader restart, in-flight graph range-merge churn, in-flight graph transport failure/recovery, partial HTTP write, stale serverless generation, and node-memory denial/recovery. The restart mode pauses the public graph after expansion round one, restarts the actual second-range leader, waits for recovery, resumes the request, and requires the complete depth-two response. The transport mode cuts real internal fanout after round one, requires the structured retryable 503 with no graph payload, heals the network, and requires a complete retry. The topology mode uses retained hosted-writer leases and the production `MergeCoordinator` across actual donor/receiver leader roots; it requires a fail-closed 503 during churn, merge finalization, and a complete graph from the recovered route. The pressure mode fills every production process envelope through exactly-once reservations, requires a public write denial, releases pressure, then requires public write/read recovery. Version 9 registers the in-process owners, role dependencies, directional links, and typed fault scopes with the reusable deployment composer, requires measured resource evidence and cluster-wide quiet acknowledgment, and queries the worker's published version/documents through `ServerlessHttpClient`. The production data-Raft merge seam now implements v3 fail-closed activation, source fencing, receiver checkpoints, ordinary-Raft document transfer, snapshot-carried markers, replicated observation, and three-store convergence; it is not yet driven by this VOPR history. P0 completion requires replacing the hosted table-source rig with actual `DataServer` owners, exercising those actions through leaders, and proving every replica plus leader failover/restart. Disjoint donor/receiver placement, bounded transfer paging, DB/derived-state snapshot rehydration, HA/data-plane co-residency, disk/socket pressure, richer overlapping cross-domain faults, and multi-worker placement remain follow-up depth. |
+| P0 partially integrated | Full-cluster distributed composition | `full-cluster-vopr-test` exact-replays a three-node metadata quorum, two-placement hosted ranges on node-local roots, three production public API HTTP listeners plus a production serverless catalog listener, non-host and cross-node clients, two tables, three distinct production resource managers, and a serverless workflow fixture on one `VoprIo`. Serialized metadata/placement Raft frames and public requests pass through real `httpx`/VOPR sockets. Nine modes cover clean operation, metadata partition/heal, non-host restart, in-flight graph range-leader restart, in-flight graph range-merge churn, in-flight graph transport failure/recovery, partial HTTP write, stale serverless generation, and node-memory denial/recovery. The restart mode pauses the public graph after expansion round one, restarts the actual second-range leader, waits for recovery, resumes the request, and requires the complete depth-two response. The transport mode cuts real internal fanout after round one, requires the structured retryable 503 with no graph payload, heals the network, and requires a complete retry. The topology mode uses retained hosted-writer leases and the production `MergeCoordinator` across actual donor/receiver leader roots; it requires a fail-closed 503 during churn, merge finalization, and a complete graph from the recovered route. The pressure mode fills every production process envelope through exactly-once reservations, requires a public write denial, releases pressure, then requires public write/read recovery. Version 9 registers the in-process owners, role dependencies, directional links, and typed fault scopes with the reusable deployment composer, requires measured resource evidence and cluster-wide quiet acknowledgment, and queries the worker's published version/documents through `ServerlessHttpClient`. The production data-Raft merge seam implements v3 fail-closed activation, source fencing, receiver checkpoints, ordinary-Raft document transfer, snapshot-carried markers, replicated observation, and three-store convergence. `data-server-vopr-test` now drives accept/catch-up/rollback/fresh-transition retry/finalize through one production `DataServer` and two local Raft groups, but that owner is not yet substituted into this full-cluster history. P0 completion requires three actual `DataServer` owners, networked action routing, every-replica convergence, and leader failover/restart. Disjoint donor/receiver placement, bounded transfer paging, DB/derived-state snapshot rehydration, HA/data-plane co-residency, disk/socket pressure, richer overlapping cross-domain faults, and multi-worker placement remain follow-up depth. |
 | P0 integrated | Query-embedding cache | `query-embedding-cache-vopr-test` exact-replays concurrent-miss coalescing, waiter cancellation, deadlines, in-flight admission, TTL, byte-budget/LRU eviction, pinned hits, and cleanup through the production cache on one `VoprIo`. |
 | P1 partially integrated | Distributed graph/public-query boundaries | `distributed-query-vopr-test` exact-replays production cross-range planning, two-shard fanout with and without document hydration, topology change between plan and fanout, one-retry success, retry exhaustion, stale per-shard generation rejection, cancellation with outstanding shard work, and cross-table authorization. Full-cluster v9 joins public HTTP to real two-range graph fanout and depth-two assembly, exact-replays an in-flight restart of the actual second-range leader, proves that real transport loss after round one returns a typed retryable 503 without partial graph data before a complete post-heal retry, and runs a cross-node production-coordinator merge with fail-closed topology exhaustion and complete recovery. Public range-split churn, replicated transition execution, cancellation, authorization changes, and public hydration are not yet composed into that history; distributed joins and global queries also remain and are not claimed by this row. |
 | P1 integrated | Generation and reranking chains | `generation-reranking-vopr-test` exact-replays generation success, retry/backoff on borrowed `std.Io`, timeout and rate-limit fallback, cancellation, reranking success, malformed count/non-finite results, timeout, and cancellation through production chain and local-provider boundaries. Remote HTTP provider parsing remains covered by `provider-boundary-vopr-test` and `media-runtime-vopr-test`, not duplicated here. |
@@ -1904,10 +1945,14 @@ Wait for a real product or toolchain requirement before adding:
 1. Finish the P0 full-cluster data plane: replace the hosted table-source/API
    rig with three production `DataServer` owners borrowing the same `VoprIo`;
    make ordinary writes and split bootstrap/catch-up/finalize cross the
-   data-Raft proposal/apply path, and drive the newly implemented merge
-   accept/catch-up/finalize/rollback path through production leaders. The merge
-   protocol checkpoint already provides a durable v3 capability barrier,
-   source prepare/finalize fencing, receiver checkpoints, Raft-mediated copy,
+   data-Raft proposal/apply path, and drive merge
+   accept/catch-up/finalize/rollback through networked production leaders. The
+   focused single-owner history already drives accept/catch-up/rollback, admits
+   a fresh transition after the terminal rollback, and finalizes it through
+   two local Raft groups while proving proposal timing and timestamps remain
+   under `VoprIo`. The merge protocol checkpoint already provides a durable v3
+   capability barrier, source prepare/finalize fencing, receiver checkpoints,
+   Raft-mediated copy,
    snapshot-carried controls, replicated observation, and three-store apply
    convergence. The remaining campaign must inspect every active replica,
    restart and fail over both donor and receiver leaders, and require identical
@@ -2054,8 +2099,8 @@ and upgrade/compatibility suites are integrated at the production seams stated
 in their conformance rows. Distributed VOPR is integrated across metadata,
 transactions, Raft, HA, the data plane, distributed graph fanout, and a
 deployment-shaped full-cluster campaign. Remaining work deepens composition—
-first by replacing the hosted full-cluster data rig with production
-`DataServer` owners and driving the now-implemented v3 data-Raft merge protocol
+first by replacing the hosted full-cluster data rig with multiple production
+`DataServer` owners and extending the focused single-owner v3 data-Raft merge path
 through disjoint placement, restart, failover, bounded transfer, and
 projection/DB/derived-state recovery; then by running public graph requests
 under those replicated topology transitions, cancellation, authorization, and
