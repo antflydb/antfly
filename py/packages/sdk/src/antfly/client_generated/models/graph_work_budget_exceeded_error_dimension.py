@@ -6,6 +6,7 @@ class GraphWorkBudgetExceededErrorDimension(str, Enum):
     EXPLORED_EDGE_BYTES = "explored_edge_bytes"
     EXPLORED_NODES = "explored_nodes"
     INTERMEDIATE_STATES = "intermediate_states"
+    SCANNED_ANCHORS = "scanned_anchors"
 
     def __str__(self) -> str:
         return str(self.value)

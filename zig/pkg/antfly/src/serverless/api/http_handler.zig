@@ -3567,6 +3567,7 @@ pub const HttpHandler = struct {
             .work_budget = request_work_budget,
             .distinct_budget = request_distinct_budget,
             .start_validation = if (conjunctive_pattern != null) .prevalidated else .required,
+            .anchors_precharged = conjunctive_pattern != null,
         };
 
         if (conjunctive_pattern) |pattern| {
@@ -3594,6 +3595,7 @@ pub const HttpHandler = struct {
                         &anchor_buffer,
                         pattern,
                         &filter_ctx,
+                        request_work_budget,
                     );
                     if (page.len == 0) continue;
                     try request_cache.session.checkCancellation();
@@ -3660,6 +3662,7 @@ pub const HttpHandler = struct {
                     &anchor_buffer,
                     pattern,
                     &filter_ctx,
+                    request_work_budget,
                 );
                 if (page.len == 0) continue;
                 try request_cache.session.checkCancellation();
@@ -4870,6 +4873,7 @@ pub const HttpHandler = struct {
             error.GraphWorkBudgetExceeded => return error.GraphWorkBudgetExceeded,
             error.GraphMinWeightDomainViolation => return error.GraphMinWeightDomainViolation,
             error.GraphMaxWeightDomainViolation => return error.GraphMaxWeightDomainViolation,
+            error.GraphPathWeightOverflow => return error.GraphPathWeightOverflow,
             error.GraphDistinctBudgetExceeded => return error.GraphDistinctBudgetExceeded,
             error.GraphAnchorFilterRequiresIndex => return error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded => return error.GraphMatchOperationLimitExceeded,
@@ -5633,12 +5637,14 @@ fn nextConjunctiveAnchorPage(
     buffer: [][]const u8,
     pattern: graph_pattern_mod.ConjunctivePattern,
     filter_ctx: *PatternDocumentFilterContext,
+    work_budget: *graph_pattern_mod.WorkBudget,
 ) ![]const []const u8 {
     const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
     var page_len: usize = 0;
     while (cursor.* < docs.len and page_len < buffer.len) {
         const doc = docs[cursor.*];
         cursor.* += 1;
+        try work_budget.consumeAnchors(1);
         if (!try publishedPatternNodeFilterEvaluator(
             @ptrCast(filter_ctx),
             .{ .table = null, .key = doc.doc_id },
@@ -11252,13 +11258,21 @@ test "serverless conjunctive anchors are enumerated in borrowed bounded pages" {
     };
     var cursor: usize = 0;
     var buffer: [2][]const u8 = undefined;
-    const first = try nextConjunctiveAnchorPage(&docs, &cursor, &buffer, pattern, &filter_ctx);
+    var work_budget = graph_pattern_mod.WorkBudget.init(
+        graph_pattern_mod.default_max_explored_nodes,
+        graph_pattern_mod.default_max_explored_edges,
+    );
+    const first = try nextConjunctiveAnchorPage(&docs, &cursor, &buffer, pattern, &filter_ctx, &work_budget);
     try std.testing.expectEqualSlices([]const u8, &.{ "a", "b" }, first);
-    const second = try nextConjunctiveAnchorPage(&docs, &cursor, &buffer, pattern, &filter_ctx);
+    const second = try nextConjunctiveAnchorPage(&docs, &cursor, &buffer, pattern, &filter_ctx, &work_budget);
     try std.testing.expectEqualSlices([]const u8, &.{ "c", "d" }, second);
-    const third = try nextConjunctiveAnchorPage(&docs, &cursor, &buffer, pattern, &filter_ctx);
+    const third = try nextConjunctiveAnchorPage(&docs, &cursor, &buffer, pattern, &filter_ctx, &work_budget);
     try std.testing.expectEqualSlices([]const u8, &.{"e"}, third);
     try std.testing.expectEqual(docs.len, cursor);
+    try std.testing.expectEqual(
+        graph_pattern_mod.default_max_scanned_anchors - docs.len,
+        work_budget.remaining_anchors,
+    );
 }
 
 test "serverless graph HTTP result copies are allocation-failure safe" {

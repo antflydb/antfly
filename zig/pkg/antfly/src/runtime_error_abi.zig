@@ -304,6 +304,7 @@ pub const Detail = enum(c_int) {
     graph_work_budget_exceeded,
     graph_min_weight_domain_violation,
     graph_max_weight_domain_violation,
+    graph_path_weight_overflow,
 };
 
 pub const Status = extern struct {
@@ -422,6 +423,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.GraphWorkBudgetExceeded => status(.invalid_argument, .graph_work_budget_exceeded),
         error.GraphMinWeightDomainViolation => status(.invalid_argument, .graph_min_weight_domain_violation),
         error.GraphMaxWeightDomainViolation => status(.invalid_argument, .graph_max_weight_domain_violation),
+        error.GraphPathWeightOverflow => status(.invalid_argument, .graph_path_weight_overflow),
         error.GraphDistinctBudgetExceeded => status(.invalid_argument, .graph_distinct_budget_exceeded),
         error.GraphAnchorFilterRequiresIndex => status(.unsupported, .graph_anchor_filter_requires_index),
         error.GraphMatchOperationLimitExceeded => status(.invalid_argument, .graph_match_operation_limit_exceeded),
@@ -905,6 +907,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .graph_work_budget_exceeded => "GraphWorkBudgetExceeded",
         .graph_min_weight_domain_violation => "GraphMinWeightDomainViolation",
         .graph_max_weight_domain_violation => "GraphMaxWeightDomainViolation",
+        .graph_path_weight_overflow => "GraphPathWeightOverflow",
     };
 }
 

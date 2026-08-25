@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const native_endian = builtin.target.cpu.arch.endian();
+const edge_weight = @import("../../../graph/edge_weight.zig");
 
 pub const codec_version: u16 = 1;
 pub const magic: [8]u8 = .{ 'A', 'F', 'E', 'N', 'R', 'C', 'H', 0 };
@@ -255,6 +256,7 @@ pub fn encodeGraphEdgeAlloc(
     updated_at: u64,
     metadata_json: []const u8,
 ) ![]u8 {
+    try edge_weight.validateStored(weight);
     const payload_len = @sizeOf(u64) + @sizeOf(u64) + @sizeOf(u64) + @sizeOf(u32) + metadata_json.len;
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
@@ -281,6 +283,17 @@ pub fn encodeGraphEdgeAlloc(
     return out;
 }
 
+test "graph edge artifacts reject weights outside the durable domain" {
+    try std.testing.expectError(
+        error.InvalidGraphEdges,
+        encodeGraphEdgeAlloc(std.testing.allocator, null, -0.1, 0, 0, ""),
+    );
+    try std.testing.expectError(
+        error.InvalidGraphEdges,
+        encodeGraphEdgeAlloc(std.testing.allocator, null, std.math.inf(f64), 0, 0, ""),
+    );
+}
+
 pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
     const header = try decodeHeader(data);
     if (header.kind != .graph_edge) return error.InvalidArtifactKind;
@@ -289,6 +302,7 @@ pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
     const payload = data[header_len..][0..header.payload_len];
     var pos: usize = 0;
     const weight = @as(f64, @bitCast(std.mem.readInt(u64, payload[pos..][0..8], .little)));
+    if (!edge_weight.isStoredValid(weight)) return error.InvalidArtifactPayload;
     pos += @sizeOf(u64);
     const created_at = std.mem.readInt(u64, payload[pos..][0..8], .little);
     pos += @sizeOf(u64);

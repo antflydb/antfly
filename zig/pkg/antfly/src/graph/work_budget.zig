@@ -12,12 +12,14 @@ const graph_mod = @import("graph.zig");
 pub const default_max_explored_nodes: usize = 100_000;
 pub const default_max_explored_edges: usize = 1_000_000;
 pub const default_max_explored_edge_bytes: usize = 64 * 1024 * 1024;
+pub const default_max_scanned_anchors: usize = 1_000_000;
 pub const default_max_intermediate_states: usize = 100_000;
 
 pub const Dimension = enum {
     explored_nodes,
     explored_edges,
     explored_edge_bytes,
+    scanned_anchors,
     intermediate_states,
 };
 
@@ -33,9 +35,11 @@ pub const WorkBudget = struct {
     max_nodes: usize,
     max_edges: usize,
     max_edge_bytes: usize,
+    max_anchors: usize,
     remaining_nodes: usize,
     remaining_edges: usize,
     remaining_edge_bytes: usize,
+    remaining_anchors: usize,
     last_exhaustion: ?Exhaustion = null,
 
     pub fn init(max_nodes: usize, max_edges: usize) WorkBudget {
@@ -43,9 +47,11 @@ pub const WorkBudget = struct {
             .max_nodes = max_nodes,
             .max_edges = max_edges,
             .max_edge_bytes = default_max_explored_edge_bytes,
+            .max_anchors = default_max_scanned_anchors,
             .remaining_nodes = max_nodes,
             .remaining_edges = max_edges,
             .remaining_edge_bytes = default_max_explored_edge_bytes,
+            .remaining_anchors = default_max_scanned_anchors,
         };
     }
 
@@ -59,6 +65,10 @@ pub const WorkBudget = struct {
 
     pub fn edgeByteLimit(self: WorkBudget) usize {
         return self.remaining_edge_bytes;
+    }
+
+    pub fn anchorLimit(self: WorkBudget) usize {
+        return self.remaining_anchors;
     }
 
     pub fn consumeNode(self: *WorkBudget) !void {
@@ -79,6 +89,11 @@ pub const WorkBudget = struct {
     pub fn consumeEdgeBytes(self: *WorkBudget, bytes: usize) !void {
         if (bytes > self.remaining_edge_bytes) return self.exhaust(.explored_edge_bytes, self.max_edge_bytes);
         self.remaining_edge_bytes -= bytes;
+    }
+
+    pub fn consumeAnchors(self: *WorkBudget, count: usize) !void {
+        if (count > self.remaining_anchors) return self.exhaust(.scanned_anchors, self.max_anchors);
+        self.remaining_anchors -= count;
     }
 
     pub fn consumeMaterializedEdges(self: *WorkBudget, edges: []const graph_mod.Edge) !void {
@@ -111,4 +126,13 @@ fn edgeOwnedBytes(edges: []const graph_mod.Edge) !usize {
         total = try std.math.add(usize, total, edge.metadata.len);
     }
     return total;
+}
+
+test "anchor scans have an independent request-wide budget" {
+    var budget = WorkBudget.init(1, 1);
+    budget.max_anchors = 2;
+    budget.remaining_anchors = 2;
+    try budget.consumeAnchors(2);
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, budget.consumeAnchors(1));
+    try std.testing.expectEqual(Dimension.scanned_anchors, budget.exhaustion().?.dimension);
 }

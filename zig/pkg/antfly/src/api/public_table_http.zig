@@ -131,6 +131,7 @@ pub const TableApi = struct {
         GraphWorkBudgetExceeded,
         GraphMinWeightDomainViolation,
         GraphMaxWeightDomainViolation,
+        GraphPathWeightOverflow,
         GraphDistinctBudgetExceeded,
         GraphAnchorFilterRequiresIndex,
         GraphMatchOperationLimitExceeded,
@@ -818,7 +819,7 @@ pub fn graphPathWeightDomainErrorBody(alloc: std.mem.Allocator) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
         .@"error" = "graph_path_weight_domain_error",
-        .message = "an eligible edge weight is outside the path algorithm's exact domain",
+        .message = "an edge weight or accumulated path score is outside the path algorithm's exact numeric domain",
         .retryable = false,
         .operation = diagnostic.operation,
         .mode = diagnostic.mode,
@@ -1276,7 +1277,7 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table graph work budget exceeded table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphWorkBudgetExceededBody(alloc), .json = true };
             },
-            error.GraphMinWeightDomainViolation, error.GraphMaxWeightDomainViolation => {
+            error.GraphMinWeightDomainViolation, error.GraphMaxWeightDomainViolation, error.GraphPathWeightOverflow => {
                 std.log.warn("public table graph path weight domain violation table={s}", .{table_name});
                 return .{ .status = 422, .body = try graphPathWeightDomainErrorBody(alloc), .json = true };
             },

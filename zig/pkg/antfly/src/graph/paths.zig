@@ -889,6 +889,84 @@ pub fn pathEdgeCost(mode: PathWeightMode, weight: f64) !f64 {
     };
 }
 
+/// Compute the canonical raw edge-weight sum. This value is part of the public
+/// GraphPath contract even when path ordering uses hops or a transformed
+/// max-product objective, so silently publishing infinity is never valid.
+pub fn sumPathEdgeWeights(edges: anytype) !f64 {
+    var total: f64 = 0.0;
+    for (edges) |edge| {
+        if (!std.math.isFinite(edge.weight)) return error.GraphPathWeightOverflow;
+        total += edge.weight;
+        if (!std.math.isFinite(total)) return error.GraphPathWeightOverflow;
+    }
+    return total;
+}
+
+fn clonePathEdge(alloc: Allocator, edge: anytype) !PathEdge {
+    const source = try alloc.dupe(u8, edge.source);
+    errdefer alloc.free(source);
+    const target = try alloc.dupe(u8, edge.target);
+    errdefer alloc.free(target);
+    const edge_type = try alloc.dupe(u8, edge.edge_type);
+    errdefer alloc.free(edge_type);
+    const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
+    errdefer if (metadata.len > 0) alloc.free(metadata);
+    return .{
+        .source = source,
+        .target = target,
+        .edge_type = edge_type,
+        .weight = edge.weight,
+        .metadata = metadata,
+    };
+}
+
+test "canonical path weight sum rejects non-finite accumulation" {
+    const edges = [_]PathEdge{
+        .{ .source = "a", .target = "b", .edge_type = "e", .weight = std.math.floatMax(f64) },
+        .{ .source = "b", .target = "c", .edge_type = "e", .weight = std.math.floatMax(f64) },
+    };
+    try std.testing.expectError(error.GraphPathWeightOverflow, sumPathEdgeWeights(&edges));
+}
+
+test "joining paths is allocation-failure safe" {
+    var root_nodes = [_][]const u8{ "a", "b" };
+    var root_edges = [_]PathEdge{.{
+        .source = "a",
+        .target = "b",
+        .edge_type = "root",
+        .weight = 1.0,
+        .metadata = "{\"root\":true}",
+    }};
+    const root = Path{
+        .nodes = &root_nodes,
+        .edges = &root_edges,
+        .total_weight = 1.0,
+        .length = 1,
+    };
+    var spur_nodes = [_][]const u8{ "b", "c" };
+    var spur_edges = [_]PathEdge{.{
+        .source = "b",
+        .target = "c",
+        .edge_type = "spur",
+        .weight = 2.0,
+        .metadata = "{\"spur\":true}",
+    }};
+    const spur = Path{
+        .nodes = &spur_nodes,
+        .edges = &spur_edges,
+        .total_weight = 2.0,
+        .length = 1,
+    };
+    const Runner = struct {
+        fn run(alloc: Allocator, root_path: Path, spur_path: Path) !void {
+            const joined = try joinPaths(alloc, &root_path, 1, &spur_path);
+            defer freePath(alloc, joined);
+            try std.testing.expectEqual(@as(f64, 3.0), joined.total_weight);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{ root, spur });
+}
+
 fn pathStateDominated(
     best_dist: *const BestDistanceMap,
     node: []const u8,
@@ -969,30 +1047,39 @@ fn reconstructPath(alloc: Allocator, end_node: *PathNode) !Path {
     }
 
     const nodes = try alloc.alloc([]const u8, count);
-    errdefer alloc.free(nodes);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[count - initialized_nodes ..]) |node| alloc.free(node);
+        alloc.free(nodes);
+    }
     const edge_count = if (count > 0) count - 1 else 0;
     const path_edges = try alloc.alloc(PathEdge, edge_count);
-    errdefer alloc.free(path_edges);
+    var initialized_edges: usize = 0;
+    errdefer {
+        for (path_edges[edge_count - initialized_edges ..]) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        alloc.free(path_edges);
+    }
 
     // Fill in reverse
     var idx = count;
     n = end_node;
-    var total_weight: f64 = 0.0;
     while (n) |node| : (n = node.parent) {
         idx -= 1;
         nodes[idx] = try alloc.dupe(u8, node.key);
+        initialized_nodes += 1;
         if (node.parent_edge) |pe| {
             // Edge array is 1 shorter than node array; idx >= 1 when parent_edge exists
-            path_edges[idx - 1] = .{
-                .source = try alloc.dupe(u8, pe.source),
-                .target = try alloc.dupe(u8, pe.target),
-                .edge_type = try alloc.dupe(u8, pe.edge_type),
-                .weight = pe.weight,
-                .metadata = if (pe.metadata.len > 0) try alloc.dupe(u8, pe.metadata) else "",
-            };
-            total_weight += pe.weight;
+            path_edges[idx - 1] = try clonePathEdge(alloc, pe);
+            initialized_edges += 1;
         }
     }
+
+    const total_weight = try sumPathEdgeWeights(path_edges);
 
     return Path{
         .nodes = nodes,
@@ -1084,38 +1171,42 @@ fn joinPaths(alloc: Allocator, root: *const Path, spur_idx: usize, spur: *const 
     const total_edges = root_node_count + spur.edges.len;
 
     const nodes = try alloc.alloc([]const u8, total_nodes);
-    errdefer alloc.free(nodes);
+    var initialized_nodes: usize = 0;
+    errdefer {
+        for (nodes[0..initialized_nodes]) |node| alloc.free(node);
+        alloc.free(nodes);
+    }
     const edges = try alloc.alloc(PathEdge, total_edges);
-    errdefer alloc.free(edges);
+    var initialized_edges: usize = 0;
+    errdefer {
+        for (edges[0..initialized_edges]) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        alloc.free(edges);
+    }
 
     // Copy root nodes and edges up to spur_idx
     for (0..root_node_count) |i| {
         nodes[i] = try alloc.dupe(u8, root.nodes[i]);
-        edges[i] = .{
-            .source = try alloc.dupe(u8, root.edges[i].source),
-            .target = try alloc.dupe(u8, root.edges[i].target),
-            .edge_type = try alloc.dupe(u8, root.edges[i].edge_type),
-            .weight = root.edges[i].weight,
-            .metadata = if (root.edges[i].metadata.len > 0) try alloc.dupe(u8, root.edges[i].metadata) else "",
-        };
+        initialized_nodes += 1;
+        edges[i] = try clonePathEdge(alloc, root.edges[i]);
+        initialized_edges += 1;
     }
 
     // Copy spur path
     for (spur.nodes, 0..) |n, i| {
         nodes[root_node_count + i] = try alloc.dupe(u8, n);
+        initialized_nodes += 1;
     }
     for (spur.edges, 0..) |e, i| {
-        edges[root_node_count + i] = .{
-            .source = try alloc.dupe(u8, e.source),
-            .target = try alloc.dupe(u8, e.target),
-            .edge_type = try alloc.dupe(u8, e.edge_type),
-            .weight = e.weight,
-            .metadata = if (e.metadata.len > 0) try alloc.dupe(u8, e.metadata) else "",
-        };
+        edges[root_node_count + i] = try clonePathEdge(alloc, e);
+        initialized_edges += 1;
     }
 
-    var tw: f64 = 0.0;
-    for (edges) |e| tw += e.weight;
+    const tw = try sumPathEdgeWeights(edges);
 
     return Path{
         .nodes = nodes,

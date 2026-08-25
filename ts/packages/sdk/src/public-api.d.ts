@@ -3001,7 +3001,7 @@ export interface components {
              * @description Bounded resource exhausted by the operation.
              * @enum {string}
              */
-            dimension: "explored_nodes" | "explored_edges" | "explored_edge_bytes" | "intermediate_states";
+            dimension: "explored_nodes" | "explored_edges" | "explored_edge_bytes" | "scanned_anchors" | "intermediate_states";
             /**
              * Format: uint64
              * @description Configured request ceiling for the exhausted resource.
@@ -12077,7 +12077,7 @@ export interface components {
         };
         /** @description Return bindings or exact aggregates. Bindings and aggregates are mutually exclusive. */
         GraphReturn: components["schemas"]["GraphBindingsReturn"] | components["schemas"]["GraphAggregatesReturn"];
-        /** @description Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission. Exact distinct identity sets are also bounded and fail closed when their request-scoped memory budget is exhausted. */
+        /** @description Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages and charged to the request-wide `scanned_anchors` work dimension; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission. Exact distinct identity sets are also bounded and fail closed when their request-scoped memory budget is exhausted. */
         GraphMatchQuery: {
             index: string;
             match: components["schemas"]["GraphMatch"];

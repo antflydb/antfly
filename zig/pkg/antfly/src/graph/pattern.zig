@@ -36,6 +36,7 @@ pub const max_identifier_bytes: usize = max_identifier_codepoints * 4;
 pub const default_max_explored_nodes = work_budget_mod.default_max_explored_nodes;
 pub const default_max_explored_edges = work_budget_mod.default_max_explored_edges;
 pub const default_max_explored_edge_bytes = work_budget_mod.default_max_explored_edge_bytes;
+pub const default_max_scanned_anchors = work_budget_mod.default_max_scanned_anchors;
 pub const default_max_intermediate_states = work_budget_mod.default_max_intermediate_states;
 pub const default_max_distinct_identities: usize = 100_000;
 pub const default_max_distinct_identity_bytes: usize = 16 * 1024 * 1024;
@@ -214,13 +215,17 @@ pub const MatchOptions = struct {
     /// trusted execution metadata, not a query option: reached nodes always go
     /// through the normal admission and filter paths.
     start_validation: enum { required, prevalidated } = .required,
+    /// The caller already charged the physical source rows inspected while
+    /// producing `start_keys`. Used by runtimes that filter an in-memory source
+    /// relation before handing a page to the matcher.
+    anchors_precharged: bool = false,
     stats: ?*MatchStats = null,
     max_explored_nodes: usize = default_max_explored_nodes,
     max_explored_edges: usize = default_max_explored_edges,
     max_intermediate_states: usize = default_max_intermediate_states,
-    /// Optional request-scoped expansion budget shared by cursor pages. Source
-    /// anchors are storage-scan input, not graph expansion, and therefore do not
-    /// consume this budget; every reached node and examined edge still does.
+    /// Optional request-scoped work budget shared by cursor pages. Source rows,
+    /// reached nodes, and examined edges have independent dimensions so a cheap
+    /// anchor scan cannot consume the expansion allowance or run unbounded.
     work_budget: ?*WorkBudget = null,
     /// Optional request-scoped budget for the exact identity sets retained by
     /// count(distinct alias). The budget is shared across aggregate specs and
@@ -1472,6 +1477,7 @@ fn matchConjunctivePatternLimitedWithEdgeReader(
     if (!declaredNodeTableMatches(edge_reader, null, anchor_node.table)) return error.InvalidArgument;
     var local_work_budget = WorkBudget.init(opts.max_explored_nodes, opts.max_explored_edges);
     const work_budget = opts.work_budget orelse &local_work_budget;
+    if (!opts.anchors_precharged) try work_budget.consumeAnchors(start_keys.len);
     const admitted_starts = if (opts.start_validation == .required and opts.node_admission != null)
         try opts.node_admission.?.filterLocalKeysAlloc(alloc, start_keys)
     else
@@ -1538,6 +1544,7 @@ fn buildConjunctiveStates(
     const anchor_alias = anchor_node.alias;
     var local_work_budget = WorkBudget.init(opts.max_explored_nodes, opts.max_explored_edges);
     const work_budget: *WorkBudget = opts.work_budget orelse &local_work_budget;
+    if (!opts.anchors_precharged) try work_budget.consumeAnchors(start_keys.len);
 
     var current = std.ArrayListUnmanaged(ConjunctiveState).empty;
     errdefer freeConjunctiveStates(alloc, &current);
@@ -1767,6 +1774,7 @@ pub const ConjunctiveCountAggregateStream = struct {
         if (!declaredNodeTableMatches(edge_reader, null, anchor_node.table)) return error.InvalidArgument;
         var local_work_budget = WorkBudget.init(aggregate_opts.max_explored_nodes, aggregate_opts.max_explored_edges);
         const work_budget = aggregate_opts.work_budget orelse &local_work_budget;
+        if (!aggregate_opts.anchors_precharged) try work_budget.consumeAnchors(start_keys.len);
         const admitted_starts = if (aggregate_opts.start_validation == .required and aggregate_opts.node_admission != null)
             try aggregate_opts.node_admission.?.filterLocalKeysAlloc(alloc, start_keys)
         else
@@ -3114,6 +3122,42 @@ test "serverless paged conjunctive aggregate preserves exact state across anchor
     }
     try std.testing.expectEqual(@as(u128, 3), results[0].value);
     try std.testing.expectEqual(@as(u128, 3), results[1].value);
+}
+
+test "anchor-only aggregate fails closed at the shared anchor scan ceiling" {
+    const alloc = std.testing.allocator;
+    const Reader = struct {
+        pub fn getEdges(_: @This(), a: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return try a.alloc(graph_mod.Edge, 0);
+        }
+
+        pub fn freeEdges(_: @This(), _: Allocator, _: []graph_mod.Edge) void {}
+    };
+    const nodes = [_]MatchNode{.{ .alias = "anchor" }};
+    const pattern = ConjunctivePattern{
+        .anchor_alias = "anchor",
+        .nodes = &nodes,
+        .edges = &.{},
+    };
+    const specs = [_]CountAggregateSpec{.{}};
+    var distinct_budget = DistinctBudget.init(default_max_distinct_identities, default_max_distinct_identity_bytes);
+    var stream = try ConjunctiveCountAggregateStream.init(alloc, &specs, &distinct_budget);
+    defer stream.deinit(alloc);
+    var work_budget = WorkBudget.init(default_max_explored_nodes, default_max_explored_edges);
+    work_budget.max_anchors = 1;
+    work_budget.remaining_anchors = 1;
+
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        stream.consumePageWithEdgeReader(
+            alloc,
+            Reader{},
+            &.{ "a", "b" },
+            pattern,
+            .{ .start_validation = .prevalidated, .work_budget = &work_budget },
+        ),
+    );
+    try std.testing.expectEqual(work_budget_diagnostic.Dimension.scanned_anchors, work_budget.exhaustion().?.dimension);
 }
 
 test "conjunctive optional predicates reject aliases outside their ordered scope" {

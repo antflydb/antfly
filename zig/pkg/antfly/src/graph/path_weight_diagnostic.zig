@@ -27,7 +27,9 @@ pub fn take() ?Diagnostic {
 }
 
 pub fn isDomainError(err: anyerror) bool {
-    return err == error.GraphMinWeightDomainViolation or err == error.GraphMaxWeightDomainViolation;
+    return err == error.GraphMinWeightDomainViolation or
+        err == error.GraphMaxWeightDomainViolation or
+        err == error.GraphPathWeightOverflow;
 }
 
 pub fn record(operation: []const u8, err: anyerror) void {
@@ -36,9 +38,29 @@ pub fn record(operation: []const u8, err: anyerror) void {
         return;
     }
     @memcpy(operation_buf[0..operation.len], operation);
+    const mode: []const u8 = if (err == error.GraphMinWeightDomainViolation)
+        "min_weight"
+    else if (err == error.GraphMaxWeightDomainViolation)
+        "max_weight"
+    else
+        "weight_sum";
+    const allowed_range: []const u8 = if (err == error.GraphMinWeightDomainViolation)
+        "[0,+inf) with a finite path sum"
+    else if (err == error.GraphMaxWeightDomainViolation)
+        "[0,1]"
+    else
+        "finite f64";
     last_diagnostic = .{
         .operation = operation_buf[0..operation.len],
-        .mode = if (err == error.GraphMinWeightDomainViolation) "min_weight" else "max_weight",
-        .allowed_range = if (err == error.GraphMinWeightDomainViolation) "[0,+inf)" else "[0,1]",
+        .mode = mode,
+        .allowed_range = allowed_range,
     };
+}
+
+test "path weight overflow has a stable public diagnostic" {
+    record("route", error.GraphPathWeightOverflow);
+    const diagnostic = take().?;
+    try std.testing.expectEqualStrings("route", diagnostic.operation);
+    try std.testing.expectEqualStrings("weight_sum", diagnostic.mode);
+    try std.testing.expectEqualStrings("finite f64", diagnostic.allowed_range);
 }

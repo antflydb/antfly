@@ -4748,7 +4748,7 @@ fn pathStateToGraphPath(
         .nodes = nodes,
         .node_tables = node_tables,
         .edges = edges,
-        .total_weight = path_states[path_state_id].distance,
+        .total_weight = try graph_paths_mod.sumPathEdgeWeights(edges),
         .length = @intCast(edges.len),
     };
 }
@@ -5012,7 +5012,7 @@ fn joinDistributedPaths(
         .nodes = nodes,
         .node_tables = node_tables,
         .edges = edges,
-        .total_weight = computeGraphPathScore(root_edges, spur_path.edges),
+        .total_weight = try computeGraphPathWeightSum(root_edges, spur_path.edges),
         .length = @intCast(edge_count),
     };
 }
@@ -5050,14 +5050,40 @@ fn graphPathScore(path: db_mod.types.GraphPath, mode: graph_paths_mod.PathWeight
     };
 }
 
-fn computeGraphPathScore(
+fn computeGraphPathWeightSum(
     root_edges: []const graph_paths_mod.PathEdge,
     spur_edges: []const graph_paths_mod.PathEdge,
-) f64 {
-    var total: f64 = 0;
-    for (root_edges) |edge| total += edge.weight;
-    for (spur_edges) |edge| total += edge.weight;
+) !f64 {
+    var total = try graph_paths_mod.sumPathEdgeWeights(root_edges);
+    for (spur_edges) |edge| {
+        total += edge.weight;
+        if (!std.math.isFinite(total)) return error.GraphPathWeightOverflow;
+    }
     return total;
+}
+
+test "distributed canonical path weight is the checked raw edge sum" {
+    const root = [_]graph_paths_mod.PathEdge{.{
+        .source = "a",
+        .target = "b",
+        .edge_type = "e",
+        .weight = 2.0,
+    }};
+    const spur = [_]graph_paths_mod.PathEdge{.{
+        .source = "b",
+        .target = "c",
+        .edge_type = "e",
+        .weight = 3.0,
+    }};
+    try std.testing.expectEqual(@as(f64, 5.0), try computeGraphPathWeightSum(&root, &spur));
+
+    const overflow = [_]graph_paths_mod.PathEdge{.{
+        .source = "b",
+        .target = "c",
+        .edge_type = "e",
+        .weight = std.math.floatMax(f64),
+    }};
+    try std.testing.expectError(error.GraphPathWeightOverflow, computeGraphPathWeightSum(&overflow, &overflow));
 }
 
 fn allocEdgeExclusionKey(

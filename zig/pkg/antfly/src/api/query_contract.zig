@@ -20,6 +20,7 @@ const document_query = @import("../storage/db/document_query.zig");
 const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
+const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const graph_mod = @import("../graph/graph.zig");
 const graph_node_identity = @import("../graph/node_identity.zig");
@@ -5298,13 +5299,19 @@ fn buildGraphQueryResults(
     for (result.graph_results) |graph_result| {
         const graph_query = findGraphQuery(req.graph_queries, graph_result.name) orelse
             return error.InvalidRemoteResponse;
-        try out.map.put(alloc, graph_result.name, try toOpenApiGraphQueryResultWithFormat(
+        const converted = toOpenApiGraphQueryResultWithFormat(
             alloc,
             graph_query.query,
             meta,
             graph_result,
             graph_query.response_format,
-        ));
+        ) catch |err| {
+            if (graph_path_weight_diagnostic.isDomainError(err)) {
+                graph_path_weight_diagnostic.record(graph_query.name, err);
+            }
+            return err;
+        };
+        try out.map.put(alloc, graph_result.name, converted);
     }
     return out;
 }
@@ -5992,6 +5999,19 @@ fn toOpenApiGraphPaths(
         if (path.node_tables.len != 0 and path.node_tables.len != path.nodes.len) {
             return error.InvalidRemoteResponse;
         }
+        const weight_sum = try graph_paths_mod.sumPathEdgeWeights(path.edges);
+        const objective_value: f64 = switch (weight_mode) {
+            .min_hops => @floatFromInt(path.length),
+            .min_weight => weight_sum,
+            .max_weight => blk: {
+                var product: f64 = 1.0;
+                for (path.edges) |edge| {
+                    product *= edge.weight;
+                    if (!std.math.isFinite(product)) return error.GraphPathWeightOverflow;
+                }
+                break :blk product;
+            },
+        };
         const nodes = try alloc.alloc(indexes_openapi.GraphPathEndpoint, path.nodes.len);
         for (path.nodes, 0..) |key, node_index| {
             nodes[node_index] = .{
@@ -6013,8 +6033,8 @@ fn toOpenApiGraphPaths(
                 .min_weight => .min_weight,
                 .max_weight => .max_weight,
             },
-            .weight_sum = path.total_weight,
-            .objective_value = graphPathObjectiveValue(path, weight_mode),
+            .weight_sum = weight_sum,
+            .objective_value = objective_value,
         };
     }
     return out;

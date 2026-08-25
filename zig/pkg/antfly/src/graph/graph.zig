@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
+const edge_weight = @import("edge_weight.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
 const docstore = @import("../storage/docstore.zig");
@@ -137,6 +138,7 @@ pub fn encodeEdgeValueAlloc(
     updated_at: u64,
     metadata: []const u8,
 ) ![]u8 {
+    try edge_weight.validateStored(weight);
     const encoded_len = std.math.add(usize, edge_value_header_len, metadata.len) catch
         return error.EdgeMetadataTooLarge;
     const buf = try alloc.alloc(u8, encoded_len);
@@ -154,6 +156,7 @@ pub fn decodeEdgeValue(data: []const u8) !DecodedEdgeValue {
     if (data.len < edge_value_header_len) return error.InvalidGraphEdgeValue;
     const weight_bits = std.mem.readInt(u64, data[0..8], .little);
     const weight: f64 = @bitCast(weight_bits);
+    if (!edge_weight.isStoredValid(weight)) return error.InvalidGraphEdgeValue;
     const created_at = std.mem.readInt(u64, data[8..16], .little);
     const updated_at = std.mem.readInt(u64, data[16..24], .little);
     const metadata = data[edge_value_header_len..];
@@ -970,6 +973,10 @@ pub const GraphIndex = struct {
 
     pub fn batchApply(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete) !void {
         if (writes.len == 0 and deletes.len == 0) return;
+
+        // Validate the complete batch before opening either physical write
+        // batch, so an invalid weight cannot partially mutate one direction.
+        for (writes) |write| try edge_weight.validateStored(write.weight);
 
         try self.validateTreeBatchWrites(writes, deletes);
 
@@ -2216,6 +2223,16 @@ test "graph edge encoding round-trip" {
     try std.testing.expectEqual(@as(u64, 1234567890), decoded.created_at);
     try std.testing.expectEqual(@as(u64, 1234567891), decoded.updated_at);
     try std.testing.expectEqualStrings("{\"key\":\"val\"}", decoded.metadata);
+
+    try std.testing.expectError(
+        error.InvalidGraphEdges,
+        encodeEdgeValueAlloc(std.testing.allocator, -0.1, 0, 0, ""),
+    );
+    const invalid = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(invalid);
+    const invalid_bits: u64 = @bitCast(std.math.inf(f64));
+    std.mem.writeInt(u64, invalid[0..8], invalid_bits, .little);
+    try std.testing.expectError(error.InvalidGraphEdgeValue, decodeEdgeValue(invalid));
 }
 
 test "graph edge values support large metadata and reject truncated records" {
