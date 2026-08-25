@@ -384,22 +384,14 @@ fn normalizeIndexConfigJson(
         var it = object.map.iterator();
         while (it.next()) |entry| {
             if (!options.include_name and std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
-            if (canonicalize_single_graph_source and
-                (std.mem.eql(u8, entry.key_ptr.*, "source") or
-                    std.mem.eql(u8, entry.key_ptr.*, "nodes") or
-                    std.mem.eql(u8, entry.key_ptr.*, "edge") or
-                    std.mem.eql(u8, entry.key_ptr.*, "context"))) continue;
+            if (canonicalize_single_graph_source and std.mem.eql(u8, entry.key_ptr.*, "source")) continue;
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     } else {
         var it = object.iterator();
         while (it.next()) |entry| {
             if (!options.include_name and std.mem.eql(u8, entry.key_ptr.*, "name")) continue;
-            if (canonicalize_single_graph_source and
-                (std.mem.eql(u8, entry.key_ptr.*, "source") or
-                    std.mem.eql(u8, entry.key_ptr.*, "nodes") or
-                    std.mem.eql(u8, entry.key_ptr.*, "edge") or
-                    std.mem.eql(u8, entry.key_ptr.*, "context"))) continue;
+            if (canonicalize_single_graph_source and std.mem.eql(u8, entry.key_ptr.*, "source")) continue;
             try appendField(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, &first);
         }
     }
@@ -431,15 +423,6 @@ fn appendCanonicalSingleGraphSourcesField(
         try appendField(alloc, out, entry.key_ptr.*, entry.value_ptr.*, &first_source_field);
     }
 
-    const mappings = [_][]const u8{ "nodes", "edge", "context" };
-    for (mappings) |mapping| {
-        if (source_value.object.get(mapping)) |value| {
-            if (value != .null) continue;
-        }
-        const value = indexObjectGet(object, mapping) orelse continue;
-        if (value == .null) continue;
-        try appendField(alloc, out, mapping, value, &first_source_field);
-    }
     try out.appendSlice(alloc, "}]");
 }
 
@@ -493,31 +476,12 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
         if (value != .null) try validatePublicCreatedShape(value, .graph_source);
     }
 
-    const graph_mappings = [_][]const u8{ "nodes", "edge", "context" };
-    if (sources) |value| {
-        if (value != .null) for (graph_mappings) |mapping| {
-            const root_value = indexObjectGet(object, mapping) orelse continue;
-            if (root_value != .null) return error.InvalidCreateIndexRequest;
-        };
-    }
-    if (source) |source_value| {
-        if (source_value == .object) for (graph_mappings) |mapping| {
-            const nested_value = source_value.object.get(mapping) orelse continue;
-            if (nested_value == .null) continue;
-            const root_value = indexObjectGet(object, mapping) orelse continue;
-            if (root_value != .null) return error.InvalidCreateIndexRequest;
-        };
-    }
-
     const artifact = if (@hasField(Object, "map")) object.map.get("artifact") else object.get("artifact");
     if (artifact) |value| {
         if (value != .null) try validatePublicGraphArtifact(value);
     }
 
     const graph_shapes = .{
-        .{ "nodes", public_index_contract.CreatedObjectShape.graph_nodes },
-        .{ "edge", public_index_contract.CreatedObjectShape.graph_edge },
-        .{ "context", public_index_contract.CreatedObjectShape.graph_context },
         .{ "algebraic_planning", public_index_contract.CreatedObjectShape.graph_algebraic_planning },
     };
     inline for (graph_shapes) |field_shape| {
@@ -1209,6 +1173,12 @@ test "table contract rejects unknown fields in closed nested index objects" {
         ,
         \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_limit":{"client_value":"private"}}]}
         ,
+        \\{"type":"graph","nodes":{"model":"document"}}
+        ,
+        \\{"type":"graph","edge":{"type":"mentions"}}
+        ,
+        \\{"type":"graph","context":{"doc_fields":["title"]}}
+        ,
         \\{"type":"graph","nodes":{"model":"document","client_value":"private"}}
         ,
         \\{"type":"graph","nodes":{"model":"unsupported"}}
@@ -1252,7 +1222,7 @@ test "table contract treats nullable nested index fields as omitted" {
     const config_json = try parseCreateIndexRequest(
         std.testing.allocator,
         "relations_graph",
-        "{\"type\":\"graph\",\"source\":null,\"artifact\":null,\"nodes\":null,\"edge\":null,\"context\":null,\"algebraic_planning\":null,\"edge_types\":null,\"resolvers\":null}",
+        "{\"type\":\"graph\",\"source\":null,\"artifact\":null,\"algebraic_planning\":null,\"edge_types\":null,\"resolvers\":null}",
     );
     defer std.testing.allocator.free(config_json);
     try ant_json.testing.expectEqualJsonText(
@@ -1386,6 +1356,7 @@ test "table contract preserves artifact-backed public full text indexes" {
         "{\"type\":\"full_text\",\"field\":\"text\",\"artifact_name\":\"document_chunks_v1\",\"enrichments\":[{\"name\":\"document_units_v1\",\"kind\":\"asset\",\"field\":\"url\",\"content_type\":\"application/json\",\"producer_json\":\"{\\\"type\\\":\\\"document_extraction\\\",\\\"config\\\":{}}\"},{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"source_artifact_name\":\"document_units_v1\",\"field\":\"text\",\"chunk_size\":512,\"chunk_overlap\":50}]}";
     const config_json = try parseCreateIndexRequest(std.testing.allocator, "document_text", artifact_index);
     defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"field\":\"text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"artifact_name\":\"document_chunks_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"enrichments\"") != null);
 
@@ -1396,6 +1367,20 @@ test "table contract preserves artifact-backed public full text indexes" {
     defer table_req.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, table_req.indexes_json.?, "\"document_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, table_req.indexes_json.?, "\"artifact_name\":\"document_chunks_v1\"") != null);
+
+    const multi_source = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_text_union",
+        "{\"type\":\"full_text\",\"field\":\"text\",\"sources\":[{\"artifact\":\"title_chunks_v1\"},{\"artifact\":\"body_chunks_v1\"}]}",
+    );
+    defer std.testing.allocator.free(multi_source);
+    try std.testing.expect(std.mem.indexOf(u8, multi_source, "\"field\":\"text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, multi_source, "\"sources\":[") != null);
+
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(std.testing.allocator, "empty_field", "{\"type\":\"full_text\",\"field\":\"\"}"),
+    );
 
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,

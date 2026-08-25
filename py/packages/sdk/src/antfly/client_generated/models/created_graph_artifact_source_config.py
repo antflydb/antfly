@@ -19,7 +19,7 @@ T = TypeVar("T", bound="CreatedGraphArtifactSourceConfig")
 
 @_attrs_define
 class CreatedGraphArtifactSourceConfig:
-    """Canonical artifact stream materialized into graph edges. Request-only compatibility discriminators are omitted.
+    """Canonical artifact stream materialized into graph edges.
 
     Attributes:
         artifact (str):

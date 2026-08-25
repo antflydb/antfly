@@ -392,4 +392,24 @@ func TestNewArtifactFullTextIndexConfig(t *testing.T) {
 	if body["name"] != "document_text" || len(body["sources"].([]any)) != 2 {
 		t.Fatalf("multi-source full-text config lost members: %s", data)
 	}
+
+	configured, err := NewArtifactFullTextIndexConfigWithOptions(
+		"document_text",
+		ArtifactFullTextIndexOptions{Field: " text ", MemOnly: true},
+		"document_text_v1",
+		"document_chunks_v1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = json.Marshal(configured)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["field"] != "text" || body["mem_only"] != true {
+		t.Fatalf("artifact full-text options were not preserved: %s", data)
+	}
 }

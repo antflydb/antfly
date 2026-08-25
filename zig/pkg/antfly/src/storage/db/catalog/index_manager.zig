@@ -368,7 +368,13 @@ const PhaseTrackingAllocator = struct {
 const TextMergeBudgetAllocator = struct {
     backing: Allocator,
     reservation: ?resource_manager_mod.Reservation,
+    /// All bytes competing inside the reservation, including persistent
+    /// publication work temporarily charged through `chargeExternal`.
     live_bytes: std.atomic.Value(usize) = .init(0),
+    /// Task-owned allocations only. Keep this separate from `live_bytes` so
+    /// operational peak telemetry is not inflated by estimated external work.
+    task_live_bytes: std.atomic.Value(usize) = .init(0),
+    peak_task_live_bytes: std.atomic.Value(usize) = .init(0),
     budget_denied: std.atomic.Value(bool) = .init(false),
 
     fn init(backing: Allocator, reservation: ?resource_manager_mod.Reservation) TextMergeBudgetAllocator {
@@ -379,6 +385,8 @@ const TextMergeBudgetAllocator = struct {
     }
 
     fn deinit(self: *TextMergeBudgetAllocator) void {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        std.debug.assert(self.task_live_bytes.load(.acquire) == 0);
         if (self.reservation) |*reservation| reservation.release();
         self.* = undefined;
     }
@@ -399,6 +407,20 @@ const TextMergeBudgetAllocator = struct {
         return self.budget_denied.load(.acquire);
     }
 
+    /// Task-owned and externally charged bytes live inside the admitted merge
+    /// reservation. This is the enforcement ledger, not task telemetry.
+    fn liveBytes(self: *const TextMergeBudgetAllocator) usize {
+        return self.live_bytes.load(.acquire);
+    }
+
+    fn taskLiveBytes(self: *const TextMergeBudgetAllocator) usize {
+        return self.task_live_bytes.load(.acquire);
+    }
+
+    fn peakTaskLiveBytes(self: *const TextMergeBudgetAllocator) usize {
+        return self.peak_task_live_bytes.load(.acquire);
+    }
+
     /// Account allocations which must be owned by the persistent index's
     /// allocator (and therefore cannot safely retain this task-local allocator
     /// after publication). The charge remains live across the external work so
@@ -410,12 +432,15 @@ const TextMergeBudgetAllocator = struct {
     }
 
     fn releaseExternal(self: *TextMergeBudgetAllocator, bytes: usize) void {
-        self.releaseBytes(bytes);
+        self.releaseReservedBytes(bytes);
     }
 
     fn reserveGrowth(self: *TextMergeBudgetAllocator, bytes: usize) bool {
-        if (bytes == 0 or self.reservation == null) return true;
-        const limit = std.math.cast(usize, self.reservation.?.bytes) orelse std.math.maxInt(usize);
+        if (bytes == 0) return true;
+        const limit = if (self.reservation) |reservation|
+            std.math.cast(usize, reservation.bytes) orelse std.math.maxInt(usize)
+        else
+            std.math.maxInt(usize);
         var live = self.live_bytes.load(.acquire);
         while (true) {
             if (bytes > limit -| live) {
@@ -426,49 +451,73 @@ const TextMergeBudgetAllocator = struct {
         }
     }
 
-    fn releaseBytes(self: *TextMergeBudgetAllocator, bytes: usize) void {
-        if (bytes == 0 or self.reservation == null) return;
+    fn releaseReservedBytes(self: *TextMergeBudgetAllocator, bytes: usize) void {
+        if (bytes == 0) return;
         const previous = self.live_bytes.fetchSub(bytes, .acq_rel);
         std.debug.assert(previous >= bytes);
     }
 
+    fn noteTaskGrowth(self: *TextMergeBudgetAllocator, bytes: usize) void {
+        if (bytes == 0) return;
+        const previous = self.task_live_bytes.fetchAdd(bytes, .acq_rel);
+        const current = previous + bytes;
+        var peak = self.peak_task_live_bytes.load(.acquire);
+        while (current > peak) {
+            peak = self.peak_task_live_bytes.cmpxchgWeak(peak, current, .acq_rel, .acquire) orelse return;
+        }
+    }
+
+    fn reserveTaskGrowth(self: *TextMergeBudgetAllocator, bytes: usize) bool {
+        if (!self.reserveGrowth(bytes)) return false;
+        self.noteTaskGrowth(bytes);
+        return true;
+    }
+
+    fn releaseTaskBytes(self: *TextMergeBudgetAllocator, bytes: usize) void {
+        if (bytes == 0) return;
+        const previous = self.task_live_bytes.fetchSub(bytes, .acq_rel);
+        std.debug.assert(previous >= bytes);
+        self.releaseReservedBytes(bytes);
+    }
+
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
-        if (!self.reserveGrowth(len)) return null;
-        return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
-            self.releaseBytes(len);
+        if (!self.reserveTaskGrowth(len)) return null;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+            self.releaseTaskBytes(len);
             return null;
         };
+        return ptr;
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) return false;
+        if (growth > 0 and !self.reserveTaskGrowth(growth)) return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) {
-            if (growth > 0) self.releaseBytes(growth);
+            if (growth > 0) self.releaseTaskBytes(growth);
             return false;
         }
-        if (new_len < memory.len) self.releaseBytes(memory.len - new_len);
+        if (new_len < memory.len) self.releaseTaskBytes(memory.len - new_len);
         return true;
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) return null;
+        if (growth > 0 and !self.reserveTaskGrowth(growth)) return null;
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
-            if (growth > 0) self.releaseBytes(growth);
+            if (growth > 0) self.releaseTaskBytes(growth);
             return null;
         };
-        if (new_len < memory.len) self.releaseBytes(memory.len - new_len);
+        if (new_len < memory.len) self.releaseTaskBytes(memory.len - new_len);
         return ptr;
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
         self.backing.rawFree(memory, alignment, ret_addr);
-        self.releaseBytes(memory.len);
+        self.releaseTaskBytes(memory.len);
     }
 };
 
@@ -499,6 +548,33 @@ test "text merge bounded task allocator enforces live reservation" {
     alloc.free(second);
     try std.testing.expectEqual(@as(usize, 40), stats.current_bytes);
     try std.testing.expectEqual(@as(usize, 64), stats.peak_bytes);
+}
+
+test "text merge task allocator tracks live and external bytes without reservation" {
+    var budget = TextMergeBudgetAllocator.init(std.testing.allocator, null);
+    defer budget.deinit();
+    const alloc = budget.allocator();
+
+    const task_bytes = try alloc.alloc(u8, 128);
+    defer alloc.free(task_bytes);
+    try std.testing.expectEqual(@as(usize, 128), budget.liveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.peakTaskLiveBytes());
+
+    const external_charge = try budget.chargeExternal(64);
+    try std.testing.expectEqual(@as(usize, 192), budget.liveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.peakTaskLiveBytes());
+
+    budget.releaseExternal(external_charge);
+    try std.testing.expectEqual(@as(usize, 128), budget.liveBytes());
+
+    const transient = try alloc.alloc(u8, 256);
+    try std.testing.expectEqual(@as(usize, 384), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 384), budget.peakTaskLiveBytes());
+    alloc.free(transient);
+    try std.testing.expectEqual(@as(usize, 128), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 384), budget.peakTaskLiveBytes());
 }
 
 pub const TextMemoryAttributionStats = struct {
@@ -1499,18 +1575,17 @@ pub const IndexManager = struct {
         prepared_owner: ?*persistent_mod.PersistentIndex = null,
         output_ordinals: []OrdinalSlot = &.{},
         output_ids: []IdSlot = &.{},
-        /// Stable allocator behind the build-scoped tracking wrapper. Result
-        /// storage must be released before the owning merge task is destroyed.
+        publication_lookup_built: bool = false,
+        /// Stable task allocator. Result storage must be released before the
+        /// owning merge task is destroyed.
         owned_alloc: ?Allocator = null,
         elapsed_ns: u64 = 0,
-        /// Peak bytes allocated through the merge task allocator. File-backed
-        /// and heap-backed builders both run through this allocator.
+        /// Exact high-water mark of task-owned bytes from task creation through
+        /// publication. Persistent publication charges are excluded.
         peak_task_alloc_bytes: u64 = 0,
 
-        // Lookup storage is allocated through the task's tracking wrapper.
-        // That wrapper delegates raw allocations unchanged to the backing
-        // allocator, so detached result ownership is released through `alloc`
-        // in deinit after the stack-scoped tracker has recorded its peak.
+        // Lookup storage uses the stable task allocator because it survives
+        // the off-lock preparation phase until atomic publication.
         fn buildPublicationLookup(self: *TextMergeResult, alloc: Allocator) !void {
             const output_count = if (self.prepared_segments.len > 0) self.prepared_segments.len else self.segments.len;
             var ordinal_count: usize = 0;
@@ -1564,6 +1639,7 @@ pub const IndexManager = struct {
             }
             self.output_ordinals = ordinals;
             self.output_ids = ids;
+            self.publication_lookup_built = true;
         }
 
         fn outputForOrdinal(self: *const TextMergeResult, identity: u32) ?OutputLocation {
@@ -9362,7 +9438,17 @@ pub const IndexManager = struct {
                 else => return err,
             };
             defer result.deinit(self.alloc);
-            _ = try self.finishTextMergeTask(&task, &result);
+            while (true) {
+                _ = self.finishTextMergeTask(&task, &result) catch |err| {
+                    if (err != error.TextMergePublicationLookupRequired) return err;
+                    // This synchronous scheduler does not acquire the runtime's
+                    // database-wide apply lock. Prepare outside IndexManager's
+                    // short per-index publication critical section and retry.
+                    try prepareTextMergeTaskPublicationLookup(&task, &result);
+                    continue;
+                };
+                break;
+            }
             completed += 1;
         }
         return completed;
@@ -12070,11 +12156,9 @@ pub const IndexManager = struct {
         const started_ns = platform_time.monotonicNs();
         defer task.discardSourceCleanPages();
         logTextMergeTaskMemory("before", task, 0);
-        var alloc_stats = PhaseAllocStats{};
-        var tracking = PhaseTrackingAllocator.init(task.mergeAllocator(), &alloc_stats);
-        const task_alloc = tracking.allocator();
+        const task_alloc = task.mergeAllocator();
         const deleted_docs = task_alloc.alloc(?roaring.RoaringBitmap, task.source.len) catch |err| {
-            if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+            if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
         defer task_alloc.free(deleted_docs);
@@ -12097,23 +12181,19 @@ pub const IndexManager = struct {
                 .prepared_owner = task.persistent,
                 .owned_alloc = task.mergeAllocator(),
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
             };
             errdefer result.deinit(alloc);
-            result.buildPublicationLookup(task_alloc) catch |err| {
-                if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-                return err;
-            };
-            result.peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes);
             return result;
         } else |err| switch (err) {
             error.EmptySegment => return .{
                 .segments = &.{},
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
             },
             error.Unsupported => {},
             else => {
-                if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+                if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
                 if (builtin.os.tag != .freestanding) {
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
                 }
@@ -12121,14 +12201,14 @@ pub const IndexManager = struct {
             },
         }
 
-        const merged = merger_mod.mergeSegmentsBounded(tracking.allocator(), task.snapshot, task.merge_indices, .{
+        const merged = merger_mod.mergeSegmentsBounded(task_alloc, task.snapshot, task.merge_indices, .{
             .target_segment_bytes = @intCast(activeTextMergePolicy().max_segment_size),
             .deleted_docs = deleted_docs,
         }) catch |err| {
-            if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+            if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
             if (err == error.EmptySegment) return .{
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
             };
             if (builtin.os.tag != .freestanding) {
                 std.log.err("scheduled text merge failed index={s}: {s}", .{ task.index_name, @errorName(err) });
@@ -12142,15 +12222,25 @@ pub const IndexManager = struct {
             .segments = merged,
             .owned_alloc = task.mergeAllocator(),
             .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-            .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+            .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
         };
         errdefer result.deinit(alloc);
-        result.buildPublicationLookup(task_alloc) catch |err| {
-            if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        };
-        result.peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes);
         return result;
+    }
+
+    /// Build the document-identity lookup required to reconcile deletions
+    /// which commit after the merge snapshot. The runtime calls this only
+    /// after publication reports that a lookup is necessary, and crucially
+    /// does so without holding the database-wide apply lock.
+    pub fn prepareTextMergeTaskPublicationLookup(task: *const TextMergeTask, result: *TextMergeResult) !void {
+        if (result.publication_lookup_built) return;
+        result.buildPublicationLookup(task.mergeAllocator()) catch |err| {
+            return task.deletion_state.allocationError(err);
+        };
+        result.peak_task_alloc_bytes = @max(
+            result.peak_task_alloc_bytes,
+            @as(u64, @intCast(task.deletion_state.budget.peakTaskLiveBytes())),
+        );
     }
 
     fn logTextMergeTaskMemory(label: []const u8, task: *const TextMergeTask, output_bytes: u64) void {
@@ -12175,7 +12265,8 @@ pub const IndexManager = struct {
     }
 
     pub fn finishTextMergeTask(self: *IndexManager, task: *const TextMergeTask, result: *TextMergeResult) !bool {
-        defer self.completeTextMergeTaskTracking(task);
+        var retire_task = true;
+        defer if (retire_task) self.completeTextMergeTaskTracking(task);
 
         const entry = self.textIndexEntry(task.index_name) orelse return false;
         if (!self.text_merge_scheduler.taskInFlight(task.index_name, task.source, task.deletion_state)) {
@@ -12206,6 +12297,19 @@ pub const IndexManager = struct {
         }
         var merge_delta_locked = true;
         defer if (merge_delta_locked) entry.merge_delta_mutex.unlock();
+        var has_deletion_deltas = false;
+        for (task.deletion_state.deltas) |delta| {
+            if (delta.count == 0) continue;
+            has_deletion_deltas = true;
+            break;
+        }
+        if (has_deletion_deltas and !result.publication_lookup_built) {
+            // Do not scan the entire merge output while the caller holds the
+            // database-wide apply lock. Preserve task registration so the
+            // runtime can prepare the lookup off-lock and retry publication.
+            retire_task = false;
+            return error.TextMergePublicationLookupRequired;
+        }
         const publication_external_bytes = estimateTextMergePublicationExternalBytes(entry, task, result) catch |err| {
             return task.deletion_state.allocationError(err);
         };
@@ -12476,9 +12580,9 @@ pub const IndexManager = struct {
             // oversized exception would account the estimate without actually
             // bounding the live working set.
             .strict => try manager.reserve(.text_merge_buffers, reservation_bytes),
-            // Scheduled tasks execute through PhaseTrackingAllocator. Permit
-            // one task up to 2x the normal hard limit: ResourceManager keeps it
-            // exclusive and the task allocator enforces the same live cap.
+            // Permit one scheduled task up to 2x the normal hard limit:
+            // ResourceManager keeps it exclusive and the task's shared budget
+            // allocator enforces the same live cap through publication.
             .bounded_task => try manager.reserveBoundedOversizedSingle(.text_merge_buffers, reservation_bytes, 2),
         };
     }
@@ -12626,15 +12730,15 @@ pub const IndexManager = struct {
         const layout = seg.layoutStats(false);
 
         // Merge working memory is driven by doc renumbering, the largest term
-        // accumulator, compact dictionary/value builders, and the publication
-        // identity table. File-backed output streams separately; heap-backed
-        // output adds its serialized source-sized envelope at the caller.
-        // Keep generous capacity/headroom factors here and enforce the
-        // reservation with the bounded task allocator.
-        // Include the fixed-capacity publication identity table. Ordinal-backed
-        // documents use 32 bytes at the table's <= 50% load factor; retain more
-        // headroom for the less common string-identity fallback.
-        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 224 else 160;
+        // accumulator, and compact dictionary/value builders. File-backed
+        // output streams separately; heap-backed output adds its serialized
+        // source-sized envelope at the caller. The publication identity table
+        // is no longer part of the normal reservation: append-only publication
+        // does not build it, while a rare concurrent-delete publication may
+        // fail its lazy allocation and safely retry the merge. Charging that
+        // O(live documents) table here recreated a hard admission ceiling even
+        // after its eager allocation was removed from execution.
+        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 128 else 64;
         var bytes = try std.math.mul(u64, seg.reader.doc_count, per_doc_bytes);
         bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_term_dict_bytes, 3));
         bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_bloom_bytes, 3));
@@ -12664,7 +12768,7 @@ pub const IndexManager = struct {
     fn textMergePublicationDeletes(
         entry: *TextIndex,
         task: *const TextMergeTask,
-        result: *const TextMergeResult,
+        result: *TextMergeResult,
         deletion_deltas: []const TextMergeDeletionDelta,
     ) !TextMergePublicationDeletes {
         if (deletion_deltas.len != task.source.len) return error.InvalidDeletionSnapshot;
@@ -12677,6 +12781,15 @@ pub const IndexManager = struct {
                 if (maybe_deleted.*) |*deleted| deleted.deinit();
             }
             publication_alloc.free(output_deleted);
+        }
+
+        // Publication requested the O(live documents) lookup only when a
+        // delete raced the unlocked build, and the runtime prepared it without
+        // holding the database-wide apply lock.
+        for (deletion_deltas) |delta| {
+            if (delta.count == 0) continue;
+            std.debug.assert(result.publication_lookup_built);
+            break;
         }
 
         const snap = entry.persistent.acquireSnapshot();
@@ -12710,6 +12823,14 @@ pub const IndexManager = struct {
                 try output_deleted[output_idx].?.add(output.doc);
             }
         }
+
+        // The shared allocator high-water mark includes task creation, merge
+        // build, the off-lock lookup, and publication bitmaps while excluding
+        // persistent publication charges by construction.
+        result.peak_task_alloc_bytes = @max(
+            result.peak_task_alloc_bytes,
+            @as(u64, @intCast(task.deletion_state.budget.peakTaskLiveBytes())),
+        );
 
         return .{
             .source_current = true,
@@ -19518,6 +19639,8 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
     if (root.object.get("execution") != null) return error.InvalidIndexConfig;
+    if (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null)
+        return error.InvalidIndexConfig;
     if (root.object.get("sources") != null and root.object.get("source") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
     const artifact_sources: []GraphArtifactSource = if (root.object.get("sources") != null)
@@ -19534,6 +19657,13 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     errdefer if (shorthand_asset) |*asset| {
         asset.deinit(alloc);
     };
+    if (shorthand_asset) |asset| {
+        if (artifact_sources.len != 1 or
+            !std.mem.eql(u8, asset.name, artifact_sources[0].artifact_name))
+        {
+            return error.InvalidIndexConfig;
+        }
+    }
 
     const edge_types = root.object.get("edge_types") orelse {
         return .{
@@ -19989,13 +20119,23 @@ test "graph shorthand asset uses artifact execution only" {
 test "graph shorthand asset maps template source without field ambiguity" {
     const alloc = std.testing.allocator;
     var cfg = try parseGraphConfig(alloc,
-        \\{"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ title }} {{ body }}"}}}
+        \\{"source":{"artifact":"relations_v1"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ title }} {{ body }}"}}}
     );
     defer cfg.deinit(alloc);
 
     const asset = cfg.shorthand_asset orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("", asset.source_field);
     try std.testing.expectEqualStrings("{{ title }} {{ body }}", asset.source_template);
+}
+
+test "graph shorthand asset requires exactly one matching consumer" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"body"}}}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"artifact":"other_v1"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"body"}}}
+    ));
 }
 
 test "graph config parses artifact mapping templates and context fields" {
@@ -27774,6 +27914,21 @@ test "text merge task carries concurrent deletes into publication" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_limit_bytes = 64 * 1024 * 1024,
+        .hard_limit_bytes = 64 * 1024 * 1024,
+    };
+    var policies = resource_manager_mod.Options.defaultPolicies();
+    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_action = .report,
+        .hard_action = .report,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .budgets = budgets,
+        .policies = policies,
+    });
+
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     const path_z = try alloc.dupeZ(u8, path);
@@ -27782,7 +27937,9 @@ test "text merge task carries concurrent deletes into publication" {
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
 
-    var manager = try IndexManager.init(alloc, path);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .resource_manager = &resource_manager,
+    });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });
 
@@ -27860,6 +28017,8 @@ test "text merge task carries concurrent deletes into publication" {
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
     var merged_docs: u32 = 0;
     for (result.prepared_segments) |*prepared| {
         var reader = try segment_mod.SegmentReader.init(alloc, prepared.data.bytes());
@@ -27875,8 +28034,33 @@ test "text merge task carries concurrent deletes into publication" {
     // the later tombstone into the replacement rather than reject the useful
     // merge and retry forever under sustained mutation.
     try std.testing.expectEqual(frozen_live_docs, merged_docs);
+    // Keep a known task-local allocation live across publication. The peak
+    // must include this existing working set plus the lazy identity lookup,
+    // rather than treating build and publication as disjoint phases.
+    const build_peak = result.peak_task_alloc_bytes;
+    const telemetry_probe_len = std.math.cast(usize, build_peak +| 4096) orelse
+        return error.TestUnexpectedResult;
+    const telemetry_probe = try task.mergeAllocator().alloc(u8, telemetry_probe_len);
+    defer task.mergeAllocator().free(telemetry_probe);
+    const publication_task_live_bytes = task.deletion_state.budget.liveBytes();
+    try std.testing.expect(publication_task_live_bytes > build_peak);
+    // Publication must never perform the document-sized scan while its caller
+    // holds the database apply lock. It preserves the in-flight task and asks
+    // the runtime to prepare the lookup off-lock instead.
+    try std.testing.expectError(
+        error.TextMergePublicationLookupRequired,
+        manager.finishTextMergeTask(&task, &result),
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
+    try std.testing.expectEqual(@as(u64, 1), manager.textMergeStats().in_flight_merges);
+
+    try IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result);
+    try std.testing.expect(result.publication_lookup_built);
     const applied = try manager.finishTextMergeTask(&task, &result);
     try std.testing.expect(applied);
+    try std.testing.expect(result.output_ordinals.len + result.output_ids.len > 0);
+    try std.testing.expect(result.peak_task_alloc_bytes >= publication_task_live_bytes);
     const merge_stats = manager.textMergeStats();
     try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_merges);
     try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_segments);
@@ -28351,8 +28535,13 @@ test "text merge task records input and output bytes" {
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
+    // Append-only merges do not pay for a document-sized publication lookup.
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
     const expected_output = IndexManager.textMergeResultOutputStats(&result);
     try std.testing.expect(try manager.finishTextMergeTask(&task, &result));
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
 
     const stats = manager.textMergeStats();
     try std.testing.expectEqual(@as(u64, 1), stats.completed_merges);

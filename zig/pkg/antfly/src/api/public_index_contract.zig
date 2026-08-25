@@ -97,9 +97,6 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
             std.mem.eql(u8, field, "source") or
             std.mem.eql(u8, field, "sources") or
             std.mem.eql(u8, field, "artifact") or
-            std.mem.eql(u8, field, "nodes") or
-            std.mem.eql(u8, field, "edge") or
-            std.mem.eql(u8, field, "context") or
             std.mem.eql(u8, field, "algebraic_planning") or
             std.mem.eql(u8, field, "resolvers"),
         .algebraic => std.mem.eql(u8, field, "derive_from_schema"),
@@ -155,12 +152,6 @@ pub fn createdObjectShapeForRootField(kind: Kind, field: []const u8) CreatedObje
             .graph_source
         else if (std.mem.eql(u8, field, "artifact"))
             .graph_artifact
-        else if (std.mem.eql(u8, field, "nodes"))
-            .graph_nodes
-        else if (std.mem.eql(u8, field, "edge"))
-            .graph_edge
-        else if (std.mem.eql(u8, field, "context"))
-            .graph_context
         else if (std.mem.eql(u8, field, "algebraic_planning"))
             .graph_algebraic_planning
         else if (std.mem.eql(u8, field, "edge_types"))
@@ -280,6 +271,8 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
     return switch (kind) {
         .full_text => if (std.mem.eql(u8, field, "mem_only"))
             isBool(value)
+        else if (std.mem.eql(u8, field, "field") or std.mem.eql(u8, field, "artifact_name"))
+            isNonEmptyString(value)
         else
             isString(value),
         .embeddings => if (std.mem.eql(u8, field, "external") or
@@ -306,9 +299,6 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
         else if (std.mem.eql(u8, field, "summarizer") or
             std.mem.eql(u8, field, "source") or
             std.mem.eql(u8, field, "artifact") or
-            std.mem.eql(u8, field, "nodes") or
-            std.mem.eql(u8, field, "edge") or
-            std.mem.eql(u8, field, "context") or
             std.mem.eql(u8, field, "algebraic_planning"))
             value == .object
         else

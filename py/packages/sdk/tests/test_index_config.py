@@ -20,6 +20,19 @@ def test_builds_multi_source_full_text_index() -> None:
         "type": "full_text",
         "sources": [{"artifact": "document_text_v1"}, {"artifact": "document_chunks_v1"}],
     }
+    assert artifact_full_text_index_config(
+        "document_text",
+        "document_text_v1",
+        "document_chunks_v1",
+        field=" text ",
+        mem_only=True,
+    ) == {
+        "name": "document_text",
+        "type": "full_text",
+        "sources": [{"artifact": "document_text_v1"}, {"artifact": "document_chunks_v1"}],
+        "field": "text",
+        "mem_only": True,
+    }
 
 
 def test_builds_document_and_chunk_embedding_sources() -> None:

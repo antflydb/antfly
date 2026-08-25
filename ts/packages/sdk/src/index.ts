@@ -39,15 +39,24 @@ export {
   DEFAULT_WRITE_MAX_REQUEST_BYTES,
   DEFAULT_WRITE_MAX_RESPONSE_BYTES,
   HierarchyCursorStaleError,
+  type IndexOperations,
   QUERY_TEMPORARILY_UNAVAILABLE_CODES,
   type QueryExecutionOptions,
   type QueryTemporarilyUnavailableCode,
   QueryTemporarilyUnavailableError,
-  type IndexOperations,
   type RestoreOptions,
   StorageReadTemporarilyUnavailableError,
   StorageResourceExhaustedError,
 } from "./client.js";
+export {
+  type ArtifactEmbeddingIndexOptions,
+  type ArtifactEmbeddingSourceConfig,
+  type ArtifactFullTextIndexOptions,
+  artifactEmbeddingIndexConfig,
+  artifactFullTextIndexConfig,
+  artifactIndexSources,
+  graphIndexSources,
+} from "./index-config.js";
 export {
   InferenceAPIError,
   InferenceCapacityError,
@@ -118,14 +127,6 @@ export {
   term,
 } from "./query-helpers.js";
 export { Client, type SDKConfig } from "./sdk.js";
-export {
-  artifactEmbeddingIndexConfig,
-  artifactFullTextIndexConfig,
-  artifactIndexSources,
-  graphIndexSources,
-  type ArtifactEmbeddingIndexOptions,
-  type ArtifactEmbeddingSourceConfig,
-} from "./index-config.js";
 // Type exports
 export type {
   // Chat Agent types
@@ -174,6 +175,13 @@ export type {
   ConnectionKind,
   ConnectionStatus,
   ConnectionsResponse,
+  CreateAlgebraicIndexRequest,
+  CreatedIndex,
+  CreateEmbeddingsIndexRequest,
+  CreateFullTextIndexRequest,
+  CreateGraphIndexRequest,
+  // Index types
+  CreateIndexRequest,
   CreateTableRequest,
   CreateUserRequest,
   DenseEmbedding,
@@ -227,13 +235,6 @@ export type {
   GraphQueryResult,
   GraphQueryType,
   GraphResultNode,
-  // Index types
-  CreateIndexRequest,
-  CreateFullTextIndexRequest,
-  CreateEmbeddingsIndexRequest,
-  CreateGraphIndexRequest,
-  CreateAlgebraicIndexRequest,
-  CreatedIndex,
   IndexConfig,
   IndexStatus,
   IndexType,

@@ -22,7 +22,8 @@ class FullTextIndexConfig:
         sources (list[ArtifactIndexSource] | Unset): Chunk or textual asset streams indexed together; every artifact
             record is an independent full-text member.
         mem_only (bool | Unset): Whether to use memory-only storage
-        field (str | Unset): Document field indexed as text. Omit for the table's default full-document text index.
+        field (str | Unset): Content field indexed as text. With an artifact source, this selects the field within each
+            artifact record; without one, it selects a document field. Omit to index the default text projection.
         artifact_name (str | Unset): Single-source convenience form. Mutually exclusive with sources; normalized
             responses use sources.
     """

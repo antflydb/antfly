@@ -31,8 +31,13 @@ def artifact_index_sources(*artifacts: str) -> list[dict[str, str]]:
     return [{"artifact": artifact} for artifact in artifacts]
 
 
-def artifact_full_text_index_config(name: str, *artifacts: str, mem_only: bool = False) -> dict[str, Any]:
-    """Build a full-text index over generated chunk or textual asset streams."""
+def artifact_full_text_index_config(
+    name: str,
+    *artifacts: str,
+    field: str | None = None,
+    mem_only: bool = False,
+) -> dict[str, Any]:
+    """Build a full-text index over artifact streams with an optional shared content field."""
 
     if not name:
         raise ValueError("index name is required")
@@ -41,6 +46,11 @@ def artifact_full_text_index_config(name: str, *artifacts: str, mem_only: bool =
         "type": "full_text",
         "sources": artifact_index_sources(*artifacts),
     }
+    if field is not None:
+        field = field.strip()
+        if not field:
+            raise ValueError("field must not be empty")
+        result["field"] = field
     if mem_only:
         result["mem_only"] = True
     return result

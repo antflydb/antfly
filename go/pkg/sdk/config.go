@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
@@ -313,9 +314,22 @@ func NewArtifactIndexSources(artifacts ...string) ([]ArtifactIndexSource, error)
 	return sources, nil
 }
 
+// ArtifactFullTextIndexOptions controls optional projection behavior for an
+// artifact-backed full-text index.
+type ArtifactFullTextIndexOptions struct {
+	Field   string
+	MemOnly bool
+}
+
 // NewArtifactFullTextIndexConfig builds a full-text index over one or more
-// generated chunk or textual asset streams.
+// generated chunk or textual asset streams using whole-artifact projection.
 func NewArtifactFullTextIndexConfig(name string, artifacts ...string) (*IndexConfig, error) {
+	return NewArtifactFullTextIndexConfigWithOptions(name, ArtifactFullTextIndexOptions{}, artifacts...)
+}
+
+// NewArtifactFullTextIndexConfigWithOptions builds an artifact-backed
+// full-text index with an optional content field shared by every source.
+func NewArtifactFullTextIndexConfigWithOptions(name string, options ArtifactFullTextIndexOptions, artifacts ...string) (*IndexConfig, error) {
 	if name == "" {
 		return nil, fmt.Errorf("index name is required")
 	}
@@ -323,7 +337,15 @@ func NewArtifactFullTextIndexConfig(name string, artifacts ...string) (*IndexCon
 	if err != nil {
 		return nil, err
 	}
-	return NewIndexConfig(name, FullTextIndexConfig{Sources: sources})
+	field := strings.TrimSpace(options.Field)
+	if options.Field != "" && field == "" {
+		return nil, fmt.Errorf("field must not be empty")
+	}
+	return NewIndexConfig(name, FullTextIndexConfig{
+		Sources: sources,
+		Field:   field,
+		MemOnly: options.MemOnly,
+	})
 }
 
 // NewGraphTemplateValue creates a string literal or Handlebars template value.

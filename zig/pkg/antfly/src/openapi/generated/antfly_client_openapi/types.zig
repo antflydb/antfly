@@ -1894,7 +1894,7 @@ pub const CreateFullTextIndexRequest = struct {
     sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
-    /// Document field indexed as text. Omit for the table's default full-document text index.
+    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. Omit to index the default text projection.
     field: ?[]const u8 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     artifact_name: ?[]const u8 = null,
@@ -1921,6 +1921,7 @@ pub const CreateGraphIndexRequest = struct {
     max_edges_per_document: ?i64 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
+    /// Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name.
     artifact: ?GraphArtifactProducerConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
@@ -2120,7 +2121,7 @@ pub const CreatedGraphArtifactProducerConfig = struct {
     execution: ?ExecutionPolicy = null,
 };
 
-/// Canonical artifact stream materialized into graph edges. Request-only compatibility discriminators are omitted.
+/// Canonical artifact stream materialized into graph edges.
 pub const CreatedGraphArtifactSourceConfig = struct {
     artifact: []const u8,
     path: ?[]const u8 = null,
@@ -3991,7 +3992,7 @@ pub const FullTextIndexConfig = struct {
     sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
-    /// Document field indexed as text. Omit for the table's default full-document text index.
+    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. Omit to index the default text projection.
     field: ?[]const u8 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     artifact_name: ?[]const u8 = null,
@@ -4366,6 +4367,7 @@ pub const GraphIndexConfig = struct {
     max_edges_per_document: ?i64 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
+    /// Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name.
     artifact: ?GraphArtifactProducerConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
@@ -4799,7 +4801,7 @@ pub const IndexConfig = struct {
     sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
-    /// Document field indexed as text. Omit for the table's default full-document text index.
+    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. Omit to index the default text projection.
     field: ?[]const u8 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     artifact_name: ?[]const u8 = null,
@@ -4838,6 +4840,7 @@ pub const IndexConfig = struct {
     max_edges_per_document: ?i64 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
+    /// Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name.
     artifact: ?GraphArtifactProducerConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,

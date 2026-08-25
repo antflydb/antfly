@@ -457,6 +457,23 @@ const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) =
               <p className="text-xs text-muted-foreground">
                 Each chunk or textual asset is indexed as an independent member.
               </p>
+              <FormField
+                control={control}
+                name="fullTextField"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Artifact content field (optional)</FormLabel>
+                    <FormControl>
+                      <Input placeholder="text" {...field} />
+                    </FormControl>
+                    <p className="text-xs text-muted-foreground">
+                      Use this when every artifact record exposes the searchable content under the
+                      same field.
+                    </p>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
               {fullTextArtifacts.fields.map((source, index) => (
                 <div key={source.id} className="flex items-start gap-2">
                   <FormField
@@ -769,6 +786,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
                   sources: (data.fullTextArtifacts ?? [])
                     .filter((source) => source?.artifact)
                     .map((source) => ({ artifact: source?.artifact || "" })),
+                  ...(data.fullTextField?.trim() ? { field: data.fullTextField.trim() } : {}),
                 }
               : data.fullTextSourceType === "field"
                 ? { field: data.fullTextField || "" }
@@ -846,10 +864,13 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
       } else if (data.indexType === "full_text") {
         indexConfig =
           data.fullTextSourceType === "artifacts"
-            ? artifactFullTextIndexConfig(
-                data.name,
-                ...data.fullTextArtifacts.map((source) => source.artifact.trim())
-              )
+            ? ({
+                ...artifactFullTextIndexConfig(
+                  data.name,
+                  ...data.fullTextArtifacts.map((source) => source.artifact.trim())
+                ),
+                ...(data.fullTextField?.trim() ? { field: data.fullTextField.trim() } : {}),
+              } as IndexConfig)
             : ({
                 name: data.name,
                 type: "full_text",

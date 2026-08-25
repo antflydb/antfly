@@ -66,6 +66,8 @@ pub struct ArtifactFullTextIndexConfigSpec {
     #[serde(rename = "type")]
     pub kind: ArtifactFullTextIndexKind,
     pub sources: Vec<ArtifactIndexSourceSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mem_only: bool,
 }
@@ -76,18 +78,45 @@ pub enum ArtifactFullTextIndexKind {
     FullText,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactFullTextIndexOptions {
+    pub field: Option<String>,
+    pub mem_only: bool,
+}
+
 pub fn artifact_full_text_index_config<'a>(
     name: &str,
     artifacts: impl IntoIterator<Item = &'a str>,
 ) -> Result<ArtifactFullTextIndexConfigSpec, IndexConfigError> {
+    artifact_full_text_index_config_with_options(
+        name,
+        artifacts,
+        ArtifactFullTextIndexOptions::default(),
+    )
+}
+
+pub fn artifact_full_text_index_config_with_options<'a>(
+    name: &str,
+    artifacts: impl IntoIterator<Item = &'a str>,
+    options: ArtifactFullTextIndexOptions,
+) -> Result<ArtifactFullTextIndexConfigSpec, IndexConfigError> {
     if name.is_empty() {
         return Err(IndexConfigError("index name is required".into()));
+    }
+    let field_was_set = options.field.is_some();
+    let field = options
+        .field
+        .map(|field| field.trim().to_owned())
+        .filter(|field| !field.is_empty());
+    if field_was_set && field.is_none() {
+        return Err(IndexConfigError("field must not be empty".into()));
     }
     Ok(ArtifactFullTextIndexConfigSpec {
         name: name.to_owned(),
         kind: ArtifactFullTextIndexKind::FullText,
         sources: artifact_index_sources(artifacts)?,
-        mem_only: false,
+        field,
+        mem_only: options.mem_only,
     })
 }
 
@@ -487,9 +516,10 @@ impl types::CreateIndexError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactEmbeddingIndexOptions, ArtifactEmbeddingSourceSpec, GraphArtifactFormat,
-        GraphContextMappingSpec, GraphEdgeMappingSpec, GraphIndexSourceSpec, GraphTemplateOrNumber,
-        antfly_embedder, artifact_embedding_index_config, artifact_full_text_index_config,
+        ArtifactEmbeddingIndexOptions, ArtifactEmbeddingSourceSpec, ArtifactFullTextIndexOptions,
+        GraphArtifactFormat, GraphContextMappingSpec, GraphEdgeMappingSpec, GraphIndexSourceSpec,
+        GraphTemplateOrNumber, antfly_embedder, artifact_embedding_index_config,
+        artifact_full_text_index_config, artifact_full_text_index_config_with_options,
         graph_index_sources, normalize_base_url, types,
     };
 
@@ -534,6 +564,18 @@ mod tests {
         .expect("valid multi-source full-text index");
         assert_eq!(config.sources.len(), 2);
         assert_eq!(config.sources[1].artifact, "document_chunks_v1");
+
+        let configured = artifact_full_text_index_config_with_options(
+            "document_text",
+            ["document_text_v1", "document_chunks_v1"],
+            ArtifactFullTextIndexOptions {
+                field: Some(" text ".into()),
+                mem_only: true,
+            },
+        )
+        .expect("valid full-text options");
+        assert_eq!(configured.field.as_deref(), Some("text"));
+        assert!(configured.mem_only);
     }
 
     #[test]

@@ -50,10 +50,36 @@ export function artifactIndexSources(...artifacts: string[]): ArtifactIndexSourc
   return artifacts.map((artifact) => ({ artifact }));
 }
 
+export interface ArtifactFullTextIndexOptions {
+  artifacts: readonly string[];
+  /** Optional content field shared by every selected artifact record. */
+  field?: string;
+  memOnly?: boolean;
+}
+
 /** Builds a full-text index over generated chunk or textual asset streams. */
-export function artifactFullTextIndexConfig(name: string, ...artifacts: string[]): IndexConfig {
+export function artifactFullTextIndexConfig(
+  name: string,
+  options: ArtifactFullTextIndexOptions
+): IndexConfig;
+/** Backward-compatible convenience overload for whole-artifact projection. */
+export function artifactFullTextIndexConfig(name: string, ...artifacts: string[]): IndexConfig;
+export function artifactFullTextIndexConfig(
+  name: string,
+  ...args: [ArtifactFullTextIndexOptions] | string[]
+): IndexConfig {
   if (name.length === 0) throw new TypeError("index name is required");
-  return { name, type: "full_text", sources: artifactIndexSources(...artifacts) };
+  const options: ArtifactFullTextIndexOptions =
+    args.length === 1 && typeof args[0] === "object" ? args[0] : { artifacts: args as string[] };
+  const field = options.field?.trim();
+  if (options.field !== undefined && !field) throw new TypeError("field must not be empty");
+  return {
+    name,
+    type: "full_text",
+    sources: artifactIndexSources(...options.artifacts),
+    ...(field ? { field } : {}),
+    ...(options.memOnly ? { mem_only: true } : {}),
+  };
 }
 
 /**
@@ -219,7 +245,9 @@ export function artifactEmbeddingIndexConfig(
       ...(source.sourceArtifact !== undefined
         ? { source_artifact_name: source.sourceArtifact }
         : {}),
-      ...(runtimeOptions.dimension !== undefined ? { expected_dims: runtimeOptions.dimension } : {}),
+      ...(runtimeOptions.dimension !== undefined
+        ? { expected_dims: runtimeOptions.dimension }
+        : {}),
     };
   });
 

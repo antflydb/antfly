@@ -71,6 +71,8 @@ pub const JobState = struct {
     idempotency_key: []const u8,
     idempotency_explicit: bool = false,
     request_fingerprint: []const u8,
+    destination_authorization_fingerprint: []const u8 = "",
+    destination_authorization_principal: []const u8 = "",
     result_json: ?[]const u8 = null,
     last_error: ?[]const u8 = null,
     created_at_ms: u64,
@@ -88,6 +90,8 @@ pub const StartRequest = struct {
     table_names: ?[]const []const u8 = null,
     idempotency_namespace: []const u8,
     idempotency_key: ?[]const u8 = null,
+    destination_authorization_fingerprint: []const u8 = "",
+    destination_authorization_principal: []const u8 = "",
 };
 
 pub const ListBatch = struct {
@@ -458,6 +462,8 @@ pub const Store = struct {
                         .idempotency_key = parsed.value.idempotency_key,
                         .idempotency_explicit = parsed.value.idempotency_explicit,
                         .request_fingerprint = parsed.value.request_fingerprint,
+                        .destination_authorization_fingerprint = parsed.value.destination_authorization_fingerprint,
+                        .destination_authorization_principal = parsed.value.destination_authorization_principal,
                         .last_error = "resuming_after_restart",
                         .created_at_ms = parsed.value.created_at_ms,
                         .updated_at_ms = nowMillis(),
@@ -718,6 +724,8 @@ pub const Store = struct {
                 .idempotency_key = parsed.value.idempotency_key,
                 .idempotency_explicit = parsed.value.idempotency_explicit,
                 .request_fingerprint = parsed.value.request_fingerprint,
+                .destination_authorization_fingerprint = parsed.value.destination_authorization_fingerprint,
+                .destination_authorization_principal = parsed.value.destination_authorization_principal,
                 .last_error = "resuming_after_restart",
                 .created_at_ms = parsed.value.created_at_ms,
                 .updated_at_ms = nowMillis(),
@@ -784,7 +792,60 @@ pub const Store = struct {
                 const encoded = self.jobs.get(job_id) orelse return error.CorruptRestoreJobStore;
                 var parsed = try std.json.parseFromSlice(JobState, alloc, encoded, .{ .ignore_unknown_fields = true });
                 defer parsed.deinit();
-                if (!std.mem.eql(u8, parsed.value.request_fingerprint, fingerprint)) return error.IdempotencyConflict;
+                const same_request = std.mem.eql(u8, parsed.value.request_fingerprint, fingerprint);
+                const reauthorize = destinationReauthorizationMatches(parsed.value, req);
+                if (!same_request and !reauthorize) return error.IdempotencyConflict;
+                if (reauthorize) {
+                    // A destination authorization failure is guaranteed to
+                    // occur before the next publication boundary. Re-admission
+                    // with the same explicit key is an authorization refresh,
+                    // not a different operation: preserve both job identity
+                    // and durable cluster progress while atomically returning
+                    // the attempt to the FIFO.
+                    self.compactPendingFullyLocked();
+                    try self.pending.ensureUnusedCapacity(self.alloc, 1);
+                    const dispatch_sequence = try self.allocateDispatchSequenceLocked();
+                    const now = nowMillis();
+                    const reauthorized = try encode(alloc, .{
+                        .format_version = restore_job_format_version,
+                        .job_id = parsed.value.job_id,
+                        .enqueue_sequence = parsed.value.enqueue_sequence,
+                        .dispatch_sequence = dispatch_sequence,
+                        .not_before_ms = now,
+                        .attempt_id = parsed.value.attempt_id,
+                        .scope = parsed.value.scope,
+                        .table_name = parsed.value.table_name,
+                        .backup_id = parsed.value.backup_id,
+                        .location = parsed.value.location,
+                        .connection = parsed.value.connection,
+                        .restore_mode = parsed.value.restore_mode,
+                        .table_names = parsed.value.table_names,
+                        .active_table_index = parsed.value.active_table_index,
+                        .durability_pending_table_ranges = parsed.value.durability_pending_table_ranges,
+                        .published_table_ranges = parsed.value.published_table_ranges,
+                        .completed_table_ranges = parsed.value.completed_table_ranges,
+                        .phase = .queued,
+                        .idempotency_namespace = parsed.value.idempotency_namespace,
+                        .idempotency_key = parsed.value.idempotency_key,
+                        .idempotency_explicit = true,
+                        .request_fingerprint = fingerprint,
+                        .destination_authorization_fingerprint = req.destination_authorization_fingerprint,
+                        .destination_authorization_principal = req.destination_authorization_principal,
+                        .created_at_ms = parsed.value.created_at_ms,
+                        .updated_at_ms = now,
+                        .expires_at_ms = std.math.maxInt(i64),
+                    });
+                    errdefer alloc.free(reauthorized);
+                    if (reauthorized.len > max_initial_restore_job_bytes)
+                        return error.RestoreJobRecordTooLarge;
+                    try self.storeLocked(job_id, reauthorized);
+                    try self.insertPendingSortedLocked(.{
+                        .job_id = job_id,
+                        .dispatch_sequence = dispatch_sequence,
+                        .not_before_ms = now,
+                    });
+                    return reauthorized;
+                }
                 return try alloc.dupe(u8, encoded);
             }
         }
@@ -824,6 +885,8 @@ pub const Store = struct {
             .idempotency_key = idempotency_key,
             .idempotency_explicit = explicit_idempotency_key != null,
             .request_fingerprint = fingerprint,
+            .destination_authorization_fingerprint = req.destination_authorization_fingerprint,
+            .destination_authorization_principal = req.destination_authorization_principal,
             .created_at_ms = now,
             .updated_at_ms = now,
             .expires_at_ms = std.math.maxInt(i64),
@@ -1364,6 +1427,8 @@ pub const Store = struct {
             .idempotency_key = current.idempotency_key,
             .idempotency_explicit = current.idempotency_explicit,
             .request_fingerprint = current.request_fingerprint,
+            .destination_authorization_fingerprint = current.destination_authorization_fingerprint,
+            .destination_authorization_principal = current.destination_authorization_principal,
             .result_json = update.result_json orelse current.result_json,
             .last_error = update.last_error,
             .created_at_ms = current.created_at_ms,
@@ -1626,6 +1691,8 @@ fn validateStartRequest(req: StartRequest) !void {
         req.location.len == 0 or req.location.len > max_restore_string_bytes or
         req.connection.len == 0 or req.connection.len > max_restore_string_bytes or
         req.idempotency_namespace.len == 0 or req.idempotency_namespace.len > 256 or
+        req.destination_authorization_fingerprint.len > 64 or
+        req.destination_authorization_principal.len > 256 or
         (req.table_name != null and req.table_name.?.len > max_restore_string_bytes))
         return error.RestoreJobRecordTooLarge;
     switch (req.scope) {
@@ -1898,12 +1965,57 @@ fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
         .connection = req.connection,
         .restore_mode = req.restore_mode,
         .table_names = req.table_names,
+        .destination_authorization_fingerprint = req.destination_authorization_fingerprint,
+        .destination_authorization_principal = req.destination_authorization_principal,
     }, .{});
     defer alloc.free(canonical);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(canonical, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
     return try alloc.dupe(u8, &hex);
+}
+
+fn optionalBytesEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.mem.eql(u8, lhs.?, rhs.?);
+}
+
+fn optionalStringListEqual(lhs: ?[]const []const u8, rhs: ?[]const []const u8) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    if (lhs.?.len != rhs.?.len) return false;
+    for (lhs.?, rhs.?) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+fn destinationReauthorizationMatches(current: JobState, req: StartRequest) bool {
+    const authorization_failure = current.last_error != null and
+        (std.mem.eql(u8, current.last_error.?, "RestoreDestinationReauthorizationRequired") or
+            std.mem.eql(u8, current.last_error.?, "StoredDestinationAuthorizationRevoked"));
+    const legacy_authorization = current.destination_authorization_fingerprint.len == 0 and
+        current.destination_authorization_principal.len == 0;
+    const same_authorization = std.mem.eql(
+        u8,
+        current.destination_authorization_fingerprint,
+        req.destination_authorization_fingerprint,
+    ) and std.mem.eql(
+        u8,
+        current.destination_authorization_principal,
+        req.destination_authorization_principal,
+    );
+    return current.phase == .failed and
+        authorization_failure and
+        req.destination_authorization_principal.len > 0 and
+        (req.scope == .cluster or req.destination_authorization_fingerprint.len > 0) and
+        (legacy_authorization or same_authorization) and
+        current.scope == req.scope and
+        optionalBytesEqual(current.table_name, req.table_name) and
+        std.mem.eql(u8, current.backup_id, req.backup_id) and
+        std.mem.eql(u8, current.location, req.location) and
+        std.mem.eql(u8, current.connection, req.connection) and
+        std.mem.eql(u8, current.restore_mode, req.restore_mode) and
+        optionalStringListEqual(current.table_names, req.table_names);
 }
 
 fn idempotencyMapKeyAlloc(alloc: std.mem.Allocator, namespace: []const u8, key: []const u8) ![]u8 {
@@ -2010,6 +2122,78 @@ const TestReplicatedPersistence = struct {
     }
 };
 
+test "failed destination authorization refresh reuses the idempotent restore job" {
+    const alloc = std.testing.allocator;
+    var persistence = TestReplicatedPersistence.init(alloc);
+    defer persistence.deinit();
+    var store = Store.initWithIo(alloc, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const legacy_request: StartRequest = .{
+        .scope = .table,
+        .table_name = "source",
+        .backup_id = "daily",
+        .location = "s3://archive/daily",
+        .connection = "archive-reader",
+        .idempotency_namespace = "basic:operator:table:source",
+        .idempotency_key = "restore-7",
+    };
+    const queued = try store.start(alloc, legacy_request);
+    defer alloc.free(queued);
+    var queued_state = try std.json.parseFromSlice(JobState, alloc, queued, .{});
+    defer queued_state.deinit();
+    const running = (try store.begin(alloc, queued_state.value.job_id)).?;
+    defer alloc.free(running);
+    var running_state = try std.json.parseFromSlice(JobState, alloc, running, .{});
+    defer running_state.deinit();
+    const failed = try store.fail(
+        alloc,
+        running_state.value,
+        "RestoreDestinationReauthorizationRequired",
+    );
+    defer alloc.free(failed);
+
+    const fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const adopted_request: StartRequest = .{
+        .scope = .table,
+        .table_name = "source",
+        .backup_id = "daily",
+        .location = "s3://archive/daily",
+        .connection = "archive-reader",
+        .idempotency_namespace = "basic:operator:table:source",
+        .idempotency_key = "restore-7",
+        .destination_authorization_fingerprint = fingerprint,
+        .destination_authorization_principal = "basic:operator",
+    };
+    const reauthorized = try store.start(alloc, adopted_request);
+    defer alloc.free(reauthorized);
+    var reauthorized_state = try std.json.parseFromSlice(JobState, alloc, reauthorized, .{});
+    defer reauthorized_state.deinit();
+    try std.testing.expectEqual(queued_state.value.job_id, reauthorized_state.value.job_id);
+    try std.testing.expectEqual(Phase.queued, reauthorized_state.value.phase);
+    try std.testing.expectEqualStrings(fingerprint, reauthorized_state.value.destination_authorization_fingerprint);
+    try std.testing.expectEqualStrings("basic:operator", reauthorized_state.value.destination_authorization_principal);
+    try std.testing.expect(reauthorized_state.value.last_error == null);
+
+    const rerunning = (try store.begin(alloc, queued_state.value.job_id)).?;
+    defer alloc.free(rerunning);
+    var rerunning_state = try std.json.parseFromSlice(JobState, alloc, rerunning, .{});
+    defer rerunning_state.deinit();
+    const revoked = try store.fail(alloc, rerunning_state.value, "StoredDestinationAuthorizationRevoked");
+    defer alloc.free(revoked);
+    const refreshed = try store.start(alloc, adopted_request);
+    defer alloc.free(refreshed);
+    var refreshed_state = try std.json.parseFromSlice(JobState, alloc, refreshed, .{});
+    defer refreshed_state.deinit();
+    try std.testing.expectEqual(Phase.queued, refreshed_state.value.phase);
+    try std.testing.expectEqual(reauthorized_state.value.job_id, refreshed_state.value.job_id);
+
+    var changed = adopted_request;
+    changed.backup_id = "different";
+    try std.testing.expectError(error.IdempotencyConflict, store.start(alloc, changed));
+}
+
 test "delayed replicated restore refresh cannot regress a running job" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
@@ -2091,6 +2275,7 @@ test "restore job store is idempotent and fenced" {
         .connection = "archive-reader",
         .idempotency_namespace = "principal:admin:cluster",
         .idempotency_key = "restore-daily",
+        .destination_authorization_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     };
     const first = try store.start(std.testing.allocator, req);
     defer std.testing.allocator.free(first);
@@ -2099,14 +2284,17 @@ test "restore job store is idempotent and fenced" {
     try std.testing.expectEqualStrings(first, second);
     var parsed = try std.json.parseFromSlice(JobState, std.testing.allocator, first, .{});
     defer parsed.deinit();
+    try std.testing.expectEqualStrings(req.destination_authorization_fingerprint, parsed.value.destination_authorization_fingerprint);
     const running = (try store.begin(std.testing.allocator, parsed.value.job_id)).?;
     defer std.testing.allocator.free(running);
     var parsed_running = try std.json.parseFromSlice(JobState, std.testing.allocator, running, .{});
     defer parsed_running.deinit();
+    try std.testing.expectEqualStrings(req.destination_authorization_fingerprint, parsed_running.value.destination_authorization_fingerprint);
     const done = try store.finish(std.testing.allocator, parsed_running.value, "{\"status\":\"completed\"}");
     defer std.testing.allocator.free(done);
     var parsed_done = try std.json.parseFromSlice(JobState, std.testing.allocator, done, .{});
     defer parsed_done.deinit();
+    try std.testing.expectEqualStrings(req.destination_authorization_fingerprint, parsed_done.value.destination_authorization_fingerprint);
     try std.testing.expectEqual(Phase.succeeded, parsed_done.value.phase);
 }
 

@@ -3087,6 +3087,7 @@ paths:
 
         direct-path generation.
       operationId: restore
+      x-antfly-credential-note: Durable CDC and graph destinations require Basic or API-key authentication.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -3126,6 +3127,13 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           $ref: '#/components/responses/Conflict'
+        '422':
+          description: The selected backup contains durable destinations that cannot be bound to this
+            credential type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
         '500':
@@ -3821,6 +3829,7 @@ paths:
       tags:
         - table_management
       operationId: createTable
+      x-antfly-credential-note: Durable CDC and graph destinations require Basic or API-key authentication.
       requestBody:
         required: true
         content:
@@ -3836,6 +3845,12 @@ paths:
                 $ref: '#/components/schemas/Table'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '422':
+          description: Durable destinations cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -4136,6 +4151,7 @@ paths:
       tags:
         - data_operations
       operationId: restoreTable
+      x-antfly-credential-note: Durable CDC and graph destinations require Basic or API-key authentication.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -4174,8 +4190,82 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           $ref: '#/components/responses/Conflict'
+        '422':
+          description: The backup contains durable destinations that cannot be bound to this credential
+            type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/destination-authorization:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table whose stored destinations should be adopted
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Adopt stored write destinations with the current credential
+      description: >
+        Reauthorizes the table's existing CDC routes and graph resolver destinations
+
+        using the caller's current permissions. This idempotent operation is intended
+
+        for upgrading tables created before durable destination authorization was
+
+        introduced, and for explicitly transferring destination ownership after a
+
+        credential is rotated. The caller needs admin permission on the source table
+
+        and write permission on every eventual destination table.
+      tags:
+        - table_management
+      operationId: reauthorizeTableDestinations
+      responses:
+        '200':
+          description: Destination authorization was durably adopted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - table
+                  - status
+                properties:
+                  table:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - authorized
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Caller lacks authority on the source or a destination table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          description: Durable destinations cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5264,6 +5354,7 @@ paths:
       tags:
         - index_management
       operationId: createIndex
+      x-antfly-credential-note: Graph resolver destinations require Basic or API-key authentication.
       requestBody:
         required: true
         content:
@@ -5285,6 +5376,12 @@ paths:
           $ref: '#/components/responses/MethodNotAllowed'
         '409':
           $ref: '#/components/responses/Conflict'
+        '422':
+          description: Graph resolver destinations cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/StorageResourceExhausted'
         '503':
@@ -16693,10 +16790,6 @@ components:
       x-antfly-mutually-exclusive:
         - - sources
           - artifact_name
-        - - sources
-          - field
-        - - artifact_name
-          - field
       properties:
         sources:
           type: array
@@ -16715,11 +16808,14 @@ components:
         field:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Document field indexed as text. Omit for the table's default full-document text
-            index.
+          minLength: 1
+          description: Content field indexed as text. With an artifact source, this selects the field
+            within each artifact record; without one, it selects a document field. Omit to index the default
+            text projection.
         artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
+          minLength: 1
           description: Single-source convenience form. Mutually exclusive with sources; normalized responses
             use sources.
     CreateFullTextIndexRequest:
@@ -18412,6 +18508,8 @@ components:
           $ref: '#/components/schemas/GraphArtifactSourceConfig'
         artifact:
           $ref: '#/components/schemas/GraphArtifactProducerConfig'
+          description: Single asset-producer shorthand. It must be paired with exactly one source selecting
+            the same artifact name.
         algebraic_planning:
           $ref: '#/components/schemas/GraphAlgebraicPlanningConfig'
         resolvers:
@@ -22728,8 +22826,7 @@ components:
       additionalProperties: false
       required:
         - artifact
-      description: Canonical artifact stream materialized into graph edges. Request-only compatibility
-        discriminators are omitted.
+      description: Canonical artifact stream materialized into graph edges.
       properties:
         artifact:
           type: string

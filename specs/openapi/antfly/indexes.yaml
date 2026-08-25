@@ -253,7 +253,7 @@ components:
       type: object
       additionalProperties: false
       required: [artifact]
-      description: "Canonical artifact stream materialized into graph edges. Request-only compatibility discriminators are omitted."
+      description: "Canonical artifact stream materialized into graph edges."
       properties:
         artifact: { type: string, minLength: 1 }
         path: { type: string }
@@ -617,8 +617,6 @@ components:
       type: object
       x-antfly-mutually-exclusive:
         - [sources, artifact_name]
-        - [sources, field]
-        - [artifact_name, field]
       properties:
         sources:
           type: array
@@ -636,10 +634,12 @@ components:
         field:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Document field indexed as text. Omit for the table's default full-document text index."
+          minLength: 1
+          description: "Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. Omit to index the default text projection."
         artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
+          minLength: 1
           description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources."
     AlgebraicIndexConfig:
       type: object
@@ -1974,6 +1974,7 @@ components:
           $ref: "#/components/schemas/GraphArtifactSourceConfig"
         artifact:
           $ref: "#/components/schemas/GraphArtifactProducerConfig"
+          description: "Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name."
         algebraic_planning:
           $ref: "#/components/schemas/GraphAlgebraicPlanningConfig"
         resolvers:
