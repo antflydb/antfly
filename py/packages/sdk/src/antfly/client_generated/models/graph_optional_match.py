@@ -23,8 +23,9 @@ class GraphOptionalMatch:
     """
     Attributes:
         edges (list[GraphMatchEdge]):
-        nodes (GraphOptionalMatchNodes | Unset): Aliases are limited to 128 Unicode code points and cannot have leading
-            or trailing whitespace.
+        nodes (GraphOptionalMatchNodes | Unset): Aliases are limited to 128 Unicode code points. Ordinary internal ASCII
+            spaces are allowed; leading or trailing spaces, non-ASCII whitespace, and Unicode control or format code points
+            are rejected.
         where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):
     """
 

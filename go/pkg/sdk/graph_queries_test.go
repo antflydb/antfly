@@ -424,10 +424,22 @@ func TestGraphResultBindingSelector(t *testing.T) {
 		{name: "authors ", binding: "post"},
 		{name: "authors", binding: " post"},
 		{name: "authors", binding: "post\u00a0"},
+		{name: "authors", binding: "post\ncomment"},
+		{name: "authors", binding: "post\x00comment"},
+		{name: "authors", binding: "post\u00a0comment"},
+		{name: "authors", binding: "post\u200bcomment"},
+		{name: "authors", binding: "post\u2028comment"},
+		{name: "authors", binding: "post\u202ecomment"},
 	} {
 		if _, err := NewGraphResultBindingSelector(tc.name, tc.binding, 1); err == nil {
-			t.Fatalf("expected identifiers with boundary whitespace to fail: %#v", tc)
+			t.Fatalf("expected identifiers with unsafe whitespace or controls to fail: %#v", tc)
 		}
+	}
+	if _, err := NewGraphResultBindingSelector("authors and posts", "post author", 1); err != nil {
+		t.Fatalf("expected ordinary internal spaces to remain valid: %v", err)
+	}
+	if _, err := NewGraphResultBindingSelector("作者", "文章", 1); err != nil {
+		t.Fatalf("expected visible Unicode identifiers to remain valid: %v", err)
 	}
 	if _, err := NewGraphResultBindingSelector("$reserved", "post", 1); err == nil {
 		t.Fatal("expected reserved graph result query name to fail")

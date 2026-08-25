@@ -343,16 +343,22 @@ pub fn isValidIdentifier(value: []const u8) bool {
         if (codepoints == 0) first = codepoint;
         last = codepoint;
         codepoints += 1;
+        if (codepoints > max_identifier_codepoints) return false;
+        if (isUnicodeControl(codepoint) or isUnicodeFormat(codepoint)) return false;
+        // Ordinary internal ASCII spaces are readable and unambiguous. Other
+        // Unicode whitespace can be invisible or change line layout, so it is
+        // never admitted in an identifier.
+        if (codepoint != ' ' and isUnicodeWhitespace(codepoint)) return false;
     }
     // Never normalize identifiers: doing so can silently retarget aliases and
-    // named-result dependencies. Reject ambiguous boundary whitespace instead.
-    if (isGoUnicodeWhitespace(first) or isGoUnicodeWhitespace(last)) return false;
-    return codepoints >= 1 and codepoints <= max_identifier_codepoints;
+    // named-result dependencies. Reject ambiguous boundary spaces instead.
+    if (first == ' ' or last == ' ') return false;
+    return codepoints >= 1;
 }
 
-/// Keep public identifier admission byte-for-byte aligned with Go's
-/// strings.TrimSpace Unicode White_Space set without allocating a copy.
-fn isGoUnicodeWhitespace(codepoint: u21) bool {
+/// Unicode White_Space is a stable property. Keep this allocation-free table
+/// aligned with the Go SDK's unicode.IsSpace admission check.
+fn isUnicodeWhitespace(codepoint: u21) bool {
     return switch (codepoint) {
         0x0009...0x000d,
         0x0020,
@@ -365,6 +371,42 @@ fn isGoUnicodeWhitespace(codepoint: u21) bool {
         0x202f,
         0x205f,
         0x3000,
+        => true,
+        else => false,
+    };
+}
+
+fn isUnicodeControl(codepoint: u21) bool {
+    return codepoint <= 0x001f or (codepoint >= 0x007f and codepoint <= 0x009f);
+}
+
+/// Unicode 15 General_Category=Cf. Format controls include bidi overrides,
+/// zero-width controls, directional isolates, and interlinear annotation
+/// controls. They are valid text but unsafe in user-visible identifiers.
+fn isUnicodeFormat(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x00ad,
+        0x0600...0x0605,
+        0x061c,
+        0x06dd,
+        0x070f,
+        0x0890,
+        0x0891,
+        0x08e2,
+        0x180e,
+        0x200b...0x200f,
+        0x202a...0x202e,
+        0x2060...0x2064,
+        0x2066...0x206f,
+        0xfeff,
+        0xfff9...0xfffb,
+        0x110bd,
+        0x110cd,
+        0x13430...0x1343f,
+        0x1bca0...0x1bca3,
+        0x1d173...0x1d17a,
+        0xe0001,
+        0xe0020...0xe007f,
         => true,
         else => false,
     };

@@ -15,8 +15,9 @@ class GraphCountAggregate:
     """
     Attributes:
         count (str): Use the reserved token `*` to count rows, or an alias to count non-null bindings. Graph aliases
-            cannot be `*`, have leading or trailing whitespace, or begin with `$`; the `$` namespace is reserved for result
-            references.
+            cannot be `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII whitespace, or contain Unicode
+            control or format code points. Ordinary internal ASCII spaces are allowed. The `$` namespace is reserved for
+            result references.
         distinct (bool | Unset): Count exact table-qualified identities. Exact distinct sets share a request memory
             budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count. Default: False.
     """

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
@@ -1072,13 +1073,35 @@ func validGraphIdentifier(value string) bool {
 		return false
 	}
 	// Keep aliases disjoint from the count(*) sentinel and result/control refs.
-	if value == "*" || value[0] == '$' || strings.TrimSpace(value) != value {
+	if value == "*" || value[0] == '$' {
 		return false
 	}
-	count := utf8.RuneCountInString(value)
-	return count >= 1 && count <= maxGraphIdentifierRunes
+	count := 0
+	var first, last rune
+	for _, codepoint := range value {
+		if count == 0 {
+			first = codepoint
+		}
+		last = codepoint
+		count++
+		if count > maxGraphIdentifierRunes {
+			return false
+		}
+		if unicode.IsControl(codepoint) || unicode.Is(unicode.Cf, codepoint) {
+			return false
+		}
+		// Preserve ordinary internal ASCII spaces, but reject whitespace that
+		// can be invisible or alter line layout.
+		if codepoint != ' ' && unicode.IsSpace(codepoint) {
+			return false
+		}
+	}
+	if first == ' ' || last == ' ' {
+		return false
+	}
+	return count >= 1
 }
 
 func invalidGraphIdentifier(kind string) error {
-	return fmt.Errorf("antfly: %s must be 1-%d Unicode code points with no leading or trailing whitespace and must not begin with $ or equal *", kind, maxGraphIdentifierRunes)
+	return fmt.Errorf("antfly: %s must be 1-%d Unicode code points, have no leading/trailing spaces, non-ASCII whitespace, or control/format characters, and must not begin with $ or equal *", kind, maxGraphIdentifierRunes)
 }
