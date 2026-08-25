@@ -1762,6 +1762,7 @@ fn shouldStoreChunkArtifacts(
     request: enrichment_types.GeneratedEnrichmentRequest,
     has_durable_text_consumer: bool,
 ) !bool {
+    if (request.persist_artifact) return true;
     if (request.full_text_index) return true;
     if (has_durable_text_consumer) return true;
     if (request.chunker_json.len == 0) return true;
@@ -9222,7 +9223,6 @@ fn processChunkText(
     if (request.chunk_size == 0 and request.chunker_json.len == 0) return;
 
     const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
-    if (chunks.len == 0) return;
 
     const artifact_name = requestArtifactName(request);
     const include_default_full_text = request.full_text_index or
@@ -9238,6 +9238,14 @@ fn processChunkText(
     const desired_chunk_keys = try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, desired_chunks);
     defer freeKeyList(runtime.alloc, desired_chunk_keys);
     const stale_vector_keys = try deleteStaleChunkArtifacts(runtime, request.doc_key, artifact_name, desired_chunk_keys);
+    // Graph reconciliation consumes the artifact journal, not the vector/text
+    // deletion stream. Publish stale chunk identities there as well so graph
+    // edges disappear when a source document shrinks or is rechunked.
+    for (stale_vector_keys) |key| {
+        if (internal_keys.isChunkArtifactRecordKey(key)) {
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        }
+    }
     if (chunks.len == 0) {
         try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
         return;
@@ -9286,6 +9294,9 @@ fn processChunkText(
         }
 
         try storePutBatchWithRetry(runtime, writes, &.{});
+        for (writes) |write| {
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, write.key);
+        }
     }
 
     if (text_indexes.len == 0) {

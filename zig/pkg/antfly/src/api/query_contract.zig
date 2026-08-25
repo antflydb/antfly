@@ -1365,7 +1365,15 @@ fn appendAlgebraicVectorWorkerRequestOptions(
     if (options.search_effort) |value| try appendJsonFieldF32(alloc, out, &first, "search_effort", value);
     if (options.distance_over) |value| try appendJsonFieldF32(alloc, out, &first, "distance_over", value);
     if (options.distance_under) |value| try appendJsonFieldF32(alloc, out, &first, "distance_under", value);
-    if (options.return_mode != .parent) try appendJsonFieldString(alloc, out, &first, "return_mode", @tagName(options.return_mode));
+    if (options.return_mode != .parent) try appendJsonFieldString(
+        alloc,
+        out,
+        &first,
+        "return_mode",
+        // Internal worker envelopes retain the established spelling so a
+        // rolling-upgrade peer can execute the equivalent raw-member shape.
+        if (options.return_mode == .member) "chunk" else @tagName(options.return_mode),
+    );
     if (options.max_chunks_per_parent != 0) try appendJsonFieldUsize(alloc, out, &first, "max_chunks_per_parent", options.max_chunks_per_parent);
     if (options.hierarchy_include_source) try appendJsonFieldBool(alloc, out, &first, "hierarchy_include_source", true);
     if (options.hierarchy_include_unit) try appendJsonFieldBool(alloc, out, &first, "hierarchy_include_unit", true);
@@ -3337,6 +3345,12 @@ fn finiteScoreOrZero(score: f32) f32 {
 
 fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit) !?std.json.Value {
     if (hit.artifact_ref == null and hit.chunk_hits.len == 0) return null;
+    const grouped_parent_mode = req.return_mode == .parent or req.return_mode == .parent_with_chunks;
+    const grouped_parent = grouped_parent_mode and
+        (hit.chunk_hits.len > 0 or if (hit.artifact_ref) |artifact_ref|
+            std.mem.eql(u8, hit.id, artifact_ref.document_id)
+        else
+            false);
 
     var mention_payload = if (hit.stored_data) |raw| try parseMentionEvidencePayload(alloc, raw) else null;
     defer if (mention_payload) |*parsed| parsed.deinit();
@@ -3344,21 +3358,31 @@ fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.Searc
     var obj = std.json.ObjectMap.empty;
     errdefer obj.deinit(alloc);
 
-    const level = if (hit.artifact_ref) |artifact_ref|
+    const level = if (grouped_parent)
+        "source"
+    else if (hit.artifact_ref) |artifact_ref|
         if (mention_payload != null) "mention" else artifactRefLevel(artifact_ref)
     else
         "source";
     try putJsonString(alloc, &obj, "level", level);
 
     if (hit.artifact_ref) |artifact_ref| {
-        const parent_doc_key = if (mention_payload) |payload|
+        const parent_doc_key = if (grouped_parent)
+            hit.id
+        else if (mention_payload) |payload|
             jsonObjectString(payload.value.object, "_parent_doc_key") orelse artifact_ref.document_id
         else
             artifact_ref.document_id;
         try putJsonString(alloc, &obj, "parent_doc_key", parent_doc_key);
-        try obj.put(alloc, try alloc.dupe(u8, "artifact"), try artifactRefJsonValue(alloc, artifact_ref));
-        if (artifact_ref.unit_id) |unit_id| {
-            try putJsonString(alloc, &obj, "parent_unit_id", unit_id);
+        try obj.put(
+            alloc,
+            try alloc.dupe(u8, if (grouped_parent) "matched_artifact" else "artifact"),
+            try artifactRefJsonValue(alloc, artifact_ref),
+        );
+        if (!grouped_parent) {
+            if (artifact_ref.unit_id) |unit_id| {
+                try putJsonString(alloc, &obj, "parent_unit_id", unit_id);
+            }
         }
         if (mention_payload) |payload| {
             try obj.put(alloc, try alloc.dupe(u8, "evidence"), try mentionEvidenceHierarchyJsonValue(alloc, payload.value.object));
@@ -3367,7 +3391,7 @@ fn searchHitHierarchyJsonValue(alloc: std.mem.Allocator, req: db_mod.types.Searc
         try putJsonString(alloc, &obj, "parent_doc_key", hit.id);
     }
 
-    if (try hierarchyAncestorsJsonValue(alloc, req, hit.artifact_ref, hit.id, hit.stored_data, hit.ancestor_source_data, hit.ancestor_unit_data)) |ancestors| {
+    if (try hierarchyAncestorsJsonValue(alloc, req, if (grouped_parent) null else hit.artifact_ref, hit.id, hit.stored_data, hit.ancestor_source_data, hit.ancestor_unit_data)) |ancestors| {
         try obj.put(alloc, try alloc.dupe(u8, "ancestors"), ancestors);
     }
 
@@ -4168,6 +4192,11 @@ test "api query contract serializes derived hierarchy ancestry" {
         .id = try alloc.dupe(u8, "doc:a"),
         .score = 0.8,
         .stored_data = try alloc.dupe(u8, "{\"title\":\"source title\",\"private\":\"omit me\"}"),
+        .artifact_ref = .{
+            .document_id = try alloc.dupe(u8, "doc:a"),
+            .name = try alloc.dupe(u8, "title_dense_v1"),
+            .kind = .embedding,
+        },
         .chunk_hits = try alloc.alloc(db_mod.types.ChunkHit, 1),
     };
     result.hits[0].chunk_hits[0] = .{
@@ -4191,6 +4220,9 @@ test "api query contract serializes derived hierarchy ancestry" {
     defer parsed_legacy.deinit();
     const legacy_hit = parsed_legacy.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
     const legacy_hierarchy = legacy_hit.object.get("hierarchy") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("source", legacy_hierarchy.object.get("level").?.string);
+    try std.testing.expectEqualStrings("title_dense_v1", legacy_hierarchy.object.get("matched_artifact").?.object.get("name").?.string);
+    try std.testing.expect(legacy_hierarchy.object.get("artifact") == null);
     try std.testing.expect(legacy_hierarchy.object.get("chunks") != null);
     try std.testing.expect(legacy_hierarchy.object.get("matches") == null);
     const legacy_chunk_source = legacy_hierarchy.object.get("chunks").?.array.items[0].object.get("_source").?.object;
@@ -4219,6 +4251,7 @@ test "api query contract serializes derived hierarchy ancestry" {
     try std.testing.expect(hit.object.get("_source").?.object.get("private") == null);
     try std.testing.expectEqualStrings("source", hierarchy.object.get("level").?.string);
     try std.testing.expectEqualStrings("doc:a", hierarchy.object.get("parent_doc_key").?.string);
+    try std.testing.expectEqualStrings("title_dense_v1", hierarchy.object.get("matched_artifact").?.object.get("name").?.string);
     const source_ancestor = hierarchy.object.get("ancestors").?.object.get("source").?.object;
     try std.testing.expectEqualStrings("doc:a", source_ancestor.get("id").?.string);
     try std.testing.expect(source_ancestor.get("document") == null);
@@ -9827,7 +9860,7 @@ fn applyPublicHierarchyControls(
                 .unit => if (grouped_matches_set) .unit_with_chunks else .unit,
             };
         } else {
-            req.return_mode = .chunk;
+            req.return_mode = .member;
         }
         return;
     }
@@ -11515,7 +11548,7 @@ test "api query contract validates canonical hierarchy controls" {
     ;
     var direct_matches = try parseQueryRequest(alloc, null, "docs", direct_matches_with_ancestors);
     defer direct_matches.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, direct_matches.req.return_mode);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, direct_matches.req.return_mode);
     try std.testing.expect(direct_matches.req.hierarchy_include_source);
     try std.testing.expect(!direct_matches.req.hierarchy_source_include_all_fields);
 
@@ -11527,7 +11560,7 @@ test "api query contract validates canonical hierarchy controls" {
     ;
     var empty_direct = try parseQueryRequest(alloc, null, "docs", empty_hierarchy);
     defer empty_direct.deinit(alloc);
-    try std.testing.expectEqual(db_mod.types.ReturnMode.chunk, empty_direct.req.return_mode);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, empty_direct.req.return_mode);
     try std.testing.expect(!empty_direct.req.hierarchy_include_source);
     try std.testing.expect(!empty_direct.req.hierarchy_include_unit);
 
@@ -13556,6 +13589,16 @@ test "api query contract carries vector worker tensor program and native constra
     const program_id = try algebraic_ir.tensorProgramIdAlloc(alloc, program_view.program);
     defer alloc.free(program_id);
     try std.testing.expectEqualStrings(parsed.tensor_program.program_id, program_id);
+}
+
+test "api query contract keeps member mode compatible with rolling upgrade workers" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+
+    try appendAlgebraicVectorWorkerRequestOptions(alloc, &encoded, .{ .return_mode = .member });
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"return_mode\":\"chunk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"return_mode\":\"member\"") == null);
 }
 
 test "api query contract carries sparse vector worker payload and proof" {

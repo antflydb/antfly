@@ -7976,6 +7976,7 @@ pub const ApiHttpServer = struct {
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
+            error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
             error.Timeout => return error.ReadUnavailable,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -8153,6 +8154,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedExclusionQueryRequest,
                 => return err,
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+                error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -8201,6 +8203,7 @@ pub const ApiHttpServer = struct {
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+            error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -8277,6 +8280,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExclusionQueryRequest,
             => return err,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
+            error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -11338,6 +11342,11 @@ pub const ApiHttpServer = struct {
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
                 try contextual_operations.textAlloc(self.alloc, 422, "unsupported query request"),
+            error.UnsupportedMixedSourceReturnMode => try contextual_operations.textAlloc(
+                self.alloc,
+                422,
+                "mixed document/chunk vector indexes support return_mode parent, parent_with_chunks, member, or chunk; unit modes require homogeneous chunk sources",
+            ),
             error.IdentityReadGenerationChanged => try contextualRetryableTextResponse(self.alloc, 409, "identity read generation changed"),
             error.HierarchyCursorStale => try contextualHierarchyCursorStaleResponse(self.alloc),
             error.QueryCandidateBudgetExceeded => try contextualQueryCandidateBudgetExceededResponse(self.alloc),

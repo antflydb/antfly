@@ -482,9 +482,13 @@ each enrichment owns its source field or upstream chunk stream. Sources may mix
 embeddings produced directly from primary documents with embeddings produced
 from chunk artifacts. Parent-level query results use each member's artifact
 identity to collapse chunk members to their parent while retaining direct
-document members in the same score-ordered result. Hierarchy-specific return
-modes (`chunk`, `parent_with_chunks`, `unit`, and `unit_with_chunks`) require a
-homogeneous source level and are rejected for mixed document/chunk indexes.
+document members in the same score-ordered result, and expose the winning
+member's artifact identity as provenance. `return_mode: "member"` returns the
+raw heterogeneous members; `chunk` remains a compatibility spelling with the
+same behavior. `parent_with_chunks` returns grouped parents and includes only
+genuinely chunk-backed members in `chunk_hits`. Unit modes require every member
+to have a unit identity and are therefore rejected for mixed document/chunk
+indexes with an actionable 422 response.
 `sources` cannot be combined with `external`, `field`, `template`, `chunker`, or
 the supported single-source artifact convenience forms.
 

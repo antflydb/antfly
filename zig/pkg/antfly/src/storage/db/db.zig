@@ -27294,6 +27294,7 @@ fn getOrCreateChunks(
 }
 
 fn shouldStoreChunkArtifacts(alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest) !bool {
+    if (request.persist_artifact) return true;
     if (request.full_text_index) return true;
     if (request.chunker_json.len == 0) return true;
     if (try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json)) return true;
@@ -27392,6 +27393,7 @@ fn computeChunkRequestDerived(
     doc_value: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
 ) !void {
@@ -27399,12 +27401,22 @@ fn computeChunkRequestDerived(
 
     const artifact_name = requestArtifactName(request);
     const chunks = try getOrCreateChunks(alloc, db, doc_value, request, cache);
-    if (chunks.len == 0) return;
+    const desired_chunk_keys = try chunkArtifactKeysForChunksAlloc(alloc, request.doc_key, artifact_name, chunks);
+    defer freeChunkArtifactKeys(alloc, desired_chunk_keys);
 
     const persist_chunks = try shouldStoreChunkArtifacts(alloc, request);
     if (persist_chunks) {
         try appendChunkArtifactWrites(alloc, request.doc_key, request.source_field, artifact_name, chunks, artifact_writes, true);
     }
+    try appendStaleChunkArtifactDeleteKeys(
+        alloc,
+        db,
+        request.doc_key,
+        artifact_name,
+        desired_chunk_keys,
+        artifact_delete_keys,
+    );
+    if (chunks.len == 0) return;
 
     const include_default_full_text = request.full_text_index or
         try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, request.chunker_json);
@@ -27446,6 +27458,68 @@ fn computeChunkRequestDerived(
 
         _ = arena_state.reset(.retain_capacity);
     }
+}
+
+fn appendStaleChunkArtifactDeleteKeys(
+    alloc: Allocator,
+    db: *DB,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    desired_chunk_keys: []const []u8,
+    artifact_delete_keys: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", artifact_name);
+    defer alloc.free(prefix);
+    const existing = try db.core.store.scanPrefix(alloc, prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, existing);
+
+    for (existing) |entry| {
+        if (containsKey(desired_chunk_keys, entry.key)) continue;
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
+            const base_key = try internal_keys.derivedEmbeddingBaseKeyAlloc(alloc, entry.key);
+            defer if (base_key) |key| alloc.free(key);
+            if (base_key != null and containsKey(desired_chunk_keys, base_key.?)) continue;
+        }
+        var already_deleted = false;
+        for (artifact_delete_keys.items) |key| {
+            if (std.mem.eql(u8, key, entry.key)) {
+                already_deleted = true;
+                break;
+            }
+        }
+        if (!already_deleted) try artifact_delete_keys.append(alloc, try alloc.dupe(u8, entry.key));
+    }
+}
+
+fn chunkArtifactKeysForChunksAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    chunks: []const chunker_mod.Chunk,
+) ![][]u8 {
+    const keys = try alloc.alloc([]u8, chunks.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (keys[0..initialized]) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+    for (chunks, 0..) |chunk, i| {
+        keys[i] = try internal_keys.chunkArtifactKeyAlloc(alloc, doc_key, artifact_name, @intCast(chunk.chunk_id));
+        initialized += 1;
+    }
+    return keys;
+}
+
+fn freeChunkArtifactKeys(alloc: Allocator, keys: []const []u8) void {
+    for (keys) |key| alloc.free(key);
+    alloc.free(keys);
+}
+
+fn containsKey(keys: []const []u8, target: []const u8) bool {
+    for (keys) |key| {
+        if (std.mem.eql(u8, key, target)) return true;
+    }
+    return false;
 }
 
 fn computeAssetRequestDerived(
@@ -32163,7 +32237,16 @@ fn prepareGeneratedEnrichments(
                     &deferred_asset_producer_items,
                     containsName(force_generated_artifact_names, requestArtifactName(request)),
                 ),
-                .chunk_text => try computeChunkRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &documents, &chunk_cache),
+                .chunk_text => try computeChunkRequestDerived(
+                    self.alloc,
+                    self,
+                    cleaned,
+                    request,
+                    &artifact_writes,
+                    &artifact_delete_keys,
+                    &documents,
+                    &chunk_cache,
+                ),
                 .dense_embedding => computeDenseRequestDerived(self.alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache) catch |err| switch (err) {
                     error.MissingDenseEmbedder => try appendGeneratedEnrichmentRef(self.alloc, &planned, request),
                     else => return err,
@@ -45165,28 +45248,53 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         dense_has_chunk = dense_has_chunk or std.mem.eql(u8, hit.id, "doc:chunk");
     }
     try std.testing.expect(dense_has_direct and dense_has_chunk);
+    for (dense.hits) |hit| try std.testing.expect(hit.artifact_ref != null);
 
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+    var dense_members = try db.search(alloc, .{
+        .index_name = "mixed_dense",
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
+        .limit = 2,
+        .search_effort = 1.0,
+        .return_mode = .member,
+    });
+    defer dense_members.deinit();
+    try std.testing.expectEqual(@as(usize, 2), dense_members.hits.len);
+    for (dense_members.hits) |hit| try std.testing.expect(hit.artifact_ref != null);
+
+    var dense_chunk_alias = try db.search(alloc, .{
         .index_name = "mixed_dense",
         .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
         .limit = 2,
         .search_effort = 1.0,
         .return_mode = .chunk,
-    }));
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+    });
+    defer dense_chunk_alias.deinit();
+    try std.testing.expectEqual(dense_members.hits.len, dense_chunk_alias.hits.len);
+
+    try std.testing.expectError(error.UnsupportedMixedSourceReturnMode, db.search(alloc, .{
         .index_name = "mixed_dense",
         .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
         .limit = 2,
         .search_effort = 1.0,
         .return_mode = .unit,
     }));
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+    var dense_with_chunks = try db.search(alloc, .{
         .index_name = "mixed_dense",
         .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
         .limit = 2,
         .search_effort = 1.0,
         .return_mode = .parent_with_chunks,
-    }));
+    });
+    defer dense_with_chunks.deinit();
+    try std.testing.expectEqual(@as(usize, 2), dense_with_chunks.hits.len);
+    for (dense_with_chunks.hits) |hit| {
+        if (std.mem.eql(u8, hit.id, "doc:direct")) {
+            try std.testing.expectEqual(@as(usize, 0), hit.chunk_hits.len);
+        } else if (std.mem.eql(u8, hit.id, "doc:chunk")) {
+            try std.testing.expectEqual(@as(usize, 1), hit.chunk_hits.len);
+            try std.testing.expect(hit.chunk_hits[0].artifact_ref != null);
+        }
+    }
 
     var sparse = try db.search(alloc, .{
         .index_name = "mixed_sparse",
@@ -45203,7 +45311,7 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         sparse_has_chunk = sparse_has_chunk or std.mem.eql(u8, hit.id, "doc:chunk");
     }
     try std.testing.expect(sparse_has_direct and sparse_has_chunk);
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+    try std.testing.expectError(error.UnsupportedMixedSourceReturnMode, db.search(alloc, .{
         .index_name = "mixed_sparse",
         .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 2 } },
         .limit = 2,
@@ -52343,6 +52451,89 @@ test "db graph index materializes unit-derived chunk artifacts into graph edge a
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
     try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"unit\":\"document:000001\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"artifact\":\"document_chunks_v1\"") != null);
+}
+
+test "db direct generated chunks feed multi-source text and graph indexes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    const ephemeral_chunker =
+        "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
+    try db.addEnrichment(.{
+        .name = "search_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunker_json = ephemeral_chunker,
+    });
+    try db.addEnrichment(.{
+        .name = "graph_chunks_v1",
+        .kind = .chunk,
+        .field = "relation",
+        .chunker_json = ephemeral_chunker,
+    });
+    try db.addIndex(.{
+        .name = "selected_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"search_chunks_v1\"}]}",
+    });
+    try db.addIndex(.{
+        .name = "selected_graph",
+        .kind = .graph,
+        .config_json =
+        \\{"sources":[{"artifact":"graph_chunks_v1","format":"extraction_relation","nodes":{"source":"{{ _artifact.value._parent_doc_key }}","target":"{{ _artifact.value.relation }}"},"edge":{"type":"mentions"}}]}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"alpha searchable text\",\"relation\":\"doc:b\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var text_result = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .member,
+    });
+    defer text_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), text_result.total_hits);
+
+    const graph_chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "graph_chunks_v1", 0);
+    defer alloc.free(graph_chunk_key);
+    const graph_chunk = try db.core.store.get(alloc, graph_chunk_key);
+    defer alloc.free(graph_chunk);
+
+    const edges = try db.getEdges(alloc, "selected_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"alpha searchable text\",\"relation\":\"\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_chunk_key));
+    const after_delete = try db.getEdges(alloc, "selected_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, after_delete);
+    try std.testing.expectEqual(@as(usize, 0), after_delete.len);
 }
 
 test "db graph replay blocks resolution artifact without resolver contract" {
@@ -63179,6 +63370,25 @@ test "db full_index supports dense parent search when chunk artifacts are epheme
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    // Updating an ephemeral chunk stream must delete only stale derived
+    // embeddings, not the desired replacements created in the same batch.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"beta refreshed template chunks\",\"body\":\"updated body text\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    const refreshed_query_vec = try deterministic.interface().embedDense(alloc, "", "beta refreshed template chunks", 3);
+    defer alloc.free(refreshed_query_vec);
+    var refreshed = try db.search(alloc, .{
+        .index_name = "semantic_template_chunked_idx",
+        .dense = .{ .vector = refreshed_query_vec, .k = 5 },
+        .return_mode = .parent,
+    });
+    defer refreshed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), refreshed.total_hits);
+    try std.testing.expectEqualStrings("doc:a", refreshed.hits[0].id);
 }
 
 test "db reopened full_index supports dense parent search when chunk artifacts are ephemeral" {

@@ -1567,6 +1567,7 @@ pub const HttpHandler = struct {
             if (response.status == 200) return try self.alloc.dupe(u8, response.body);
             return switch (response.status) {
                 400 => error.InvalidQueryRequest,
+                422 => error.UnsupportedMixedSourceReturnMode,
                 404 => error.FileNotFound,
                 else => error.InternalQueryFailure,
             };
@@ -1587,6 +1588,7 @@ pub const HttpHandler = struct {
                     std.log.warn("serverless public table search rejected table={s} err={}", .{ table_name, err });
                     return error.InvalidQueryRequest;
                 },
+                error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
                 error.FileNotFound,
                 error.VectorSegmentNotFound,
                 error.SparseSegmentNotFound,
@@ -2700,6 +2702,7 @@ pub const HttpHandler = struct {
                 error.VectorDimsMismatch,
                 error.SparseQueryRequired,
                 => return error.InvalidQueryRequest,
+                error.UnsupportedMixedSourceReturnMode => return try unsupportedMixedSourceReturnModeResponse(self.alloc),
                 else => return err,
             };
             defer execution.deinit(self.alloc);
@@ -2792,6 +2795,7 @@ pub const HttpHandler = struct {
                     std.log.err("serverless query invalid namespace={s} err={}", .{ namespace, err });
                     return try textResponse(self.alloc, 400, "invalid query request");
                 },
+                error.UnsupportedMixedSourceReturnMode => return try unsupportedMixedSourceReturnModeResponse(self.alloc),
                 error.FileNotFound => {
                     std.log.err("serverless query missing namespace={s} err={}", .{ namespace, err });
                     return try textResponse(self.alloc, 404, "not found");
@@ -2881,6 +2885,7 @@ pub const HttpHandler = struct {
             error.VectorDimsMismatch,
             error.SparseQueryRequired,
             => return try textResponse(self.alloc, 400, "invalid query request"),
+            error.UnsupportedMixedSourceReturnMode => return try unsupportedMixedSourceReturnModeResponse(self.alloc),
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.VectorSegmentNotFound => return try textResponse(self.alloc, 404, "vector segment not found"),
             error.SparseSegmentNotFound => return try textResponse(self.alloc, 404, "sparse segment not found"),
@@ -2900,6 +2905,7 @@ pub const HttpHandler = struct {
                 error.UnsupportedAggregation,
                 error.InvalidAggregation,
                 => return try textResponse(self.alloc, 400, "invalid query request"),
+                error.UnsupportedMixedSourceReturnMode => return try unsupportedMixedSourceReturnModeResponse(self.alloc),
                 else => {
                     std.log.err("table aggregations failed table={s} err={}", .{ table_name, err });
                     return try textResponse(self.alloc, 500, "query failed");
@@ -4591,6 +4597,7 @@ pub const HttpHandler = struct {
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
+            error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -6650,6 +6657,14 @@ fn textResponse(alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
         .content_type = try alloc.dupe(u8, "text/plain"),
         .body = try alloc.dupe(u8, body),
     };
+}
+
+fn unsupportedMixedSourceReturnModeResponse(alloc: Allocator) !HttpResponse {
+    return textResponse(
+        alloc,
+        422,
+        "mixed document/chunk vector indexes support return_mode parent, parent_with_chunks, member, or chunk; unit modes require homogeneous chunk sources",
+    );
 }
 
 test "serverless http handler serves internal namespace lifecycle, admission, and query head" {

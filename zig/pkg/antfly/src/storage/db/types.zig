@@ -1619,10 +1619,15 @@ pub const NamedGraphInputSet = struct {
 
 pub const ReturnMode = enum {
     parent,
+    /// Compatibility spelling for raw chunk/member results.
     chunk,
     parent_with_chunks,
     unit,
     unit_with_chunks,
+    /// Return each indexed source member without hierarchy grouping. This is
+    /// the precise name for raw results from heterogeneous artifact unions.
+    /// Appended to preserve the numeric ABI of the established modes.
+    member,
 };
 
 pub const HierarchyGroupLevel = enum {

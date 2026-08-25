@@ -114,6 +114,7 @@ pub const TableApi = struct {
         InvalidExclusionQueryRequest,
         UnsupportedFilterQueryRequest,
         UnsupportedExclusionQueryRequest,
+        UnsupportedMixedSourceReturnMode,
         NotFound,
         DocIdentityUnavailable,
         ReadRequiresPrimary,
@@ -893,6 +894,10 @@ pub fn handleTableQueryRequest(
                 "exclusion_query",
                 .unsupported,
             ),
+            error.UnsupportedMixedSourceReturnMode => return .{
+                .status = 422,
+                .body = try alloc.dupe(u8, "mixed document/chunk vector indexes support return_mode parent, parent_with_chunks, member, or chunk; unit modes require homogeneous chunk sources"),
+            },
             error.NotFound => {
                 std.log.err("public table query missing table={s} err={}", .{ table_name, err });
                 return .{ .status = 404, .body = try alloc.dupe(u8, "not found") };
@@ -2610,7 +2615,7 @@ test "public table query handler maps doc identity unavailable errors" {
     );
 }
 
-test "public table query handler preserves structured filter diagnostics" {
+test "public table query handler preserves structured filter and mixed-source diagnostics" {
     const Backend = struct {
         err: TableApi.ExecuteQueryError,
 
@@ -2690,6 +2695,18 @@ test "public table query handler preserves structured filter diagnostics" {
         try std.testing.expectEqualStrings("query_string", parsed.value.offending_node);
         try std.testing.expect(!parsed.value.retryable);
     }
+
+    var mixed_backend = Backend{ .err = error.UnsupportedMixedSourceReturnMode };
+    var mixed_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{}",
+        null,
+        mixed_backend.iface(),
+    );
+    defer mixed_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), mixed_resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_resp.body, "return_mode parent, parent_with_chunks, member, or chunk") != null);
 }
 
 test "public table query handler preserves retryable failure status" {

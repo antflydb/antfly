@@ -7674,7 +7674,7 @@ pub const QueryHit = struct {
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.Value = null,
     _source: ?std.json.Value = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
     hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
@@ -7688,6 +7688,8 @@ pub const QueryHitHierarchy = struct {
     /// Unit identifier when the hit is attached to a document unit.
     parent_unit_id: ?[]const u8 = null,
     artifact: ?HierarchyArtifact = null,
+    /// Artifact member that supplied the score for a source-level grouped hit.
+    matched_artifact: ?HierarchyArtifact = null,
     ancestors: ?QueryHitHierarchyAncestors = null,
     evidence: ?HierarchyEvidence = null,
     /// Matching descendant hits attached by the canonical hierarchy.group_by request.

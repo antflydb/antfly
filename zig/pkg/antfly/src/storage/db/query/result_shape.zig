@@ -345,7 +345,7 @@ pub fn reshapeChunkBackedResult(
     raw: types.SearchResult,
     shaper: ChunkParentResultShaper,
 ) !types.SearchResult {
-    if (req.return_mode == .chunk) return try hydrateDirectChunkAncestors(alloc, req, raw, shaper);
+    if (req.return_mode == .member or req.return_mode == .chunk) return try hydrateDirectChunkAncestors(alloc, req, raw, shaper);
 
     const group_by_unit = req.return_mode == .unit or req.return_mode == .unit_with_chunks;
     const loaded_unit_chunk_payloads = if (group_by_unit)
@@ -379,7 +379,12 @@ pub fn reshapeChunkBackedResult(
 
         const gop = try grouped.getOrPut(alloc, parent_id);
         if (!gop.found_existing) {
-            var unit_ref = if (group_by_unit) try artifact_ids.decodeArtifactRefAlloc(alloc, parent_id) else null;
+            var unit_ref = if (group_by_unit)
+                try artifact_ids.decodeArtifactRefAlloc(alloc, parent_id)
+            else if (chunk_hit.artifact_ref) |artifact_ref|
+                try artifact_ref.clone(alloc)
+            else
+                null;
             errdefer if (unit_ref) |*artifact_ref| artifact_ref.deinit(alloc);
             var parent = types.SearchHit{
                 .id = try alloc.dupe(u8, parent_id),
@@ -416,8 +421,16 @@ pub fn reshapeChunkBackedResult(
         if (parent_hit.score == null or (chunk_hit.score != null and chunk_hit.score.? > parent_hit.score.?)) {
             parent_hit.score = chunk_hit.score;
             parent_hit.distance = chunk_hit.distance;
+            if (!group_by_unit) {
+                if (parent_hit.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
+                parent_hit.artifact_ref = if (chunk_hit.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+            }
         }
         if (req.return_mode == .parent_with_chunks or req.return_mode == .unit_with_chunks) {
+            // Unit grouping has already proved chunk identity by resolving the
+            // chunk's parent-unit metadata. Parent grouping also accepts direct
+            // document members, so it must filter those out explicitly.
+            if (req.return_mode == .parent_with_chunks and !try hitHasChunkIdentity(alloc, chunk_hit)) continue;
             if (req.max_chunks_per_parent > 0 and parent_hit.chunk_hits.len >= req.max_chunks_per_parent) {
                 continue;
             }
@@ -758,6 +771,33 @@ fn chunkStorageKeyForHitAlloc(alloc: Allocator, hit: types.SearchHit) !?[]u8 {
     var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, hit.id)) orelse return null;
     defer artifact_ref.deinit(alloc);
     return try chunkStorageKeyForArtifactRefAlloc(alloc, artifact_ref);
+}
+
+fn hitHasChunkIdentity(alloc: Allocator, hit: types.SearchHit) !bool {
+    if (hit.artifact_ref) |artifact_ref| {
+        if (artifact_ref.kind == .chunk) return true;
+        return artifact_ref.kind == .embedding and
+            artifact_ref.source != null and
+            artifact_ref.source.?.kind == .chunk;
+    }
+    if (internal_keys.isChunkArtifactRecordKey(hit.id)) return true;
+
+    const maybe_embedding_identity = artifact_ids.decodeEmbeddingArtifactIdentityAlloc(alloc, hit.id) catch |err| switch (err) {
+        error.InvalidInternalUserKey => null,
+        else => return err,
+    };
+    if (maybe_embedding_identity) |identity_value| {
+        var identity = identity_value;
+        defer identity.deinit(alloc);
+        return internal_keys.isChunkArtifactRecordKey(identity.doc_key);
+    }
+
+    var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, hit.id)) orelse return false;
+    defer artifact_ref.deinit(alloc);
+    if (artifact_ref.kind == .chunk) return true;
+    return artifact_ref.kind == .embedding and
+        artifact_ref.source != null and
+        artifact_ref.source.?.kind == .chunk;
 }
 
 fn hydrateDirectChunkAncestors(

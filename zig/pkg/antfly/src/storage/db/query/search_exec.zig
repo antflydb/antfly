@@ -11074,7 +11074,14 @@ fn compareU64(expected: u64, item: u64) std.math.Order {
 }
 
 pub fn shouldGroupChunkParents(req: types.SearchRequest, is_chunk_backed: bool) bool {
-    return is_chunk_backed and req.return_mode != .chunk;
+    return is_chunk_backed and req.return_mode != .member and req.return_mode != .chunk;
+}
+
+fn mixedSourceReturnModeSupported(return_mode: types.ReturnMode) bool {
+    return switch (return_mode) {
+        .parent, .parent_with_chunks, .member, .chunk => true,
+        .unit, .unit_with_chunks => false,
+    };
 }
 
 pub fn searchText(
@@ -13003,8 +13010,8 @@ fn searchDenseInternal(
     const index_lookup_start = total_start;
     const entry = (try executor.dense_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
     profile.index_lookup_ns = platform_time.monotonicNs() - index_lookup_start;
-    if (entry.heterogeneous_source_levels and req.return_mode != .parent) {
-        return error.UnsupportedQueryRequest;
+    if (entry.heterogeneous_source_levels and !mixedSourceReturnModeSupported(req.return_mode)) {
+        return error.UnsupportedMixedSourceReturnMode;
     }
 
     const chunk_backed = entry.chunk_name != null;
@@ -14733,8 +14740,8 @@ pub fn searchSparse(
     var page_ns: u64 = 0;
     var projected_source_profile = ProjectedSourceLoadProfile{};
     const entry = (try executor.sparse_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
-    if (entry.heterogeneous_source_levels and req.return_mode != .parent) {
-        return error.UnsupportedQueryRequest;
+    if (entry.heterogeneous_source_levels and !mixedSourceReturnModeSupported(req.return_mode)) {
+        return error.UnsupportedMixedSourceReturnMode;
     }
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);

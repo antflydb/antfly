@@ -5997,6 +5997,7 @@ pub fn build(b: *std.Build) void {
             "public create index exposes retryable storage descriptor exhaustion",
             "public create index returns normalized created resource",
             "public table query handler maps doc identity unavailable errors",
+            "public table query handler preserves structured filter and mixed-source diagnostics",
             "public table query handler preserves retryable failure status",
             "public table query handler maps HA read gate errors",
             "public table query handler maps unsupported exact sort",

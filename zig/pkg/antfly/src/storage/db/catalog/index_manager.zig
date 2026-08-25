@@ -6225,23 +6225,25 @@ pub const IndexManager = struct {
         }
 
         for (self.text_indexes.items) |entry| {
-            const chunk_name = entry.chunk_name orelse continue;
-            const chunk_cfg = self.getEnrichment(.chunk, chunk_name) orelse continue;
-            if (chunk_cfg.source_artifact_name.len > 0) continue;
-            if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
-                try requests.append(alloc, .{
-                    .kind = .chunk_text,
-                    .index_name = try alloc.dupe(u8, entry.config.name),
-                    .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                    .doc_key = try alloc.dupe(u8, doc_key),
-                    .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                    .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
-                    .chunk_size = chunk_cfg.chunk_size,
-                    .chunk_overlap = chunk_cfg.chunk_overlap,
-                    .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
-                    .full_text_index = true,
-                    .execution_json = if (chunk_cfg.execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.execution_json) else "",
-                });
+            if (entry.chunk_name) |chunk_name| {
+                if (self.getEnrichment(.chunk, chunk_name)) |chunk_cfg| {
+                    if (chunk_cfg.source_artifact_name.len == 0) {
+                        try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false);
+                    }
+                }
+            }
+            for (entry.source_artifact_names) |artifact_name| {
+                const chunk_cfg = self.getEnrichment(.chunk, artifact_name) orelse continue;
+                if (chunk_cfg.source_artifact_name.len > 0) continue;
+                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false);
+            }
+        }
+
+        for (self.graph_indexes.items) |entry| {
+            for (entry.artifact_sources) |source| {
+                const chunk_cfg = self.getEnrichment(.chunk, source.artifact_name) orelse continue;
+                if (chunk_cfg.source_artifact_name.len > 0) continue;
+                try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true);
             }
         }
 
@@ -19217,6 +19219,48 @@ fn containsOwnedString(items: []const []const u8, value: []const u8) bool {
     return false;
 }
 
+fn appendGeneratedChunkRequest(
+    alloc: Allocator,
+    requests: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    index_name: []const u8,
+    doc_key: []const u8,
+    chunk_cfg: *const enrichment_catalog.EnrichmentConfig,
+    full_text_index: bool,
+    persist_artifact: bool,
+) !void {
+    for (requests.items) |*request| {
+        if (request.kind != .chunk_text) continue;
+        if (!std.mem.eql(u8, request.doc_key, doc_key)) continue;
+        if (!std.mem.eql(u8, request.source_field, chunk_cfg.source_field)) continue;
+        if (!std.mem.eql(u8, request.source_template, chunk_cfg.source_template)) continue;
+        if (!std.mem.eql(u8, request.artifact_name, chunk_cfg.name)) continue;
+
+        // One producer request can feed every consumer of the same artifact.
+        // Merge the strongest delivery requirements so catalog iteration order
+        // cannot change persistence or default full-text behavior.
+        request.full_text_index = request.full_text_index or full_text_index or chunk_cfg.full_text_index;
+        request.persist_artifact = request.persist_artifact or persist_artifact;
+        return;
+    }
+
+    const request = try enrichment_types.cloneGeneratedRequest(alloc, .{
+        .kind = .chunk_text,
+        .index_name = index_name,
+        .artifact_name = chunk_cfg.name,
+        .doc_key = doc_key,
+        .source_field = chunk_cfg.source_field,
+        .source_template = chunk_cfg.source_template,
+        .chunk_size = chunk_cfg.chunk_size,
+        .chunk_overlap = chunk_cfg.chunk_overlap,
+        .chunker_json = chunk_cfg.chunker_json,
+        .full_text_index = full_text_index or chunk_cfg.full_text_index,
+        .persist_artifact = persist_artifact,
+        .execution_json = chunk_cfg.execution_json,
+    });
+    errdefer enrichment_types.freeGeneratedRequest(alloc, request);
+    try requests.append(alloc, request);
+}
+
 fn hasGeneratedChunkRequest(
     requests: []const enrichment_types.GeneratedEnrichmentRequest,
     doc_key: []const u8,
@@ -22317,6 +22361,31 @@ test "multi-source consumers participate in generation routing and preserve sour
     try std.testing.expect(manager.hasGeneratedEnrichmentTargets());
     try std.testing.expect(try manager.computeGeneratedEnrichmentTargetCacheExcluding("sparse_union", null));
     try std.testing.expect(try manager.computeGeneratedEnrichmentTargetCacheExcluding("relations_graph", null));
+
+    const generated = try manager.planGeneratedEnrichments(
+        alloc,
+        "doc:routed",
+        "{\"title\":\"terms\",\"body\":\"search text\",\"relations\":\"alice knows bob\"}",
+        &.{},
+        &.{},
+    );
+    defer enrichment_types.deinitGeneratedRequests(alloc, generated);
+    try std.testing.expectEqual(@as(usize, 3), generated.len);
+    try std.testing.expect(hasGeneratedSparseEmbeddingRequest(generated, "doc:routed", "title", "", "", "sparse_terms_v1"));
+    try std.testing.expect(hasGeneratedChunkRequest(generated, "doc:routed", "body", "", "text_chunks"));
+    try std.testing.expect(hasGeneratedChunkRequest(generated, "doc:routed", "relations", "", "graph_chunks"));
+    var text_request: ?enrichment_types.GeneratedEnrichmentRequest = null;
+    var graph_request: ?enrichment_types.GeneratedEnrichmentRequest = null;
+    for (generated) |request| {
+        if (std.mem.eql(u8, request.artifact_name, "text_chunks")) text_request = request;
+        if (std.mem.eql(u8, request.artifact_name, "graph_chunks")) graph_request = request;
+    }
+    try std.testing.expect(text_request != null);
+    try std.testing.expect(text_request.?.full_text_index);
+    try std.testing.expect(!text_request.?.persist_artifact);
+    try std.testing.expect(graph_request != null);
+    try std.testing.expect(!graph_request.?.full_text_index);
+    try std.testing.expect(graph_request.?.persist_artifact);
 
     const unrelated_targets = try manager.textIndexesForChunk(alloc, "unrelated_chunks", true);
     defer {
