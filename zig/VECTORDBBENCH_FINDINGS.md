@@ -1700,6 +1700,53 @@ the repeat reached 1,161 QPS but had 50.8/14.5/14.2/30.4/46.9 ms p95 at
 concurrency 1/5/10/20/30, so the 1M gate must report query and restart
 latencies rather than treating the improved storage counters as sufficient.
 
+The first geometric 1M gate was correct and improved load from 1,502.04 to
+1,267.79 seconds (1,263.74 insert plus 4.05 catch-up), but did not preserve its
+early ~13-minute trajectory. Direct publication stopped after 1.087M of 5M
+logical entries because transient bulk sessions no longer accumulated to the
+8 MiB floor as the lower-level base slowed request overlap. The tail produced
+3,869 flushes, 14,104 flush-output files, and 3,931 manifests. More
+importantly, the hard-pressure lane bypassed geometric carries and performed
+165 compactions with 92.74 GB input and 92.10 GB output for a 3.52 GB primary
+run set. This is write amplification, not necessary dataset size.
+
+Recall remained 0.9849. C1/C5/C10/C20/C30 throughput improved to
+11.79/74.46/122.10/124.09/122.57 QPS, eliminating the former C30 collapse.
+The warm 1,000-query profile was 35.26 ms mean and 77.89 ms p95 at 0.98452
+recall, essentially the post-governor latency baseline. Demand improved to
+1.70 GB live and 1.30 GB after restart, while cache-inclusive live RSS peaked
+at 3.38 GB during compaction overlap. The next gate lowers the byte-based
+direct-publication floor to 4 MiB and makes hard run-count pressure attempt a
+geometric carry before generic promotion; byte-hard pressure remains directly
+leveled because a same-level merge cannot reduce its byte debt.
+
+The 4 MiB direct floor plus foreground geometric hard-pressure assist recovered
+the intended load envelope. Its 50K gate finished in 21.74 seconds (19.71
+insert plus 2.03 catch-up) at 0.9867 live recall, used 377 MiB on disk, cloned
+76.7 MB, and performed seven geometric compactions over 326.8 MB. C1/C5/C10/
+C20/C30 throughput was 59.44/1,253.64/1,580.69/1,276.12/1,285.59 QPS with
+42.3/7.0/8.9/21.0/32.5 ms p95. No hard-pressure event occurred. Live RSS
+peaked at 1.97 GB, so the speed result passed while memory retained noticeable
+host/cache variance.
+
+The matched 1M gate finished in 759.03 seconds (754.97 insert plus 4.06
+catch-up), recovering the ~13-minute target while preserving 0.9859 recall.
+Direct publication reached 3.9635M of 5M logical entries instead of freezing
+at 1.087M. All 653 pressure events made progress with zero overloads. One
+byte-hard promotion established a 2.09 GB lower-level base; geometric carries
+then avoided rewriting it. Total compaction input fell from 92.74 GB to
+14.55 GB, compaction time was 101.0 seconds, and final disk was 3.86 GB.
+
+This load win is not yet the balanced endpoint. Live/restart demand was
+3.15/2.18 GB and cache-inclusive RSS peaked at 3.94/2.19 GB. Warm recall was
+0.9857, but warm p50/p95/p99 regressed to 41.1/90.0/108.3 ms. The public
+profile attributes 29.88 ms mean and 77.45 ms p95 to rerank artifact reads.
+After maintenance the primary still had 74 L0 runs containing 1.43 GB above a
+2.09 GB base, while the LSM and HBC caches held about 470 and 408 MB. The next
+experiment should retain geometric carries but permit one justified base-growth
+merge when accumulated L0 is a substantial fraction of the lower base. That
+is bounded size-ratio leveling, not a return to repeated low-growth rewrites.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process

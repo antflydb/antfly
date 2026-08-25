@@ -5583,7 +5583,20 @@ pub const Backend = struct {
         var steps: usize = 0;
         while (pressure.overHardLimit(hard_runs, hard_bytes) and steps < max_steps) {
             const before_step_compactions = self.compaction_stats.compactions;
-            _ = try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
+            const byte_hard = hard_bytes > 0 and pressure.bytes > hard_bytes;
+            const tiered = if (!byte_hard and
+                hard_runs > 0 and pressure.runs > hard_runs and
+                self.options.bulk_ingest_tiered_l0_fan_in >= 2)
+                try compaction_mod.compactBulkL0Tier(
+                    Backend,
+                    self,
+                    self.options.bulk_ingest_tiered_l0_fan_in,
+                )
+            else
+                false;
+            if (!tiered) {
+                _ = try compaction_mod.compactL0ToLimit(Backend, self, target_runs);
+            }
             if (self.compaction_stats.compactions == before_step_compactions) break;
             steps += self.compaction_stats.compactions - before_step_compactions;
             pressure = self.snapshotL0PressureLocked();
@@ -10807,6 +10820,40 @@ test "lsm backend tier-owned L0 avoids low-growth rewrite below hard pressure" {
     try std.testing.expect(try backend.runMaintenanceStep());
     try std.testing.expect(backend.compaction_stats.compactions > before_compactions);
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 2);
+}
+
+test "lsm backend hard run pressure prefers a complete geometric L0 carry" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 100,
+        .l0_hard_limit_runs = 100,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+    });
+    defer backend.close();
+
+    // Build four equally sized chronological publication generations while
+    // hard pressure is disabled. They form one complete geometric carry.
+    for (0..4) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 4), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 0), countLevelRuns(backend.runs.items, 1));
+
+    backend.options.l0_hard_limit_runs = 3;
+    const locked = runtime_mod.lockBackend(Backend, &backend);
+    defer runtime_mod.unlockBackend(Backend, &backend, locked);
+    try backend.enforceWritePressure();
+
+    try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+    try std.testing.expectEqual(@as(usize, 0), countLevelRuns(backend.runs.items, 1));
+    try std.testing.expectEqual(@as(u64, 1), backend.write_stats.write_pressure_compactions);
+    try std.testing.expectEqual(@as(u64, 0), backend.write_stats.write_pressure_overloads);
 }
 
 test "lsm backend defers soft compaction behind latency-sensitive derived replay" {

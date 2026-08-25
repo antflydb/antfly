@@ -66,11 +66,11 @@ pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
     .read_snapshot_rotate_mutable_bytes = 32 * 1024 * 1024,
     // Public bulk transactions are already coalesced and sorted. Publish them
-    // directly at a quarter of the ordinary mutable flush size so concurrent
+    // directly at an eighth of the ordinary mutable flush size so concurrent
     // status/catch-up scans do not rotate normal replay windows into thousands
-    // of split immutable runs. Eight MiB remains a meaningful publication unit
+    // of split immutable runs. Four MiB remains a meaningful publication unit
     // for general bulk loads while fitting below the adaptive replay window.
-    .direct_bulk_ingest_min_bytes = 8 * 1024 * 1024,
+    .direct_bulk_ingest_min_bytes = 4 * 1024 * 1024,
     // Four-way size-tiered merging turns sorted publication windows into an
     // external merge tree. This bounds L0 read amplification during sustained
     // imports without repeatedly merging each window through the full base.
@@ -589,7 +589,7 @@ test "index lsm profiles preserve current flush profiles" {
     const primary_opts = primary_lsm_options_default;
     try std.testing.expectEqual(@as(u64, 32 * 1024 * 1024), primary_opts.flush_threshold_bytes);
     try std.testing.expectEqual(primary_opts.flush_threshold_bytes, primary_opts.read_snapshot_rotate_mutable_bytes);
-    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), primary_opts.direct_bulk_ingest_min_bytes);
+    try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024), primary_opts.direct_bulk_ingest_min_bytes);
     try std.testing.expectEqual(@as(usize, 4), primary_opts.bulk_ingest_tiered_l0_fan_in);
     try std.testing.expectEqual(@as(u64, 0), primary_opts.bulk_ingest_current_scan_clone_max_bytes);
     try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), primary_opts.mutable_idle_flush_after_ns);

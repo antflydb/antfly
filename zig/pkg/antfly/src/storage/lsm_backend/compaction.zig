@@ -334,6 +334,25 @@ pub fn compactBulkL0TierScheduled(
     return compactBulkL0TierScheduledBeforeSequence(BackendType, backend, fan_in, score, 0);
 }
 
+/// Foreground variant used only to relieve hard L0 run-count pressure. It
+/// bypasses optional-maintenance admission/yielding because the write cannot
+/// safely leave the hard envelope, while retaining the same input-size bound
+/// and geometric-growth contract as the background lane.
+pub fn compactBulkL0Tier(
+    comptime BackendType: type,
+    backend: *BackendType,
+    fan_in: usize,
+) !bool {
+    const plan = selectBulkL0Tier(
+        backend.runs.items,
+        fan_in,
+        backend.options.max_compaction_input_bytes,
+        0,
+    ) orelse return false;
+    try compactPlanAt(BackendType, backend, plan);
+    return true;
+}
+
 /// Variant used while a bulk window is open. A non-zero sequence ceiling
 /// keeps the tier merger out of the request publications owned by that
 /// window; those are combined exactly once by `compactBulkL0WindowScheduled`.
