@@ -123,6 +123,11 @@ def _parse_response(
 
         return response_409
 
+    if response.status_code == 422:
+        response_422 = Error.from_dict(response.json())
+
+        return response_422
+
     if response.status_code == 429:
         response_429 = StorageResourceExhaustedError.from_dict(response.json())
 

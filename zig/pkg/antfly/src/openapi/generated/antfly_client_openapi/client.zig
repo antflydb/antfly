@@ -1115,6 +1115,17 @@ pub const Client = struct {
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Adopt stored write destinations with the current credential
+    /// POST /db/v1/tables/{tableName}/destination-authorization
+    pub fn reauthorizeTableDestinations(self: *@This(), table_name: []const u8) !ApiResponse(std.json.Value) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/destination-authorization", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
     /// Scan documents in a table within a key range
     /// POST /db/v1/tables/{tableName}/documents
     pub fn scanKeys(self: *@This(), table_name: []const u8, body: ?types.ScanKeysRequest) !RawResponse {

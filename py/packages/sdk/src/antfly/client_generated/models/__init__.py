@@ -660,6 +660,8 @@ from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
+from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
+from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -1484,6 +1486,8 @@ __all__ = (
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",
     "QueryTemporarilyUnavailableErrorCode",
+    "ReauthorizeTableDestinationsResponse200",
+    "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
     "RepairIssueListRequest",
     "RepairRunRequest",

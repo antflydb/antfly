@@ -74,7 +74,12 @@ pub const MetadataServer = struct {
     ) !MetadataServer {
         const svc = try alloc.create(service.MetadataHttpService);
         errdefer alloc.destroy(svc);
-        svc.* = try service.MetadataHttpService.init(alloc, cfg.http, deps.http, cfg.service);
+        var service_cfg = cfg.service;
+        service_cfg.destination_authorizer = .{
+            .manager = cfg.api_server_cfg.user_manager,
+            .auth_enabled = cfg.api_server_cfg.auth_enabled,
+        };
+        svc.* = try service.MetadataHttpService.init(alloc, cfg.http, deps.http, service_cfg);
         errdefer svc.deinit();
 
         var owned_hosted_shard_ops: ?*raft_hosted_shard_ops.HostedShardOperationAdapter = null;
@@ -180,6 +185,10 @@ pub const MetadataServer = struct {
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
+            _ = public_write_source.withDestinationAuthorization(.{
+                .manager = cfg.api_server_cfg.user_manager,
+                .auth_enabled = cfg.api_server_cfg.auth_enabled,
+            });
             owned_public_write_source = public_write_source;
 
             var api_server_cfg = cfg.api_server_cfg;

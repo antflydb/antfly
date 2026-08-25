@@ -451,7 +451,7 @@ const IndexSummary = struct {
     source_total: ?i64 = null,
     indexed: ?i64,
     visible: ?i64,
-    ready: bool,
+    complete: bool,
     queryable: bool = false,
     failed: bool,
 };
@@ -523,12 +523,12 @@ fn summarizeStats(stats: anytype) IndexSummary {
         indexed;
     const readiness = if (@hasField(Stats, "readiness")) stats.readiness else null;
     const state = if (readiness) |value| @tagName(value.state) else legacy_state;
-    const ready = if (readiness) |value|
-        value.state == .ready
+    const complete = if (readiness) |value|
+        value.complete
     else
         !readiness_pending and !coverage_incomplete and (std.mem.eql(u8, state, "ready") or
             (reported_state == null and rebuilding == false and error_text == null and !config_mismatch));
-    const queryable = if (readiness) |value| value.queryable else ready;
+    const queryable = if (readiness) |value| value.queryable else complete;
     const failed = if (readiness) |value|
         value.state == .failed
     else
@@ -540,7 +540,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
         .source_total = source_total,
         .indexed = indexed,
         .visible = visible,
-        .ready = ready,
+        .complete = complete,
         .queryable = queryable,
         .failed = failed,
     };
@@ -578,7 +578,7 @@ const WaitTarget = enum { complete, queryable };
 const WaitDisposition = enum { ready, waiting, failed };
 
 fn waitDisposition(summary: IndexSummary, target: WaitTarget) WaitDisposition {
-    if (summary.ready or target == .queryable and summary.queryable) return .ready;
+    if (summary.complete or target == .queryable and summary.queryable) return .ready;
     if (summary.failed) return .failed;
     return .waiting;
 }
@@ -1013,7 +1013,7 @@ test "index wait requires complete compatible coverage" {
         .backfill_state = "ready",
     });
     try std.testing.expectEqualStrings("coverage_unavailable", summary.state);
-    try std.testing.expect(!summary.ready);
+    try std.testing.expect(!summary.complete);
     try std.testing.expect(!summary.failed);
 
     summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
@@ -1021,7 +1021,7 @@ test "index wait requires complete compatible coverage" {
         .rebuilding = false,
     });
     try std.testing.expectEqualStrings("coverage_unavailable", summary.state);
-    try std.testing.expect(!summary.ready);
+    try std.testing.expect(!summary.complete);
 
     summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
         .index_type = .embeddings,
@@ -1029,7 +1029,7 @@ test "index wait requires complete compatible coverage" {
         .backfill_state = "ready",
         .coverage = coverage,
     });
-    try std.testing.expect(summary.ready);
+    try std.testing.expect(summary.complete);
     try std.testing.expect(!summary.failed);
 
     coverage.observation_complete = false;
@@ -1041,7 +1041,7 @@ test "index wait requires complete compatible coverage" {
         .coverage = coverage,
     });
     try std.testing.expectEqualStrings("coverage_incomplete", summary.state);
-    try std.testing.expect(!summary.ready);
+    try std.testing.expect(!summary.complete);
     try std.testing.expect(!summary.failed);
 
     coverage.config_mismatch_group_count = 1;
@@ -1066,7 +1066,7 @@ test "index wait requires complete compatible coverage" {
         .coverage = coverage,
     });
     try std.testing.expectEqualStrings("ready", summary.state);
-    try std.testing.expect(summary.ready);
+    try std.testing.expect(summary.complete);
 
     summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
         .index_type = .embeddings,
@@ -1078,7 +1078,7 @@ test "index wait requires complete compatible coverage" {
         .coverage = coverage,
     });
     try std.testing.expectEqualStrings("running", summary.state);
-    try std.testing.expect(!summary.ready);
+    try std.testing.expect(!summary.complete);
 }
 
 test "index wait prefers authoritative readiness contract" {
@@ -1097,7 +1097,7 @@ test "index wait prefers authoritative readiness contract" {
         },
     });
     try std.testing.expectEqualStrings("pending", summary.state);
-    try std.testing.expect(!summary.ready);
+    try std.testing.expect(!summary.complete);
     try std.testing.expect(!summary.failed);
 
     summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
@@ -1116,7 +1116,30 @@ test "index wait prefers authoritative readiness contract" {
     });
     try std.testing.expectEqualStrings("queryable_partial", summary.state);
     try std.testing.expect(summary.queryable);
-    try std.testing.expect(!summary.ready);
+    try std.testing.expect(!summary.complete);
+    try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, .complete));
+    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, .queryable));
+
+    // The explicit booleans are the wait contract. Do not let a stale or
+    // mixed-version state label make --complete return before the server's
+    // complete-generation proof succeeds.
+    summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = false,
+        .backfill_state = "ready",
+        .readiness = .{
+            .state = .ready,
+            .queryable = true,
+            .complete = false,
+            .incarnation = "g-000000000000002a",
+            .target_revision = 11,
+            .published_revision = 10,
+            .pending_reasons = &.{"coverage"},
+        },
+    });
+    try std.testing.expectEqualStrings("ready", summary.state);
+    try std.testing.expect(summary.queryable);
+    try std.testing.expect(!summary.complete);
     try std.testing.expectEqual(WaitDisposition.waiting, waitDisposition(summary, .complete));
     try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(summary, .queryable));
 
@@ -1136,7 +1159,7 @@ test "index wait prefers authoritative readiness contract" {
         },
     });
     try std.testing.expectEqualStrings("ready", summary.state);
-    try std.testing.expect(summary.ready);
+    try std.testing.expect(summary.complete);
 
     summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
         .index_type = .embeddings,
@@ -1153,7 +1176,7 @@ test "index wait prefers authoritative readiness contract" {
         },
     });
     try std.testing.expectEqualStrings("failed", summary.state);
-    try std.testing.expect(!summary.ready);
+    try std.testing.expect(!summary.complete);
     try std.testing.expect(summary.failed);
     try std.testing.expectEqual(WaitDisposition.failed, waitDisposition(summary, .complete));
 }
@@ -1173,7 +1196,7 @@ test "index wait disposition retries mismatch and fails only terminal states" {
         .progress = 0,
         .indexed = 0,
         .visible = 0,
-        .ready = false,
+        .complete = false,
         .failed = false,
     }, .complete));
     try std.testing.expectEqual(WaitDisposition.failed, waitDisposition(.{
@@ -1181,7 +1204,7 @@ test "index wait disposition retries mismatch and fails only terminal states" {
         .progress = 1,
         .indexed = 10,
         .visible = 10,
-        .ready = false,
+        .complete = false,
         .failed = true,
     }, .complete));
     try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(.{
@@ -1189,7 +1212,7 @@ test "index wait disposition retries mismatch and fails only terminal states" {
         .progress = 1,
         .indexed = 10,
         .visible = 10,
-        .ready = true,
+        .complete = true,
         .failed = false,
     }, .complete));
 }
