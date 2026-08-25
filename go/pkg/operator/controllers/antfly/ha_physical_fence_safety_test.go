@@ -17,6 +17,46 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+func TestPhysicalIsolationOwnsOnlyExactPendingPrimaryFailure(t *testing.T) {
+	status := &antflyv1.HAStatus{
+		PrimaryAdminFailureThresholdMet: true,
+		PrimaryAdminLastError:           "primary admin endpoint timed out",
+		PlannedActions: []antflyv1.HAPlannedActionStatus{{
+			Kind:                     string(haActionIsolateFormerPrimary),
+			AdminJobName:             haKubernetesPhysicalFenceName,
+			AdminJobPhase:            haAdminJobPhaseRunning,
+			PhysicalIsolationReceipt: &antflyv1.HAPhysicalIsolationReceiptStatus{},
+		}},
+	}
+	if !haPhysicalIsolationOwnsPrimaryFailure(status) {
+		t.Fatal("exact running physical isolation did not retain the durable primary failure observation")
+	}
+
+	tests := map[string]func(*antflyv1.HAStatus){
+		"reachable primary": func(candidate *antflyv1.HAStatus) { candidate.PrimaryAdminReachable = true },
+		"threshold not met": func(candidate *antflyv1.HAStatus) { candidate.PrimaryAdminFailureThresholdMet = false },
+		"missing error":     func(candidate *antflyv1.HAStatus) { candidate.PrimaryAdminLastError = "" },
+		"missing receipt": func(candidate *antflyv1.HAStatus) {
+			candidate.PlannedActions[0].PhysicalIsolationReceipt = nil
+		},
+		"wrong executor": func(candidate *antflyv1.HAStatus) {
+			candidate.PlannedActions[0].AdminJobName = "direct-admin-api"
+		},
+		"promotion recorded": func(candidate *antflyv1.HAStatus) {
+			candidate.LastPromotion = &antflyv1.HAPromotionStatus{ClusterID: 1}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := status.DeepCopy()
+			mutate(candidate)
+			if haPhysicalIsolationOwnsPrimaryFailure(candidate) {
+				t.Fatal("non-authoritative isolation state suppressed a live primary probe")
+			}
+		})
+	}
+}
+
 // This is the durable-commit safety oracle for the controller action. A
 // dependent promotion action must never observe Succeeded in the same
 // reconciliation that first constructs the final isolation receipt.

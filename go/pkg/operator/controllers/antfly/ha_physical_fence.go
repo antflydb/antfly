@@ -31,6 +31,36 @@ type haPhysicalIsolationGraceKey struct {
 	processBootID       string
 }
 
+// observeHAPrimaryAdminStatusForReconcile avoids serially paying the full HTTP
+// timeout after a generation-bound Kubernetes isolation transaction has
+// already frozen the unreachable-primary observation. Lease and candidate
+// status are still refreshed on every pass, and the isolation receipt is
+// revalidated uncached before any dependent action can advance.
+func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatusForReconcile(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster != nil && haPhysicalIsolationOwnsPrimaryFailure(cluster.Status.HAStatus) {
+		return errors.New(strings.TrimSpace(cluster.Status.HAStatus.PrimaryAdminLastError))
+	}
+	return r.observeHAPrimaryAdminStatus(ctx, cluster)
+}
+
+func haPhysicalIsolationOwnsPrimaryFailure(status *antflyv1.HAStatus) bool {
+	if status == nil || status.LastPromotion != nil || status.PrimaryAdminReachable ||
+		!status.PrimaryAdminFailureThresholdMet || strings.TrimSpace(status.PrimaryAdminLastError) == "" {
+		return false
+	}
+	for i := range status.PlannedActions {
+		action := &status.PlannedActions[i]
+		if haActionKind(action.Kind) != haActionIsolateFormerPrimary ||
+			action.AdminJobName != haKubernetesPhysicalFenceName || action.PhysicalIsolationReceipt == nil {
+			continue
+		}
+		if action.AdminJobPhase == haAdminJobPhaseRunning || action.AdminJobPhase == haAdminJobPhaseSucceeded {
+			return true
+		}
+	}
+	return false
+}
+
 // reconcileHAFormerPrimaryIsolation is the fail-safe path for an automatic
 // failover whose former primary cannot be reached through its admin endpoint.
 // A Kubernetes Lease or Pod API absence alone does not stop the old writer.

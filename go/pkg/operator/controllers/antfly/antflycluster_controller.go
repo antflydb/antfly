@@ -5165,7 +5165,7 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 		if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
 			return err
 		}
-		haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
+		haAdminStatusErr := r.observeHAPrimaryAdminStatusForReconcile(ctx, cluster)
 		if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
 			haAdminStatusErr = standbyErr
 		}
@@ -5314,7 +5314,7 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 	if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
 		return err
 	}
-	haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
+	haAdminStatusErr := r.observeHAPrimaryAdminStatusForReconcile(ctx, cluster)
 	if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
 		haAdminStatusErr = standbyErr
 	}
