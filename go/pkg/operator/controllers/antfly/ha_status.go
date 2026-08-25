@@ -483,19 +483,47 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 
 	clearBootstrapReceipt := false
 	bootstrapReceipt := strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt])
-	if bootstrapReceipt != "" || (bootstrapUnknownBoundary && scope.primaryLSN == 0) {
+	boundHandoffReceipt := committedHandoffRenewal &&
+		haWatchdogProcessBootIDValid(strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID])) &&
+		bootstrapReceipt == haFencingLeaseBootstrapReceipt(
+			currentHolder, transitions, lease.Annotations[haFencingLeaseAnnotationProcessBootID],
+		)
+	boundSuccessorReceipt := cluster.UID != "" &&
+		currentHolder == localNodeID && holder == currentHolder &&
+		lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" &&
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) != "" &&
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationFormerHolder]) != currentHolder &&
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationTransferOriginUID]) != "" &&
+		lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] != string(cluster.UID) &&
+		lease.Annotations[haFencingLeaseAnnotationCommittedTransition] == strconv.FormatInt(int64(transitions), 10) &&
+		haWatchdogProcessBootIDValid(strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID])) &&
+		bootstrapReceipt == haFencingLeaseBootstrapReceipt(
+			currentHolder, transitions, lease.Annotations[haFencingLeaseAnnotationProcessBootID],
+		) &&
+		haLeaseFenceScopeMatches(lease, scope)
+	if (bootstrapReceipt != "" || (bootstrapUnknownBoundary && scope.primaryLSN == 0)) && !boundHandoffReceipt {
 		if lease.Spec.RenewTime == nil || !haLeaseFenceScopeMatches(lease, scope) {
 			return nil
 		}
+		proofBoundary := lease.Spec.RenewTime.Time
+		if (committedSuccessor || boundSuccessorReceipt) && lease.Spec.AcquireTime != nil {
+			// The exact former controller may continue renewing after the successor
+			// process receipt is bound. Compare the successor's full-authority proof
+			// to the immutable holder-transfer boundary so those safety renewals
+			// cannot continually outrun proof publication.
+			proofBoundary = lease.Spec.AcquireTime.Time
+		}
 		ready, err := r.haCurrentPrimaryRuntimeWatchdogReady(
-			ctx, cluster, currentHolder, uint64(transitions), lease.Spec.RenewTime.Time, true,
+			ctx, cluster, currentHolder, uint64(transitions), proofBoundary, true,
 		)
 		if err != nil || !ready {
 			return err
 		}
 		clearBootstrapReceipt = bootstrapReceipt != ""
 	}
-	preserveTransferredScope := false
+	// A former-controller bridge advances time only. It never edits the
+	// committed holder, generation, process binding, or child topology scope.
+	preserveTransferredScope := boundHandoffReceipt
 	if lease.Annotations[haFencingLeaseAnnotationTransferCommitted] == "true" && currentHolder != "" &&
 		haKubernetesLeaseFenceCandidate(ha, cluster.Status.HAStatus) == "" && holder != currentHolder {
 		// Status loss or controller restart must never hand authority back to the

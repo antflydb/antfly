@@ -459,19 +459,68 @@ func TestCommittedTransferBindsSuccessorProcessDespiteFormerHolderRenewals(t *te
 		t.Fatalf("committed successor was not atomically rebound on its exact next scope: %#v", observed)
 	}
 
+	// Colony can publish the child topology before the successor controller has
+	// consumed the bound process receipt. The exact former controller must keep
+	// that already-selected process alive, without mutating any authority scope.
+	former := parent.DeepCopy()
+	former.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	former.Spec.HighAvailability.Identity.TimelineID++
+	former.Spec.HighAvailability.Identity.Epoch++
+	former.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryAdminLastError: "HA Lease watchdog is not active for node standby-a",
+		PrimaryLSN:            711,
+	}
+	boundAt := observed.Spec.RenewTime.DeepCopy()
+	observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] =
+		haFencingLeaseBootstrapReceipt("standby-a", 2, strings.Repeat("d", 64))
+	if err := reconciler.Update(context.Background(), observed); err != nil {
+		t.Fatal(err)
+	}
+	now = leaseTime.Add(9 * time.Second)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), former); err != nil {
+		t.Fatalf("reject mismatched successor receipt bridge: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Equal(boundAt) {
+		t.Fatalf("former controller renewed a mismatched successor receipt: %#v", observed)
+	}
+	observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = wantReceipt
+	if err := reconciler.Update(context.Background(), observed); err != nil {
+		t.Fatal(err)
+	}
+	now = leaseTime.Add(10 * time.Second)
+	if err := reconciler.reconcileHAFencingLease(context.Background(), former); err != nil {
+		t.Fatalf("renew bound successor through exact former-controller bridge: %v", err)
+	}
+	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(now) ||
+		observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != wantReceipt ||
+		observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" ||
+		observed.Annotations[haFencingLeaseAnnotationTimelineID] != "5" ||
+		observed.Annotations[haFencingLeaseAnnotationEpoch] != "7" ||
+		observed.Annotations[haFencingLeaseAnnotationCurrentPrimaryID] != "standby-a" ||
+		observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "711" {
+		t.Fatalf("former-controller receipt bridge mutated authority or failed to renew: %#v", observed)
+	}
+
 	// A full-authority proof after the one-shot binding resumes ordinary owner
-	// renewal, advances the observed positive boundary, and closes the former
-	// controller's transfer bridge.
+	// renewal even if it was observed before the former controller's latest
+	// safety renewal, advances the observed positive boundary, and closes the
+	// former controller's transfer bridge.
 	now = leaseTime.Add(13 * time.Second)
 	proof := successor.Status.HAStatus.PrimaryWatchdogProof
 	proof.AuthorityGranted = true
 	proof.AuthorityRemainingMS = 9_000
-	proof.ObservedAt = metav1.NewTime(now.Add(-time.Second))
+	proof.ObservedAt = metav1.NewTime(leaseTime.Add(8 * time.Second))
 	successor.Status.HAStatus.PrimaryAdminReachable = true
 	successor.Status.HAStatus.PrimaryAdminLastError = ""
 	successor.Status.HAStatus.PrimaryLSN = 711
 	ready, err := reconciler.haCurrentPrimaryRuntimeWatchdogReady(
-		context.Background(), successor, "standby-a", 2, observed.Spec.RenewTime.Time, true,
+		context.Background(), successor, "standby-a", 2, observed.Spec.AcquireTime.Time, true,
 	)
 	if err != nil || !ready {
 		t.Fatalf("bound successor full-authority proof is not ready: ready=%t err=%v proof=%#v lease=%#v", ready, err, proof, observed)
