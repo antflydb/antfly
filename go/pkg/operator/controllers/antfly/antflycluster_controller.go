@@ -4194,14 +4194,6 @@ func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx conte
 	if ha == nil || ha.Runtime == nil || ha.Runtime.Role != antflyv1.HARuntimeRolePrimary {
 		return false, nil
 	}
-	promotionReceipt := strings.TrimSpace(cluster.Annotations[cloudHAPromotionReceiptAnnotation])
-	if !isLowerHexDigest(promotionReceipt) {
-		return false, nil
-	}
-	topologyGeneration, err := strconv.ParseUint(strings.TrimSpace(cluster.Annotations[cloudHATopologyGenerationAnnotation]), 10, 64)
-	if err != nil || topologyGeneration < 2 {
-		return false, nil
-	}
 
 	pod := &corev1.Pod{}
 	key := types.NamespacedName{Name: statefulSet.Name + "-0", Namespace: statefulSet.Namespace}
@@ -4216,11 +4208,27 @@ func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx conte
 		pod.Annotations[haNodeIDAnnotation] != strings.TrimSpace(ha.Runtime.NodeID) {
 		return false, nil
 	}
+
+	// Colony publishes the promoted primary spec and its exact promotion receipt
+	// in separate control-plane reconciliations. A StatefulSet controller can act
+	// on the new primary template before the receipt reaches this CR. Recognize
+	// the immutable command shape of the still-running standby process and switch
+	// to OnDelete immediately; otherwise a rollout already queued in that window
+	// cannot be cancelled when the receipt/Pod-UID binding arrives. This is only
+	// a rollout hold, never promotion authority: the route and Lease paths still
+	// require the exact receipt and generation below.
+	runningPromotedProcess := podRunsHAStandbyCommand(pod)
+	promotionReceipt := strings.TrimSpace(cluster.Annotations[cloudHAPromotionReceiptAnnotation])
+	topologyGeneration, generationErr := strconv.ParseUint(strings.TrimSpace(cluster.Annotations[cloudHATopologyGenerationAnnotation]), 10, 64)
+	receiptReady := isLowerHexDigest(promotionReceipt) && generationErr == nil && topologyGeneration >= 2
+	if !receiptReady {
+		return runningPromotedProcess, nil
+	}
 	binding := promotionReceipt + ":" + string(pod.UID)
 	if hasExactPromotedProcessBinding(cluster, statefulSet, pod) {
 		return true, nil
 	}
-	if pod.Labels[cloudHARoleLabel] != cloudHAStandbyRole {
+	if !runningPromotedProcess {
 		return false, nil
 	}
 	if statefulSet.Annotations == nil {
@@ -4228,6 +4236,21 @@ func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx conte
 	}
 	statefulSet.Annotations[haPromotedProcessBindingAnnotation] = binding
 	return true, nil
+}
+
+func podRunsHAStandbyCommand(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	for i := range pod.Spec.Containers {
+		container := &pod.Spec.Containers[i]
+		if container.Name != "antfly" {
+			continue
+		}
+		args := strings.Join(container.Args, "\n")
+		return strings.Contains(args, "--ha-standby-log") && !strings.Contains(args, "--ha-primary-log")
+	}
+	return false
 }
 
 // hasExactPromotedProcessBinding identifies the one live process that adopted

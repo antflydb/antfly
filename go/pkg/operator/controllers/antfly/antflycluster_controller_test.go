@@ -14485,6 +14485,10 @@ func TestReconcileStandaloneStatefulSetPreservesExactLivePromotedProcess(t *test
 				UID: statefulSet.UID, Controller: &controller,
 			}},
 		},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "antfly",
+			Args: []string{"exec /antfly standalone --ha-standby-log '/antflydb/ha/standby.wal'"},
+		}}},
 		Status: corev1.PodStatus{Conditions: []corev1.PodCondition{{
 			Type: corev1.PodReady, Status: corev1.ConditionTrue,
 		}}},
@@ -14542,6 +14546,21 @@ func TestPromotedStandaloneRolloutRequiresExactReceiptAndOwnedPod(t *testing.T) 
 	deferRollout, err := reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(deferRollout).To(BeFalse())
+
+	// Desired primary publication can race ahead of the exact promotion receipt.
+	// Hold the immutable standby process before that receipt arrives, even if a
+	// mutable role label has already converged to the desired primary template.
+	pod.Spec.Containers = []corev1.Container{{
+		Name: "antfly",
+		Args: []string{"exec /antfly standalone --ha-standby-log '/antflydb/ha/standby.wal'"},
+	}}
+	pod.Labels[cloudHARoleLabel] = "primary"
+	g.Expect(client.Update(context.Background(), pod)).To(Succeed())
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeTrue())
+	g.Expect(statefulSet.Annotations).NotTo(HaveKey(haPromotedProcessBindingAnnotation))
+
 	cluster.Annotations = map[string]string{
 		cloudHAPromotionReceiptAnnotation:   strings.Repeat("a", 64),
 		cloudHATopologyGenerationAnnotation: "2",
@@ -14571,7 +14590,7 @@ func TestPromotedStandaloneRolloutRequiresExactReceiptAndOwnedPod(t *testing.T) 
 	cluster.Annotations[cloudHAPromotionReceiptAnnotation] = "not-a-canonical-receipt"
 	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(deferRollout).To(BeFalse())
+	g.Expect(deferRollout).To(BeTrue(), "an invalid receipt cannot authorize promotion, but must not restart the live standby-shaped process")
 
 	cluster.Annotations[cloudHAPromotionReceiptAnnotation] = strings.Repeat("a", 64)
 	pod.OwnerReferences[0].UID = types.UID("different-statefulset-uid")
