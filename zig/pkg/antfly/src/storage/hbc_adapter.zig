@@ -767,6 +767,11 @@ fn noteHbcKindAdmissionSkip(stats: *HbcCacheStats, kind: HbcCacheKind) void {
     hbcKindStats(stats, kind).admission_skips += 1;
 }
 
+fn cacheFillEpochCurrent(fill_epoch: ?*const std.atomic.Value(u64), expected_epoch: u64) bool {
+    const epoch = fill_epoch orelse return true;
+    return expected_epoch & 1 == 0 and epoch.load(.acquire) == expected_epoch;
+}
+
 fn noteHbcKindEviction(stats: *HbcCacheStats, kind: HbcCacheKind) void {
     hbcKindStats(stats, kind).evictions += 1;
 }
@@ -1290,6 +1295,16 @@ pub const Cache = struct {
     }
 
     pub fn cacheNode(self: *Cache, namespace: u64, node: *const Node) !bool {
+        return try self.cacheNodeGuarded(namespace, node, null, 0);
+    }
+
+    fn cacheNodeGuarded(
+        self: *Cache,
+        namespace: u64,
+        node: *const Node,
+        fill_epoch: ?*const std.atomic.Value(u64),
+        expected_epoch: u64,
+    ) !bool {
         const cloned = try node.clone(self.alloc);
         var cloned_active = true;
         defer if (cloned_active) {
@@ -1298,6 +1313,7 @@ pub const Cache = struct {
         };
         self.mutex.lockExclusive();
         defer self.mutex.unlockExclusive();
+        if (!cacheFillEpochCurrent(fill_epoch, expected_epoch)) return false;
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = node.id };
         _ = self.removeNodeLocked(key, false);
         const bytes = estimateNodeCacheBytes(node);
@@ -1323,11 +1339,23 @@ pub const Cache = struct {
     }
 
     pub fn cacheQuantized(self: *Cache, namespace: u64, node_id: u64, qs: *const QuantizedSet) !bool {
+        return try self.cacheQuantizedGuarded(namespace, node_id, qs, null, 0);
+    }
+
+    fn cacheQuantizedGuarded(
+        self: *Cache,
+        namespace: u64,
+        node_id: u64,
+        qs: *const QuantizedSet,
+        fill_epoch: ?*const std.atomic.Value(u64),
+        expected_epoch: u64,
+    ) !bool {
         var cloned = try qs.clone(self.alloc);
         var cloned_active = true;
         defer if (cloned_active) cloned.deinit(self.alloc);
         self.mutex.lockExclusive();
         defer self.mutex.unlockExclusive();
+        if (!cacheFillEpochCurrent(fill_epoch, expected_epoch)) return false;
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = node_id };
         _ = self.removeQuantizedLocked(key, false);
         const bytes = estimateQuantizedCacheBytes(qs);
@@ -1467,6 +1495,17 @@ pub const Cache = struct {
     }
 
     pub fn cacheMetadata(self: *Cache, namespace: u64, vector_id: u64, metadata: []const u8) ![]const u8 {
+        return try self.cacheMetadataGuarded(namespace, vector_id, metadata, null, 0);
+    }
+
+    fn cacheMetadataGuarded(
+        self: *Cache,
+        namespace: u64,
+        vector_id: u64,
+        metadata: []const u8,
+        fill_epoch: ?*const std.atomic.Value(u64),
+        expected_epoch: u64,
+    ) ![]const u8 {
         const copied = try self.alloc.dupe(u8, metadata);
         const entry = self.alloc.create(MetadataCacheEntry) catch |err| {
             self.alloc.free(copied);
@@ -1477,6 +1516,7 @@ pub const Cache = struct {
         defer if (entry_active) releaseMetadataCacheEntry(self.alloc, entry);
         self.mutex.lockExclusive();
         defer self.mutex.unlockExclusive();
+        if (!cacheFillEpochCurrent(fill_epoch, expected_epoch)) return metadata;
         const key: HbcSharedCacheKey = .{ .namespace = namespace, .id = vector_id };
         _ = self.removeMetadataLocked(key, false);
         const bytes = estimateMetadataCacheBytes(metadata);
@@ -4370,15 +4410,21 @@ pub const HBCIndex = struct {
     }
 
     pub fn beginRuntimeReadTxn(self: *HBCIndex) !vectorindex_store.NamespaceReadTxn {
-        return try self.store.beginRead();
+        const fill_epoch = self.beginSearchCacheFill();
+        var txn = try self.store.beginRead();
+        txn.cache_fill_epoch = fill_epoch;
+        return txn;
     }
 
     pub fn beginRuntimeSearchTxn(self: *HBCIndex) !vectorindex_store.NamespaceReadTxn {
-        return try self.store.beginProbeOrRead();
+        const fill_epoch = self.beginSearchCacheFill();
+        var txn = try self.store.beginProbeOrRead();
+        txn.cache_fill_epoch = fill_epoch;
+        return txn;
     }
 
     pub fn beginRuntimeCompleteSearchTxn(self: *HBCIndex) !vectorindex_store.NamespaceReadTxn {
-        return try self.store.beginRead();
+        return try self.beginRuntimeReadTxn();
     }
 
     pub fn beginRuntimeSearchTxnForCoverage(self: *HBCIndex, complete_snapshot: bool) !vectorindex_store.NamespaceReadTxn {
@@ -4889,18 +4935,42 @@ pub const HBCIndex = struct {
         return self.active_searches.load(.acquire) <= 1;
     }
 
+    /// Capture the publication epoch immediately before an authoritative cache
+    /// miss read. Admission later rechecks this token under the cache's write
+    /// lock, which makes invalidation and stale-fill rejection one ordered
+    /// operation for both local and shared caches.
+    pub fn beginSearchCacheFill(self: *const HBCIndex) ?u64 {
+        if (self.lsmSessionBatchingActive()) return null;
+        const epoch = self.published_mutation_epoch.load(.acquire);
+        if (epoch & 1 != 0) return null;
+        return epoch;
+    }
+
+    fn searchCacheFillCurrent(self: *const HBCIndex, expected_epoch: u64) bool {
+        return cacheFillEpochCurrent(&self.published_mutation_epoch, expected_epoch);
+    }
+
     pub fn cacheNode(self: *HBCIndex, node: *const Node) !void {
+        return try self.cacheNodeWithFillEpoch(node, null);
+    }
+
+    fn cacheNodeWithFillEpoch(self: *HBCIndex, node: *const Node, fill_epoch: ?u64) !void {
         if (!self.cache_enabled) return;
+        if (fill_epoch) |expected| if (!self.searchCacheFillCurrent(expected)) return;
         {
             self.cache_mu.lockExclusive();
             defer self.cache_mu.unlockExclusive();
+            if (fill_epoch) |expected| if (!self.searchCacheFillCurrent(expected)) return;
             if (self.pinned_node_cache.contains(node.id)) {
                 try self.cachePinnedNodeLocked(node, true);
             }
         }
         if (self.shared_cache) |cache| {
             if (self.config.max_cached_nodes == 0) return;
-            _ = try cache.cacheNode(self.cache_namespace, node);
+            _ = if (fill_epoch) |expected|
+                try cache.cacheNodeGuarded(self.cache_namespace, node, &self.published_mutation_epoch, expected)
+            else
+                try cache.cacheNode(self.cache_namespace, node);
             return;
         }
         const cloned = try node.clone(self.alloc);
@@ -4910,6 +4980,13 @@ pub const HBCIndex = struct {
         }
         self.cache_mu.lockExclusive();
         defer self.cache_mu.unlockExclusive();
+        if (fill_epoch) |expected| {
+            if (!self.searchCacheFillCurrent(expected)) {
+                var owned = cloned;
+                owned.deinit(self.alloc);
+                return;
+            }
+        }
         var admission = self.prepareHbcCacheAdmission(.node, node.id, estimateNodeCacheBytes(node)) orelse {
             self.noteHbcCacheAdmissionSkip(.node);
             var owned = cloned;
@@ -4931,25 +5008,48 @@ pub const HBCIndex = struct {
         try self.cacheNode(node);
     }
 
+    pub fn cacheSearchNodeIfFillCurrent(self: *HBCIndex, node: *const Node, fill_epoch: u64) !void {
+        try self.cacheNodeWithFillEpoch(node, fill_epoch);
+    }
+
     pub fn cacheQuantized(self: *HBCIndex, node_id: u64, qs: *const QuantizedSet) !void {
         if (self.lsmSessionBatchingActive() or self.publicationMutationActive()) return;
+        try self.cacheQuantizedWithFillEpoch(node_id, qs, null);
+    }
+
+    pub fn cacheQuantizedIfFillCurrent(self: *HBCIndex, node_id: u64, qs: *const QuantizedSet, fill_epoch: u64) !void {
+        try self.cacheQuantizedWithFillEpoch(node_id, qs, fill_epoch);
+    }
+
+    fn cacheQuantizedWithFillEpoch(self: *HBCIndex, node_id: u64, qs: *const QuantizedSet, fill_epoch: ?u64) !void {
         if (!self.cache_enabled) return;
+        if (fill_epoch) |expected| if (!self.searchCacheFillCurrent(expected)) return;
         {
             self.cache_mu.lockExclusive();
             defer self.cache_mu.unlockExclusive();
+            if (fill_epoch) |expected| if (!self.searchCacheFillCurrent(expected)) return;
             if (self.pinned_quantized_cache.contains(node_id)) {
                 try self.cachePinnedQuantizedOwnedLocked(node_id, try qs.clone(self.alloc), true);
             }
         }
         if (self.shared_cache) |cache| {
             if (self.config.max_cached_nodes == 0) return;
-            _ = try cache.cacheQuantized(self.cache_namespace, node_id, qs);
+            _ = if (fill_epoch) |expected|
+                try cache.cacheQuantizedGuarded(self.cache_namespace, node_id, qs, &self.published_mutation_epoch, expected)
+            else
+                try cache.cacheQuantized(self.cache_namespace, node_id, qs);
             return;
         }
         var cloned = try qs.clone(self.alloc);
         errdefer cloned.deinit(self.alloc);
         self.cache_mu.lockExclusive();
         defer self.cache_mu.unlockExclusive();
+        if (fill_epoch) |expected| {
+            if (!self.searchCacheFillCurrent(expected)) {
+                cloned.deinit(self.alloc);
+                return;
+            }
+        }
         var admission = self.prepareHbcCacheAdmission(.quantized, node_id, estimateQuantizedCacheBytes(qs)) orelse {
             self.noteHbcCacheAdmissionSkip(.quantized);
             cloned.deinit(self.alloc);
@@ -5098,12 +5198,26 @@ pub const HBCIndex = struct {
     pub fn cacheMetadata(self: *HBCIndex, vector_id: u64, metadata: []const u8) ![]const u8 {
         if (!self.cache_enabled) return metadata;
         if (self.lsmSessionBatchingActive() or self.publicationMutationActive()) return metadata;
+        return try self.cacheMetadataWithFillEpoch(vector_id, metadata, null);
+    }
+
+    pub fn cacheMetadataIfFillCurrent(self: *HBCIndex, vector_id: u64, metadata: []const u8, fill_epoch: u64) ![]const u8 {
+        return try self.cacheMetadataWithFillEpoch(vector_id, metadata, fill_epoch);
+    }
+
+    fn cacheMetadataWithFillEpoch(self: *HBCIndex, vector_id: u64, metadata: []const u8, fill_epoch: ?u64) ![]const u8 {
+        if (!self.cache_enabled) return metadata;
+        if (fill_epoch) |expected| if (!self.searchCacheFillCurrent(expected)) return metadata;
         if (self.config.max_cached_metadata == 0) return metadata;
         if (self.shared_cache) |cache| {
-            return try cache.cacheMetadata(self.cache_namespace, vector_id, metadata);
+            return if (fill_epoch) |expected|
+                try cache.cacheMetadataGuarded(self.cache_namespace, vector_id, metadata, &self.published_mutation_epoch, expected)
+            else
+                try cache.cacheMetadata(self.cache_namespace, vector_id, metadata);
         }
         self.cache_mu.lockExclusive();
         defer self.cache_mu.unlockExclusive();
+        if (fill_epoch) |expected| if (!self.searchCacheFillCurrent(expected)) return metadata;
         var admission = self.prepareHbcCacheAdmission(.metadata, vector_id, estimateMetadataCacheBytes(metadata)) orelse {
             self.noteHbcCacheAdmissionSkip(.metadata);
             return metadata;
@@ -9097,6 +9211,71 @@ test "hbc shared cache namespaces entries" {
     try expectSharedVectorCached(&cache, ns_b, 7, &vec_b);
 }
 
+test "hbc shared cache rejects node quantized and metadata fills from an older publication" {
+    const alloc = std.testing.allocator;
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    const namespace = hbcCacheNamespace("/tmp/hbc-publication-fill-guard");
+    var epoch = std.atomic.Value(u64).init(0);
+
+    var current_centroid = [_]f32{ 9, 9 };
+    const current_node = Node{
+        .id = 7,
+        .is_leaf = true,
+        .level = 0,
+        .parent = 9,
+        .centroid = &current_centroid,
+        .children = &.{},
+        .members = &.{},
+    };
+    var stale_centroid = [_]f32{ 1, 1 };
+    const stale_node = Node{
+        .id = 7,
+        .is_leaf = true,
+        .level = 0,
+        .parent = 1,
+        .centroid = &stale_centroid,
+        .children = &.{},
+        .members = &.{},
+    };
+    var current_vectors = [_]f32{ 9, 9 };
+    const current_quantized: QuantizedSet = .{ .nonquant = .{ .vectors = .{
+        .dims = 2,
+        .count = 1,
+        .data = &current_vectors,
+    } } };
+    var stale_vectors = [_]f32{ 1, 1 };
+    const stale_quantized: QuantizedSet = .{ .nonquant = .{ .vectors = .{
+        .dims = 2,
+        .count = 1,
+        .data = &stale_vectors,
+    } } };
+
+    try std.testing.expect(try cache.cacheNode(namespace, &current_node));
+    try std.testing.expect(try cache.cacheQuantized(namespace, 7, &current_quantized));
+    _ = try cache.cacheMetadata(namespace, 7, "current");
+
+    // Generation 0 was captured before the writer's publication. Generation 2
+    // is now live; a delayed MVCC reader must not replace any current entry.
+    epoch.store(2, .release);
+    try std.testing.expect(!try cache.cacheNodeGuarded(namespace, &stale_node, &epoch, 0));
+    try std.testing.expect(!try cache.cacheQuantizedGuarded(namespace, 7, &stale_quantized, &epoch, 0));
+    _ = try cache.cacheMetadataGuarded(namespace, 7, "stale", &epoch, 0);
+
+    var node = cache.borrowNode(namespace, 7).?;
+    defer node.deinit();
+    try std.testing.expectEqual(@as(u64, 9), node.ptr().parent);
+    var quantized = cache.borrowQuantized(namespace, 7).?;
+    defer quantized.deinit();
+    switch (quantized.ptr().*) {
+        .nonquant => |set| try std.testing.expectEqualSlices(f32, &current_vectors, set.vectors.data),
+        .rabit => return error.TestUnexpectedResult,
+    }
+    var metadata = cache.borrowMetadata(namespace, 7).?;
+    defer metadata.deinit();
+    try std.testing.expectEqualStrings("current", metadata.view());
+}
+
 test "hbc shared cache evicts across namespaces under one resource budget" {
     const vector_bytes = estimateVectorCacheBytes(&.{ 1.0, 2.0, 3.0, 4.0 });
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -9876,6 +10055,7 @@ test "hbc old snapshot metadata cannot poison the current cache generation" {
 
     var old_txn = try idx.beginReadTxn();
     defer old_txn.abort();
+    try std.testing.expect(old_txn.cache_fill_epoch != null);
     const ids = [_]u64{1};
     var metadata: [1]?[]const u8 = undefined;
     var lookups: [1]FixedKeyLookup = undefined;
@@ -9900,7 +10080,7 @@ test "hbc old snapshot metadata cannot poison the current cache generation" {
     }
     try expectMetadataNotCached(&idx, 1);
 
-    try idx.getMetadataManySortedInTxnWithScratchUncached(
+    try idx.getMetadataManySortedInTxnWithScratch(
         &old_txn,
         &ids,
         &metadata,

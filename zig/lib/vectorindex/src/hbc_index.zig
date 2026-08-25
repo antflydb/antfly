@@ -273,13 +273,64 @@ fn loadSearchNodeFromStorage(self: anytype, txn: anytype, node_id: u64) !types.N
     return try self.loadNodeFromStorage(txn, node_id);
 }
 
-fn cacheSearchNode(self: anytype, node: *const types.Node) !void {
+const SearchCacheFill = struct {
+    guarded: bool,
+    epoch: ?u64,
+};
+
+fn searchCacheFillForTxn(self: anytype, txn: anytype) SearchCacheFill {
     const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "beginSearchCacheFill")) {
+        const Txn = comptime childType(@TypeOf(txn));
+        if (comptime @hasField(Txn, "cache_fill_epoch")) {
+            return .{ .guarded = true, .epoch = txn.cache_fill_epoch };
+        }
+        // A miss-time epoch is insufficient: the transaction may already be
+        // an old MVCC snapshot after a writer completed. Fail closed unless the
+        // adapter bound the epoch to transaction creation.
+        return .{ .guarded = true, .epoch = null };
+    }
+    return .{ .guarded = false, .epoch = null };
+}
+
+fn cacheSearchNodeAfterLoad(self: anytype, node: *const types.Node, fill: SearchCacheFill) !void {
+    const Index = comptime childType(@TypeOf(self));
+    if (fill.guarded) {
+        const epoch = fill.epoch orelse return;
+        if (comptime @hasDecl(Index, "cacheSearchNodeIfFillCurrent")) {
+            try self.cacheSearchNodeIfFillCurrent(node, epoch);
+        }
+        return;
+    }
     if (comptime @hasDecl(Index, "cacheSearchNode")) {
         try self.cacheSearchNode(node);
     } else {
         try self.cacheNode(node);
     }
+}
+
+fn cacheQuantizedAfterLoad(self: anytype, node_id: u64, qs: *const hbc_runtime.QuantizedSet, fill: SearchCacheFill) !void {
+    const Index = comptime childType(@TypeOf(self));
+    if (fill.guarded) {
+        const epoch = fill.epoch orelse return;
+        if (comptime @hasDecl(Index, "cacheQuantizedIfFillCurrent")) {
+            try self.cacheQuantizedIfFillCurrent(node_id, qs, epoch);
+        }
+        return;
+    }
+    try self.cacheQuantized(node_id, qs);
+}
+
+fn cacheMetadataAfterLoad(self: anytype, vector_id: u64, metadata: []const u8, fill: SearchCacheFill) ![]const u8 {
+    const Index = comptime childType(@TypeOf(self));
+    if (fill.guarded) {
+        const epoch = fill.epoch orelse return metadata;
+        if (comptime @hasDecl(Index, "cacheMetadataIfFillCurrent")) {
+            return try self.cacheMetadataIfFillCurrent(vector_id, metadata, epoch);
+        }
+        return metadata;
+    }
+    return try self.cacheMetadata(vector_id, metadata);
 }
 
 fn borrowCachedVectorHandle(self: anytype, vector_id: u64) ?CachedVectorReadHandle(@TypeOf(self)) {
@@ -382,9 +433,10 @@ fn loadNodeReadHandleProfiledWithCachePolicy(
     profile.node_cache_lookup_ns += elapsed_fn(lookup_start);
 
     const start = now_fn();
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     var loaded = try loadSearchNodeFromStorage(self, txn, node_id);
     errdefer loaded.deinit(self.alloc);
-    if (use_cache) try self.cacheSearchNode(&loaded);
+    if (use_cache) try cacheSearchNodeAfterLoad(self, &loaded, fill);
     profile.node_cache_miss_ns += elapsed_fn(start);
     profile.node_cache_misses += 1;
     return .{ .owned = loaded };
@@ -408,9 +460,10 @@ fn loadNodeReadHandleWithCachePolicy(
         if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| return cached;
     }
 
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     var loaded = try loadSearchNodeFromStorage(self, txn, node_id);
     errdefer loaded.deinit(self.alloc);
-    if (use_cache) try self.cacheSearchNode(&loaded);
+    if (use_cache) try cacheSearchNodeAfterLoad(self, &loaded, fill);
     return .{ .owned = loaded };
 }
 
@@ -501,6 +554,7 @@ fn loadQuantizedReadHandleProfiledWithCachePolicy(
     }
 
     const start = now_fn();
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
         if (is_not_found(err) or err == error.Corrupted) return null;
         return err;
@@ -508,7 +562,7 @@ fn loadQuantizedReadHandleProfiledWithCachePolicy(
     profile.quantized_cache_miss_ns += elapsed_fn(start);
     profile.quantized_cache_misses += 1;
     if (use_cache and self.cache_enabled) {
-        self.cacheQuantized(node_id, &decoded) catch {};
+        cacheQuantizedAfterLoad(self, node_id, &decoded, fill) catch {};
     }
     return .{ .owned = decoded };
 }
@@ -544,12 +598,13 @@ pub fn loadQuantizedReadHandle(
         if (try self.getCachedQuantizedClone(node_id)) |valid| return .{ .owned = valid };
     }
 
+    const fill = searchCacheFillForTxn(self, txn);
     const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
         if (is_not_found(err) or err == error.Corrupted) return null;
         return err;
     };
     if (self.cache_enabled) {
-        self.cacheQuantized(node_id, &decoded) catch {};
+        cacheQuantizedAfterLoad(self, node_id, &decoded, fill) catch {};
     }
     return .{ .owned = decoded };
 }
@@ -935,11 +990,12 @@ fn loadMetadataRawWithCachePolicy(
         if (self.getCachedMetadata(vector_id)) |cached| return cached;
     }
     var key_buf: [10]u8 = undefined;
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     const data = self.getNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&key_buf, vector_id)) catch |err| {
         if (is_not_found(err)) return null;
         return err;
     };
-    return if (use_cache) try self.cacheMetadata(vector_id, data) else data;
+    return if (use_cache) try cacheMetadataAfterLoad(self, vector_id, data, fill) else data;
 }
 
 pub fn putMetadata(self: anytype, txn: anytype, vector_id: u64, metadata: []const u8) !void {
@@ -1969,6 +2025,7 @@ fn getMetadataManySortedInTxnWithScratchProfiled(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     const miss_start = if (now_fn_u64) |now| now() else 0;
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
         try txn.getManySorted(.vecs, key_views, values);
@@ -1984,7 +2041,7 @@ fn getMetadataManySortedInTxnWithScratchProfiled(
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
         out_metadata[lookups[i].item_index] = if (use_cache)
-            try self.cacheMetadata(lookups[i].vector_id, value)
+            try cacheMetadataAfterLoad(self, lookups[i].vector_id, value, fill)
         else
             value;
     }
@@ -2307,7 +2364,7 @@ fn searchProfiledRequestAttempt(
             self,
             &txn,
             transformed_query,
-            scratch,
+            &scratch_handle,
             &profile,
             coverage_policy,
             if (exhaustive_coverage) .{
@@ -2319,7 +2376,6 @@ fn searchProfiledRequestAttempt(
             now_fn_u64,
             elapsed_fn_u64,
         );
-        defer self.alloc.free(probes);
         const probe_count = probes.len;
         const initial_probe_limit = if (exhaustive_coverage)
             probe_count
@@ -4746,10 +4802,11 @@ fn populateMetadataBatchedWithScratch(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     try txn.getManySorted(.vecs, key_views, values);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
-        if (use_cache) _ = try self.cacheMetadata(lookups[i].vector_id, value);
+        if (use_cache) _ = try cacheMetadataAfterLoad(self, lookups[i].vector_id, value, fill);
         results.items.items[lookups[i].item_index].metadata = try self.alloc.dupe(u8, value);
     }
 }

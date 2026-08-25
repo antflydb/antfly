@@ -48,6 +48,17 @@ pub const CancellationToken = struct {
     }
 };
 
+/// One scored posting in the flat centroid frontier. This lives in the shared
+/// search types module so SearchScratch can own both the frontier and its merge
+/// workspace without introducing an import cycle with spfresh_index.
+pub const FlatCentroidProbe = struct {
+    posting_id: u64,
+    distance: f32,
+    error_bound: f32,
+    member_lower_bound: f32 = -std.math.inf(f32),
+    bound_resolved: bool = false,
+};
+
 pub const SearchResult = search_results.SearchResult;
 pub const SearchResults = search_results.SearchResults;
 

@@ -51,6 +51,8 @@ pub const SearchScratch = struct {
     vector_views: [][]const f32,
     distances: []f32,
     error_bounds: []f32,
+    flat_probes: []search_types.FlatCentroidProbe,
+    flat_probe_merge: []search_types.FlatCentroidProbe,
     coverage_members: []CoverageMember,
     coverage_visited_words: []usize,
 
@@ -91,6 +93,10 @@ pub const SearchScratch = struct {
         errdefer alloc.free(distances);
         const error_bounds = try alloc.alloc(f32, max_candidates);
         errdefer alloc.free(error_bounds);
+        const flat_probes = try alloc.alloc(search_types.FlatCentroidProbe, 0);
+        errdefer alloc.free(flat_probes);
+        const flat_probe_merge = try alloc.alloc(search_types.FlatCentroidProbe, 0);
+        errdefer alloc.free(flat_probe_merge);
         const coverage_members = try alloc.alloc(CoverageMember, 0);
         errdefer alloc.free(coverage_members);
         const coverage_visited_words = try alloc.alloc(usize, 0);
@@ -112,6 +118,8 @@ pub const SearchScratch = struct {
             .vector_views = vector_views,
             .distances = distances,
             .error_bounds = error_bounds,
+            .flat_probes = flat_probes,
+            .flat_probe_merge = flat_probe_merge,
             .coverage_members = coverage_members,
             .coverage_visited_words = coverage_visited_words,
         };
@@ -149,6 +157,13 @@ pub const SearchScratch = struct {
 
     pub fn ensureCoverageMemberCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
         if (self.coverage_members.len < needed) self.coverage_members = try alloc.realloc(self.coverage_members, needed);
+    }
+
+    pub fn ensureFlatProbeCapacity(self: *SearchScratch, alloc: Allocator, needed: usize, needs_merge: bool) !void {
+        if (self.flat_probes.len < needed) self.flat_probes = try alloc.realloc(self.flat_probes, needed);
+        if (needs_merge and self.flat_probe_merge.len < needed) {
+            self.flat_probe_merge = try alloc.realloc(self.flat_probe_merge, needed);
+        }
     }
 
     pub fn resetCoverageVisited(self: *SearchScratch, alloc: Allocator, node_count: u64) !void {
@@ -190,6 +205,8 @@ pub const SearchScratch = struct {
             byteLen(self.vector_views) +
             byteLen(self.distances) +
             byteLen(self.error_bounds) +
+            byteLen(self.flat_probes) +
+            byteLen(self.flat_probe_merge) +
             byteLen(self.coverage_members) +
             byteLen(self.coverage_visited_words);
     }
@@ -211,6 +228,8 @@ pub const SearchScratch = struct {
         alloc.free(self.vector_views);
         alloc.free(self.distances);
         alloc.free(self.error_bounds);
+        alloc.free(self.flat_probes);
+        alloc.free(self.flat_probe_merge);
         alloc.free(self.coverage_members);
         alloc.free(self.coverage_visited_words);
         self.* = undefined;
@@ -248,6 +267,18 @@ test "SearchScratch accounts coverage buffers and detects repeated nodes" {
     try std.testing.expect(scratch.markCoverageNodeVisited(130, 130));
     try std.testing.expect(!scratch.markCoverageNodeVisited(130, 130));
     try std.testing.expect(!scratch.markCoverageNodeVisited(131, 130));
+}
+
+test "SearchScratch accounts reusable flat frontier workspace" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 4, 2, 2);
+    defer scratch.deinit(alloc);
+
+    const bytes_before = scratch.bytes();
+    try scratch.ensureFlatProbeCapacity(alloc, 4_097, true);
+
+    try std.testing.expect(scratch.bytes() >= bytes_before +
+        2 * 4_097 * @sizeOf(search_types.FlatCentroidProbe));
 }
 
 fn estimateScratchBytes(scratch: *const quantizer.RaBitQuantizer.EstimateScratch) u64 {

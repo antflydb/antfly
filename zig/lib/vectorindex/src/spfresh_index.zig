@@ -66,13 +66,8 @@ pub const FlatCentroidDirectory = struct {
     }
 };
 
-pub const FlatCentroidProbe = struct {
-    posting_id: u64,
-    distance: f32,
-    error_bound: f32,
-    member_lower_bound: f32 = -std.math.inf(f32),
-    bound_resolved: bool = false,
-};
+pub const FlatCentroidProbe = search_types.FlatCentroidProbe;
+const cancellable_flat_sort_chunk_size: usize = 4_096;
 
 fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
@@ -153,8 +148,8 @@ fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
 }
 
 fn sortFlatProbesCancellable(
-    alloc: std.mem.Allocator,
     probes: []FlatCentroidProbe,
+    merge_buffer: []FlatCentroidProbe,
     cancellation: ?search_types.CancellationToken,
 ) !void {
     try checkCancellation(cancellation);
@@ -165,8 +160,7 @@ fn sortFlatProbesCancellable(
     // cancellable frontiers are sorted in bounded chunks and merged linearly;
     // this avoids heapsort's poor locality and O(n log n) work on already sorted
     // inputs while keeping cancellation latency independent of total index size.
-    const cancellable_chunk_size: usize = 4_096;
-    if (cancellation == null or probes.len <= cancellable_chunk_size) {
+    if (cancellation == null or probes.len <= cancellable_flat_sort_chunk_size) {
         std.mem.sort(FlatCentroidProbe, probes, {}, flatProbeLess);
         try checkCancellation(cancellation);
         return;
@@ -175,16 +169,15 @@ fn sortFlatProbesCancellable(
     var chunk_start: usize = 0;
     while (chunk_start < probes.len) {
         try checkCancellation(cancellation);
-        const chunk_end = chunk_start + @min(cancellable_chunk_size, probes.len - chunk_start);
+        const chunk_end = chunk_start + @min(cancellable_flat_sort_chunk_size, probes.len - chunk_start);
         std.mem.sort(FlatCentroidProbe, probes[chunk_start..chunk_end], {}, flatProbeLess);
         chunk_start = chunk_end;
     }
 
-    const merge_buffer = try alloc.alloc(FlatCentroidProbe, probes.len);
-    defer alloc.free(merge_buffer);
+    if (merge_buffer.len < probes.len) return error.BufferTooSmall;
     var source = probes;
     var destination = merge_buffer;
-    var run_width: usize = cancellable_chunk_size;
+    var run_width: usize = cancellable_flat_sort_chunk_size;
     while (run_width < probes.len) {
         try checkCancellation(cancellation);
         var start: usize = 0;
@@ -205,7 +198,7 @@ fn sortFlatProbesCancellable(
         var offset: usize = 0;
         while (offset < probes.len) {
             try checkCancellation(cancellation);
-            const end = offset + @min(cancellable_chunk_size, probes.len - offset);
+            const end = offset + @min(cancellable_flat_sort_chunk_size, probes.len - offset);
             @memcpy(probes[offset..end], source[offset..end]);
             offset = end;
         }
@@ -267,7 +260,7 @@ test "flat frontier cancellable sort preserves deterministic ordering" {
         .{ .posting_id = 1, .distance = 2, .error_bound = 0 },
         .{ .posting_id = 5, .distance = 1, .error_bound = 0 },
     };
-    try sortFlatProbesCancellable(std.testing.allocator, &probes, null);
+    try sortFlatProbesCancellable(&probes, &.{}, null);
     for (probes[0 .. probes.len - 1], probes[1..]) |lhs, rhs| {
         try std.testing.expect(!flatProbeLess({}, rhs, lhs));
     }
@@ -288,7 +281,7 @@ test "flat frontier scoring sort honors cancellation" {
     };
     try std.testing.expectError(
         error.Cancelled,
-        sortFlatProbesCancellable(std.testing.allocator, &probes, search_types.CancellationToken.fromAtomic(&cancelled)),
+        sortFlatProbesCancellable(&probes, &.{}, search_types.CancellationToken.fromAtomic(&cancelled)),
     );
 }
 
@@ -296,6 +289,8 @@ test "large cancellable flat frontier uses deterministic chunked merge" {
     const probe_count = 4_097;
     const probes = try std.testing.allocator.alloc(FlatCentroidProbe, probe_count);
     defer std.testing.allocator.free(probes);
+    const merge_buffer = try std.testing.allocator.alloc(FlatCentroidProbe, probe_count);
+    defer std.testing.allocator.free(merge_buffer);
     for (probes, 0..) |*probe, i| {
         const reverse_id: u64 = @intCast(probe_count - i);
         probe.* = .{
@@ -306,8 +301,8 @@ test "large cancellable flat frontier uses deterministic chunked merge" {
     }
     var cancelled = std.atomic.Value(bool).init(false);
     try sortFlatProbesCancellable(
-        std.testing.allocator,
         probes,
+        merge_buffer,
         search_types.CancellationToken.fromAtomic(&cancelled),
     );
     for (probes[0 .. probes.len - 1], probes[1..]) |lhs, rhs| {
@@ -689,7 +684,7 @@ pub fn selectFlatRabitqPostingsAlloc(
     self: anytype,
     txn: anytype,
     query: []const f32,
-    scratch: anytype,
+    scratch_handle: anytype,
     profile: *search_types.SearchProfile,
     coverage_policy: search_types.CoveragePolicy,
     expected_snapshot: ?PublishedSnapshot,
@@ -697,6 +692,7 @@ pub fn selectFlatRabitqPostingsAlloc(
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) ![]FlatCentroidProbe {
+    const scratch = &scratch_handle.scratch;
     const start = now_fn_u64();
     const directory = try acquireFlatCentroidDirectory(self, txn, expected_snapshot, cancellation);
     defer directory.release(self.alloc);
@@ -710,8 +706,15 @@ pub fn selectFlatRabitqPostingsAlloc(
         posting_count = std.math.add(usize, posting_count, block.posting_ids.len) catch return error.OutOfMemory;
     }
     std.debug.assert(posting_count == directory.posting_count);
-    const probes = try self.alloc.alloc(FlatCentroidProbe, posting_count);
-    errdefer self.alloc.free(probes);
+    const needs_merge = cancellation != null and posting_count > cancellable_flat_sort_chunk_size;
+    try scratch.ensureFlatProbeCapacity(self.alloc, posting_count, needs_merge);
+    const Index = comptime @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "refreshSearchScratchAccounting")) {
+        // Account both retained buffers before scoring starts so large flat
+        // frontiers are never invisible to resource telemetry/governance.
+        self.refreshSearchScratchAccounting(scratch_handle);
+    }
+    const probes = scratch.flat_probes[0..posting_count];
     var probe_count: usize = 0;
 
     for (directory.blocks) |*block| {
@@ -738,7 +741,7 @@ pub fn selectFlatRabitqPostingsAlloc(
     }
 
     std.debug.assert(probe_count == posting_count);
-    try sortFlatProbesCancellable(self.alloc, probes[0..probe_count], cancellation);
+    try sortFlatProbesCancellable(probes[0..probe_count], scratch.flat_probe_merge, cancellation);
     profile.approx_nodes_expanded += @intCast(directory.blocks.len);
     return probes;
 }
