@@ -8594,7 +8594,7 @@ test "serverless create index normalization resolves and persists one probed emb
     defer alloc.free(response);
     try ant_json.testing.expectEqualJsonText(
         alloc,
-        "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
+        "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
         response,
     );
 }

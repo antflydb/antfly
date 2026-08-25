@@ -15,7 +15,11 @@ T = TypeVar("T", bound="IndexReadinessStatus")
 class IndexReadinessStatus:
     """
     Attributes:
-        state (IndexReadinessState): Authoritative query-readiness state for the desired index incarnation.
+        state (IndexReadinessState): Authoritative query-readiness and completeness state for the desired index
+            incarnation.
+        queryable (bool): Whether the published generation can safely answer queries.
+        complete (bool): Whether the desired incarnation has complete coverage and publication according to its
+            configured policies.
         pending_reasons (list[str]): Stable, machine-readable blockers. Empty when state is ready.
         incarnation (str | Unset): Opaque identity for the desired index incarnation. Clients may compare it for
             equality but must not interpret its contents.
@@ -25,6 +29,8 @@ class IndexReadinessStatus:
     """
 
     state: IndexReadinessState
+    queryable: bool
+    complete: bool
     pending_reasons: list[str]
     incarnation: str | Unset = UNSET
     target_revision: int | Unset = UNSET
@@ -32,6 +38,10 @@ class IndexReadinessStatus:
 
     def to_dict(self) -> dict[str, Any]:
         state = self.state.value
+
+        queryable = self.queryable
+
+        complete = self.complete
 
         pending_reasons = self.pending_reasons
 
@@ -46,6 +56,8 @@ class IndexReadinessStatus:
         field_dict.update(
             {
                 "state": state,
+                "queryable": queryable,
+                "complete": complete,
                 "pending_reasons": pending_reasons,
             }
         )
@@ -63,6 +75,10 @@ class IndexReadinessStatus:
         d = dict(src_dict)
         state = IndexReadinessState(d.pop("state"))
 
+        queryable = d.pop("queryable")
+
+        complete = d.pop("complete")
+
         pending_reasons = cast(list[str], d.pop("pending_reasons"))
 
         incarnation = d.pop("incarnation", UNSET)
@@ -73,6 +89,8 @@ class IndexReadinessStatus:
 
         index_readiness_status = cls(
             state=state,
+            queryable=queryable,
+            complete=complete,
             pending_reasons=pending_reasons,
             incarnation=incarnation,
             target_revision=target_revision,

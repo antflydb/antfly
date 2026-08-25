@@ -934,7 +934,6 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         {
             "name": index_name,
             "type": "embeddings",
-            "publication_policy": "progressive",
             "field": "body",
             "dimension": 3,
             "execution": {"embedding": {"batch_items": 1}},
@@ -946,6 +945,8 @@ def test_progressive_index_is_semantically_queryable_before_full_coverage(
         },
     )
     assert_created_index(created, index_name, "embeddings")
+    # The public quickstart omits the policy. Verify the API and runtime apply
+    # the v0.2 default instead of relying on an explicit test-only override.
     assert created["publication_policy"] == "progressive"
     backup_api.wait_index_ready(table_name, index_name, timeout_s=30.0)
 

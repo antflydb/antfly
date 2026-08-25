@@ -6086,20 +6086,14 @@ pub const DB = struct {
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.overwrite_probe_ns, overwrite_probe_start_ns);
         }
 
-        // A semantic no-op must also avoid rewriting the primary document and
-        // timestamp records. Besides needless WAL/LSM churn, such writes can
-        // schedule storage maintenance while an external-vector generation is
-        // settling. The batch remains successful and is still mirrored as a
-        // source mutation; only its identical local values are elided.
+        // A semantic no-op may avoid rewriting the primary document and
+        // derived journal. Keep its timestamp write: timestamps are observable
+        // write metadata and, when a TTL field is absent, define the document's
+        // expiry baseline. This preserves logical-write and TTL-refresh
+        // semantics without paying the much larger source/derived replay cost.
         for (overwrite_probe_entries.items) |entry| {
             if (derived_changed_flags[entry.write_index]) continue;
             removePendingStoreWriteByKey(&store_writes, entry.key);
-            const source_key = effective_req.writes[entry.write_index].key;
-            if (shouldWriteTimestamp(source_key)) {
-                const timestamp_key = try makeTimestampKey(self.alloc, source_key);
-                defer self.alloc.free(timestamp_key);
-                removeOwnedPendingStoreWriteByKey(self.alloc, &timestamp_writes, timestamp_key);
-            }
         }
 
         for (effective_req.graph_writes) |graph_write| {
@@ -6631,16 +6625,6 @@ pub const DB = struct {
         for (writes.items, 0..) |write, i| {
             if (!std.mem.eql(u8, write.key, key)) continue;
             _ = writes.orderedRemove(i);
-            return;
-        }
-    }
-
-    fn removeOwnedPendingStoreWriteByKey(alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore_mod.KVPair), key: []const u8) void {
-        for (writes.items, 0..) |write, i| {
-            if (!std.mem.eql(u8, write.key, key)) continue;
-            const removed = writes.orderedRemove(i);
-            alloc.free(@constCast(removed.key));
-            alloc.free(@constCast(removed.value));
             return;
         }
     }
@@ -85464,6 +85448,32 @@ test "db writes and reads timestamp metadata" {
 
     try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, first_doc));
     try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_101), try db.getTimestamp(alloc, second_doc));
+}
+
+test "db identical rewrite refreshes timestamp metadata" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const document = "{\"title\":\"alpha\"}";
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = document }},
+        .timestamp_ns = 100,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = document }},
+        .timestamp_ns = 200,
+    });
+
+    try std.testing.expectEqual(@as(u64, 200), try db.getTimestamp(alloc, "doc:a"));
+    const stored = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(document, stored);
 }
 
 test "db lookup hides expired documents when ttl schema is configured" {

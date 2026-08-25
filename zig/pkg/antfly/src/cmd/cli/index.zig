@@ -888,6 +888,8 @@ fn fatalWaitTimeout(timeout_ms: u64, index_name: []const u8, last_state: []const
 
 fn canonicalWaitState(state: []const u8) []const u8 {
     const known = [_][]const u8{
+        "pending",
+        "queryable_partial",
         "ready",
         "running",
         "retrying",
@@ -901,6 +903,12 @@ fn canonicalWaitState(state: []const u8) []const u8 {
     };
     for (known) |value| if (std.mem.eql(u8, state, value)) return value;
     return "other";
+}
+
+test "index wait preserves public readiness states in diagnostics" {
+    try std.testing.expectEqualStrings("pending", canonicalWaitState("pending"));
+    try std.testing.expectEqualStrings("queryable_partial", canonicalWaitState("queryable_partial"));
+    try std.testing.expectEqualStrings("other", canonicalWaitState("future_state"));
 }
 
 fn parseDurationMs(raw: []const u8) !u64 {

@@ -97,6 +97,7 @@ def main() -> int:
         "2,477 of the 10,000",
         "full_text_index_v0",
         "antfly index wait --table wikipedia",
+        "--queryable",
         "physical chunks or vector",
         "## Troubleshooting",
         "standalone inference paths",
@@ -109,6 +110,15 @@ def main() -> int:
         fail("the quickstart must have exactly one shared Wikipedia ingestion step")
     if source.index("antfly load --table wikipedia") > source.index("## Search"):
         fail("the shared ingestion step must precede every search example")
+    wait_blocks = [
+        block
+        for language, block in blocks
+        if language in {"bash", "sh", "shell"} and "antfly index wait" in block
+    ]
+    if len(wait_blocks) < 2 or any("--queryable" not in block for block in wait_blocks):
+        fail("every quickstart index wait must stop at first safe queryability")
+    if "rg '" in source:
+        fail("quickstart troubleshooting must not require undeclared ripgrep tooling")
 
     for token in (
         "NewAntflyClient(\"http://localhost:8080\", http.DefaultClient)",
