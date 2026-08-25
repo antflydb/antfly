@@ -145,6 +145,11 @@ pub const ServerConfig = struct {
     /// the Server owns a private runtime whose listener, connection, and
     /// request-task lanes are sized to this configuration.
     http_runtime: ?*HttpRuntime = null,
+    /// Make that private runtime borrow `Server.io` for all execution lanes.
+    /// Deterministic/cooperative callers use this to prevent listener and
+    /// request work from escaping into hidden native Threaded executors. Such
+    /// callers must disable H1 disconnect cancellation or supply a probe.
+    borrow_http_runtime_io: bool = false,
     h1_disconnect_cancellation: H1DisconnectCancellation = .required,
     /// Required when disconnect cancellation runs on borrowed std.Io lanes.
     /// Native runtimes leave this null and use their descriptor observer.
@@ -1326,6 +1331,10 @@ pub const Server = struct {
                 .max_active_h1_requests = cfg.max_connections,
                 .max_active_connections = cfg.max_connections,
                 .max_active_requests = cfg.max_request_tasks,
+                .borrowed_io = if (cfg.borrow_http_runtime_io)
+                    .{ .listener = io, .connection = io, .request = io }
+                else
+                    null,
             }),
         };
     }

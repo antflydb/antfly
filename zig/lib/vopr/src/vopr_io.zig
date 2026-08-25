@@ -1932,6 +1932,30 @@ test "VoprIo modeled file surface supports deterministic iteration atomic replac
     try sim.ensureNoCapabilityViolation();
 }
 
+test "VoprIo file open options acquire and release locks" {
+    var sim = try VoprIo.init(.{ .required = .of(&.{.files}), .seed = 0x10cc });
+    defer sim.deinit();
+    const io = sim.io();
+
+    var exclusive = try std.Io.Dir.cwd().createFile(io, "open-options-lock", .{
+        .read = true,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    });
+    defer exclusive.close(io);
+    try std.testing.expectError(error.WouldBlock, std.Io.Dir.cwd().openFile(io, "open-options-lock", .{
+        .lock = .shared,
+        .lock_nonblocking = true,
+    }));
+
+    try exclusive.downgradeLock(io);
+    var shared = try std.Io.Dir.cwd().openFile(io, "open-options-lock", .{
+        .lock = .shared,
+        .lock_nonblocking = true,
+    });
+    shared.close(io);
+}
+
 test "VoprIo stream sockets expose packet delivery and waiter wake choices" {
     const Shared = struct {
         io: std.Io,

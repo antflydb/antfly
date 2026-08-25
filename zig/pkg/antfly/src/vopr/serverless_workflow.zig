@@ -20,6 +20,7 @@ const wal_mod = @import("../serverless/wal/mod.zig");
 const catalog_mod = @import("../serverless/catalog/mod.zig");
 const build_mod = @import("../serverless/build/mod.zig");
 const api_mod = @import("../serverless/api/mod.zig");
+const api_codec = @import("../serverless/api/codec.zig");
 const query_mod = @import("../serverless/query/mod.zig");
 const document_segment = @import("../serverless/document_segment/mod.zig");
 const runtime_manager = @import("../serverless/runtime/manager.zig");
@@ -28,7 +29,7 @@ const maintenance_cancellation = @import("../serverless/maintenance_cancellation
 
 pub const Scenario = struct {
     pub const name: []const u8 = "serverless-workflow-production-recovery";
-    pub const version: u32 = 3;
+    pub const version: u32 = 4;
 
     const no_lost_documents_id = vopr.id.stable(name, "no-lost-documents");
     const catalog_visible_id = vopr.id.stable(name, "catalog-visible-after-cutover");
@@ -37,6 +38,7 @@ pub const Scenario = struct {
     const duplicate_serialized_id = vopr.id.stable(name, "duplicate-workers-serialized");
     const recovery_id = vopr.id.stable(name, "interrupted-workflow-recovers");
     const compacted_id = vopr.id.stable(name, "compaction-publishes-complete-head");
+    const generation_fenced_id = vopr.id.stable(name, "stale-enrichment-generation-preserves-documents");
 
     pub const properties = &[_]vopr.property.Declaration{
         .{ .id = no_lost_documents_id, .name = name ++ ".no-lost-documents", .kind = .always },
@@ -46,6 +48,7 @@ pub const Scenario = struct {
         .{ .id = duplicate_serialized_id, .name = name ++ ".duplicate-workers-serialized", .kind = .always },
         .{ .id = recovery_id, .name = name ++ ".interrupted-workflow-recovers", .kind = .reachable },
         .{ .id = compacted_id, .name = name ++ ".compaction-publishes-complete-head", .kind = .reachable },
+        .{ .id = generation_fenced_id, .name = name ++ ".stale-enrichment-generation-preserves-documents", .kind = .always },
     };
 
     const Mode = enum {
@@ -58,6 +61,7 @@ pub const Scenario = struct {
         retry,
         crash_recovery,
         compaction_crash,
+        stale_enrichment_generation,
     };
 
     const mode_ids = [_]vopr.id.StableId{
@@ -70,6 +74,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "retry"),
         vopr.id.stable(name, "crash-recovery"),
         vopr.id.stable(name, "compaction-crash"),
+        vopr.id.stable(name, "stale-enrichment-generation"),
     };
     const mode_names = [_][]const u8{
         name ++ ".clean",
@@ -81,11 +86,16 @@ pub const Scenario = struct {
         name ++ ".retry",
         name ++ ".crash_recovery",
         name ++ ".compaction_crash",
+        name ++ ".stale_enrichment_generation",
     };
 
-    const State = struct {
+    /// Reusable production serverless owner graph. Full-cluster campaigns may
+    /// borrow their shared VoprIo so worker clocks and any spawned maintenance
+    /// tasks participate in the same history as clients and data nodes.
+    pub const Fixture = struct {
         alloc: std.mem.Allocator,
-        sim: vopr.vopr_io.VoprIo,
+        owned_sim: ?vopr.vopr_io.VoprIo,
+        sim: *vopr.vopr_io.VoprIo,
         memory: objectstore.MemoryClient,
         artifact_faults: objectstore.ScriptedFaultClient,
         manifest_faults: objectstore.ScriptedFaultClient,
@@ -120,17 +130,33 @@ pub const Scenario = struct {
         final_head: u64 = 0,
         visible_document_mask: u8 = 0,
         compacted: bool = false,
+        generation_fenced: bool = true,
 
-        fn init(alloc: std.mem.Allocator) !*State {
-            const self = try alloc.create(State);
+        fn init(alloc: std.mem.Allocator) !*Fixture {
+            const self = try alloc.create(Fixture);
             errdefer alloc.destroy(self);
             self.alloc = alloc;
-            self.sim = try vopr.vopr_io.VoprIo.init(.{
+            self.owned_sim = try vopr.vopr_io.VoprIo.init(.{
                 .seed = 0x5352564c,
                 .realtime_ns = 1_000,
                 .instrumentation = .{ .enabled = false, .map_digest = 0x5352564c },
             });
-            errdefer self.sim.deinit();
+            errdefer self.owned_sim.?.deinit();
+            self.sim = &self.owned_sim.?;
+            return try self.initStores();
+        }
+
+        pub fn initWithVoprIo(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*Fixture {
+            const self = try alloc.create(Fixture);
+            errdefer alloc.destroy(self);
+            self.alloc = alloc;
+            self.owned_sim = null;
+            self.sim = sim;
+            return try self.initStores();
+        }
+
+        fn initStores(self: *Fixture) !*Fixture {
+            const alloc = self.alloc;
             self.memory = objectstore.MemoryClient.init(alloc);
             errdefer self.memory.deinit();
             self.artifact_faults = objectstore.ScriptedFaultClient.init(alloc, self.memory.client());
@@ -230,6 +256,7 @@ pub const Scenario = struct {
             self.final_head = 0;
             self.visible_document_mask = 0;
             self.compacted = false;
+            self.generation_fenced = true;
 
             try self.initRuntime("worker-primary");
             errdefer self.runtime.deinit();
@@ -242,7 +269,7 @@ pub const Scenario = struct {
             return self;
         }
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *Fixture) void {
             if (self.runtime_live) self.runtime.deinit();
             self.query.deinit();
             self.catalog.deinit();
@@ -259,11 +286,11 @@ pub const Scenario = struct {
             self.manifest_faults.deinit();
             self.artifact_faults.deinit();
             self.memory.deinit();
-            self.sim.deinit();
+            if (self.owned_sim) |*owned| owned.deinit();
             self.alloc.destroy(self);
         }
 
-        fn initRuntime(self: *State, owner_id: []const u8) !void {
+        fn initRuntime(self: *Fixture, owner_id: []const u8) !void {
             self.runtime = runtime_manager.ManagedRuntime.initWithIo(
                 self.alloc,
                 self.sim.io(),
@@ -298,7 +325,7 @@ pub const Scenario = struct {
             self.runtime_live = true;
         }
 
-        fn restartRuntime(self: *State) !void {
+        fn restartRuntime(self: *Fixture) !void {
             if (self.runtime_live) {
                 self.runtime.deinit();
                 self.runtime_live = false;
@@ -312,7 +339,7 @@ pub const Scenario = struct {
             try self.initRuntime("worker-recovery");
         }
 
-        fn ingest(self: *State, doc_id: []const u8, body: []const u8, timestamp_ns: u64) !void {
+        fn ingest(self: *Fixture, doc_id: []const u8, body: []const u8, timestamp_ns: u64) !void {
             const mutations = [_]api_mod.DocumentMutation{.{
                 .kind = .upsert,
                 .doc_id = doc_id,
@@ -326,9 +353,9 @@ pub const Scenario = struct {
             result.deinit(self.alloc);
         }
 
-        fn runFirstPublication(self: *State) !void {
+        fn runFirstPublication(self: *Fixture) !void {
             switch (self.mode) {
-                .clean, .compaction_crash => {
+                .clean, .compaction_crash, .stale_enrichment_generation => {
                     _ = try self.runtime.runOnce();
                 },
                 .duplicate_workers => {
@@ -390,14 +417,14 @@ pub const Scenario = struct {
             try std.testing.expectEqual(@as(u64, 1), try self.progress.getHead("docs"));
         }
 
-        fn expectInterrupted(self: *State, expected: anyerror) !void {
+        fn expectInterrupted(self: *Fixture, expected: anyerror) !void {
             if (self.runtime.runOnce()) |_| return error.ExpectedWorkflowInterruption else |err| {
                 if (err != expected) return err;
                 self.first_attempt_interrupted = true;
             }
         }
 
-        fn runSecondPublicationAndCompaction(self: *State) !void {
+        fn runSecondPublicationAndCompaction(self: *Fixture) !void {
             try self.ingest("doc-b", "beta gamma", 200);
             if (self.mode == .lease_takeover) {
                 var stale = (try build_mod.work_lease.acquireHeld(
@@ -522,7 +549,7 @@ pub const Scenario = struct {
             if (self.final_head == 3) self.compacted = true;
         }
 
-        fn observeVisibility(self: *State) !void {
+        fn observeVisibility(self: *Fixture) !void {
             var status = try self.catalog.buildStatus("docs");
             defer status.deinit(self.alloc);
             if (status.head_version != self.final_head or
@@ -548,7 +575,64 @@ pub const Scenario = struct {
             self.visible_document_mask = mask;
         }
 
-        fn run(self: *State) !void {
+        fn runStaleEnrichmentGeneration(self: *Fixture) !void {
+            try self.ingest("doc-a", "{\"text\":\"authoritative\"}", 100);
+            _ = try self.runtime.runOnce();
+            try std.testing.expectEqual(@as(u64, 1), try self.progress.getHead("docs"));
+
+            // Model a WAL-free external/metadata generation cutover after an
+            // enricher captured head 1 but before it appended its full-body
+            // derived mutation.
+            var generation_two = try self.manifests.getAlloc("docs", 1);
+            defer generation_two.deinit(self.alloc);
+            generation_two.version = 2;
+            try self.manifests.put(generation_two);
+            if (!try self.progress.compareAndSwapHead("docs", 1, 2))
+                return error.GenerationCutoverConflict;
+
+            const stale_mutation = try api_codec.encodeMutationAlloc(self.alloc, .{
+                .kind = .upsert,
+                .doc_id = "doc-a",
+                .body = "{\"text\":\"stale-derived-overwrite\"}",
+            });
+            defer self.alloc.free(stale_mutation);
+            if (try self.wal.appendIdempotentIfLatest(
+                "docs",
+                101,
+                stale_mutation,
+                "enrich-v1/1/1/0/1",
+                1,
+            ) != 2) return error.StaleEnrichmentAppendNotRecorded;
+
+            var consumed = try self.builder.publishNamespace("docs");
+            defer consumed.deinit(self.alloc);
+            self.final_head = consumed.version;
+            if (!consumed.published or consumed.version != 3 or consumed.wal_end_lsn != 2)
+                return error.StaleEnrichmentNotConsumed;
+
+            var visible = try self.manifests.getAlloc("docs", 3);
+            defer visible.deinit(self.alloc);
+            const document_ref = for (visible.artifacts) |artifact| {
+                if (artifact.kind == .document_segment) break artifact;
+            } else return error.DocumentSegmentNotFound;
+            const payload = try self.artifacts.getAlloc(document_ref.artifact_id);
+            defer self.alloc.free(payload);
+            const entries = try document_segment.decodeAlloc(self.alloc, payload);
+            defer document_segment.freeEntries(self.alloc, entries);
+            self.generation_fenced = entries.len == 1 and
+                std.mem.eql(u8, entries[0].doc_id, "doc-a") and
+                std.mem.eql(u8, entries[0].body, "{\"text\":\"authoritative\"}");
+            self.visible_document_mask = @intFromBool(self.generation_fenced);
+            self.recovered = true;
+            self.complete = true;
+        }
+
+        fn run(self: *Fixture) !void {
+            if (self.mode == .stale_enrichment_generation) {
+                try self.runStaleEnrichmentGeneration();
+                try self.sim.ensureNoCapabilityViolation();
+                return;
+            }
             try self.ingest("doc-a", "alpha beta", 100);
             try self.runFirstPublication();
             try self.runSecondPublicationAndCompaction();
@@ -557,12 +641,22 @@ pub const Scenario = struct {
             self.recovered = true;
             self.complete = true;
         }
+
+        pub fn runClean(self: *Fixture) !void {
+            self.mode = .clean;
+            try self.run();
+        }
+
+        pub fn cleanWorkflowVisible(self: *const Fixture) bool {
+            return self.complete and self.recovered and self.final_head == 3 and
+                self.visible_document_mask == 3 and self.compacted;
+        }
     };
 
-    pub const World = struct { state: *State };
+    pub const World = struct { state: *Fixture };
 
     pub fn init(allocator: std.mem.Allocator) !World {
-        return .{ .state = try State.init(allocator) };
+        return .{ .state = try Fixture.init(allocator) };
     }
 
     pub fn deinit(world: *World, _: std.mem.Allocator) void {
@@ -611,7 +705,7 @@ pub const Scenario = struct {
     ) !void {
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(world.state.complete));
         try builder.addNamed(allocator, name ++ ".head", @intCast(world.state.final_head));
-        try builder.addNamed(allocator, name ++ ".documents", world.state.visible_document_mask);
+        try builder.addNamed(allocator, name ++ ".documents", @intCast(world.state.visible_document_mask));
         try builder.addNamed(allocator, name ++ ".interrupted", @intFromBool(world.state.first_attempt_interrupted));
         try builder.addNamed(allocator, name ++ ".compacted", @intFromBool(world.state.compacted));
         try builder.addNamed(allocator, name ++ ".legacy-epoch-preserved", @intFromBool(world.state.legacy_epoch_preserved));
@@ -623,10 +717,11 @@ pub const Scenario = struct {
         allocator: std.mem.Allocator,
     ) !void {
         const state = world.state;
+        const expected_document_mask: u8 = if (state.mode == .stale_enrichment_generation) 1 else 3;
         try sink.check(
             allocator,
             no_lost_documents_id,
-            !state.complete or state.visible_document_mask == 3,
+            !state.complete or state.visible_document_mask == expected_document_mask,
         );
         try sink.check(
             allocator,
@@ -649,18 +744,26 @@ pub const Scenario = struct {
             state.mode != .duplicate_workers or state.duplicate_blocked,
         );
         try sink.check(allocator, recovery_id, state.complete and state.recovered);
-        try sink.check(allocator, compacted_id, state.complete and state.compacted);
+        try sink.check(allocator, compacted_id, state.complete and
+            (state.mode == .stale_enrichment_generation or state.compacted));
+        try sink.check(
+            allocator,
+            generation_fenced_id,
+            state.mode != .stale_enrichment_generation or state.generation_fenced,
+        );
     }
 
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
         const state = world.state;
+        const expected_document_mask: u8 = if (state.mode == .stale_enrichment_generation) 1 else 3;
         return state.sim.healthSnapshot(.{
             .progress_expected = true,
             .progress_units = state.final_head + @popCount(state.visible_document_mask),
             .recovery_expected = state.mode != .clean,
             .recovery_complete = state.complete and state.recovered,
             .consistency_valid = !state.complete or
-                (state.visible_document_mask == 3 and state.final_head == 3 and state.compacted),
+                (state.visible_document_mask == expected_document_mask and state.final_head == 3 and
+                    (state.mode == .stale_enrichment_generation or state.compacted) and state.generation_fenced),
             .cleanup_complete = state.complete and !state.runtime_live,
         });
     }
@@ -682,7 +785,7 @@ test "complete serverless workflow VOPR exact replays claim build compact publis
                 .system = "antfly",
                 .transition_budget = 1,
                 .backend_ids = &backend_ids,
-                .source_revision = "serverless-workflow-vopr-v3",
+                .source_revision = "serverless-workflow-vopr-v4",
                 .target = "native",
                 .optimize = @tagName(@import("builtin").mode),
             },

@@ -336,6 +336,7 @@ pub const BackendRuntime = struct {
     retired_generation_cleanup_owner_id: u64,
     owner_registry: *OwnerRegistry,
     native_storage_pool: *storage_io.NativeStoragePool,
+    borrowed_storage: ?storage_io.IoStorage = null,
     io_impl: ?*IoImpl = null,
     raft_inbound_io_impl: ?*IoImpl = null,
     raft_outbound_io_impl: ?*IoImpl = null,
@@ -385,6 +386,7 @@ pub const BackendRuntime = struct {
             .native_storage_pool = native_storage_pool,
             .durable_jobs = undefined,
             .borrowed_io = config.borrowed_io,
+            .borrowed_storage = if (config.borrowed_io) |borrowed| storage_io.IoStorage.init(borrowed.general) else null,
         };
         runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
 
@@ -486,6 +488,11 @@ pub const BackendRuntime = struct {
 
     pub fn nativeStoragePool(self: *BackendRuntime) *storage_io.NativeStoragePool {
         return self.native_storage_pool;
+    }
+
+    pub fn storage(self: *BackendRuntime) ?storage_io.Storage {
+        if (self.borrowed_storage) |*borrowed| return borrowed.storage();
+        return null;
     }
 
     pub fn snapshotNativeStorageStats(self: *const BackendRuntime) storage_io.NativeStorageStats {

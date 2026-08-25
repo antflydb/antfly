@@ -9,7 +9,7 @@ const vopr = @import("vopr");
 const lifecycle = @import("../storage/db/generation_lifecycle.zig");
 
 pub const Scenario = struct {
-    pub const name = "generation-lifecycle";
+    pub const name: []const u8 = "generation-lifecycle";
     pub const version: u32 = 1;
 
     const sound_id = vopr.id.stable(name, "publication-remains-recoverable");
@@ -124,8 +124,8 @@ pub const Scenario = struct {
                     defer staged.deinit();
                     try self.writePayload(staged.path(), "retry");
                     self.sim.failNextFileRename();
-                    staged.publish() catch |err| {
-                        if (err != error.InputOutput) return err;
+                    _ = staged.publish() catch |err| {
+                        if (err != error.HardwareFailure) return err;
                         const outcome = try staged.publish();
                         self.sound = outcome == .durable and try self.payloadEquals(path, "retry");
                         self.progress += 1;
@@ -259,7 +259,7 @@ pub const Scenario = struct {
     }
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
-        try builder.addNamed(allocator, name ++ ".progress", world.state.progress);
+        try builder.addNamed(allocator, name ++ ".progress", @intCast(world.state.progress));
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(world.state.complete));
     }
 

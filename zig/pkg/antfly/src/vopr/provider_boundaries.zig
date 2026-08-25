@@ -120,7 +120,8 @@ pub const Scenario = struct {
             self.cancellation_checks += 1;
             // Let the production boundary enter the adapter, then cancel at
             // the adapter's first explicit context check.
-            return self.cancellation_checks >= if (self.mode == .inference_cancel) 2 else 1;
+            const threshold: u32 = if (self.mode == .inference_cancel) 2 else 1;
+            return self.cancellation_checks >= threshold;
         }
 
         fn denseFallback(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
@@ -387,7 +388,7 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(state.complete));
         try builder.addNamed(allocator, name ++ ".inference-attempts", state.inference_attempts);
         try builder.addNamed(allocator, name ++ ".postgres-attempts", state.postgres_attempts);
-        try builder.addNamed(allocator, name ++ ".admission-in-flight", state.inference_admission.stats().in_flight + state.postgres_admission.stats().in_flight);
+        try builder.addNamed(allocator, name ++ ".admission-in-flight", @intCast(state.inference_admission.stats().in_flight + state.postgres_admission.stats().in_flight));
     }
 
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
@@ -435,7 +436,7 @@ test "provider boundary VOPR exact replays inference and PostgreSQL adapter outc
             .optimize = @tagName(@import("builtin").mode),
         });
         defer recorded.deinit();
-        try std.testing.expectEqual(@as(u64, 0), recorded.summary.property_failures);
+        try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
         for (0..3) |_| {
             var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &recorded);
             replayed.deinit();

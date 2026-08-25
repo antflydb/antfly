@@ -24,10 +24,11 @@ pub const ActiveRuntime = struct {
         client: httpx.ClientConfig = .{},
     };
 
-    client: ?httpx.Client = null,
-    transcribing_runtime: ?transcribing.Runtime = null,
-    readers_runtime: ?readers.Runtime = null,
-    synthesizing_runtime: ?synthesizing.Runtime = null,
+    alloc: ?std.mem.Allocator = null,
+    client: ?*httpx.Client = null,
+    transcribing_runtime: ?*transcribing.Runtime = null,
+    readers_runtime: ?*readers.Runtime = null,
+    synthesizing_runtime: ?*synthesizing.Runtime = null,
     previous_transcribing_runtime: ?*const transcribing.Runtime = null,
     previous_readers_runtime: ?*const readers.Runtime = null,
     previous_synthesizing_runtime: ?*const synthesizing.Runtime = null,
@@ -46,7 +47,7 @@ pub const ActiveRuntime = struct {
         cfg: ?*const config_mod.Config,
         options: Options,
     ) !ActiveRuntime {
-        var out = ActiveRuntime{};
+        var out = ActiveRuntime{ .alloc = alloc };
         const loaded = cfg orelse return out;
         const has_transcribing = loaded.transcribers.defaultProviderName() != null;
         const has_readers = loaded.readers.defaultProviderName() != null;
@@ -58,25 +59,43 @@ pub const ActiveRuntime = struct {
         // Provider implementations and their shared client are one lifetime.
         // Teardown must interrupt and drain requests before freeing either.
         client_config.cancel_in_flight_on_shutdown = true;
-        out.client = httpx.Client.initWithConfig(alloc, io, client_config);
-        errdefer if (out.client) |*client| client.deinit();
+        out.client = try alloc.create(httpx.Client);
+        out.client.?.* = httpx.Client.initWithConfig(alloc, io, client_config);
+        errdefer if (out.client) |client| {
+            client.deinit();
+            alloc.destroy(client);
+        };
+        errdefer {
+            if (out.synthesizing_runtime) |runtime| {
+                runtime.deinit();
+                alloc.destroy(runtime);
+            }
+            if (out.readers_runtime) |runtime| {
+                runtime.deinit();
+                alloc.destroy(runtime);
+            }
+            if (out.transcribing_runtime) |runtime| {
+                runtime.deinit();
+                alloc.destroy(runtime);
+            }
+        }
 
         if (has_transcribing) {
-            out.transcribing_runtime = transcribing.Runtime.init(alloc);
-            errdefer if (out.transcribing_runtime) |*runtime| runtime.deinit();
-            try out.transcribing_runtime.?.loadFromRegistry(&out.client.?, &loaded.transcribers);
+            out.transcribing_runtime = try alloc.create(transcribing.Runtime);
+            out.transcribing_runtime.?.* = transcribing.Runtime.init(alloc);
+            try out.transcribing_runtime.?.loadFromRegistry(out.client.?, &loaded.transcribers);
         }
 
         if (has_readers) {
-            out.readers_runtime = readers.Runtime.init(alloc);
-            errdefer if (out.readers_runtime) |*runtime| runtime.deinit();
-            try out.readers_runtime.?.loadFromRegistry(&out.client.?, &loaded.readers);
+            out.readers_runtime = try alloc.create(readers.Runtime);
+            out.readers_runtime.?.* = readers.Runtime.init(alloc);
+            try out.readers_runtime.?.loadFromRegistry(out.client.?, &loaded.readers);
         }
 
         if (has_synthesizing) {
-            out.synthesizing_runtime = synthesizing.Runtime.init(alloc);
-            errdefer if (out.synthesizing_runtime) |*runtime| runtime.deinit();
-            try out.synthesizing_runtime.?.loadFromRegistry(&out.client.?, &loaded.text_to_speech);
+            out.synthesizing_runtime = try alloc.create(synthesizing.Runtime);
+            out.synthesizing_runtime.?.* = synthesizing.Runtime.init(alloc);
+            try out.synthesizing_runtime.?.loadFromRegistry(out.client.?, &loaded.text_to_speech);
         }
 
         // Publish the new registry set as one final, non-failing phase. A
@@ -84,15 +103,15 @@ pub const ActiveRuntime = struct {
         // active runtime untouched.
         if (out.transcribing_runtime != null) {
             out.previous_transcribing_runtime = transcribing.getActiveRuntime();
-            transcribing.setActiveRuntime(&out.transcribing_runtime.?);
+            transcribing.setActiveRuntime(out.transcribing_runtime.?);
         }
         if (out.readers_runtime != null) {
             out.previous_readers_runtime = readers.getActiveRuntime();
-            readers.setActiveRuntime(&out.readers_runtime.?);
+            readers.setActiveRuntime(out.readers_runtime.?);
         }
         if (out.synthesizing_runtime != null) {
             out.previous_synthesizing_runtime = synthesizing.getActiveRuntime();
-            synthesizing.setActiveRuntime(&out.synthesizing_runtime.?);
+            synthesizing.setActiveRuntime(out.synthesizing_runtime.?);
         }
 
         return out;
@@ -105,11 +124,24 @@ pub const ActiveRuntime = struct {
         if (self.readers_runtime != null) readers.setActiveRuntime(self.previous_readers_runtime);
         if (self.transcribing_runtime != null) transcribing.setActiveRuntime(self.previous_transcribing_runtime);
 
-        if (self.client) |*client| client.shutdown();
-        if (self.synthesizing_runtime) |*runtime| runtime.deinit();
-        if (self.readers_runtime) |*runtime| runtime.deinit();
-        if (self.transcribing_runtime) |*runtime| runtime.deinit();
-        if (self.client) |*client| client.deinit();
+        if (self.client) |client| client.shutdown();
+        const alloc = self.alloc.?;
+        if (self.synthesizing_runtime) |runtime| {
+            runtime.deinit();
+            alloc.destroy(runtime);
+        }
+        if (self.readers_runtime) |runtime| {
+            runtime.deinit();
+            alloc.destroy(runtime);
+        }
+        if (self.transcribing_runtime) |runtime| {
+            runtime.deinit();
+            alloc.destroy(runtime);
+        }
+        if (self.client) |client| {
+            client.deinit();
+            alloc.destroy(client);
+        }
         self.* = undefined;
     }
 };

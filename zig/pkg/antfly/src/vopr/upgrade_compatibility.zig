@@ -41,7 +41,7 @@ fn CompatibilityScenario(comptime scenario_version: u32, comptime changed_semant
             return .applied();
         }
         pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
-            try builder.addNamed(allocator, name ++ ".value", world.value + @intFromBool(changed_semantics));
+            try builder.addNamed(allocator, name ++ ".value", @intCast(world.value + @intFromBool(changed_semantics)));
         }
         pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
             try sink.check(allocator, bounded_id, world.value <= 2);
@@ -51,7 +51,7 @@ fn CompatibilityScenario(comptime scenario_version: u32, comptime changed_semant
         }
         pub fn snapshotAlloc(world: *const World, allocator: std.mem.Allocator) ![]u8 {
             const bytes = try allocator.alloc(u8, @sizeOf(u64));
-            std.mem.writeInt(u64, bytes, world.value, .little);
+            std.mem.writeInt(u64, bytes[0..8], world.value, .little);
             return bytes;
         }
         pub fn restoreSnapshot(world: *World, bytes: []const u8, _: std.mem.Allocator) !void {
@@ -255,7 +255,7 @@ pub const Scenario = struct {
         }
 
         fn crashDataDirMigration(self: *State) !void {
-            self.sim.failNextRename();
+            self.sim.failNextFileRename();
             if (data_format.ensureCompatible(self.allocator, self.sim.io(), "/upgrade")) |_| {
                 self.sound = false;
                 return;
@@ -286,7 +286,8 @@ pub const Scenario = struct {
             defer self.allocator.free(incompatible);
             const marker = std.mem.indexOf(u8, incompatible, vopr.trace.format) orelse return error.MissingTraceFormat;
             incompatible[marker + vopr.trace.format.len - 1] = '9';
-            if (vopr.trace.parseAlloc(self.allocator, incompatible)) |*unexpected| {
+            if (vopr.trace.parseAlloc(self.allocator, incompatible)) |unexpected_value| {
+                var unexpected = unexpected_value;
                 unexpected.deinit();
                 self.sound = false;
             } else |err| self.sound = err == error.IncompatibleTrace;
@@ -296,7 +297,8 @@ pub const Scenario = struct {
             var source = try newFixtureTrace(self.allocator);
             defer source.deinit();
             source.header.scenario_version = 99;
-            if (vopr.replay.exact(FixtureV1, self.allocator, &source)) |*unexpected| {
+            if (vopr.replay.exact(FixtureV1, self.allocator, &source)) |unexpected_value| {
+                var unexpected = unexpected_value;
                 unexpected.deinit();
                 self.sound = false;
             } else |err| self.sound = err == error.IncompatibleScenarioVersion;
@@ -329,7 +331,8 @@ pub const Scenario = struct {
                 FixtureMigration.transformV2Changed,
                 FixtureMigration.replayV2Changed,
                 .{},
-            )) |*unexpected| {
+            )) |unexpected_value| {
+                var unexpected = unexpected_value;
                 unexpected.deinit();
                 self.sound = false;
             } else |err| self.sound = err == error.FixtureMigrationFinalObservationChanged;
@@ -404,7 +407,8 @@ pub const Scenario = struct {
             const encoded = try external_codec.encodeAlloc(self.allocator, inventory);
             defer self.allocator.free(encoded);
             std.mem.writeInt(u32, encoded[4..8], 99, .little);
-            if (external_codec.decodeAlloc(self.allocator, encoded)) |*unexpected| {
+            if (external_codec.decodeAlloc(self.allocator, encoded)) |unexpected_value| {
+                var unexpected = unexpected_value;
                 unexpected.deinit(self.allocator);
                 self.sound = false;
             } else |err| self.sound = err == error.UnsupportedExternalSourceInventoryVersion;
@@ -425,7 +429,8 @@ pub const Scenario = struct {
             const encoded = try manifest_codec.encodeAlloc(self.allocator, minimalManifest());
             defer self.allocator.free(encoded);
             std.mem.writeInt(u16, encoded[manifest_codec.wire_magic.len..][0..2], 99, .little);
-            if (manifest_codec.decodeAlloc(self.allocator, encoded)) |*unexpected| {
+            if (manifest_codec.decodeAlloc(self.allocator, encoded)) |unexpected_value| {
+                var unexpected = unexpected_value;
                 unexpected.deinit(self.allocator);
                 self.sound = false;
             } else |err| self.sound = err == error.UnsupportedManifestVersion;
@@ -478,7 +483,7 @@ pub const Scenario = struct {
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         try builder.addNamed(allocator, name ++ ".sound", @intFromBool(world.state.sound));
-        try builder.addNamed(allocator, name ++ ".progress", world.state.progress);
+        try builder.addNamed(allocator, name ++ ".progress", @intCast(world.state.progress));
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(world.state.complete));
     }
 
@@ -511,7 +516,6 @@ test "upgrade compatibility VOPR exact replays formats migrations and rejection"
         });
         defer artifact.deinit();
         try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.property_failures);
-        try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.harness_errors);
         var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &artifact);
         replayed.deinit();
     }

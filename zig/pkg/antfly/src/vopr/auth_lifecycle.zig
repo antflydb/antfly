@@ -9,6 +9,7 @@ const std = @import("std");
 const casbin = @import("antfly_casbin");
 const vopr = @import("vopr");
 const usermgr = @import("../usermgr/user_manager.zig");
+const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Hook = struct {
     vopr_io: *vopr.vopr_io.VoprIo,
@@ -67,8 +68,20 @@ pub const Scenario = struct {
         vopr.id.stable(name, "crash-between-user-and-policy"),
         vopr.id.stable(name, "seed-capture"),
     };
+    const mode_names = [_][]const u8{
+        name ++ ".password-rotate",
+        name ++ ".api-key-rotate",
+        name ++ ".permission-change",
+        name ++ ".row-filter-change",
+        name ++ ".revoke-with-stale-reader",
+        name ++ ".durable-reload",
+        name ++ ".crash-between-user-and-policy",
+        name ++ ".seed-capture",
+    };
 
     const State = struct {
+        owner_allocator: std.mem.Allocator,
+        fixture_allocator: FixtureAllocator,
         allocator: std.mem.Allocator,
         sim: vopr.vopr_io.VoprIo,
         store: usermgr.MemoryStore,
@@ -96,7 +109,11 @@ pub const Scenario = struct {
         fn reach(ptr: *anyopaque, event: usermgr.AuthLifecycleEvent) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.lifecycle_calls += 1;
-            try self.sim.safepoint(Hook.stableId(event));
+            // Most modes invoke one production mutation as the selected VOPR
+            // transition itself. The seed-capture mode deliberately runs two
+            // child tasks and therefore enables scheduler-visible lifecycle
+            // suspension within those tasks.
+            if (self.mode == .seed_capture) try self.sim.safepoint(Hook.stableId(event));
             if (self.inject_user_crash and event.phase == .user_persisted) {
                 self.inject_user_crash = false;
                 return error.InjectedAuthCrash;
@@ -183,17 +200,20 @@ pub const Scenario = struct {
             try scheduler.executeReady(capture_transition.id, &events, self.allocator);
             if (!self.seed_capture_acquired) return error.SeedCaptureTaskDidNotAcquire;
 
-            enabled.items.clearRetainingCapacity();
-            try scheduler.enumerateReady(&enabled, self.allocator);
-            try enabled.canonicalize();
-            var mutation_transition: ?vopr.transition.Transition = null;
-            for (enabled.items.items) |candidate| {
-                if (candidate.actor_id != capture_actor and std.mem.eql(u8, candidate.name, "sim-io.task_resume")) {
-                    mutation_transition = candidate;
-                    break;
+            var mutation_steps: usize = 0;
+            while (!self.seed_mutation_started and mutation_steps < 8) : (mutation_steps += 1) {
+                enabled.items.clearRetainingCapacity();
+                try scheduler.enumerateReady(&enabled, self.allocator);
+                try enabled.canonicalize();
+                var mutation_transition: ?vopr.transition.Transition = null;
+                for (enabled.items.items) |candidate| {
+                    if (candidate.actor_id != capture_actor) {
+                        mutation_transition = candidate;
+                        break;
+                    }
                 }
+                try scheduler.executeReady((mutation_transition orelse return error.SeedMutationTaskNotRunnable).id, &events, self.allocator);
             }
-            try scheduler.executeReady((mutation_transition orelse return error.SeedMutationTaskNotRunnable).id, &events, self.allocator);
             if (!self.seed_mutation_started or self.seed_mutation_finished) return error.SeedMutationDidNotBlock;
 
             var transitions: usize = 0;
@@ -298,27 +318,35 @@ pub const Scenario = struct {
     pub fn init(allocator: std.mem.Allocator) !World {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.allocator = allocator;
-        state.sim = try vopr.vopr_io.VoprIo.init(.{ .seed = 0x41555448, .realtime_ns = 1_000_000 });
-        errdefer state.sim.deinit();
-        state.store = usermgr.MemoryStore.init(allocator);
-        errdefer state.store.deinit();
-        try state.store.users.append(allocator, .{
-            .username = try allocator.dupe(u8, "alice"),
-            .password_hash = try allocator.dupe(u8, "not-used-before-rotation"),
-            .metadata_json = try allocator.dupe(u8, "{\"tenant_id\":\"acme\"}"),
+        state.owner_allocator = allocator;
+        state.fixture_allocator = .init;
+        errdefer _ = state.fixture_allocator.deinit();
+        const fixture_allocator = state.fixture_allocator.allocator();
+        state.allocator = fixture_allocator;
+        state.sim = try vopr.vopr_io.VoprIo.init(.{
+            .seed = 0x41555448,
+            .realtime_ns = 1_000_000,
+            .instrumentation = .{ .enabled = true, .map_digest = 0x41555448 },
         });
-        state.policy_store = casbin.MemoryAdapter.init(allocator);
+        errdefer state.sim.deinit();
+        state.store = usermgr.MemoryStore.init(fixture_allocator);
+        errdefer state.store.deinit();
+        try state.store.users.append(fixture_allocator, .{
+            .username = try fixture_allocator.dupe(u8, "alice"),
+            .password_hash = try fixture_allocator.dupe(u8, "not-used-before-rotation"),
+            .metadata_json = try fixture_allocator.dupe(u8, "{\"tenant_id\":\"acme\"}"),
+        });
+        state.policy_store = casbin.MemoryAdapter.init(fixture_allocator);
         errdefer state.policy_store.deinit();
         state.manager = try usermgr.UserManager.initWithIo(
-            allocator,
+            fixture_allocator,
             state.sim.io(),
             state.store.iface(),
-            try usermgr.initDefaultEnforcer(allocator, state.policy_store.iface()),
+            try usermgr.initDefaultEnforcer(fixture_allocator, state.policy_store.iface()),
         );
         errdefer state.manager.deinit();
-        var read = try usermgr.Permission.initOwned(allocator, .table, "docs", .read);
-        defer read.deinit(allocator);
+        var read = try usermgr.Permission.initOwned(fixture_allocator, .table, "docs", .read);
+        defer read.deinit(fixture_allocator);
         try state.manager.addPermissionToUser("alice", read);
         state.mode = .password_rotate;
         state.complete = false;
@@ -337,21 +365,23 @@ pub const Scenario = struct {
         return .{ .state = state };
     }
 
-    pub fn deinit(world: *World, allocator: std.mem.Allocator) void {
+    pub fn deinit(world: *World, _: std.mem.Allocator) void {
         const state = world.state;
         state.manager.deinit();
         state.policy_store.deinit();
         state.store.deinit();
         state.sim.deinit();
-        allocator.destroy(state);
+        const owner_allocator = state.owner_allocator;
+        std.debug.assert(state.fixture_allocator.deinit() == .ok);
+        owner_allocator.destroy(state);
         world.* = undefined;
     }
 
     pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: std.mem.Allocator) !void {
         if (world.state.complete) return;
-        inline for (std.meta.tags(Mode), mode_ids) |mode, id| try list.append(allocator, .{
+        inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, mode_name| try list.append(allocator, .{
             .id = id,
-            .name = name ++ "." ++ @tagName(mode),
+            .name = mode_name,
             .kind = if (mode == .crash_between_user_and_policy) .fault else .workload,
         });
     }
@@ -370,7 +400,7 @@ pub const Scenario = struct {
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(world.state.complete));
-        try builder.addNamed(allocator, name ++ ".lifecycle-calls", world.state.lifecycle_calls);
+        try builder.addNamed(allocator, name ++ ".lifecycle-calls", @intCast(world.state.lifecycle_calls));
         try builder.addNamed(allocator, name ++ ".durable-agreement", @intFromBool(world.state.durable_agreement));
         try builder.addNamed(allocator, name ++ ".revoked-safe", @intFromBool(world.state.revoked_safe));
     }
@@ -416,7 +446,7 @@ test "user auth lifecycle VOPR exact replays rotate revoke reload and crash reco
             .optimize = @tagName(@import("builtin").mode),
         });
         defer recorded.deinit();
-        try std.testing.expectEqual(@as(u64, 0), recorded.summary.property_failures);
+        try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
         for (0..5) |_| {
             var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &recorded);
             replayed.deinit();

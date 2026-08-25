@@ -2894,7 +2894,8 @@ fn makeLsmBackgroundExecutor(runtime: *background_runtime_mod.BackendRuntime, ow
 }
 
 fn installLsmReadRuntime(options: *lsm_backend_mod.Options, runtime: *background_runtime_mod.BackendRuntime) void {
-    if (options.native_storage_pool == null) options.native_storage_pool = runtime.nativeStoragePool();
+    if (options.storage == null) options.storage = runtime.storage();
+    if (options.storage == null and options.native_storage_pool == null) options.native_storage_pool = runtime.nativeStoragePool();
     if (options.read_runtime != null) return;
     if (runtime.io()) |io| options.read_runtime = lsm_backend_mod.storage_io.ReadRuntime.init(io);
 }
@@ -3311,8 +3312,10 @@ pub const DB = struct {
                 });
                 break :blk_runtime owned_backend_runtime.?.runtime;
             };
+            if (opts.index_repair_checkpoint_storage == null)
+                opts.index_repair_checkpoint_storage = backend_runtime.storage();
             var effective_executor = opts.executor;
-            if (backend_runtime.io() == null and effective_executor.backend == .io_threaded) {
+            if ((backend_runtime.io() == null or backend_runtime.usesBorrowedIo()) and effective_executor.backend == .io_threaded) {
                 effective_executor.backend = .manual;
             }
             const backend_owner_id = try backend_runtime.allocOwnerId();

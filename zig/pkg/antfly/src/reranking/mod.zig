@@ -70,7 +70,10 @@ pub fn rerankDocumentsWithOptions(
             if (cfg.url.len == 0) {
                 if (options.antfly_provider) |local| {
                     if (local.rerank_texts) |rerank| {
-                        return try rerank(local.ptr, alloc, cfg.model, query, documents);
+                        const scores = try rerank(local.ptr, alloc, cfg.model, query, documents);
+                        errdefer alloc.free(scores);
+                        try validateScores(scores, documents.len);
+                        return scores;
                     }
                 }
             }
@@ -78,10 +81,16 @@ pub fn rerankDocumentsWithOptions(
             defer provider.deinit();
             var result = try provider.reranker().rerank(alloc, cfg.model, query, documents);
             defer result.deinit();
+            try validateScores(result.scores, documents.len);
             return try alloc.dupe(f32, result.scores);
         },
         else => return error.UnsupportedRerankerProvider,
     }
+}
+
+fn validateScores(scores: []const f32, document_count: usize) !void {
+    if (scores.len != document_count) return error.InvalidRerankerResponse;
+    for (scores) |score| if (!std.math.isFinite(score)) return error.InvalidRerankerResponse;
 }
 
 test "reranking runtime delegates to antfly provider" {

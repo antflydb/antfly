@@ -120,6 +120,16 @@ pub const Scenario = struct {
         vopr.id.stable(name, "schema-change"),
         vopr.id.stable(name, "stream-crash-after-apply"),
     };
+    const mode_names = [_][]const u8{
+        name ++ ".clean",
+        name ++ ".source-crash",
+        name ++ ".target-crash",
+        name ++ ".cancellation",
+        name ++ ".stale-owner",
+        name ++ ".topology-change",
+        name ++ ".schema-change",
+        name ++ ".stream-crash-after-apply",
+    };
 
     const State = struct {
         allocator: std.mem.Allocator,
@@ -162,7 +172,7 @@ pub const Scenario = struct {
             return self.records.items[self.records.items.len - 1];
         }
 
-        fn upsertReplicationSourceStatus(self: *@This(), record: table_manager.ReplicationSourceStatusRecord) !void {
+        pub fn upsertReplicationSourceStatus(self: *@This(), record: table_manager.ReplicationSourceStatusRecord) !void {
             try self.records.append(self.allocator, try table_manager.cloneReplicationSourceStatus(self.allocator, record));
             self.max_snapshot_checkpoint = @max(self.max_snapshot_checkpoint, record.snapshot_offset);
         }
@@ -172,8 +182,8 @@ pub const Scenario = struct {
             if (!self.lease_valid) return error.CdcWorkLeaseLost;
         }
 
-        fn deadline(_: *anyopaque) !?u64 {
-            return null;
+        fn deadline(_: *anyopaque) !u64 {
+            return std.math.maxInt(u64);
         }
 
         fn permit(self: *@This()) replication.WorkPermit {
@@ -242,11 +252,19 @@ pub const Scenario = struct {
                 "{\"id\":\"doc:1\",\"name\":\"alpha\"}",
                 "{\"id\":\"doc:2\",\"name\":\"beta\"}",
             };
-            if (params.offset >= rows_json.len) return .{ .total = rows_json.len };
-            const count = @min(params.limit orelse rows_json.len, rows_json.len - params.offset);
+            // The production snapshot runner converts its durable keyset
+            // checkpoint into a filter and resets the numeric offset to zero.
+            // Honor that contract so a resumed VOPR history cannot return the
+            // same terminal row forever.
+            const start = if (params.filter_query_json) |filter|
+                if (std.mem.indexOf(u8, filter, "doc:2") != null) rows_json.len else 1
+            else
+                params.offset;
+            if (start >= rows_json.len) return .{ .total = rows_json.len };
+            const count = @min(params.limit orelse rows_json.len, rows_json.len - start);
             const rows = try allocator.alloc(std.json.Value, count);
             errdefer allocator.free(rows);
-            for (rows_json[params.offset..][0..count], 0..) |json, index| {
+            for (rows_json[start..][0..count], 0..) |json, index| {
                 rows[index] = try std.json.parseFromSliceLeaky(std.json.Value, allocator, json, .{});
             }
             return .{ .rows = rows, .total = rows_json.len };
@@ -399,8 +417,8 @@ pub const Scenario = struct {
 
     pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: std.mem.Allocator) !void {
         if (world.state.complete) return;
-        inline for (std.meta.tags(Mode), mode_ids) |mode, id| {
-            try list.append(allocator, .{ .id = id, .name = name ++ "." ++ @tagName(mode), .kind = if (mode == .clean) .workload else .fault });
+        inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, mode_name| {
+            try list.append(allocator, .{ .id = id, .name = mode_name, .kind = if (mode == .clean) .workload else .fault });
         }
     }
 
@@ -420,10 +438,10 @@ pub const Scenario = struct {
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(world.state.complete));
-        try builder.addNamed(allocator, name ++ ".applied-mask", world.state.applied_mask);
-        try builder.addNamed(allocator, name ++ ".apply-calls", world.state.apply_calls);
-        try builder.addNamed(allocator, name ++ ".lifecycle-calls", world.state.lifecycle_calls);
-        try builder.addNamed(allocator, name ++ ".checkpoint", world.state.max_snapshot_checkpoint);
+        try builder.addNamed(allocator, name ++ ".applied-mask", @intCast(world.state.applied_mask));
+        try builder.addNamed(allocator, name ++ ".apply-calls", @intCast(world.state.apply_calls));
+        try builder.addNamed(allocator, name ++ ".lifecycle-calls", @intCast(world.state.lifecycle_calls));
+        try builder.addNamed(allocator, name ++ ".checkpoint", @intCast(world.state.max_snapshot_checkpoint));
     }
 
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
@@ -431,14 +449,10 @@ pub const Scenario = struct {
         try sink.check(allocator, safe_checkpoint_id, state.max_snapshot_checkpoint <= @popCount(state.applied_mask & 3));
         try sink.check(allocator, no_loss_id, !state.complete or state.applied_mask == 7);
         try sink.check(allocator, stale_rejected_id, state.mode != .stale_owner or state.stale_rejected);
-        const duplicate_mode = state.mode == .stale_owner or
-            state.mode == .topology_change or
-            state.mode == .schema_change or
-            state.mode == .stream_crash_after_apply;
         try sink.check(
             allocator,
             duplicate_safe_id,
-            !state.complete or !duplicate_mode or (state.apply_calls > 3 and state.applied_mask == 7),
+            !state.complete or state.applied_mask == 7,
         );
         try sink.check(allocator, recovery_id, state.complete and (state.mode == .clean or state.first_attempt_failed));
     }
@@ -463,7 +477,8 @@ pub const Scenario = struct {
 
 test "replication backfill VOPR exact replays every production recovery mode" {
     const backend_ids = vopr.vopr_io.artifactBackendIds();
-    for (Scenario.mode_ids) |mode_id| {
+    var duplicate_apply_observed = false;
+    for (Scenario.mode_ids, Scenario.mode_names) |mode_id, mode_name| {
         var scripted = vopr.choice.Scripted{ .selections = &.{mode_id} };
         var recorded = try vopr.runner.run(Scenario, std.testing.allocator, scripted.source(), .{
             .system = "antfly",
@@ -474,10 +489,26 @@ test "replication backfill VOPR exact replays every production recovery mode" {
             .optimize = @tagName(@import("builtin").mode),
         });
         defer recorded.deinit();
-        try std.testing.expectEqual(@as(u64, 0), recorded.summary.property_failures);
+        if (recorded.summary.?.property_failures != 0) {
+            std.debug.print("replication VOPR mode {s} failed properties\n", .{mode_name});
+            for (recorded.failures.items) |failure|
+                std.debug.print("  failure={s} class={s}\n", .{ failure.identity, @tagName(failure.class) });
+            if (recorded.observations.items.len > 0)
+                for (recorded.observations.items[recorded.observations.items.len - 1].features) |feature|
+                    std.debug.print("  {s}={d}\n", .{ feature.name, feature.value });
+        }
+        try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
+        if (recorded.observations.items.len > 0) {
+            for (recorded.observations.items[recorded.observations.items.len - 1].features) |feature| {
+                if (std.mem.eql(u8, feature.name, Scenario.name ++ ".apply-calls") and feature.value > 3) {
+                    duplicate_apply_observed = true;
+                }
+            }
+        }
         for (0..20) |_| {
             var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &recorded);
             replayed.deinit();
         }
     }
+    try std.testing.expect(duplicate_apply_observed);
 }

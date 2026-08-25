@@ -24,7 +24,7 @@ const archive_config =
 ;
 
 pub const Scenario = struct {
-    pub const name = "config-extension-lifecycle";
+    pub const name: []const u8 = "config-extension-lifecycle";
     pub const version: u32 = 1;
 
     const sound_id = vopr.id.stable(name, "publication-remains-sound");
@@ -105,12 +105,24 @@ pub const Scenario = struct {
             try put(store, self.allocator, "archive.secret", "ARCHIVE-SECRET");
         }
 
-        fn snapshotUses(facade: *scraping.RemoteContentConfig, name_value: []const u8, access: []const u8) bool {
+        fn snapshotUses(
+            self: *@This(),
+            facade: *scraping.RemoteContentConfig,
+            store: *secrets.FileStore,
+            name_value: []const u8,
+            access_reference: []const u8,
+            resolved_access: []const u8,
+        ) !bool {
             var snapshot = facade.acquire();
             defer snapshot.deinit();
-            if (!std.mem.eql(u8, snapshot.config.default_s3 orelse "", name_value)) return false;
+            const actual_name = snapshot.config.default_s3 orelse "";
+            if (!std.mem.eql(u8, actual_name, name_value)) return false;
             const credential = snapshot.config.getS3(name_value) orelse return false;
-            return std.mem.eql(u8, credential.access_key_id orelse "", access);
+            const actual_access = credential.access_key_id orelse "";
+            if (!std.mem.eql(u8, actual_access, access_reference)) return false;
+            const resolved = try secrets.resolveReferenceOwned(self.allocator, store, actual_access);
+            defer self.allocator.free(resolved);
+            return std.mem.eql(u8, resolved, resolved_access);
         }
 
         fn coldValid(self: *@This(), mode: Mode) !void {
@@ -127,7 +139,14 @@ pub const Scenario = struct {
             var facade = scraping.RemoteContentConfig{};
             runtime.attach(&facade);
             const health = runtime.health();
-            self.sound = health.generation == 1 and !health.stale_snapshot and snapshotUses(&facade, "primary", "PRIMARY-ACCESS");
+            const snapshot_sound = try self.snapshotUses(
+                &facade,
+                &store,
+                "primary",
+                "${secret:primary.access}",
+                "PRIMARY-ACCESS",
+            );
+            self.sound = health.generation == 1 and !health.stale_snapshot and snapshot_sound;
             self.progress += 1;
         }
 
@@ -141,6 +160,7 @@ pub const Scenario = struct {
                 self.sound = false;
             } else |err| {
                 self.sound = err == expected;
+                if (!self.sound) std.debug.print("cold config expected={} actual={}\n", .{ expected, err });
             }
             self.progress += 1;
         }
@@ -192,7 +212,13 @@ pub const Scenario = struct {
             var facade = scraping.RemoteContentConfig{};
             reopened_runtime.attach(&facade);
             self.sound = std.mem.eql(u8, archive_access.value, "ARCHIVE-ACCESS") and
-                snapshotUses(&facade, "primary", "PRIMARY-ACCESS");
+                try self.snapshotUses(
+                    &facade,
+                    &reopened_store,
+                    "primary",
+                    "${secret:primary.access}",
+                    "PRIMARY-ACCESS",
+                );
             self.progress += 2;
         }
 
@@ -215,17 +241,35 @@ pub const Scenario = struct {
 
             try self.writeFile(config_path, archive_config, true);
             const published = runtime.refreshIfChanged();
-            const archive_visible = snapshotUses(&facade, "archive", "ARCHIVE-ACCESS");
+            const archive_visible = try self.snapshotUses(
+                &facade,
+                &store,
+                "archive",
+                "${secret:archive.access}",
+                "ARCHIVE-ACCESS",
+            );
             try self.writeFile(config_path,
                 \\{"health_port":8081,"remote_content":{"default_s3":"missing","s3":{}}}
             , true);
             const rejected = !runtime.refreshIfChanged();
-            const retained = snapshotUses(&facade, "archive", "ARCHIVE-ACCESS");
+            const retained = try self.snapshotUses(
+                &facade,
+                &store,
+                "archive",
+                "${secret:archive.access}",
+                "ARCHIVE-ACCESS",
+            );
             const stale = runtime.health().stale_snapshot;
             try self.writeFile(config_path, primary_config, true);
             const recovered = runtime.refreshIfChanged();
             self.sound = published and archive_visible and rejected and retained and stale and recovered and
-                snapshotUses(&facade, "primary", "PRIMARY-ACCESS") and
+                try self.snapshotUses(
+                    &facade,
+                    &store,
+                    "primary",
+                    "${secret:primary.access}",
+                    "PRIMARY-ACCESS",
+                ) and
                 std.mem.eql(u8, held.config.default_s3 orelse "", "primary") and
                 !runtime.health().stale_snapshot;
             self.progress += 3;
@@ -268,7 +312,7 @@ pub const Scenario = struct {
                 return @as([*]extensions.PackageManifest, @ptrCast(&self.package))[0..1];
             }
 
-            fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
                 return .{
                     .status = .{ .metadata_group_id = 1, .metrics = .{} },
                     .tables = self.empty_tables[0..],
@@ -281,9 +325,9 @@ pub const Scenario = struct {
                 };
             }
 
-            fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+            pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
 
-            fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
+            pub fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
                 _ = command;
                 self.proposals += 1;
             }
@@ -296,7 +340,7 @@ pub const Scenario = struct {
                 .scope = .{ .kind = .cluster },
             });
             defer admin_installed.deinitOwned(self.allocator);
-            var dry_run = try extension_lifecycle.installOnServiceWithIo(&service, self.allocator, self.sim.io(), "preview", .{
+            var dry_run = try extension_lifecycle.installOnServiceWithIo(&service, self.allocator, self.sim.io(), "memoryaf", .{
                 .version = "1.0.0",
                 .scope = .{ .kind = .cluster },
                 .dry_run = true,
@@ -379,7 +423,7 @@ pub const Scenario = struct {
         fn run(self: *@This(), mode: Mode) !void {
             switch (mode) {
                 .cold_valid_config => try self.coldValid(mode),
-                .cold_malformed_config => try self.coldRejected(mode, "{", error.SyntaxError),
+                .cold_malformed_config => try self.coldRejected(mode, "{", error.UnexpectedEndOfInput),
                 .cold_partial_config => try self.coldRejected(mode,
                     \\{"health_port":8081,"remote_content":{"default_s3":"missing","s3":{}}}
                 , error.InvalidRemoteContentConfig),
@@ -444,7 +488,7 @@ pub const Scenario = struct {
     }
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
-        try builder.addNamed(allocator, name ++ ".progress", world.state.progress);
+        try builder.addNamed(allocator, name ++ ".progress", @intCast(world.state.progress));
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(world.state.complete));
     }
 
@@ -469,7 +513,7 @@ pub const Scenario = struct {
 
 test "config extension lifecycle VOPR exact replays cold start rotation refresh and activation" {
     const backend_ids = vopr.vopr_io.artifactBackendIds();
-    for (Scenario.mode_ids) |mode_id| {
+    for (Scenario.mode_ids, 0..) |mode_id, mode_ordinal| {
         var scripted = vopr.choice.Scripted{ .selections = &.{mode_id} };
         var artifact = try vopr.runner.run(Scenario, std.testing.allocator, scripted.source(), .{
             .system = "antfly",
@@ -477,6 +521,12 @@ test "config extension lifecycle VOPR exact replays cold start rotation refresh 
             .backend_ids = &backend_ids,
         });
         defer artifact.deinit();
+        if (artifact.summary.?.property_failures != 0) {
+            for (artifact.failures.items) |failure| std.debug.print(
+                "config extension mode={s} failure={s} class={s}\n",
+                .{ Scenario.mode_names[mode_ordinal], failure.identity, @tagName(failure.class) },
+            );
+        }
         try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.property_failures);
         var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &artifact);
         replayed.deinit();

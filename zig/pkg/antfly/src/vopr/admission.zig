@@ -218,11 +218,11 @@ test "resource admission VOPR composes request and multi-slice cancellation edge
     try std.testing.expectEqual(@as(usize, 3), shared.canceled);
     try std.testing.expectEqual(@as(usize, 1), shared.completed);
     try std.testing.expectEqual(@as(usize, 0), foreground.stats().in_flight);
-    try std.testing.expectEqual(@as(u64, 0), manager.memoryStats().used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_search_working_set).used_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.derived_replay_window).used_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.inference_scratch_working_set).used_bytes);
-    try std.testing.expectEqual(@as(u64, 0), manager.memoryStats().accounting_errors);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
     try sim.ensureNoCapabilityViolation();
 }
 
@@ -349,7 +349,7 @@ test "resource admission VOPR preserves foreground priority and bounded minimum 
     try std.testing.expect(shared.contender_denied);
     try std.testing.expect(shared.background_released);
     try std.testing.expect(shared.minimum_released);
-    try std.testing.expectEqual(@as(u64, 0), manager.memoryStats().used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_compaction_work).used_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.text_merge_buffers).used_bytes);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.dense_search_working_set).used_bytes);

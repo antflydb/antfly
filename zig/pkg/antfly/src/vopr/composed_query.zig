@@ -238,12 +238,12 @@ pub const Scenario = struct {
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, name ++ ".components", @as(u64, @intFromBool(state.text_complete)) |
+        try builder.addNamed(allocator, name ++ ".components", @intCast(@as(u64, @intFromBool(state.text_complete)) |
             (@as(u64, @intFromBool(state.vector_complete)) << 1) |
-            (@as(u64, @intFromBool(state.graph_complete)) << 2));
+            (@as(u64, @intFromBool(state.graph_complete)) << 2)));
         try builder.addNamed(allocator, name ++ ".published", @intFromBool(state.published));
         try builder.addNamed(allocator, name ++ ".cancelled", @intFromBool(state.cancelled));
-        try builder.addNamed(allocator, name ++ ".in-flight", state.admission.stats().in_flight);
+        try builder.addNamed(allocator, name ++ ".in-flight", @intCast(state.admission.stats().in_flight));
     }
 
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
@@ -261,7 +261,7 @@ pub const Scenario = struct {
         const state = world.state;
         return .{
             .progress_expected = true,
-            .progress_units = @intFromBool(state.text_complete) + @intFromBool(state.vector_complete) +
+            .progress_units = @as(u64, @intFromBool(state.text_complete)) + @intFromBool(state.vector_complete) +
                 @intFromBool(state.graph_complete) + @intFromBool(state.published),
             .recovery_expected = state.graph_failed or state.pressure_observed,
             .recovery_complete = state.done and state.admission.stats().in_flight == 0,
@@ -288,7 +288,7 @@ fn recordAndReplay(selections: []const u64) !void {
         .optimize = @tagName(@import("builtin").mode),
     });
     defer recorded.deinit();
-    try std.testing.expectEqual(@as(u64, 0), recorded.summary.property_failures);
+    try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
     for (0..3) |_| {
         var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &recorded);
         replayed.deinit();

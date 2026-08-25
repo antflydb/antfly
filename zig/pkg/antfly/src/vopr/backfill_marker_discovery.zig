@@ -10,7 +10,7 @@ const metadata_service = @import("../metadata/service.zig");
 const backfill_state = @import("../storage/db/backfill_state.zig");
 
 pub const Scenario = struct {
-    pub const name = "backfill-marker-discovery";
+    pub const name: []const u8 = "backfill-marker-discovery";
     pub const version: u32 = 1;
 
     const sound_id = vopr.id.stable(name, "cache-reflects-durable-marker-state");
@@ -275,7 +275,7 @@ pub const Scenario = struct {
     }
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
-        try builder.addNamed(allocator, name ++ ".progress", world.state.progress);
+        try builder.addNamed(allocator, name ++ ".progress", @intCast(world.state.progress));
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(world.state.complete));
     }
 

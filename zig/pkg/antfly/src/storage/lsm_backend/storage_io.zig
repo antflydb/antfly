@@ -621,6 +621,116 @@ pub fn createDirPathPortable(io: anytype, path: []const u8) !void {
     return fs_paths.createDirPathPortable(io, path);
 }
 
+/// Borrowed `std.Io` storage adapter. This keeps durable LSM operations on the
+/// caller's I/O implementation, including deterministic VOPR filesystems,
+/// instead of silently creating a native threaded storage lane.
+pub const IoStorage = struct {
+    io: std.Io,
+
+    pub fn init(io: std.Io) IoStorage {
+        return .{ .io = io };
+    }
+
+    pub fn storage(self: *IoStorage) Storage {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Storage.VTable = .{
+        .create_dir_path = createDirPath,
+        .read_file_alloc = readFileAlloc,
+        .read_file_range_alloc = readFileRangeAlloc,
+        .read_file_range_into = readFileRangeInto,
+        .read_file_range_at_most_into = readFileRangeAtMostInto,
+        .file_size = fileSize,
+        .read_file_trailer_alloc = readFileTrailerAlloc,
+        .write_file_absolute = writeFileAbsolute,
+        .append_file_absolute = appendFileAbsolute,
+        .sync_contents_absolute = syncContentsAbsolute,
+        .sync_parent_absolute = syncParentAbsolute,
+        .rename_absolute = renameAbsolute,
+        .delete_file_absolute = deleteFileAbsolute,
+        .delete_tree = deleteTree,
+        .now_ns = nowNs,
+        .root_identity_alloc = rootIdentityAlloc,
+        .rename_is_atomic = true,
+        .supports_native_path_locks = false,
+    };
+
+    fn context(ptr: *anyopaque) *IoStorage {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
+        try fs_paths.createDirPathPortable(context(ptr).io, path);
+    }
+
+    fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+        return try std.Io.Dir.cwd().readFileAlloc(context(ptr).io, path, allocator, .limited(max_bytes));
+    }
+
+    fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+        return try readFileRangeWithIo(context(ptr).io, allocator, path, offset, len);
+    }
+
+    fn readFileRangeInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !void {
+        try readFileRangeWithIoInto(context(ptr).io, path, offset, out);
+    }
+
+    fn readFileRangeAtMostInto(ptr: *anyopaque, path: []const u8, offset: u64, out: []u8) !usize {
+        return try readFileRangeWithIoAtMostInto(context(ptr).io, path, offset, out);
+    }
+
+    fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
+        return try fileSizeWithIo(context(ptr).io, path);
+    }
+
+    fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
+        return try readFileTrailerWithIo(context(ptr).io, allocator, path, len);
+    }
+
+    fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
+        try std.Io.Dir.cwd().writeFile(context(ptr).io, .{ .sub_path = path, .data = contents });
+    }
+
+    fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
+        const io = context(ptr).io;
+        var file = try fs_paths.createFilePortable(io, path, .{ .read = true, .truncate = false });
+        defer file.close(io);
+        const offset = try file.length(io);
+        try file.writePositionalAll(io, contents, offset);
+        if (sync) try file.sync(io);
+    }
+
+    fn syncContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        try syncFileContentsPathWithIo(context(ptr).io, path);
+    }
+
+    fn syncParentAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        try syncParentPathWithIo(context(ptr).io, path);
+    }
+
+    fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, context(ptr).io);
+    }
+
+    fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
+        try deleteFilePathWithIo(context(ptr).io, path);
+    }
+
+    fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
+        try std.Io.Dir.cwd().deleteTree(context(ptr).io, path);
+    }
+
+    fn nowNs(ptr: *anyopaque) u64 {
+        const value = std.Io.Clock.awake.now(context(ptr).io).toNanoseconds();
+        return if (value <= 0) 0 else @intCast(@min(value, std.math.maxInt(u64)));
+    }
+
+    fn rootIdentityAlloc(ptr: *anyopaque, allocator: Allocator, root_dir: []const u8) ![]u8 {
+        return try std.fmt.allocPrint(allocator, "std-io:{x}:{s}", .{ @intFromPtr(context(ptr)), root_dir });
+    }
+};
+
 /// Thin wrapper for host-provided storage callbacks.
 /// Intended for embedders that want durable LSM semantics without native fs access,
 /// such as wasm or foreign host runtimes. Durable writers require either a

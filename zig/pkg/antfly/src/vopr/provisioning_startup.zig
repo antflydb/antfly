@@ -11,7 +11,7 @@ const provisioner = @import("../metadata/table_provisioner.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 
 pub const Scenario = struct {
-    pub const name = "provisioning-startup";
+    pub const name: []const u8 = "provisioning-startup";
     pub const version: u32 = 1;
     const sound_id = vopr.id.stable(name, "startup-fails-closed-and-recovers");
     const complete_id = vopr.id.stable(name, "mode-completes");
@@ -60,7 +60,7 @@ pub const Scenario = struct {
                 "/startup/data/replicas",
                 100,
                 &.{ 100, 2001 },
-                &.{.{ .table_id = 7, .name = "docs", .indexes_json = "" }},
+                &.{.{ .table_id = 7, .name = "docs", .indexes_json = "{}" }},
                 &.{.{ .group_id = 2001, .table_id = 7, .start_key = "", .end_key = null }},
                 .{ .io = self.sim.io(), .backend_runtime = &runtime },
             );
@@ -154,7 +154,7 @@ pub const Scenario = struct {
         return .applied();
     }
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
-        try builder.addNamed(allocator, name ++ ".progress", world.state.progress);
+        try builder.addNamed(allocator, name ++ ".progress", @intCast(world.state.progress));
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(world.state.complete));
     }
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {

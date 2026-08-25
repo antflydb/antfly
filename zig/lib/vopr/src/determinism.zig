@@ -87,7 +87,7 @@ pub fn firstFinding(source: []const u8) ?Finding {
     var previous_line: []const u8 = "";
     while (lines.next()) |line| {
         line_number += 1;
-        inline for (patterns) |pattern| {
+        for (patterns) |pattern| {
             const column = std.mem.indexOf(u8, line, pattern.token) orelse continue;
             if (hasAllowance(line, pattern.category) or hasAllowance(previous_line, pattern.category)) continue;
             return .{

@@ -46,6 +46,15 @@ pub const Scenario = struct {
         vopr.id.stable(name, "watchdog-expiry"),
         vopr.id.stable(name, "restart"),
     };
+    const mode_names = [_][]const u8{
+        name ++ ".clean",
+        name ++ ".partial-startup-failure",
+        name ++ ".shutdown-during-startup",
+        name ++ ".child-service-failure",
+        name ++ ".coordinated-shutdown",
+        name ++ ".watchdog-expiry",
+        name ++ ".restart",
+    };
 
     const Child = struct {
         running: bool = false,
@@ -109,7 +118,7 @@ pub const Scenario = struct {
             self.maintenance.start();
             switch (self.mode) {
                 .partial_startup_failure => {
-                    _ = self.supervisor.fail("serverless", "public-api-start", error.AddressInUse);
+                    self.supervisor.fail("serverless", "public-api-start", error.AddressInUse) catch {};
                     self.maintenance.stop();
                     if (self.maintenance.running) self.rollback_violation = true;
                     self.supervisor.markStopped();
@@ -126,7 +135,7 @@ pub const Scenario = struct {
                     const deadline = self.supervisor.startupDeadline();
                     try self.sim.advance(31 * std.time.ns_per_ms);
                     if (!deadline.expired()) return error.VoprStartupDeadlineDidNotExpire;
-                    _ = self.supervisor.fail("standalone", "startup-watchdog", error.StartupTimeout);
+                    self.supervisor.fail("standalone", "startup-watchdog", error.StartupTimeout) catch {};
                     self.maintenance.stop();
                     self.supervisor.markStopped();
                     try self.restartHealthy();
@@ -138,7 +147,7 @@ pub const Scenario = struct {
             }
 
             if (self.mode == .child_service_failure) {
-                _ = self.supervisor.fail("serverless", "maintenance", error.InputOutput);
+                self.supervisor.fail("serverless", "maintenance", error.InputOutput) catch {};
                 if (!self.supervisor.token().isCancelled()) self.failure_without_cancellation = true;
                 self.stopChildren();
                 self.supervisor.markStopped();
@@ -184,10 +193,10 @@ pub const Scenario = struct {
 
     pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: std.mem.Allocator) !void {
         if (world.state.complete) return;
-        inline for (std.meta.tags(Mode), mode_ids) |mode, id| {
+        inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, mode_name| {
             try list.append(allocator, .{
                 .id = id,
-                .name = name ++ "." ++ @tagName(mode),
+                .name = mode_name,
                 .kind = if (mode == .clean or mode == .coordinated_shutdown or mode == .restart) .workload else .fault,
             });
         }
@@ -208,8 +217,8 @@ pub const Scenario = struct {
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         const state = world.state;
         try builder.addNamed(allocator, name ++ ".state", @intFromEnum(state.supervisor.currentState()));
-        try builder.addNamed(allocator, name ++ ".ready-generations", state.ready_generations);
-        try builder.addNamed(allocator, name ++ ".restarts", state.restart_count);
+        try builder.addNamed(allocator, name ++ ".ready-generations", @intCast(state.ready_generations));
+        try builder.addNamed(allocator, name ++ ".restarts", @intCast(state.restart_count));
         try builder.addNamed(allocator, name ++ ".public-running", @intFromBool(state.public_api.running));
         try builder.addNamed(allocator, name ++ ".maintenance-running", @intFromBool(state.maintenance.running));
     }
@@ -262,7 +271,7 @@ test "standalone serverless supervision VOPR exact replays lifecycle failures" {
             .optimize = @tagName(@import("builtin").mode),
         });
         defer recorded.deinit();
-        try std.testing.expectEqual(@as(u64, 0), recorded.summary.property_failures);
+        try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
         for (0..20) |_| {
             var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &recorded);
             replayed.deinit();

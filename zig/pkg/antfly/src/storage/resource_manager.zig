@@ -739,6 +739,7 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        _ = alloc;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         var it = self.capacity_domains.valueIterator();
@@ -750,7 +751,7 @@ pub const ResourceManager = struct {
             @panic("resource manager deinitialized with live reservations");
         if (self.batch_reservation_identities.count() != 0)
             @panic("resource manager deinitialized with live batch reservations");
-        self.capacity_domains.deinit(alloc);
+        self.capacity_domains.deinit(self.identity_allocator);
         self.capacity_domains = .empty;
         self.reservation_identities.deinit(self.identity_allocator);
         self.reservation_identities = .empty;
@@ -768,10 +769,11 @@ pub const ResourceManager = struct {
         observation: CapacityObservation,
         now_ns: u64,
     ) !CapacityReservation {
+        _ = alloc;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
-        const entry = try self.capacity_domains.getOrPut(alloc, domain_id);
+        const entry = try self.capacity_domains.getOrPut(self.identity_allocator, domain_id);
         if (!entry.found_existing) entry.value_ptr.* = .{};
         const domain = entry.value_ptr;
         self.observeCapacityLocked(domain, observation);
@@ -2522,6 +2524,19 @@ test "resource manager coordinates growable capacity by physical domain" {
     try std.testing.expectEqual(@as(u64, 2), stats.denials);
     try std.testing.expectEqual(@as(u64, 1), stats.growth_denials);
     try std.testing.expectEqual(@as(usize, 2), stats.domain_count);
+}
+
+test "resource manager owns capacity domains independently of consumer allocator" {
+    var manager = ResourceManager.init(.{
+        .identity_allocator = std.testing.allocator,
+        .disk_safety_floor_bytes = 0,
+        .disk_safety_floor_divisor = 0,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var reservation = try manager.reserveCapacity(std.heap.page_allocator, 7, 1, .{}, 0);
+    reservation.release();
+    try std.testing.expectEqual(@as(usize, 1), manager.capacityStats().domain_count);
 }
 
 test "capacity reservation revalidation fails closed when available space falls" {

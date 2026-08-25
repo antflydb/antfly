@@ -245,7 +245,6 @@ pub const Socket = struct {
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
                     try self.checkRequestDeadline();
-                    if (wait.poll_only) continue;
                     return error.Timeout;
                 }
                 return error.SendFailed;
@@ -281,7 +280,6 @@ pub const Socket = struct {
                 try self.checkRequestCancellation();
                 if (err == error.Timeout or err == error.WouldBlock) {
                     try self.checkRequestDeadline();
-                    if (wait.poll_only) continue;
                     return error.Timeout;
                 }
                 return error.RecvFailed;
@@ -308,10 +306,6 @@ pub const Socket = struct {
 
     const OperationWait = struct {
         timeout_ms: ?u64,
-        /// True when the timer only exists to poll request cancellation. A
-        /// poll expiry is retryable; socket and request deadline expiries are
-        /// terminal.
-        poll_only: bool,
     };
 
     fn socketOperationDeadline(self: *Self, operation: DeadlineOperation) ?i64 {
@@ -339,16 +333,13 @@ pub const Socket = struct {
                 remaining_ms;
         }
 
-        if (self.request_cancel_cb != null) {
-            const cancellation_poll_ms: u64 = 20;
-            if (terminal_timeout_ms == null or cancellation_poll_ms < terminal_timeout_ms.?) {
-                return .{ .timeout_ms = cancellation_poll_ms, .poll_only = true };
-            }
-        }
-        return .{
-            .timeout_ms = if (terminal_timeout_ms) |timeout| @max(timeout, 1) else null,
-            .poll_only = false,
-        };
+        // Request cancellation is owned by the client's outer watchdog. It
+        // cancels the request task and shuts down its published socket, which
+        // wakes a blocking operation. Racing a second polling timer against a
+        // socket read is unsafe: the read can consume bytes just before the
+        // timer wins, after which discarding the losing future loses stream
+        // data. Keep only actual socket/request deadlines here.
+        return .{ .timeout_ms = if (terminal_timeout_ms) |timeout| @max(timeout, 1) else null };
     }
 
     fn netRead(self: *Self, buffer: []u8) net.Stream.Reader.Error!usize {

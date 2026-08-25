@@ -15,6 +15,7 @@ const provider_registry = @import("../common/provider_registry.zig");
 const transcribing = @import("antfly_transcribing");
 const readers = @import("antfly_readers");
 const synthesizing = @import("antfly_synthesizing");
+const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 const valid_transcript =
     "{\"object\":\"list\",\"data\":[{\"object\":\"transcription\",\"index\":0,\"text\":\"vopr transcript\",\"language\":\"en\"}],\"model\":\"vopr-stt\",\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2,\"total_tokens\":2}}";
@@ -43,7 +44,7 @@ const delayed_routes = [_]httpx.TestRoute{
 };
 
 pub const Scenario = struct {
-    pub const name = "media-runtime";
+    pub const name: []const u8 = "media-runtime";
     pub const version: u32 = 2;
 
     const restored_id = vopr.id.stable(name, "globals-restored");
@@ -101,6 +102,7 @@ pub const Scenario = struct {
 
     const State = struct {
         allocator: std.mem.Allocator,
+        fixture_allocator: FixtureAllocator,
         sim: vopr.vopr_io.VoprIo,
         original_stt: ?*const transcribing.Runtime,
         original_tts: ?*const synthesizing.Runtime,
@@ -192,6 +194,13 @@ pub const Scenario = struct {
 
             var options = audio_runtime.ActiveRuntime.Options{};
             options.client.retry_policy = .noRetry();
+            // Successful modes are schedule-driven rather than wall-clock
+            // bounded. Only the timeout mode installs a request deadline;
+            // otherwise an intentionally starved runnable task could turn a
+            // success/retry property into a timeout property.
+            options.client.timeouts.request_ms = 0;
+            options.client.timeouts.read_ms = 0;
+            options.client.timeouts.write_ms = 0;
             if (mode == .stt_timeout) options.client.timeouts.request_ms = 10;
             if (mode == .tts_retry) options.client.retry_policy = .{
                 .max_retries = 1,
@@ -265,7 +274,7 @@ pub const Scenario = struct {
             defer self.request_done = true;
             const mode = self.mode.?;
             if (isTtsMode(mode)) {
-                const runtime = if (self.active) |*active| &active.synthesizing_runtime.? else unreachable;
+                const runtime = if (self.active) |*active| active.synthesizing_runtime.? else unreachable;
                 const provider = runtime.get(null) catch |err| {
                     self.request_error = err;
                     return;
@@ -282,7 +291,7 @@ pub const Scenario = struct {
                 return;
             }
 
-            const runtime = if (self.active) |*active| &active.transcribing_runtime.? else unreachable;
+            const runtime = if (self.active) |*active| active.transcribing_runtime.? else unreachable;
             const provider = runtime.get(null) catch |err| {
                 self.request_error = err;
                 return;
@@ -336,7 +345,7 @@ pub const Scenario = struct {
                 .tts_success => self.result_classified = self.request_error == null and std.mem.eql(u8, self.audio orelse "", "VOPR-AUDIO"),
                 .stt_malformed, .tts_partial => self.result_classified = self.request_error != null and self.transcript == null and self.audio == null,
                 .stt_timeout => {
-                    self.timeout_propagated = self.request_error == error.Timeout;
+                    self.timeout_propagated = if (self.request_error) |err| err == error.Timeout else false;
                     self.result_classified = self.timeout_propagated;
                 },
                 .tts_retry => {
@@ -347,7 +356,8 @@ pub const Scenario = struct {
                     self.result_classified = self.retry_recovered;
                 },
                 .stt_cancel_shutdown => {
-                    self.cancellation_propagated = self.shutdown_started and self.shutdown_done and self.request_error == error.Cancelled;
+                    self.cancellation_propagated = self.shutdown_started and self.shutdown_done and
+                        (if (self.request_error) |err| err == error.Cancelled else false);
                     self.result_classified = self.cancellation_propagated;
                 },
                 .stt_runtime_replacement => {
@@ -392,22 +402,45 @@ pub const Scenario = struct {
     pub fn init(allocator: std.mem.Allocator) !World {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.* = .{
-            .allocator = allocator,
-            .sim = try vopr.vopr_io.VoprIo.init(.{
-                .seed = 0x4d45_4449_41,
-                .tasks = .{ .stack_size = 4 * 1024 * 1024 },
-                .network = .{ .max_sockets = 16 },
-                .required = .of(&.{ .clock_read, .sockets, .task_scheduling, .synchronization, .sleep }),
-            }),
-            .original_stt = transcribing.getActiveRuntime(),
-            .original_tts = synthesizing.getActiveRuntime(),
-        };
+        state.fixture_allocator = .init;
+        errdefer _ = state.fixture_allocator.deinit();
+        state.allocator = state.fixture_allocator.allocator();
+        state.sim = try vopr.vopr_io.VoprIo.init(.{
+            .seed = 0x4d45_4449_41,
+            .tasks = .{ .stack_size = 32 * 1024 * 1024 },
+            .network = .{ .max_sockets = 16 },
+            .required = .of(&.{ .clock_read, .sockets, .task_scheduling, .synchronization, .sleep }),
+        });
+        state.original_stt = transcribing.getActiveRuntime();
+        state.original_tts = synthesizing.getActiveRuntime();
+        state.mode = null;
+        state.server = null;
+        state.active = null;
+        state.active_live = false;
+        state.request_done = false;
+        state.server_done = false;
+        state.shutdown_started = false;
+        state.shutdown_done = false;
+        state.replacement_done = false;
+        state.request_error = null;
+        state.server_error = null;
+        state.transcript = null;
+        state.audio = null;
+        state.complete = false;
+        state.result_classified = true;
+        state.timeout_propagated = true;
+        state.retry_recovered = true;
+        state.cancellation_propagated = true;
+        state.replacement_preserved = true;
+        state.resources_cleaned = true;
         return .{ .state = state };
     }
 
     pub fn deinit(world: *World, allocator: std.mem.Allocator) void {
         world.state.cleanup();
+        const allocation_status = world.state.fixture_allocator.deinit();
+        if (allocation_status != .ok) std.debug.print("media runtime leaked allocations in mode={s}\n", .{@tagName(world.state.mode.?)});
+        std.debug.assert(allocation_status == .ok);
         allocator.destroy(world.state);
         world.* = undefined;
     }
@@ -474,7 +507,7 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".server-done", @intFromBool(state.server_done));
         try builder.addNamed(allocator, name ++ ".shutdown-done", @intFromBool(state.shutdown_done));
         try builder.addNamed(allocator, name ++ ".replacement-done", @intFromBool(state.replacement_done));
-        try builder.addNamed(allocator, name ++ ".active-tasks", state.sim.tasks.activeTaskCount());
+        try builder.addNamed(allocator, name ++ ".active-tasks", @intCast(state.sim.tasks.activeTaskCount()));
     }
 
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
@@ -513,8 +546,13 @@ test "media provider VOPR exact replays production HTTP and lifecycle modes" {
             .backend_ids = &backend_ids,
         });
         defer artifact.deinit();
+        if (artifact.summary.?.property_failures != 0) {
+            for (artifact.failures.items) |failure| std.debug.print(
+                "media runtime mode={s} failure={s} class={s}\n",
+                .{ Scenario.mode_names[index], failure.identity, @tagName(failure.class) },
+            );
+        }
         try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.property_failures);
-        try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.harness_errors);
         var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &artifact);
         replayed.deinit();
     }

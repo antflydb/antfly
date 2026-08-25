@@ -17,6 +17,7 @@ const Source = struct {
 const metadata_sim_source = @embedFile("../metadata/sim_harness.zig");
 
 fn region(comptime source: []const u8, comptime begin: []const u8, comptime end: []const u8) []const u8 {
+    @setEvalBranchQuota(100_000);
     const start = std.mem.indexOf(u8, source, begin) orelse @compileError("determinism audit region start not found: " ++ begin);
     const tail = source[start..];
     const finish = std.mem.indexOf(u8, tail, end) orelse @compileError("determinism audit region end not found: " ++ end);
@@ -32,9 +33,12 @@ const replayable_sources = [_]Source{
     .{ .path = "vopr/config_extension_lifecycle.zig", .bytes = @embedFile("config_extension_lifecycle.zig") },
     .{ .path = "vopr/data_server.zig", .bytes = @embedFile("data_server.zig") },
     .{ .path = "vopr/db_index_races.zig", .bytes = @embedFile("db_index_races.zig") },
+    .{ .path = "vopr/distributed_query.zig", .bytes = @embedFile("distributed_query.zig") },
     .{ .path = "vopr/domain_vopr.zig", .bytes = @embedFile("domain_vopr.zig") },
     .{ .path = "vopr/embedded_lite_lifecycle.zig", .bytes = @embedFile("embedded_lite_lifecycle.zig") },
     .{ .path = "vopr/external_lake.zig", .bytes = @embedFile("external_lake.zig") },
+    .{ .path = "vopr/full_cluster.zig", .bytes = @embedFile("full_cluster.zig") },
+    .{ .path = "vopr/generation_reranking.zig", .bytes = @embedFile("generation_reranking.zig") },
     .{ .path = "vopr/generation_lifecycle.zig", .bytes = @embedFile("generation_lifecycle.zig") },
     .{ .path = "vopr/http_disconnect.zig", .bytes = @embedFile("http_disconnect.zig") },
     .{ .path = "vopr/http_lifecycle.zig", .bytes = @embedFile("http_lifecycle.zig") },
@@ -43,11 +47,13 @@ const replayable_sources = [_]Source{
     .{ .path = "vopr/parquet_cache.zig", .bytes = @embedFile("parquet_cache.zig") },
     .{ .path = "vopr/provider_boundaries.zig", .bytes = @embedFile("provider_boundaries.zig") },
     .{ .path = "vopr/provisioning_startup.zig", .bytes = @embedFile("provisioning_startup.zig") },
+    .{ .path = "vopr/query_embedding_cache.zig", .bytes = @embedFile("query_embedding_cache.zig") },
     .{ .path = "vopr/replication_backfill.zig", .bytes = @embedFile("replication_backfill.zig") },
     .{ .path = "vopr/request_lifecycle.zig", .bytes = @embedFile("request_lifecycle.zig") },
     .{ .path = "vopr/resource_pressure.zig", .bytes = @embedFile("resource_pressure.zig") },
     .{ .path = "vopr/serverless_workflow.zig", .bytes = @embedFile("serverless_workflow.zig") },
     .{ .path = "vopr/supervision.zig", .bytes = @embedFile("supervision.zig") },
+    .{ .path = "vopr/upgrade_compatibility.zig", .bytes = @embedFile("upgrade_compatibility.zig") },
     .{ .path = "raft/vopr.zig", .bytes = @embedFile("../raft/vopr.zig") },
     .{ .path = "storage/lsm_vopr.zig", .bytes = @embedFile("../storage/lsm_vopr.zig") },
     .{ .path = "storage/lmdb_vopr.zig", .bytes = @embedFile("../storage/lmdb_vopr.zig") },

@@ -14,6 +14,7 @@
 
 pub const http_common = @import("http_common.zig");
 pub const http_driver = @import("http_driver.zig");
+pub const io_http_executor = @import("../../common/http/io_http_executor.zig");
 pub const http_server = @import("http_server.zig");
 pub const http_snapshot = @import("http_snapshot.zig");
 pub const file_snapshot_store = @import("file_snapshot_store.zig");
@@ -28,6 +29,8 @@ pub const RequestHeader = http_common.RequestHeader;
 pub const HttpHeader = http_common.Header;
 pub const HttpResponse = http_common.HttpResponse;
 pub const HttpMethod = http_common.Method;
+pub const IoHttpExecutor = io_http_executor.IoHttpExecutor;
+pub const IoHttpExecutorConfig = io_http_executor.IoHttpExecutorConfig;
 pub const RequestExecutor = http_common.RequestExecutor;
 pub const HttpFrameDriver = http_driver.HttpFrameDriver;
 pub const HttpServer = http_server.HttpServer;
@@ -49,6 +52,8 @@ test "raft transport module compiles" {
     _ = HttpHeader;
     _ = HttpResponse;
     _ = HttpMethod;
+    _ = IoHttpExecutor;
+    _ = IoHttpExecutorConfig;
     _ = RequestExecutor;
     _ = HttpFrameDriver;
     _ = HttpServer;

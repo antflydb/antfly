@@ -170,6 +170,94 @@ pub const Scripted = struct {
     }
 };
 
+/// Forces a reviewed prefix and then continues with deterministic seeded
+/// choices. This is useful for selecting a scenario mode while retaining full
+/// scheduler exploration inside that mode.
+pub const PrefixedSeeded = struct {
+    prefix: []const ids.StableId,
+    cursor: usize = 0,
+    fallback: Seeded,
+
+    pub fn init(prefix: []const ids.StableId, seed: u64) PrefixedSeeded {
+        return .{ .prefix = prefix, .fallback = Seeded.init(seed) };
+    }
+
+    pub fn source(self: *PrefixedSeeded) Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    fn choose(ptr: *anyopaque, request: Request) !ids.StableId {
+        const self: *PrefixedSeeded = @ptrCast(@alignCast(ptr));
+        if (self.cursor < self.prefix.len) {
+            defer self.cursor += 1;
+            return self.prefix[self.cursor];
+        }
+        return Seeded.choose(&self.fallback, request);
+    }
+
+    fn finish(ptr: *anyopaque) !void {
+        const self: *PrefixedSeeded = @ptrCast(@alignCast(ptr));
+        if (self.cursor != self.prefix.len) return error.UnusedChoicePrefix;
+    }
+};
+
+/// Forces a reviewed prefix and then makes deterministic seeded choices while
+/// postponing virtual time jumps until no non-time transition is runnable.
+/// This models the fairness of an ordinary event loop: explicit clock-fault
+/// scenarios can still choose time independently, while a clean history does
+/// not expire healthy sockets with packets or wakeups already pending.
+pub const PrefixedFairSeeded = struct {
+    prefix: []const ids.StableId,
+    cursor: usize = 0,
+    fallback: Seeded,
+
+    pub fn init(prefix: []const ids.StableId, seed: u64) PrefixedFairSeeded {
+        return .{ .prefix = prefix, .fallback = Seeded.init(seed) };
+    }
+
+    pub fn source(self: *PrefixedFairSeeded) Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    fn choose(ptr: *anyopaque, request: Request) !ids.StableId {
+        const self: *PrefixedFairSeeded = @ptrCast(@alignCast(ptr));
+        if (self.cursor < self.prefix.len) {
+            defer self.cursor += 1;
+            return self.prefix[self.cursor];
+        }
+        var runnable_count: usize = 0;
+        var weighted = false;
+        var total_weight: u64 = 0;
+        for (request.enabled) |candidate| {
+            if (std.mem.eql(u8, candidate.name, "sim-io.time_advance") or
+                std.mem.eql(u8, candidate.name, "runtime.time_advance")) continue;
+            runnable_count += 1;
+            if (candidate.weight == 0) return error.InvalidTransitionWeight;
+            weighted = weighted or candidate.weight != 1;
+            total_weight = std.math.add(u64, total_weight, candidate.weight) catch
+                return error.ChoiceWeightOverflow;
+        }
+        if (runnable_count == 0) return Seeded.choose(&self.fallback, request);
+        var ordinal = if (weighted)
+            self.fallback.prng.random().uintLessThan(u64, total_weight)
+        else
+            self.fallback.prng.random().intRangeLessThan(u64, 0, runnable_count);
+        for (request.enabled) |candidate| {
+            if (std.mem.eql(u8, candidate.name, "sim-io.time_advance") or
+                std.mem.eql(u8, candidate.name, "runtime.time_advance")) continue;
+            const width: u64 = if (weighted) candidate.weight else 1;
+            if (ordinal < width) return candidate.id;
+            ordinal -= width;
+        }
+        unreachable;
+    }
+
+    fn finish(ptr: *anyopaque) !void {
+        const self: *PrefixedFairSeeded = @ptrCast(@alignCast(ptr));
+        if (self.cursor != self.prefix.len) return error.UnusedChoicePrefix;
+    }
+};
+
 /// Deterministic depth-first enumeration of a dynamic choice tree.
 ///
 /// Call `beginHistory` before each clean-world execution, run the scenario
@@ -486,6 +574,51 @@ test "seeded source honors weights while preserving enabled membership" {
     try source.finish();
     try std.testing.expect(common > rare * 5);
     try std.testing.expect(common < rare * 9);
+}
+
+test "prefixed seeded source forces reviewed setup then explores its suffix" {
+    const enabled = [_]transition.Transition{
+        .{ .id = 1, .name = "one", .kind = .workload },
+        .{ .id = 2, .name = "two", .kind = .workload },
+    };
+    var prefixed = PrefixedSeeded.init(&.{2}, 17);
+    const source = prefixed.source();
+    try std.testing.expectEqual(@as(u64, 2), try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed",
+        .occurrence = 0,
+        .enabled = &enabled,
+    }));
+    const suffix = try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed",
+        .occurrence = 1,
+        .enabled = &enabled,
+    });
+    try std.testing.expect(suffix == 1 or suffix == 2);
+    try source.finish();
+}
+
+test "prefixed fair seeded source postpones time while application work is runnable" {
+    const enabled = [_]transition.Transition{
+        .{ .id = 1, .name = "sim-io.time_advance", .kind = .scheduler },
+        .{ .id = 2, .name = "request.ready", .kind = .workload },
+    };
+    var prefixed = PrefixedFairSeeded.init(&.{1}, 19);
+    const source = prefixed.source();
+    try std.testing.expectEqual(@as(u64, 1), try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-fair",
+        .occurrence = 0,
+        .enabled = &enabled,
+    }));
+    try std.testing.expectEqual(@as(u64, 2), try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-fair",
+        .occurrence = 1,
+        .enabled = &enabled,
+    }));
+    try source.finish();
 }
 
 test "starving source systematically delays then forces a runnable target" {

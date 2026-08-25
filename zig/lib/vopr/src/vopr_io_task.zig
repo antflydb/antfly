@@ -51,6 +51,7 @@ const FutexWake = struct {
     ptr: *const u32,
     remaining: u32,
     sequence: u64,
+    eligible_through: u64,
 };
 
 const FutexIdentity = struct {
@@ -62,6 +63,7 @@ const ExternalWake = struct {
     resource_id: ids.StableId,
     remaining: u32,
     sequence: u64,
+    eligible_through: u64,
 };
 
 const Task = struct {
@@ -83,7 +85,9 @@ const Task = struct {
     waiting_on_group: ?*GroupState = null,
     sleep: ?Sleep = null,
     futex_ptr: ?*const u32 = null,
+    futex_wait_sequence: u64 = 0,
     external_id: ?ids.StableId = null,
+    external_wait_sequence: u64 = 0,
     futex_uncancelable: bool = false,
     cancel_requested: bool = false,
     cancel_acknowledged: bool = false,
@@ -169,6 +173,7 @@ pub const Kernel = struct {
     allocator: std.mem.Allocator,
     config: Config,
     next_sequence: u64 = 1,
+    next_wait_sequence: u64 = 1,
     main_context: std.Io.fiber.Context = undefined,
     current: ?*Task = null,
     tasks: std.ArrayListUnmanaged(*Task) = .empty,
@@ -344,7 +349,7 @@ pub const Kernel = struct {
     pub fn groupAwait(self: *Kernel, public_group: *std.Io.Group, token: *anyopaque) !void {
         const group: *GroupState = @ptrCast(@alignCast(token));
         if (group.public != public_group) return error.InvalidVoprIoGroup;
-        if (group.tasks.items.len != 0) {
+        while (group.tasks.items.len != 0) {
             const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
             if (group.awaiter != null) return error.InvalidVoprIoGroup;
             group.awaiter = awaiter;
@@ -353,8 +358,10 @@ pub const Kernel = struct {
             if (awaiter.cancel_requested) self.cancelGroupTasks(group);
             self.yieldCurrent(awaiter);
             awaiter.waiting_on_group = null;
-            try awaiter.checkCancel();
+            group.awaiter = null;
+            if (group.tasks.items.len != 0 and awaiter.cancel_requested) self.cancelGroupTasks(group);
         }
+        if (self.currentTask()) |task| try task.checkCancel();
         self.destroyGroup(group);
     }
 
@@ -362,7 +369,7 @@ pub const Kernel = struct {
         const group: *GroupState = @ptrCast(@alignCast(token));
         if (group.public != public_group) return error.InvalidVoprIoGroup;
         self.cancelGroupTasks(group);
-        if (group.tasks.items.len != 0) {
+        while (group.tasks.items.len != 0) {
             const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
             if (group.awaiter != null) return error.InvalidVoprIoGroup;
             group.awaiter = awaiter;
@@ -370,6 +377,7 @@ pub const Kernel = struct {
             awaiter.status = .waiting_group;
             self.yieldCurrent(awaiter);
             awaiter.waiting_on_group = null;
+            group.awaiter = null;
         }
         self.destroyGroup(group);
     }
@@ -420,6 +428,7 @@ pub const Kernel = struct {
         const task = self.currentTask() orelse return error.VoprIoOperationOutsideTask;
         if (!uncancelable) try task.checkCancel();
         task.futex_ptr = ptr;
+        task.futex_wait_sequence = self.allocateWaitSequence();
         task.futex_uncancelable = uncancelable;
         task.sleep = sleep_info;
         task.status = .waiting_futex;
@@ -435,6 +444,7 @@ pub const Kernel = struct {
             .ptr = ptr,
             .remaining = max_waiters,
             .sequence = sequence,
+            .eligible_through = self.next_wait_sequence - 1,
         });
     }
 
@@ -444,6 +454,7 @@ pub const Kernel = struct {
         const task = self.currentTask() orelse return error.VoprIoOperationOutsideTask;
         try task.checkCancel();
         task.external_id = resource_id;
+        task.external_wait_sequence = self.allocateWaitSequence();
         task.status = .waiting_external;
         self.yieldCurrent(task);
         try task.checkCancel();
@@ -458,6 +469,7 @@ pub const Kernel = struct {
             .resource_id = resource_id,
             .remaining = max_waiters,
             .sequence = try self.allocateSequence(),
+            .eligible_through = self.next_wait_sequence - 1,
         });
     }
 
@@ -475,7 +487,8 @@ pub const Kernel = struct {
         }
         for (self.futex_wakes.items) |wake| {
             for (self.tasks.items) |task| {
-                if (task.status != .waiting_futex or task.futex_ptr != wake.ptr) continue;
+                if (task.status != .waiting_futex or task.futex_ptr != wake.ptr or
+                    task.futex_wait_sequence > wake.eligible_through) continue;
                 try list.append(allocator, .{
                     .id = ids.derive("sim-io.futex-wake", task.id, wake.sequence),
                     .name = "sim-io.futex_wake",
@@ -488,7 +501,8 @@ pub const Kernel = struct {
         }
         for (self.external_wakes.items) |wake| {
             for (self.tasks.items) |task| {
-                if (task.status != .waiting_external or task.external_id != wake.resource_id) continue;
+                if (task.status != .waiting_external or task.external_id != wake.resource_id or
+                    task.external_wait_sequence > wake.eligible_through) continue;
                 try list.append(allocator, .{
                     .id = ids.derive("sim-io.external-wake", task.id, wake.sequence),
                     .name = "sim-io.external_wake",
@@ -516,11 +530,12 @@ pub const Kernel = struct {
         for (self.futex_wakes.items, 0..) |*wake, wake_index| {
             for (self.tasks.items) |task| {
                 if (task.status != .waiting_futex or task.futex_ptr != wake.ptr or
+                    task.futex_wait_sequence > wake.eligible_through or
                     ids.derive("sim-io.futex-wake", task.id, wake.sequence) != transition_id) continue;
                 task.makeRunnable();
                 const task_id = task.id;
                 wake.remaining -= 1;
-                if (wake.remaining == 0 or !self.hasFutexWaiter(wake.ptr)) {
+                if (wake.remaining == 0 or !self.hasEligibleFutexWaiter(wake)) {
                     _ = self.futex_wakes.orderedRemove(wake_index);
                 }
                 return .{ .task_id = task_id, .completed = false, .kind = .futex_wake };
@@ -529,11 +544,12 @@ pub const Kernel = struct {
         for (self.external_wakes.items, 0..) |*wake, wake_index| {
             for (self.tasks.items) |task| {
                 if (task.status != .waiting_external or task.external_id != wake.resource_id or
+                    task.external_wait_sequence > wake.eligible_through or
                     ids.derive("sim-io.external-wake", task.id, wake.sequence) != transition_id) continue;
                 task.makeRunnable();
                 const task_id = task.id;
                 wake.remaining -= 1;
-                if (wake.remaining == 0 or !self.hasExternalWaiter(wake.resource_id))
+                if (wake.remaining == 0 or !self.hasEligibleExternalWaiter(wake))
                     _ = self.external_wakes.orderedRemove(wake_index);
                 return .{ .task_id = task_id, .completed = false, .kind = .external_wake };
             }
@@ -738,16 +754,32 @@ pub const Kernel = struct {
         return false;
     }
 
+    fn hasEligibleFutexWaiter(self: *const Kernel, wake: *const FutexWake) bool {
+        for (self.tasks.items) |task| {
+            if (task.status == .waiting_futex and task.futex_ptr == wake.ptr and
+                task.futex_wait_sequence <= wake.eligible_through) return true;
+        }
+        return false;
+    }
+
+    fn hasEligibleExternalWaiter(self: *const Kernel, wake: *const ExternalWake) bool {
+        for (self.tasks.items) |task| {
+            if (task.status == .waiting_external and task.external_id == wake.resource_id and
+                task.external_wait_sequence <= wake.eligible_through) return true;
+        }
+        return false;
+    }
+
     fn pruneStaleWakes(self: *Kernel) void {
         var futex_index: usize = 0;
         while (futex_index < self.futex_wakes.items.len) {
-            if (!self.hasFutexWaiter(self.futex_wakes.items[futex_index].ptr)) {
+            if (!self.hasEligibleFutexWaiter(&self.futex_wakes.items[futex_index])) {
                 _ = self.futex_wakes.orderedRemove(futex_index);
             } else futex_index += 1;
         }
         var external_index: usize = 0;
         while (external_index < self.external_wakes.items.len) {
-            if (!self.hasExternalWaiter(self.external_wakes.items[external_index].resource_id)) {
+            if (!self.hasEligibleExternalWaiter(&self.external_wakes.items[external_index])) {
                 _ = self.external_wakes.orderedRemove(external_index);
             } else external_index += 1;
         }
@@ -759,6 +791,12 @@ pub const Kernel = struct {
         const logical_id = ids.derive("sim-io.futex", capability_kernel_id, sequence);
         try self.futex_identities.append(self.allocator, .{ .ptr = ptr, .id = logical_id });
         return logical_id;
+    }
+
+    fn allocateWaitSequence(self: *Kernel) u64 {
+        const result = self.next_wait_sequence;
+        self.next_wait_sequence +|= 1;
+        return result;
     }
 
     fn futexIdentity(self: *const Kernel, ptr: *const u32) ?ids.StableId {
@@ -837,4 +875,72 @@ test "task kernel parks future await and exposes each resume" {
         _ = (try kernel.executeReady(enabled.items.items[0].id)).?;
     }
     try std.testing.expectEqualSlices(u8, &.{ 1, 3, 2, 4 }, shared.order[0..shared.len]);
+}
+
+test "futex wake cannot be stolen by a waiter that parks later" {
+    const Adapter = struct {
+        fn async(userdata: ?*anyopaque, result: []u8, result_alignment: std.mem.Alignment, context: []const u8, context_alignment: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) ?*std.Io.AnyFuture {
+            const kernel: *Kernel = @ptrCast(@alignCast(userdata));
+            return kernel.async(result, result_alignment, context, context_alignment, start);
+        }
+        const vtable: std.Io.VTable = blk: {
+            var table = std.Io.failing.vtable.*;
+            table.async = async;
+            break :blk table;
+        };
+    };
+    const Shared = struct {
+        kernel: *Kernel,
+        word: std.atomic.Value(u32) = .init(0),
+        first_done: bool = false,
+        second_done: bool = false,
+
+        fn first(self: *@This()) void {
+            self.kernel.futexWait(&self.word.raw, 0, null, true) catch unreachable;
+            self.first_done = true;
+        }
+
+        fn second(self: *@This()) void {
+            self.kernel.futexWait(&self.word.raw, 0, null, true) catch unreachable;
+            self.second_done = true;
+        }
+
+        fn io(self: *@This()) std.Io {
+            return .{ .userdata = self.kernel, .vtable = &Adapter.vtable };
+        }
+    };
+
+    var kernel = try Kernel.init(std.heap.page_allocator, .{});
+    defer kernel.deinit();
+    var shared = Shared{ .kernel = &kernel };
+    _ = shared.io().async(Shared.first, .{&shared});
+
+    var ready: transition.List = .{};
+    defer ready.deinit(std.heap.page_allocator);
+    try kernel.enumerateReady(&ready, std.heap.page_allocator);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
+    _ = (try kernel.executeReady(ready.items.items[0].id)).?;
+    try kernel.futexWake(&shared.word.raw, 1);
+
+    _ = shared.io().async(Shared.second, .{&shared});
+    ready.items.clearRetainingCapacity();
+    try kernel.enumerateReady(&ready, std.heap.page_allocator);
+    const second_resume = for (ready.items.items) |candidate| {
+        if (std.mem.eql(u8, candidate.name, "sim-io.task_resume")) break candidate;
+    } else return error.MissingSecondWaiterResume;
+    _ = (try kernel.executeReady(second_resume.id)).?;
+
+    ready.items.clearRetainingCapacity();
+    try kernel.enumerateReady(&ready, std.heap.page_allocator);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
+    try std.testing.expectEqualStrings("sim-io.futex_wake", ready.items.items[0].name);
+    _ = (try kernel.executeReady(ready.items.items[0].id)).?;
+
+    ready.items.clearRetainingCapacity();
+    try kernel.enumerateReady(&ready, std.heap.page_allocator);
+    try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
+    try std.testing.expectEqualStrings("sim-io.task_resume", ready.items.items[0].name);
+    _ = (try kernel.executeReady(ready.items.items[0].id)).?;
+    try std.testing.expect(shared.first_done);
+    try std.testing.expect(!shared.second_done);
 }

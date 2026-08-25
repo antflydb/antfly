@@ -54,6 +54,7 @@ const transition_state = @import("transition_state.zig");
 const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const io_http_executor = @import("../common/http/io_http_executor.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
 const common_config = @import("../common/config.zig");
 const docstore_mod = @import("../storage/docstore.zig");
@@ -5595,10 +5596,11 @@ fn startPublicApiServers(
     comptime N: usize,
     alloc: std.mem.Allocator,
     cluster: *MetadataHttpClusterSimulation,
-    shared_io: *std.Io.Threaded,
+    shared_io: std.Io,
+    async_limit: std.Io.Limit,
     roots: *const [N][]const u8,
     metadata_snapshot_mode: PublicApiStatusSource.MetadataSnapshotMode,
-    forward_executor: *std_http_executor.StdHttpExecutor,
+    forward_executor: http_common.RequestExecutor,
     listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
     status_sources: *[N]PublicApiStatusSource,
@@ -5625,14 +5627,14 @@ fn startPublicApiServers(
             catalog_sources[i].iface(),
             cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
             routers[i].iface(),
-            forward_executor.executor(),
+            forward_executor,
         );
-        _ = read_sources[i].withIo(shared_io);
+        _ = read_sources[i].withIoInterface(shared_io, async_limit);
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
-            forward_executor.executor(),
+            forward_executor,
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         const server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
@@ -5764,10 +5766,11 @@ fn PublicApiTestRig(comptime N: usize) type {
                 N,
                 alloc,
                 cluster,
-                &self.http_io,
+                self.http_io.io(),
+                self.http_io.async_limit,
                 &roots,
                 metadata_snapshot_mode,
-                &self.forward_executor,
+                self.forward_executor.executor(),
                 &self.listeners,
                 &self.servers,
                 &self.status_sources,
@@ -5812,6 +5815,443 @@ fn PublicApiTestRig(comptime N: usize) type {
         }
     };
 }
+
+/// Deployment-shaped metadata/data/public-HTTP owner graph for the composed
+/// full-cluster VOPR scenario. Metadata and Raft retain their deterministic
+/// explicit-step transport while every public listener, forwarding request,
+/// client, timeout, and shutdown task borrows the caller's single VoprIo.
+pub const VoprPublicClusterFixture = struct {
+    pub const FaultMode = enum { clean, metadata_partition, node_restart, partial_http_write };
+    const node_count = 3;
+    const metadata_group_id: u64 = 6840;
+    const table_id: u64 = 6841;
+    const data_group_id: u64 = 6842;
+    const tenant_table_id: u64 = 6843;
+    const tenant_data_group_id: u64 = 6844;
+
+    alloc: std.mem.Allocator,
+    sim: *vopr.vopr_io.VoprIo,
+    tmp: std.testing.TmpDir,
+    roots: [node_count][]u8 = undefined,
+    root_count: usize = 0,
+    catalogs: [node_count][]u8 = undefined,
+    catalog_count: usize = 0,
+    stores: [node_count]raft_engine.core.MemoryStorage = undefined,
+    store_count: usize = 0,
+    factories: [node_count]TestDescriptorFactory = undefined,
+    modeled_devices: [node_count]storage_sim.ModeledDevice = undefined,
+    modeled_device_count: usize = 0,
+    modeled_configurators: [node_count]ModeledDbOpenConfigurator = undefined,
+    cluster: MetadataHttpClusterSimulation = undefined,
+    cluster_live: bool = false,
+    cluster_started: bool = false,
+    listeners: [node_count]api_http_test_runtime.Runtime = undefined,
+    servers: [node_count]api_http_server.ApiHttpServer = undefined,
+    status_sources: [node_count]PublicApiStatusSource = undefined,
+    catalog_sources: [node_count]PublicApiCatalogSource = undefined,
+    routers: [node_count]PublicApiRouter(node_count) = undefined,
+    read_sources: [node_count]api_table_reads.HostedProvisionedTableReadSource = undefined,
+    write_sources: [node_count]api_table_writes.HostedProvisionedTableWriteSource = undefined,
+    api_base_uris: [node_count][]const u8 = undefined,
+    uri_count: usize = 0,
+    forward_http_executor: io_http_executor.IoHttpExecutor = undefined,
+    client_http_executor: io_http_executor.IoHttpExecutor = undefined,
+    forward_executor_live: bool = false,
+    client_executor_live: bool = false,
+    stack_live: bool = false,
+    client: api_http_client.ApiHttpClient = undefined,
+    metadata_leader_index: usize = 0,
+    client_index: usize = 0,
+    actual_host_count: usize = 0,
+    write_done: std.Io.Event = .unset,
+    tenant_write_done: std.Io.Event = .unset,
+    write_finished: bool = false,
+    read_finished: bool = false,
+    tenant_write_finished: bool = false,
+    tenant_read_finished: bool = false,
+    fault_finished: bool = false,
+    write_sound: bool = false,
+    read_sound: bool = false,
+    tenant_write_sound: bool = false,
+    tenant_read_sound: bool = false,
+    table_isolation_sound: bool = false,
+    topology_sound: bool = false,
+    cleanup_sound: bool = false,
+    request_errors: u64 = 0,
+    last_request_error_code: u64 = 0,
+    complete: bool = false,
+
+    pub fn init(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*VoprPublicClusterFixture {
+        const self = try alloc.create(VoprPublicClusterFixture);
+        self.* = .{
+            .alloc = alloc,
+            .sim = sim,
+            .tmp = std.testing.tmpDir(.{}), // vopr-audit: allow(host_filesystem) production DB differential roots remain node-local
+        };
+        errdefer self.deinit();
+
+        for (0..node_count) |index| {
+            self.stores[index] = raft_engine.core.MemoryStorage.init(alloc);
+            self.store_count += 1;
+            self.modeled_devices[index] = storage_sim.ModeledDevice.init(alloc);
+            self.modeled_device_count += 1;
+            self.modeled_configurators[index] = .{ .device = &self.modeled_devices[index] };
+            self.roots[index] = try std.fmt.allocPrint(
+                alloc,
+                ".zig-cache/tmp/{s}/full-cluster-node-{d}",
+                .{ self.tmp.sub_path, index + 1 },
+            );
+            self.root_count += 1;
+            self.catalogs[index] = try std.fmt.allocPrint(
+                alloc,
+                ".zig-cache/tmp/{s}/full-cluster-node-{d}.catalog",
+                .{ self.tmp.sub_path, index + 1 },
+            );
+            self.catalog_count += 1;
+        }
+        for (0..node_count) |index| {
+            self.factories[index] = .{
+                .alloc = alloc,
+                .store = &self.stores[index],
+                .peers = &.{ 1, 2, 3 },
+            };
+            self.factories[index].split_runtime.replica_root_dir = self.roots[index];
+        }
+
+        const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+            makeHostSimConfig(1, metadata_group_id, self.roots[0], self.catalogs[0]),
+            makeHostSimConfig(2, metadata_group_id, self.roots[1], self.catalogs[1]),
+            makeHostSimConfig(3, metadata_group_id, self.roots[2], self.catalogs[2]),
+        };
+        const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+            makeHostSimDeps(&self.factories[0]),
+            makeHostSimDeps(&self.factories[1]),
+            makeHostSimDeps(&self.factories[2]),
+        };
+        self.cluster = try MetadataHttpClusterSimulation.init(alloc, metadata_group_id, &configs, &deps);
+        self.cluster_live = true;
+        for (0..node_count) |index| {
+            self.cluster.backendRuntime(index).setDbOpenConfigurator(self.modeled_configurators[index].iface());
+            self.factories[index].split_runtime.backend_runtime = self.cluster.backendRuntime(index);
+        }
+        self.metadata_leader_index = try startBootstrappedMetadataCluster(&self.cluster, 48, true);
+        self.cluster_started = true;
+
+        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        const ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = data_group_id,
+            .table_id = table_id,
+            .start_key = "doc:a",
+            .end_key = null,
+        }};
+        try createActiveTableRanges(&workflow, &self.cluster, self.metadata_leader_index, .{
+            .table_id = table_id,
+            .name = "docs",
+            .description = "full cluster VOPR documents",
+            .indexes_json = api_tables.default_indexes_json,
+            .desired_replica_count = 2,
+            .min_ranges = 1,
+        }, &ranges, 64);
+        const placement = try waitForFirstProjectedRange(
+            &self.cluster,
+            self.metadata_leader_index,
+            1,
+            2,
+            true,
+            64,
+        );
+        self.actual_host_count = placement.active_count;
+        self.client_index = placement.non_host_index orelse return error.FullClusterNonHostMissing;
+        try ensureGroupTextIndexOnActiveReplicas(
+            &self.cluster,
+            self.roots[0..],
+            data_group_id,
+            api_tables.default_full_text_index_name,
+            64,
+        );
+
+        const tenant_ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = tenant_data_group_id,
+            .table_id = tenant_table_id,
+            .start_key = "tenant:a",
+            .end_key = null,
+        }};
+        try createActiveTableRanges(&workflow, &self.cluster, self.metadata_leader_index, .{
+            .table_id = tenant_table_id,
+            .name = "tenant_b_docs",
+            .description = "full cluster VOPR tenant-isolation documents",
+            .indexes_json = api_tables.default_indexes_json,
+            .desired_replica_count = 2,
+            .min_ranges = 1,
+        }, &tenant_ranges, 64);
+        _ = try waitForFirstProjectedRange(
+            &self.cluster,
+            self.metadata_leader_index,
+            2,
+            2,
+            true,
+            64,
+        );
+        try ensureGroupTextIndexOnActiveReplicas(
+            &self.cluster,
+            self.roots[0..],
+            tenant_data_group_id,
+            api_tables.default_full_text_index_name,
+            64,
+        );
+
+        const deterministic_http_config: io_http_executor.IoHttpExecutorConfig = .{
+            .keep_alive = true,
+            .connect_timeout_ms = 0,
+            .read_timeout_ms = 0,
+            .write_timeout_ms = 0,
+            .pool_max_connections = 24,
+            .pool_max_per_host = 8,
+        };
+        self.forward_http_executor = io_http_executor.IoHttpExecutor.init(alloc, sim.io(), deterministic_http_config);
+        self.forward_executor_live = true;
+        self.client_http_executor = io_http_executor.IoHttpExecutor.init(alloc, sim.io(), deterministic_http_config);
+        self.client_executor_live = true;
+        const borrowed_roots = [_][]const u8{ self.roots[0], self.roots[1], self.roots[2] };
+        try startPublicApiServers(
+            node_count,
+            alloc,
+            &self.cluster,
+            sim.io(),
+            .limited(16),
+            &borrowed_roots,
+            .leader_backed,
+            self.forward_http_executor.executor(),
+            &self.listeners,
+            &self.servers,
+            &self.status_sources,
+            &self.catalog_sources,
+            &self.routers,
+            &self.read_sources,
+            &self.write_sources,
+            .{},
+            &self.api_base_uris,
+        );
+        self.uri_count = node_count;
+        self.stack_live = true;
+        self.client = api_http_client.ApiHttpClient.init(alloc, self.client_http_executor.executor());
+        for (0..node_count) |index| try self.cluster.node(index).runRound();
+        return self;
+    }
+
+    pub fn start(self: *VoprPublicClusterFixture, mode: FaultMode) !void {
+        switch (mode) {
+            .clean => self.fault_finished = true,
+            .metadata_partition => {
+                const leader_node_id = self.cluster.cluster.configs[self.metadata_leader_index].host.http.host.local_node_id;
+                try self.cluster.virtual_network.partitionNode(leader_node_id);
+                _ = self.sim.io().async(healMetadataPartition, .{ self, leader_node_id });
+            },
+            .node_restart => {
+                _ = self.sim.io().async(restartNonHost, .{self});
+            },
+            .partial_http_write => {
+                try self.sim.limitNextNetworkWrite(1);
+                self.fault_finished = true;
+            },
+        }
+        _ = self.sim.io().async(runWriter, .{self});
+        _ = self.sim.io().async(runReader, .{self});
+        _ = self.sim.io().async(runTenantWriter, .{self});
+        _ = self.sim.io().async(runTenantReader, .{self});
+        _ = self.sim.io().async(shutdownWhenComplete, .{self});
+    }
+
+    fn runWriter(self: *VoprPublicClusterFixture) void {
+        defer {
+            self.write_finished = true;
+            self.write_done.set(self.sim.io());
+        }
+        var response = self.client.fetchBatch(self.api_base_uris[self.client_index], "docs",
+            \\{"inserts":{"doc:z":{"title":"zeta","body":"hello distributed world"},"doc:y":{"title":"gamma","body":"hello cluster"}}}
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer response.deinit(self.alloc);
+        self.write_sound = response.status >= 200 and response.status < 300 and
+            std.mem.indexOf(u8, response.body, "\"inserted\":2") != null;
+    }
+
+    fn runReader(self: *VoprPublicClusterFixture) void {
+        self.write_done.waitUncancelable(self.sim.io());
+        defer self.read_finished = true;
+        if (!self.write_sound) return;
+        var lookup = self.client.fetchLookup(
+            self.api_base_uris[self.client_index],
+            "docs",
+            "doc:z",
+            null,
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer lookup.deinit(self.alloc);
+        if (std.mem.indexOf(u8, lookup.body, "\"zeta\"") == null) return;
+        var query = self.client.fetchQuery(self.api_base_uris[self.client_index], "docs",
+            \\{"full_text_search":{"match":{"field":"body","text":"distributed"}},"fields":["title","body"],"limit":10}
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer query.deinit(self.alloc);
+        self.read_sound = std.mem.indexOf(u8, query.body, "\"_id\":\"doc:z\"") != null;
+    }
+
+    fn runTenantWriter(self: *VoprPublicClusterFixture) void {
+        defer {
+            self.tenant_write_finished = true;
+            self.tenant_write_done.set(self.sim.io());
+        }
+        const route_index = (self.client_index + 1) % node_count;
+        var response = self.client.fetchBatch(self.api_base_uris[route_index], "tenant_b_docs",
+            \\{"inserts":{"tenant:z":{"title":"private","body":"tenant-isolation-sentinel"}}}
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer response.deinit(self.alloc);
+        self.tenant_write_sound = response.status >= 200 and response.status < 300 and
+            std.mem.indexOf(u8, response.body, "\"inserted\":1") != null;
+    }
+
+    fn runTenantReader(self: *VoprPublicClusterFixture) void {
+        self.tenant_write_done.waitUncancelable(self.sim.io());
+        defer self.tenant_read_finished = true;
+        if (!self.tenant_write_sound) return;
+        const route_index = (self.client_index + 2) % node_count;
+        var tenant_query = self.client.fetchQuery(self.api_base_uris[route_index], "tenant_b_docs",
+            \\{"full_text_search":{"match":{"field":"body","text":"tenant-isolation-sentinel"}},"fields":["title","body"],"limit":10}
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer tenant_query.deinit(self.alloc);
+        var docs_query = self.client.fetchQuery(self.api_base_uris[self.client_index], "docs",
+            \\{"full_text_search":{"match":{"field":"body","text":"tenant-isolation-sentinel"}},"fields":["title","body"],"limit":10}
+        ) catch |err| {
+            self.request_errors +|= 1;
+            self.last_request_error_code = @intFromError(err);
+            return;
+        };
+        defer docs_query.deinit(self.alloc);
+        self.tenant_read_sound = std.mem.indexOf(u8, tenant_query.body, "\"_id\":\"tenant:z\"") != null;
+        self.table_isolation_sound = self.tenant_read_sound and
+            std.mem.indexOf(u8, docs_query.body, "\"_id\":\"tenant:z\"") == null;
+    }
+
+    fn healMetadataPartition(self: *VoprPublicClusterFixture, node_id: u64) void {
+        self.sim.io().sleep(.fromNanoseconds(10), .awake) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            return;
+        };
+        self.cluster.virtual_network.healNode(node_id);
+        var rounds: usize = 0;
+        while (rounds < 16) : (rounds += 1) self.cluster.stepAll() catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            return;
+        };
+        self.topology_sound = currentMetadataLeaderIndex(&self.cluster) != null;
+        self.fault_finished = true;
+    }
+
+    fn restartNonHost(self: *VoprPublicClusterFixture) void {
+        self.cluster.restartNode(self.client_index) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            return;
+        };
+        var rounds: usize = 0;
+        while (rounds < 16) : (rounds += 1) self.cluster.stepAll() catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            return;
+        };
+        self.topology_sound = currentMetadataLeaderIndex(&self.cluster) != null;
+        self.fault_finished = true;
+    }
+
+    fn shutdownWhenComplete(self: *VoprPublicClusterFixture) void {
+        while (!self.write_finished or !self.read_finished or !self.tenant_write_finished or
+            !self.tenant_read_finished or !self.fault_finished)
+        {
+            self.sim.io().sleep(.fromNanoseconds(1), .awake) catch {
+                self.request_errors +|= 1;
+                return;
+            };
+        }
+        if (self.stack_live) {
+            deinitPublicApiStack(node_count, &self.listeners, &self.servers, &self.write_sources);
+            self.stack_live = false;
+        }
+        for (self.api_base_uris[0..self.uri_count]) |uri| self.alloc.free(uri);
+        self.uri_count = 0;
+        if (self.client_executor_live) {
+            self.client_http_executor.deinit();
+            self.client_executor_live = false;
+        }
+        if (self.forward_executor_live) {
+            self.forward_http_executor.deinit();
+            self.forward_executor_live = false;
+        }
+        self.topology_sound = self.topology_sound or currentMetadataLeaderIndex(&self.cluster) != null;
+        self.cleanup_sound = true;
+        self.complete = true;
+    }
+
+    pub fn deinit(self: *VoprPublicClusterFixture) void {
+        if (self.stack_live) {
+            deinitPublicApiStack(node_count, &self.listeners, &self.servers, &self.write_sources);
+            self.stack_live = false;
+        }
+        for (self.api_base_uris[0..self.uri_count]) |uri| self.alloc.free(uri);
+        self.uri_count = 0;
+        if (self.client_executor_live) {
+            self.client_http_executor.deinit();
+            self.client_executor_live = false;
+        }
+        if (self.forward_executor_live) {
+            self.forward_http_executor.deinit();
+            self.forward_executor_live = false;
+        }
+        if (self.cluster_started) self.cluster.stopAll();
+        if (self.cluster_live) self.cluster.deinit();
+        for (self.modeled_devices[0..self.modeled_device_count]) |*device| device.deinit();
+        for (self.stores[0..self.store_count]) |*store| store.deinit();
+        for (self.roots[0..self.root_count]) |root| self.alloc.free(root);
+        for (self.catalogs[0..self.catalog_count]) |catalog| self.alloc.free(catalog);
+        self.tmp.cleanup();
+        self.alloc.destroy(self);
+    }
+
+    pub fn healthSnapshot(self: *const VoprPublicClusterFixture) struct {
+        hosts: usize,
+        requests_ok: bool,
+        topology_ok: bool,
+        cleanup_ok: bool,
+    } {
+        return .{
+            .hosts = self.actual_host_count,
+            .requests_ok = self.write_sound and self.read_sound and self.tenant_write_sound and
+                self.tenant_read_sound and self.table_isolation_sound and self.request_errors == 0,
+            .topology_ok = self.topology_sound,
+            .cleanup_ok = self.cleanup_sound,
+        };
+    }
+};
 
 fn startBootstrappedMetadataCluster(
     cluster: *MetadataHttpClusterSimulation,
@@ -7482,13 +7922,13 @@ fn metadataVoprRunExpandedLivenessWorkload(
 
 const MetadataVoprScratch = struct {
     alloc: std.mem.Allocator,
-    io_impl: *std.Io.Threaded,
+    io_impl: *std.Io.Threaded, // vopr-audit: allow(native_thread_or_io) metadata VOPR retains native storage as an explicit differential backend
     sub_path: []u8,
 
     fn init(alloc: std.mem.Allocator) !MetadataVoprScratch {
         const io_impl = try alloc.create(std.Io.Threaded); // vopr-audit: allow(native_thread_or_io) metadata VOPR retains native storage as an explicit differential backend
         errdefer alloc.destroy(io_impl);
-        io_impl.* = std.Io.Threaded.init(alloc, .{});
+        io_impl.* = std.Io.Threaded.init(alloc, .{}); // vopr-audit: allow(native_thread_or_io) differential scratch backend only
         errdefer io_impl.deinit();
         var random_bytes: [12]u8 = undefined;
         io_impl.io().random(&random_bytes); // vopr-audit: allow(host_entropy) random bytes isolate a normalized scratch path and never enter choices observations or events
@@ -8369,10 +8809,11 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
         4,
         sim_alloc,
         &cluster,
-        &http_io,
+        http_io.io(),
+        http_io.async_limit,
         &roots,
         .local,
-        &forward_executor,
+        forward_executor.executor(),
         &listeners,
         &servers,
         &status_sources,
@@ -8569,10 +9010,11 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
         4,
         sim_alloc,
         &cluster,
-        &http_io,
+        http_io.io(),
+        http_io.async_limit,
         &roots,
         .local,
-        &forward_executor,
+        forward_executor.executor(),
         &listeners,
         &servers,
         &status_sources,
@@ -11988,7 +12430,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
             read_sources[i].source(),
             write_sources[i].source(),
         );
-        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, http_io.io(), &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -12264,7 +12706,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, http_io.io(), &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -12547,7 +12989,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
-        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
+        listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, http_io.io(), &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
     defer for (api_base_uris) |uri| std.testing.allocator.free(uri);
@@ -13605,7 +14047,7 @@ test "metadata http cluster simulation load balanced backup retries a real elect
         );
         listeners[index] = try api_http_test_runtime.Runtime.startShared(
             leanSimHttpAllocator(),
-            &http_io,
+            http_io.io(),
             &servers[index],
         );
         started += 1;

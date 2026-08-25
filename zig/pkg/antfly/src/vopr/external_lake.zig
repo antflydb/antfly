@@ -15,9 +15,10 @@ const lake = @import("../serverless/query/lake_parquet_rowgroup.zig");
 const range_io = @import("../serverless/query/lake_range_io.zig");
 const lake_rows = @import("../serverless/query/lake_rows.zig");
 const lake_scan_plan = @import("../serverless/query/lake_scan_plan.zig");
+const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
-    pub const name = "external-lake";
+    pub const name: []const u8 = "external-lake";
     pub const version: u32 = 2;
     const sound_id = vopr.id.stable(name, "composition-sound");
     const complete_id = vopr.id.stable(name, "mode-completes");
@@ -78,6 +79,7 @@ pub const Scenario = struct {
 
     const State = struct {
         allocator: std.mem.Allocator,
+        fixture_allocator: FixtureAllocator,
         sim: vopr.vopr_io.VoprIo,
         cache: lake.ObjectRangeCache = .{},
         calls: u64 = 0,
@@ -86,6 +88,8 @@ pub const Scenario = struct {
         sound: bool = true,
         complete: bool = false,
         restart_recovered: bool = false,
+        operation: ?std.Io.Future(void) = null,
+        operation_error: ?anyerror = null,
 
         fn reader(self: *@This()) lake.ObjectRangeReader {
             return .{ .ctx = self, .read_range_alloc = readRange };
@@ -398,6 +402,14 @@ pub const Scenario = struct {
                 else => try self.runComposition(),
             }
             self.progress += 1;
+        }
+
+        fn runAsync(self: *@This()) void {
+            self.run() catch |err| {
+                self.operation_error = err;
+                self.complete = true;
+                return;
+            };
             self.complete = true;
         }
     };
@@ -406,47 +418,77 @@ pub const Scenario = struct {
     pub fn init(allocator: std.mem.Allocator) !World {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.* = .{
-            .allocator = allocator,
-            .sim = try vopr.vopr_io.VoprIo.init(.{
-                .seed = 0xe17e_4a4e,
-                .required = .of(&.{ .clock_read, .files, .task_scheduling, .synchronization, .deterministic_entropy }),
-            }),
-        };
+        state.fixture_allocator = .init;
+        errdefer _ = state.fixture_allocator.deinit();
+        const fixture_alloc = state.fixture_allocator.allocator();
+        state.allocator = fixture_alloc;
+        state.sim = try vopr.vopr_io.VoprIo.init(.{
+            .seed = 0xe17e_4a4e,
+            // Avro schema decoding has a deliberately deep parser stack in
+            // Debug builds. Keep the deterministic fiber above the native
+            // test-thread stack size so the composition modes exercise the
+            // parser rather than the signal handler.
+            .tasks = .{ .stack_size = 32 * 1024 * 1024 },
+            .required = .of(&.{ .clock_read, .files, .task_scheduling, .synchronization, .deterministic_entropy }),
+        });
+        state.cache = .{};
+        state.calls = 0;
+        state.progress = 0;
+        state.mode = .cached_read;
+        state.sound = true;
+        state.complete = false;
+        state.restart_recovered = false;
+        state.operation = null;
+        state.operation_error = null;
         return .{ .state = state };
     }
     pub fn deinit(world: *World, allocator: std.mem.Allocator) void {
-        world.state.cache.deinit(allocator);
+        world.state.cache.deinit(world.state.allocator);
         world.state.sim.deinit();
+        std.debug.assert(world.state.fixture_allocator.deinit() == .ok);
         allocator.destroy(world.state);
         world.* = undefined;
     }
     pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: std.mem.Allocator) !void {
-        if (world.state.complete) return;
-        inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, mode_name| try list.append(allocator, .{
-            .id = id,
-            .name = mode_name,
-            .kind = switch (mode) {
-                .cached_read, .version_isolation, .full_composition, .schema_evolution, .restart_recovery => .workload,
-                else => .fault,
-            },
-        });
+        if (world.state.operation == null) {
+            if (world.state.complete) return;
+            inline for (std.meta.tags(Mode), mode_ids, mode_names) |mode, id, mode_name| try list.append(allocator, .{
+                .id = id,
+                .name = mode_name,
+                .kind = switch (mode) {
+                    .cached_read, .version_isolation, .full_composition, .schema_evolution, .restart_recovery => .workload,
+                    else => .fault,
+                },
+            });
+            return;
+        }
+        try world.state.sim.scheduler().enumerateReady(list, allocator);
     }
     pub fn execute(world: *World, selected: vopr.transition.Transition, events: *vopr.event.Sink, allocator: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
-        var found = false;
-        inline for (std.meta.tags(Mode), mode_ids) |mode, id| if (selected.id == id) {
-            world.state.mode = mode;
-            try world.state.run();
-            try world.state.sim.ensureNoCapabilityViolation();
-            found = true;
-        };
-        if (!found) return error.InvalidExternalLakeTransition;
-        try events.emitNamed(allocator, .domain, selected.name, world.state.calls);
+        const state = world.state;
+        if (state.operation == null and !state.complete) {
+            var found = false;
+            inline for (std.meta.tags(Mode), mode_ids) |mode, id| if (selected.id == id) {
+                state.mode = mode;
+                state.operation = try state.sim.io().concurrent(State.runAsync, .{state});
+                found = true;
+            };
+            if (!found) return error.InvalidExternalLakeTransition;
+            try events.emitNamed(allocator, .domain, selected.name, state.calls);
+            return .applied();
+        }
+
+        try state.sim.scheduler().executeReady(selected.id, events, allocator);
+        if (state.complete) {
+            state.operation = null;
+            if (state.operation_error) |err| return err;
+            try state.sim.ensureNoCapabilityViolation();
+        }
         return .applied();
     }
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
-        try builder.addNamed(allocator, name ++ ".calls", world.state.calls);
-        try builder.addNamed(allocator, name ++ ".progress", world.state.progress);
+        try builder.addNamed(allocator, name ++ ".calls", @intCast(world.state.calls));
+        try builder.addNamed(allocator, name ++ ".progress", @intCast(world.state.progress));
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(world.state.complete));
     }
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
@@ -463,7 +505,7 @@ pub const Scenario = struct {
         });
     }
     pub fn done(world: *World) bool {
-        return world.state.complete;
+        return world.state.complete and world.state.operation == null and world.state.sim.scheduler().quiescent();
     }
 };
 
@@ -515,13 +557,20 @@ fn evolvedMetadataJson() []const u8 {
 
 test "external lake VOPR exact replays full Iceberg and Parquet lifecycle faults" {
     const backend_ids = vopr.vopr_io.artifactBackendIds();
-    for (Scenario.mode_ids) |mode_id| {
-        var scripted = vopr.choice.Scripted{ .selections = &.{mode_id} };
-        var artifact = try vopr.runner.run(Scenario, std.testing.allocator, scripted.source(), .{
+    for (Scenario.mode_ids, 0..) |mode_id, mode_ordinal| {
+        var choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0xe17e_4a4e ^ mode_id);
+        var artifact = vopr.runner.run(Scenario, std.testing.allocator, choices.source(), .{
             .system = "antfly",
-            .transition_budget = 1,
+            .transition_budget = 512,
             .backend_ids = &backend_ids,
-        });
+        }) catch |err| {
+            if (err == error.VoprIoCapabilityViolation) {
+                std.debug.print("external lake capability violation mode={s} detail={any}\n", .{ Scenario.mode_names[mode_ordinal], @errorName(err) });
+            } else {
+                std.debug.print("external lake mode={s} failed: {s}\n", .{ Scenario.mode_names[mode_ordinal], @errorName(err) });
+            }
+            return err;
+        };
         defer artifact.deinit();
         try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.property_failures);
         var replayed = try vopr.replay.exact(Scenario, std.testing.allocator, &artifact);

@@ -174,7 +174,11 @@ pub const FileSystem = struct {
             error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
             else => return error.SystemResources,
         };
-        return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        errdefer _ = self.closeFiles(&.{file});
+        if (options.lock != .none and !(self.tryLock(file, options.lock) catch return error.FileLocksUnsupported))
+            return error.WouldBlock;
+        return file;
     }
 
     pub fn createFileAtomic(self: *FileSystem, dir: std.Io.Dir, sub_path: []const u8, options: std.Io.Dir.CreateFileAtomicOptions, now_ns: i96) std.Io.Dir.CreateFileAtomicError!std.Io.File.Atomic {
@@ -217,7 +221,11 @@ pub const FileSystem = struct {
             error.ProcessFdQuotaExceeded => return error.ProcessFdQuotaExceeded,
             else => return error.SystemResources,
         };
-        return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        const file: std.Io.File = .{ .handle = handle, .flags = .{ .nonblocking = false } };
+        errdefer _ = self.closeFiles(&.{file});
+        if (options.lock != .none and !(self.tryLock(file, options.lock) catch return error.FileLocksUnsupported))
+            return error.WouldBlock;
+        return file;
     }
 
     pub fn closeDirs(self: *FileSystem, dirs: []const std.Io.Dir) bool {
@@ -368,7 +376,7 @@ pub const FileSystem = struct {
     pub fn rename(self: *FileSystem, old_dir: std.Io.Dir, old_sub_path: []const u8, new_dir: std.Io.Dir, new_sub_path: []const u8, preserve: bool) anyerror!void {
         if (self.faults.fail_next_rename) {
             self.faults.fail_next_rename = false;
-            return error.InputOutput;
+            return error.HardwareFailure;
         }
         const old_path = self.resolvePath(old_dir, old_sub_path, false) catch |err| return mapRenamePathError(err);
         defer self.allocator.free(old_path);

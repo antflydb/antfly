@@ -6986,6 +6986,50 @@ pub fn build(b: *std.Build) void {
     );
     composed_query_vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
 
+    const query_embedding_cache_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"query embedding cache VOPR exact replays"},
+    });
+    const run_query_embedding_cache_vopr_tests = b.addRunArtifact(query_embedding_cache_vopr_tests);
+    const query_embedding_cache_vopr_test_step = b.step(
+        "query-embedding-cache-vopr-test",
+        "Run query embedding coalescing, cancellation, timeout, admission, TTL, LRU, and pin races on VoprIo",
+    );
+    query_embedding_cache_vopr_test_step.dependOn(&run_query_embedding_cache_vopr_tests.step);
+
+    const full_cluster_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster VOPR exact replays"},
+    });
+    const run_full_cluster_vopr_tests = b.addRunArtifact(full_cluster_vopr_tests);
+    const full_cluster_vopr_test_step = b.step(
+        "full-cluster-vopr-test",
+        "Run one shared-scheduler metadata, data, serverless, HTTP, and client deployment history",
+    );
+    full_cluster_vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
+
+    const generation_reranking_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"generation and reranking chain VOPR exact replays"},
+    });
+    const run_generation_reranking_vopr_tests = b.addRunArtifact(generation_reranking_vopr_tests);
+    const generation_reranking_vopr_test_step = b.step(
+        "generation-reranking-vopr-test",
+        "Run generation fallback/retry and reranking validation/error histories on VoprIo",
+    );
+    generation_reranking_vopr_test_step.dependOn(&run_generation_reranking_vopr_tests.step);
+
+    const distributed_query_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"distributed query VOPR exact replays"},
+    });
+    const run_distributed_query_vopr_tests = b.addRunArtifact(distributed_query_vopr_tests);
+    const distributed_query_vopr_test_step = b.step(
+        "distributed-query-vopr-test",
+        "Run distributed graph planning, fanout, hydration, topology, snapshot, and cancellation histories on VoprIo",
+    );
+    distributed_query_vopr_test_step.dependOn(&run_distributed_query_vopr_tests.step);
+
     const parquet_cache_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"persistent Parquet cache VOPR exact replays"},
@@ -7287,6 +7331,10 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_admission_vopr_tests.step);
     vopr_test_step.dependOn(&run_provider_boundary_vopr_tests.step);
     vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
+    vopr_test_step.dependOn(&run_query_embedding_cache_vopr_tests.step);
+    vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
+    vopr_test_step.dependOn(&run_generation_reranking_vopr_tests.step);
+    vopr_test_step.dependOn(&run_distributed_query_vopr_tests.step);
     vopr_test_step.dependOn(&run_parquet_cache_vopr_tests.step);
     vopr_test_step.dependOn(&run_provisioning_startup_vopr_tests.step);
     vopr_test_step.dependOn(&run_generation_lifecycle_vopr_tests.step);
