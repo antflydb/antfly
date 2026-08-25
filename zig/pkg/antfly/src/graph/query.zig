@@ -66,11 +66,14 @@ const TraverseResultAdmissionContext = struct {
     }
 };
 
-pub fn validateRequestOperationBudget(queries: anytype) !void {
+/// Validate execution-cost limits shared by canonical and compatibility graph
+/// requests. Public identifier syntax belongs to the dialect-specific API
+/// parser: legacy operation names are opaque wire keys and must survive the
+/// transition adapter unchanged.
+pub fn validateExecutionOperationBudget(queries: anytype) !void {
     if (queries.len > max_named_queries) return error.InvalidQueryRequest;
     var complete_matches: usize = 0;
     for (queries) |named_query| {
-        if (!isValidQueryName(named_query.name)) return error.InvalidQueryRequest;
         if (named_query.query.match_pattern == null) continue;
         complete_matches += 1;
         if (complete_matches > max_match_queries_per_request)

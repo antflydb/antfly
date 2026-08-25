@@ -5412,10 +5412,10 @@ pub const GraphResultNode = struct {
     evidence: ?std.json.Value = null,
 };
 
+/// Select nodes from a prior graph result. `binding` is valid only when `result_ref` names a prior MATCH result; traversal and path results select their returned or endpoint nodes and prohibit `binding`.
 pub const GraphResultRefNodeSelector = struct {
     /// `$query_results` selects the final ranked query results. `$graph_results.<query-name>` selects a prior graph query result. Prior MATCH results require `binding`; traversal and path results prohibit it. A path result selects the endpoint node of each returned path.
     result_ref: []const u8,
-    /// Binding alias to select from a prior MATCH result. Valid only with `$graph_results.<query-name>` when that query returns MATCH rows.
     binding: ?GraphIdentifier = null,
     /// Maximum referenced results to use. Omit only when the referenced result is complete.
     limit: ?i64 = null,
@@ -8999,7 +8999,7 @@ pub const QueryRequest = struct {
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
-    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Names beginning with `$` are reserved for result namespaces.
+    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Legacy operation names remain opaque and byte-for-byte compatible; canonical GraphIdentifier rules apply only to `graph_queries`. The request-wide limit of 64 operations also applies here to bound execution work during the compatibility window.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
     /// Deprecated compatibility behavior for `graph_searches`. Canonical `graph_queries` return independently typed, potentially table-qualified identities and cannot be combined with this field. Strategy for merging legacy graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
     expand_strategy: ?[]const u8 = null,
@@ -9666,7 +9666,7 @@ pub const RetrievalQueryRequest = struct {
     analyses: ?Analyses = null,
     /// Declarative graph matching, traversal, and path queries. A nested node `filter` is a typed, non-scoring stored-document predicate. It shares familiar scalar syntax with document queries but deliberately excludes analyzer-backed and index-only clauses. A request may contain at most 64 named graph operations, of which at most 8 may be named `match` operations. Each operation key is a GraphIdentifier under the versioned policy published in the GraphIdentifier schema. Put multiple counts over one pattern in the same `match` return object so they share one complete anchor scan.
     graph_queries: ?std.json.ArrayHashMap(GraphQuery) = null,
-    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Names beginning with `$` are reserved for result namespaces.
+    /// Deprecated compatibility alias for the v0.2 graph query contract. Use `graph_queries`; requests containing both fields are rejected. Legacy operation names remain opaque and byte-for-byte compatible; canonical GraphIdentifier rules apply only to `graph_queries`. The request-wide limit of 64 operations also applies here to bound execution work during the compatibility window.
     graph_searches: ?std.json.ArrayHashMap(LegacyGraphQuery) = null,
     /// Deprecated compatibility behavior for `graph_searches`. Canonical `graph_queries` return independently typed, potentially table-qualified identities and cannot be combined with this field. Strategy for merging legacy graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
     expand_strategy: ?[]const u8 = null,

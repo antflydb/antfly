@@ -2522,6 +2522,10 @@ components:
           items: { $ref: '#/components/schemas/GraphPathEndpoint' }
           description: Exact node identities. Omitted table means the query table.
     GraphResultRefNodeSelector:
+      description: >-
+        Select nodes from a prior graph result. `binding` is valid only when
+        `result_ref` names a prior MATCH result; traversal and path results
+        select their returned or endpoint nodes and prohibit `binding`.
       type: object
       additionalProperties: false
       required: [result_ref]
@@ -2538,9 +2542,6 @@ components:
             returned path.
         binding:
           $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier'
-          description: >-
-            Binding alias to select from a prior MATCH result. Valid only with
-            `$graph_results.<query-name>` when that query returns MATCH rows.
         limit:
           type: integer
           minimum: 1

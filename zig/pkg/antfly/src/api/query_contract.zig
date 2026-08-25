@@ -14529,6 +14529,26 @@ test "api query contract owns the admitted graph wire for exact proxying" {
     try std.testing.expectEqualStrings("active", filter.object.get("term").?.string);
 }
 
+test "api query contract preserves opaque legacy graph operation names" {
+    const alloc = std.testing.allocator;
+    const body =
+        \\{
+        \\  "graph_searches": {
+        \\    "$legacy": {
+        \\      "type": "neighbors",
+        \\      "index_name": "graph_idx",
+        \\      "start_nodes": {"keys":["doc:a"]}
+        \\    }
+        \\  }
+        \\}
+    ;
+    var owned = try parseQueryRequest(alloc, null, "docs", body);
+    defer owned.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+    try std.testing.expectEqualStrings("$legacy", owned.req.graph_queries[0].name);
+}
+
 test "canonical graph contract rejects modes without exact public execution" {
     const cases = [_][]const u8{
         "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"direction\":\"in\"}}}}",

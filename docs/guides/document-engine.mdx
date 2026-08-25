@@ -312,7 +312,10 @@ budget. Exhaustion returns `graph_distinct_budget_exceeded`; narrow the anchor
 predicate or use a non-distinct aggregate.
 
 The deprecated `graph_searches` request field remains a wire-compatibility
-adapter for the v0.2 shape. New clients should generate only `graph_queries`.
+adapter for the v0.2 shape. Its operation names remain opaque legacy map keys;
+the canonical GraphIdentifier policy applies only to `graph_queries`. The
+request-wide 64-operation safety limit applies to both dialects. New clients
+should generate only `graph_queries`.
 
 ## Full-Text And Vector Search
 

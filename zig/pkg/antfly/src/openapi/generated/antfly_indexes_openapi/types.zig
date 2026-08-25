@@ -2193,10 +2193,10 @@ pub const GraphResultNode = struct {
     evidence: ?std.json.Value = null,
 };
 
+/// Select nodes from a prior graph result. `binding` is valid only when `result_ref` names a prior MATCH result; traversal and path results select their returned or endpoint nodes and prohibit `binding`.
 pub const GraphResultRefNodeSelector = struct {
     /// `$query_results` selects the final ranked query results. `$graph_results.<query-name>` selects a prior graph query result. Prior MATCH results require `binding`; traversal and path results prohibit it. A path result selects the endpoint node of each returned path.
     result_ref: []const u8,
-    /// Binding alias to select from a prior MATCH result. Valid only with `$graph_results.<query-name>` when that query returns MATCH rows.
     binding: ?antfly_graph_identifier_openapi.GraphIdentifier = null,
     /// Maximum referenced results to use. Omit only when the referenced result is complete.
     limit: ?i64 = null,

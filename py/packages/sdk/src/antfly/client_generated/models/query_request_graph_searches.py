@@ -17,7 +17,10 @@ T = TypeVar("T", bound="QueryRequestGraphSearches")
 class QueryRequestGraphSearches:
     """Deprecated compatibility alias for the v0.2 graph query contract.
     Use `graph_queries`; requests containing both fields are rejected.
-    Names beginning with `$` are reserved for result namespaces.
+    Legacy operation names remain opaque and byte-for-byte compatible;
+    canonical GraphIdentifier rules apply only to `graph_queries`.
+    The request-wide limit of 64 operations also applies here to bound
+    execution work during the compatibility window.
 
     """
 

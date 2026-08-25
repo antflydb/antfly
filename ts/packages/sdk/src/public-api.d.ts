@@ -6915,7 +6915,10 @@ export interface components {
              * @deprecated
              * @description Deprecated compatibility alias for the v0.2 graph query contract.
              *     Use `graph_queries`; requests containing both fields are rejected.
-             *     Names beginning with `$` are reserved for result namespaces.
+             *     Legacy operation names remain opaque and byte-for-byte compatible;
+             *     canonical GraphIdentifier rules apply only to `graph_queries`.
+             *     The request-wide limit of 64 operations also applies here to bound
+             *     execution work during the compatibility window.
              */
             graph_searches?: {
                 [key: string]: components["schemas"]["LegacyGraphQuery"];
@@ -12127,10 +12130,10 @@ export interface components {
             /** @description Exact node identities. Omitted table means the query table. */
             identities: components["schemas"]["GraphPathEndpoint"][];
         };
+        /** @description Select nodes from a prior graph result. `binding` is valid only when `result_ref` names a prior MATCH result; traversal and path results select their returned or endpoint nodes and prohibit `binding`. */
         GraphResultRefNodeSelector: {
             /** @description `$query_results` selects the final ranked query results. `$graph_results.<query-name>` selects a prior graph query result. Prior MATCH results require `binding`; traversal and path results prohibit it. A path result selects the endpoint node of each returned path. */
             result_ref: string;
-            /** @description Binding alias to select from a prior MATCH result. Valid only with `$graph_results.<query-name>` when that query returns MATCH rows. */
             binding?: components["schemas"]["GraphIdentifier"];
             /** @description Maximum referenced results to use. Omit only when the referenced result is complete. */
             limit?: number;

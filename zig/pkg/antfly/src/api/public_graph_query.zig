@@ -85,7 +85,6 @@ pub fn parseSupportedGraphQueriesAlloc(
     } else if (request.graph_searches) |graph_searches| {
         var it = graph_searches.map.iterator();
         while (it.next()) |entry| {
-            if (!graph_query_mod.isValidQueryName(entry.key_ptr.*)) return error.InvalidQueryRequest;
             const name = try alloc.dupe(u8, entry.key_ptr.*);
             var name_owned = true;
             errdefer if (name_owned) alloc.free(name);
@@ -132,7 +131,7 @@ pub fn sortQueriesByDependencies(
     alloc: std.mem.Allocator,
     queries: []const db_mod.types.NamedGraphQuery,
 ) ![]usize {
-    try graph_query_mod.validateRequestOperationBudget(queries);
+    try graph_query_mod.validateExecutionOperationBudget(queries);
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
     for (queries, 0..) |query, i| {
@@ -599,14 +598,24 @@ test "parse supported graph queries accepts deprecated graph searches" {
     try std.testing.expectEqual(@as(u32, 7), items[0].query.params.max_results);
 }
 
-test "deprecated graph searches share canonical name admission" {
+test "deprecated graph searches preserve opaque legacy operation names" {
     const alloc = std.testing.allocator;
     var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
-        \\{"graph_searches":{"":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]}}}}
+        \\{"graph_searches":{"":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]}},"$legacy":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-b"]}}}}
     , .{});
     defer parsed.deinit();
 
-    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    defer freeNamedGraphQueries(alloc, items);
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    var saw_empty = false;
+    var saw_reserved = false;
+    for (items) |item| {
+        if (item.name.len == 0) saw_empty = true;
+        if (std.mem.eql(u8, item.name, "$legacy")) saw_reserved = true;
+    }
+    try std.testing.expect(saw_empty);
+    try std.testing.expect(saw_reserved);
 }
 
 test "graph operation names cannot shadow reserved result namespaces" {

@@ -3831,9 +3831,10 @@ pub fn build(b: *std.Build) void {
         "canonical graph path metadata safely reads legacy non-object records",
         "api query contract preserves algebraic graph path provenance",
         "api query contract owns the admitted graph wire for exact proxying",
+        "api query contract preserves opaque legacy graph operation names",
         "canonical graph contract rejects modes without exact public execution",
         "generated graph result union decodes pre-discriminator legacy responses",
-        "deprecated graph searches share canonical name admission",
+        "deprecated graph searches preserve opaque legacy operation names",
         "api query contract preflight summarizes query lanes and result refs",
         "parse supported graph queries accepts pattern requests",
         "graph node filters reject analyzer-backed text clauses",
@@ -3884,6 +3885,7 @@ pub fn build(b: *std.Build) void {
         "unsupported graph query modes fail closed",
         "parseRemoteSearchResult preserves typed graph rows and hydrated documents",
         "parseRemoteSearchResult preserves canonical graph path table identities",
+        "remote legacy graph results preserve opaque operation names",
     };
     const lib_unit_filters = selectTestFilters(b, &lib_unit_default_filters);
     const lib_unit_tests = b.addTest(.{

@@ -18204,9 +18204,13 @@ fn parseRemoteGraphResults(
 
     var it = value.map.iterator();
     while (it.next()) |entry| {
-        if (!graph_query_mod.isValidQueryName(entry.key_ptr.*))
-            return error.InvalidRemoteResponse;
         const result_value = entry.value_ptr.*;
+        // Canonical response keys obey the same GraphIdentifier policy as the
+        // request. Compatibility responses retain arbitrary v0.2 map keys;
+        // request/result correlation still verifies them exactly downstream.
+        if (result_value != .legacy_graph_query_result and
+            !graph_query_mod.isValidQueryName(entry.key_ptr.*))
+            return error.InvalidRemoteResponse;
         const ResultView = struct {
             canonical_nodes: ?[]const indexes_openapi.GraphResultNode = null,
             legacy_nodes: ?[]const indexes_openapi.LegacyGraphResultNode = null,
@@ -19104,6 +19108,17 @@ test "remote canonical graph result stats and aggregate exactness fail closed" {
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
         \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a"},{"key":"extra"}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
     ));
+}
+
+test "remote legacy graph results preserve opaque operation names" {
+    const alloc = std.testing.allocator;
+    var result = try parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"$legacy":{"type":"neighbors","total":0}},"took":0,"status":200,"table":"docs"}]}
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqualStrings("$legacy", result.graph_results[0].name);
 }
 
 test "remote legacy graph paths require contiguous identities and exact weight sums" {

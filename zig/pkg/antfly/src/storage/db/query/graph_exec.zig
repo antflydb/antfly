@@ -260,11 +260,10 @@ pub const SearchGraphExecutor = struct {
 const VisitState = enum { unvisited, visiting, done };
 
 pub fn sortGraphQueriesByDependencies(alloc: Allocator, queries: []const types.NamedGraphQuery) ![]usize {
-    try graph_query_mod.validateRequestOperationBudget(queries);
+    try graph_query_mod.validateExecutionOperationBudget(queries);
     var by_name = std.StringHashMapUnmanaged(usize).empty;
     defer by_name.deinit(alloc);
     for (queries, 0..) |query, i| {
-        if (!graph_query_mod.isValidQueryName(query.name)) return error.InvalidQueryRequest;
         const result = try by_name.getOrPut(alloc, query.name);
         if (result.found_existing) return error.InvalidQueryRequest;
         result.value_ptr.* = i;
@@ -312,20 +311,27 @@ test "graph query dependency sorting enforces request-wide operation bounds" {
         sortGraphQueriesByDependencies(std.testing.allocator, &too_many_complete_matches),
     );
 
+    // Dependency sorting operates on the admitted IR and is deliberately
+    // dialect-neutral. The legacy adapter preserves opaque v0.2 map keys;
+    // canonical public parsers enforce GraphIdentifier syntax before here.
+    var legacy_name = item;
+    legacy_name.name = "$legacy";
+    const legacy_sorted = try sortGraphQueriesByDependencies(std.testing.allocator, &.{legacy_name});
+    defer std.testing.allocator.free(legacy_sorted);
+    try std.testing.expectEqualSlices(usize, &.{0}, legacy_sorted);
+
     var empty_name = item;
     empty_name.name = "";
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        sortGraphQueriesByDependencies(std.testing.allocator, &.{empty_name}),
-    );
+    const empty_sorted = try sortGraphQueriesByDependencies(std.testing.allocator, &.{empty_name});
+    defer std.testing.allocator.free(empty_sorted);
+    try std.testing.expectEqualSlices(usize, &.{0}, empty_sorted);
 
     const too_long_name = [_]u8{'q'} ** (graph_query_mod.max_query_name_codepoints + 1);
     var overlong = item;
     overlong.name = &too_long_name;
-    try std.testing.expectError(
-        error.InvalidQueryRequest,
-        sortGraphQueriesByDependencies(std.testing.allocator, &.{overlong}),
-    );
+    const overlong_sorted = try sortGraphQueriesByDependencies(std.testing.allocator, &.{overlong});
+    defer std.testing.allocator.free(overlong_sorted);
+    try std.testing.expectEqualSlices(usize, &.{0}, overlong_sorted);
 }
 
 test "graph query dependency sorting accepts path result endpoints" {

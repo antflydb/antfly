@@ -46,10 +46,9 @@ class GraphIdentifierPolicyTest(unittest.TestCase):
         self.assertEqual(identifier_ref, indexes["GraphAliasOperand"]["properties"]["alias"])
         self.assertEqual(identifier_ref, indexes["GraphMatch"]["properties"]["anchor"])
         self.assertEqual(identifier_ref, indexes["GraphBindingsReturn"]["properties"]["bindings"]["items"])
-        self.assertEqual(
-            identifier_ref["$ref"],
-            indexes["GraphResultRefNodeSelector"]["properties"]["binding"]["$ref"],
-        )
+        selector = indexes["GraphResultRefNodeSelector"]
+        self.assertEqual(identifier_ref, selector["properties"]["binding"])
+        self.assertIn("prior MATCH result", selector["description"])
         self.assertEqual(
             identifier_ref,
             indexes["GraphResultRefNodeSelector"]["properties"]["result_ref"][
