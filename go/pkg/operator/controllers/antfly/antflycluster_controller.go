@@ -29,6 +29,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -169,6 +170,7 @@ const (
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters/finalizers,verbs=update
 //+kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update
@@ -220,8 +222,10 @@ func secretStoreEnv(store *antflyv1.SecretStoreSpec) []corev1.EnvVar {
 type internalServiceAuthRolloutMode string
 
 const (
-	internalServiceAuthRolloutEnforce   internalServiceAuthRolloutMode = "enforce"
-	internalServiceAuthRolloutMigration internalServiceAuthRolloutMode = "migration"
+	internalServiceAuthRolloutEnforce           internalServiceAuthRolloutMode = "enforce"
+	internalServiceAuthRolloutMigration         internalServiceAuthRolloutMode = "migration"
+	internalServiceAuthPublicBoundaryLabel                                     = "antfly.io/internal-service-auth-boundary"
+	internalServiceAuthPublicBoundaryAnnotation                                = "antfly.io/internal-service-auth-public-boundary"
 )
 
 func internalServiceAuthIssuer(cluster *antflyv1.AntflyCluster) string {
@@ -2202,6 +2206,78 @@ func (r *AntflyClusterReconciler) desiredInternalServiceAuthRolloutMode(ctx cont
 	return internalServiceAuthRolloutEnforce, false, nil
 }
 
+// internalServiceAuthPublicBoundaryReady keeps the externally addressable
+// Service drained until every workload normally selected by it is running in
+// enforce mode. Migration necessarily accepts unsigned legacy peers on the
+// shared listener; withdrawing its endpoints turns that compatibility window
+// into an explicit maintenance boundary instead of reopening /internal/v1 to
+// the Internet. The headless node Services remain available for the rollout.
+func (r *AntflyClusterReconciler) internalServiceAuthPublicBoundaryReady(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	boundaryEstablished := false
+	publicService := &corev1.Service{}
+	publicKey := types.NamespacedName{Name: cluster.Name + "-public-api", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, publicKey, publicService); err == nil {
+		boundaryEstablished = publicService.Annotations[internalServiceAuthPublicBoundaryAnnotation] == "enforced"
+	} else if !errors.IsNotFound(err) {
+		return false, fmt.Errorf("read public Service internal-service boundary: %w", err)
+	}
+
+	metadataStatefulSet := &appsv1.StatefulSet{}
+	metadataKey := types.NamespacedName{Name: cluster.Name + "-metadata", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, metadataKey, metadataStatefulSet); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read metadata StatefulSet for public internal-service boundary: %w", err)
+	}
+	metadataReplicas := effectiveMetadataNodeReplicas(cluster)
+	if statefulSetInternalServiceAuthMode(metadataStatefulSet) != internalServiceAuthRolloutEnforce ||
+		(!boundaryEstablished && !statefulSetRolloutComplete(metadataStatefulSet, metadataReplicas)) {
+		return false, nil
+	}
+
+	dataReplicas := effectiveDataNodeReplicas(cluster)
+	if cluster.Spec.DataNodes.Suspend {
+		dataReplicas = 0
+	}
+	dataStatefulSet := &appsv1.StatefulSet{}
+	dataKey := types.NamespacedName{Name: cluster.Name + "-data", Namespace: cluster.Namespace}
+	if err := r.Get(ctx, dataKey, dataStatefulSet); err != nil {
+		if errors.IsNotFound(err) && dataReplicas == 0 {
+			return true, nil
+		}
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read data StatefulSet for public internal-service boundary: %w", err)
+	}
+	return statefulSetInternalServiceAuthMode(dataStatefulSet) == internalServiceAuthRolloutEnforce &&
+		(boundaryEstablished || statefulSetRolloutComplete(dataStatefulSet, dataReplicas)), nil
+}
+
+func (r *AntflyClusterReconciler) internalServiceAuthPublicBoundaryDrained(ctx context.Context, cluster *antflyv1.AntflyCluster) (bool, error) {
+	if cluster.Spec.PublicAPI == nil || cluster.Spec.PublicAPI.Enabled == nil || !*cluster.Spec.PublicAPI.Enabled {
+		return true, nil
+	}
+	var slices discoveryv1.EndpointSliceList
+	if err := r.haBoundaryReader().List(
+		ctx,
+		&slices,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels{discoveryv1.LabelServiceName: cluster.Name + "-public-api"},
+	); err != nil {
+		return false, fmt.Errorf("list public API EndpointSlices for internal-service boundary: %w", err)
+	}
+	for i := range slices.Items {
+		for _, endpoint := range slices.Items[i].Endpoints {
+			if len(endpoint.Addresses) > 0 {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
 func (state metadataMembershipCapabilityRolloutState) requeueAfter() time.Duration {
 	if state == metadataMembershipCapabilityUnavailable {
 		return 0
@@ -2719,7 +2795,7 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.reconcileConfigMap(ctx, workingCluster); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.reconcileServices(ctx, workingCluster); err != nil {
+		if err := r.reconcileServices(ctx, workingCluster, false); err != nil {
 			return ctrl.Result{}, err
 		}
 		component := standaloneComponent(workingCluster)
@@ -2767,16 +2843,32 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// Create Services
-	if err := r.reconcileServices(ctx, workingCluster); err != nil {
-		return ctrl.Result{}, err
-	}
 	internalServiceAuthMode, internalServiceAuthRolloutPending, err := r.desiredInternalServiceAuthRolloutMode(ctx, workingCluster)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	publicBoundaryReady, err := r.internalServiceAuthPublicBoundaryReady(ctx, workingCluster)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// The internal headless Services stay present throughout the two-phase
+	// rollout, while the optional externally addressable Service is restored
+	// only after every selected pod proves enforcement.
+	if err := r.reconcileServices(ctx, workingCluster, !publicBoundaryReady); err != nil {
+		return ctrl.Result{}, err
+	}
+	if !publicBoundaryReady {
+		drained, err := r.internalServiceAuthPublicBoundaryDrained(ctx, workingCluster)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !drained {
+			log.Info("Waiting for public API endpoints to drain before starting internal-service migration")
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+	}
 	if internalServiceAuthRolloutPending {
-		log.Info("Internal-service authentication upgrade is rolling in migration mode", "mode", internalServiceAuthMode)
+		log.Info("Internal-service authentication upgrade is rolling behind a suspended public API boundary", "mode", internalServiceAuthMode)
 	}
 
 	// Create Metadata StatefulSet
@@ -3697,7 +3789,7 @@ func standaloneRuntimeStorageConfig(cluster *antflyv1.AntflyCluster) map[string]
 	}
 }
 
-func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster *antflyv1.AntflyCluster, suspendPublicAPI bool) error {
 	mode := effectiveTopologyMode(cluster)
 
 	// Build list of services to reconcile
@@ -3706,6 +3798,22 @@ func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster
 	// Only add public API service if enabled
 	publicAPIService := r.createPublicAPIService(cluster, mode == topologyModeStandalone)
 	if publicAPIService != nil {
+		if mode != topologyModeStandalone && cluster.Spec.InternalServiceAuth != nil {
+			if publicAPIService.Annotations == nil {
+				publicAPIService.Annotations = make(map[string]string)
+			}
+			publicAPIService.Annotations[internalServiceAuthPublicBoundaryAnnotation] = "enforced"
+		}
+		if suspendPublicAPI {
+			// Preserve the Service object, ClusterIP, and cloud load-balancer address
+			// while publishing zero endpoints during the legacy compatibility
+			// window. No operator-managed pod carries this quarantine label.
+			publicAPIService.Spec.Selector[internalServiceAuthPublicBoundaryLabel] = "enforce-ready"
+			if publicAPIService.Annotations == nil {
+				publicAPIService.Annotations = make(map[string]string)
+			}
+			publicAPIService.Annotations[internalServiceAuthPublicBoundaryAnnotation] = "suspended"
+		}
 		serviceDefs = append(serviceDefs, publicAPIService)
 	}
 
@@ -3765,6 +3873,11 @@ func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster
 			service.Spec.Selector = serviceDef.Spec.Selector
 			if serviceDef.Name == cluster.Name+"-public-api" {
 				syncHAPrimaryRouteServiceAnnotations(service, serviceDef.Annotations)
+				if value, ok := serviceDef.Annotations[internalServiceAuthPublicBoundaryAnnotation]; ok {
+					service.Annotations[internalServiceAuthPublicBoundaryAnnotation] = value
+				} else {
+					delete(service.Annotations, internalServiceAuthPublicBoundaryAnnotation)
+				}
 			}
 
 			// Copy ports, handling NodePort specially

@@ -7,6 +7,8 @@
 //! Short-lived, audience-bound credentials for node-to-node API calls.
 
 const std = @import("std");
+const http_common = @import("../common/http/http_common.zig");
+const platform_time = @import("antfly_platform").time;
 
 pub const audience = "antfly-internal-v1";
 pub const principal_kind = "service";
@@ -30,6 +32,53 @@ pub const Config = struct {
     issuer: []const u8,
     subject: []const u8 = default_subject,
 };
+
+pub fn requestTargetsInternalApi(uri: []const u8) bool {
+    const path_start = if (std.mem.indexOf(u8, uri, "://")) |scheme_end| blk: {
+        const authority_start = scheme_end + 3;
+        break :blk std.mem.indexOfScalarPos(u8, uri, authority_start, '/') orelse return false;
+    } else 0;
+    const target = uri[path_start..];
+    const path_end = std.mem.indexOfAny(u8, target, "?#") orelse target.len;
+    const path = target[0..path_end];
+    return std.mem.eql(u8, path, "/internal/v1") or
+        std.mem.startsWith(u8, path, "/internal/v1/");
+}
+
+/// Execute a request with a short-lived service credential only when its
+/// resolved target is inside the internal API namespace. Keeping signing here
+/// gives every handwritten node client the same non-leakage and duplicate-
+/// header guarantees as generated API forwarding.
+pub fn executeRequest(
+    alloc: std.mem.Allocator,
+    executor: http_common.RequestExecutor,
+    request: http_common.HttpRequest,
+    config: ?Config,
+) !http_common.HttpResponse {
+    const signing = config orelse return executor.execute(alloc, request);
+    if (!requestTargetsInternalApi(request.uri)) return executor.execute(alloc, request);
+
+    const token = try tokenAlloc(
+        alloc,
+        signing,
+        @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+    );
+    defer alloc.free(token);
+
+    const headers = try alloc.alloc(http_common.RequestHeader, request.headers.len + 1);
+    defer alloc.free(headers);
+    var header_count: usize = 0;
+    for (request.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, header_name)) continue;
+        headers[header_count] = header;
+        header_count += 1;
+    }
+    headers[header_count] = .{ .name = header_name, .value = token };
+    header_count += 1;
+    var authenticated = request;
+    authenticated.headers = headers[0..header_count];
+    return executor.execute(alloc, authenticated);
+}
 
 pub fn parseRolloutMode(raw: ?[]const u8) !RolloutMode {
     const value = raw orelse return .enforce;

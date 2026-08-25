@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const platform_time = @import("antfly_platform").time;
 const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
 const metadata_mod = @import("../metadata/domain.zig");
@@ -277,37 +276,12 @@ pub const ApiHttpClient = struct {
     /// authentication and prevents the credential from leaking to public API
     /// requests made through the same client.
     pub fn executeRequest(self: *ApiHttpClient, request: http_common.HttpRequest) !http_common.HttpResponse {
-        const config = self.internal_service orelse
-            return self.executor.execute(self.alloc, request);
-        if (!requestTargetsInternalApi(request.uri))
-            return self.executor.execute(self.alloc, request);
-
-        const token = try internal_service_auth.tokenAlloc(
+        return internal_service_auth.executeRequest(
             self.alloc,
-            config,
-            @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)),
+            self.executor,
+            request,
+            self.internal_service,
         );
-        defer self.alloc.free(token);
-
-        const headers = try self.alloc.alloc(http_common.RequestHeader, request.headers.len + 1);
-        defer self.alloc.free(headers);
-        var header_count: usize = 0;
-        for (request.headers) |header| {
-            // A routed caller cannot override or duplicate the credential the
-            // client owns. Some HTTP stacks select the first duplicate header,
-            // so appending without normalization would be ambiguous.
-            if (std.ascii.eqlIgnoreCase(header.name, internal_service_auth.header_name)) continue;
-            headers[header_count] = header;
-            header_count += 1;
-        }
-        headers[header_count] = .{
-            .name = internal_service_auth.header_name,
-            .value = token,
-        };
-        header_count += 1;
-        var authenticated = request;
-        authenticated.headers = headers[0..header_count];
-        return self.executor.execute(self.alloc, authenticated);
     }
 
     /// Public generated operations live below `/db/v1`. Internal forwarding
@@ -2845,18 +2819,6 @@ pub const ApiHttpClient = struct {
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 };
-
-fn requestTargetsInternalApi(uri: []const u8) bool {
-    const path_start = if (std.mem.indexOf(u8, uri, "://")) |scheme_end| blk: {
-        const authority_start = scheme_end + 3;
-        break :blk std.mem.indexOfScalarPos(u8, uri, authority_start, '/') orelse return false;
-    } else 0;
-    const target = uri[path_start..];
-    const path_end = std.mem.indexOfAny(u8, target, "?#") orelse target.len;
-    const path = target[0..path_end];
-    return std.mem.eql(u8, path, "/internal/v1") or
-        std.mem.startsWith(u8, path, "/internal/v1/");
-}
 
 const EncodedTransitionAction = struct {
     kind: enum {

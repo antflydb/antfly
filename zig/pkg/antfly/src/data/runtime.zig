@@ -14312,6 +14312,10 @@ pub const DataServer = struct {
         const remote_metadata = try alloc.create(RemoteMetadataSource);
         errdefer alloc.destroy(remote_metadata);
         remote_metadata.* = try RemoteMetadataSource.init(alloc, metadata_api_urls, api_io_impl);
+        _ = remote_metadata.withInternalServiceAuth(
+            cfg.api_server_cfg.internal_service_secret,
+            cfg.api_server_cfg.internal_service_issuer,
+        );
         errdefer remote_metadata.deinit();
 
         var data_raft_store: ?*raft_engine.core.MemoryStorage = null;
@@ -14700,6 +14704,8 @@ const RemoteMetadataSource = struct {
     linearizable_snapshot_unsupported_until_ns: []u64,
     http_executors: []antfly.raft.transport.std_http_executor.StdHttpExecutor,
     next_http_executor: std.atomic.Value(usize) = .init(0),
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
     test_faults: TestFaults = .{},
 
     fn init(
@@ -14752,6 +14758,25 @@ const RemoteMetadataSource = struct {
         self.alloc.free(self.base_uris);
         self.cache_mutex.unlock();
         self.* = undefined;
+    }
+
+    fn withInternalServiceAuth(
+        self: *RemoteMetadataSource,
+        secret: ?[]const u8,
+        issuer: ?[]const u8,
+    ) *RemoteMetadataSource {
+        self.internal_service_secret = secret;
+        self.internal_service_issuer = issuer;
+        return self;
+    }
+
+    fn metadataClient(
+        self: *RemoteMetadataSource,
+        alloc: std.mem.Allocator,
+    ) antfly.metadata_http_client.MetadataHttpClient {
+        var client = antfly.metadata_http_client.MetadataHttpClient.init(alloc, self.httpExecutor());
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client;
     }
 
     fn httpExecutor(self: *RemoteMetadataSource) antfly.common.http.RequestExecutor {
@@ -15127,7 +15152,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -15186,10 +15211,7 @@ const RemoteMetadataSource = struct {
                 const ticket = self.beginLinearizableSnapshot();
                 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
-                var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(
-                    arena.allocator(),
-                    self.httpExecutor(),
-                );
+                var metadata_client = self.metadataClient(arena.allocator());
                 var parsed = metadata_client.fetchLinearizableSnapshot(self.base_uris[index], budget) catch |err| {
                     if (err == error.UnsupportedOperation) {
                         self.noteLinearizableSnapshotUnsupported(index, platform_time.monotonicNs());
@@ -15255,7 +15277,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             const head = metadata_client.fetchHeadWithBudget(self.base_uris[index], budget) catch |err| {
                 if (err == error.Cancelled or err == error.Timeout) return err;
                 last_err = err;
@@ -15279,7 +15301,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             const status = metadata_client.fetchStatus(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -15312,7 +15334,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             var parsed = metadata_client.fetchSnapshotWithBudget(self.base_uris[index], budget) catch |err| {
                 if (err == error.Cancelled or err == error.Timeout) return err;
                 last_err = err;
@@ -15366,7 +15388,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             const valid = metadata_client.validateCatalogPublication(self.base_uris[index], contract) catch |err| {
                 last_err = err;
                 continue;
@@ -15387,7 +15409,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             const valid = metadata_client.validateCatalogTablePublication(self.base_uris[index], contract) catch |err| {
                 last_err = err;
                 continue;

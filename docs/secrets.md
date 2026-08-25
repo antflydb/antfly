@@ -121,7 +121,9 @@ an explicit two-phase rollout:
    `antfly.internal_service.rollout_mode` to `migration` (or set
    `ANTFLY_INTERNAL_SERVICE_ROLLOUT_MODE=migration`) and roll out the new
    binary. New nodes sign all outbound RPC while temporarily accepting old
-   unsigned peers. Responses to such legacy requests carry
+   unsigned peers. **Withdraw every externally addressable Service or ingress
+   that targets this listener before entering migration mode.** Responses to
+   such legacy requests carry
    `X-Antfly-Internal-Auth: legacy-migration` for traffic verification.
 2. After every peer is upgraded and legacy-marked traffic has stopped, set the
    mode to `enforce` (the default) and perform a second rolling restart. Nodes
@@ -130,7 +132,13 @@ an explicit two-phase rollout:
 
 Migration mode deliberately weakens the internal listener boundary and emits
 a prominent startup warning. Keep the listener private during that phase and
-do not leave migration mode enabled after the upgrade.
+do not leave migration mode enabled after the upgrade. The Kubernetes operator
+temporarily drains the optional `*-public-api` Service before migration while
+preserving its ClusterIP and load-balancer address. Endpoints return only after
+every metadata and data
+StatefulSet has completed its `enforce` rollout. This makes the compatibility
+phase an observable maintenance window instead of exposing unsigned
+`/internal/v1` routes.
 
 ### Kubernetes operator deployments
 

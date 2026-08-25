@@ -6478,6 +6478,7 @@ pub fn build(b: *std.Build) void {
         "metadata linearizable snapshot fences and frees one owned response",
         "metadata linearizable snapshot detects concurrent projection changes",
         "coherent linearizable snapshot retries a torn capture and preserves request context",
+        "metadata http client signs internal routes without leaking authority to public routes",
         "metadata http client fetches one bounded linearizable snapshot",
         "metadata http client treats missing linearizable snapshot route as unsupported",
         "metadata http server accepts internal reallocate and split merge routes",

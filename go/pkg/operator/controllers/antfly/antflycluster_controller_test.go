@@ -23,6 +23,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -108,6 +109,9 @@ func TestInternalServiceAuthUpgradeRequiresRuntimeCapabilityBeforeEnforcement(t 
 	if err := appsv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: "cluster-uid"},
 		Spec: antflyv1.AntflyClusterSpec{
@@ -171,6 +175,122 @@ func TestInternalServiceAuthUpgradeRequiresRuntimeCapabilityBeforeEnforcement(t 
 	mode, pending, err = missingCapabilityReconciler.desiredInternalServiceAuthRolloutMode(context.Background(), cluster)
 	if err != nil || mode != internalServiceAuthRolloutMigration || !pending {
 		t.Fatalf("missing runtime capability must remain in migration, mode=%q pending=%t err=%v", mode, pending, err)
+	}
+}
+
+func TestInternalServiceAuthPublicBoundaryWaitsForEveryEnforcingWorkload(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Mode:          antflyv1.ClusterModeDistributed,
+			MetadataNodes: antflyv1.MetadataNodesSpec{Replicas: 1},
+			DataNodes:     antflyv1.DataNodesSpec{Replicas: 1},
+		},
+	}
+	complete := func(name string, mode internalServiceAuthRolloutMode) *appsv1.StatefulSet {
+		return &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace, Generation: 2},
+			Spec: appsv1.StatefulSetSpec{Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{internalServiceAuthRolloutAnnotation: string(mode)},
+			}}},
+			Status: appsv1.StatefulSetStatus{
+				ObservedGeneration: 2,
+				UpdatedReplicas:    1,
+				ReadyReplicas:      1,
+				CurrentRevision:    "revision-a",
+				UpdateRevision:     "revision-a",
+			},
+		}
+	}
+	ready := func(objects ...client.Object) bool {
+		reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()}
+		value, err := reconciler.internalServiceAuthPublicBoundaryReady(context.Background(), cluster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	if ready() {
+		t.Fatal("a new cluster must not publish its API before authenticated workloads are ready")
+	}
+	if ready(
+		complete("example-metadata", internalServiceAuthRolloutMigration),
+		complete("example-data", internalServiceAuthRolloutMigration),
+	) {
+		t.Fatal("migration mode must keep the public API boundary withdrawn")
+	}
+	if ready(
+		complete("example-metadata", internalServiceAuthRolloutEnforce),
+		complete("example-data", internalServiceAuthRolloutMigration),
+	) {
+		t.Fatal("one remaining migration workload must keep the boundary withdrawn")
+	}
+	if !ready(
+		complete("example-metadata", internalServiceAuthRolloutEnforce),
+		complete("example-data", internalServiceAuthRolloutEnforce),
+	) {
+		t.Fatal("the public API may return after every workload is enforcing")
+	}
+	establishedService := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Name:        "example-public-api",
+		Namespace:   cluster.Namespace,
+		Annotations: map[string]string{internalServiceAuthPublicBoundaryAnnotation: "enforced"},
+	}}
+	incompleteMetadata := complete("example-metadata", internalServiceAuthRolloutEnforce)
+	incompleteMetadata.Status.UpdatedReplicas = 0
+	incompleteMetadata.Status.UpdateRevision = "revision-b"
+	if !ready(
+		establishedService,
+		incompleteMetadata,
+		complete("example-data", internalServiceAuthRolloutEnforce),
+	) {
+		t.Fatal("later enforcing-only rollouts must preserve the established public boundary")
+	}
+}
+
+func TestInternalServiceAuthPublicBoundaryWaitsForEndpointDrain(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := discoveryv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec:       antflyv1.AntflyClusterSpec{PublicAPI: &antflyv1.PublicAPIConfig{Enabled: &enabled}},
+	}
+	endpointSlice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "example-public-api-abc",
+			Namespace: cluster.Namespace,
+			Labels:    map[string]string{discoveryv1.LabelServiceName: "example-public-api"},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints:   []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.10"}}},
+	}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(endpointSlice).Build()}
+	drained, err := reconciler.internalServiceAuthPublicBoundaryDrained(context.Background(), cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drained {
+		t.Fatal("the workload rollout must not start while a stale public endpoint remains")
+	}
+	if err := reconciler.Delete(context.Background(), endpointSlice); err != nil {
+		t.Fatal(err)
+	}
+	drained, err = reconciler.internalServiceAuthPublicBoundaryDrained(context.Background(), cluster)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !drained {
+		t.Fatal("the workload rollout may start after every public endpoint drains")
 	}
 }
 
@@ -1119,7 +1239,8 @@ func TestUpdateStatusRejectsSteadyStateMetadataSplit(t *testing.T) {
 	cluster := &antflyv1.AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", Generation: 7},
 		Spec: antflyv1.AntflyClusterSpec{
-			Mode: antflyv1.ClusterModeDistributed,
+			Mode:                antflyv1.ClusterModeDistributed,
+			InternalServiceAuth: testInternalServiceAuthSpec(),
 			MetadataNodes: antflyv1.MetadataNodesSpec{
 				Replicas:    3,
 				MetadataAPI: antflyv1.APISpec{Port: 12377},
@@ -13125,7 +13246,7 @@ func TestReconcileServices_DeletesPublicAPIWhenDisabled(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred(), "Service should exist before reconciliation")
 
 	// Run reconcileServices
-	err = reconciler.reconcileServices(context.Background(), cluster)
+	err = reconciler.reconcileServices(context.Background(), cluster, false)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	// Verify the public-api service has been deleted
@@ -13181,8 +13302,50 @@ func TestReconcileServices_NoErrorWhenPublicAPIDisabledAndNoService(t *testing.T
 	}
 
 	// Should not error even when no public-api service exists
-	err = reconciler.reconcileServices(context.Background(), cluster)
+	err = reconciler.reconcileServices(context.Background(), cluster, false)
 	g.Expect(err).NotTo(HaveOccurred())
+}
+
+func TestReconcileServices_DrainsPublicAPIWithoutReplacingService(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	client := fake.NewClientBuilder().WithScheme(s).Build()
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+	enabled := true
+	serviceType := corev1.ServiceTypeLoadBalancer
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default", UID: "cluster-uid"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Mode:                antflyv1.ClusterModeDistributed,
+			InternalServiceAuth: testInternalServiceAuthSpec(),
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI:  antflyv1.APISpec{Port: 12377},
+				MetadataRaft: antflyv1.APISpec{Port: 9017},
+			},
+			DataNodes: antflyv1.DataNodesSpec{
+				API:  antflyv1.APISpec{Port: 12380},
+				Raft: antflyv1.APISpec{Port: 9021},
+			},
+			PublicAPI: &antflyv1.PublicAPIConfig{Enabled: &enabled, ServiceType: &serviceType, Port: 80},
+		},
+	}
+
+	g.Expect(reconciler.reconcileServices(context.Background(), cluster, true)).To(Succeed())
+	key := types.NamespacedName{Name: "test-cluster-public-api", Namespace: "default"}
+	service := &corev1.Service{}
+	g.Expect(client.Get(context.Background(), key, service)).To(Succeed())
+	uid := service.UID
+	g.Expect(service.Spec.Selector).To(HaveKeyWithValue(internalServiceAuthPublicBoundaryLabel, "enforce-ready"))
+	g.Expect(service.Annotations).To(HaveKeyWithValue(internalServiceAuthPublicBoundaryAnnotation, "suspended"))
+
+	g.Expect(reconciler.reconcileServices(context.Background(), cluster, false)).To(Succeed())
+	service = &corev1.Service{}
+	g.Expect(client.Get(context.Background(), key, service)).To(Succeed())
+	g.Expect(service.UID).To(Equal(uid))
+	g.Expect(service.Spec.Selector).NotTo(HaveKey(internalServiceAuthPublicBoundaryLabel))
+	g.Expect(service.Annotations).To(HaveKeyWithValue(internalServiceAuthPublicBoundaryAnnotation, "enforced"))
 }
 
 // Integration tests using envtest
@@ -13913,7 +14076,7 @@ func TestReconcileServices_StandaloneCreatesStandaloneAndPublicAPI(t *testing.T)
 		Scheme: s,
 	}
 
-	err = reconciler.reconcileServices(context.Background(), cluster)
+	err = reconciler.reconcileServices(context.Background(), cluster, false)
 	g.Expect(err).NotTo(HaveOccurred())
 
 	publicSvc := &corev1.Service{}
@@ -13996,7 +14159,7 @@ func TestReconcileServices_PublicAPIUsesHAPromotedRouteSelector(t *testing.T) {
 	client := newHAControllerTestClient(t, s, cluster)
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
 
-	g.Expect(reconciler.reconcileServices(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconciler.reconcileServices(context.Background(), cluster, false)).To(Succeed())
 
 	publicSvc := &corev1.Service{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
@@ -14042,7 +14205,7 @@ func TestReconcileServices_PublicAPIClearsStaleHARouteAnnotationsWhenHAManagemen
 	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, service).Build()
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
 
-	g.Expect(reconciler.reconcileServices(context.Background(), cluster)).To(Succeed())
+	g.Expect(reconciler.reconcileServices(context.Background(), cluster, false)).To(Succeed())
 
 	publicSvc := &corev1.Service{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-public-api", Namespace: "default"}, publicSvc)).To(Succeed())
