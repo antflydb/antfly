@@ -2109,11 +2109,19 @@ pub const HBCIndex = struct {
     published_active_count: AtomicU64,
     published_node_count: AtomicU64,
     published_generation: AtomicU64,
-    // Complete-snapshot searches take the shared side for their lifetime;
-    // ordinary publications take the exclusive side before mutating topology
-    // or its caches. Best-effort searches remain lock-free.
+    // Publishers take the exclusive side before mutating topology or caches.
+    // Complete searches normally use short shared capture/validation sections
+    // and retry optimistically; only a conflicting retry holds the shared side
+    // for progress. Best-effort searches remain lock-free.
     published_snapshot_mu: apply_rw_lock_mod.ApplyRwLock = .{},
     published_mutation_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Seqlock-style epoch for optimistic complete-snapshot searches. Every
+    /// mutation, including an aborted one that leaves the durable generation
+    /// unchanged, advances this from even -> odd -> even.
+    published_mutation_epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Exact reachable-vector coverage is immutable within a published
+    /// generation, so only the first complete search needs to validate it.
+    complete_coverage_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64)),
     rng: go_rand.GoPcg,
     // Set when a write path observes a tree-link inconsistency (stale parent
     // pointer, dangling node reference); background maintenance runs a
@@ -2226,6 +2234,63 @@ pub const HBCIndex = struct {
     pub const BorrowedVector = BorrowedVectorLease;
     pub const BorrowedMetadata = BorrowedMetadataLease;
     pub const NodeRead = vectorindex_hbc_index.CachedNodeReadHandle(*HBCIndex);
+
+    fn PublishedTxn(comptime Inner: type) type {
+        return struct {
+            const Self = @This();
+
+            owner: *HBCIndex,
+            inner: Inner,
+            active: bool = true,
+
+            pub fn abort(self: *Self) void {
+                if (!self.active) return;
+                self.inner.abort();
+                self.owner.abortPublishedSearchStateRefresh();
+                self.active = false;
+            }
+
+            pub fn commit(self: *Self) !void {
+                if (!self.active) return error.TransactionClosed;
+                self.owner.markPublishedSearchStateCommitting();
+                self.inner.commit() catch |err| {
+                    self.inner.abort();
+                    self.owner.abortPublishedSearchStateRefresh();
+                    self.active = false;
+                    return err;
+                };
+                self.owner.finishPublishedSearchStateRefresh();
+                self.active = false;
+            }
+
+            pub fn get(self: *Self, namespace: Namespace, key: []const u8) ![]const u8 {
+                return try self.inner.get(namespace, key);
+            }
+
+            pub fn getManySorted(self: *Self, namespace: Namespace, keys: []const []const u8, values: []?[]const u8) !void {
+                return try self.inner.getManySorted(namespace, keys, values);
+            }
+
+            pub fn put(self: *Self, namespace: Namespace, key: []const u8, value: []const u8) !void {
+                return try self.inner.put(namespace, key, value);
+            }
+
+            pub fn appendPut(self: *Self, namespace: Namespace, key: []const u8, value: []const u8) !void {
+                return try self.inner.appendPut(namespace, key, value);
+            }
+
+            pub fn delete(self: *Self, namespace: Namespace, key: []const u8) !void {
+                return try self.inner.delete(namespace, key);
+            }
+
+            pub fn openCursor(self: *Self, namespace: Namespace) !vectorindex_store.Cursor {
+                return try self.inner.openCursor(namespace);
+            }
+        };
+    }
+
+    pub const PublishedWriteTxn = PublishedTxn(vectorindex_store.NamespaceWriteTxn);
+    pub const PublishedBatchTxn = PublishedTxn(vectorindex_store.NamespaceBatch);
 
     pub const DenseRoute = enum(u8) { unknown, exact, hbc };
 
@@ -2593,6 +2658,8 @@ pub const HBCIndex = struct {
                 try options.checkAdmission();
                 publish_window += 1;
                 const window_start_ns = nowNs();
+                self.beginPublishedSearchStateRefresh();
+                errdefer self.abortPublishedSearchStateRefresh();
                 var batch = try self.store.beginBatch();
                 errdefer batch.abort();
                 const split_calls_before = self.write_profile.split_leaf_calls;
@@ -2621,8 +2688,7 @@ pub const HBCIndex = struct {
                 try self.flushMetadataNow(&batch);
                 if (!has_more_deferred_splits) try self.clearBulkPublishStateTxn(&batch);
                 const commit_start = nowNs();
-                self.beginPublishedSearchStateRefresh();
-                errdefer self.abortPublishedSearchStateRefresh();
+                self.markPublishedSearchStateCommitting();
                 try batch.commit();
                 self.write_profile.insert_commit_ns += elapsedSince(commit_start);
                 self.finishPublishedSearchStateRefresh();
@@ -2926,6 +2992,8 @@ pub const HBCIndex = struct {
 
     pub fn beginPublishedSearchStateRefresh(self: *HBCIndex) void {
         self.published_snapshot_mu.lockExclusive();
+        const previous = self.published_mutation_epoch.fetchAdd(1, .acq_rel);
+        std.debug.assert((previous & 1) == 0);
         self.published_mutation_active.store(true, .release);
     }
 
@@ -2936,9 +3004,9 @@ pub const HBCIndex = struct {
     }
 
     pub fn finishPublishedSearchStateRefresh(self: *HBCIndex) void {
-        // Legacy/manual transaction helpers begin their publication at the
-        // commit boundary. New mutation-fenced paths mark explicitly just
-        // before commit so readers cannot observe an odd generation early.
+        // Publication paths normally mark explicitly just before commit so
+        // readers cannot observe an odd durable generation early. Keep this
+        // fallback for adapters that only provide begin/finish hooks.
         if ((self.published_generation.load(.acquire) & 1) == 0) {
             self.markPublishedSearchStateCommitting();
         }
@@ -2947,6 +3015,8 @@ pub const HBCIndex = struct {
         self.published_node_count.store(self.metadata.node_count, .release);
         _ = self.published_generation.fetchAdd(1, .acq_rel);
         self.finishVectorCacheMutations();
+        const previous_mutation = self.published_mutation_epoch.fetchAdd(1, .acq_rel);
+        std.debug.assert((previous_mutation & 1) != 0);
         self.published_mutation_active.store(false, .release);
         self.published_snapshot_mu.unlockExclusive();
     }
@@ -2955,7 +3025,20 @@ pub const HBCIndex = struct {
         if ((self.published_generation.load(.acquire) & 1) != 0) {
             _ = self.published_generation.fetchAdd(1, .acq_rel);
         }
+        // Mutation helpers can populate caches before the storage commit so
+        // later operations in the same transaction can reuse staged state.
+        // None of those entries may escape an abort. Clearing transaction-
+        // populated caches is an exceptional-path cost and restores the
+        // published generation without penalizing successful writes.
+        self.clearNodeCache();
+        self.clearQuantizedCache();
+        self.clearMetadataCache();
+        self.metadata.root_node = self.published_root_node.load(.acquire);
+        self.metadata.active_count = self.published_active_count.load(.acquire);
+        self.metadata.node_count = self.published_node_count.load(.acquire);
         self.finishVectorCacheMutations();
+        const previous_mutation = self.published_mutation_epoch.fetchAdd(1, .acq_rel);
+        std.debug.assert((previous_mutation & 1) != 0);
         self.published_mutation_active.store(false, .release);
         self.published_snapshot_mu.unlockExclusive();
     }
@@ -2984,6 +3067,18 @@ pub const HBCIndex = struct {
 
     pub fn publishedGeneration(self: *const HBCIndex) u64 {
         return self.published_generation.load(.acquire);
+    }
+
+    pub fn publishedMutationEpoch(self: *const HBCIndex) u64 {
+        return self.published_mutation_epoch.load(.acquire);
+    }
+
+    pub fn completeCoverageAlreadyValidated(self: *const HBCIndex, generation: u64) bool {
+        return self.complete_coverage_generation.load(.acquire) == generation;
+    }
+
+    pub fn noteCompleteCoverageValidated(self: *HBCIndex, generation: u64) void {
+        self.complete_coverage_generation.store(generation, .release);
     }
 
     pub fn attachResourceManager(self: *HBCIndex, resource_manager: *resource_manager_mod.ResourceManager) void {
@@ -3665,6 +3760,8 @@ pub const HBCIndex = struct {
             vectorindex_store.NamespaceReadTxn,
             vectorindex_store.NamespaceWriteTxn,
             vectorindex_store.NamespaceBatch,
+            PublishedWriteTxn,
+            PublishedBatchTxn,
             => {},
             else => @compileError("expected vectorindex namespace transaction"),
         }
@@ -3781,6 +3878,8 @@ pub const HBCIndex = struct {
             vectorindex_store.NamespaceReadTxn,
             vectorindex_store.NamespaceWriteTxn,
             vectorindex_store.NamespaceBatch,
+            PublishedWriteTxn,
+            PublishedBatchTxn,
             => return try txn.get(if (namespace == .vecs) self.vectorArtifactReadNamespace() else namespace, key),
             else => @compileError("expected vectorindex namespace transaction"),
         }
@@ -3834,6 +3933,8 @@ pub const HBCIndex = struct {
             vectorindex_store.NamespaceReadTxn,
             vectorindex_store.NamespaceWriteTxn,
             vectorindex_store.NamespaceBatch,
+            PublishedWriteTxn,
+            PublishedBatchTxn,
             => return try txn.get(namespace, key),
             else => @compileError("expected vectorindex namespace transaction"),
         }
@@ -3844,6 +3945,8 @@ pub const HBCIndex = struct {
         switch (Child) {
             vectorindex_store.NamespaceWriteTxn,
             vectorindex_store.NamespaceBatch,
+            PublishedWriteTxn,
+            PublishedBatchTxn,
             => {
                 if (namespace == .nodes and try self.stageNodeKeyPut(key, value)) return;
                 try txn.put(namespace, key, value);
@@ -3857,7 +3960,7 @@ pub const HBCIndex = struct {
     pub fn appendNamespaced(self: *HBCIndex, txn: anytype, comptime namespace: Namespace, key: []const u8, value: []const u8) !void {
         const Child = comptime txnLikeChild(@TypeOf(txn));
         switch (Child) {
-            vectorindex_store.NamespaceWriteTxn => {
+            vectorindex_store.NamespaceWriteTxn, PublishedWriteTxn => {
                 txn.appendPut(namespace, key, value) catch |err| switch (err) {
                     error.Unsupported => {
                         try txn.put(namespace, key, value);
@@ -3868,7 +3971,7 @@ pub const HBCIndex = struct {
                 };
                 self.noteNamespacePut(namespace, key.len, value.len, true);
             },
-            vectorindex_store.NamespaceBatch => {
+            vectorindex_store.NamespaceBatch, PublishedBatchTxn => {
                 txn.appendPut(namespace, key, value) catch |err| switch (err) {
                     error.Unsupported => {
                         try txn.put(namespace, key, value);
@@ -3889,6 +3992,8 @@ pub const HBCIndex = struct {
         switch (Child) {
             vectorindex_store.NamespaceWriteTxn,
             vectorindex_store.NamespaceBatch,
+            PublishedWriteTxn,
+            PublishedBatchTxn,
             => {
                 if (namespace == .nodes and try self.stageNodeKeyDelete(key)) return;
                 try txn.delete(namespace, key);
@@ -3971,6 +4076,7 @@ pub const HBCIndex = struct {
         switch (Child) {
             vectorindex_store.NamespaceReadTxn,
             vectorindex_store.NamespaceWriteTxn,
+            PublishedWriteTxn,
             => return try txn.openCursor(namespace),
             else => @compileError("expected vectorindex namespace transaction"),
         }
@@ -4536,7 +4642,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn cacheQuantized(self: *HBCIndex, node_id: u64, qs: *const QuantizedSet) !void {
-        if (self.publicationMutationActive()) return;
+        if (self.lsmSessionBatchingActive() or self.publicationMutationActive()) return;
         if (!self.cache_enabled) return;
         {
             self.cache_mu.lockExclusive();
@@ -4701,7 +4807,7 @@ pub const HBCIndex = struct {
 
     pub fn cacheMetadata(self: *HBCIndex, vector_id: u64, metadata: []const u8) ![]const u8 {
         if (!self.cache_enabled) return metadata;
-        if (self.lsmSessionBatchingActive()) return metadata;
+        if (self.lsmSessionBatchingActive() or self.publicationMutationActive()) return metadata;
         if (self.config.max_cached_metadata == 0) return metadata;
         if (self.shared_cache) |cache| {
             return try cache.cacheMetadata(self.cache_namespace, vector_id, metadata);
@@ -4808,7 +4914,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn borrowCachedQuantized(self: *HBCIndex, node_id: u64) ?BorrowedQuantized {
-        if (self.publicationMutationActive()) return null;
+        if (self.lsmSessionBatchingActive() or self.publicationMutationActive()) return null;
         if (!self.cache_enabled) return null;
         self.cache_mu.lockShared();
         if (self.pinned_quantized_cache.get(node_id)) |entry| {
@@ -4855,6 +4961,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn borrowCachedMetadata(self: *HBCIndex, vector_id: u64) ?BorrowedMetadata {
+        if (self.lsmSessionBatchingActive() or self.publicationMutationActive()) return null;
         if (!self.cache_enabled) return null;
         if (self.shared_cache) |cache| return cache.borrowMetadata(self.cache_namespace, vector_id);
         self.cache_mu.lockShared();
@@ -4947,27 +5054,34 @@ pub const HBCIndex = struct {
         return try self.beginRuntimeReadTxn();
     }
 
-    pub fn beginWriteTxn(self: *HBCIndex) !vectorindex_store.NamespaceWriteTxn {
-        return try self.beginRuntimeWriteTxn();
+    pub fn beginWriteTxn(self: *HBCIndex) !PublishedWriteTxn {
+        self.beginPublishedSearchStateRefresh();
+        errdefer self.abortPublishedSearchStateRefresh();
+        return .{
+            .owner = self,
+            .inner = try self.beginRuntimeWriteTxn(),
+        };
     }
 
-    pub fn beginBatchTxn(self: *HBCIndex) !vectorindex_store.NamespaceBatch {
-        return try self.beginRuntimeBatchTxn();
+    pub fn beginBatchTxn(self: *HBCIndex) !PublishedBatchTxn {
+        self.beginPublishedSearchStateRefresh();
+        errdefer self.abortPublishedSearchStateRefresh();
+        return .{
+            .owner = self,
+            .inner = try self.beginRuntimeBatchTxn(),
+        };
     }
 
-    pub fn finishWriteTxn(self: *HBCIndex, txn: anytype) !void {
+    pub fn finishWriteTxn(self: *HBCIndex, txn: *PublishedWriteTxn) !void {
         try self.finishWriteTxnOptions(txn, .{});
     }
 
-    pub fn finishWriteTxnOptions(self: *HBCIndex, txn: anytype, options: BatchInsertOptions) !void {
+    pub fn finishWriteTxnOptions(self: *HBCIndex, txn: *PublishedWriteTxn, options: BatchInsertOptions) !void {
         errdefer self.abortVectorCacheMutations();
         try self.finalizeWriteTxnOptions(txn, options);
         const commit_start = nowNs();
-        self.beginPublishedSearchStateRefresh();
-        errdefer self.abortPublishedSearchStateRefresh();
-        try commitTxn(txn);
+        try txn.commit();
         self.write_profile.insert_commit_ns += elapsedSince(commit_start);
-        self.finishPublishedSearchStateRefresh();
     }
 
     fn finalizeWriteTxnOptions(self: *HBCIndex, txn: anytype, options: BatchInsertOptions) !void {
@@ -7435,12 +7549,12 @@ pub const HBCIndex = struct {
         var txn = try self.beginWriteTxn();
         errdefer txn.abort();
         const result = try vectorindex_hbc_index.repairDirtyPostingsTxnWithOptions(self, &txn, options);
+        // This is the maintenance operation itself. Running the generic
+        // write finalizer here would apply the separately configured auto
+        // maintenance budget after the caller's explicit bound.
         const commit_start = nowNs();
-        self.beginPublishedSearchStateRefresh();
-        errdefer self.abortPublishedSearchStateRefresh();
-        try commitTxn(&txn);
+        try txn.commit();
         self.write_profile.insert_commit_ns += elapsedSince(commit_start);
-        self.finishPublishedSearchStateRefresh();
         return result;
     }
 
@@ -7824,7 +7938,7 @@ test "complete snapshot rejects orphaned reachable coverage and schedules genera
     try std.testing.expect(idx.treeLinkRepairPending());
 }
 
-test "complete snapshot fences publication from capture through read transaction" {
+test "complete snapshot retries optimistic publication conflicts under a progress fence" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -7840,23 +7954,45 @@ test "complete snapshot fences publication from capture through read transaction
     try idx.insert(1, &.{ 0, 0 });
     try idx.insert(2, &.{ 1, 0 });
     try idx.insert(3, &.{ 0, 1 });
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
 
     const HookContext = struct {
-        fired: bool = false,
-        publication_fenced: bool = false,
+        io: std.Io,
+        captures: usize = 0,
+        optimistic_capture_unfenced: bool = false,
+        retry_fenced: bool = false,
+        writer_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn publishConcurrentInsert(index: *HBCIndex, failed: *std.atomic.Value(bool)) void {
+            index.insert(4, &.{ 1, 1 }) catch failed.store(true, .release);
+        }
 
         fn onCapture(raw_ctx: ?*anyopaque, index: *HBCIndex) void {
             const ctx: *@This() = @ptrCast(@alignCast(raw_ctx.?));
-            if (ctx.fired) return;
-            ctx.fired = true;
+            ctx.captures += 1;
+            if (ctx.captures == 1) {
+                if (!index.published_snapshot_mu.tryLockExclusive()) return;
+                index.published_snapshot_mu.unlockExclusive();
+                ctx.optimistic_capture_unfenced = true;
+
+                // Publish a real concurrent mutation after capture. The
+                // optimistic attempt must discard its result and retry while
+                // holding the shared side of the publication fence for
+                // progress.
+                var writer = std.Io.async(ctx.io, publishConcurrentInsert, .{ index, &ctx.writer_failed });
+                writer.await(ctx.io);
+                return;
+            }
             if (index.published_snapshot_mu.tryLockExclusive()) {
                 index.published_snapshot_mu.unlockExclusive();
-            } else {
-                ctx.publication_fenced = true;
+                return;
             }
+            ctx.retry_fenced = true;
         }
     };
-    var hook_ctx = HookContext{};
+    var hook_ctx = HookContext{ .io = io };
     test_complete_snapshot_capture_ctx = &hook_ctx;
     test_complete_snapshot_capture_hook = HookContext.onCapture;
     defer {
@@ -7871,9 +8007,74 @@ test "complete snapshot fences publication from capture through read transaction
         .load_metadata = false,
     });
     defer results.deinit();
-    try std.testing.expect(hook_ctx.fired);
-    try std.testing.expect(hook_ctx.publication_fenced);
+    try std.testing.expectEqual(@as(usize, 2), hook_ctx.captures);
+    try std.testing.expect(hook_ctx.optimistic_capture_unfenced);
+    try std.testing.expect(hook_ctx.retry_fenced);
+    try std.testing.expect(!hook_ctx.writer_failed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 4), idx.stats().active_count);
     try std.testing.expectEqual(@as(usize, 3), results.getHits().len);
+    try std.testing.expect(!idx.generationRepairPending());
+}
+
+test "aborted published transaction cannot leak staged topology through caches" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 64,
+        .branching_factor = 4,
+        .use_quantization = false,
+    });
+    defer idx.close();
+    try idx.insertWithMetadata(1, &.{ 0, 0 }, "committed:1");
+    try idx.insertWithMetadata(2, &.{ 1, 0 }, "committed:2");
+    try idx.insertWithMetadata(3, &.{ 0, 1 }, "committed:3");
+    const warmed_metadata = (try idx.getMetadata(1)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(warmed_metadata);
+    var warmed = idx.borrowCachedMetadata(1) orelse return error.TestUnexpectedResult;
+    warmed.deinit();
+
+    const epoch_before = idx.publishedMutationEpoch();
+    {
+        var txn = try idx.beginWriteTxn();
+        var root = try idx.loadNode(&txn, idx.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        const staged_members = try alloc.dupe(u64, root.members[0..1]);
+        alloc.free(root.members);
+        root.members = staged_members;
+        try idx.saveNode(&txn, &root);
+        try idx.putMetadata(&txn, 1, "staged:1");
+        try std.testing.expect(idx.borrowCachedMetadata(1) == null);
+        idx.metadata.active_count = 1;
+        txn.abort();
+    }
+
+    const epoch_after = idx.publishedMutationEpoch();
+    try std.testing.expectEqual(epoch_before + 2, epoch_after);
+    try std.testing.expectEqual(@as(u64, 0), epoch_after & 1);
+    try std.testing.expectEqual(@as(u64, 3), idx.stats().active_count);
+    try std.testing.expect(idx.borrowCachedMetadata(1) == null);
+
+    var results = try idx.searchWithRequest(.{
+        .query = &.{ 0, 0 },
+        .k = 3,
+        .search_effort = 1,
+        .load_metadata = true,
+    });
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 3), results.getHits().len);
+    var found_committed_metadata = false;
+    for (results.getHits()) |hit| {
+        if (hit.vector_id != 1) continue;
+        const metadata = hit.metadata orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("committed:1", metadata);
+        found_committed_metadata = true;
+    }
+    try std.testing.expect(found_committed_metadata);
     try std.testing.expect(!idx.generationRepairPending());
 }
 
