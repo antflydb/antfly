@@ -51,7 +51,7 @@ pub const Scenario = struct {
         .{ .id = generation_fenced_id, .name = name ++ ".stale-enrichment-generation-preserves-documents", .kind = .always },
     };
 
-    const Mode = enum {
+    pub const Mode = enum {
         clean,
         duplicate_workers,
         lease_takeover,
@@ -643,13 +643,24 @@ pub const Scenario = struct {
         }
 
         pub fn runClean(self: *Fixture) !void {
-            self.mode = .clean;
+            try self.runMode(.clean);
+        }
+
+        pub fn runMode(self: *Fixture, mode: Mode) !void {
+            self.mode = mode;
             try self.run();
         }
 
         pub fn cleanWorkflowVisible(self: *const Fixture) bool {
+            return self.workflowVisibleForMode(.clean);
+        }
+
+        pub fn workflowVisibleForMode(self: *const Fixture, mode: Mode) bool {
+            const expected_document_mask: u8 = if (mode == .stale_enrichment_generation) 1 else 3;
             return self.complete and self.recovered and self.final_head == 3 and
-                self.visible_document_mask == 3 and self.compacted;
+                self.visible_document_mask == expected_document_mask and
+                (mode == .stale_enrichment_generation or self.compacted) and
+                self.generation_fenced;
         }
     };
 

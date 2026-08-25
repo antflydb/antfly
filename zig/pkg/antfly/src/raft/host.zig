@@ -205,6 +205,11 @@ pub const HttpHostDeps = struct {
     snapshot_resolver: ?transport.http_snapshot.SnapshotTargetResolver = null,
     request_executor: ?transport.RequestExecutor = null,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
+    /// Cluster simulations may publish the transport server through a
+    /// caller-owned `std.Io` listener. In that case constructing the native
+    /// listener would create an unused Threaded runtime and violate the
+    /// simulation's single-I/O-owner contract.
+    listener_disabled: bool = false,
 };
 
 const PeerSnapshotTargetResolver = struct {
@@ -890,7 +895,7 @@ pub const HttpHost = struct {
     host: *Host,
     batch_handler: *transport.HostBatchHandler,
     server: *transport.HttpServer,
-    listener: *transport.StdHttpListener,
+    listener: ?*transport.StdHttpListener,
 
     pub fn init(alloc: std.mem.Allocator, cfg: HttpHostConfig, deps: HttpHostDeps) !HttpHost {
         var executor: ?*transport.StdHttpExecutor = null;
@@ -974,15 +979,18 @@ pub const HttpHost = struct {
             batch_handler.snapshotHandler(),
         );
 
-        const listener = try alloc.create(transport.StdHttpListener);
-        errdefer alloc.destroy(listener);
-        listener.* = if (deps.backend_runtime) |backend_runtime|
-            if (backend_runtime.raftInboundIoImpl()) |io_impl|
-                transport.StdHttpListener.initShared(alloc, cfg.listener, server.executor(), io_impl)
+        const listener = if (deps.listener_disabled) null else blk: {
+            const owned = try alloc.create(transport.StdHttpListener);
+            errdefer alloc.destroy(owned);
+            owned.* = if (deps.backend_runtime) |backend_runtime|
+                if (backend_runtime.raftInboundIoImpl()) |io_impl|
+                    transport.StdHttpListener.initShared(alloc, cfg.listener, server.executor(), io_impl)
+                else
+                    transport.StdHttpListener.init(alloc, cfg.listener, server.executor())
             else
-                transport.StdHttpListener.init(alloc, cfg.listener, server.executor())
-        else
-            transport.StdHttpListener.init(alloc, cfg.listener, server.executor());
+                transport.StdHttpListener.init(alloc, cfg.listener, server.executor());
+            break :blk owned;
+        };
 
         return .{
             .alloc = alloc,
@@ -1001,8 +1009,10 @@ pub const HttpHost = struct {
     }
 
     pub fn deinit(self: *HttpHost) void {
-        self.listener.deinit();
-        self.alloc.destroy(self.listener);
+        if (self.listener) |listener| {
+            listener.deinit();
+            self.alloc.destroy(listener);
+        }
         self.alloc.destroy(self.server);
         self.alloc.destroy(self.batch_handler);
         self.host.deinit();
@@ -1022,15 +1032,17 @@ pub const HttpHost = struct {
     }
 
     pub fn start(self: *HttpHost) !void {
-        try self.listener.start();
+        const listener = self.listener orelse return error.HttpListenerDisabled;
+        try listener.start();
     }
 
     pub fn stop(self: *HttpHost) void {
-        self.listener.stop();
+        if (self.listener) |listener| listener.stop();
     }
 
     pub fn baseUri(self: *const HttpHost, alloc: std.mem.Allocator) ![]u8 {
-        return try self.listener.baseUri(alloc);
+        const listener = self.listener orelse return error.HttpListenerDisabled;
+        return try listener.baseUri(alloc);
     }
 
     pub fn metricsSnapshot(self: *const HttpHost) HostMetrics {

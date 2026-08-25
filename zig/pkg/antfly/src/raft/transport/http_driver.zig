@@ -82,7 +82,7 @@ pub const HttpFrameDriver = struct {
     cfg: HttpDriverConfig,
     executor: common.RequestExecutor,
     io: std.Io,
-    threads: []std.Thread = &.{},
+    workers: []std.Io.Future(void) = &.{},
     isolated_executors: []common_http.StdHttpExecutor = &.{},
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
@@ -172,8 +172,12 @@ pub const HttpFrameDriver = struct {
     }
 
     fn startAsyncSender(self: *HttpFrameDriver) !void {
-        if (self.threads.len != 0) return;
-        if (self.cfg.async_send_worker_count == 0) return error.InvalidAsyncSendWorkerCount;
+        if (self.workers.len != 0) return;
+        // A zero-sized pool is the explicit synchronous mode. It is useful to
+        // deterministic runtimes that drive Raft in bounded rounds: delivery
+        // must finish (and may itself yield through borrowed Io) before the
+        // next modeled round begins.
+        if (self.cfg.async_send_worker_count == 0) return;
         try self.in_flight_peers.ensureTotalCapacity(self.alloc, self.cfg.async_send_worker_count);
         if (self.cfg.isolated_worker_executors) {
             self.isolated_executors = try self.alloc.alloc(common_http.StdHttpExecutor, self.cfg.async_send_worker_count);
@@ -182,31 +186,31 @@ pub const HttpFrameDriver = struct {
             }
         }
         errdefer self.deinitIsolatedExecutors();
-        self.threads = try self.alloc.alloc(std.Thread, self.cfg.async_send_worker_count);
+        self.workers = try self.alloc.alloc(std.Io.Future(void), self.cfg.async_send_worker_count);
         var started: usize = 0;
         errdefer {
             self.mutex.lockUncancelable(self.io);
             self.closing = true;
             self.cond.broadcast(self.io);
             self.mutex.unlock(self.io);
-            for (self.threads[0..started]) |thread| thread.join();
-            self.alloc.free(self.threads);
-            self.threads = &.{};
+            for (self.workers[0..started]) |*worker| _ = worker.await(self.io);
+            self.alloc.free(self.workers);
+            self.workers = &.{};
         }
-        while (started < self.threads.len) : (started += 1) {
-            self.threads[started] = try std.Thread.spawn(.{}, asyncSenderMain, .{ self, started });
+        while (started < self.workers.len) : (started += 1) {
+            self.workers[started] = try self.io.concurrent(asyncSenderMain, .{ self, started });
         }
     }
 
     fn stopAsyncSender(self: *HttpFrameDriver) void {
-        if (self.threads.len == 0) return;
+        if (self.workers.len == 0) return;
         self.mutex.lockUncancelable(self.io);
         self.closing = true;
         self.cond.broadcast(self.io);
         self.mutex.unlock(self.io);
-        for (self.threads) |thread| thread.join();
-        self.alloc.free(self.threads);
-        self.threads = &.{};
+        for (self.workers) |*worker| _ = worker.await(self.io);
+        self.alloc.free(self.workers);
+        self.workers = &.{};
         self.deinitIsolatedExecutors();
     }
 
@@ -303,7 +307,7 @@ pub const HttpFrameDriver = struct {
     }
 
     fn enqueueFrame(self: *HttpFrameDriver, req: raft_engine.runtime.frame_driver_iface.SendFrameRequest) !void {
-        if (self.threads.len == 0) {
+        if (self.workers.len == 0) {
             return try self.sendBatch(.{
                 .source_id = req.source_id,
                 .peer_id = req.peer_id,

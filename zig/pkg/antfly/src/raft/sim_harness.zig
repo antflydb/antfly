@@ -182,6 +182,10 @@ pub const ManagedHttpHostSimulationConfig = struct {
 pub const ManagedHttpHostSimulationDeps = struct {
     host: managed_host.ManagedHttpHostDeps = .{},
     service: service.ManagedServiceDeps = .{},
+    /// Optional application-owned deterministic I/O for the transport driver.
+    /// The clustered harness publishes the server separately and therefore
+    /// never needs to manufacture a Threaded runtime merely to send frames.
+    borrowed_io: ?std.Io = null,
 };
 
 pub const DelayingRequestExecutor = struct {
@@ -301,6 +305,7 @@ pub const VirtualHttpNetwork = struct {
     partitioned_links: std.AutoHashMapUnmanaged(Link, void) = .empty,
     unavailable_nodes: std.AutoHashMapUnmanaged(u64, void) = .empty,
     queued_requests: std.ArrayListUnmanaged(QueuedRequest) = .empty,
+    queue_mutex: std.atomic.Mutex = .unlocked,
     random_drop_prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     release_prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
     release_policy: ReleasePolicy = .fifo,
@@ -312,8 +317,10 @@ pub const VirtualHttpNetwork = struct {
     delay_next_ticks_value: u64 = 0,
     queue_capacity: ?usize = null,
     delivery_mode: DeliveryMode = .immediate,
+    serialize_drains: bool = false,
     virtual_tick: u64 = 0,
     next_sequence: u64 = 0,
+    drain_in_progress: std.atomic.Value(bool) = .init(false),
     request_count: u64 = 0,
     delivered_count: u64 = 0,
     dropped_count: u64 = 0,
@@ -389,6 +396,14 @@ pub const VirtualHttpNetwork = struct {
 
     pub fn useImmediateDelivery(self: *VirtualHttpNetwork) void {
         self.delivery_mode = .immediate;
+    }
+
+    /// Suspendable targets can yield back into a second scheduler task while
+    /// one delivery still owns a removed queue entry. Enable single-drainer
+    /// ownership for those targets; ordinary in-process handlers retain the
+    /// established nested-drain semantics used by metadata control loops.
+    pub fn useSerializedDrains(self: *VirtualHttpNetwork) void {
+        self.serialize_drains = true;
     }
 
     pub fn queuedCount(self: *const VirtualHttpNetwork) usize {
@@ -651,12 +666,41 @@ pub const VirtualHttpNetwork = struct {
     }
 
     pub fn drainDue(self: *VirtualHttpNetwork, max_events: ?usize) !usize {
+        if (!self.serialize_drains) {
+            // Preserve the established explicit-step behavior: an in-process
+            // handler may synchronously cause another control-loop drain.
+            var delivered: usize = 0;
+            while (self.nextDueIndex()) |index| {
+                if (max_events) |limit| {
+                    if (delivered >= limit) break;
+                }
+                var queued = self.queued_requests.orderedRemove(index);
+                defer queued.deinit(self.queue_alloc);
+                try self.deliverQueued(&queued);
+                delivered += 1;
+            }
+            return delivered;
+        }
+        // A wire-backed target may suspend while its HTTP request is in
+        // flight. A second scheduler task can then attempt to drain the same
+        // queue. Only one owner may select/remove queue indices at a time;
+        // enqueues remain legal while that owner is suspended and are picked
+        // up by its next loop iteration.
+        if (self.drain_in_progress.cmpxchgStrong(false, true, .acq_rel, .acquire) != null)
+            return 0;
+        defer self.drain_in_progress.store(false, .release);
         var delivered: usize = 0;
-        while (self.nextDueIndex()) |index| {
+        while (true) {
             if (max_events) |limit| {
                 if (delivered >= limit) break;
             }
+            lockAtomic(&self.queue_mutex);
+            const index = self.nextDueIndex() orelse {
+                self.queue_mutex.unlock();
+                break;
+            };
             var queued = self.queued_requests.orderedRemove(index);
+            self.queue_mutex.unlock();
             defer queued.deinit(self.queue_alloc);
             try self.deliverQueued(&queued);
             delivered += 1;
@@ -676,12 +720,6 @@ pub const VirtualHttpNetwork = struct {
     }
 
     fn enqueue(self: *VirtualHttpNetwork, base_uri: []const u8, request: transport.HttpRequest, delay_ticks: u64) !void {
-        if (self.queue_capacity) |capacity| {
-            if (self.queued_requests.items.len >= capacity) {
-                self.saturated_count +|= 1;
-                return error.VirtualNetworkQueueFull;
-            }
-        }
         const owned_base_uri = try self.queue_alloc.dupe(u8, base_uri);
         errdefer self.queue_alloc.free(owned_base_uri);
         const owned_uri = try self.queue_alloc.dupe(u8, request.uri);
@@ -711,6 +749,14 @@ pub const VirtualHttpNetwork = struct {
         const owned_body = try self.queue_alloc.dupe(u8, request.body);
         errdefer if (owned_body.len > 0) self.queue_alloc.free(owned_body);
 
+        lockAtomic(&self.queue_mutex);
+        defer self.queue_mutex.unlock();
+        if (self.queue_capacity) |capacity| {
+            if (self.queued_requests.items.len >= capacity) {
+                self.saturated_count +|= 1;
+                return error.VirtualNetworkQueueFull;
+            }
+        }
         try self.queued_requests.append(self.queue_alloc, .{
             .due_tick = self.virtual_tick +| delay_ticks,
             .sequence = self.next_sequence,
@@ -726,6 +772,10 @@ pub const VirtualHttpNetwork = struct {
             },
         });
         self.next_sequence +|= 1;
+    }
+
+    fn lockAtomic(mutex: *std.atomic.Mutex) void {
+        while (!mutex.tryLock()) std.atomic.spinLoopHint();
     }
 
     fn deliverQueued(self: *VirtualHttpNetwork, queued: *const QueuedRequest) !void {
@@ -1328,7 +1378,16 @@ pub const ManagedHttpHostSimulation = struct {
         errdefer updates.deinit();
 
         var host_deps = deps.host;
-        var backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = if (cfg.async_transport)
+        var backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = if (deps.borrowed_io) |io|
+            try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+                .backend = .manual,
+                .borrowed_io = .{
+                    .general = io,
+                    .raft_inbound = io,
+                    .raft_outbound = io,
+                },
+            })
+        else if (cfg.async_transport)
             try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{})
         else
             null;
@@ -1384,7 +1443,7 @@ pub const ManagedHttpHostSimulation = struct {
         self.virtual_base_uri = try VirtualHttpNetwork.baseUri(self.alloc, node_id);
     }
 
-    fn serverExecutor(self: *ManagedHttpHostSimulation) transport.RequestExecutor {
+    pub fn serverRequestExecutor(self: *ManagedHttpHostSimulation) transport.RequestExecutor {
         return self.runtime.svc.host.http_host.server.executor();
     }
 
@@ -1639,6 +1698,7 @@ pub const ManagedHttpClusterSimulation = struct {
         errdefer alloc.free(owned_deps);
         for (owned_deps) |*dep| {
             dep.host.http.request_executor = network.executor();
+            dep.host.http.listener_disabled = dep.borrowed_io != null;
             dep.service.transition_retry_clock = network.transitionRetryClock();
         }
 
@@ -1659,7 +1719,7 @@ pub const ManagedHttpClusterSimulation = struct {
             initialized += 1;
             const node_id = cfg.host.http.host.local_node_id;
             try nodes[i].useVirtualBaseUri(node_id);
-            try network.registerNode(node_id, nodes[i].serverExecutor());
+            try network.registerNode(node_id, nodes[i].serverRequestExecutor());
         }
 
         return .{

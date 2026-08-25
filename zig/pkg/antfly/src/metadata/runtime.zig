@@ -1997,7 +1997,8 @@ test "metadata runtime serves raft and admin listener requests on threaded io co
     defer server.deinit();
 
     const admin_listener = server.server.owned_admin_listener orelse return error.MissingMetadataAdminListener;
-    const raft_listener = server.server.svc.raft.host.http_host.listener;
+    const raft_listener = server.server.svc.raft.host.http_host.listener orelse
+        return error.MissingRaftListener;
     try std.testing.expect(raft_listener.cfg.serve_in_connection_threads);
     try std.testing.expectEqual(antfly.raft.default_http_listener_max_connection_threads, raft_listener.cfg.max_connection_threads);
     try std.testing.expect(admin_listener.cfg.serve_in_connection_threads);

@@ -61,6 +61,7 @@ const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const storage_sim = @import("../storage/sim_runtime.zig");
+const resource_manager_mod = @import("../storage/resource_manager.zig");
 const raft_trace_logger = @import("../tracing/raft_trace_logger.zig");
 const platform_clock = @import("antfly_platform").clock;
 const usermgr = @import("../usermgr/mod.zig");
@@ -3071,6 +3072,15 @@ fn makeHostSimDeps(factory: *TestDescriptorFactory) raft_sim.ManagedHttpHostSimu
     return makeHostSimDepsWithTransportExecutor(factory, null);
 }
 
+fn makeHostSimDepsWithBorrowedIo(
+    factory: *TestDescriptorFactory,
+    io: std.Io,
+) raft_sim.ManagedHttpHostSimulationDeps {
+    var deps = makeHostSimDeps(factory);
+    deps.borrowed_io = io;
+    return deps;
+}
+
 fn makeHostSimDepsWithTransportExecutor(
     factory: *TestDescriptorFactory,
     request_executor: ?raft_transport.RequestExecutor,
@@ -3095,6 +3105,7 @@ fn makeHostSimDepsWithTransportExecutor(
 
 const ModeledDbOpenConfigurator = struct {
     device: *storage_sim.ModeledDevice,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
     fn iface(self: *@This()) db_mod.background_runtime.DbOpenConfigurator {
         return .{ .ptr = self, .configure_fn = configure };
@@ -3105,6 +3116,7 @@ const ModeledDbOpenConfigurator = struct {
         const options: *db_mod.OpenOptions = @ptrCast(@alignCast(opaque_options));
         options.primary_backend = .{ .lsm = .{ .flush_threshold = 1 } };
         options.storage = self.device.storage();
+        options.resource_manager = self.resource_manager;
         options.physical_root_mode = .external_backend;
         options.index_backends = .{
             .text_main_backend = .lsm,
@@ -5589,6 +5601,7 @@ fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, pass
 fn PublicApiServerOptions(comptime N: usize) type {
     return struct {
         auth_managers: ?*[N]SimAuthManager = null,
+        resource_managers: ?*[N]resource_manager_mod.ResourceManager = null,
     };
 }
 
@@ -5637,10 +5650,13 @@ fn startPublicApiServers(
             forward_executor,
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        const server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
-            .auth_enabled = true,
-            .user_manager = &auth_managers[i].manager,
-        } else .{};
+        var server_config: api_http_server.ApiHttpServerConfig = .{};
+        if (options.auth_managers) |auth_managers| {
+            server_config.auth_enabled = true;
+            server_config.user_manager = &auth_managers[i].manager;
+        }
+        if (options.resource_managers) |resource_managers|
+            server_config.resource_manager = &resource_managers[i];
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             alloc,
             http_alloc,
@@ -5842,9 +5858,17 @@ pub const VoprPublicClusterFixture = struct {
     modeled_devices: [node_count]storage_sim.ModeledDevice = undefined,
     modeled_device_count: usize = 0,
     modeled_configurators: [node_count]ModeledDbOpenConfigurator = undefined,
+    resource_managers: [node_count]resource_manager_mod.ResourceManager = undefined,
+    resource_manager_count: usize = 0,
     cluster: MetadataHttpClusterSimulation = undefined,
     cluster_live: bool = false,
     cluster_started: bool = false,
+    raft_wire_executor: io_http_executor.IoHttpExecutor = undefined,
+    raft_wire_executor_live: bool = false,
+    raft_wire_runtimes: [node_count]raft_transport.HttpxRuntime = undefined,
+    raft_wire_runtime_count: usize = 0,
+    raft_wire_targets: [node_count]raft_transport.AbsoluteHttpExecutor = undefined,
+    raft_wire_requests: u64 = 0,
     listeners: [node_count]api_http_test_runtime.Runtime = undefined,
     servers: [node_count]api_http_server.ApiHttpServer = undefined,
     status_sources: [node_count]PublicApiStatusSource = undefined,
@@ -5895,7 +5919,19 @@ pub const VoprPublicClusterFixture = struct {
             self.store_count += 1;
             self.modeled_devices[index] = storage_sim.ModeledDevice.init(alloc);
             self.modeled_device_count += 1;
-            self.modeled_configurators[index] = .{ .device = &self.modeled_devices[index] };
+            self.resource_managers[index] = resource_manager_mod.ResourceManager.init(.{
+                .memory_budget = .{
+                    .soft_limit_bytes = 384 * 1024 * 1024,
+                    .hard_limit_bytes = 512 * 1024 * 1024,
+                },
+                .query_embedding_cache_bytes = 4 * 1024 * 1024,
+                .identity_allocator = alloc,
+            });
+            self.resource_manager_count += 1;
+            self.modeled_configurators[index] = .{
+                .device = &self.modeled_devices[index],
+                .resource_manager = &self.resource_managers[index],
+            };
             self.roots[index] = try std.fmt.allocPrint(
                 alloc,
                 ".zig-cache/tmp/{s}/full-cluster-node-{d}",
@@ -5918,23 +5954,59 @@ pub const VoprPublicClusterFixture = struct {
             self.factories[index].split_runtime.replica_root_dir = self.roots[index];
         }
 
-        const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        var configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
             makeHostSimConfig(1, metadata_group_id, self.roots[0], self.catalogs[0]),
             makeHostSimConfig(2, metadata_group_id, self.roots[1], self.catalogs[1]),
             makeHostSimConfig(3, metadata_group_id, self.roots[2], self.catalogs[2]),
         };
+        // Raft rounds are deliberately bounded and synchronous in this
+        // fixture. The send still crosses the virtual fault router and a real
+        // httpx/VoprIo socket; it simply completes before the next round.
+        for (&configs) |*config| config.host.http.transport.driver.async_send_worker_count = 0;
         const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
-            makeHostSimDeps(&self.factories[0]),
-            makeHostSimDeps(&self.factories[1]),
-            makeHostSimDeps(&self.factories[2]),
+            makeHostSimDepsWithBorrowedIo(&self.factories[0], sim.io()),
+            makeHostSimDepsWithBorrowedIo(&self.factories[1], sim.io()),
+            makeHostSimDepsWithBorrowedIo(&self.factories[2], sim.io()),
         };
         self.cluster = try MetadataHttpClusterSimulation.init(alloc, metadata_group_id, &configs, &deps);
         self.cluster_live = true;
+        // startAll publishes the harness's default in-process routes. Do that
+        // before replacing them with concrete httpx listener targets so the
+        // wire routes remain authoritative throughout bootstrap.
+        try self.cluster.startAll();
+        self.cluster.virtual_network.useSerializedDrains();
+        self.raft_wire_executor = io_http_executor.IoHttpExecutor.init(alloc, sim.io(), .{
+            .keep_alive = true,
+            .connect_timeout_ms = 0,
+            .read_timeout_ms = 0,
+            .write_timeout_ms = 0,
+            .pool_max_connections = 24,
+            .pool_max_per_host = 8,
+        });
+        self.raft_wire_executor_live = true;
+        for (0..node_count) |index| {
+            self.raft_wire_runtimes[index] = try raft_transport.HttpxRuntime.start(
+                alloc,
+                sim.io(),
+                self.cluster.cluster.node(index).serverRequestExecutor(),
+            );
+            self.raft_wire_runtime_count += 1;
+            self.raft_wire_targets[index] = .{
+                .alloc = alloc,
+                .base_uri = self.raft_wire_runtimes[index].base_uri,
+                .inner = self.raft_wire_executor.executor(),
+            };
+            const node_id = self.cluster.cluster.configs[index].host.http.host.local_node_id;
+            try self.cluster.virtual_network.registerNode(
+                node_id,
+                self.raft_wire_targets[index].executor(),
+            );
+        }
         for (0..node_count) |index| {
             self.cluster.backendRuntime(index).setDbOpenConfigurator(self.modeled_configurators[index].iface());
             self.factories[index].split_runtime.backend_runtime = self.cluster.backendRuntime(index);
         }
-        self.metadata_leader_index = try startBootstrappedMetadataCluster(&self.cluster, 48, true);
+        self.metadata_leader_index = try finishBootstrappedMetadataCluster(&self.cluster, 48, true);
         self.cluster_started = true;
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
@@ -6030,7 +6102,7 @@ pub const VoprPublicClusterFixture = struct {
             &self.routers,
             &self.read_sources,
             &self.write_sources,
-            .{},
+            .{ .resource_managers = &self.resource_managers },
             &self.api_base_uris,
         );
         self.uri_count = node_count;
@@ -6174,6 +6246,18 @@ pub const VoprPublicClusterFixture = struct {
             self.fault_finished = true;
             return;
         };
+        self.raft_wire_runtimes[self.client_index].setTarget(
+            self.cluster.cluster.node(self.client_index).serverRequestExecutor(),
+        );
+        const restarted_node_id = self.cluster.cluster.configs[self.client_index].host.http.host.local_node_id;
+        self.cluster.virtual_network.registerNode(
+            restarted_node_id,
+            self.raft_wire_targets[self.client_index].executor(),
+        ) catch {
+            self.request_errors +|= 1;
+            self.fault_finished = true;
+            return;
+        };
         var rounds: usize = 0;
         while (rounds < 16) : (rounds += 1) self.cluster.stepAll() catch {
             self.request_errors +|= 1;
@@ -6208,6 +6292,18 @@ pub const VoprPublicClusterFixture = struct {
             self.forward_executor_live = false;
         }
         self.topology_sound = self.topology_sound or currentMetadataLeaderIndex(&self.cluster) != null;
+        // Drivers are joined before their real wire peers and shared client
+        // pool disappear. Preserve the final health facts above because the
+        // cluster is intentionally no longer queryable after this point.
+        if (self.cluster_started) {
+            self.cluster.stopAll();
+            self.cluster_started = false;
+        }
+        if (self.cluster_live) {
+            self.cluster.deinit();
+            self.cluster_live = false;
+        }
+        self.stopRaftWire();
         self.cleanup_sound = true;
         self.complete = true;
     }
@@ -6227,9 +6323,14 @@ pub const VoprPublicClusterFixture = struct {
             self.forward_http_executor.deinit();
             self.forward_executor_live = false;
         }
+        // Drivers are torn down while their wire peers still exist; this lets
+        // cancellation drain any committed outbound work before listeners and
+        // the client pool disappear.
         if (self.cluster_started) self.cluster.stopAll();
         if (self.cluster_live) self.cluster.deinit();
+        self.stopRaftWire();
         for (self.modeled_devices[0..self.modeled_device_count]) |*device| device.deinit();
+        for (self.resource_managers[0..self.resource_manager_count]) |*manager| manager.deinit(self.alloc);
         for (self.stores[0..self.store_count]) |*store| store.deinit();
         for (self.roots[0..self.root_count]) |root| self.alloc.free(root);
         for (self.catalogs[0..self.catalog_count]) |catalog| self.alloc.free(catalog);
@@ -6237,11 +6338,30 @@ pub const VoprPublicClusterFixture = struct {
         self.alloc.destroy(self);
     }
 
+    fn stopRaftWire(self: *VoprPublicClusterFixture) void {
+        if (self.raft_wire_runtime_count > 0) {
+            for (self.raft_wire_runtimes[0..self.raft_wire_runtime_count]) |*runtime|
+                self.raft_wire_requests +|= runtime.requestCount();
+            var index = self.raft_wire_runtime_count;
+            while (index > 0) {
+                index -= 1;
+                self.raft_wire_runtimes[index].deinit();
+            }
+            self.raft_wire_runtime_count = 0;
+        }
+        if (self.raft_wire_executor_live) {
+            self.raft_wire_executor.deinit();
+            self.raft_wire_executor_live = false;
+        }
+    }
+
     pub fn healthSnapshot(self: *const VoprPublicClusterFixture) struct {
         hosts: usize,
         requests_ok: bool,
         topology_ok: bool,
         cleanup_ok: bool,
+        raft_wire_requests: u64,
+        node_resource_managers: usize,
     } {
         return .{
             .hosts = self.actual_host_count,
@@ -6249,6 +6369,8 @@ pub const VoprPublicClusterFixture = struct {
                 self.tenant_read_sound and self.table_isolation_sound and self.request_errors == 0,
             .topology_ok = self.topology_sound,
             .cleanup_ok = self.cleanup_sound,
+            .raft_wire_requests = self.raft_wire_requests,
+            .node_resource_managers = self.resource_manager_count,
         };
     }
 };
@@ -6259,6 +6381,14 @@ fn startBootstrappedMetadataCluster(
     publish_stores: bool,
 ) !usize {
     try cluster.startAll();
+    return try finishBootstrappedMetadataCluster(cluster, leader_wait_rounds, publish_stores);
+}
+
+fn finishBootstrappedMetadataCluster(
+    cluster: *MetadataHttpClusterSimulation,
+    leader_wait_rounds: usize,
+    publish_stores: bool,
+) !usize {
     try cluster.bootstrapMetadataReplicas();
     const leader_index = (try cluster.waitForMetadataLeader(leader_wait_rounds)) orelse return error.TestExpectedEqual;
     try cluster.node(leader_index).campaignMetadataGroup();
