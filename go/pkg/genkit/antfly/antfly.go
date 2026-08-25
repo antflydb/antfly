@@ -147,7 +147,7 @@ func (w *Antfly) newDocstore(ctx context.Context, cfg *IndexConfig) (*Docstore, 
 			if err != nil {
 				return nil, fmt.Errorf("antfly model config failed: %v", err)
 			}
-			indexConfig, err := antfly.NewIndexConfig(cfg.IndexName, antfly.EmbeddingsIndexConfig{
+			indexConfig, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
 				Field:    textKey,
 				Embedder: *modelConfig,
 			})
@@ -155,7 +155,7 @@ func (w *Antfly) newDocstore(ctx context.Context, cfg *IndexConfig) (*Docstore, 
 				return nil, fmt.Errorf("antfly index config failed: %v", err)
 			}
 			err = w.client.CreateTable(ctx, cfg.TableName, antfly.CreateTableRequest{
-				Indexes: map[string]antfly.IndexConfig{
+				Indexes: map[string]antfly.CreateIndexRequest{
 					cfg.IndexName: *indexConfig,
 				},
 			})

@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-
-	"github.com/antflydb/antfly/go/pkg/libaf/ai"
 )
 
 // mockReader is a test helper that returns configured results.
@@ -15,7 +13,7 @@ type mockReader struct {
 	closed  bool
 }
 
-func (m *mockReader) Read(_ context.Context, pages []ai.BinaryContent, _ *ReadOptions) ([]string, error) {
+func (m *mockReader) Read(_ context.Context, pages []BinaryContent, _ *ReadOptions) ([]string, error) {
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -63,7 +61,7 @@ func TestFallbackReader_FirstSucceeds(t *testing.T) {
 	second := &mockReader{results: []string{"backup text"}}
 
 	fb := NewFallbackReader(first, second)
-	results, err := fb.Read(context.Background(), []ai.BinaryContent{
+	results, err := fb.Read(context.Background(), []BinaryContent{
 		{MIMEType: "image/png", Data: []byte{1}},
 	}, nil)
 
@@ -80,7 +78,7 @@ func TestFallbackReader_FirstEmpty_SecondSucceeds(t *testing.T) {
 	second := &mockReader{results: []string{"fallback text"}}
 
 	fb := NewFallbackReader(first, second)
-	results, err := fb.Read(context.Background(), []ai.BinaryContent{
+	results, err := fb.Read(context.Background(), []BinaryContent{
 		{MIMEType: "image/png", Data: []byte{1}},
 	}, nil)
 
@@ -97,7 +95,7 @@ func TestFallbackReader_FirstErrors_SecondSucceeds(t *testing.T) {
 	second := &mockReader{results: []string{"fallback text"}}
 
 	fb := NewFallbackReader(first, second)
-	results, err := fb.Read(context.Background(), []ai.BinaryContent{
+	results, err := fb.Read(context.Background(), []BinaryContent{
 		{MIMEType: "image/png", Data: []byte{1}},
 	}, nil)
 
@@ -114,7 +112,7 @@ func TestFallbackReader_AllFail(t *testing.T) {
 	second := &mockReader{err: errors.New("model 2 failed")}
 
 	fb := NewFallbackReader(first, second)
-	_, err := fb.Read(context.Background(), []ai.BinaryContent{
+	_, err := fb.Read(context.Background(), []BinaryContent{
 		{MIMEType: "image/png", Data: []byte{1}},
 	}, nil)
 
@@ -128,7 +126,7 @@ func TestFallbackReader_AllEmpty(t *testing.T) {
 	second := &mockReader{results: []string{"  "}}
 
 	fb := NewFallbackReader(first, second)
-	results, err := fb.Read(context.Background(), []ai.BinaryContent{
+	results, err := fb.Read(context.Background(), []BinaryContent{
 		{MIMEType: "image/png", Data: []byte{1}},
 	}, nil)
 

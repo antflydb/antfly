@@ -289,11 +289,11 @@ Traverses objects in S3-compatible buckets (AWS S3, MinIO, R2, etc.) and yields 
 // Basic configuration with MinIO
 source, err := docsaf.NewS3Source(docsaf.S3SourceConfig{
     // Required: S3 credentials
-    Credentials: s3.Credentials{
+    Credentials: docsaf.S3Credentials{
         Endpoint:        "s3.amazonaws.com",
-        AccessKeyId:     "your-access-key",
+        AccessKeyID:     "your-access-key",
         SecretAccessKey: "your-secret-key",
-        UseSsl:          true,
+        UseSSL:          true,
     },
 
     // Required: Bucket name
@@ -369,11 +369,11 @@ source that does not require Drive downloads.
 
 ```go
 source, err := docsaf.NewS3Source(docsaf.S3SourceConfig{
-    Credentials: s3.Credentials{
+    Credentials: docsaf.S3Credentials{
         Endpoint:        "localhost:9000",
-        AccessKeyId:     "minioadmin",
+        AccessKeyID:     "minioadmin",
         SecretAccessKey: "minioadmin",
-        UseSsl:          false,  // Disable SSL for local MinIO
+        UseSSL:          false,  // Disable SSL for local MinIO
     },
     Bucket:          "documentation",
     IncludePatterns: []string{"**/*.md"},
@@ -387,9 +387,9 @@ The S3 source supports environment variable fallbacks for credentials:
 ```go
 // Credentials will fall back to AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
 source, err := docsaf.NewS3Source(docsaf.S3SourceConfig{
-    Credentials: s3.Credentials{
+    Credentials: docsaf.S3Credentials{
         Endpoint: "s3.amazonaws.com",
-        UseSsl:   true,
+        UseSSL:   true,
     },
     Bucket: "my-bucket",
     Prefix: "documentation/",
@@ -407,17 +407,16 @@ import (
     "log"
 
     "github.com/antflydb/antfly/go/pkg/docsaf"
-    "github.com/antflydb/antfly/go/pkg/libaf/s3"
 )
 
 func main() {
     // Create S3 source
     source, err := docsaf.NewS3Source(docsaf.S3SourceConfig{
-        Credentials: s3.Credentials{
+        Credentials: docsaf.S3Credentials{
             Endpoint:        "s3.amazonaws.com",
-            AccessKeyId:     "your-access-key",
+            AccessKeyID:     "your-access-key",
             SecretAccessKey: "your-secret-key",
-            UseSsl:          true,
+            UseSSL:          true,
         },
         Bucket:          "my-docs",
         Prefix:          "documentation/",

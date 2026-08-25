@@ -49,19 +49,19 @@ func main() {
 		Model: "openai/clip-vit-base-patch32",
 	})
 
-	// Build the index config (union type)
-	var indexConfig oapi.IndexConfig
-	indexConfig.Name = "embeddings"
-	indexConfig.Type = oapi.IndexTypeEmbeddings
-	indexConfig.FromEmbeddingsIndexConfig(oapi.EmbeddingsIndexConfig{
+	// Build the path-identified index request.
+	indexConfig, err := antfly.NewCreateIndexRequest(oapi.EmbeddingsIndexConfig{
 		Dimension: 512,
 		Template:  "{{media url=image_url}}{{caption}}",
 		Embedder:  embedderConfig,
 	})
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	err = client.CreateTable(ctx, "images", antfly.CreateTableRequest{
-		Indexes: map[string]oapi.IndexConfig{
-			"embeddings": indexConfig,
+		Indexes: map[string]antfly.CreateIndexRequest{
+			"embeddings": *indexConfig,
 		},
 	})
 	if err != nil {

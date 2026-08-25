@@ -1,6 +1,6 @@
 package docsaf
 
-import "github.com/antflydb/antfly/go/pkg/libaf/reading"
+import "github.com/antflydb/antfly/go/pkg/docsaf/reading"
 
 // RegistryOption configures a DefaultRegistry.
 type RegistryOption func(*registryConfig)
