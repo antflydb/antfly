@@ -954,8 +954,12 @@ test "hosted shard db adapter routes median key to remote leader" {
         }
     };
 
+    const internal_service_secret = "hosted-shard-db-test-internal-service-secret-v1";
+    const internal_service_issuer = "hosted-shard-db-test";
     var server = api_http_server.ApiHttpServer.init(std.heap.page_allocator, .{
         .shard_db_adapter = FakeRemoteShardDb.adapter(),
+        .internal_service_secret = internal_service_secret,
+        .internal_service_issuer = internal_service_issuer,
     }, FakeStatus.iface(), null, null);
     defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
@@ -1013,8 +1017,10 @@ test "hosted shard db adapter routes median key to remote leader" {
         executor.executor(),
         null,
     );
+    _ = hosted.withInternalServiceAuth(internal_service_secret, internal_service_issuer);
 
-    const median_key = (try hosted.adapter().fetchMedianKey(std.testing.allocator, 88)).?;
+    const median_key = (try hosted.adapter().fetchMedianKey(std.testing.allocator, 88)) orelse
+        return error.TestExpectedMedianKey;
     defer std.testing.allocator.free(median_key);
     try std.testing.expectEqualStrings("doc:m", median_key);
     try std.testing.expectError(error.UnsupportedOperation, hosted.adapter().schemaIndexReady(std.testing.allocator, "docs", 88, 2, 1));
