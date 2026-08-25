@@ -4487,35 +4487,37 @@ pub const GraphDistinctBudgetExceededError = struct {
 
 pub const GraphDocumentBoolFieldFilter = struct {
     bool: bool,
-    field: []const u8,
+    /// RFC 6901 JSON Pointer to the stored-document value.
+    path: []const u8,
 };
 
 /// At least one of start or end is required and enforced by the server.
 pub const GraphDocumentDateRangeFilter = struct {
-    field: []const u8,
+    /// RFC 6901 JSON Pointer to the stored-document value.
+    path: []const u8,
     start: ?[]const u8 = null,
     end: ?[]const u8 = null,
     inclusive_start: ?bool = null,
     inclusive_end: ?bool = null,
 };
 
-/// A non-scoring stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers. Alias-to-alias predicates belong in GraphMatch.where.
+/// A non-scoring stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Fuzzy predicates require an explicit fuzziness, range predicates use numeric_range or term_range wrappers, and every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates belong in GraphMatch.where.
 pub const GraphDocumentFilter = union(enum) {
     graph_document_date_range_filter: *GraphDocumentDateRangeFilter,
     graph_document_filter_boolean: *GraphDocumentFilterBoolean,
     graph_document_fuzzy_filter: *GraphDocumentFuzzyFilter,
-    graph_document_filter_disjunction: *GraphDocumentFilterDisjunction,
     graph_document_bool_field_filter: *GraphDocumentBoolFieldFilter,
+    graph_document_filter_disjunction: *GraphDocumentFilterDisjunction,
+    graph_document_prefix_filter: *GraphDocumentPrefixFilter,
+    graph_document_regexp_filter: *GraphDocumentRegexpFilter,
+    graph_document_term_filter: *GraphDocumentTermFilter,
+    graph_document_wildcard_filter: *GraphDocumentWildcardFilter,
     graph_document_filter_conjunction: *GraphDocumentFilterConjunction,
     graph_document_ids_filter: *GraphDocumentIdsFilter,
     graph_document_match_all_filter: *GraphDocumentMatchAllFilter,
     graph_document_match_none_filter: *GraphDocumentMatchNoneFilter,
     graph_document_numeric_range_filter: *GraphDocumentNumericRangeFilter,
-    graph_document_prefix_filter: *GraphDocumentPrefixFilter,
-    graph_document_regexp_filter: *GraphDocumentRegexpFilter,
-    graph_document_term_filter: *GraphDocumentTermFilter,
     graph_document_term_range_filter: *GraphDocumentTermRangeFilter,
-    graph_document_wildcard_filter: *GraphDocumentWildcardFilter,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
         const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
@@ -4542,6 +4544,7 @@ pub const GraphDocumentFilter = union(enum) {
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
         if (objectHasAnyKey(source.object, &.{
+            "path",
             "start",
             "end",
             "inclusive_start",
@@ -4559,10 +4562,17 @@ pub const GraphDocumentFilter = union(enum) {
         }
         if (objectHasAnyKey(source.object, &.{
             "term",
+            "path",
             "fuzziness",
             "prefix_length",
         })) {
             if (try parseStructuralVariant(GraphDocumentFuzzyFilter, allocator, source, options)) |parsed| return .{ .graph_document_fuzzy_filter = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "bool",
+            "path",
+        })) {
+            if (try parseStructuralVariant(GraphDocumentBoolFieldFilter, allocator, source, options)) |parsed| return .{ .graph_document_bool_field_filter = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "disjuncts",
@@ -4571,9 +4581,28 @@ pub const GraphDocumentFilter = union(enum) {
             if (try parseStructuralVariant(GraphDocumentFilterDisjunction, allocator, source, options)) |parsed| return .{ .graph_document_filter_disjunction = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "bool",
+            "prefix",
+            "path",
         })) {
-            if (try parseStructuralVariant(GraphDocumentBoolFieldFilter, allocator, source, options)) |parsed| return .{ .graph_document_bool_field_filter = parsed };
+            if (try parseStructuralVariant(GraphDocumentPrefixFilter, allocator, source, options)) |parsed| return .{ .graph_document_prefix_filter = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "regexp",
+            "path",
+        })) {
+            if (try parseStructuralVariant(GraphDocumentRegexpFilter, allocator, source, options)) |parsed| return .{ .graph_document_regexp_filter = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "term",
+            "path",
+        })) {
+            if (try parseStructuralVariant(GraphDocumentTermFilter, allocator, source, options)) |parsed| return .{ .graph_document_term_filter = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "wildcard",
+            "path",
+        })) {
+            if (try parseStructuralVariant(GraphDocumentWildcardFilter, allocator, source, options)) |parsed| return .{ .graph_document_wildcard_filter = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "conjuncts",
@@ -4601,29 +4630,9 @@ pub const GraphDocumentFilter = union(enum) {
             if (try parseStructuralVariant(GraphDocumentNumericRangeFilter, allocator, source, options)) |parsed| return .{ .graph_document_numeric_range_filter = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "prefix",
-        })) {
-            if (try parseStructuralVariant(GraphDocumentPrefixFilter, allocator, source, options)) |parsed| return .{ .graph_document_prefix_filter = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "regexp",
-        })) {
-            if (try parseStructuralVariant(GraphDocumentRegexpFilter, allocator, source, options)) |parsed| return .{ .graph_document_regexp_filter = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "term",
-        })) {
-            if (try parseStructuralVariant(GraphDocumentTermFilter, allocator, source, options)) |parsed| return .{ .graph_document_term_filter = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
             "term_range",
         })) {
             if (try parseStructuralVariant(GraphDocumentTermRangeFilter, allocator, source, options)) |parsed| return .{ .graph_document_term_range_filter = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "wildcard",
-        })) {
-            if (try parseStructuralVariant(GraphDocumentWildcardFilter, allocator, source, options)) |parsed| return .{ .graph_document_wildcard_filter = parsed };
         }
         return error.UnexpectedToken;
     }
@@ -4633,18 +4642,18 @@ pub const GraphDocumentFilter = union(enum) {
             .graph_document_date_range_filter => |v| try jw.write(v.*),
             .graph_document_filter_boolean => |v| try jw.write(v.*),
             .graph_document_fuzzy_filter => |v| try jw.write(v.*),
-            .graph_document_filter_disjunction => |v| try jw.write(v.*),
             .graph_document_bool_field_filter => |v| try jw.write(v.*),
+            .graph_document_filter_disjunction => |v| try jw.write(v.*),
+            .graph_document_prefix_filter => |v| try jw.write(v.*),
+            .graph_document_regexp_filter => |v| try jw.write(v.*),
+            .graph_document_term_filter => |v| try jw.write(v.*),
+            .graph_document_wildcard_filter => |v| try jw.write(v.*),
             .graph_document_filter_conjunction => |v| try jw.write(v.*),
             .graph_document_ids_filter => |v| try jw.write(v.*),
             .graph_document_match_all_filter => |v| try jw.write(v.*),
             .graph_document_match_none_filter => |v| try jw.write(v.*),
             .graph_document_numeric_range_filter => |v| try jw.write(v.*),
-            .graph_document_prefix_filter => |v| try jw.write(v.*),
-            .graph_document_regexp_filter => |v| try jw.write(v.*),
-            .graph_document_term_filter => |v| try jw.write(v.*),
             .graph_document_term_range_filter => |v| try jw.write(v.*),
-            .graph_document_wildcard_filter => |v| try jw.write(v.*),
         }
     }
 };
@@ -4668,7 +4677,8 @@ pub const GraphDocumentFilterDisjunction = struct {
 
 pub const GraphDocumentFuzzyFilter = struct {
     term: []const u8,
-    field: []const u8,
+    /// RFC 6901 JSON Pointer to the stored-document value.
+    path: []const u8,
     /// Required so fuzzy and exact term predicates remain structurally distinct.
     fuzziness: Fuzziness,
     prefix_length: ?i32 = null,
@@ -4688,7 +4698,8 @@ pub const GraphDocumentMatchNoneFilter = struct {
 
 /// At least one of min or max is required and enforced by the server.
 pub const GraphDocumentNumericRangeBody = struct {
-    field: []const u8,
+    /// RFC 6901 JSON Pointer to the stored-document value.
+    path: []const u8,
     min: ?f64 = null,
     max: ?f64 = null,
     inclusive_min: ?bool = null,
@@ -4701,22 +4712,26 @@ pub const GraphDocumentNumericRangeFilter = struct {
 
 pub const GraphDocumentPrefixFilter = struct {
     prefix: []const u8,
-    field: []const u8,
+    /// RFC 6901 JSON Pointer to the stored-document value.
+    path: []const u8,
 };
 
 pub const GraphDocumentRegexpFilter = struct {
     regexp: []const u8,
-    field: []const u8,
+    /// RFC 6901 JSON Pointer to the stored-document value.
+    path: []const u8,
 };
 
 pub const GraphDocumentTermFilter = struct {
     term: []const u8,
-    field: []const u8,
+    /// RFC 6901 JSON Pointer to the stored-document value.
+    path: []const u8,
 };
 
 /// At least one of min or max is required and enforced by the server.
 pub const GraphDocumentTermRangeBody = struct {
-    field: []const u8,
+    /// RFC 6901 JSON Pointer to the stored-document value.
+    path: []const u8,
     min: ?[]const u8 = null,
     max: ?[]const u8 = null,
     inclusive_min: ?bool = null,
@@ -4729,7 +4744,8 @@ pub const GraphDocumentTermRangeFilter = struct {
 
 pub const GraphDocumentWildcardFilter = struct {
     wildcard: []const u8,
-    field: []const u8,
+    /// RFC 6901 JSON Pointer to the stored-document value.
+    path: []const u8,
 };
 
 pub const GraphIdentityNodeSelector = struct {

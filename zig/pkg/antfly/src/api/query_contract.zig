@@ -9798,10 +9798,45 @@ fn parseGraphFilterValue(alloc: std.mem.Allocator, value: ?indexes_openapi.Graph
     // the generic tree before this recursive inspection; the normalizer also
     // validates the tree, but this ordering is what makes recursion safe.
     try validatePublicQueryTraversalBudgetAlloc(alloc, parsed.value);
+    if (!graphDocumentFilterPathsAreCanonical(parsed.value)) {
+        return error.InvalidQueryRequest;
+    }
     if (graphDocumentFilterContainsAnalyzerBackedClause(parsed.value)) {
         return error.UnsupportedQueryRequest;
     }
     return .{ .filter_query_json = try normalizePublicStoredFilterQueryAlloc(alloc, parsed.value) };
+}
+
+fn graphDocumentFilterPathsAreCanonical(value: std.json.Value) bool {
+    switch (value) {
+        .array => |array| {
+            for (array.items) |child| {
+                if (!graphDocumentFilterPathsAreCanonical(child)) return false;
+            }
+        },
+        .object => |object| {
+            if (object.get("path")) |path| {
+                if (path != .string or !validGraphDocumentJsonPointer(path.string)) return false;
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (!graphDocumentFilterPathsAreCanonical(entry.value_ptr.*)) return false;
+            }
+        },
+        else => {},
+    }
+    return true;
+}
+
+fn validGraphDocumentJsonPointer(path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, "/")) return false;
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) {
+        if (path[i] != '~') continue;
+        if (i + 1 >= path.len or (path[i + 1] != '0' and path[i + 1] != '1')) return false;
+        i += 1;
+    }
+    return true;
 }
 
 fn graphDocumentFilterContainsAnalyzerBackedClause(value: std.json.Value) bool {
@@ -14248,7 +14283,7 @@ test "api query contract owns the admitted graph wire for exact proxying" {
         \\      "index": "graph_idx",
         \\      "traverse": {
         \\        "start": {"keys":["doc:a"]},
-        \\        "filter": {"term":"active","field":"status"}
+        \\        "filter": {"term":"active","path":"/status"}
         \\      }
         \\    }
         \\  },

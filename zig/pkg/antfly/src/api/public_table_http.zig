@@ -21,6 +21,7 @@ const batch_api = @import("batch.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_query_mod = @import("../graph/query.zig");
+const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -820,7 +821,21 @@ pub fn graphQueryCapabilityUnsupportedBody(
     var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
     defer if (parsed) |*value| value.deinit();
     var diagnostic = if (parsed) |value| graphQueryModeDiagnostic(value.value) else GraphQueryModeDiagnostic{};
-    if (reason) |value| diagnostic.reason = value;
+    if (reason) |value| {
+        if (graph_query_diagnostic.take()) |recorded| {
+            if (std.mem.eql(u8, value, @tagName(recorded.reason))) {
+                diagnostic = .{
+                    .operation = recorded.operation,
+                    .mode = recorded.mode,
+                    .reason = value,
+                };
+            } else {
+                diagnostic.reason = value;
+            }
+        } else {
+            diagnostic.reason = value;
+        }
+    }
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
         .@"error" = "graph_query_mode_unsupported",
@@ -1138,6 +1153,7 @@ pub fn handleTableQueryRequest(
     }
 
     db_mod.resetLastSortRejectionDiagnostic();
+    graph_query_diagnostic.reset();
     query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
         error.InvalidQueryRequest => {
             std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
@@ -3543,9 +3559,18 @@ test "public table query handler maps exact graph execution failures" {
                 .anchor_filter => error.GraphAnchorFilterRequiresIndex,
                 .match_operation_limit => error.GraphMatchOperationLimitExceeded,
                 .graph_query_mode => error.GraphQueryModeUnsupported,
-                .external_alias_filter => error.GraphExternalAliasDocumentFilterUnsupported,
-                .external_alias_source => error.GraphExternalAliasSourceUnsupported,
-                .reverse_variable_path => error.GraphReverseVariablePathUnsupported,
+                .external_alias_filter => {
+                    graph_query_diagnostic.record("pattern", "match", .external_alias_document_filter_not_supported);
+                    return error.GraphExternalAliasDocumentFilterUnsupported;
+                },
+                .external_alias_source => {
+                    graph_query_diagnostic.record("pattern", "match", .external_alias_source_not_supported);
+                    return error.GraphExternalAliasSourceUnsupported;
+                },
+                .reverse_variable_path => {
+                    graph_query_diagnostic.record("pattern", "match", .reverse_variable_path_not_supported);
+                    return error.GraphReverseVariablePathUnsupported;
+                },
                 .topology_changed => error.TopologyChanged,
             };
         }
@@ -3669,7 +3694,7 @@ test "public table query handler maps exact graph execution failures" {
         var capability_resp = try handleTableQueryRequest(
             std.testing.allocator,
             "docs",
-            "{\"graph_queries\":{\"pattern\":{\"index\":\"relationships\",\"match\":{\"anchor\":\"a\",\"nodes\":{\"a\":{}},\"edges\":[]},\"return\":{\"bindings\":[\"a\"]}}}}",
+            "{\"graph_queries\":{\"first_walk\":{\"index\":\"relationships\",\"traverse\":{\"start\":{\"keys\":[\"doc:a\"]}}},\"pattern\":{\"index\":\"relationships\",\"match\":{\"anchor\":\"a\",\"nodes\":{\"a\":{}},\"edges\":[]},\"return\":{\"bindings\":[\"a\"]}}}}",
             null,
             Backend.iface(&kind),
         );
@@ -3804,6 +3829,31 @@ test "unsupported graph mode diagnostics identify the rejected operation constra
         try std.testing.expectEqualStrings(case.mode, parsed.value.mode);
         try std.testing.expectEqualStrings(case.reason, parsed.value.reason);
     }
+}
+
+test "runtime graph capability diagnostics preserve the failing named operation" {
+    graph_query_diagnostic.reset();
+    graph_query_diagnostic.record(
+        "later_match",
+        "match",
+        .external_alias_source_not_supported,
+    );
+    const body = try graphQueryCapabilityUnsupportedBody(
+        std.testing.allocator,
+        "{\"graph_queries\":{\"first_walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]}}},\"later_match\":{\"index\":\"g\",\"match\":{}}}}",
+        "external_alias_source_not_supported",
+    );
+    defer std.testing.allocator.free(body);
+    var parsed = try ant_json.parseFromSlice(
+        metadata_openapi.GraphQueryModeUnsupportedError,
+        std.testing.allocator,
+        body,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("later_match", parsed.value.operation);
+    try std.testing.expectEqualStrings("match", parsed.value.mode);
+    try std.testing.expectEqualStrings("external_alias_source_not_supported", parsed.value.reason);
 }
 
 test "public table query handler maps unsupported exact sort" {

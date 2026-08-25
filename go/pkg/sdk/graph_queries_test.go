@@ -117,7 +117,7 @@ func TestGraphSelectorAndProjectionConstructors(t *testing.T) {
 		t.Fatalf("start = %#v", startJSON)
 	}
 	filterJSON := traverse["filter"].(map[string]any)
-	if filterJSON["term"] != "beta" || filterJSON["field"] != "title" {
+	if filterJSON["term"] != "beta" || filterJSON["path"] != "/title" {
 		t.Fatalf("filter = %#v", filterJSON)
 	}
 
@@ -262,8 +262,30 @@ func TestGraphDocumentFilterUsesDiscriminatedRangeWireShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	body, ok := value["numeric_range"].(map[string]any)
-	if !ok || body["field"] != "score" || body["min"] != float64(0) || body["max"] != float64(10) || body["inclusive_min"] != false {
+	if !ok || body["path"] != "/score" || body["min"] != float64(0) || body["max"] != float64(10) || body["inclusive_min"] != false {
 		t.Fatalf("unexpected graph range filter: %#v", value)
+	}
+}
+
+func TestGraphDocumentFilterCanonicalizesNestedAndEscapedPaths(t *testing.T) {
+	filter, err := NewGraphDocumentFilter(querydsl.TermQuery{Term: "beta", Field: "author.display/name~raw"}.ToQuery())
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["path"] != "/author/display~1name~0raw" {
+		t.Fatalf("path = %#v", value["path"])
+	}
+
+	if _, err := NewGraphDocumentFilter(querydsl.TermQuery{Term: "beta", Field: "/bad~escape"}.ToQuery()); err == nil {
+		t.Fatal("expected invalid JSON Pointer error")
 	}
 }
 

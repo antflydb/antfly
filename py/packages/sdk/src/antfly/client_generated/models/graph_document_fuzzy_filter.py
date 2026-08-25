@@ -16,20 +16,20 @@ class GraphDocumentFuzzyFilter:
     """
     Attributes:
         term (str):
-        field (str):
+        path (str): RFC 6901 JSON Pointer to the stored-document value.
         fuzziness (FuzzinessType1 | int): The fuzziness of the query. Can be an integer or "auto".
         prefix_length (int | Unset):
     """
 
     term: str
-    field: str
+    path: str
     fuzziness: FuzzinessType1 | int
     prefix_length: int | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         term = self.term
 
-        field = self.field
+        path = self.path
 
         fuzziness: int | str
         if isinstance(self.fuzziness, FuzzinessType1):
@@ -44,7 +44,7 @@ class GraphDocumentFuzzyFilter:
         field_dict.update(
             {
                 "term": term,
-                "field": field,
+                "path": path,
                 "fuzziness": fuzziness,
             }
         )
@@ -58,7 +58,7 @@ class GraphDocumentFuzzyFilter:
         d = dict(src_dict)
         term = d.pop("term")
 
-        field = d.pop("field")
+        path = d.pop("path")
 
         def _parse_fuzziness(data: object) -> FuzzinessType1 | int:
             try:
@@ -77,7 +77,7 @@ class GraphDocumentFuzzyFilter:
 
         graph_document_fuzzy_filter = cls(
             term=term,
-            field=field,
+            path=path,
             fuzziness=fuzziness,
             prefix_length=prefix_length,
         )

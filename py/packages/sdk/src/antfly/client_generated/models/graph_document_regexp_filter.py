@@ -13,23 +13,23 @@ class GraphDocumentRegexpFilter:
     """
     Attributes:
         regexp (str):
-        field (str):
+        path (str): RFC 6901 JSON Pointer to the stored-document value.
     """
 
     regexp: str
-    field: str
+    path: str
 
     def to_dict(self) -> dict[str, Any]:
         regexp = self.regexp
 
-        field = self.field
+        path = self.path
 
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
             {
                 "regexp": regexp,
-                "field": field,
+                "path": path,
             }
         )
 
@@ -40,11 +40,11 @@ class GraphDocumentRegexpFilter:
         d = dict(src_dict)
         regexp = d.pop("regexp")
 
-        field = d.pop("field")
+        path = d.pop("path")
 
         graph_document_regexp_filter = cls(
             regexp=regexp,
-            field=field,
+            path=path,
         )
 
         return graph_document_regexp_filter

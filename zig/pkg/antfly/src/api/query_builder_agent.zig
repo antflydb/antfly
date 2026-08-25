@@ -6864,7 +6864,7 @@ test "query builder metadata validator accepts executable graph node filters" {
         \\  "graph_queries": {
         \\    "graph_search": {
         \\      "index": "doc_graph",
-        \\      "traverse": {"start": {"keys": ["doc:a"]}, "filter": {"prefix":"doc:","field":"_id"}}
+        \\      "traverse": {"start": {"keys": ["doc:a"]}, "filter": {"prefix":"doc:","path":"/_id"}}
         \\    }
         \\  }
         \\}

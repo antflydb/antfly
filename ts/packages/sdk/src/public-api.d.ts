@@ -11826,7 +11826,8 @@ export interface components {
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
         GraphDocumentFuzzyFilter: {
             term: string;
-            field: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
             /** @description Required so fuzzy and exact term predicates remain structurally distinct. */
             fuzziness: components["schemas"]["Fuzziness"];
             /** Format: int32 */
@@ -11834,23 +11835,28 @@ export interface components {
         };
         GraphDocumentTermFilter: {
             term: string;
-            field: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
         };
         GraphDocumentPrefixFilter: {
             prefix: string;
-            field: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
         };
         GraphDocumentRegexpFilter: {
             regexp: string;
-            field: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
         };
         GraphDocumentWildcardFilter: {
             wildcard: string;
-            field: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
         };
         /** @description At least one of min or max is required and enforced by the server. */
         GraphDocumentNumericRangeBody: {
-            field: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
             /** Format: double */
             min?: number;
             /** Format: double */
@@ -11865,7 +11871,8 @@ export interface components {
         };
         /** @description At least one of min or max is required and enforced by the server. */
         GraphDocumentTermRangeBody: {
-            field: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
             min?: string;
             max?: string;
             /** @default true */
@@ -11878,7 +11885,8 @@ export interface components {
         };
         /** @description At least one of start or end is required and enforced by the server. */
         GraphDocumentDateRangeFilter: {
-            field: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
             /** Format: date-time */
             start?: string;
             /** Format: date-time */
@@ -11899,7 +11907,8 @@ export interface components {
         };
         GraphDocumentBoolFieldFilter: {
             bool: boolean;
-            field: string;
+            /** @description RFC 6901 JSON Pointer to the stored-document value. */
+            path: string;
         };
         GraphDocumentFilterConjunction: {
             conjuncts: components["schemas"]["GraphDocumentFilter"][];
@@ -11918,7 +11927,7 @@ export interface components {
             must_not?: components["schemas"]["GraphDocumentFilterDisjunction"];
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
-        /** @description A non-scoring stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers. Alias-to-alias predicates belong in GraphMatch.where. */
+        /** @description A non-scoring stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Fuzzy predicates require an explicit fuzziness, range predicates use numeric_range or term_range wrappers, and every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates belong in GraphMatch.where. */
         GraphDocumentFilter: components["schemas"]["GraphDocumentFuzzyFilter"] | components["schemas"]["GraphDocumentTermFilter"] | components["schemas"]["GraphDocumentPrefixFilter"] | components["schemas"]["GraphDocumentRegexpFilter"] | components["schemas"]["GraphDocumentWildcardFilter"] | components["schemas"]["GraphDocumentNumericRangeFilter"] | components["schemas"]["GraphDocumentTermRangeFilter"] | components["schemas"]["GraphDocumentDateRangeFilter"] | components["schemas"]["GraphDocumentMatchAllFilter"] | components["schemas"]["GraphDocumentMatchNoneFilter"] | components["schemas"]["GraphDocumentIdsFilter"] | components["schemas"]["GraphDocumentBoolFieldFilter"] | components["schemas"]["GraphDocumentFilterBoolean"] | components["schemas"]["GraphDocumentFilterConjunction"] | components["schemas"]["GraphDocumentFilterDisjunction"];
         /** @description Declared under an alias of at most 128 Unicode code points. Omit table for the queried table. Declare it for a cross-table alias that may be used as the source of a relationship, including planner-selected reverse expansion of a branched pattern. */
         GraphMatchNode: {

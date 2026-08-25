@@ -43,6 +43,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const platform_time = @import("antfly_platform").time;
 const indexes_api = @import("indexes.zig");
 const query_contract = @import("query_contract.zig");
+const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const tables_api = @import("tables.zig");
 
 pub const Worker = struct {
@@ -1008,7 +1009,7 @@ fn executeCrossRangeOnce(
 
     for (sorted_query_indexes, 0..) |query_index, i| {
         const graph_query = req.graph_queries[query_index];
-        results[i] = try executeSingleCrossRange(
+        results[i] = executeSingleCrossRange(
             alloc,
             catalog,
             worker,
@@ -1021,7 +1022,16 @@ fn executeCrossRangeOnce(
             consistency,
             &request_work_budget,
             &request_distinct_budget,
-        );
+        ) catch |err| {
+            if (graph_query_diagnostic.reasonForError(err)) |reason| {
+                graph_query_diagnostic.record(
+                    graph_query.name,
+                    graph_query_diagnostic.mode(graph_query.query),
+                    reason,
+                );
+            }
+            return err;
+        };
         initialized += 1;
     }
     return results;

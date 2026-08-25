@@ -553,7 +553,7 @@ test "parse supported graph queries alloc clones edge types and keys" {
         \\        "start": {"keys": ["doc-a"]},
         \\        "edge_types": ["cites", "related"],
         \\        "limit": 7,
-        \\        "filter": {"term": "visible", "field": "tenant"}
+        \\        "filter": {"term": "visible", "path": "/tenant"}
         \\      }
         \\    }
         \\  }
@@ -933,7 +933,7 @@ test "parse supported graph queries accepts pattern node filter queries" {
         \\      "index": "graph_idx",
         \\      "match": {
         \\        "anchor": "a",
-        \\        "nodes": {"a": {}, "b": {"filter": {"term": "beta", "field": "title"}}},
+        \\        "nodes": {"a": {}, "b": {"filter": {"term": "beta", "path": "/title"}}},
         \\        "edges": [{"from": "a", "to": "b", "types": ["links"]}]
         \\      },
         \\      "return": {"bindings": ["a", "b"], "include_documents": true, "fields": ["title"]}
@@ -954,8 +954,27 @@ test "parse supported graph queries accepts pattern node filter queries" {
     try std.testing.expectEqualStrings("title", items[0].query.fields[0]);
     try std.testing.expect(items[0].query.match_pattern.?.nodes[1].filter.filter_query_json != null);
     try std.testing.expectEqualStrings(
-        "{\"term\":{\"path\":\"title\",\"term\":\"beta\"}}",
+        "{\"term\":{\"path\":\"/title\",\"term\":\"beta\"}}",
         items[0].query.match_pattern.?.nodes[1].filter.filter_query_json.?,
+    );
+
+    try std.testing.expectError(error.UnexpectedToken, ant_json.parseFromSlice(
+        metadata_openapi.QueryRequest,
+        alloc,
+        "{\"graph_queries\":{\"walk\":{\"index\":\"graph_idx\",\"match\":{\"anchor\":\"a\",\"nodes\":{\"a\":{\"filter\":{\"term\":\"beta\",\"field\":\"title\"}}},\"edges\":[]},\"return\":{\"bindings\":[\"a\"]}}}}",
+        .{},
+    ));
+
+    var malformed_path = try ant_json.parseFromSlice(
+        metadata_openapi.QueryRequest,
+        alloc,
+        "{\"graph_queries\":{\"walk\":{\"index\":\"graph_idx\",\"match\":{\"anchor\":\"a\",\"nodes\":{\"a\":{\"filter\":{\"term\":\"beta\",\"path\":\"/bad~escape\"}}},\"edges\":[]},\"return\":{\"bindings\":[\"a\"]}}}}",
+        .{},
+    );
+    defer malformed_path.deinit();
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSupportedGraphQueriesAlloc(alloc, malformed_path.value),
     );
 }
 

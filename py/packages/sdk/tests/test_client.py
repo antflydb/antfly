@@ -91,17 +91,17 @@ class TestAntflyClient:
         assert "name" not in request
 
     def test_graph_document_filters_parse_to_unambiguous_sdk_types(self) -> None:
-        exact = GraphMatchNode.from_dict({"filter": {"term": "beta", "field": "title"}})
-        fuzzy = GraphMatchNode.from_dict({"filter": {"term": "beta", "field": "title", "fuzziness": 1}})
-        numeric = GraphMatchNode.from_dict({"filter": {"numeric_range": {"field": "score", "min": 0.8}}})
+        exact = GraphMatchNode.from_dict({"filter": {"term": "beta", "path": "/title"}})
+        fuzzy = GraphMatchNode.from_dict({"filter": {"term": "beta", "path": "/title", "fuzziness": 1}})
+        numeric = GraphMatchNode.from_dict({"filter": {"numeric_range": {"path": "/score", "min": 0.8}}})
 
         assert isinstance(exact.filter_, GraphDocumentTermFilter)
         assert isinstance(fuzzy.filter_, GraphDocumentFuzzyFilter)
         assert isinstance(numeric.filter_, GraphDocumentNumericRangeFilter)
-        assert exact.to_dict()["filter"] == {"term": "beta", "field": "title"}
+        assert exact.to_dict()["filter"] == {"term": "beta", "path": "/title"}
         assert fuzzy.to_dict()["filter"] == {
             "term": "beta",
-            "field": "title",
+            "path": "/title",
             "fuzziness": 1,
         }
 

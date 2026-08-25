@@ -239,12 +239,12 @@ not run full-text analyzers. Range predicates use explicit `numeric_range` or
       "match": {
         "anchor": "author",
         "nodes": {
-          "author": {"filter": {"term": "person", "field": "kind"}},
+          "author": {"filter": {"term": "person", "path": "/kind"}},
           "post": {"table": "messages"},
           "reply": {
             "table": "messages",
             "filter": {
-              "numeric_range": {"field": "score", "min": 0.8}
+              "numeric_range": {"path": "/score", "min": 0.8}
             }
           }
         },
@@ -296,6 +296,10 @@ node. Because exact anchors are cursor-scanned in `_id` order, fields used by th
 anchor or authorization filters must have native index coverage. Antfly returns
 `graph_anchor_filter_requires_index` when it cannot prove that complete scan;
 index the referenced fields rather than relying on stored-source fallback.
+Graph document filters address stored values with RFC 6901 JSON Pointers. For
+example, use `/kind` for a top-level field and `/author/name` for a nested field;
+escape `~` as `~0` and `/` within a key as `~1`.
+
 MATCH and compatibility-pattern expansion work is budgeted across the whole
 request, not once per named operation. Traversal and path operations retain
 their explicit per-operation depth and result bounds.

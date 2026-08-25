@@ -24,6 +24,7 @@ const foreign_sources_api = @import("../../api/foreign_sources.zig");
 const join_model = @import("../../api/join_model.zig");
 const query_api = @import("../../api/query.zig");
 const public_graph_query = @import("../../api/public_graph_query.zig");
+const graph_query_diagnostic = @import("../../api/graph_query_diagnostic.zig");
 const public_search_request = @import("../../api/public_search_request.zig");
 const public_text_query = @import("../../api/public_text_query.zig");
 const public_table_http = @import("../../api/public_table_http.zig");
@@ -3137,15 +3138,25 @@ pub const HttpHandler = struct {
         }
         for (sorted_query_indexes, 0..) |query_index, idx| {
             try session.checkCancellation();
-            results[idx] = try self.executePublicGraphQueryAlloc(
+            const named_query = graph_queries[query_index];
+            results[idx] = self.executePublicGraphQueryAlloc(
                 source_table,
-                graph_queries[query_index],
+                named_query,
                 available_sets.items,
                 &request_work_budget,
                 &request_distinct_budget,
                 &request_graph_read_budget,
                 &request_cache,
-            );
+            ) catch |err| {
+                if (graph_query_diagnostic.reasonForError(err)) |reason| {
+                    graph_query_diagnostic.record(
+                        named_query.name,
+                        graph_query_diagnostic.mode(named_query.query),
+                        reason,
+                    );
+                }
+                return err;
+            };
             try available_sets.append(self.alloc, .{
                 .name = results[idx].name,
                 .hits = results[idx].hits,
@@ -10655,7 +10666,7 @@ test "http handler serves published graph query endpoints" {
         .method = .post,
         .path = "/tables/docs/query",
         .body =
-        \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{"filter":{"term":"beta","field":"title"}},"c":{"filter":{"prefix":"ga","field":"title"}}},"edges":[{"from":"a","to":"b","types":["cites"]},{"from":"b","to":"c","types":["cites"]}]},"return":{"bindings":["a","b","c"],"limit":10}}},"limit":10}
+        \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{"filter":{"term":"beta","path":"/title"}},"c":{"filter":{"prefix":"ga","path":"/title"}}},"edges":[{"from":"a","to":"b","types":["cites"]},{"from":"b","to":"c","types":["cites"]}]},"return":{"bindings":["a","b","c"],"limit":10}}},"limit":10}
         ,
     });
     defer pattern.deinit(alloc);

@@ -30,6 +30,7 @@ const restore_jobs = @import("restore_jobs.zig");
 const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
+const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
@@ -11460,6 +11461,7 @@ pub const ApiHttpServer = struct {
 
         const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
         db_mod.resetLastSortRejectionDiagnostic();
+        graph_query_diagnostic.reset();
         const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
@@ -11527,6 +11529,7 @@ pub const ApiHttpServer = struct {
 
             const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
             db_mod.resetLastSortRejectionDiagnostic();
+            graph_query_diagnostic.reset();
             const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
                 self.alloc,
                 source,

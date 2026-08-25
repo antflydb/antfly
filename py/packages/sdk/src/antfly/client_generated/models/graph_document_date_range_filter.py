@@ -17,21 +17,21 @@ class GraphDocumentDateRangeFilter:
     """At least one of start or end is required and enforced by the server.
 
     Attributes:
-        field (str):
+        path (str): RFC 6901 JSON Pointer to the stored-document value.
         start (datetime.datetime | Unset):
         end (datetime.datetime | Unset):
         inclusive_start (bool | Unset):  Default: True.
         inclusive_end (bool | Unset):  Default: False.
     """
 
-    field: str
+    path: str
     start: datetime.datetime | Unset = UNSET
     end: datetime.datetime | Unset = UNSET
     inclusive_start: bool | Unset = True
     inclusive_end: bool | Unset = False
 
     def to_dict(self) -> dict[str, Any]:
-        field = self.field
+        path = self.path
 
         start: str | Unset = UNSET
         if not isinstance(self.start, Unset):
@@ -49,7 +49,7 @@ class GraphDocumentDateRangeFilter:
 
         field_dict.update(
             {
-                "field": field,
+                "path": path,
             }
         )
         if start is not UNSET:
@@ -66,7 +66,7 @@ class GraphDocumentDateRangeFilter:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        field = d.pop("field")
+        path = d.pop("path")
 
         _start = d.pop("start", UNSET)
         start: datetime.datetime | Unset
@@ -87,7 +87,7 @@ class GraphDocumentDateRangeFilter:
         inclusive_end = d.pop("inclusive_end", UNSET)
 
         graph_document_date_range_filter = cls(
-            field=field,
+            path=path,
             start=start,
             end=end,
             inclusive_start=inclusive_start,

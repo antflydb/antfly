@@ -15,21 +15,21 @@ class GraphDocumentTermRangeBody:
     """At least one of min or max is required and enforced by the server.
 
     Attributes:
-        field (str):
+        path (str): RFC 6901 JSON Pointer to the stored-document value.
         min_ (str | Unset):
         max_ (str | Unset):
         inclusive_min (bool | Unset):  Default: True.
         inclusive_max (bool | Unset):  Default: False.
     """
 
-    field: str
+    path: str
     min_: str | Unset = UNSET
     max_: str | Unset = UNSET
     inclusive_min: bool | Unset = True
     inclusive_max: bool | Unset = False
 
     def to_dict(self) -> dict[str, Any]:
-        field = self.field
+        path = self.path
 
         min_ = self.min_
 
@@ -43,7 +43,7 @@ class GraphDocumentTermRangeBody:
 
         field_dict.update(
             {
-                "field": field,
+                "path": path,
             }
         )
         if min_ is not UNSET:
@@ -60,7 +60,7 @@ class GraphDocumentTermRangeBody:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        field = d.pop("field")
+        path = d.pop("path")
 
         min_ = d.pop("min", UNSET)
 
@@ -71,7 +71,7 @@ class GraphDocumentTermRangeBody:
         inclusive_max = d.pop("inclusive_max", UNSET)
 
         graph_document_term_range_body = cls(
-            field=field,
+            path=path,
             min_=min_,
             max_=max_,
             inclusive_min=inclusive_min,

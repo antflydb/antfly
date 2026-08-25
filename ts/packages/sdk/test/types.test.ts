@@ -198,9 +198,9 @@ describe("Antfly Query Type Integration", () => {
 
   describe("QueryRequest type safety", () => {
     it("keeps graph filters in the stored-document predicate subset", () => {
-      const filter: GraphDocumentFilter = { term: "active", field: "status" };
+      const filter: GraphDocumentFilter = { term: "active", path: "/status" };
       const numeric: GraphDocumentFilter = {
-        numeric_range: { field: "score", min: 0 },
+        numeric_range: { path: "/score", min: 0 },
       };
       const graph: GraphMatchQuery = {
         index: "social",
@@ -210,7 +210,7 @@ describe("Antfly Query Type Integration", () => {
       const request: QueryRequest = { graph_queries: { people: graph } };
 
       expect(request.graph_queries?.people).toBeDefined();
-      expect(numeric).toEqual({ numeric_range: { field: "score", min: 0 } });
+      expect(numeric).toEqual({ numeric_range: { path: "/score", min: 0 } });
     });
 
     it("types pre-discriminator graph responses during the compatibility window", () => {

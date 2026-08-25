@@ -13,23 +13,23 @@ class GraphDocumentTermFilter:
     """
     Attributes:
         term (str):
-        field (str):
+        path (str): RFC 6901 JSON Pointer to the stored-document value.
     """
 
     term: str
-    field: str
+    path: str
 
     def to_dict(self) -> dict[str, Any]:
         term = self.term
 
-        field = self.field
+        path = self.path
 
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
             {
                 "term": term,
-                "field": field,
+                "path": path,
             }
         )
 
@@ -40,11 +40,11 @@ class GraphDocumentTermFilter:
         d = dict(src_dict)
         term = d.pop("term")
 
-        field = d.pop("field")
+        path = d.pop("path")
 
         graph_document_term_filter = cls(
             term=term,
-            field=field,
+            path=path,
         )
 
         return graph_document_term_filter

@@ -13,23 +13,23 @@ class GraphDocumentBoolFieldFilter:
     """
     Attributes:
         bool_ (bool):
-        field (str):
+        path (str): RFC 6901 JSON Pointer to the stored-document value.
     """
 
     bool_: bool
-    field: str
+    path: str
 
     def to_dict(self) -> dict[str, Any]:
         bool_ = self.bool_
 
-        field = self.field
+        path = self.path
 
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
             {
                 "bool": bool_,
-                "field": field,
+                "path": path,
             }
         )
 
@@ -40,11 +40,11 @@ class GraphDocumentBoolFieldFilter:
         d = dict(src_dict)
         bool_ = d.pop("bool")
 
-        field = d.pop("field")
+        path = d.pop("path")
 
         graph_document_bool_field_filter = cls(
             bool_=bool_,
-            field=field,
+            path=path,
         )
 
         return graph_document_bool_field_filter

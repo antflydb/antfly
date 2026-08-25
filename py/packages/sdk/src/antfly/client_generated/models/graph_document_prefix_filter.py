@@ -13,23 +13,23 @@ class GraphDocumentPrefixFilter:
     """
     Attributes:
         prefix (str):
-        field (str):
+        path (str): RFC 6901 JSON Pointer to the stored-document value.
     """
 
     prefix: str
-    field: str
+    path: str
 
     def to_dict(self) -> dict[str, Any]:
         prefix = self.prefix
 
-        field = self.field
+        path = self.path
 
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
             {
                 "prefix": prefix,
-                "field": field,
+                "path": path,
             }
         )
 
@@ -40,11 +40,11 @@ class GraphDocumentPrefixFilter:
         d = dict(src_dict)
         prefix = d.pop("prefix")
 
-        field = d.pop("field")
+        path = d.pop("path")
 
         graph_document_prefix_filter = cls(
             prefix=prefix,
-            field=field,
+            path=path,
         )
 
         return graph_document_prefix_filter

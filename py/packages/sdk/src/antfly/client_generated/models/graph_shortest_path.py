@@ -52,8 +52,9 @@ class GraphShortestPath:
             GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter | Unset): A non-scoring
             stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and
             deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
-            Fuzzy predicates require an explicit fuzziness, and range predicates use numeric_range or term_range wrappers.
-            Alias-to-alias predicates belong in GraphMatch.where.
+            Fuzzy predicates require an explicit fuzziness, range predicates use numeric_range or term_range wrappers, and
+            every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates belong in
+            GraphMatch.where.
         include_documents (bool | Unset): Include stored documents on terminal result nodes returned alongside the path.
             Default: False.
         fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.

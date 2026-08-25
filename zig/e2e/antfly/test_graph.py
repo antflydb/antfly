@@ -636,8 +636,8 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
         "anchor": "a",
         "nodes": {
             "a": {"filter": {"ids": ["doc-a"]}},
-            "b": {"filter": {"term": "beta", "field": "title"}},
-            "c": {"filter": {"prefix": "ga", "field": "title"}},
+            "b": {"filter": {"term": "beta", "path": "/title"}},
+            "c": {"filter": {"prefix": "ga", "path": "/title"}},
         },
         "edges": [
             {"from": "a", "to": "b", "types": ["cites"]},
@@ -1492,7 +1492,7 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
     assert wait_until(predicates_ready, timeout_s=120.0, interval_s=0.25) is not None
 
     def node(label: str) -> dict:
-        return {"filter": {"term": label, "field": "/type"}}
+        return {"filter": {"term": label, "path": "/type"}}
 
     def count_query(nodes: dict, edges: list, *, where=None, optional=None) -> dict:
         match = {"anchor": next(iter(nodes)), "nodes": nodes, "edges": edges}

@@ -2686,17 +2686,25 @@ components:
     GraphDocumentTermFilter:
       type: object
       additionalProperties: false
-      required: [term, field]
+      required: [term, path]
       properties:
         term: { type: string }
-        field: { type: string }
+        path:
+          type: string
+          minLength: 1
+          pattern: '^/'
+          description: RFC 6901 JSON Pointer to the stored-document value.
     GraphDocumentFuzzyFilter:
       type: object
       additionalProperties: false
-      required: [term, field, fuzziness]
+      required: [term, path, fuzziness]
       properties:
         term: { type: string }
-        field: { type: string }
+        path:
+          type: string
+          minLength: 1
+          pattern: '^/'
+          description: RFC 6901 JSON Pointer to the stored-document value.
         fuzziness:
           $ref: 'query.yaml#/components/schemas/Fuzziness'
           description: Required so fuzzy and exact term predicates remain structurally distinct.
@@ -2708,31 +2716,47 @@ components:
     GraphDocumentPrefixFilter:
       type: object
       additionalProperties: false
-      required: [prefix, field]
+      required: [prefix, path]
       properties:
         prefix: { type: string }
-        field: { type: string }
+        path:
+          type: string
+          minLength: 1
+          pattern: '^/'
+          description: RFC 6901 JSON Pointer to the stored-document value.
     GraphDocumentRegexpFilter:
       type: object
       additionalProperties: false
-      required: [regexp, field]
+      required: [regexp, path]
       properties:
         regexp: { type: string }
-        field: { type: string }
+        path:
+          type: string
+          minLength: 1
+          pattern: '^/'
+          description: RFC 6901 JSON Pointer to the stored-document value.
     GraphDocumentWildcardFilter:
       type: object
       additionalProperties: false
-      required: [wildcard, field]
+      required: [wildcard, path]
       properties:
         wildcard: { type: string }
-        field: { type: string }
+        path:
+          type: string
+          minLength: 1
+          pattern: '^/'
+          description: RFC 6901 JSON Pointer to the stored-document value.
     GraphDocumentNumericRangeBody:
       type: object
       additionalProperties: false
-      required: [field]
+      required: [path]
       description: At least one of min or max is required and enforced by the server.
       properties:
-        field: { type: string }
+        path:
+          type: string
+          minLength: 1
+          pattern: '^/'
+          description: RFC 6901 JSON Pointer to the stored-document value.
         min:
           type: number
           format: double
@@ -2758,10 +2782,14 @@ components:
     GraphDocumentTermRangeBody:
       type: object
       additionalProperties: false
-      required: [field]
+      required: [path]
       description: At least one of min or max is required and enforced by the server.
       properties:
-        field: { type: string }
+        path:
+          type: string
+          minLength: 1
+          pattern: '^/'
+          description: RFC 6901 JSON Pointer to the stored-document value.
         min:
           type: string
           x-go-type-skip-optional-pointer: false
@@ -2785,10 +2813,14 @@ components:
     GraphDocumentDateRangeFilter:
       type: object
       additionalProperties: false
-      required: [field]
+      required: [path]
       description: At least one of start or end is required and enforced by the server.
       properties:
-        field: { type: string }
+        path:
+          type: string
+          minLength: 1
+          pattern: '^/'
+          description: RFC 6901 JSON Pointer to the stored-document value.
         start:
           type: string
           format: date-time
@@ -2831,10 +2863,14 @@ components:
     GraphDocumentBoolFieldFilter:
       type: object
       additionalProperties: false
-      required: [bool, field]
+      required: [bool, path]
       properties:
         bool: { type: boolean }
-        field: { type: string }
+        path:
+          type: string
+          minLength: 1
+          pattern: '^/'
+          description: RFC 6901 JSON Pointer to the stored-document value.
     GraphDocumentFilterBoolean:
       type: object
       additionalProperties: false
@@ -2897,7 +2933,8 @@ components:
         uses structurally distinct stored-field predicates and deliberately
         excludes analyzer-backed full-text clauses such as match, phrase,
         multi_match, and query_string. Fuzzy predicates require an explicit
-        fuzziness, and range predicates use numeric_range or term_range wrappers.
+        fuzziness, range predicates use numeric_range or term_range wrappers,
+        and every stored value is addressed by an RFC 6901 JSON Pointer in `path`.
         Alias-to-alias predicates belong in GraphMatch.where.
     GraphTraversal:
       type: object

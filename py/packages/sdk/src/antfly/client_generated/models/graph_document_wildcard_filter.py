@@ -13,23 +13,23 @@ class GraphDocumentWildcardFilter:
     """
     Attributes:
         wildcard (str):
-        field (str):
+        path (str): RFC 6901 JSON Pointer to the stored-document value.
     """
 
     wildcard: str
-    field: str
+    path: str
 
     def to_dict(self) -> dict[str, Any]:
         wildcard = self.wildcard
 
-        field = self.field
+        path = self.path
 
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
             {
                 "wildcard": wildcard,
-                "field": field,
+                "path": path,
             }
         )
 
@@ -40,11 +40,11 @@ class GraphDocumentWildcardFilter:
         d = dict(src_dict)
         wildcard = d.pop("wildcard")
 
-        field = d.pop("field")
+        path = d.pop("path")
 
         graph_document_wildcard_filter = cls(
             wildcard=wildcard,
-            field=field,
+            path=path,
         )
 
         return graph_document_wildcard_filter

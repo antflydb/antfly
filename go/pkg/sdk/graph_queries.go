@@ -40,9 +40,11 @@ const (
 )
 
 // NewGraphDocumentFilter adapts the non-scoring stored-document subset of the
-// query DSL to a graph node filter. Analyzer-backed full-text clauses are
-// rejected locally because evaluating them against stored JSON would change
-// both their semantics and cost model.
+// query DSL to a graph node filter. Query DSL dotted fields are converted to
+// canonical RFC 6901 JSON Pointers; an already pointer-shaped field is
+// validated and preserved. Analyzer-backed full-text clauses are rejected
+// locally because evaluating them against stored JSON would change both their
+// semantics and cost model.
 func NewGraphDocumentFilter(filter querydsl.Query) (GraphDocumentFilter, error) {
 	encoded, err := json.Marshal(filter)
 	if err != nil {
@@ -55,7 +57,7 @@ func NewGraphDocumentFilter(filter querydsl.Query) (GraphDocumentFilter, error) 
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		return GraphDocumentFilter{}, err
 	}
-	decoded, err = normalizeGraphDocumentFilterRanges(decoded)
+	decoded, err = normalizeGraphDocumentFilter(decoded)
 	if err != nil {
 		return GraphDocumentFilter{}, err
 	}
@@ -139,23 +141,39 @@ func decodeLegacyGraphQueryResult(result GraphQueryResult, envelope map[string]j
 
 // Range query variants share the same flat full-text shape, which makes an
 // OpenAPI oneOf impossible to discriminate reliably. Graph filters use
-// explicit numeric_range and term_range operator wrappers on the wire.
-func normalizeGraphDocumentFilterRanges(value any) (any, error) {
+// explicit numeric_range and term_range operator wrappers on the wire and
+// canonical JSON Pointers rather than full-text field names.
+func normalizeGraphDocumentFilter(value any) (any, error) {
 	switch current := value.(type) {
 	case map[string]any:
-		// Canonical graph ranges are already discriminated. Keeping this
-		// normalization idempotent also prevents a canonical range body from
-		// being wrapped a second time when it is nested in a boolean filter.
-		if _, ok := current["numeric_range"]; ok {
-			return current, nil
+		if fieldValue, ok := current["field"]; ok {
+			if _, hasPath := current["path"]; hasPath {
+				return nil, fmt.Errorf("antfly: graph document filter cannot contain both field and path")
+			}
+			field, ok := fieldValue.(string)
+			if !ok {
+				return nil, fmt.Errorf("antfly: graph document filter field must be a string")
+			}
+			path, err := graphDocumentPathFromQueryField(field)
+			if err != nil {
+				return nil, err
+			}
+			delete(current, "field")
+			current["path"] = path
 		}
-		if _, ok := current["term_range"]; ok {
-			return current, nil
+		if pathValue, ok := current["path"]; ok {
+			path, ok := pathValue.(string)
+			if !ok || !validGraphDocumentJSONPointer(path) {
+				return nil, fmt.Errorf("antfly: graph document filter path must be an RFC 6901 JSON Pointer")
+			}
 		}
-		_, hasField := current["field"]
+
+		_, isNumericRange := current["numeric_range"]
+		_, isTermRange := current["term_range"]
+		_, hasPath := current["path"]
 		min, hasMin := current["min"]
 		max, hasMax := current["max"]
-		if hasField && (hasMin || hasMax) {
+		if !isNumericRange && !isTermRange && hasPath && (hasMin || hasMax) {
 			kind := ""
 			for _, bound := range []struct {
 				value any
@@ -185,7 +203,7 @@ func normalizeGraphDocumentFilterRanges(value any) (any, error) {
 			return map[string]any{kind: current}, nil
 		}
 		for key, child := range current {
-			normalized, err := normalizeGraphDocumentFilterRanges(child)
+			normalized, err := normalizeGraphDocumentFilter(child)
 			if err != nil {
 				return nil, err
 			}
@@ -194,7 +212,7 @@ func normalizeGraphDocumentFilterRanges(value any) (any, error) {
 		return current, nil
 	case []any:
 		for i, child := range current {
-			normalized, err := normalizeGraphDocumentFilterRanges(child)
+			normalized, err := normalizeGraphDocumentFilter(child)
 			if err != nil {
 				return nil, err
 			}
@@ -204,6 +222,42 @@ func normalizeGraphDocumentFilterRanges(value any) (any, error) {
 	default:
 		return value, nil
 	}
+}
+
+func graphDocumentPathFromQueryField(field string) (string, error) {
+	if field == "" {
+		return "", fmt.Errorf("antfly: graph document filter field must not be empty")
+	}
+	if strings.HasPrefix(field, "/") {
+		if !validGraphDocumentJSONPointer(field) {
+			return "", fmt.Errorf("antfly: graph document filter field is not a valid RFC 6901 JSON Pointer")
+		}
+		return field, nil
+	}
+	segments := strings.Split(field, ".")
+	for i, segment := range segments {
+		if segment == "" {
+			return "", fmt.Errorf("antfly: graph document filter field contains an empty path segment")
+		}
+		segments[i] = strings.ReplaceAll(strings.ReplaceAll(segment, "~", "~0"), "/", "~1")
+	}
+	return "/" + strings.Join(segments, "/"), nil
+}
+
+func validGraphDocumentJSONPointer(path string) bool {
+	if !strings.HasPrefix(path, "/") {
+		return false
+	}
+	for i := 0; i < len(path); i++ {
+		if path[i] != '~' {
+			continue
+		}
+		if i+1 >= len(path) || (path[i+1] != '0' && path[i+1] != '1') {
+			return false
+		}
+		i++
+	}
+	return true
 }
 
 func validateGraphDocumentFilterJSON(encoded []byte) error {
