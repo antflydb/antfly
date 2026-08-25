@@ -9,12 +9,12 @@
 package sdk
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
 	"unicode/utf8"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
 )
 
