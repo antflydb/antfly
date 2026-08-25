@@ -315,7 +315,10 @@ pub const ObjectStore = struct {
 
         var kept = std.ArrayListUnmanaged(wal_types.Record).empty;
         defer {
-            for (kept.items) |record| self.alloc.free(record.payload);
+            for (kept.items) |record| {
+                self.alloc.free(record.payload);
+                if (record.operation_id) |operation_id| self.alloc.free(operation_id);
+            }
             kept.deinit(self.alloc);
         }
 
@@ -325,15 +328,12 @@ pub const ObjectStore = struct {
                 removed += 1;
                 continue;
             }
-            try kept.append(self.alloc, .{
-                .lsn = record.lsn,
-                .timestamp_ns = record.timestamp_ns,
-                .payload = try self.alloc.dupe(u8, record.payload),
-                .operation_id = if (record.operation_id) |operation_id|
-                    try self.alloc.dupe(u8, operation_id)
-                else
-                    null,
-            });
+            const cloned = try cloneRecordAlloc(self.alloc, record);
+            kept.append(self.alloc, cloned) catch |err| {
+                self.alloc.free(cloned.payload);
+                if (cloned.operation_id) |operation_id| self.alloc.free(operation_id);
+                return err;
+            };
         }
 
         if (kept.items.len == 0) {
@@ -450,6 +450,20 @@ pub fn encodeRecordAlloc(alloc: std.mem.Allocator, lsn: u64, timestamp_ns: u64, 
     pos += 4;
     @memcpy(buf[pos..][0..payload.len], payload);
     return buf;
+}
+
+fn cloneRecordAlloc(alloc: std.mem.Allocator, record: wal_types.Record) !wal_types.Record {
+    const payload = try alloc.dupe(u8, record.payload);
+    errdefer alloc.free(payload);
+    return .{
+        .lsn = record.lsn,
+        .timestamp_ns = record.timestamp_ns,
+        .payload = payload,
+        .operation_id = if (record.operation_id) |operation_id|
+            try alloc.dupe(u8, operation_id)
+        else
+            null,
+    };
 }
 
 pub const idempotent_record_flag: u32 = @as(u32, 1) << 31;
@@ -592,6 +606,26 @@ fn logKeyAlloc(alloc: std.mem.Allocator, prefix: []const u8, namespace: []const 
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
+}
+
+test "serverless objectstore WAL retained record cloning is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var payload = "payload".*;
+            var operation_id = "operation".*;
+            const cloned = try cloneRecordAlloc(alloc, .{
+                .lsn = 1,
+                .timestamp_ns = 2,
+                .payload = payload[0..],
+                .operation_id = operation_id[0..],
+            });
+            defer {
+                alloc.free(cloned.payload);
+                if (cloned.operation_id) |owned_operation_id| alloc.free(owned_operation_id);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless objectstore-backed WAL conditionally appends and truncates over file uri" {

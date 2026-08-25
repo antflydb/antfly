@@ -300,6 +300,7 @@ pub const Builder = struct {
                         plan,
                         publication_guard,
                         cancellation,
+                        null,
                     );
                 }
             } else if (current_head == 0 and plan.table_definition.base_source != null) {
@@ -311,6 +312,7 @@ pub const Builder = struct {
                     plan,
                     publication_guard,
                     cancellation,
+                    null,
                 );
             }
             if (current_head != 0 and plan.forceRepublishFromHead()) {
@@ -321,6 +323,7 @@ pub const Builder = struct {
                     plan,
                     publication_guard,
                     cancellation,
+                    null,
                 );
             }
             return .{
@@ -341,11 +344,37 @@ pub const Builder = struct {
         // wedge an external/read-only table or overwrite a newer generation.
         if (applicable_records.len == 0) {
             const current = current_manifest orelse return error.StaleEnrichmentWithoutPublishedHead;
+            const last_record = records[records.len - 1];
+            if (plan.external_source_plan) |external_plan| {
+                if (!externalSourcePlanMatchesManifest(external_plan, current)) {
+                    return try self.publishExternalManifestWithoutWal(
+                        namespace,
+                        current_head,
+                        next_version,
+                        start_lsn,
+                        plan,
+                        publication_guard,
+                        cancellation,
+                        last_record,
+                    );
+                }
+            }
+            if (plan.forceRepublishFromHead()) {
+                return try self.republishHeadWithPlan(
+                    namespace,
+                    current_head,
+                    vector_metric,
+                    plan,
+                    publication_guard,
+                    cancellation,
+                    last_record,
+                );
+            }
             return try self.publishHeadConsumingIgnoredWal(
                 namespace,
                 current_head,
                 current,
-                records[records.len - 1],
+                last_record,
                 publication_guard,
                 cancellation,
             );
@@ -554,6 +583,11 @@ pub const Builder = struct {
         defer manifest.deinit(self.alloc);
         manifest.version = std.math.add(u64, current_head, 1) catch return error.ManifestVersionExhausted;
         manifest.built_at_ns = last_record.timestamp_ns;
+        // The cloned artifacts are already a complete published snapshot and
+        // do not depend on any of the ignored mutations. Advance the retained
+        // WAL boundary with the consumed tail so repeated stale work cannot
+        // pin the namespace's entire historical log.
+        manifest.wal_start_lsn = last_record.lsn;
         manifest.wal_end_lsn = last_record.lsn;
 
         const published_version = try putManifestForPublication(self.manifests, &manifest, current_head);
@@ -584,10 +618,16 @@ pub const Builder = struct {
         plan: publication_plan.TablePublicationPlan,
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
+        consumed_record: ?wal_mod.Record,
     ) !BuildResult {
         try maintenance_cancellation.check(cancellation);
         var manifest = try buildEmptyExternalManifestAlloc(self.alloc, namespace, version, start_lsn, plan);
         defer manifest.deinit(self.alloc);
+        if (consumed_record) |record| {
+            manifest.built_at_ns = record.timestamp_ns;
+            manifest.wal_start_lsn = record.lsn;
+            manifest.wal_end_lsn = record.lsn;
+        }
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         try maintenance_cancellation.check(cancellation);
@@ -609,8 +649,8 @@ pub const Builder = struct {
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
             .version = published_version,
-            .wal_start_lsn = start_lsn,
-            .wal_end_lsn = start_lsn - 1,
+            .wal_start_lsn = manifest.wal_start_lsn,
+            .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
         };
     }
@@ -625,7 +665,7 @@ pub const Builder = struct {
         return try self.republishHeadWithPlan(namespace, current_head, vector_metric, .{
             .targets = targets,
             .metadata_republish = .{ .published_search_sources_changed = true },
-        }, null, null);
+        }, null, null, null);
     }
 
     fn republishHeadWithPlan(
@@ -636,6 +676,7 @@ pub const Builder = struct {
         plan: publication_plan.TablePublicationPlan,
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
+        consumed_record: ?wal_mod.Record,
     ) !BuildResult {
         try maintenance_cancellation.check(cancellation);
         const targets = plan.targets;
@@ -782,11 +823,12 @@ pub const Builder = struct {
         try maintenance_cancellation.check(cancellation);
 
         const next_version = current_head + 1;
+        const wal_end_lsn = if (consumed_record) |record| record.lsn else current.wal_end_lsn;
         var manifest = try buildCompactedManifestFromRefsAlloc(
             self.alloc,
             namespace,
             next_version,
-            current.wal_end_lsn,
+            wal_end_lsn,
             @intCast(current.stats.document_count),
             if (plan.artifact_actions.document_segment == .reuse)
                 if (current.stats.document_base_version != 0) current.stats.document_base_version else current.version
@@ -803,6 +845,7 @@ pub const Builder = struct {
             plan.table_definition,
         );
         defer manifest.deinit(self.alloc);
+        if (consumed_record) |record| manifest.built_at_ns = record.timestamp_ns;
         try attachResolvedExternalSourcePlanIfPresent(self.alloc, &manifest, plan);
 
         try maintenance_cancellation.check(cancellation);
@@ -824,8 +867,8 @@ pub const Builder = struct {
             .namespace = try self.alloc.dupe(u8, namespace),
             .published = true,
             .version = published_version,
-            .wal_start_lsn = current.wal_end_lsn,
-            .wal_end_lsn = current.wal_end_lsn,
+            .wal_start_lsn = manifest.wal_start_lsn,
+            .wal_end_lsn = manifest.wal_end_lsn,
             .artifact_count = manifest.artifacts.len,
         };
     }
@@ -1520,21 +1563,108 @@ fn externalSourcePlanMatchesManifest(
         else => false,
     };
     if (!sources_match or plan.artifacts.len == 0) return false;
+
+    // External plans own the external metadata refs, while a published
+    // manifest may also carry unrelated document and search artifacts. Match
+    // the owned refs as an exact multiset so
+    // a logical rename, removal, duplicate, or replacement cannot be mistaken
+    // for an unchanged plan, while a harmless order change does not force a
+    // new publication.
+    for (plan.artifacts) |artifact| {
+        if (artifact.kind != .external_base_source) return false;
+    }
+    var current_external_count: usize = 0;
+    for (manifest.artifacts) |current_artifact| {
+        if (current_artifact.kind == .external_base_source) current_external_count += 1;
+    }
+    if (current_external_count != plan.artifacts.len) return false;
     for (plan.artifacts) |planned_artifact| {
-        var found = false;
-        for (manifest.artifacts) |current_artifact| {
-            if (planned_artifact.kind == current_artifact.kind and
-                std.mem.eql(u8, planned_artifact.artifact_id, current_artifact.artifact_id) and
-                planned_artifact.byte_len == current_artifact.byte_len and
-                std.mem.eql(u8, planned_artifact.checksum, current_artifact.checksum))
-            {
-                found = true;
-                break;
-            }
+        var planned_occurrences: usize = 0;
+        for (plan.artifacts) |candidate| {
+            if (artifactRefEql(planned_artifact, candidate)) planned_occurrences += 1;
         }
-        if (!found) return false;
+        var current_occurrences: usize = 0;
+        for (manifest.artifacts) |candidate| {
+            if (artifactRefEql(planned_artifact, candidate)) current_occurrences += 1;
+        }
+        if (planned_occurrences != current_occurrences) return false;
     }
     return true;
+}
+
+fn artifactRefEql(left: manifest_mod.ArtifactRef, right: manifest_mod.ArtifactRef) bool {
+    return left.kind == right.kind and
+        std.mem.eql(u8, left.name, right.name) and
+        std.mem.eql(u8, left.artifact_id, right.artifact_id) and
+        left.byte_len == right.byte_len and
+        std.mem.eql(u8, left.checksum, right.checksum);
+}
+
+test "serverless external source plan matching is exact over owned artifacts" {
+    const base_source = manifest_mod.BaseSourceDescriptor{ .external_parquet = .{
+        .format = .parquet_prefix,
+        .source_uri = "s3://bucket/events",
+        .snapshot_id = "snapshot-1",
+        .schema_fingerprint = "schema-v1",
+        .file_inventory_artifact = "inventory-1",
+        .row_group_metadata_artifact = "row-groups-1",
+    } };
+    var planned_artifacts = [_]manifest_mod.ArtifactRef{
+        .{
+            .kind = .external_base_source,
+            .name = "events.external-files",
+            .artifact_id = "inventory-1",
+            .byte_len = 128,
+            .checksum = "sha256:inventory-1",
+        },
+        .{
+            .kind = .external_base_source,
+            .name = "events.row-groups",
+            .artifact_id = "row-groups-1",
+            .byte_len = 32,
+            .checksum = "sha256:row-groups-1",
+        },
+    };
+    var current_artifacts = [_]manifest_mod.ArtifactRef{
+        .{
+            .kind = .document_segment,
+            .artifact_id = "documents-1",
+            .byte_len = 64,
+            .checksum = "sha256:documents-1",
+        },
+        planned_artifacts[1],
+        planned_artifacts[0],
+        .{
+            .kind = .external_base_source,
+            .name = "events.deletes",
+            .artifact_id = "deletes-1",
+            .byte_len = 16,
+            .checksum = "sha256:deletes-1",
+        },
+    };
+    const plan = external_source_manifest.Plan{
+        .base_source = base_source,
+        .artifacts = planned_artifacts[0..],
+    };
+    var manifest = manifest_mod.Manifest{
+        .namespace = "events",
+        .version = 1,
+        .built_at_ns = 1,
+        .wal_start_lsn = 1,
+        .wal_end_lsn = 0,
+        .stats = .{},
+        .artifacts = current_artifacts[0..3],
+        .base_source = base_source,
+    };
+
+    try std.testing.expect(externalSourcePlanMatchesManifest(plan, manifest));
+    planned_artifacts[0].name = "events.renamed-files";
+    try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
+    planned_artifacts[0].name = "events.external-files";
+    manifest.artifacts = current_artifacts[0..2];
+    try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
+    manifest.artifacts = current_artifacts[0..];
+    try std.testing.expect(!externalSourcePlanMatchesManifest(plan, manifest));
 }
 
 fn externalSourceDescriptorMatches(
@@ -5919,6 +6049,53 @@ test "serverless builder publishes initial external manifest without wal records
     try std.testing.expect(!unchanged.published);
     try std.testing.expectEqual(@as(u64, 1), unchanged.version);
 
+    // A content-addressed inventory can retain the same bytes while its
+    // logical manifest name changes. Consume a stale enrichment record in the
+    // same publication and prove the renamed external plan is not mistaken
+    // for the current plan merely because its content identity is unchanged.
+    try std.testing.expectEqual(
+        @as(?u64, 1),
+        try wal_store.appendIdempotentIfLatest(
+            "events",
+            99,
+            "ignored-stale-enrichment",
+            "enrich-v1/2/1/0/1",
+            0,
+        ),
+    );
+    var renamed_plan = try external_source_manifest.planAlloc(
+        alloc,
+        .parquet_prefix,
+        "s3://bucket/events",
+        "snapshot-1",
+        "schema-v1",
+        .{
+            .artifact_id = "external-inventory-1",
+            .byte_len = 128,
+            .checksum = "sha256:inventory-1",
+            .name = "events.external-files",
+        },
+    );
+    defer renamed_plan.deinit(alloc);
+    var renamed = try builder.publishNamespaceWithMetricAndPlan("events", .cosine, .{
+        .targets = .{ .published_search_sources = search_sources.defaultPublishedSearchSources() },
+        .external_source_plan = renamed_plan,
+        .table_definition = .{
+            .schema_json = @constCast("{\"storage_mode\":\"relational\"}"),
+            .read_schema_json = @constCast("{}"),
+            .indexes_json = @constCast("{}"),
+        },
+    });
+    defer renamed.deinit(alloc);
+    try std.testing.expect(renamed.published);
+    try std.testing.expectEqual(@as(u64, 2), renamed.version);
+    try std.testing.expectEqual(@as(u64, 1), renamed.wal_start_lsn);
+    try std.testing.expectEqual(@as(u64, 1), renamed.wal_end_lsn);
+    var renamed_manifest = try manifest_store.getAlloc("events", 2);
+    defer renamed_manifest.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), renamed_manifest.artifacts.len);
+    try std.testing.expectEqualStrings("events.external-files", renamed_manifest.artifacts[0].name);
+
     var updated_plan = try external_source_manifest.planAlloc(
         alloc,
         .parquet_prefix,
@@ -5929,6 +6106,7 @@ test "serverless builder publishes initial external manifest without wal records
             .artifact_id = "external-inventory-2",
             .byte_len = 144,
             .checksum = "sha256:inventory-2",
+            .name = "events.external-files",
         },
     );
     defer updated_plan.deinit(alloc);
@@ -5943,9 +6121,9 @@ test "serverless builder publishes initial external manifest without wal records
     });
     defer updated.deinit(alloc);
     try std.testing.expect(updated.published);
-    try std.testing.expectEqual(@as(u64, 2), updated.version);
+    try std.testing.expectEqual(@as(u64, 3), updated.version);
 
-    var updated_manifest = try manifest_store.getAlloc("events", 2);
+    var updated_manifest = try manifest_store.getAlloc("events", 3);
     defer updated_manifest.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), updated_manifest.artifacts.len);
     try std.testing.expectEqualStrings("external-inventory-2", updated_manifest.artifacts[0].artifact_id);
@@ -5967,7 +6145,7 @@ test "serverless builder publishes initial external manifest without wal records
             .indexes_json = @constCast("{}"),
         },
     }));
-    try std.testing.expectEqual(@as(u64, 2), try progress_store.getHead("events"));
+    try std.testing.expectEqual(@as(u64, 3), try progress_store.getHead("events"));
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
