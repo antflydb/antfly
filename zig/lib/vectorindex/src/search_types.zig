@@ -55,6 +55,10 @@ pub const SearchRequest = struct {
     query: []const f32,
     k: usize,
     rerank_k: ?usize = null,
+    /// Normalized public search effort. The storage layer may still provide a
+    /// tuned search_width, but HBC owns topology-sensitive semantics such as
+    /// effort 1.0 exhausting the published search snapshot.
+    search_effort: ?f32 = null,
     search_width: ?u32 = null,
     epsilon: ?f32 = null,
     // Multiplier on k for how many approximate candidates are retained for
@@ -70,6 +74,16 @@ pub const SearchRequest = struct {
     /// intervals so a disconnected caller does not retain query capacity.
     cancellation: ?CancellationToken = null,
 };
+
+pub fn normalizedSearchEffort(req: SearchRequest) ?f32 {
+    const effort = req.search_effort orelse return null;
+    if (std.math.isNan(effort)) return null;
+    return std.math.clamp(effort, 0, 1);
+}
+
+pub fn requiresExhaustiveCoverage(req: SearchRequest) bool {
+    return (normalizedSearchEffort(req) orelse return false) >= 1;
+}
 
 pub fn checkCancelled(req: SearchRequest) !void {
     if (req.cancellation) |cancellation| {
@@ -283,10 +297,9 @@ pub fn candidateLessThan(_: void, a: types.PriorityItem, b: types.PriorityItem) 
 }
 
 fn candidatePriorityScore(item: types.PriorityItem) f32 {
-    // An unresolved candidate may conceal the best admissible bound, so it
-    // must be resolved before any bound-based frontier ordering or stop.
-    if (!item.bound_resolved) return -std.math.inf(f32);
-    if (std.math.isFinite(item.lower_bound)) return item.lower_bound;
+    // Covering-radius bounds are proof metadata, not an ANN-quality ranking.
+    // Ordering by them preferentially visits broad postings whose lower bound
+    // is near zero even when their centroid is far from the query.
     return item.distance - item.error_bound;
 }
 

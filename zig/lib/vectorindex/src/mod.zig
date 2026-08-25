@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const std = @import("std");
+
 pub const types = @import("types.zig");
 pub const bulk_build = @import("bulk_build.zig");
 pub const kmeans = @import("kmeans.zig");
@@ -104,3 +106,122 @@ pub const encodeVecKey = hbc.encodeVecKey;
 pub const encodeVecLeafKey = hbc.encodeVecLeafKey;
 pub const encodeVecMetaKey = hbc.encodeVecMetaKey;
 pub const encodeQuantKey = hbc.encodeQuantKey;
+
+test "cache-rejected unaligned batch vector reads keep stable per-id views" {
+    const TestTxn = struct {
+        vector_1: [12]u8 = undefined,
+        vector_2: [12]u8 = undefined,
+
+        fn unalignedOffset(storage: *const [12]u8) usize {
+            return if ((@intFromPtr(storage) & (@alignOf(f32) - 1)) == 0) 1 else 0;
+        }
+
+        fn writeUnalignedVector(storage: *[12]u8, vector: []const f32) void {
+            const offset = unalignedOffset(storage);
+            for (vector, 0..) |value, i| {
+                std.mem.writeInt(u32, storage[offset + i * 4 ..][0..4], @bitCast(value), .little);
+            }
+        }
+
+        fn view(storage: *const [12]u8) []const u8 {
+            const offset = unalignedOffset(storage);
+            const bytes = storage[offset..][0 .. 2 * @sizeOf(f32)];
+            std.debug.assert((@intFromPtr(bytes.ptr) & (@alignOf(f32) - 1)) != 0);
+            return bytes;
+        }
+
+        pub fn getManySorted(self: *@This(), _: anytype, keys: []const []const u8, values: []?[]const u8) !void {
+            for (keys, 0..) |key, i| {
+                const vector_id = std.mem.readInt(u64, key[2..10], .big);
+                values[i] = switch (vector_id) {
+                    1 => view(&self.vector_1),
+                    2 => view(&self.vector_2),
+                    else => null,
+                };
+            }
+        }
+    };
+    const TestIndex = struct {
+        pub fn cacheVector(_: @This(), _: u64, vector: []const f32) ![]const f32 {
+            // Models a governed cache declining admission and returning the
+            // caller-owned view unchanged.
+            return vector;
+        }
+
+        pub fn getVectorInto(_: @This(), _: anytype, _: u64, _: []f32) ![]const f32 {
+            return error.UnexpectedScalarFallback;
+        }
+    };
+
+    const index = TestIndex{};
+    var txn: TestTxn = .{};
+    TestTxn.writeUnalignedVector(&txn.vector_1, &.{ 1, 10 });
+    TestTxn.writeUnalignedVector(&txn.vector_2, &.{ 2, 20 });
+    var vector_views: [2][]const f32 = undefined;
+    var lookups: [2]search_runtime.RerankLookup = undefined;
+    var key_views: [2][]const u8 = undefined;
+    var values: [2]?[]const u8 = .{ null, null };
+    var scratch: [2]f32 = undefined;
+    var batch_scratch: [4]f32 = undefined;
+
+    try hbc_index.loadVectorIdsSortedWithScratchForTest(
+        index,
+        &txn,
+        &.{ 2, 1 },
+        vector_views[0..],
+        lookups[0..],
+        key_views[0..],
+        values[0..],
+        scratch[0..],
+        batch_scratch[0..],
+    );
+
+    try std.testing.expectEqualSlices(f32, &.{ 2, 20 }, vector_views[0]);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 10 }, vector_views[1]);
+    try std.testing.expect(@intFromPtr(vector_views[0].ptr) != @intFromPtr(vector_views[1].ptr));
+}
+
+test "search effort normalization owns exhaustive coverage semantics" {
+    try std.testing.expect(search_types.normalizedSearchEffort(.{ .query = &.{}, .k = 1 }) == null);
+    try std.testing.expectEqual(@as(f32, 0), search_types.normalizedSearchEffort(.{ .query = &.{}, .k = 1, .search_effort = -1 }).?);
+    try std.testing.expectEqual(@as(f32, 1), search_types.normalizedSearchEffort(.{ .query = &.{}, .k = 1, .search_effort = 2 }).?);
+    try std.testing.expect(!search_types.requiresExhaustiveCoverage(.{ .query = &.{}, .k = 1, .search_effort = 0.999 }));
+    try std.testing.expect(search_types.requiresExhaustiveCoverage(.{ .query = &.{}, .k = 1, .search_effort = 1 }));
+}
+
+test "candidate ANN ordering is independent of resolved subtree bounds" {
+    const nearby = PriorityItem{
+        .id = 1,
+        .distance = 1,
+        .error_bound = 0.25,
+        .lower_bound = 100,
+        .bound_resolved = true,
+    };
+    const broad_far = PriorityItem{
+        .id = 2,
+        .distance = 4,
+        .error_bound = 0,
+        .lower_bound = 0,
+        .bound_resolved = true,
+    };
+    try std.testing.expectEqual(std.math.Order.lt, candidateLessThan({}, nearby, broad_far));
+}
+
+test "flat probe ANN ordering is independent of covering-radius bounds" {
+    const nearby = spfresh_index.FlatCentroidProbe{
+        .posting_id = 1,
+        .distance = 1,
+        .error_bound = 0.25,
+        .member_lower_bound = 100,
+        .bound_resolved = true,
+    };
+    const broad_far = spfresh_index.FlatCentroidProbe{
+        .posting_id = 2,
+        .distance = 4,
+        .error_bound = 0,
+        .member_lower_bound = 0,
+        .bound_resolved = true,
+    };
+    try std.testing.expect(spfresh_index.flatProbeLessForTesting(nearby, broad_far));
+    try std.testing.expect(!spfresh_index.flatProbeLessForTesting(broad_far, nearby));
+}

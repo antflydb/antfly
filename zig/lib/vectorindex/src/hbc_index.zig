@@ -1591,6 +1591,24 @@ fn includeSplitRangeBounds(
 test "internal node split range loads child ranges in one sorted batch" {
     const TestIndex = struct {
         alloc: Allocator,
+
+        fn getCachedMetadata(_: @This(), _: u64) ?[]const u8 {
+            return null;
+        }
+
+        fn cacheMetadata(_: @This(), _: u64, metadata: []const u8) ![]const u8 {
+            return metadata;
+        }
+
+        fn getCachedNodeClone(_: @This(), _: u64) !?types.Node {
+            return null;
+        }
+
+        fn loadNodeFromStorage(_: @This(), _: anytype, _: u64) !types.Node {
+            return error.UnexpectedNodeLoad;
+        }
+
+        fn cacheNode(_: @This(), _: *const types.Node) !void {}
     };
     const TestTxn = struct {
         first: []const u8,
@@ -1649,6 +1667,16 @@ test "leaf node split range loads member metadata in one sorted batch" {
         fn cacheMetadata(_: @This(), _: u64, metadata: []const u8) ![]const u8 {
             return metadata;
         }
+
+        fn getCachedNodeClone(_: @This(), _: u64) !?types.Node {
+            return null;
+        }
+
+        fn loadNodeFromStorage(_: @This(), _: anytype, _: u64) !types.Node {
+            return error.UnexpectedNodeLoad;
+        }
+
+        fn cacheNode(_: @This(), _: *const types.Node) !void {}
     };
     const TestTxn = struct {
         calls: usize = 0,
@@ -2023,6 +2051,7 @@ pub fn searchProfiledRequest(
         .inner_product => 0,
     };
     const search_width = req.search_width orelse self.config.search_width;
+    const exhaustive_coverage = search_types.requiresExhaustiveCoverage(req);
     const epsilon = req.epsilon orelse self.config.epsilon;
     const rerank_factor: usize = req.rerank_factor orelse search_mod.rerankFactor(epsilon);
     const should_rerank = self.config.use_quantization and self.config.rerank_policy != .never;
@@ -2043,7 +2072,7 @@ pub fn searchProfiledRequest(
             self.config.flat_centroid_probe_count
         else
             @as(usize, @intCast(search_width));
-        const initial_probe_limit = @max(configured_probe_count, @as(usize, 1));
+        const requested_probe_limit = @max(configured_probe_count, @as(usize, 1));
         // The flat directory is compact (one id/radius plus a quantized
         // centroid per posting). Keep the full ordered frontier so selective
         // filters can advance without rebuilding it and stopping can be based
@@ -2059,6 +2088,10 @@ pub fn searchProfiledRequest(
         );
         defer self.alloc.free(probes);
         const probe_count = probes.len;
+        const initial_probe_limit = if (exhaustive_coverage)
+            probe_count
+        else
+            @min(requested_probe_limit, probe_count);
 
         var flat_leaves_scored: usize = 0;
         var previous_wave_end: usize = 0;
@@ -2071,15 +2104,14 @@ pub fn searchProfiledRequest(
                     profile.traversal_max_wave_leaves,
                     @as(u64, @intCast(next_wave_end - previous_wave_end)),
                 );
-                if (approx_results.isFull() and probe.bound_resolved) {
-                    const result_upper = retainedResultUpperBound(&approx_results);
-                    if (probe.member_lower_bound > result_upper) {
-                        profile.traversal_bound_stops += 1;
-                        profile.traversal_frontier_remaining = @intCast(probe_count - i);
-                        profile.traversal_stop_lower_bound = probe.member_lower_bound;
-                        profile.traversal_stop_result_upper_bound = result_upper;
-                        break;
-                    }
+                // Covering-radius bounds remain shadow telemetry until their
+                // end-to-end certification includes payload freshness and
+                // quantized candidate retention. Preserve the ANN budget as a
+                // floor, then expand only when filters or sparse postings have
+                // not filled the requested rerank pool.
+                if (!exhaustive_coverage and approx_results.items.items.len >= candidate_limit) {
+                    profile.traversal_frontier_remaining = @intCast(probe_count - i);
+                    break;
                 }
 
                 const explored = @max(flat_leaves_scored, 1);
@@ -2097,7 +2129,10 @@ pub fn searchProfiledRequest(
             }
             if (i % 64 == 0) try search_types.checkCancelled(req);
             profile.nodes_visited += 1;
-            var leaf_handle = loadNodeReadHandleProfiled(self, &txn, probe.posting_id, &profile, now_fn_u64, elapsed_fn_u64) catch continue;
+            var leaf_handle = loadNodeReadHandleProfiled(self, &txn, probe.posting_id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| {
+                try handleTraversalNodeLoadError(err, exhaustive_coverage);
+                continue;
+            };
             var leaf_handle_active = true;
             defer if (leaf_handle_active) leaf_handle.deinit(self.alloc);
             const leaf = leaf_handle.ptr();
@@ -2146,6 +2181,7 @@ pub fn searchProfiledRequest(
     const root_start = now_fn_u64();
     var root_handle = loadNodeReadHandleProfiled(self, &txn, root_node_id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
         error.NotFound => {
+            if (exhaustive_coverage) return error.IncompletePublishedSnapshot;
             approx_results.deinit();
             const empty = search_results.SearchResults.init(self.alloc, req.k);
             profile.total_ns = elapsed_fn_u64(total_start);
@@ -2203,7 +2239,7 @@ pub fn searchProfiledRequest(
         const root_uses_nonquantized_payload = usesNonQuantizedPayload(root);
         root_handle.deinit(self.alloc);
         root_handle_active = false;
-        try addChildCandidatesFromIds(self, &txn, root_id, root_uses_nonquantized_payload, root_child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+        try addChildCandidatesFromIds(self, &txn, root_id, root_uses_nonquantized_payload, root_child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, exhaustive_coverage, now_fn_u64, elapsed_fn_u64);
     }
 
     var beam_state = search_mod.BeamSearchState{};
@@ -2213,23 +2249,9 @@ pub fn searchProfiledRequest(
     profile.traversal_initial_wave_leaves = initial_wave_leaves;
     while (true) {
         try search_types.checkCancelled(req);
-        if (beam_state.leaves_explored >= next_wave_leaf) {
+        if (!exhaustive_coverage and beam_state.leaves_explored >= next_wave_leaf) {
             profile.traversal_waves += 1;
             profile.traversal_max_wave_leaves = @max(profile.traversal_max_wave_leaves, next_wave_leaf - previous_wave_leaf);
-            if (approx_results.isFull()) {
-                if (candidates.peek()) |frontier| {
-                    if (frontier.bound_resolved and std.math.isFinite(frontier.lower_bound)) {
-                        const result_upper = retainedResultUpperBound(&approx_results);
-                        if (frontier.lower_bound > result_upper) {
-                            profile.traversal_bound_stops += 1;
-                            profile.traversal_frontier_remaining = @intCast(candidates.items.len);
-                            profile.traversal_stop_lower_bound = frontier.lower_bound;
-                            profile.traversal_stop_result_upper_bound = result_upper;
-                            break;
-                        }
-                    }
-                }
-            }
             if (next_wave_leaf < search_width) {
                 const explored = @max(beam_state.leaves_explored, 1);
                 const eligible = @max(profile.traversal_eligible_vectors, 1);
@@ -2247,10 +2269,13 @@ pub fn searchProfiledRequest(
             }
         }
         var candidate = candidates.pop() orelse break;
-        if (search_mod.shouldStopBeamSearch(&beam_state, search_width)) break;
+        if (!exhaustive_coverage and search_mod.shouldStopBeamSearch(&beam_state, search_width)) break;
         profile.nodes_visited += 1;
 
-        var node_handle = loadNodeReadHandleProfiled(self, &txn, candidate.id, &profile, now_fn_u64, elapsed_fn_u64) catch continue;
+        var node_handle = loadNodeReadHandleProfiled(self, &txn, candidate.id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| {
+            try handleTraversalNodeLoadError(err, exhaustive_coverage);
+            continue;
+        };
         var node_handle_active = true;
         defer if (node_handle_active) node_handle.deinit(self.alloc);
         const node = node_handle.ptr();
@@ -2265,16 +2290,16 @@ pub fn searchProfiledRequest(
                     candidate.lower_bound = lower_bound;
                     candidate.bound_resolved = true;
                     candidate.is_leaf = node.is_leaf;
-                    node_handle.deinit(self.alloc);
-                    node_handle_active = false;
-                    try candidates.push(self.alloc, candidate);
-                    continue;
+                } else {
+                    profile.traversal_bound_fallbacks += 1;
+                    candidate.bound_resolved = true;
                 }
+            } else {
+                profile.traversal_bound_fallbacks += 1;
+                candidate.bound_resolved = true;
             }
-            profile.traversal_bound_fallbacks += 1;
-            candidate.bound_resolved = true;
         }
-        const allow_dynamic_pruning = self.config.metric != .inner_product;
+        const allow_dynamic_pruning = !exhaustive_coverage and self.config.metric != .inner_product;
         if (allow_dynamic_pruning and !node.is_leaf and search_mod.shouldBreakOnInternalCandidate(candidate, &approx_results)) {
             node_handle.deinit(self.alloc);
             node_handle_active = false;
@@ -2310,7 +2335,7 @@ pub fn searchProfiledRequest(
             const node_uses_nonquantized_payload = usesNonQuantizedPayload(node);
             node_handle.deinit(self.alloc);
             node_handle_active = false;
-            try addChildCandidatesFromIds(self, &txn, node_id, node_uses_nonquantized_payload, child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+            try addChildCandidatesFromIds(self, &txn, node_id, node_uses_nonquantized_payload, child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, exhaustive_coverage, now_fn_u64, elapsed_fn_u64);
         }
     }
 
@@ -2393,7 +2418,7 @@ pub fn addChildCandidates(
     try scratch.ensureMemberIdCapacity(self.alloc, node.children.len);
     const child_ids = scratch.member_ids[0..node.children.len];
     @memcpy(child_ids, node.children);
-    return try addChildCandidatesFromIds(self, txn, node.id, usesNonQuantizedPayload(node), child_ids, query, query_measure, candidates, scratch, profile, now_fn_u64, elapsed_fn_u64);
+    return try addChildCandidatesFromIds(self, txn, node.id, usesNonQuantizedPayload(node), child_ids, query, query_measure, candidates, scratch, profile, false, now_fn_u64, elapsed_fn_u64);
 }
 
 fn addChildCandidatesFromIds(
@@ -2407,6 +2432,7 @@ fn addChildCandidatesFromIds(
     candidates: *std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan),
     scratch: anytype,
     profile: *search_types.SearchProfile,
+    require_complete_snapshot: bool,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
@@ -2451,7 +2477,10 @@ fn addChildCandidatesFromIds(
             continue;
         }
 
-        var child_handle = loadNodeReadHandle(self, txn, child_id) catch continue;
+        var child_handle = loadNodeReadHandle(self, txn, child_id) catch |err| {
+            try handleTraversalNodeLoadError(err, require_complete_snapshot);
+            continue;
+        };
         defer child_handle.deinit(self.alloc);
         const dist = vec.distanceToQuery(query, query_measure, child_handle.ptr().centroid, self.config.metric);
         try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0, .bound_resolved = false });
@@ -3318,7 +3347,12 @@ fn loadVectorIdsSortedWithScratch(
             vector_views[lookups[i].item_index] = slot_scratch[0..cached.len];
             continue;
         }
-        const view = try vectorViewFromRaw(value, scratch);
+        // Cache admission is an optimization, not an ownership contract.
+        // Decode into this result's stable batch slot so a rejected cache
+        // fill cannot leave every returned view aliasing the shared scalar
+        // scratch buffer (and therefore the final vector decoded).
+        const slot_scratch = batch_scratch[lookups[i].item_index * scratch.len ..][0..scratch.len];
+        const view = try vectorViewFromRaw(value, slot_scratch);
         if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
             self.notifyVectorViewLoadForTest(lookups[i].vector_id);
         }
@@ -3328,6 +3362,33 @@ fn loadVectorIdsSortedWithScratch(
             .epoch = lookups[i].vector_cache_fill_epoch,
         });
     }
+}
+
+/// Narrow test seam for the cache-admission ownership regression. Keeping the
+/// generic loader private in production avoids widening the vector-index API.
+pub fn loadVectorIdsSortedWithScratchForTest(
+    self: anytype,
+    txn: anytype,
+    vector_ids: []const u64,
+    vector_views: [][]const f32,
+    lookup_storage: []search_runtime.RerankLookup,
+    key_views_storage: [][]const u8,
+    values_storage: []?[]const u8,
+    scratch: []f32,
+    batch_scratch: []f32,
+) !void {
+    if (!builtin.is_test) @compileError("test-only vector batch loader seam");
+    return try loadVectorIdsSortedWithScratch(
+        self,
+        txn,
+        vector_ids,
+        vector_views,
+        lookup_storage,
+        key_views_storage,
+        values_storage,
+        scratch,
+        batch_scratch,
+    );
 }
 
 fn loadTransformedVectorIdsIntoMatrix(
@@ -3935,6 +3996,16 @@ test "kmeans bulk builder packs bounded leaves" {
         fn putNodeSplitRange(_: *@This(), _: anytype, _: u64, _: anytype) !void {}
 
         fn updateParent(_: *@This(), _: anytype, _: u64, _: u64) !void {}
+
+        fn getCachedNodeClone(_: *@This(), _: u64) !?types.Node {
+            return null;
+        }
+
+        fn loadNodeFromStorage(_: *@This(), _: anytype, _: u64) !types.Node {
+            return error.UnexpectedNodeLoad;
+        }
+
+        fn cacheNode(_: *@This(), _: *const types.Node) !void {}
     };
 
     const raw = [_]f32{
@@ -3963,6 +4034,7 @@ test "kmeans bulk builder packs bounded leaves" {
             .dims = 2,
             .leaf_size = 2,
             .branching_factor = 2,
+            .metric = .cosine,
             .kmeans_max_iter = 4,
             .kmeans_update_strategy = .segmented,
             .use_quantization = false,
@@ -4184,12 +4256,6 @@ fn l2SubtreeLowerBound(candidate: types.PriorityItem, covering_radius: f32) ?f32
     if (!std.math.isFinite(centroid_squared_lower)) return null;
     const vector_distance_lower = @max(@as(f32, 0), @sqrt(centroid_squared_lower) - covering_radius);
     return vector_distance_lower * vector_distance_lower;
-}
-
-fn retainedResultUpperBound(results: *const search_results.ApproxSearchResults) f32 {
-    var upper: f32 = -std.math.inf(f32);
-    for (results.items.items) |item| upper = @max(upper, item.distance + item.error_bound);
-    return upper;
 }
 
 fn computeInternalCoveringRadius(self: anytype, txn: anytype, node: *const types.Node) !f32 {
@@ -8939,6 +9005,15 @@ fn deferQuantizedRebuild(options: anytype) bool {
 
 fn isNotFoundGeneric(err: anyerror) bool {
     return err == error.NotFound;
+}
+
+/// Approximate searches tolerate stale topology references so repair can run
+/// without turning a partially useful index into an outage. Full-effort
+/// searches promise coverage of the published snapshot, so the same missing
+/// node must be surfaced instead of silently weakening that contract.
+fn handleTraversalNodeLoadError(err: anyerror, require_complete_snapshot: bool) !void {
+    if (!isNotFoundGeneric(err)) return err;
+    if (require_complete_snapshot) return error.IncompletePublishedSnapshot;
 }
 
 fn nowNsI128Fixed() i128 {

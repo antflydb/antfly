@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 const hbc = @import("hbc.zig");
 const hbc_runtime = @import("hbc_runtime.zig");
@@ -116,31 +117,33 @@ fn insertFlatProbe(probes: []FlatCentroidProbe, count: *usize, candidate: FlatCe
         count.* += 1;
     } else {
         var worst_index: usize = 0;
-        var worst_score = flatProbeScore(probes[0]);
+        var worst_score = flatAnnScore(probes[0]);
         for (probes[1..], 1..) |probe, i| {
-            const score = flatProbeScore(probe);
+            const score = flatAnnScore(probe);
             if (score > worst_score) {
                 worst_score = score;
                 worst_index = i;
             }
         }
-        if (flatProbeScore(candidate) >= worst_score) return;
+        if (flatAnnScore(candidate) >= worst_score) return;
         probes[worst_index] = candidate;
     }
 }
 
-fn flatProbeScore(probe: FlatCentroidProbe) f32 {
-    // Unknown radii must be visited before bounded postings: omitting them
-    // from a bounded directory selection would make the stopping proof false.
-    if (!probe.bound_resolved) return -std.math.inf(f32);
-    return probe.member_lower_bound;
+fn flatAnnScore(probe: FlatCentroidProbe) f32 {
+    return probe.distance - probe.error_bound;
 }
 
 fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
-    const lhs_score = flatProbeScore(lhs);
-    const rhs_score = flatProbeScore(rhs);
+    const lhs_score = flatAnnScore(lhs);
+    const rhs_score = flatAnnScore(rhs);
     if (lhs_score != rhs_score) return lhs_score < rhs_score;
     return lhs.posting_id < rhs.posting_id;
+}
+
+pub fn flatProbeLessForTesting(lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
+    if (!builtin.is_test) @compileError("test-only flat probe ordering seam");
+    return flatProbeLess({}, lhs, rhs);
 }
 
 fn flatL2MemberLowerBound(distance: f32, error_bound: f32, covering_radius: f32) ?f32 {
@@ -865,8 +868,17 @@ test "owned slice replacement survives later error cleanup" {
 test "posting backlog stats starts clean" {
     const TestIndex = struct {
         alloc: std.mem.Allocator,
-        metadata: hbc.IndexMetadata = .{ .node_count = 0 },
-        config: types.HBCConfig = .{},
+        metadata: hbc.IndexMetadata = .{
+            .dims = 0,
+            .branching_factor = 0,
+            .leaf_size = 0,
+            .node_count = 0,
+        },
+        config: types.HBCConfig = .{ .dims = 0 },
+
+        fn loadNode(_: *@This(), _: anytype, _: u64) !types.Node {
+            return error.NotFound;
+        }
     };
     var index = TestIndex{ .alloc = std.testing.allocator };
     const txn = {};

@@ -7582,6 +7582,18 @@ test "hbc repairTreeLinks clears dangling references and restores consistency" {
         var results = try idx.search(&query, 5);
         defer results.deinit();
         try std.testing.expect(results.getHits().len > 0);
+
+        // Full effort is a coverage contract, so it must distinguish a
+        // damaged published topology from a valid but low-recall result.
+        try std.testing.expectError(
+            error.IncompletePublishedSnapshot,
+            idx.searchWithRequest(.{
+                .query = &query,
+                .k = 5,
+                .search_effort = 1,
+                .load_metadata = false,
+            }),
+        );
     }
 
     // Deleting a vector whose leaf is gone cleans up instead of erroring,
@@ -9032,7 +9044,7 @@ test "insert and search" {
     try std.testing.expectEqual(@as(u64, 1), hits[0].vector_id);
 }
 
-test "progressive filtered l2 traversal preserves exact top k and stops on leaf bounds" {
+test "progressive filtered l2 traversal preserves exact top k without bound stops" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
     const path = tp.init();
@@ -9070,7 +9082,7 @@ test "progressive filtered l2 traversal preserves exact top k and stops on leaf 
     try std.testing.expectEqual(@as(u64, 7), hits[2].vector_id);
     try std.testing.expect(profiled.profile.traversal_bound_resolutions > 0);
     try std.testing.expect(profiled.profile.traversal_waves > 0);
-    try std.testing.expect(profiled.profile.traversal_bound_stops > 0);
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
     try std.testing.expect(profiled.profile.leaves_explored < 32);
 }
 
@@ -9156,7 +9168,89 @@ test "flat rabitq filtered traversal advances past its initial probe wave safely
     try std.testing.expect(profiled.profile.traversal_initial_wave_leaves == 2);
     try std.testing.expect(profiled.profile.traversal_waves > 1);
     try std.testing.expect(profiled.profile.leaves_explored > 2);
-    try std.testing.expect(profiled.profile.traversal_bound_stops > 0);
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
+}
+
+test "flat rabitq full effort exhausts an underfilled published directory" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const leaf_size: u32 = 4;
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .leaf_size = leaf_size,
+        .branching_factor = 2,
+        .search_width = 16,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .flat_centroid_block_size = 4,
+        .flat_centroid_probe_count = 0,
+    });
+    defer idx.close();
+
+    for (0..64) |i| {
+        const value: f32 = @floatFromInt(i);
+        try idx.insert(@intCast(i + 1), &.{ value, value / 8 });
+    }
+
+    const stats = idx.stats();
+    const estimated_leaves: u32 = @intCast((stats.active_count + leaf_size - 1) / leaf_size);
+    var profiled = try idx.searchProfiledRequest(.{
+        .query = &.{ 0, 0 },
+        .k = 3,
+        .search_effort = 1,
+        // Model the DB-layer estimate that previously became a false ceiling.
+        .search_width = estimated_leaves,
+        .load_metadata = false,
+    });
+    defer profiled.results.deinit();
+
+    try std.testing.expect(profiled.profile.leaves_explored > estimated_leaves);
+    try std.testing.expectEqual(stats.active_count, profiled.profile.approx_vectors_scored);
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_frontier_remaining);
+}
+
+test "tree full effort exhausts underfilled leaves beyond estimated width" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const leaf_size: u32 = 4;
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .leaf_size = leaf_size,
+        .branching_factor = 2,
+        .search_width = 16,
+        .use_quantization = true,
+    });
+    defer idx.close();
+
+    for (0..64) |i| {
+        const value: f32 = @floatFromInt(i);
+        try idx.insert(@intCast(i + 1), &.{ value, value / 8 });
+    }
+
+    const stats = idx.stats();
+    const estimated_leaves: u32 = @intCast((stats.active_count + leaf_size - 1) / leaf_size);
+    var profiled = try idx.searchProfiledRequest(.{
+        .query = &.{ 0, 0 },
+        .k = 3,
+        .search_effort = 1,
+        .search_width = estimated_leaves,
+        .load_metadata = false,
+    });
+    defer profiled.results.deinit();
+
+    try std.testing.expect(profiled.profile.leaves_explored > estimated_leaves);
+    try std.testing.expectEqual(stats.active_count, profiled.profile.approx_vectors_scored);
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_bound_stops);
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.traversal_frontier_remaining);
 }
 
 test "searchProfiled records phase timings and counters" {
