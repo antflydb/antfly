@@ -4,6 +4,7 @@ import type { TableSchema } from "../api";
 import CreateIndexDialog, {
   buildGraphSourceConfig,
   getSchemaFieldNames,
+  parseAdvancedIndexConfig,
 } from "./CreateIndexDialog";
 
 vi.mock("./IndexForm", () => ({
@@ -51,6 +52,8 @@ describe("CreateIndexDialog", () => {
         sourceNode: " {{ _doc.key }} ",
         targetNode: " {{ _item.target.text }} ",
         edgeType: " {{ _item.predicate }} ",
+        edgeWeight: " {{ _item.confidence }} ",
+        edgeMetadata: '{"evidence":"{{ _item.evidence }}"}',
         contextFields: "title, body",
       })
     ).toEqual({
@@ -63,9 +66,33 @@ describe("CreateIndexDialog", () => {
         source: "{{ _doc.key }}",
         target: "{{ _item.target.text }}",
       },
-      edge: { type: "{{ _item.predicate }}" },
+      edge: {
+        type: "{{ _item.predicate }}",
+        weight: "{{ _item.confidence }}",
+        metadata: { evidence: "{{ _item.evidence }}" },
+      },
       context: { doc_fields: ["title", "body"] },
     });
+  });
+
+  it("parses complete advanced JSON while rejecting invalid top-level contracts", () => {
+    expect(
+      parseAdvancedIndexConfig(
+        JSON.stringify({
+          name: "knowledge_graph",
+          type: "graph",
+          sources: [{ artifact: "relations_v1" }],
+          algebraic_planning: { bounded_traversal: { law: "provenance_semiring" } },
+        })
+      )
+    ).toMatchObject({ name: "knowledge_graph", type: "graph" });
+    expect(() => parseAdvancedIndexConfig("[]")).toThrow("must be a JSON object");
+    expect(() => parseAdvancedIndexConfig('{"name":"missing_type"}')).toThrow("type must be");
+    expect(() =>
+      parseAdvancedIndexConfig(
+        JSON.stringify({ name: "too_many", type: "graph", sources: Array(65).fill({}) })
+      )
+    ).toThrow("between 1 and 64");
   });
 
   it("preserves an external graph node model without custom templates", () => {
@@ -86,6 +113,18 @@ describe("CreateIndexDialog", () => {
       format: "extraction_graph",
       nodes: { model: "external" },
     });
+  });
+
+  it("keeps live graph previews renderable while metadata JSON is incomplete", () => {
+    expect(
+      buildGraphSourceConfig({
+        artifact: "relations_v1",
+        path: "",
+        format: "extraction_relation",
+        nodeModel: "document",
+        edgeMetadata: '{"evidence":',
+      })
+    ).toEqual({ artifact: "relations_v1", format: "extraction_relation" });
   });
 
   it("does not crash while closed when schema properties are absent", () => {

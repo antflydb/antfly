@@ -10182,23 +10182,13 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** @description Configured graph artifact source projected in deterministic precedence order. During the rolling transition, identity is available as canonical artifact on new servers or deprecated name on older servers. New servers continue emitting deprecated aliases for old clients, but new clients must not require them. */
+        /** @description Configured graph artifact source projected in deterministic precedence order. */
         GraphSourceArtifactStatus: {
-            /** @description Canonical artifact source identity. New servers always populate this field; clients may fall back to the deprecated name alias when reading an older server. */
-            artifact?: string;
-            /**
-             * @deprecated
-             * @description Deprecated compatibility alias for artifact.
-             */
-            name?: string;
+            /** @description Canonical artifact source identity. */
+            artifact: string;
             path: string;
             /** @enum {string} */
             format: "extraction_relation" | "extraction_graph";
-            /**
-             * @deprecated
-             * @description Deprecated aggregate compatibility projection. This mirrors enclosing index catch-up state and is not source-specific.
-             */
-            materialization_pending?: boolean;
         };
         /** @description Statistics for graph index */
         GraphIndexStats: {

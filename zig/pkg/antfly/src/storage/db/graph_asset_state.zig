@@ -9,6 +9,12 @@ const Allocator = std.mem.Allocator;
 const version_3_magic = "AGS3";
 const header_len = version_3_magic.len + @sizeOf(u64);
 
+pub const Format = enum {
+    /// v0.2.0 persisted only an edge count followed by length-prefixed keys.
+    v0_2_0,
+    v3,
+};
+
 pub const Entry = struct {
     key: []u8,
     value: []u8,
@@ -23,6 +29,54 @@ pub const Entry = struct {
 pub fn freeEntries(alloc: Allocator, entries: []Entry) void {
     for (entries) |*entry| entry.deinit(alloc);
     if (entries.len > 0) alloc.free(entries);
+}
+
+pub fn freeKeys(alloc: Allocator, keys: [][]u8) void {
+    for (keys) |key| alloc.free(key);
+    if (keys.len > 0) alloc.free(keys);
+}
+
+pub fn format(raw: []const u8) !Format {
+    if (std.mem.startsWith(u8, raw, version_3_magic)) {
+        if (raw.len < header_len) return error.InvalidGraphAssetState;
+        return .v3;
+    }
+    // The only released predecessor is v0.2.0's unversioned key-only
+    // encoding. Validate the whole payload before treating arbitrary bytes as
+    // that format so corrupt state fails closed instead of becoming migration
+    // input.
+    var pos: usize = 0;
+    const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+    const minimum_entry_bytes: usize = @sizeOf(u32);
+    if (@as(usize, count) > (raw.len - pos) / minimum_entry_bytes) return error.InvalidGraphAssetState;
+    for (0..count) |_| {
+        const key_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+        if (key_len > raw.len - pos) return error.InvalidGraphAssetState;
+        pos += key_len;
+    }
+    if (pos != raw.len) return error.InvalidGraphAssetState;
+    return .v0_2_0;
+}
+
+pub fn decodeV020KeysAlloc(alloc: Allocator, raw: []const u8) ![][]u8 {
+    if (try format(raw) != .v0_2_0) return error.UnsupportedGraphAssetStateVersion;
+    var pos: usize = 0;
+    const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+    const keys = if (count > 0) try alloc.alloc([]u8, count) else return &.{};
+    var initialized: usize = 0;
+    errdefer {
+        for (keys[0..initialized]) |key| alloc.free(key);
+        alloc.free(keys);
+    }
+    for (keys) |*key| {
+        const key_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+        if (key_len > raw.len - pos) return error.InvalidGraphAssetState;
+        key.* = try alloc.dupe(u8, raw[pos..][0..key_len]);
+        pos += key_len;
+        initialized += 1;
+    }
+    if (pos != raw.len) return error.InvalidGraphAssetState;
+    return keys;
 }
 
 /// Stores the owning graph generation and the complete payload for each edge.
@@ -77,10 +131,10 @@ pub fn decodeAlloc(alloc: Allocator, raw: []const u8) ![]Entry {
 }
 
 pub fn containsKey(raw: []const u8, target_key: []const u8) !bool {
-    if (!std.mem.startsWith(u8, raw, version_3_magic) or raw.len < header_len) return error.UnsupportedGraphAssetStateVersion;
-    var pos: usize = header_len;
+    const state_format = try format(raw);
+    var pos: usize = if (state_format == .v3) header_len else 0;
     const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-    const minimum_entry_bytes: usize = 2 * @sizeOf(u32);
+    const minimum_entry_bytes: usize = if (state_format == .v3) 2 * @sizeOf(u32) else @sizeOf(u32);
     if (@as(usize, count) > (raw.len - pos) / minimum_entry_bytes) return error.InvalidGraphAssetState;
     var found = false;
     for (0..count) |_| {
@@ -88,18 +142,22 @@ pub fn containsKey(raw: []const u8, target_key: []const u8) !bool {
         if (key_len > raw.len - pos) return error.InvalidGraphAssetState;
         const matches = std.mem.eql(u8, raw[pos..][0..key_len], target_key);
         pos += key_len;
-        const value_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-        if (value_len > raw.len - pos) return error.InvalidGraphAssetState;
-        pos += value_len;
+        if (state_format == .v3) {
+            const value_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+            if (value_len > raw.len - pos) return error.InvalidGraphAssetState;
+            pos += value_len;
+        }
         found = found or matches;
     }
     if (pos != raw.len) return error.InvalidGraphAssetState;
     return found;
 }
 
-pub fn coverageGeneration(raw: []const u8) !u64 {
-    if (!std.mem.startsWith(u8, raw, version_3_magic) or raw.len < header_len) return error.UnsupportedGraphAssetStateVersion;
-    return std.mem.readInt(u64, raw[version_3_magic.len..][0..@sizeOf(u64)], .big);
+pub fn coverageGeneration(raw: []const u8) !?u64 {
+    return switch (try format(raw)) {
+        .v0_2_0 => null,
+        .v3 => std.mem.readInt(u64, raw[version_3_magic.len..][0..@sizeOf(u64)], .big),
+    };
 }
 
 fn readU32Big(bytes: []const u8, pos: *usize) !u32 {
@@ -132,14 +190,20 @@ test "graph asset state v3 round trip preserves generation and payloads" {
     try std.testing.expectEqualStrings("edge:a", entries[0].key);
     try std.testing.expectEqualStrings("payload:a", entries[0].value);
     try std.testing.expect(try containsKey(raw, "edge:b"));
-    try std.testing.expectEqual(@as(u64, 42), try coverageGeneration(raw));
+    try std.testing.expectEqual(@as(u64, 42), (try coverageGeneration(raw)).?);
 }
 
-test "graph asset state rejects legacy key-only manifests" {
+test "graph asset state reads v0.2.0 key-only manifests" {
     const alloc = std.testing.allocator;
-    const raw = "AGS2" ++ [_]u8{ 0, 0, 0, 1, 0, 0, 0, 6 } ++ "edge:a";
+    const raw = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 6 } ++ "edge:a";
+    try std.testing.expectEqual(Format.v0_2_0, try format(raw));
+    try std.testing.expect((try coverageGeneration(raw)) == null);
+    const keys = try decodeV020KeysAlloc(alloc, raw);
+    defer freeKeys(alloc, keys);
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    try std.testing.expectEqualStrings("edge:a", keys[0]);
+    try std.testing.expect(try containsKey(raw, "edge:a"));
     try std.testing.expectError(error.UnsupportedGraphAssetStateVersion, decodeAlloc(alloc, raw));
-    try std.testing.expectError(error.UnsupportedGraphAssetStateVersion, containsKey(raw, "edge:a"));
 }
 
 test "graph asset state rejects impossible entry counts before allocation" {

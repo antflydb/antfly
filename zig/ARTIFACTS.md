@@ -517,12 +517,14 @@ source without rescanning all edges. Batch reconciliation coalesces repeated
 artifact mutations, groups them by document and index, and scans each state
 prefix once. Graph manifests and edge payloads carry the index generation;
 retired generations are never replayed into a recreated index.
+Released v0.2.0 key-only graph manifests and v1 edge payloads remain readable
+during upgrade; the first source materialization rewrites them in the current
+generation-bound format. Missing or malformed legacy payloads are ignored, and
+index retirement durably removes both edge payloads and source manifests before
+same-name recreation is admitted.
 Graph status echoes the configured artifact, path, and format in that same
 precedence order and uses `artifact` as the source identity. Catch-up and repair
-state remains index-wide. The deprecated `name` alias remains identical to
-`artifact`, and deprecated per-item `materialization_pending` mirrors aggregate
-index catch-up state only; new clients use the enclosing catch-up and repair
-fields instead.
+state remains index-wide; clients use the enclosing catch-up and repair fields.
 
 ```json
 {

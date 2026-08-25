@@ -1552,16 +1552,12 @@ pub const GraphResultNode = struct {
     edges: ?[]const Edge = null,
 };
 
-/// Configured graph artifact source projected in deterministic precedence order. During the rolling transition, identity is available as canonical artifact on new servers or deprecated name on older servers. New servers continue emitting deprecated aliases for old clients, but new clients must not require them.
+/// Configured graph artifact source projected in deterministic precedence order.
 pub const GraphSourceArtifactStatus = struct {
-    /// Canonical artifact source identity. New servers always populate this field; clients may fall back to the deprecated name alias when reading an older server.
-    artifact: ?[]const u8 = null,
-    /// Deprecated compatibility alias for artifact.
-    name: ?[]const u8 = null,
+    /// Canonical artifact source identity.
+    artifact: []const u8,
     path: []const u8,
     format: []const u8,
-    /// Deprecated aggregate compatibility projection. This mirrors enclosing index catch-up state and is not source-specific.
-    materialization_pending: ?bool = null,
 };
 
 /// A literal numeric value or a Handlebars template evaluated for each materialized graph item.

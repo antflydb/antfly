@@ -30685,17 +30685,36 @@ fn loadGraphAssetStateKeysAlloc(
         else => return err,
     };
     defer alloc.free(raw);
-    if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return null;
-    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
-    defer graph_asset_state.freeEntries(alloc, entries);
-    const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};
+    if (try graph_asset_state.coverageGeneration(raw)) |generation| {
+        if (generation != expected_generation) return null;
+        const entries = try graph_asset_state.decodeAlloc(alloc, raw);
+        defer graph_asset_state.freeEntries(alloc, entries);
+        const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};
+        var initialized: usize = 0;
+        errdefer {
+            for (keys[0..initialized]) |key| alloc.free(@constCast(key));
+            alloc.free(keys);
+        }
+        for (keys, entries) |*key, entry| {
+            key.* = try alloc.dupe(u8, entry.key);
+            initialized += 1;
+        }
+        return keys;
+    }
+
+    // v0.2.0 state has no generation or payloads. Its keys are still needed
+    // to remove superseded edges while the first post-upgrade materialization
+    // atomically replaces this record with v3 state.
+    const legacy_keys = try graph_asset_state.decodeV020KeysAlloc(alloc, raw);
+    defer graph_asset_state.freeKeys(alloc, legacy_keys);
+    const keys = if (legacy_keys.len > 0) try alloc.alloc([]const u8, legacy_keys.len) else return &.{};
     var initialized: usize = 0;
     errdefer {
         for (keys[0..initialized]) |key| alloc.free(@constCast(key));
         alloc.free(keys);
     }
-    for (keys, entries) |*key, entry| {
-        key.* = try alloc.dupe(u8, entry.key);
+    for (keys, legacy_keys) |*key, legacy_key| {
+        key.* = try alloc.dupe(u8, legacy_key);
         initialized += 1;
     }
     return keys;
@@ -30733,34 +30752,63 @@ const GraphEdgeWinners = struct {
 
 fn addGraphStateManifest(
     alloc: Allocator,
+    store: ?*docstore_mod.DocStore,
     winners: *GraphEdgeWinners,
     state_key: []const u8,
     source_priority: usize,
     raw: []const u8,
     expected_generation: u64,
 ) !void {
-    if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return;
-    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
+    const generation = try graph_asset_state.coverageGeneration(raw);
+    if (generation) |value| if (value != expected_generation) return;
+
+    const entries: []graph_asset_state.Entry = if (generation != null) try graph_asset_state.decodeAlloc(alloc, raw) else &.{};
     defer graph_asset_state.freeEntries(alloc, entries);
-    for (entries) |entry| {
-        if (winners.map.getPtr(entry.key)) |winner| {
+    const legacy_keys: [][]u8 = if (generation == null) try graph_asset_state.decodeV020KeysAlloc(alloc, raw) else &.{};
+    defer graph_asset_state.freeKeys(alloc, legacy_keys);
+    const count = if (generation != null) entries.len else legacy_keys.len;
+    for (0..count) |entry_index| {
+        const key = if (generation != null) entries[entry_index].key else legacy_keys[entry_index];
+        const payload = if (generation != null)
+            try alloc.dupe(u8, entries[entry_index].value)
+        else legacy_payload: {
+            const source_store = store orelse return error.PrimaryStoreUnavailable;
+            const stored = source_store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            defer alloc.free(stored);
+            var decoded = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, stored) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            };
+            defer decoded.deinit(alloc);
+            if (!enrichment_artifact_codec.needsGraphGenerationBinding(stored) and decoded.generation != expected_generation) continue;
+            break :legacy_payload if (enrichment_artifact_codec.needsGraphGenerationBinding(stored))
+                try enrichment_artifact_codec.bindGraphEdgeGenerationAlloc(alloc, stored, expected_generation)
+            else
+                try alloc.dupe(u8, stored);
+        };
+        errdefer alloc.free(payload);
+        if (winners.map.getPtr(key)) |winner| {
             if (source_priority > winner.source_priority or
-                (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt)) continue;
+                (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt))
+            {
+                alloc.free(payload);
+                continue;
+            }
             const owner = try alloc.dupe(u8, state_key);
             errdefer alloc.free(owner);
-            const payload = try alloc.dupe(u8, entry.value);
             alloc.free(winner.owner_state_key);
             alloc.free(winner.payload);
             winner.* = .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority };
             continue;
         }
 
-        const owned_key = try alloc.dupe(u8, entry.key);
+        const owned_key = try alloc.dupe(u8, key);
         errdefer alloc.free(owned_key);
         const owner = try alloc.dupe(u8, state_key);
         errdefer alloc.free(owner);
-        const payload = try alloc.dupe(u8, entry.value);
-        errdefer alloc.free(payload);
         try winners.map.put(alloc, owned_key, .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority });
     }
 }
@@ -30843,13 +30891,13 @@ fn loadGraphEdgeWinnersWithOverrides(
             _ = override_values.remove(entry.key);
         }
         const source_priority = try graphStateSourcePriorityAlloc(alloc, entry.key, prefix, sources) orelse continue;
-        try addGraphStateManifest(alloc, &winners, entry.key, source_priority, raw, expected_generation);
+        try addGraphStateManifest(alloc, store, &winners, entry.key, source_priority, raw, expected_generation);
     }
     var override_it = override_values.iterator();
     while (override_it.next()) |override| {
         if (!std.mem.startsWith(u8, override.key_ptr.*, prefix)) continue;
         const source_priority = try graphStateSourcePriorityAlloc(alloc, override.key_ptr.*, prefix, sources) orelse continue;
-        try addGraphStateManifest(alloc, &winners, override.key_ptr.*, source_priority, override.value_ptr.*, expected_generation);
+        try addGraphStateManifest(alloc, store, &winners, override.key_ptr.*, source_priority, override.value_ptr.*, expected_generation);
     }
     return winners;
 }
@@ -51674,11 +51722,49 @@ test "graph state winner arbitration ignores stale index generations" {
 
     var winners = GraphEdgeWinners{};
     defer winners.deinit(alloc);
-    try addGraphStateManifest(alloc, &winners, "state:stale", 0, stale, 42);
+    try addGraphStateManifest(alloc, null, &winners, "state:stale", 0, stale, 42);
     try std.testing.expectEqual(@as(usize, 0), winners.map.count());
 
-    try addGraphStateManifest(alloc, &winners, "state:current", 1, current, 42);
+    try addGraphStateManifest(alloc, null, &winners, "state:current", 1, current, 42);
     try std.testing.expectEqualStrings("current", winners.map.get("edge:a").?.payload);
+}
+
+test "graph state winner arbitration migrates v0.2.0 manifests and v1 edge payloads" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
+    defer alloc.free(edge_key);
+    const legacy_edge =
+        "AFENRCH\x00" ++
+        "\x01\x00\x05\x00" ++
+        "\x00\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x23\x00\x00\x00" ++
+        "\x00\x00\x00\x00\x00\x00\xf8\x3f" ++
+        "\x0a\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x14\x00\x00\x00\x00\x00\x00\x00" ++
+        "\x07\x00\x00\x00{\"k\":1}";
+    try store.put(edge_key, legacy_edge);
+
+    var legacy_state = std.ArrayListUnmanaged(u8).empty;
+    defer legacy_state.deinit(alloc);
+    try appendU32Big(&legacy_state, alloc, 1);
+    try appendU32Big(&legacy_state, alloc, @intCast(edge_key.len));
+    try legacy_state.appendSlice(alloc, edge_key);
+
+    var winners = GraphEdgeWinners{};
+    defer winners.deinit(alloc);
+    try addGraphStateManifest(alloc, &store, &winners, "state:v0.2.0", 0, legacy_state.items, 42);
+    const migrated = winners.map.get(edge_key) orelse return error.TestUnexpectedResult;
+    var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, migrated.payload);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 42), decoded.generation);
+    try std.testing.expectEqual(@as(f64, 1.5), decoded.weight);
+    try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
 }
 
 test "db direct graph writes record graph artifacts in the replay stream instead of graph payload replay" {

@@ -22,7 +22,6 @@ from antfly.client_generated.models.graph_artifact_producer_source_config_type i
     GraphArtifactProducerSourceConfigType,
 )
 from antfly.client_generated.models.graph_source_artifact_status import GraphSourceArtifactStatus
-from antfly.client_generated.types import UNSET
 
 
 def test_created_graph_index_exposes_artifact_mapping_and_planning() -> None:
@@ -78,24 +77,17 @@ def test_created_graph_index_exposes_artifact_mapping_and_planning() -> None:
     assert created.to_dict()["algebraic_planning"]["bounded_traversal"]["law"] == ("provenance_semiring")
 
 
-def test_graph_source_status_reads_old_and_new_server_shapes() -> None:
-    legacy = GraphSourceArtifactStatus.from_dict(
-        {
-            "name": "relations_v1",
-            "path": "$.relations[*]",
-            "format": "extraction_relation",
-            "materialization_pending": True,
-        }
-    )
-    assert legacy.artifact is UNSET
-
+def test_graph_source_status_uses_canonical_artifact_identity() -> None:
     current = GraphSourceArtifactStatus.from_dict(
         {
             "artifact": "relations_v1",
-            "name": "relations_v1",
             "path": "$.relations[*]",
             "format": "extraction_relation",
-            "materialization_pending": False,
         }
     )
     assert current.artifact == "relations_v1"
+    assert current.to_dict() == {
+        "artifact": "relations_v1",
+        "path": "$.relations[*]",
+        "format": "extraction_relation",
+    }

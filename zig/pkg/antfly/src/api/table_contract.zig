@@ -375,7 +375,7 @@ fn normalizeIndexConfigJson(
 
     const canonicalize_single_graph_source = index_type == .graph and
         indexObjectGet(object, "sources") == null and
-        indexObjectGet(object, "source") != null;
+        if (indexObjectGet(object, "source")) |source| source == .object else false;
     if (canonicalize_single_graph_source) {
         try appendCanonicalSingleGraphSourcesField(alloc, &out, object, &first);
     }

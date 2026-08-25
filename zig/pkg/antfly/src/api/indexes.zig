@@ -1382,14 +1382,9 @@ fn appendGraphSourceStatusObject(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     source: GraphSourceStatus,
-    materialization_pending: bool,
 ) !void {
     try out.append(alloc, '{');
     try appendJsonString(alloc, out, "artifact");
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, out, source.artifact);
-    try out.append(alloc, ',');
-    try appendJsonString(alloc, out, "name");
     try out.append(alloc, ':');
     try appendJsonString(alloc, out, source.artifact);
     try out.append(alloc, ',');
@@ -1400,8 +1395,6 @@ fn appendGraphSourceStatusObject(
     try appendJsonString(alloc, out, "format");
     try out.append(alloc, ':');
     try appendJsonString(alloc, out, source.format);
-    try out.appendSlice(alloc, ",\"materialization_pending\":");
-    try out.appendSlice(alloc, if (materialization_pending) "true" else "false");
     try out.append(alloc, '}');
 }
 
@@ -3869,15 +3862,11 @@ fn appendSingleIndexRuntimeStatus(
         try appendIntValue(alloc, out, item.algebraic_graph_traversal_result_node_count);
         try out.appendSlice(alloc, "}}");
         if (graph_source_status) |status| {
-            // Preserve the old aggregate projection until clients have moved to
-            // the enclosing catch-up fields. It is deliberately identical for
-            // every source and must not be treated as per-source telemetry.
-            const materialization_pending = catch_up_active or replay_catch_up_required;
             try out.appendSlice(alloc, ",\"source_artifacts\":[");
             var first = true;
             if (status.single_source) |source_value| {
                 if (graphSourceStatusFromValue(source_value)) |source| {
-                    try appendGraphSourceStatusObject(alloc, out, source, materialization_pending);
+                    try appendGraphSourceStatusObject(alloc, out, source);
                     first = false;
                 }
             }
@@ -3885,7 +3874,7 @@ fn appendSingleIndexRuntimeStatus(
                 const source = graphSourceStatusFromValue(source_value) orelse continue;
                 if (!first) try out.append(alloc, ',');
                 first = false;
-                try appendGraphSourceStatusObject(alloc, out, source, materialization_pending);
+                try appendGraphSourceStatusObject(alloc, out, source);
             }
             try out.append(alloc, ']');
         }
@@ -5215,7 +5204,7 @@ test "index encoders expose graph artifact source materialization status" {
 
     const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "relations_graph", &local_status)).?;
     defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifacts\":[{\"artifact\":\"relations_v1\",\"name\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\",\"materialization_pending\":true},{\"artifact\":\"graph_v1\",\"name\":\"graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\",\"materialization_pending\":true}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifacts\":[{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"},{\"artifact\":\"graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
 }
 

@@ -23,6 +23,7 @@ import {
   SelectTrigger,
   SelectValue,
   Switch,
+  Textarea,
 } from "@antfly/design-system";
 import {
   artifactEmbeddingIndexConfig,
@@ -41,7 +42,6 @@ import { api, type TableSchema } from "../api";
 import { createIndexArguments } from "../lib/create-index";
 import { Combobox } from "./Combobox";
 import IndexForm from "./IndexForm";
-import JsonViewer from "./JsonViewer";
 
 interface CreateIndexDialogProps {
   open: boolean;
@@ -67,6 +67,32 @@ export function getSchemaFieldNames(schema: TableSchema | null): string[] {
   return [...new Set(fields)].sort((a, b) => a.localeCompare(b));
 }
 
+export function parseAdvancedIndexConfig(source: string): IndexConfig {
+  let value: unknown;
+  try {
+    value = JSON.parse(source);
+  } catch (error) {
+    throw new Error(error instanceof Error ? `Invalid JSON: ${error.message}` : "Invalid JSON.");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Index configuration must be a JSON object.");
+  }
+  const config = value as Record<string, unknown>;
+  if (typeof config.name !== "string" || !config.name.trim()) {
+    throw new Error("Index configuration requires a non-empty name.");
+  }
+  if (config.type !== "embeddings" && config.type !== "full_text" && config.type !== "graph") {
+    throw new Error('Index configuration type must be "embeddings", "full_text", or "graph".');
+  }
+  if (
+    Array.isArray(config.sources) &&
+    (config.sources.length === 0 || config.sources.length > 64)
+  ) {
+    throw new Error("Index sources must contain between 1 and 64 items.");
+  }
+  return value as IndexConfig;
+}
+
 const indexFormSchema = z
   .object({
     name: z.string().trim().min(1, "Index name is required."),
@@ -84,7 +110,7 @@ const indexFormSchema = z
         })
       )
       .max(64, "At most 64 artifact sources are allowed."),
-    fullTextSourceType: z.enum(["field", "artifacts"]),
+    fullTextSourceType: z.enum(["document", "field", "artifacts"]),
     fullTextField: z.string().optional(),
     fullTextArtifacts: z.array(z.object({ artifact: z.string() })).max(64),
     graphSources: z
@@ -98,6 +124,8 @@ const indexFormSchema = z
           sourceNode: z.string().optional(),
           targetNode: z.string().optional(),
           edgeType: z.string().optional(),
+          edgeWeight: z.string().optional(),
+          edgeMetadata: z.string().optional(),
           contextFields: z.string().optional(),
         })
       )
@@ -158,6 +186,20 @@ const indexFormSchema = z
             path: ["graphSources", index, "contextFields"],
             message: "Context fields must be unique.",
           });
+        }
+        if (source.edgeMetadata?.trim()) {
+          try {
+            const value: unknown = JSON.parse(source.edgeMetadata);
+            if (!value || typeof value !== "object" || Array.isArray(value)) {
+              throw new Error("not an object");
+            }
+          } catch {
+            context.addIssue({
+              code: "custom",
+              path: ["graphSources", index, "edgeMetadata"],
+              message: "Edge metadata must be a JSON object.",
+            });
+          }
         }
       });
       return;
@@ -257,6 +299,20 @@ export function buildGraphSourceConfig(source: GraphSourceFormData) {
   const sourceNode = source.sourceNode?.trim();
   const targetNode = source.targetNode?.trim();
   const edgeType = source.edgeType?.trim();
+  const edgeWeight = source.edgeWeight?.trim();
+  const numericWeight = edgeWeight ? Number(edgeWeight) : Number.NaN;
+  let edgeMetadata: Record<string, unknown> | undefined;
+  if (source.edgeMetadata?.trim()) {
+    try {
+      const parsed: unknown = JSON.parse(source.edgeMetadata);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        edgeMetadata = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Live form previews must remain renderable while the user is typing;
+      // schema validation blocks submission until the JSON object is valid.
+    }
+  }
   const contextFields = splitContextFields(source.contextFields);
   return {
     artifact: source.artifact.trim(),
@@ -272,7 +328,17 @@ export function buildGraphSourceConfig(source: GraphSourceFormData) {
           },
         }
       : {}),
-    ...(edgeType ? { edge: { type: edgeType } } : {}),
+    ...(edgeType || edgeWeight || edgeMetadata
+      ? {
+          edge: {
+            ...(edgeType ? { type: edgeType } : {}),
+            ...(edgeWeight
+              ? { weight: Number.isFinite(numericWeight) ? numericWeight : edgeWeight }
+              : {}),
+            ...(edgeMetadata ? { metadata: edgeMetadata } : {}),
+          },
+        }
+      : {}),
     ...(contextFields.length > 0 ? { context: { doc_fields: contextFields } } : {}),
   };
 }
@@ -351,6 +417,12 @@ const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) =
                     </FormItem>
                     <FormItem className="flex items-center gap-2 space-y-0">
                       <FormControl>
+                        <RadioGroupItem value="document" />
+                      </FormControl>
+                      <FormLabel className="font-normal">Whole document</FormLabel>
+                    </FormItem>
+                    <FormItem className="flex items-center gap-2 space-y-0">
+                      <FormControl>
                         <RadioGroupItem value="artifacts" />
                       </FormControl>
                       <FormLabel className="font-normal">Artifact streams</FormLabel>
@@ -380,7 +452,7 @@ const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) =
                 </FormItem>
               )}
             />
-          ) : (
+          ) : fullTextSourceType === "artifacts" ? (
             <div className="space-y-2">
               <p className="text-xs text-muted-foreground">
                 Each chunk or textual asset is indexed as an independent member.
@@ -421,6 +493,11 @@ const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) =
                 Add artifact source
               </Button>
             </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Index the complete stored document using Antfly&apos;s default document text
+              projection.
+            </p>
           )}
         </div>
       ) : (
@@ -548,6 +625,36 @@ const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) =
                 />
                 <FormField
                   control={control}
+                  name={`graphSources.${index}.edgeWeight`}
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Edge weight</FormLabel>
+                      <FormControl>
+                        <Input placeholder="1.0 or {{ _item.confidence }}" {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={control}
+                  name={`graphSources.${index}.edgeMetadata`}
+                  render={({ field }) => (
+                    <FormItem className="sm:col-span-2">
+                      <FormLabel>Edge metadata JSON</FormLabel>
+                      <FormControl>
+                        <Textarea
+                          className="min-h-20 font-mono text-xs"
+                          placeholder={'{"evidence":"{{ _item.evidence }}"}'}
+                          {...field}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={control}
                   name={`graphSources.${index}.contextFields`}
                   render={({ field }) => (
                     <FormItem>
@@ -581,6 +688,8 @@ const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) =
                 sourceNode: "",
                 targetNode: "",
                 edgeType: "",
+                edgeWeight: "",
+                edgeMetadata: "",
                 contextFields: "",
               })
             }
@@ -608,6 +717,8 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
     dimension: 0,
     embedder: { provider: "ollama", model: "" },
   });
+  const [jsonSource, setJsonSource] = useState("");
+  const [jsonValidationError, setJsonValidationError] = useState<string | null>(null);
   const form = useForm<IndexFormData>({
     resolver: zodResolver(indexFormSchema),
     defaultValues: {
@@ -630,6 +741,8 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
           sourceNode: "",
           targetNode: "",
           edgeType: "",
+          edgeWeight: "",
+          edgeMetadata: "",
           contextFields: "",
         },
       ],
@@ -657,7 +770,9 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
                     .filter((source) => source?.artifact)
                     .map((source) => ({ artifact: source?.artifact || "" })),
                 }
-              : { field: data.fullTextField || "" }),
+              : data.fullTextSourceType === "field"
+                ? { field: data.fullTextField || "" }
+                : {}),
           } as IndexConfig;
         } else if (data.indexType === "graph") {
           indexConfig = {
@@ -675,6 +790,8 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
                   sourceNode: source?.sourceNode,
                   targetNode: source?.targetNode,
                   edgeType: source?.edgeType,
+                  edgeWeight: source?.edgeWeight,
+                  edgeMetadata: source?.edgeMetadata,
                   contextFields: source?.contextFields,
                 })
               ),
@@ -725,7 +842,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
     try {
       let indexConfig: IndexConfig;
       if (viewMode === "json") {
-        indexConfig = jsonPayload as IndexConfig;
+        indexConfig = parseAdvancedIndexConfig(jsonSource);
       } else if (data.indexType === "full_text") {
         indexConfig =
           data.fullTextSourceType === "artifacts"
@@ -736,7 +853,9 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
             : ({
                 name: data.name,
                 type: "full_text",
-                field: data.fullTextField?.trim(),
+                ...(data.fullTextSourceType === "field"
+                  ? { field: data.fullTextField?.trim() }
+                  : {}),
               } as IndexConfig);
       } else if (data.indexType === "graph") {
         indexConfig = {
@@ -817,7 +936,27 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
   };
 
   const handleViewChange = (checked: boolean) => {
-    setViewMode(checked ? "json" : "form");
+    if (checked) {
+      const source = JSON.stringify(jsonPayload, null, 2);
+      setJsonSource(source);
+      setJsonValidationError(null);
+      setViewMode("json");
+      return;
+    }
+    setViewMode("form");
+  };
+
+  const handleJsonChange = (source: string) => {
+    setJsonSource(source);
+    try {
+      const parsed = parseAdvancedIndexConfig(source);
+      setJsonPayload(parsed);
+      setJsonValidationError(null);
+    } catch (validationError) {
+      setJsonValidationError(
+        validationError instanceof Error ? validationError.message : "Invalid index configuration."
+      );
+    }
   };
 
   const schemaFields = getSchemaFieldNames(schema);
@@ -847,9 +986,36 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
           </Alert>
         )}
 
-        <Form form={form} onSubmit={form.handleSubmit(onSubmit)}>
+        <Form
+          form={form}
+          onSubmit={
+            viewMode === "json"
+              ? (event) => {
+                  event.preventDefault();
+                  void onSubmit(form.getValues());
+                }
+              : form.handleSubmit(onSubmit)
+          }
+        >
           {viewMode === "json" ? (
-            <JsonViewer json={jsonPayload} />
+            <div className="space-y-2">
+              <Textarea
+                aria-label="Advanced index JSON"
+                className="min-h-96 resize-y font-mono text-xs"
+                spellCheck={false}
+                value={jsonSource}
+                onChange={(event) => handleJsonChange(event.target.value)}
+              />
+              {jsonValidationError ? (
+                <p className="text-sm text-destructive" role="alert">
+                  {jsonValidationError}
+                </p>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Validated advanced mode. All supported index options are accepted.
+                </p>
+              )}
+            </div>
           ) : (
             <IndexKindForm schemaFields={schemaFields} />
           )}
@@ -859,7 +1025,9 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
                 Cancel
               </Button>
             </DialogTrigger>
-            <Button type="submit">Create</Button>
+            <Button type="submit" disabled={viewMode === "json" && jsonValidationError !== null}>
+              Create
+            </Button>
           </FormActions>
         </Form>
       </DialogContent>

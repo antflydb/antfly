@@ -1223,6 +1223,34 @@ pub fn isGraphEdgeArtifactKey(key: []const u8) bool {
     return target_term + 2 == key.len;
 }
 
+pub fn matchesGraphEdgeIndexName(key: []const u8, index_name: []const u8) bool {
+    if (!isGraphEdgeArtifactKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2 + 1;
+    const type_term = findComponentTerminator(key, pos) orelse return false;
+    pos = type_term + 2;
+    return componentEquals(key, pos, index_name);
+}
+
+pub fn isGraphAssetStateKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != graph_asset_state_kind) return false;
+    pos += 1;
+    const index_term = findComponentTerminator(key, pos) orelse return false;
+    pos = index_term + 2;
+    const state_term = findComponentTerminator(key, pos) orelse return false;
+    return state_term + 2 == key.len;
+}
+
+pub fn matchesGraphAssetStateIndexName(key: []const u8, index_name: []const u8) bool {
+    if (!isGraphAssetStateKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const index_start = doc_term + 2 + 1;
+    return componentEquals(key, index_start, index_name);
+}
+
 pub fn componentEquals(key: []const u8, start: usize, raw: []const u8) bool {
     const term = findComponentTerminator(key, start) orelse return false;
     var in_pos = start;
@@ -1883,6 +1911,8 @@ test "graph edge artifact key round trip" {
 
     try std.testing.expect(isGraphEdgeArtifactKey(key));
     try std.testing.expect(!isEmbeddingArtifactKey(key));
+    try std.testing.expect(matchesGraphEdgeIndexName(key, "gr_v1"));
+    try std.testing.expect(!matchesGraphEdgeIndexName(key, "gr_v10"));
 
     const parsed = (try parseGraphEdgeArtifactKeyAlloc(alloc, key)).?;
     defer alloc.free(parsed.doc_key);
@@ -1893,6 +1923,20 @@ test "graph edge artifact key round trip" {
     try std.testing.expectEqualStrings("gr_v1", parsed.index_name);
     try std.testing.expectEqualStrings("links", parsed.edge_type);
     try std.testing.expectEqualStrings("doc:b", parsed.target_doc_key);
+}
+
+test "graph asset state key matches exact index name" {
+    const alloc = std.testing.allocator;
+    const key = try graphAssetStateIndexPrefixAlloc(alloc, "doc:a", "gr_v1");
+    defer alloc.free(key);
+    var full = std.ArrayListUnmanaged(u8).empty;
+    defer full.deinit(alloc);
+    try full.appendSlice(alloc, key);
+    try appendEncodedComponent(&full, alloc, "relations_v1");
+
+    try std.testing.expect(isGraphAssetStateKey(full.items));
+    try std.testing.expect(matchesGraphAssetStateIndexName(full.items, "gr_v1"));
+    try std.testing.expect(!matchesGraphAssetStateIndexName(full.items, "gr_v10"));
 }
 
 test "graph edge artifact key round trip with arbitrary source and target ids" {

@@ -4396,6 +4396,7 @@ pub const IndexManager = struct {
         algebraic_active_tuples = 10,
         algebraic_active_dictionary = 11,
         algebraic_active_registry = 12,
+        graph_artifacts = 13,
     };
 
     const AlgebraicCleanupGeneration = enum { canonical, active };
@@ -4947,10 +4948,11 @@ pub const IndexManager = struct {
         var plan = GeneratedArtifactCleanupPlan{ .alloc = self.alloc };
         errdefer plan.deinit();
         plan.key = try internal_keys.indexArtifactCleanupKeyAlloc(self.alloc, name, coverage_generation);
-        const initial_phase: GeneratedArtifactCleanupPhase = if (kind == .algebraic)
-            .algebraic_canonical_facts
-        else
-            .generated_artifacts;
+        const initial_phase: GeneratedArtifactCleanupPhase = switch (kind) {
+            .algebraic => .algebraic_canonical_facts,
+            .graph => .graph_artifacts,
+            else => .generated_artifacts,
+        };
         plan.value = try self.encodeGeneratedArtifactCleanupRecord(initial_phase, owned_chunk_name, owned_embedding_name, null);
         return plan;
     }
@@ -5017,10 +5019,11 @@ pub const IndexManager = struct {
             .algebraic_active_dictionary => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .active, .dictionary, .algebraic_active_registry),
             .algebraic_active_registry => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .active, .registry, .finalization),
             .finalization => return .{ .found = true, .completed = true },
-            .generated_artifacts => {},
+            .generated_artifacts, .graph_artifacts => {},
         }
 
-        if (record.chunk_name == null and record.embedding_name == null) {
+        const cleanup_graph = record.phase == .graph_artifacts;
+        if (!cleanup_graph and record.chunk_name == null and record.embedding_name == null) {
             const next_value = try self.encodeGeneratedArtifactCleanupRecord(.dense_metadata, null, null, null);
             defer self.alloc.free(next_value);
             try store.put(key, next_value);
@@ -5030,11 +5033,14 @@ pub const IndexManager = struct {
         defer self.alloc.free(lower);
         const upper_owned = try internal_keys.documentRangeUpperAlloc(self.alloc, "");
         defer if (upper_owned) |upper| self.alloc.free(upper);
+        const graph_index_name = if (cleanup_graph) try internal_keys.indexArtifactCleanupNameAlloc(self.alloc, key) else null;
+        defer if (graph_index_name) |name| self.alloc.free(name);
 
         const ScanState = struct {
             manager: *IndexManager,
             chunk_name: ?[]const u8,
             embedding_name: ?[]const u8,
+            graph_index_name: ?[]const u8,
             deletes: std.ArrayListUnmanaged([]u8) = .empty,
             last_key: ?[]u8 = null,
             scanned: usize = 0,
@@ -5059,6 +5065,10 @@ pub const IndexManager = struct {
                     should_delete = (internal_keys.isEmbeddingArtifactKey(candidate) and internal_keys.matchesEmbeddingArtifactName(candidate, embedding_name)) or
                         (internal_keys.isDerivedEmbeddingArtifactKey(candidate) and internal_keys.matchesDerivedEmbeddingArtifactName(candidate, embedding_name));
                 };
+                if (!should_delete) if (state.graph_index_name) |index_name| {
+                    should_delete = internal_keys.matchesGraphEdgeIndexName(candidate, index_name) or
+                        internal_keys.matchesGraphAssetStateIndexName(candidate, index_name);
+                };
                 if (should_delete) try state.deletes.append(state.manager.alloc, try state.manager.alloc.dupe(u8, candidate));
 
                 if (state.scanned >= generated_artifact_cleanup_scan_limit) {
@@ -5074,6 +5084,7 @@ pub const IndexManager = struct {
             .manager = self,
             .chunk_name = record.chunk_name,
             .embedding_name = record.embedding_name,
+            .graph_index_name = graph_index_name,
         };
         defer state.deinit();
         try store.scanWithContext(
@@ -5090,7 +5101,7 @@ pub const IndexManager = struct {
         for (state.deletes.items) |delete_key| delete_keys.appendAssumeCapacity(delete_key);
 
         if (state.stopped) {
-            const next_value = try self.encodeGeneratedArtifactCleanupRecord(.generated_artifacts, record.chunk_name, record.embedding_name, state.last_key.?);
+            const next_value = try self.encodeGeneratedArtifactCleanupRecord(record.phase, record.chunk_name, record.embedding_name, state.last_key.?);
             defer self.alloc.free(next_value);
             const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
             try store.putBatch(&writes, delete_keys.items);
@@ -25534,6 +25545,71 @@ test "remove persists generated artifact cleanup debt until same-name recreation
     defer alloc.free(coverage_probe);
     try std.testing.expectError(error.NotFound, store.get(alloc, coverage_probe));
     try std.testing.expectError(error.NotFound, store.get(alloc, cleanup_key));
+    try manager.addManaged(&store, cfg, null);
+}
+
+test "graph retirement durably removes edge artifacts and source state before same-name recreation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "graph-artifact-remove-outbox");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const cfg: types.IndexConfig = .{ .name = "graph_v1", .kind = .graph, .config_json = "{}" };
+    try manager.addAllNoBackfill(&store, &.{cfg});
+
+    const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", cfg.name, "mentions", "doc:b");
+    defer alloc.free(edge_key);
+    const unrelated_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "other_graph", "mentions", "doc:c");
+    defer alloc.free(unrelated_edge_key);
+    const state_prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(alloc, "doc:a", cfg.name);
+    defer alloc.free(state_prefix);
+    var state_key_list = std.ArrayListUnmanaged(u8).empty;
+    defer state_key_list.deinit(alloc);
+    try state_key_list.appendSlice(alloc, state_prefix);
+    try internal_keys.appendEncodedComponent(&state_key_list, alloc, "relations_v1");
+    const state_key = try state_key_list.toOwnedSlice(alloc);
+    defer alloc.free(state_key);
+    const unrelated_state_prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(alloc, "doc:a", "other_graph");
+    defer alloc.free(unrelated_state_prefix);
+    var unrelated_state_key_list = std.ArrayListUnmanaged(u8).empty;
+    defer unrelated_state_key_list.deinit(alloc);
+    try unrelated_state_key_list.appendSlice(alloc, unrelated_state_prefix);
+    try internal_keys.appendEncodedComponent(&unrelated_state_key_list, alloc, "relations_v1");
+    const unrelated_state_key = try unrelated_state_key_list.toOwnedSlice(alloc);
+    defer alloc.free(unrelated_state_key);
+    try store.putBatch(&.{
+        .{ .key = edge_key, .value = "legacy-edge" },
+        .{ .key = state_key, .value = "legacy-state" },
+        .{ .key = unrelated_edge_key, .value = "other-edge" },
+        .{ .key = unrelated_state_key, .value = "other-state" },
+    }, &.{});
+
+    try std.testing.expect(try manager.remove(&store, cfg.name));
+    try std.testing.expectError(error.IndexArtifactCleanupPending, manager.addManaged(&store, cfg, null));
+    while (true) {
+        var result = try manager.drainGeneratedArtifactCleanupOutboxPage(&store);
+        defer result.deinit();
+        if (!result.found) break;
+        if (result.completed) {
+            try manager.finalizeRetiredIndexStorage(&store, result.index_name);
+            try store.delete(result.key);
+        }
+    }
+
+    try std.testing.expectError(error.NotFound, store.get(alloc, edge_key));
+    try std.testing.expectError(error.NotFound, store.get(alloc, state_key));
+    const unrelated_edge = try store.get(alloc, unrelated_edge_key);
+    defer alloc.free(unrelated_edge);
+    try std.testing.expectEqualStrings("other-edge", unrelated_edge);
+    const unrelated_state = try store.get(alloc, unrelated_state_key);
+    defer alloc.free(unrelated_state);
+    try std.testing.expectEqualStrings("other-state", unrelated_state);
     try manager.addManaged(&store, cfg, null);
 }
 

@@ -7557,35 +7557,62 @@ const RuntimeGraphEdgeWinners = struct {
 };
 
 fn runtimeAddGraphStateManifest(
-    alloc: Allocator,
+    runtime: *EnrichmentRuntime,
     winners: *RuntimeGraphEdgeWinners,
     state_key: []const u8,
     source_priority: usize,
     raw: []const u8,
     expected_generation: u64,
 ) !void {
-    if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return;
-    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
+    const alloc = runtime.alloc;
+    const generation = try graph_asset_state.coverageGeneration(raw);
+    if (generation) |value| if (value != expected_generation) return;
+    const entries: []graph_asset_state.Entry = if (generation != null) try graph_asset_state.decodeAlloc(alloc, raw) else &.{};
     defer graph_asset_state.freeEntries(alloc, entries);
-    for (entries) |entry| {
-        if (winners.map.getPtr(entry.key)) |winner| {
+    const legacy_keys: [][]u8 = if (generation == null) try graph_asset_state.decodeV020KeysAlloc(alloc, raw) else &.{};
+    defer graph_asset_state.freeKeys(alloc, legacy_keys);
+    const count = if (generation != null) entries.len else legacy_keys.len;
+    for (0..count) |entry_index| {
+        const key = if (generation != null) entries[entry_index].key else legacy_keys[entry_index];
+        const payload = if (generation != null)
+            try alloc.dupe(u8, entries[entry_index].value)
+        else legacy_payload: {
+            const stored = storeGetAlloc(runtime, key) catch |err| switch (err) {
+                std.mem.Allocator.Error.OutOfMemory => return err,
+                else => continue,
+            };
+            defer alloc.free(stored);
+            var decoded = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, stored) catch |err| switch (err) {
+                std.mem.Allocator.Error.OutOfMemory => return err,
+                else => continue,
+            };
+            defer decoded.deinit(alloc);
+            if (!enrichment_artifact_codec.needsGraphGenerationBinding(stored) and decoded.generation != expected_generation) continue;
+            break :legacy_payload if (enrichment_artifact_codec.needsGraphGenerationBinding(stored))
+                try enrichment_artifact_codec.bindGraphEdgeGenerationAlloc(alloc, stored, expected_generation)
+            else
+                try alloc.dupe(u8, stored);
+        };
+        errdefer alloc.free(payload);
+        if (winners.map.getPtr(key)) |winner| {
             if (source_priority > winner.source_priority or
-                (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt)) continue;
+                (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt))
+            {
+                alloc.free(payload);
+                continue;
+            }
             const owner = try alloc.dupe(u8, state_key);
             errdefer alloc.free(owner);
-            const payload = try alloc.dupe(u8, entry.value);
             alloc.free(winner.owner_state_key);
             alloc.free(winner.payload);
             winner.* = .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority };
             continue;
         }
 
-        const owned_key = try alloc.dupe(u8, entry.key);
+        const owned_key = try alloc.dupe(u8, key);
         errdefer alloc.free(owned_key);
         const owner = try alloc.dupe(u8, state_key);
         errdefer alloc.free(owner);
-        const payload = try alloc.dupe(u8, entry.value);
-        errdefer alloc.free(payload);
         try winners.map.put(alloc, owned_key, .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority });
     }
 }
@@ -7628,9 +7655,9 @@ fn runtimeLoadGraphEdgeWinners(
             saw_current = true;
             break :blk current_state_value;
         } else entry.value;
-        try runtimeAddGraphStateManifest(runtime.alloc, &winners, entry.key, try runtimeGraphStateSourcePriorityAlloc(runtime, entry.key, prefix, index_name), raw, expected_generation);
+        try runtimeAddGraphStateManifest(runtime, &winners, entry.key, try runtimeGraphStateSourcePriorityAlloc(runtime, entry.key, prefix, index_name), raw, expected_generation);
     }
-    if (!saw_current) try runtimeAddGraphStateManifest(runtime.alloc, &winners, current_state_key, try runtimeGraphStateSourcePriorityAlloc(runtime, current_state_key, prefix, index_name), current_state_value, expected_generation);
+    if (!saw_current) try runtimeAddGraphStateManifest(runtime, &winners, current_state_key, try runtimeGraphStateSourcePriorityAlloc(runtime, current_state_key, prefix, index_name), current_state_value, expected_generation);
     return winners;
 }
 
@@ -11541,17 +11568,32 @@ fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const 
         else => return null,
     };
     defer alloc.free(raw);
-    if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return null;
-    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
-    defer graph_asset_state.freeEntries(alloc, entries);
-    const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};
+    if (try graph_asset_state.coverageGeneration(raw)) |generation| {
+        if (generation != expected_generation) return null;
+        const entries = try graph_asset_state.decodeAlloc(alloc, raw);
+        defer graph_asset_state.freeEntries(alloc, entries);
+        const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};
+        var initialized: usize = 0;
+        errdefer {
+            for (keys[0..initialized]) |key| alloc.free(@constCast(key));
+            alloc.free(keys);
+        }
+        for (keys, entries) |*key, entry| {
+            key.* = try alloc.dupe(u8, entry.key);
+            initialized += 1;
+        }
+        return keys;
+    }
+    const legacy_keys = try graph_asset_state.decodeV020KeysAlloc(alloc, raw);
+    defer graph_asset_state.freeKeys(alloc, legacy_keys);
+    const keys = if (legacy_keys.len > 0) try alloc.alloc([]const u8, legacy_keys.len) else return &.{};
     var initialized: usize = 0;
     errdefer {
         for (keys[0..initialized]) |key| alloc.free(@constCast(key));
         alloc.free(keys);
     }
-    for (keys, entries) |*key, entry| {
-        key.* = try alloc.dupe(u8, entry.key);
+    for (keys, legacy_keys) |*key, legacy_key| {
+        key.* = try alloc.dupe(u8, legacy_key);
         initialized += 1;
     }
     return keys;
