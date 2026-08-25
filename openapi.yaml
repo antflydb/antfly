@@ -22927,6 +22927,8 @@ components:
       properties:
         index:
           type: string
+          minLength: 1
+          pattern: .*\S.*
         match:
           $ref: '#/components/schemas/GraphMatch'
         return:
@@ -23064,6 +23066,8 @@ components:
       properties:
         index:
           type: string
+          minLength: 1
+          pattern: .*\S.*
         traverse:
           $ref: '#/components/schemas/GraphTraversal'
     PathWeightMode:
@@ -23138,6 +23142,8 @@ components:
       properties:
         index:
           type: string
+          minLength: 1
+          pattern: .*\S.*
         shortest_path:
           $ref: '#/components/schemas/GraphShortestPath'
     GraphKShortestPaths:
@@ -23202,6 +23208,8 @@ components:
       properties:
         index:
           type: string
+          minLength: 1
+          pattern: .*\S.*
         k_shortest_paths:
           $ref: '#/components/schemas/GraphKShortestPaths'
     GraphQuery:
@@ -23587,10 +23595,12 @@ components:
             - null
     GraphResultRow:
       type: object
+      maxProperties: 64
       additionalProperties:
         $ref: '#/components/schemas/GraphResultBinding'
     GraphQueryStats:
       type: object
+      additionalProperties: false
       required:
         - returned_items
         - truncated
@@ -23598,6 +23608,8 @@ components:
         returned_items:
           type: integer
           format: uint64
+          minimum: 0
+          maximum: 10000
           description: Number of primary result items returned (nodes, paths, rows, or aggregates).
         truncated:
           type: boolean
@@ -23621,12 +23633,14 @@ components:
           description: Stable discriminator for the graph result shape.
         rows:
           type: array
+          maxItems: 10000
           items:
             $ref: '#/components/schemas/GraphResultRow'
         stats:
           $ref: '#/components/schemas/GraphQueryStats'
     GraphAggregateValue:
       type: object
+      additionalProperties: false
       required:
         - value
         - exact
@@ -23657,6 +23671,8 @@ components:
           description: Stable discriminator for the graph result shape.
         aggregates:
           type: object
+          minProperties: 1
+          maxProperties: 64
           additionalProperties:
             $ref: '#/components/schemas/GraphAggregateValue'
         stats:
@@ -23692,10 +23708,12 @@ components:
         weight_sum:
           type: number
           format: double
+          minimum: 0
           description: Sum of raw edge weights along the path, independent of the selected ranking objective.
         objective_value:
           type: number
           format: double
+          minimum: 0
           description: The user-facing value optimized by weight_mode; edge count for min_hops, weight_sum
             for min_weight, and the raw edge-weight product for max_weight.
         length:
@@ -23721,6 +23739,7 @@ components:
           description: Stable discriminator for the graph result shape.
         nodes:
           type: array
+          maxItems: 10000
           items:
             $ref: '#/components/schemas/GraphResultNode'
           description: Traversal result nodes. Path operations emit one terminal result node per returned
@@ -23728,6 +23747,7 @@ components:
         paths:
           x-go-type-skip-optional-pointer: true
           type: array
+          maxItems: 10000
           items:
             $ref: '#/components/schemas/GraphPath'
           description: Materialized result paths; empty when paths were not requested or produced.

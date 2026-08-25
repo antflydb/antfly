@@ -5444,6 +5444,10 @@ fn toOpenApiGraphQueryResultWithFormat(
         return .{ .graph_bindings_result = response };
     }
     if (query.aggregates.len > 0) {
+        // Canonical aggregate values are exact by contract. A producer that
+        // stopped early cannot attach `exact: true` values to a truncated
+        // result, even if every individual accumulator claims exactness.
+        if (graph_result.truncated) return error.QueryCandidateBudgetExceeded;
         const aggregates = try toOpenApiGraphAggregates(alloc, query, graph_result);
         const response = try alloc.create(indexes_openapi.GraphAggregatesResult);
         errdefer alloc.destroy(response);
@@ -5525,11 +5529,14 @@ fn toOpenApiGraphRows(
     graph_result: db_mod.types.GraphSearchResult,
     document_lookup: *GraphDocumentLookup,
 ) ![]const indexes_openapi.GraphResultRow {
+    if (graph_result.matches.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
     const out = try alloc.alloc(indexes_openapi.GraphResultRow, graph_result.matches.len);
     for (graph_result.matches, 0..) |match, i| {
         var row: indexes_openapi.GraphResultRow = .{};
         errdefer row.deinit(alloc);
         for (match.bindings) |binding| {
+            try validateCanonicalGraphResultNode(binding.node);
             const node = indexes_openapi.GraphResultNode{
                 .key = binding.node.key,
                 .table = binding.node.table,
@@ -5695,6 +5702,23 @@ test "graph aggregate response fails closed on missing or inexact results" {
             .aggregates = @constCast(partial[0..]),
             .hits = &.{},
             .total_hits = 0,
+        },
+    ));
+    const complete_aggregate = [_]db_mod.types.GraphAggregateResult{.{
+        .name = @constCast("count"),
+        .value = 1,
+        .exact = true,
+    }};
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, toOpenApiGraphQueryResult(
+        alloc,
+        query,
+        .{},
+        .{
+            .name = @constCast("counted"),
+            .aggregates = @constCast(complete_aggregate[0..]),
+            .hits = &.{},
+            .total_hits = 0,
+            .truncated = true,
         },
     ));
 }
@@ -5914,8 +5938,11 @@ fn toOpenApiGraphNodes(
     graph_result: db_mod.types.GraphSearchResult,
     document_lookup: *GraphDocumentLookup,
 ) ![]const indexes_openapi.GraphResultNode {
+    if (graph_result.nodes.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
     const nodes = try alloc.alloc(indexes_openapi.GraphResultNode, graph_result.nodes.len);
     for (graph_result.nodes, 0..) |node, i| {
+        try validateCanonicalGraphResultNode(node);
         nodes[i] = .{
             .key = node.key,
             .table = node.table,
@@ -5929,6 +5956,57 @@ fn toOpenApiGraphNodes(
         };
     }
     return nodes;
+}
+
+fn validateCanonicalGraphResultNode(node: graph_query_mod.GraphResultNode) !void {
+    if (node.key.len == 0) return error.InvalidRemoteResponse;
+    if (node.table) |table| if (table.len == 0) return error.InvalidRemoteResponse;
+    if (node.depth > graph_pattern_mod.max_pattern_hops) return error.InvalidRemoteResponse;
+    if (!std.math.isFinite(node.distance) or node.distance < 0) return error.InvalidRemoteResponse;
+
+    if (node.path) |path| {
+        if (path.len == 0 or path.len > graph_pattern_mod.max_pattern_hops + 1)
+            return error.InvalidRemoteResponse;
+        if (node.path_tables) |tables| {
+            if (tables.len != path.len) return error.InvalidRemoteResponse;
+        }
+        for (path, 0..) |key, i| {
+            if (key.len == 0) return error.InvalidRemoteResponse;
+            if (node.path_tables) |tables| {
+                if (tables[i]) |table| if (table.len == 0) return error.InvalidRemoteResponse;
+            }
+        }
+        if (node.path_edges) |edges| {
+            if (edges.len != path.len - 1) return error.InvalidRemoteResponse;
+        }
+    } else {
+        if (node.path_tables != null) return error.InvalidRemoteResponse;
+        if (node.path_edges) |edges| if (edges.len != 0) return error.InvalidRemoteResponse;
+    }
+}
+
+test "canonical graph result nodes fail closed outside the public contract" {
+    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+        .key = @constCast(""),
+        .depth = 0,
+        .distance = 0,
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+        .key = @constCast("node"),
+        .depth = graph_pattern_mod.max_pattern_hops + 1,
+        .distance = 0,
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+        .key = @constCast("node"),
+        .depth = 0,
+        .distance = -0.1,
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+        .key = @constCast("node"),
+        .depth = 0,
+        .distance = 0,
+        .path = @constCast((&[_][]const u8{})[0..]),
+    }));
 }
 
 fn toOpenApiLegacyGraphNodes(
@@ -5994,6 +6072,8 @@ fn toOpenApiGraphPaths(
     paths: []const db_mod.types.GraphPath,
     weight_mode: graph_paths_mod.PathWeightMode,
 ) ![]const indexes_openapi.GraphPath {
+    if (paths.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
     const out = try alloc.alloc(indexes_openapi.GraphPath, paths.len);
     for (paths, 0..) |path, i| {
         if (@as(usize, path.length) != path.edges.len) return error.InvalidRemoteResponse;
@@ -9404,6 +9484,7 @@ fn parseLegacyGraphQueryParams(
 
 fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphTraverseQuery) !graph_query_mod.GraphQuery {
     const traversal = value.traverse;
+    try validateGraphIndexName(value.index);
     try validateGraphWeightBounds(traversal.min_weight, traversal.max_weight);
     if (traversal.fields != null and traversal.include_documents != true)
         return error.InvalidQueryRequest;
@@ -9448,6 +9529,7 @@ fn parseGraphPathQuery(
     query_type: graph_query_mod.QueryType,
 ) !graph_query_mod.GraphQuery {
     if (k == 0 or k > 100) return error.InvalidQueryRequest;
+    try validateGraphIndexName(index_value);
     try validateGraphWeightBounds(path.min_weight, path.max_weight);
     if (path.fields != null and path.include_documents != true)
         return error.InvalidQueryRequest;
@@ -9504,6 +9586,7 @@ fn parseGraphPathEndpointSelector(alloc: std.mem.Allocator, endpoint: anytype) !
 }
 
 fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMatchQuery) !graph_query_mod.GraphQuery {
+    try validateGraphIndexName(value.index);
     const index = try alloc.dupe(u8, value.index);
     errdefer alloc.free(index);
     const base_ref = try alloc.dupe(u8, "$query_results");
@@ -9599,6 +9682,16 @@ fn parseGraphMatchQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphMa
         .fields = fields,
         .include_all_fields = if (bindings_return) |return_value| return_value.fields == null else true,
     };
+}
+
+fn validateGraphIndexName(index: []const u8) !void {
+    if (std.mem.trim(u8, index, " \t\r\n").len == 0) return error.InvalidQueryRequest;
+}
+
+test "canonical graph index names are nonblank" {
+    try validateGraphIndexName("social");
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphIndexName(""));
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphIndexName(" \t"));
 }
 
 fn graphAliasIsDeclared(

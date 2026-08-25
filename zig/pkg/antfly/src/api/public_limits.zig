@@ -24,10 +24,15 @@ pub const max_query_binding_expansion_growth_bytes: usize = 8 * 1024 * 1024;
 /// document in one named operation. This keeps document projection comparable
 /// to a 10k-hit retrieval page even when a row projects many aliases.
 pub const max_graph_hydrated_bindings: usize = 10_000;
+/// Maximum number of primary items in one canonical graph result collection.
+/// This matches the largest public traversal/MATCH limit and is also enforced
+/// when decoding peer responses before allocating derived result state.
+pub const max_graph_result_items: usize = 10_000;
 
 test "public API request body limit matches Go linear merge contract" {
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), max_request_body_bytes);
     try std.testing.expectEqual(max_request_body_bytes, max_json_value_len);
     try std.testing.expect(max_query_binding_expansion_growth_bytes < max_request_body_bytes);
     try std.testing.expect(max_graph_hydrated_bindings <= 10_000);
+    try std.testing.expectEqual(@as(usize, 10_000), max_graph_result_items);
 }

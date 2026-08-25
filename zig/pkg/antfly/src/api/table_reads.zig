@@ -58,6 +58,7 @@ const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
+const public_limits = @import("public_limits.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
 const table_read_source = @import("table_read_source.zig");
@@ -18174,6 +18175,8 @@ fn parseRemoteGraphResults(
     alloc: std.mem.Allocator,
     value: std.json.ArrayHashMap(indexes_openapi.GraphQueryResult),
 ) ![]db_mod.types.GraphSearchResult {
+    if (value.map.count() > graph_query_mod.max_named_queries)
+        return error.InvalidRemoteResponse;
     const results = try alloc.alloc(db_mod.types.GraphSearchResult, value.map.count());
     var initialized: usize = 0;
     errdefer {
@@ -18183,6 +18186,8 @@ fn parseRemoteGraphResults(
 
     var it = value.map.iterator();
     while (it.next()) |entry| {
+        if (!graph_query_mod.isValidQueryName(entry.key_ptr.*))
+            return error.InvalidRemoteResponse;
         const result_value = entry.value_ptr.*;
         const ResultView = struct {
             canonical_nodes: ?[]const indexes_openapi.GraphResultNode = null,
@@ -18194,18 +18199,38 @@ fn parseRemoteGraphResults(
             truncated: bool = false,
         };
         const view: ResultView = switch (result_value) {
-            .graph_nodes_result => |result| .{
-                .canonical_nodes = result.nodes,
-                .canonical_paths = result.paths,
-                .truncated = result.stats.truncated,
+            .graph_nodes_result => |result| blk: {
+                if (result.nodes.len > public_limits.max_graph_result_items or
+                    result.paths.len > public_limits.max_graph_result_items)
+                    return error.InvalidRemoteResponse;
+                const returned_items = if (result.paths.len > 0) result.paths.len else result.nodes.len;
+                if (!remoteGraphReturnedItemsMatch(result.stats.returned_items, returned_items))
+                    return error.InvalidRemoteResponse;
+                break :blk .{
+                    .canonical_nodes = result.nodes,
+                    .canonical_paths = result.paths,
+                    .truncated = result.stats.truncated,
+                };
             },
-            .graph_bindings_result => |result| .{
-                .rows = result.rows,
-                .truncated = result.stats.truncated,
+            .graph_bindings_result => |result| blk: {
+                if (result.rows.len > public_limits.max_graph_result_items or
+                    !remoteGraphReturnedItemsMatch(result.stats.returned_items, result.rows.len))
+                    return error.InvalidRemoteResponse;
+                break :blk .{
+                    .rows = result.rows,
+                    .truncated = result.stats.truncated,
+                };
             },
-            .graph_aggregates_result => |result| .{
-                .aggregates = result.aggregates,
-                .truncated = result.stats.truncated,
+            .graph_aggregates_result => |result| blk: {
+                if (result.stats.truncated) return error.QueryCandidateBudgetExceeded;
+                if (result.aggregates.map.count() == 0 or
+                    result.aggregates.map.count() > graph_pattern_mod.max_count_aggregates or
+                    !remoteGraphReturnedItemsMatch(result.stats.returned_items, result.aggregates.map.count()))
+                    return error.InvalidRemoteResponse;
+                break :blk .{
+                    .aggregates = result.aggregates,
+                    .truncated = false,
+                };
             },
             .legacy_graph_query_result => |result| .{
                 .legacy_nodes = result.nodes,
@@ -18271,6 +18296,11 @@ fn parseRemoteGraphResults(
     return results;
 }
 
+fn remoteGraphReturnedItemsMatch(value: i64, actual: usize) bool {
+    const parsed = std.math.cast(usize, value) orelse return false;
+    return parsed == actual;
+}
+
 fn parseRemoteGraphAggregates(
     alloc: std.mem.Allocator,
     value: std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue),
@@ -18283,6 +18313,8 @@ fn parseRemoteGraphAggregates(
     }
     var it = value.map.iterator();
     while (it.next()) |entry| {
+        if (!graph_query_mod.isValidIdentifier(entry.key_ptr.*) or !entry.value_ptr.exact)
+            return error.InvalidRemoteResponse;
         const parsed_value = std.fmt.parseInt(u128, entry.value_ptr.value, 10) catch return error.InvalidRemoteResponse;
         aggregates[initialized] = .{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
@@ -18322,6 +18354,8 @@ fn parseRemoteGraphNodes(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.GraphResultNode,
 ) !ParsedRemoteGraphNodes {
+    if (value.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
     const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -18351,6 +18385,8 @@ fn parseRemoteLegacyGraphNodes(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.LegacyGraphResultNode,
 ) !ParsedRemoteGraphNodes {
+    if (value.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
     const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -18430,6 +18466,7 @@ fn parseRemoteGraphNodeWithKey(
 ) !graph_query_mod.GraphResultNode {
     try validateRemoteCanonicalGraphIdentity(key, item.table);
     const depth = std.math.cast(u32, item.depth orelse 0) orelse return error.InvalidQueryRequest;
+    if (depth > graph_pattern_mod.max_pattern_hops) return error.InvalidQueryRequest;
     const distance = item.distance orelse 0;
     if (!std.math.isFinite(distance) or distance < 0) return error.InvalidQueryRequest;
     if (item.path) |path| {
@@ -18532,6 +18569,8 @@ fn parseRemoteGraphRows(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.GraphResultRow,
 ) !ParsedRemoteGraphMatches {
+    if (value.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
     const matches = try alloc.alloc(db_mod.types.GraphPatternMatch, value.len);
     var initialized_matches: usize = 0;
     errdefer {
@@ -18544,6 +18583,8 @@ fn parseRemoteGraphRows(
         hits.deinit(alloc);
     }
     for (value, 0..) |row, i| {
+        if (row.map.count() > graph_pattern_mod.max_conjunctive_nodes)
+            return error.InvalidRemoteResponse;
         var bindings = std.ArrayListUnmanaged(db_mod.types.GraphPatternBinding).empty;
         errdefer {
             for (bindings.items) |*binding| binding.deinit(alloc);
@@ -18556,6 +18597,8 @@ fn parseRemoteGraphRows(
         }
         var it = row.map.iterator();
         while (it.next()) |entry| {
+            if (!graph_query_mod.isValidIdentifier(entry.key_ptr.*))
+                return error.InvalidRemoteResponse;
             const node_value = entry.value_ptr.* orelse {
                 const alias = try alloc.dupe(u8, entry.key_ptr.*);
                 errdefer alloc.free(alias);
@@ -18703,6 +18746,8 @@ fn freeRemoteGraphNodePathEdges(alloc: std.mem.Allocator, edges: []const graph_q
 }
 
 fn parseRemoteLegacyGraphPaths(alloc: std.mem.Allocator, value: []const indexes_openapi.Path) ![]graph_paths.Path {
+    if (value.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
     const paths = try alloc.alloc(graph_paths.Path, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -18725,6 +18770,8 @@ fn parseRemoteCanonicalGraphPaths(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.GraphPath,
 ) ![]graph_paths.Path {
+    if (value.len > public_limits.max_graph_result_items)
+        return error.InvalidRemoteResponse;
     const paths = try alloc.alloc(graph_paths.Path, value.len);
     var initialized: usize = 0;
     errdefer {
@@ -18742,7 +18789,8 @@ fn parseRemoteCanonicalGraphPath(
     alloc: std.mem.Allocator,
     item: indexes_openapi.GraphPath,
 ) !graph_paths.Path {
-    if (item.length < 0 or @as(u64, @intCast(item.length)) != item.edges.len)
+    if (item.length < 0 or item.length > graph_pattern_mod.max_pattern_hops or
+        @as(u64, @intCast(item.length)) != item.edges.len)
         return error.InvalidQueryRequest;
     try validateRemoteCanonicalGraphPathScores(item);
     const nodes = try alloc.alloc([]const u8, item.nodes.len);
@@ -18900,7 +18948,8 @@ fn validateRemoteCanonicalGraphPathEdges(
 fn validateRemoteCanonicalGraphPathNodes(
     nodes: []const indexes_openapi.GraphPathEndpoint,
 ) !void {
-    if (nodes.len == 0) return error.InvalidQueryRequest;
+    if (nodes.len == 0 or nodes.len > graph_pattern_mod.max_pattern_hops + 1)
+        return error.InvalidQueryRequest;
     for (nodes) |node| try validateRemoteCanonicalGraphIdentity(node.key, node.table);
 }
 
@@ -18931,12 +18980,33 @@ test "remote canonical graph nodes reject invalid identity and numeric domains" 
     }));
     try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
+        .depth = graph_pattern_mod.max_pattern_hops + 1,
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
         .distance = -0.1,
     }));
     try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
         .distance = std.math.inf(f64),
     }));
+
+    const too_many_path_nodes = [_]indexes_openapi.GraphPathEndpoint{.{ .key = "node" }} **
+        (graph_pattern_mod.max_pattern_hops + 2);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        validateRemoteCanonicalGraphPathNodes(&too_many_path_nodes),
+    );
+}
+
+test "remote canonical graph result stats and aggregate exactness fail closed" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"walk":{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":1,"truncated":false}}}}]}
+    ));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"counted":{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}}}]}
+    ));
 }
 
 test "remote canonical graph paths reject impossible shapes and weight domains" {
