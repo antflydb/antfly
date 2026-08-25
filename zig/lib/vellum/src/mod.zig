@@ -424,6 +424,7 @@ pub const Builder = struct {
             .last = .empty,
             .out = .empty,
         };
+        errdefer b.deinit();
 
         // Write header
         try b.out.appendSlice(alloc, &std.mem.toBytes(std.mem.nativeToLittle(u64, version_v1)));
