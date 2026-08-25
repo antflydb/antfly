@@ -13203,7 +13203,8 @@ var _ = Describe("AntflyCluster Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: antflyv1.AntflyClusterSpec{
-					Image: "antfly:latest",
+					Image:               "antfly:latest",
+					InternalServiceAuth: testInternalServiceAuthSpec(),
 					MetadataNodes: antflyv1.MetadataNodesSpec{
 						Replicas: 3,
 						Resources: antflyv1.ResourceSpec{
@@ -13323,7 +13324,8 @@ var _ = Describe("AntflyCluster Controller", func() {
 					Namespace: namespace,
 				},
 				Spec: antflyv1.AntflyClusterSpec{
-					Image: "antfly:latest",
+					Image:               "antfly:latest",
+					InternalServiceAuth: testInternalServiceAuthSpec(),
 					MetadataNodes: antflyv1.MetadataNodesSpec{
 						Replicas: 3,
 						Resources: antflyv1.ResourceSpec{
