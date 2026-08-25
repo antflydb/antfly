@@ -4038,6 +4038,17 @@ const MetadataMergeTransitionFinalizedProgressContext = struct {
 };
 
 pub const MetadataHttpClusterSimulation = struct {
+    pub const DataPlaneOwnership = enum {
+        /// Metadata and data replicas are co-located in the managed-host
+        /// simulation. This remains the default for focused metadata tests.
+        co_located,
+        /// Only the metadata group is materialized by this harness. Projected
+        /// data placements remain authoritative metadata, but production
+        /// DataServer owners consume and report them instead of creating
+        /// shadow replicas in the metadata processes.
+        external,
+    };
+
     alloc: std.mem.Allocator,
     metadata_group_id: u64,
     cluster: raft_sim.ManagedHttpClusterSimulation,
@@ -4056,6 +4067,7 @@ pub const MetadataHttpClusterSimulation = struct {
     reconcile_lease_update_in_flight: bool = false,
     metadata_proposal_in_flight: usize = 0,
     next_reallocation_request_id: u128 = 1,
+    data_plane_ownership: DataPlaneOwnership = .co_located,
 
     pub const ProgressPredicate = *const fn (*MetadataHttpClusterSimulation, *anyopaque) anyerror!bool;
     const min_pending_reconcile_lease_retry_ms: u64 = 250;
@@ -4221,6 +4233,17 @@ pub const MetadataHttpClusterSimulation = struct {
 
     pub fn startAll(self: *MetadataHttpClusterSimulation) !void {
         try self.registerVirtualNodes();
+    }
+
+    /// Selects who owns projected data replicas. Call this before publishing
+    /// any data placement when composing production DataServers with the real
+    /// metadata quorum.
+    pub fn setDataPlaneOwnership(
+        self: *MetadataHttpClusterSimulation,
+        ownership: DataPlaneOwnership,
+    ) void {
+        self.data_plane_ownership = ownership;
+        @memset(self.placement_intent_hash_valid, false);
     }
 
     pub fn stopAll(self: *MetadataHttpClusterSimulation) void {
@@ -4594,6 +4617,9 @@ pub const MetadataHttpClusterSimulation = struct {
     }
 
     fn refreshLocalPlacementIntents(self: *MetadataHttpClusterSimulation, index: usize) !void {
+        if (self.data_plane_ownership == .external)
+            return try self.refreshMetadataPlacementIntent(index);
+
         const sim = self.cluster.node(index);
         const store = sim.runtime.svc.host.owned_metadata_store orelse return;
         const local_node_id = self.cluster.configs[index].host.http.host.local_node_id;
@@ -4658,6 +4684,93 @@ pub const MetadataHttpClusterSimulation = struct {
         }
 
         try sim.runtime.svc.host.replacePlacementIntents(local);
+        _ = try sim.runtime.svc.host.reconcileOnce();
+        self.placement_intent_hashes[index] = local_hash;
+        self.placement_intent_hash_valid[index] = true;
+    }
+
+    /// Reconciles only the metadata replica into a metadata process. Data
+    /// placements stay in the replicated metadata store for external
+    /// DataServers to consume, but cannot accidentally instantiate a second,
+    /// test-owned data plane with the same node and group identities.
+    fn refreshMetadataPlacementIntent(self: *MetadataHttpClusterSimulation, index: usize) !void {
+        const sim = self.cluster.node(index);
+        const store = sim.runtime.svc.host.owned_metadata_store orelse return;
+        const local_node_id = self.cluster.configs[index].host.http.host.local_node_id;
+        const projected = try store.listLocalPlacementIntents(
+            self.alloc,
+            self.metadata_group_id,
+            local_node_id,
+        );
+        defer store.freePlacementIntents(self.alloc, projected);
+
+        var selected: []const raft_reconciler.PlacementIntent = &.{};
+        for (projected, 0..) |intent, intent_index| {
+            if (intent.record.group_id != self.metadata_group_id) continue;
+            selected = projected[intent_index .. intent_index + 1];
+            break;
+        }
+
+        var synthesized: [1]raft_reconciler.PlacementIntent = undefined;
+        var synthesized_peers: ?[]u64 = null;
+        defer if (synthesized_peers) |peers| self.alloc.free(peers);
+        if (selected.len == 0) {
+            if (sim.runtime.svc.host.http_host.host.raftStatus(self.metadata_group_id)) |status| {
+                synthesized_peers = try allocPeerNodeIdsExcludingSelf(
+                    self.alloc,
+                    status.conf_state.voters,
+                    local_node_id,
+                );
+                synthesized[0] = .{
+                    .record = .{
+                        .group_id = self.metadata_group_id,
+                        .replica_id = local_node_id,
+                        .local_node_id = local_node_id,
+                        .bootstrap_mode = .persisted,
+                    },
+                    .peer_node_ids = synthesized_peers.?,
+                };
+                selected = synthesized[0..];
+            }
+        }
+
+        const local_hash = hashPlacementIntentSlice(selected);
+        if (self.placement_intent_hash_valid[index] and
+            self.placement_intent_hashes[index] == local_hash)
+        {
+            _ = try sim.runtime.svc.host.reconcileOnce();
+            return;
+        }
+
+        const base_uris = try self.alloc.alloc([]u8, self.cluster.nodes.len);
+        defer {
+            for (base_uris) |uri| self.alloc.free(uri);
+            self.alloc.free(base_uris);
+        }
+        for (0..self.cluster.nodes.len) |peer_index|
+            base_uris[peer_index] = try self.nodeBaseUri(self.alloc, peer_index);
+
+        for (selected) |intent| {
+            for (intent.peer_node_ids) |node_id| {
+                if (node_id == local_node_id) continue;
+                const peer_index = self.indexForNodeId(node_id) orelse continue;
+                try sim.runtime.svc.host.apply(.{
+                    .peer_route = .{
+                        .upsert = .{
+                            .group_id = self.metadata_group_id,
+                            .node_id = node_id,
+                            .endpoints = &.{.{
+                                .protocol = .http,
+                                .address = base_uris[peer_index],
+                                .metadata = "",
+                            }},
+                        },
+                    },
+                });
+            }
+        }
+
+        try sim.runtime.svc.host.replacePlacementIntents(selected);
         _ = try sim.runtime.svc.host.reconcileOnce();
         self.placement_intent_hashes[index] = local_hash;
         self.placement_intent_hash_valid[index] = true;
@@ -9406,6 +9519,82 @@ test "metadata http cluster simulation drives table placement convergence" {
     const nodes = try cluster.node(leader_index).listProjectedNodes(std.testing.allocator);
     defer cluster.node(leader_index).freeProjectedNodes(std.testing.allocator, nodes);
     try std.testing.expectEqual(@as(usize, 3), nodes.len);
+}
+
+test "metadata-only cluster preserves external data placements without shadow replicas" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = std.testing.allocator, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-a", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_a);
+    const root_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-b", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_b);
+    const root_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-c", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_c);
+    const cat_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-a.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-b.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-only-c.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(cat_c);
+
+    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, 4050, root_a, cat_a),
+        makeHostSimConfig(2, 4050, root_b, cat_b),
+        makeHostSimConfig(3, 4050, root_c, cat_c),
+    };
+    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+
+    var cluster = try MetadataHttpClusterSimulation.init(std.testing.allocator, 4050, &configs, &deps);
+    defer cluster.deinit();
+    cluster.setDataPlaneOwnership(.external);
+    try cluster.startAll();
+    defer cluster.stopAll();
+    try cluster.bootstrapMetadataReplicas();
+    const leader_index = (try cluster.waitForMetadataLeader(24)) orelse return error.TestExpectedEqual;
+    try cluster.node(leader_index).campaignMetadataGroup();
+    try cluster.stepAll();
+    try cluster.publishClusterNodes(leader_index);
+
+    var workflow = metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
+    defer workflow.deinit();
+    const summary = try workflow.createTable(&cluster.node(leader_index), .{
+        .table_id = 46,
+        .name = "external_docs",
+        .desired_replica_count = 3,
+        .min_ranges = 1,
+    }, .{
+        .group_id = 4601,
+        .table_id = 46,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    });
+    try std.testing.expectEqual(@as(usize, 3), summary.placement_upserts);
+    for (0..8) |_| try cluster.stepAll();
+
+    const intents = try cluster.node(leader_index).listProjectedPlacementIntents(std.testing.allocator);
+    defer cluster.node(leader_index).freeProjectedPlacementIntents(std.testing.allocator, intents);
+    try std.testing.expectEqual(@as(usize, 3), intents.len);
+    const factories = [_]*TestDescriptorFactory{ &factory_a, &factory_b, &factory_c };
+    for (0..3) |index| {
+        try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(index).status(4601));
+        try std.testing.expect(!factories[index].group_stores.contains(4601));
+    }
 }
 
 test "metadata http cluster simulation serves public lifecycle from a non-host node after public create" {

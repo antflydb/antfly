@@ -889,6 +889,13 @@ VOPR work has found concrete production and harness defects:
   native descriptor observer. It now supports caller-owned backend-neutral
   lanes, preserves bounded admission, and fails closed when native disconnect
   observation is requested from a backend that cannot provide it.
+- The metadata HTTP test runtime accepted a caller's `std.Io` but did not tell
+  httpx to borrow it for accept and connection work. A VOPR composition could
+  therefore place the listener on a hidden Threaded runtime and observe
+  deterministic clients failing with `ConnectionRefused` while work escaped
+  the selected schedule. The runtime now borrows the supplied I/O, disables
+  host-only timeouts and descriptor observation, and keeps bounded connection
+  admission inside the caller's capability domain.
 - Borrowed HTTP runtimes could not observe a peer reset because the native
   descriptor observer cannot inspect virtual socket handles; DataServer
   consequently disabled hard-disconnect cancellation under deterministic I/O.
@@ -1457,6 +1464,22 @@ implemented runtime foundation with incomplete composition breadth; and the
 event-query layer is implemented for current filters/temporal predicates while
 the richer cross-run set algebra remains future work.
 
+The word **fully** is consequently never implicit. The conformance audit is:
+
+| Claim class | Audit result | Explicit exclusion |
+| --- | --- | --- |
+| Named VOPR engine/tooling features | **Implemented at the registered in-process `std.Io` boundary.** `vopr-engine-test` and `vopr-determinism-audit` pass at this checkpoint | Arbitrary guest-kernel RNG/syscall interception, uninstrumented native libraries, and separate process address spaces |
+| Rows labeled integrated | **Implemented for the production seam, schedules, properties, and exact-replay gate named in that row** | Residual work stated in the row and combinations with other independently tested domains |
+| Rows labeled partially integrated | **Not complete end to end** | Promotion requires the remaining public/deployment composition and its replay gate |
+| Local results/index/corpus tooling | **Implemented as repository-owned commands and formats** | Nightly sharding, retention policy, notifications, dashboards, and routine quarantine review |
+| Antithesis parity | **Not claimed** | Hosted orchestration/UI, deterministic execution of arbitrary containers or kernels, and operational service parity |
+
+This is the answer to “have we fully implemented what we call finished?”: yes
+for each narrowly stated integrated contract, based on its focused executing
+gate; no for the overall roadmap, Antithesis product parity, or any residual
+work named beside that contract. A broader sentence must not erase those
+boundaries.
+
 HA, per-group Raft, LSM/WAL/LMDB/persistent/index-manager/DB-split, metadata
 distributed data, the deployment-shaped full cluster, and the newer P0/P1/P2
 boundary suites are implemented at the exact production seams and modes stated
@@ -1491,7 +1514,7 @@ implements the analogous application-level fault domains inside a registered
 | Requirement | Current status | Remaining work |
 | --- | --- | --- |
 | Deterministic multi-node runtime, clocks, links, storage, restart, resources, replay, and quiet suffix | **Integrated foundation.** The reusable deployment composer registers node/role/domain/fault/quiet obligations; metadata, Raft, HA, transaction, data-plane, and full-cluster gates exercise complementary real owners | Adopt the manifest in the remaining distributed suites and maintain fail-closed audits as new owners appear |
-| Metadata quorum, production `DataServer` replicas, public clients, and real HTTP/Raft transport in one history | **Partially integrated across two complementary histories.** Full-cluster v9 sends serialized metadata/placement Raft frames through deterministic link policy and real `httpx`/`VoprIo` sockets, drives three production public API listeners over hosted node-local roots plus the serverless catalog listener, injects three distinct production resource managers, exact-replays aggregate node-memory denial/recovery, public graph requests across an in-flight range-leader restart and range merge, and a real fanout transport failure with fail-closed 503/recovery, and proves registered cluster quiescence. It does not instantiate `DataServer` or its data-Raft apply owner. Separately, `data-server-transition-vopr-test` runs three production `DataServer` owners and three replicated groups over time, chaining merge into split with real public HTTP/Raft listeners, leader transfer, a post-bootstrap public write, replicated delta catch-up/finalize, owner restart, routed terminal retry, document/range equality, and every-replica transition/watermark convergence on one `VoprIo` | Substitute the proven production owners into the full-cluster history so active split actions forward against the real metadata quorum; add disjoint donor/receiver placement, bounded retained-history paging, snapshot-install DB/derived-state rehydration, derived graph/index equality, partitions, disk/socket pressure, and richer overlapping failures |
+| Metadata quorum, production `DataServer` replicas, public clients, and real HTTP/Raft transport in one history | **Partially integrated across two complementary histories.** Full-cluster v9 sends serialized metadata/placement Raft frames through deterministic link policy and real `httpx`/`VoprIo` sockets, drives three production public API listeners over hosted node-local roots plus the serverless catalog listener, injects three distinct production resource managers, exact-replays aggregate node-memory denial/recovery, public graph requests across an in-flight range-leader restart and range merge, and a real fanout transport failure with fail-closed 503/recovery, and proves registered cluster quiescence. It does not instantiate `DataServer` or its data-Raft apply owner. Separately, `data-server-transition-vopr-test` runs three production `DataServer` owners and three replicated groups over time, chaining merge into split with real public HTTP/Raft listeners, leader transfer, a post-bootstrap public write, replicated delta catch-up/finalize, owner restart, routed terminal retry, document/range equality, and every-replica transition/watermark convergence on one `VoprIo`. The metadata harness now also has a focused regression-tested external-data-plane ownership mode: metadata replicas continue to reconcile while authoritative data placements remain projected without creating same-identity shadow replicas. This is the required handoff foundation, not the completed substitution | Instantiate the proven production owners behind that metadata-only handoff in the full-cluster history so active split actions forward against the real metadata quorum; add disjoint donor/receiver placement, bounded retained-history paging, snapshot-install DB/derived-state rehydration, derived graph/index equality, partitions, disk/socket pressure, and richer overlapping failures |
 | Serverless worker output through its production public catalog and ownership graph | **Integrated at the stated seam.** The production worker, durable lease, object stores, catalog service, HTTP handler/listener, and public client share one `VoprIo`. Every mode lists the worker-created table and queries the published head/documents; stale generation remains fenced. This correctly retains the distinct serverless object and metadata placement catalogs | Overlap serverless lease/object-store failures with metadata topology and node-resource faults, then add multi-worker placement when production owns that topology |
 | HA, data-plane, metadata, public API, and serverless owners all co-resident | **Ongoing.** Each domain has an integrated exact-replay suite; they do not yet all coexist in one history | Build one bounded deployment composition and cluster-wide recovery oracle without duplicating business logic |
 | Public distributed graph request from HTTP planning through fanout/hydration | **Partially integrated.** Full-cluster v9 executes a public depth-two graph traversal across two ranges through real HTTP, planning, internal expansion fanout, and canonical response assembly. Production-neutral lifecycle events pause after the first consistent round. One mode restarts the actual second-range leader and requires the resumed request's complete result; another cuts the real internal transport and requires a typed retryable 503 before a complete retry; the ninth runs a production `MergeCoordinator` across the actual donor/receiver leader roots, requires topology churn to fail closed, finalizes the merge, and requires the recovered route's complete graph. The focused distributed suite separately covers optional hydration, topology retry/exhaustion, cancellation, stale generations, and authorization; the production DataServer seam now proves replicated split independently | Substitute that DataServer seam and add public range-split churn, then compose cancellation, authorization changes, and public hydration; add distributed joins and global queries with the same fail-closed publication rule |
@@ -1849,13 +1872,26 @@ ownership is released.
 | P2 integrated | Media-provider execution and runtime | `media-runtime-vopr-test` exact-replays production Antfly STT and OpenAI-compatible TTS HTTP success, malformed JSON, truncated bodies, logical timeout, POST retry, partial-startup rollback, nested and in-flight runtime replacement, and shutdown cancellation/drain on borrowed `VoprIo`. `httpx.Client` closes admission and drains committed requests before shared provider state is destroyed. Real codecs, models, and GPU execution remain differential/integration concerns. |
 | P2 integrated | Upgrade and compatibility campaigns | `upgrade-compatibility-vopr-test` exact-replays eighteen histories covering v1 HA golden replication/checkpoint/backup bytes, legacy and future data-directory admission, crash-before-rename recovery, v1 trace roundtrip and incompatible format/scenario versions, replay-proven v1-to-v2 fixture migration and semantic-change rejection, logical checkpoint restore/version/corruption, and legacy/future serverless head, v14 inventory, and v12 manifest artifacts. Outcomes are explicit forward completion, rollback/retry, or safe rejection. |
 
+The source-boundary audit also identifies four useful additions after the
+current P0 distributed composition. These are independent candidates, not
+prerequisites for the integrated rows above:
+
+| Priority | Area | Why it is still useful |
+| --- | --- | --- |
+| P1 | Production metadata-admin/control path | Drive the actual `MetadataService`/`MetadataHttpService` mutation path—including reallocation timestamps, leadership change, ambiguous admission, status reporting, and split/merge requests—over borrowed clocks and real metadata HTTP. Current distributed histories prove the underlying quorum and workflows, while some HTTP simulations intentionally use a harness source instead of the complete production service owner. |
+| P1 | MCP and A2A session/task state machines | Compose production session expiry, event-id replay, task reservation/generation fencing, cancellation races, bounded capacity, SSE disconnect/reconnect, and shutdown on `VoprIo`. Both libraries already accept caller-owned `std.Io`; the missing value is an Antfly-level public orchestration history, not another runtime abstraction. |
+| P2 | Cloud authentication and signed object requests | Put Google token refresh and S3/GCS signing immediately in front of the existing deterministic object-store response adapters. Exercise credential rotation, refresh collapse, clock skew, timeout-after-send, retry, cancellation, and stale-token rejection without contacting a cloud service. |
+| P2 | Extension invocation lifecycle | Extend the integrated extension install/configuration/startup histories through a real bounded Wasm invocation: concurrent configuration replacement, host-call cancellation, fuel/memory admission, trap, shutdown, and durable restart. Keep the Wasmtime engine itself differential; schedule the Antfly ownership and publication boundaries. |
+
 Replication backfill and the standalone/serverless supervisor were the first
 targets because they have the richest combinations of durable state,
 ownership, concurrency, and recovery; both are now integrated. The complete
 serverless workflow and DB/index request-race compositions are also
 integrated, as are the P2 provider, query, media, and compatibility suites.
-The full-cluster, query-cache, distributed-query, and generation/reranking
-campaigns are now integrated. Future test work is targeted composition,
+The query-cache and generation/reranking focused campaigns are integrated.
+The full-cluster and distributed-query campaigns remain partially integrated
+at the broader end-to-end boundary described in their rows, even though their
+named constituent histories pass. Future test work is targeted composition,
 workload dimensions, and newly exposed safe suspension points rather than
 missing scheduler or replay foundations.
 
@@ -1924,7 +1960,8 @@ work already completed:
 
 - extend the current conjunctive/temporal event queries into a reusable event-
   set algebra for joins, unions, differences, quantified sequences, and saved
-  queries across runs;
+  queries across runs, comparable to the newer
+  [Antithesis event-set model](https://antithesis.com/docs/reference/event-set-reference/);
 - make nightly campaign sharding, corpus merge, retention, quarantine review,
   usage indexing, and notifications a repository-owned operational workflow;
 - ingest source/basic-block coverage only as search guidance, with fail-closed
@@ -1940,6 +1977,15 @@ entrypoints, exact local artifacts, the line-oriented debugger, and ordinary
 native/container differential tests. Reimplementing a deterministic
 hypervisor or hosted UI would be the expensive part of Antithesis without
 improving the in-process scheduler's visibility.
+
+Antithesis also announced control of the guest kernel's internal random-number
+generator in its [August 2026 release
+notes](https://antithesis.com/docs/release_notes/). VOPR's self-contained
+equivalent is complete only for code that draws entropy through registered
+`std.Io.randomSecure` and passes the fail-closed source audit. Intercepting RNG
+inside an arbitrary unmodified native dependency or kernel is not implemented;
+it belongs with the conditional federated/native fidelity work, not under the
+integrated entropy claim.
 
 Deterministic distributed testing itself is therefore not an unported
 Antithesis engine feature: VOPR already supplies registered
@@ -2007,6 +2053,33 @@ Wait for a real product or toolchain requirement before adding:
 
 ### Ongoing Roadmap
 
+The shortest current summary is:
+
+1. **Finish the production-owned distributed history.** Use the completed
+   metadata-only ownership handoff to put the real three-`DataServer`/data-Raft
+   composition behind the real metadata quorum, public clients, and serverless
+   owner in one replayable deployment.
+2. **Deepen public distributed operations.** Add range-split churn, public
+   hydration, cancellation, authorization changes, joins, and global queries;
+   every incomplete fanout must continue to fail closed.
+3. **Compose independently proven fault domains.** Co-locate HA and the data
+   plane, add disk/socket pressure, and overlap link, storage, restart,
+   serverless lease/object-store, and resource faults under one quiet-suffix
+   oracle.
+4. **Broaden workloads at those same seams.** Add authenticated tenants,
+   remote-content secret rotation at actual request use, remote generation and
+   reranking adapters, production metadata-admin mutations, MCP/A2A
+   orchestration, cloud-auth refresh/signing, bounded extension invocation, and
+   client/background fairness.
+5. **Operationalize the self-contained platform.** Run sharded nightly
+   campaigns, deterministic corpus merges, retention/quarantine workflows,
+   usage indexing, notifications, dashboards, and search-quality regression
+   tracking.
+6. **Keep the expensive fidelity layers conditional.** Add compiler coverage,
+   datagrams, server TLS, live mixed binaries, or a federated process broker
+   only when their stated product/toolchain prerequisites exist. Do not build a
+   hosted UI or deterministic-hypervisor clone merely for nominal parity.
+
 1. Finish the P0 full-cluster data plane by substituting the already-proven
    three-owner production `DataServer` composition for the hosted
    table-source/API rig. The focused histories already cover rollback and fresh
@@ -2020,9 +2093,12 @@ Wait for a real product or toolchain requirement before adding:
    focused history now admits a new split generation, bootstraps it, performs a
    public post-bootstrap write, replays that delta after leader changes,
    finalizes cutover, restarts one owner, and verifies both ranges and all
-   documents before fresh-state replay. The full-cluster composition must now
-   substitute those owners so active transition commands route against the
-   real metadata quorum while public graph/serverless clients and faults remain
+   documents before fresh-state replay. The metadata harness now has a focused,
+   regression-tested external-data-plane mode that keeps metadata replicas live
+   while refusing to instantiate projected data placements as shadow hosted
+   replicas. The full-cluster composition must now put those production owners
+   behind that handoff so active transition commands route against the real
+   metadata quorum while public graph/serverless clients and faults remain
    co-scheduled. Then remove the current
    co-location assumption with disjoint donor/receiver replica sets, page
    retained delete-history replay within an explicit resource budget, inject

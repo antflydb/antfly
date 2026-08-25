@@ -31,6 +31,15 @@ pub const Runtime = struct {
         server.* = httpx.Server.initWithConfig(alloc, io, .{
             .host = "127.0.0.1",
             .port = 0,
+            // The caller owns the complete transport runtime. In particular,
+            // VOPR must not let metadata listeners silently allocate a
+            // Threaded accept/connection pool outside the selected schedule.
+            .header_read_timeout_ms = 0,
+            .body_read_timeout_ms = 0,
+            .response_write_timeout_ms = 0,
+            .max_connections = 64,
+            .borrow_http_runtime_io = true,
+            .h1_disconnect_cancellation = .disabled,
         });
         errdefer server.deinit();
         try admin.registerRoutes(server);
