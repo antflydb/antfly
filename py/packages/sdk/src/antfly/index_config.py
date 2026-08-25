@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
 from typing import Any, Literal
 
 MAX_ARTIFACT_SOURCES = 64
+_GRAPH_ARTIFACT_PATH = re.compile(r"^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$")
 
 
 def _validate_artifacts(artifacts: Sequence[object]) -> None:
@@ -123,6 +125,8 @@ def graph_index_sources(*sources: GraphArtifactSource) -> list[dict[str, Any]]:
     _validate_artifacts([source.artifact for source in sources])
     result: list[dict[str, Any]] = []
     for index, source in enumerate(sources):
+        if source.path is not None and _GRAPH_ARTIFACT_PATH.fullmatch(source.path) is None:
+            raise ValueError(f"sources[{index}].path must be $, a dot-separated field path, or end in [*]")
         if source.format not in ("extraction_relation", "extraction_graph"):
             raise ValueError(f"sources[{index}].format is invalid")
         if source.nodes is not None and source.nodes.model not in ("document", "external"):

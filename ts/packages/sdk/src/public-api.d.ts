@@ -9314,6 +9314,7 @@ export interface components {
         /** @description Artifact stream materialized into graph edges. */
         GraphArtifactSourceConfig: {
             artifact: string;
+            /** @description Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`. */
             path?: string;
             /**
              * @default extraction_relation

@@ -188,6 +188,13 @@ pub fn graph_index_sources(
 ) -> Result<Vec<GraphIndexSourceSpec>, IndexConfigError> {
     validate_artifact_names(sources.iter().map(|source| source.artifact.as_str()))?;
     for (source_index, source) in sources.iter().enumerate() {
+        if let Some(path) = source.path.as_deref()
+            && !valid_graph_artifact_path(path)
+        {
+            return Err(IndexConfigError(format!(
+                "sources[{source_index}].path must be $, a dot-separated field path, or end in [*]"
+            )));
+        }
         if let Some(edge) = source.edge.as_ref() {
             for (field_name, value) in [
                 ("type", edge.edge_type.as_ref()),
@@ -220,6 +227,25 @@ pub fn graph_index_sources(
         }
     }
     Ok(sources)
+}
+
+fn valid_graph_artifact_path(path: &str) -> bool {
+    if path.is_empty() || path == "$" {
+        return true;
+    }
+    let Some(mut trimmed) = path.strip_prefix("$.") else {
+        return false;
+    };
+    if let Some(without_wildcard) = trimmed.strip_suffix("[*]") {
+        trimmed = without_wildcard;
+    }
+    !trimmed.is_empty()
+        && trimmed.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_')
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -608,6 +634,18 @@ mod tests {
             context: None,
         };
         assert!(graph_index_sources(vec![duplicate.clone(), duplicate]).is_err());
+        assert!(
+            graph_index_sources(vec![GraphIndexSourceSpec {
+                artifact: "relations".into(),
+                path: Some("$.relations[0]".into()),
+                format: None,
+                mention_edge_type: None,
+                nodes: None,
+                edge: None,
+                context: None,
+            }])
+            .is_err()
+        );
     }
 
     #[test]

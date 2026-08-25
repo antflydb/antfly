@@ -90,3 +90,5 @@ def test_graph_sources_reject_duplicates_and_invalid_values() -> None:
         graph_index_sources(GraphArtifactSource("same"), GraphArtifactSource("same"))
     with pytest.raises(ValueError, match="finite"):
         graph_index_sources(GraphArtifactSource("relations", edge=GraphEdgeMapping(weight=float("nan"))))
+    with pytest.raises(ValueError, match="path"):
+        graph_index_sources(GraphArtifactSource("relations", path="$.relations[0]"))

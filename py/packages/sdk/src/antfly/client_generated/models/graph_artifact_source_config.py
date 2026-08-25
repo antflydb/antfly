@@ -23,7 +23,8 @@ class GraphArtifactSourceConfig:
 
     Attributes:
         artifact (str):
-        path (str | Unset):
+        path (str | Unset): Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field
+            names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
         format_ (GraphArtifactSourceConfigFormat | Unset):  Default:
             GraphArtifactSourceConfigFormat.EXTRACTION_RELATION.
         mention_edge_type (str | Unset):

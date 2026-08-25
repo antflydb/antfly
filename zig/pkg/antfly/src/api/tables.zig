@@ -88,7 +88,7 @@ fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json
             }
             if (std.mem.startsWith(u8, name, "full_text_index")) return error.InvalidCreateTableRequest;
             const artifact_backed_full_text = is_full_text and config == .object and
-                (config.object.contains("artifact_name") or config.object.contains("enrichments"));
+                (config.object.contains("artifact_name") or config.object.contains("sources") or config.object.contains("enrichments"));
             if (is_full_text and !artifact_backed_full_text) continue;
         }
 
@@ -4318,6 +4318,17 @@ test "create table raw parser preserves artifact backed full text index" {
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"document_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"artifact_name\":\"document_chunks_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"enrichments\"") != null);
+}
+
+test "create table raw parser preserves source-only artifact full text index" {
+    var parsed = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"document_vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"}],\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3}]},\"document_text_union\":{\"type\":\"full_text\",\"field\":\"text\",\"sources\":[{\"artifact\":\"document_chunks_v1\"}]}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"document_text_union\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"sources\":[{\"artifact\":\"document_chunks_v1\"}]") != null);
 }
 
 test "create table raw parser accepts its canonical full text output" {

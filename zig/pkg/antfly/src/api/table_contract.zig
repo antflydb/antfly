@@ -693,9 +693,9 @@ fn validatePublicIndexFields(object: anytype, index_type: public_index_contract.
 fn isArtifactBackedFullTextIndex(object: anytype) bool {
     const Object = @TypeOf(object);
     if (@hasField(Object, "map")) {
-        return object.map.contains("artifact_name") or object.map.contains("enrichments");
+        return object.map.contains("artifact_name") or object.map.contains("sources") or object.map.contains("enrichments");
     }
-    return object.contains("artifact_name") or object.contains("enrichments");
+    return object.contains("artifact_name") or object.contains("sources") or object.contains("enrichments");
 }
 
 fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -1376,6 +1376,14 @@ test "table contract preserves artifact-backed public full text indexes" {
     defer std.testing.allocator.free(multi_source);
     try std.testing.expect(std.mem.indexOf(u8, multi_source, "\"field\":\"text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, multi_source, "\"sources\":[") != null);
+
+    var multi_source_table = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"document_vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"}],\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3}]},\"document_text_union\":{\"type\":\"full_text\",\"field\":\"text\",\"sources\":[{\"artifact\":\"document_chunks_v1\"}]}}}",
+    );
+    defer multi_source_table.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, multi_source_table.indexes_json.?, "\"document_text_union\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, multi_source_table.indexes_json.?, "\"sources\":[{\"artifact\":\"document_chunks_v1\"}]") != null);
 
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,

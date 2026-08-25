@@ -5078,7 +5078,7 @@ pub fn build(b: *std.Build) void {
         "api http server routes table query through read schema full text index",
         "api http server serves table query response envelope",
         "api http server executes public Query filter roots and compositions",
-        "public table query handler preserves structured filter diagnostics",
+        "public table query handler preserves structured filter and mixed-source diagnostics",
         "api http server serves retrieval agent response envelope",
         "api http server serves table batch writes",
         "api http server routes table batches through the batch commit hook",

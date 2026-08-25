@@ -18253,6 +18253,9 @@ components:
           minLength: 1
         path:
           type: string
+          pattern: ^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$
+          description: Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII
+            field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
         format:
           type: string
           enum:

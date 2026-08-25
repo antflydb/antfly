@@ -4340,6 +4340,7 @@ pub const GraphArtifactProducerSourceConfig = struct {
 /// Artifact stream materialized into graph edges.
 pub const GraphArtifactSourceConfig = struct {
     artifact: []const u8,
+    /// Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
     path: ?[]const u8 = null,
     format: ?[]const u8 = null,
     mention_edge_type: ?[]const u8 = null,

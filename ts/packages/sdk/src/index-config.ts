@@ -90,6 +90,14 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
   validateArtifactNames(sources.map((source) => source.artifact));
   sources.forEach((source, index) => {
     if (
+      source.path !== undefined &&
+      !/^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$/.test(source.path)
+    ) {
+      throw new TypeError(
+        `sources[${index}].path must be $, a dot-separated field path, or end in [*]`
+      );
+    }
+    if (
       source.format !== undefined &&
       source.format !== "extraction_relation" &&
       source.format !== "extraction_graph"

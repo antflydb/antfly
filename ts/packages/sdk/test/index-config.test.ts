@@ -91,5 +91,8 @@ describe("artifact embedding index configuration", () => {
     expect(() =>
       graphIndexSources({ artifact: "relations", edge: { weight: Number.NaN } })
     ).toThrow(/finite/);
+    expect(() => graphIndexSources({ artifact: "relations", path: "$.relations[0]" })).toThrow(
+      /path/
+    );
   });
 });

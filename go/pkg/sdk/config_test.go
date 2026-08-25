@@ -374,6 +374,9 @@ func TestNewGraphIndexSourcesValidatesAndCopies(t *testing.T) {
 	); err == nil {
 		t.Fatal("duplicate graph sources must be rejected")
 	}
+	if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{Artifact: "relations", Path: "$.relations[0]"}); err == nil {
+		t.Fatal("unsupported graph artifact paths must be rejected")
+	}
 }
 
 func TestNewArtifactFullTextIndexConfig(t *testing.T) {

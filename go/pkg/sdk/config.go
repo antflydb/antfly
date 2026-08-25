@@ -383,6 +383,9 @@ func NewGraphIndexSources(sources ...GraphArtifactSourceConfig) ([]GraphArtifact
 		if source.Artifact == "" {
 			return nil, fmt.Errorf("sources[%d].artifact is required", i)
 		}
+		if !validGraphArtifactPath(source.Path) {
+			return nil, fmt.Errorf("sources[%d].path must be $, a dot-separated field path, or end in [*]", i)
+		}
 		if _, exists := seen[source.Artifact]; exists {
 			return nil, fmt.Errorf("duplicate graph artifact source %q", source.Artifact)
 		}
@@ -418,6 +421,31 @@ func NewGraphIndexSources(sources ...GraphArtifactSourceConfig) ([]GraphArtifact
 		seen[source.Artifact] = struct{}{}
 	}
 	return result, nil
+}
+
+func validGraphArtifactPath(path string) bool {
+	if path == "" || path == "$" {
+		return true
+	}
+	if !strings.HasPrefix(path, "$.") {
+		return false
+	}
+	trimmed := strings.TrimPrefix(path, "$.")
+	trimmed = strings.TrimSuffix(trimmed, "[*]")
+	if trimmed == "" {
+		return false
+	}
+	for _, part := range strings.Split(trimmed, ".") {
+		if part == "" {
+			return false
+		}
+		for _, ch := range []byte(part) {
+			if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // ArtifactEmbeddingSource describes one generated embedding artifact stream
