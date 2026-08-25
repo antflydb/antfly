@@ -3629,7 +3629,7 @@ func haPrimaryRoutePlannedAction(evaluation haPrimaryRouteEvaluation, status *an
 		Reason:          evaluation.Reason,
 	}
 	if status != nil {
-		action.TargetLSN = status.PrimaryLSN
+		action.TargetLSN = haPrimaryRouteTargetLSN(status, evaluation.DesiredTarget)
 		if action.FenceAuthority == "" {
 			action.FenceAuthority = status.Fencing.Authority
 		}
@@ -3640,6 +3640,18 @@ func haPrimaryRoutePlannedAction(evaluation haPrimaryRouteEvaluation, status *an
 		action.StandbyName = evaluation.DesiredTarget
 	}
 	return action
+}
+
+// haPrimaryRouteTargetLSN keeps route publication bound to the immutable
+// promotion transaction. The promoted primary may advance immediately after
+// takeover; using its current LSN would make the regenerated route action stop
+// matching the durable promotion receipt and permanently fail closed.
+func haPrimaryRouteTargetLSN(status *antflyv1.HAStatus, desiredTarget string) uint64 {
+	if promotion := haPromotionReceipt(status); promotion != nil &&
+		strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(desiredTarget) {
+		return haPromotionRequiredLSN(promotion)
+	}
+	return status.PrimaryLSN
 }
 
 func haHasPlannedAction(actions []haPlannedAction, kind haActionKind) bool {

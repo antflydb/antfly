@@ -5265,7 +5265,9 @@ func TestUpdateHAStatusRendersFormerPrimaryRejoinCommandsWithReceipt(t *testing.
 func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 	cluster := haCluster()
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
-		PrimaryLSN: 12,
+		// The new primary is allowed to advance after the promotion receipt is
+		// committed. Route publication must remain bound to that receipt's LSN.
+		PrimaryLSN: 13,
 		PrimaryRoute: antflyv1.HAPrimaryRouteStatus{
 			CurrentTarget: "primary",
 		},
@@ -5297,6 +5299,7 @@ func TestUpdateHAStatusPlansPrimaryRouteAfterCompletedPromotion(t *testing.T) {
 	if !ok ||
 		routeAction.RouteFrom != "primary" ||
 		routeAction.RouteTo != "standby-a" ||
+		routeAction.TargetLSN != 12 ||
 		routeAction.FenceAuthority != antflyv1.HAFencingAuthorityKubernetesLease ||
 		routeAction.FenceGeneration != 5 ||
 		routeAction.FenceReason != "operator-approved" {
