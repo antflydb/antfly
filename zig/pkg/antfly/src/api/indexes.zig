@@ -950,9 +950,6 @@ fn appendPublicIndexConfig(
         if (source != .object) break :blk null;
         const artifact = source.object.get("artifact") orelse break :blk null;
         if (artifact != .string or artifact.string.len == 0) break :blk null;
-        if (source.object.get("kind")) |kind| {
-            if (kind != .string or !std.mem.eql(u8, kind.string, "artifact")) break :blk null;
-        }
         break :blk source;
     } else null;
     const single_embedding_artifact = if (!has_sources and index_type == .embeddings) blk: {
@@ -968,7 +965,7 @@ fn appendPublicIndexConfig(
         }
     } else if (single_graph_source) |source| {
         try out.appendSlice(alloc, ",\"sources\":");
-        try appendCanonicalSingleGraphSource(alloc, out, config, source);
+        try appendCanonicalSingleGraphSource(alloc, out, source);
     } else if (single_embedding_artifact) |artifact| {
         try out.appendSlice(alloc, ",\"sources\":[{\"artifact\":");
         try appendJsonString(alloc, out, artifact.string);
@@ -980,11 +977,7 @@ fn appendPublicIndexConfig(
         if (std.mem.eql(u8, entry.key_ptr.*, "name") or
             std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.incarnation_field)) continue;
         if (single_full_text_artifact != null and std.mem.eql(u8, entry.key_ptr.*, "artifact_name")) continue;
-        if (single_graph_source != null and
-            (std.mem.eql(u8, entry.key_ptr.*, "source") or
-                std.mem.eql(u8, entry.key_ptr.*, "nodes") or
-                std.mem.eql(u8, entry.key_ptr.*, "edge") or
-                std.mem.eql(u8, entry.key_ptr.*, "context"))) continue;
+        if (single_graph_source != null and std.mem.eql(u8, entry.key_ptr.*, "source")) continue;
         if (single_embedding_artifact != null and
             (std.mem.eql(u8, entry.key_ptr.*, "embedding_name") or
                 std.mem.eql(u8, entry.key_ptr.*, "source_artifact_name"))) continue;
@@ -1016,7 +1009,6 @@ fn appendPublicIndexConfig(
 fn appendCanonicalSingleGraphSource(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
-    config: std.json.Value,
     source: std.json.Value,
 ) !void {
     try out.appendSlice(alloc, "[{");
@@ -1024,7 +1016,6 @@ fn appendCanonicalSingleGraphSource(
     var it = source.object.iterator();
     while (it.next()) |entry| {
         if (!public_index_contract.isAllowedGraphArtifactSourceField(entry.key_ptr.*)) continue;
-        if (std.mem.eql(u8, entry.key_ptr.*, "kind")) continue;
         if (!public_index_contract.createdFieldValueMatches(.graph_source, entry.key_ptr.*, entry.value_ptr.*)) continue;
         const child_shape = public_index_contract.createdObjectShapeForChild(.graph_source, entry.key_ptr.*);
         if (!public_index_contract.createdValueMatchesShape(child_shape, entry.value_ptr.*)) continue;
@@ -1033,23 +1024,6 @@ fn appendCanonicalSingleGraphSource(
         try appendJsonString(alloc, out, entry.key_ptr.*);
         try out.append(alloc, ':');
         try appendPublicConfigValue(alloc, out, entry.value_ptr.*, entry.key_ptr.*, child_shape);
-    }
-    const mappings = [_]struct { name: []const u8, shape: public_index_contract.CreatedObjectShape }{
-        .{ .name = "nodes", .shape = .graph_nodes },
-        .{ .name = "edge", .shape = .graph_edge },
-        .{ .name = "context", .shape = .graph_context },
-    };
-    for (mappings) |mapping| {
-        if (source.object.get(mapping.name)) |nested| {
-            if (nested != .null) continue;
-        }
-        const value = config.object.get(mapping.name) orelse continue;
-        if (!public_index_contract.createdValueMatchesShape(mapping.shape, value)) continue;
-        if (!first) try out.append(alloc, ',');
-        first = false;
-        try appendJsonString(alloc, out, mapping.name);
-        try out.append(alloc, ':');
-        try appendPublicConfigValue(alloc, out, value, mapping.name, mapping.shape);
     }
     try out.appendSlice(alloc, "}]");
 }
@@ -4731,7 +4705,7 @@ test "public index config encoders omit root write-only producer documents" {
 
 test "created graph index response projects closed nested schemas" {
     const config =
-        \\{"type":"graph","template":{"client_value":"private-root-value"},"source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":{"client_value":"private-format-value"},"client_value":"private-source-value","settings":{"opaque":"private-source-settings"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}","client_value":"private-source-value"},"content_type":{"client_value":"private-content-type"},"producer_json":{"provider":"private","api_key":"private-key"},"execution":{"batch_items":8,"settings":{"opaque":"private-execution-settings"}},"client_value":"private-artifact-value","settings":{"opaque":"private-artifact-settings"}},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}","client_value":"private-node-value"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","api_key":"private-metadata-key","nested":{"label":"public","authorization":"private-authorization"}},"client_value":"private-edge-mapping-value"},"context":{"doc_fields":["title","body"],"client_value":"private-context-value"},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":true,"client_value":"private-bounded-value"},"client_value":"private-planning-value"},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"],"client_value":"private-edge-value"},{"name":"malformed","required_metadata":{"client_value":"private-metadata-value"}},{"name":{"client_value":"private-required-value"}}],"resolvers":["private-malformed-resolver",{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix","candidate_limit":{"client_value":"private-limit-value"},"client_value":"private-resolver-value","settings":{"opaque":"private-resolver-settings"}}]}
+        \\{"type":"graph","template":{"client_value":"private-root-value"},"source":{"artifact":"relations_v1","path":"$.relations[*]","format":{"client_value":"private-format-value"},"client_value":"private-source-value","settings":{"opaque":"private-source-settings"},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}","client_value":"private-node-value"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","api_key":"private-metadata-key","nested":{"label":"public","authorization":"private-authorization"}},"client_value":"private-edge-mapping-value"},"context":{"doc_fields":["title","body"],"client_value":"private-context-value"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}","client_value":"private-source-value"},"content_type":{"client_value":"private-content-type"},"producer_json":{"provider":"private","api_key":"private-key"},"execution":{"batch_items":8,"settings":{"opaque":"private-execution-settings"}},"client_value":"private-artifact-value","settings":{"opaque":"private-artifact-settings"}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":true,"client_value":"private-bounded-value"},"client_value":"private-planning-value"},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"],"client_value":"private-edge-value"},{"name":"malformed","required_metadata":{"client_value":"private-metadata-value"}},{"name":{"client_value":"private-required-value"}}],"resolvers":["private-malformed-resolver",{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix","candidate_limit":{"client_value":"private-limit-value"},"client_value":"private-resolver-value","settings":{"opaque":"private-resolver-settings"}}]}
     ;
     const expected =
         \\{"name":"relations_graph","type":"graph","sources":[{"artifact":"relations_v1","path":"$.relations[*]","nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","nested":{"label":"public"}}},"context":{"doc_fields":["title","body"]}}],"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"execution":{"batch_items":8}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"]},{"name":"malformed"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}

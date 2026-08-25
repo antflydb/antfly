@@ -16690,6 +16690,17 @@ components:
           description: Stable name of a generated chunk or asset artifact stream.
     FullTextIndexConfig:
       type: object
+      not:
+        anyOf:
+          - required:
+              - sources
+              - artifact_name
+          - required:
+              - sources
+              - field
+          - required:
+              - artifact_name
+              - field
       properties:
         sources:
           type: array
@@ -17968,6 +17979,26 @@ components:
         vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index
         (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be
         auto-detected.
+      not:
+        anyOf:
+          - required:
+              - sources
+              - external
+          - required:
+              - sources
+              - field
+          - required:
+              - sources
+              - template
+          - required:
+              - sources
+              - chunker
+          - required:
+              - sources
+              - embedding_name
+          - required:
+              - sources
+              - source_artifact_name
       properties:
         coverage_policy:
           $ref: '#/components/schemas/DerivedCoveragePolicy'
@@ -18013,9 +18044,8 @@ components:
         embedding_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          deprecated: true
-          description: Deprecated single-source artifact reference. Use sources with a matching embedding
-            enrichment; accepted requests are normalized to sources.
+          description: Single-source convenience form. Mutually exclusive with sources; accepted requests
+            are normalized to sources.
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -18133,13 +18163,6 @@ components:
         - artifact
       description: Artifact stream materialized into graph edges.
       properties:
-        kind:
-          type: string
-          enum:
-            - artifact
-          deprecated: true
-          description: Compatibility discriminator for the former graph source union. Omit it; artifact
-            is the only public source kind.
         artifact:
           type: string
           minLength: 1
@@ -18354,6 +18377,10 @@ components:
     GraphIndexConfig:
       type: object
       description: Configuration for graph index type
+      not:
+        required:
+          - sources
+          - source
       properties:
         sources:
           type: array
@@ -18363,8 +18390,8 @@ components:
           items:
             $ref: '#/components/schemas/GraphArtifactSourceConfig'
           x-go-type-skip-optional-pointer: true
-          description: Chunk or JSON asset streams whose edge-like values are unioned into this graph
-            index.
+          description: Ordered chunk or JSON asset streams whose edge-like values are unioned into this
+            graph index. Earlier sources win when multiple sources materialize the same edge identity.
         summarizer:
           description: Configuration for generating node summaries (enables tree navigation in Retrieval
             Agent)
@@ -18397,21 +18424,6 @@ components:
           $ref: '#/components/schemas/GraphArtifactSourceConfig'
         artifact:
           $ref: '#/components/schemas/GraphArtifactProducerConfig'
-        nodes:
-          deprecated: true
-          description: Deprecated root-level single-source mapping. Put nodes inside source or each sources
-            item.
-          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
-        edge:
-          deprecated: true
-          description: Deprecated root-level single-source mapping. Put edge inside source or each sources
-            item.
-          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
-        context:
-          deprecated: true
-          description: Deprecated root-level single-source mapping. Put context inside source or each
-            sources item.
-          $ref: '#/components/schemas/GraphArtifactContextConfig'
         algebraic_planning:
           $ref: '#/components/schemas/GraphAlgebraicPlanningConfig'
         resolvers:

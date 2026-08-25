@@ -317,7 +317,6 @@ from .graph_artifact_producer_source_config import GraphArtifactProducerSourceCo
 from .graph_artifact_producer_source_config_type import GraphArtifactProducerSourceConfigType
 from .graph_artifact_source_config import GraphArtifactSourceConfig
 from .graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
-from .graph_artifact_source_config_kind import GraphArtifactSourceConfigKind
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
 from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
 from .graph_index_config import GraphIndexConfig
@@ -1150,7 +1149,6 @@ __all__ = (
     "GraphArtifactProducerSourceConfigType",
     "GraphArtifactSourceConfig",
     "GraphArtifactSourceConfigFormat",
-    "GraphArtifactSourceConfigKind",
     "GraphBoundedTraversalConfig",
     "GraphBoundedTraversalConfigLaw",
     "GraphIndexConfig",

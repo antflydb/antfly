@@ -12,9 +12,6 @@ if TYPE_CHECKING:
     from ..models.edge_type_config import EdgeTypeConfig
     from ..models.generator_config import GeneratorConfig
     from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
-    from ..models.graph_artifact_context_config import GraphArtifactContextConfig
-    from ..models.graph_artifact_edge_mapping_config import GraphArtifactEdgeMappingConfig
-    from ..models.graph_artifact_node_mapping_config import GraphArtifactNodeMappingConfig
     from ..models.graph_artifact_producer_config import GraphArtifactProducerConfig
     from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
     from ..models.graph_resolver_config import GraphResolverConfig
@@ -28,8 +25,8 @@ class GraphIndexConfig:
     """Configuration for graph index type
 
     Attributes:
-        sources (list[GraphArtifactSourceConfig] | Unset): Chunk or JSON asset streams whose edge-like values are
-            unioned into this graph index.
+        sources (list[GraphArtifactSourceConfig] | Unset): Ordered chunk or JSON asset streams whose edge-like values
+            are unioned into this graph index. Earlier sources win when multiple sources materialize the same edge identity.
         summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
              Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
         template (str | Unset): Handlebars template for generating summarizer input text.
@@ -41,11 +38,6 @@ class GraphIndexConfig:
         max_edges_per_document (int | Unset): Maximum number of edges per document (0 = unlimited)
         source (GraphArtifactSourceConfig | Unset): Artifact stream materialized into graph edges.
         artifact (GraphArtifactProducerConfig | Unset): Asset producer used by an artifact-backed graph index.
-        nodes (GraphArtifactNodeMappingConfig | Unset): Maps each artifact item to graph node identifiers.
-        edge (GraphArtifactEdgeMappingConfig | Unset): Maps each artifact item to an edge type, weight, and public
-            metadata.
-        context (GraphArtifactContextConfig | Unset): Document fields made available to graph mapping templates through
-            `_doc.value`.
         algebraic_planning (GraphAlgebraicPlanningConfig | Unset): Optional algebraic planning features for graph
             traversal.
         resolvers (list[GraphResolverConfig] | Unset):
@@ -58,9 +50,6 @@ class GraphIndexConfig:
     max_edges_per_document: int | Unset = UNSET
     source: GraphArtifactSourceConfig | Unset = UNSET
     artifact: GraphArtifactProducerConfig | Unset = UNSET
-    nodes: GraphArtifactNodeMappingConfig | Unset = UNSET
-    edge: GraphArtifactEdgeMappingConfig | Unset = UNSET
-    context: GraphArtifactContextConfig | Unset = UNSET
     algebraic_planning: GraphAlgebraicPlanningConfig | Unset = UNSET
     resolvers: list[GraphResolverConfig] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -96,18 +85,6 @@ class GraphIndexConfig:
         if not isinstance(self.artifact, Unset):
             artifact = self.artifact.to_dict()
 
-        nodes: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.nodes, Unset):
-            nodes = self.nodes.to_dict()
-
-        edge: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.edge, Unset):
-            edge = self.edge.to_dict()
-
-        context: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.context, Unset):
-            context = self.context.to_dict()
-
         algebraic_planning: dict[str, Any] | Unset = UNSET
         if not isinstance(self.algebraic_planning, Unset):
             algebraic_planning = self.algebraic_planning.to_dict()
@@ -136,12 +113,6 @@ class GraphIndexConfig:
             field_dict["source"] = source
         if artifact is not UNSET:
             field_dict["artifact"] = artifact
-        if nodes is not UNSET:
-            field_dict["nodes"] = nodes
-        if edge is not UNSET:
-            field_dict["edge"] = edge
-        if context is not UNSET:
-            field_dict["context"] = context
         if algebraic_planning is not UNSET:
             field_dict["algebraic_planning"] = algebraic_planning
         if resolvers is not UNSET:
@@ -154,9 +125,6 @@ class GraphIndexConfig:
         from ..models.edge_type_config import EdgeTypeConfig
         from ..models.generator_config import GeneratorConfig
         from ..models.graph_algebraic_planning_config import GraphAlgebraicPlanningConfig
-        from ..models.graph_artifact_context_config import GraphArtifactContextConfig
-        from ..models.graph_artifact_edge_mapping_config import GraphArtifactEdgeMappingConfig
-        from ..models.graph_artifact_node_mapping_config import GraphArtifactNodeMappingConfig
         from ..models.graph_artifact_producer_config import GraphArtifactProducerConfig
         from ..models.graph_artifact_source_config import GraphArtifactSourceConfig
         from ..models.graph_resolver_config import GraphResolverConfig
@@ -205,27 +173,6 @@ class GraphIndexConfig:
         else:
             artifact = GraphArtifactProducerConfig.from_dict(_artifact)
 
-        _nodes = d.pop("nodes", UNSET)
-        nodes: GraphArtifactNodeMappingConfig | Unset
-        if isinstance(_nodes, Unset):
-            nodes = UNSET
-        else:
-            nodes = GraphArtifactNodeMappingConfig.from_dict(_nodes)
-
-        _edge = d.pop("edge", UNSET)
-        edge: GraphArtifactEdgeMappingConfig | Unset
-        if isinstance(_edge, Unset):
-            edge = UNSET
-        else:
-            edge = GraphArtifactEdgeMappingConfig.from_dict(_edge)
-
-        _context = d.pop("context", UNSET)
-        context: GraphArtifactContextConfig | Unset
-        if isinstance(_context, Unset):
-            context = UNSET
-        else:
-            context = GraphArtifactContextConfig.from_dict(_context)
-
         _algebraic_planning = d.pop("algebraic_planning", UNSET)
         algebraic_planning: GraphAlgebraicPlanningConfig | Unset
         if isinstance(_algebraic_planning, Unset):
@@ -250,9 +197,6 @@ class GraphIndexConfig:
             max_edges_per_document=max_edges_per_document,
             source=source,
             artifact=artifact,
-            nodes=nodes,
-            edge=edge,
-            context=context,
             algebraic_planning=algebraic_planning,
             resolvers=resolvers,
         )

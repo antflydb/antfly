@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 
 from ..models.graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
-from ..models.graph_artifact_source_config_kind import GraphArtifactSourceConfigKind
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -24,8 +23,6 @@ class GraphArtifactSourceConfig:
 
     Attributes:
         artifact (str):
-        kind (GraphArtifactSourceConfigKind | Unset): Compatibility discriminator for the former graph source union.
-            Omit it; artifact is the only public source kind.
         path (str | Unset):
         format_ (GraphArtifactSourceConfigFormat | Unset):  Default:
             GraphArtifactSourceConfigFormat.EXTRACTION_RELATION.
@@ -38,7 +35,6 @@ class GraphArtifactSourceConfig:
     """
 
     artifact: str
-    kind: GraphArtifactSourceConfigKind | Unset = UNSET
     path: str | Unset = UNSET
     format_: GraphArtifactSourceConfigFormat | Unset = GraphArtifactSourceConfigFormat.EXTRACTION_RELATION
     mention_edge_type: str | Unset = UNSET
@@ -48,10 +44,6 @@ class GraphArtifactSourceConfig:
 
     def to_dict(self) -> dict[str, Any]:
         artifact = self.artifact
-
-        kind: str | Unset = UNSET
-        if not isinstance(self.kind, Unset):
-            kind = self.kind.value
 
         path = self.path
 
@@ -80,8 +72,6 @@ class GraphArtifactSourceConfig:
                 "artifact": artifact,
             }
         )
-        if kind is not UNSET:
-            field_dict["kind"] = kind
         if path is not UNSET:
             field_dict["path"] = path
         if format_ is not UNSET:
@@ -105,13 +95,6 @@ class GraphArtifactSourceConfig:
 
         d = dict(src_dict)
         artifact = d.pop("artifact")
-
-        _kind = d.pop("kind", UNSET)
-        kind: GraphArtifactSourceConfigKind | Unset
-        if isinstance(_kind, Unset):
-            kind = UNSET
-        else:
-            kind = GraphArtifactSourceConfigKind(_kind)
 
         path = d.pop("path", UNSET)
 
@@ -147,7 +130,6 @@ class GraphArtifactSourceConfig:
 
         graph_artifact_source_config = cls(
             artifact=artifact,
-            kind=kind,
             path=path,
             format_=format_,
             mention_edge_type=mention_edge_type,

@@ -7566,33 +7566,19 @@ fn runtimeAddGraphStateManifest(
 ) !void {
     const alloc = runtime.alloc;
     const generation = try graph_asset_state.coverageGeneration(raw);
-    if (generation) |value| if (value != expected_generation) return;
-    const entries: []graph_asset_state.Entry = if (generation != null) try graph_asset_state.decodeAlloc(alloc, raw) else &.{};
+    // Generation-less v0.2 manifests cannot distinguish a retained incarnation
+    // from debris left by a delete/recreate. Ordinary source replay rewrites
+    // them with authenticated payloads before they can become winners.
+    if (generation == null or generation.? != expected_generation) return;
+    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
     defer graph_asset_state.freeEntries(alloc, entries);
-    const legacy_keys: [][]u8 = if (generation == null) try graph_asset_state.decodeV020KeysAlloc(alloc, raw) else &.{};
-    defer graph_asset_state.freeKeys(alloc, legacy_keys);
-    const count = if (generation != null) entries.len else legacy_keys.len;
-    for (0..count) |entry_index| {
-        const key = if (generation != null) entries[entry_index].key else legacy_keys[entry_index];
-        const payload = if (generation != null)
-            try alloc.dupe(u8, entries[entry_index].value)
-        else legacy_payload: {
-            const stored = storeGetAlloc(runtime, key) catch |err| switch (err) {
-                std.mem.Allocator.Error.OutOfMemory => return err,
-                else => continue,
-            };
-            defer alloc.free(stored);
-            var decoded = enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, stored) catch |err| switch (err) {
-                std.mem.Allocator.Error.OutOfMemory => return err,
-                else => continue,
-            };
-            defer decoded.deinit(alloc);
-            if (!enrichment_artifact_codec.needsGraphGenerationBinding(stored) and decoded.generation != expected_generation) continue;
-            break :legacy_payload if (enrichment_artifact_codec.needsGraphGenerationBinding(stored))
-                try enrichment_artifact_codec.bindGraphEdgeGenerationAlloc(alloc, stored, expected_generation)
-            else
-                try alloc.dupe(u8, stored);
-        };
+    for (entries) |entry| {
+        const key = entry.key;
+        const payload = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(
+            alloc,
+            entry.value,
+            expected_generation,
+        )) orelse continue;
         errdefer alloc.free(payload);
         if (winners.map.getPtr(key)) |winner| {
             if (source_priority > winner.source_priority or
@@ -8422,7 +8408,7 @@ fn processMaterializedChunkDenseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashSource(text);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(text, ctx.request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -8647,7 +8633,7 @@ fn processMaterializedChunkSparseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashSource(text);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(text, ctx.request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -8745,7 +8731,7 @@ fn collectPlainDenseBatchItem(
         return null;
     };
     errdefer runtime.alloc.free(@constCast(source_text));
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     errdefer runtime.alloc.free(artifact_key);
@@ -8958,7 +8944,7 @@ fn processChunkedDenseWindow(
             }
 
             source_loop: for (source_set.sources) |*source| {
-                const source_hash = enrichment_artifact_codec.hashSource(source.text);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
                 if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -9439,7 +9425,7 @@ fn processDenseEmbedding(
         for (chunk_embeddings) |embedding| {
             if (embedding.vector.len > 0) try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, embedding.doc_key);
         }
-        try writeChunkEmbeddingArtifacts(runtime, request.doc_key, request.source_field, embedding_artifact_name, chunk_embeddings);
+        try writeChunkEmbeddingArtifacts(runtime, request.doc_key, request.source_field, request.producer_json, embedding_artifact_name, chunk_embeddings);
         try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         var expanded = try expandDenseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
         defer {
@@ -9503,7 +9489,7 @@ fn processDenseEmbedding(
         return;
     };
     defer runtime.alloc.free(source_text);
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
@@ -9604,7 +9590,7 @@ fn processSparseEmbedding(
         return;
     };
     defer runtime.alloc.free(source_text);
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
@@ -9655,7 +9641,7 @@ fn buildChunkDenseEmbeddingsFromSources(
         const chunk_key = try runtime.alloc.dupe(u8, source.key);
         var chunk_key_owned = true;
         errdefer if (chunk_key_owned) runtime.alloc.free(chunk_key);
-        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
         const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -9781,7 +9767,7 @@ fn buildChunkSparseEmbeddingsFromSources(
         const chunk_key = try runtime.alloc.dupe(u8, source.key);
         var chunk_key_owned = true;
         errdefer if (chunk_key_owned) runtime.alloc.free(chunk_key);
-        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
         const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -11630,6 +11616,7 @@ fn writeChunkEmbeddingArtifacts(
     runtime: *EnrichmentRuntime,
     parent_doc_key: []const u8,
     source_field: []const u8,
+    producer_json: []const u8,
     artifact_name: []const u8,
     embeddings: []derived_types.DerivedDenseEmbeddingWrite,
 ) !void {
@@ -11643,7 +11630,7 @@ fn writeChunkEmbeddingArtifacts(
             .artifact_name = artifact_name,
             .source_field = source_field,
             .source_key = embedding.doc_key,
-            .source_hash = try chunkArtifactSourceHash(runtime, embedding.doc_key, source_field),
+            .source_hash = try chunkArtifactSourceHash(runtime, embedding.doc_key, source_field, producer_json),
             .vector = embedding.vector,
         });
         embedding.artifact_key = artifact_key;
@@ -11722,7 +11709,7 @@ fn deleteStaleChunkArtifacts(
     return try stale_vector_keys.toOwnedSlice(runtime.alloc);
 }
 
-fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, source_field: []const u8) !?u64 {
+fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, source_field: []const u8, producer_json: []const u8) !?u64 {
     const raw = storeGetAlloc(runtime, chunk_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return null,
@@ -11734,7 +11721,7 @@ fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, s
     if (parsed.value != .object) return null;
     const source = parsed.value.object.get(source_field) orelse return null;
     if (source != .string) return null;
-    return enrichment_artifact_codec.hashSource(source.string);
+    return enrichment_artifact_codec.hashEmbeddingSource(source.string, producer_json);
 }
 
 fn chunkPayloadHasText(alloc: Allocator, payload: []const u8, source_field: []const u8) !bool {

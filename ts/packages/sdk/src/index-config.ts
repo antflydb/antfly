@@ -56,7 +56,10 @@ export function artifactFullTextIndexConfig(name: string, ...artifacts: string[]
   return { name, type: "full_text", sources: artifactIndexSources(...artifacts) };
 }
 
-/** Validates and copies graph sources, preserving per-source path and format. */
+/**
+ * Validates and copies ordered graph sources. Earlier sources win when more
+ * than one source materializes the same edge identity.
+ */
 export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSource[] {
   validateArtifactNames(sources.map((source) => source.artifact));
   sources.forEach((source, index) => {
@@ -132,10 +135,28 @@ export interface ArtifactEmbeddingSourceConfig {
   template?: string;
 }
 
-export interface ArtifactEmbeddingIndexOptions {
+interface ArtifactEmbeddingIndexOptionsBase {
   sources: ArtifactEmbeddingSourceConfig[];
   embedder: EmbedderConfig;
-  /** Dense dimension. Omit when the server can probe it; must be omitted for sparse indexes. */
+}
+
+export type ArtifactEmbeddingIndexOptions = ArtifactEmbeddingIndexOptionsBase &
+  (
+    | {
+        /** Dense is the default. Omit dimension when the server can probe it. */
+        sparse?: false;
+        dimension?: number;
+        distanceMetric?: NonNullable<EmbeddingsIndexConfig["distance_metric"]>;
+      }
+    | {
+        /** Sparse indexes reject dense-only dimension and distance settings at compile time. */
+        sparse: true;
+        dimension?: never;
+        distanceMetric?: never;
+      }
+  );
+
+interface RuntimeArtifactEmbeddingIndexOptions extends ArtifactEmbeddingIndexOptionsBase {
   dimension?: number;
   sparse?: boolean;
   distanceMetric?: NonNullable<EmbeddingsIndexConfig["distance_metric"]>;
@@ -149,37 +170,40 @@ export function artifactEmbeddingIndexConfig(
   name: string,
   options: ArtifactEmbeddingIndexOptions
 ): IndexConfig {
+  // Keep runtime checks for JavaScript consumers and values crossing an
+  // untyped boundary even though TypeScript callers get a discriminated union.
+  const runtimeOptions: RuntimeArtifactEmbeddingIndexOptions = options;
   if (name.length === 0) throw new TypeError("index name is required");
-  validateArtifactNames(options.sources.map((source) => source.artifact));
-  if (options.sparse && options.dimension !== undefined) {
+  validateArtifactNames(runtimeOptions.sources.map((source) => source.artifact));
+  if (runtimeOptions.sparse && runtimeOptions.dimension !== undefined) {
     throw new TypeError("dimension must be omitted for sparse embedding indexes");
   }
-  if (options.sparse && options.distanceMetric !== undefined) {
+  if (runtimeOptions.sparse && runtimeOptions.distanceMetric !== undefined) {
     throw new TypeError("distanceMetric must be omitted for sparse embedding indexes");
   }
   if (
-    options.dimension !== undefined &&
-    (!Number.isInteger(options.dimension) || options.dimension <= 0)
+    runtimeOptions.dimension !== undefined &&
+    (!Number.isInteger(runtimeOptions.dimension) || runtimeOptions.dimension <= 0)
   ) {
     throw new RangeError("dimension must be a positive integer");
   }
   if (
-    typeof (options.embedder as { provider?: unknown }).provider !== "string" ||
-    (options.embedder as { provider: string }).provider.length === 0
+    typeof (runtimeOptions.embedder as { provider?: unknown }).provider !== "string" ||
+    (runtimeOptions.embedder as { provider: string }).provider.length === 0
   ) {
     throw new TypeError("embedder.provider is required");
   }
   if (
-    options.distanceMetric !== undefined &&
-    options.distanceMetric !== "l2_squared" &&
-    options.distanceMetric !== "inner_product" &&
-    options.distanceMetric !== "cosine"
+    runtimeOptions.distanceMetric !== undefined &&
+    runtimeOptions.distanceMetric !== "l2_squared" &&
+    runtimeOptions.distanceMetric !== "inner_product" &&
+    runtimeOptions.distanceMetric !== "cosine"
   ) {
     throw new TypeError("distanceMetric is invalid");
   }
 
-  const sources = artifactIndexSources(...options.sources.map((source) => source.artifact));
-  const enrichments: EnrichmentConfig[] = options.sources.map((source, index) => {
+  const sources = artifactIndexSources(...runtimeOptions.sources.map((source) => source.artifact));
+  const enrichments: EnrichmentConfig[] = runtimeOptions.sources.map((source, index) => {
     const field = source.field ?? "text";
     if (field.length === 0 && (source.template?.length ?? 0) === 0) {
       throw new TypeError(`sources[${index}] requires field or template`);
@@ -195,7 +219,7 @@ export function artifactEmbeddingIndexConfig(
       ...(source.sourceArtifact !== undefined
         ? { source_artifact_name: source.sourceArtifact }
         : {}),
-      ...(options.dimension !== undefined ? { expected_dims: options.dimension } : {}),
+      ...(runtimeOptions.dimension !== undefined ? { expected_dims: runtimeOptions.dimension } : {}),
     };
   });
 
@@ -204,9 +228,11 @@ export function artifactEmbeddingIndexConfig(
     type: "embeddings",
     sources,
     enrichments,
-    embedder: options.embedder,
-    ...(options.sparse ? { sparse: true } : {}),
-    ...(options.dimension !== undefined ? { dimension: options.dimension } : {}),
-    ...(options.distanceMetric !== undefined ? { distance_metric: options.distanceMetric } : {}),
+    embedder: runtimeOptions.embedder,
+    ...(runtimeOptions.sparse ? { sparse: true } : {}),
+    ...(runtimeOptions.dimension !== undefined ? { dimension: runtimeOptions.dimension } : {}),
+    ...(runtimeOptions.distanceMetric !== undefined
+      ? { distance_metric: runtimeOptions.distanceMetric }
+      : {}),
   };
 }

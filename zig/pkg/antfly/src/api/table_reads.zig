@@ -18466,9 +18466,13 @@ test "provisioned table read source routes lookup and scan across ranges" {
     const right_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7002);
     defer alloc.free(right_path);
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
+    var left_db = try db_mod.DB.open(alloc, left_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+    });
     defer left_db.close();
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
+    var right_db = try db_mod.DB.open(alloc, right_path, .{
+        .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+    });
     defer right_db.close();
 
     try left_db.batch(.{
@@ -25464,23 +25468,35 @@ test "hosted cross-range graph query expands explicit local start keys" {
         \\{"relations_graph":{"type":"graph","edge_types":[{"name":"mentions"}]}}
     ;
 
-    var left_db = try db_mod.DB.open(alloc, left_path, .{});
-    defer left_db.close();
-    try left_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
-    try left_db.batch(.{
-        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
-        .sync_level = .write,
-    });
+    {
+        var left_db = try db_mod.DB.open(alloc, left_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
+        });
+        defer left_db.close();
+        try left_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
+        try left_db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
+            .sync_level = .full_index,
+        });
+    }
 
-    var right_db = try db_mod.DB.open(alloc, right_path, .{});
-    defer right_db.close();
-    try right_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
-    try right_db.batch(.{
-        .writes = &.{.{ .key = "zdoc:a", .value = "{\"title\":\"right\"}" }},
-        .sync_level = .write,
-    });
-    const graph_entry = right_db.core.graphIndex("relations_graph") orelse return error.IndexNotFound;
-    try graph_entry.index.addEdge("zdoc:a", "entity:ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
+    {
+        var right_db = try db_mod.DB.open(alloc, right_path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+        });
+        defer right_db.close();
+        try right_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
+        try right_db.batch(.{
+            .writes = &.{.{ .key = "zdoc:a", .value = "{\"title\":\"right\"}" }},
+            .graph_writes = &.{.{
+                .index_name = "relations_graph",
+                .source = "zdoc:a",
+                .target = "entity:ada",
+                .edge_type = "mentions",
+            }},
+            .sync_level = .full_index,
+        });
+    }
 
     const FakeCatalog = struct {
         const statuses = [_]metadata_reconciler.MergedGroupStatus{

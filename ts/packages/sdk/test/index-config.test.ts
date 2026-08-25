@@ -45,6 +45,7 @@ describe("artifact embedding index configuration", () => {
   it("rejects duplicate sources and invalid sparse options", () => {
     expect(() => artifactIndexSources("same", "same")).toThrow(/duplicate/);
     expect(() =>
+      // @ts-expect-error Sparse configurations reject dense-only dimensions.
       artifactEmbeddingIndexConfig("sparse", {
         sources: [{ artifact: "tokens_v1" }],
         embedder: { provider: "antfly", model: "splade" },

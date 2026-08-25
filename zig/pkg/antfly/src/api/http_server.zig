@@ -30159,7 +30159,7 @@ test "api http server create index installs exact visible config and defers lagg
         .method = .POST,
         .uri = "/tables/docs/indexes/invalid_graph",
         .content_type = "application/json",
-        .body = "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
+        .body = "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
     });
     defer invalid_graph_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_graph_resp.status);
@@ -31385,7 +31385,7 @@ test "api http server create table with local writes waits for projected presenc
         .method = .POST,
         .uri = "/tables/docs",
         .content_type = "application/json",
-        .body = "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
+        .body = "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
     });
     defer invalid_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);

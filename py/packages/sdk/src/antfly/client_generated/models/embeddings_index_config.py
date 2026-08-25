@@ -41,8 +41,8 @@ class EmbeddingsIndexConfig:
                 is an independent vector member identified by (artifact name, source key). All sources must use the same dense
                 vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or
                 source_artifact_name.
-            embedding_name (str | Unset): Deprecated single-source artifact reference. Use sources with a matching embedding
-                enrichment; accepted requests are normalized to sources.
+            embedding_name (str | Unset): Single-source convenience form. Mutually exclusive with sources; accepted requests
+                are normalized to sources.
             source_artifact_name (str | Unset): Deprecated index-level description of an embedding producer input. Put this
                 field on the matching embedding enrichment and select its output through sources.
             template (str | Unset): Handlebars template for generating prompts (managed indexes only; not allowed when

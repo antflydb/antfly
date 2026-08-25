@@ -322,30 +322,56 @@ pub fn isPortableUnboundGraphEdge(data: []const u8) bool {
     return std.mem.readInt(u64, data[header_len..][0..8], .little) == 0;
 }
 
-/// Generation-less v1 records predate incarnation fencing. Treat them like
-/// portable records and bind them exactly once before exposing them to an
-/// active index. Version 2 makes new records self-describing and ensures an
-/// older binary rejects them instead of interpreting the generation as weight.
+/// Generation-less v1 records predate incarnation fencing. Callers must not
+/// bind them unless a generation-bearing owner manifest authenticates the
+/// payload. Explicitly portable records may be bound by an active producer.
+/// Version 2 makes new records self-describing and ensures an older binary
+/// rejects them instead of interpreting the generation as weight.
 pub fn needsGraphGenerationBinding(data: []const u8) bool {
+    return isLegacyUnboundGraphEdge(data) or isPortableUnboundGraphEdge(data);
+}
+
+pub fn isLegacyUnboundGraphEdge(data: []const u8) bool {
     const header = decodeHeader(data) catch return false;
     if (header.kind != .graph_edge) return false;
-    return header.version == codec_version or isPortableUnboundGraphEdge(data);
+    return header.version == codec_version;
 }
 
 pub fn bindGraphEdgeGenerationAlloc(alloc: Allocator, data: []const u8, generation: u64) ![]u8 {
     if (!needsGraphGenerationBinding(data)) return error.GraphGenerationAlreadyBound;
 
+    const header = try decodeHeader(data);
     var decoded = try decodeGraphEdgeAlloc(alloc, data);
     defer decoded.deinit(alloc);
     return encodeGraphEdgeAlloc(
         alloc,
-        null,
+        if (header.flags.has_source_hash) header.source_hash else null,
         generation,
         decoded.weight,
         decoded.created_at,
         decoded.updated_at,
         decoded.metadata_json,
     );
+}
+
+/// Returns a generation-authenticated copy of a graph edge, or null when the
+/// payload is malformed or belongs to a different index incarnation. A
+/// current generation-bearing state manifest is sufficient authority to bind
+/// legacy and explicitly portable payloads exactly once.
+pub fn authenticateGraphEdgeGenerationAlloc(alloc: Allocator, data: []const u8, generation: u64) !?[]u8 {
+    if (needsGraphGenerationBinding(data)) {
+        return bindGraphEdgeGenerationAlloc(alloc, data, generation) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+    }
+    var decoded = decodeGraphEdgeAlloc(alloc, data) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer decoded.deinit(alloc);
+    if (decoded.generation != generation) return null;
+    return try alloc.dupe(u8, data);
 }
 
 pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
@@ -596,6 +622,37 @@ test "artifact codec binds portable graph edge generation exactly once" {
     try std.testing.expectEqual(@as(u64, 42), decoded.generation);
     try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
     try std.testing.expectError(error.GraphGenerationAlreadyBound, bindGraphEdgeGenerationAlloc(alloc, bound, 43));
+}
+
+test "artifact codec generation binding preserves source identity" {
+    const alloc = std.testing.allocator;
+    const source_hash = hashSource("graph source");
+    const portable = try encodePortableUnboundGraphEdgeAlloc(alloc, 1.5, 10, 20, "{}");
+    defer alloc.free(portable);
+    var header = try decodeHeader(portable);
+    header.flags.has_source_hash = true;
+    header.source_hash = source_hash;
+    writeHeader(portable[0..header_len], header);
+
+    const bound = try bindGraphEdgeGenerationAlloc(alloc, portable, 42);
+    defer alloc.free(bound);
+    const bound_header = try decodeHeader(bound);
+    try std.testing.expect(bound_header.flags.has_source_hash);
+    try std.testing.expectEqual(source_hash, bound_header.source_hash);
+}
+
+test "artifact codec authenticates graph edge incarnation" {
+    const alloc = std.testing.allocator;
+    const current = try encodeGraphEdgeAlloc(alloc, null, 42, 1, 0, 0, "{}");
+    defer alloc.free(current);
+    const stale = try encodeGraphEdgeAlloc(alloc, null, 41, 1, 0, 0, "{}");
+    defer alloc.free(stale);
+
+    const authenticated = (try authenticateGraphEdgeGenerationAlloc(alloc, current, 42)).?;
+    defer alloc.free(authenticated);
+    try std.testing.expectEqualSlices(u8, current, authenticated);
+    try std.testing.expect((try authenticateGraphEdgeGenerationAlloc(alloc, stale, 42)) == null);
+    try std.testing.expect((try authenticateGraphEdgeGenerationAlloc(alloc, "corrupt", 42)) == null);
 }
 
 test "artifact codec reads and fences generation-less v1 graph edges" {

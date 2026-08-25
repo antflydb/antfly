@@ -1171,7 +1171,7 @@ test "table contract rejects ambiguous index source spellings" {
 
 test "table contract rejects unknown fields in closed nested index objects" {
     const invalid_requests = [_][]const u8{
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","client_value":"private"}}
+        \\{"type":"graph","source":{"artifact":"relations_v1","client_value":"private"}}
         ,
         \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","client_value":"private"}}
         ,
@@ -1193,7 +1193,7 @@ test "table contract rejects unknown fields in closed nested index objects" {
         ,
         \\{"type":"graph","artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"execution":{"batch_items":0}}}
         ,
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","format":"unsupported"}}
+        \\{"type":"graph","source":{"artifact":"relations_v1","format":"unsupported"}}
         ,
         \\{"type":"graph","source":{"kind":"document_field","artifact":"relations_v1"}}
         ,
@@ -1205,7 +1205,7 @@ test "table contract rejects unknown fields in closed nested index objects" {
         ,
         \\{"type":"graph","edge_types":[{"topology":"graph"}]}
         ,
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":{"client_value":"private"}}}
+        \\{"type":"graph","source":{"artifact":"relations_v1","path":{"client_value":"private"}}}
         ,
         \\{"type":"graph","resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_limit":{"client_value":"private"}}]}
         ,
@@ -1315,7 +1315,7 @@ test "table contract rejects graph configs the runtime cannot materialize" {
         error.InvalidCreateTableRequest,
         parseCreateTableRequest(
             std.testing.allocator,
-            "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
+            "{\"indexes\":{\"relations\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}}",
         ),
     );
 }

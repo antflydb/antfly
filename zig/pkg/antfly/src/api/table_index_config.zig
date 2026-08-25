@@ -221,13 +221,13 @@ test "graph index validation runs the runtime parser before catalog admission" {
     try validateIndexConfig(
         alloc,
         "relations_graph",
-        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}",
+        "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}",
     );
 
     const invalid_configs = [_][]const u8{
-        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
+        "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}",
         "{\"type\":\"graph\",\"edge_types\":[{\"name\":\"mentions\",\"topology\":\"dag\"}]}",
-        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"nodes\":{\"source\":\"{{ _doc.value.tenant }}\"}}",
+        "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":\"{{ _doc.value.tenant }}\"}}}",
         "{\"type\":\"graph\",\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"document\",\"value\":\"relations\"}}}",
     };
     for (invalid_configs) |config| {
@@ -242,13 +242,13 @@ test "table graph validation rejects runtime-invalid configs before catalog admi
     const alloc = std.testing.allocator;
     try validateGraphIndexesJson(
         alloc,
-        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"relations_graph\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"}}}",
+        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"relations_graph\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"}}}",
     );
     try std.testing.expectError(
         error.InvalidCreateTableRequest,
         validateGraphIndexesJson(
             alloc,
-            "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}",
+            "{\"relations_graph\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"path\":\"$.relations[0]\"}}}",
         ),
     );
 }

@@ -104,21 +104,18 @@ func TestNewCreateIndexRequestConvertsNamedIndexConfig(t *testing.T) {
 	}
 }
 
-func TestNewCreateIndexRequestPreservesSupportedGraphMappingPayload(t *testing.T) {
-	var legacy IndexConfig
+func TestNewCreateIndexRequestPreservesCanonicalGraphMappingPayload(t *testing.T) {
+	var config IndexConfig
 	if err := json.Unmarshal([]byte(`{
 		"name":"relationships",
 		"type":"graph",
-		"source":{"kind":"artifact","artifact":"relations"},
-		"nodes":{"model":"document","target":"{{ _item.target.text }}"},
-		"edge":{"weight":"{{ _item.score }}","metadata":{"source":"extractor"}},
-		"context":{"doc_fields":["title"]},
+		"source":{"artifact":"relations","nodes":{"model":"document","target":"{{ _item.target.text }}"},"edge":{"weight":"{{ _item.score }}","metadata":{"source":"extractor"}},"context":{"doc_fields":["title"]}},
 		"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}}
-	}`), &legacy); err != nil {
+	}`), &config); err != nil {
 		t.Fatalf("unmarshal index config: %v", err)
 	}
 
-	request, err := NewCreateIndexRequest(legacy)
+	request, err := NewCreateIndexRequest(config)
 	if err != nil {
 		t.Fatalf("NewCreateIndexRequest failed: %v", err)
 	}
@@ -133,11 +130,15 @@ func TestNewCreateIndexRequestPreservesSupportedGraphMappingPayload(t *testing.T
 	if _, exists := body["name"]; exists {
 		t.Fatalf("request must not duplicate path-owned name: %s", data)
 	}
-	nodes, ok := body["nodes"].(map[string]any)
+	graphSource, ok := body["source"].(map[string]any)
+	if !ok {
+		t.Fatalf("converted request lost graph source: %s", data)
+	}
+	nodes, ok := graphSource["nodes"].(map[string]any)
 	if !ok || nodes["target"] != "{{ _item.target.text }}" {
 		t.Fatalf("converted request lost node mapping: %s", data)
 	}
-	edge, ok := body["edge"].(map[string]any)
+	edge, ok := graphSource["edge"].(map[string]any)
 	if !ok || edge["weight"] != "{{ _item.score }}" {
 		t.Fatalf("converted request lost edge mapping: %s", data)
 	}
@@ -168,9 +169,19 @@ func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
 
 	request, err := NewCreateIndexRequest(GraphIndexConfig{
 		Source: GraphArtifactSourceConfig{
-			Kind:     GraphArtifactSourceConfigKindArtifact,
 			Artifact: "relations_v1",
 			Format:   GraphArtifactSourceConfigFormatExtractionGraph,
+			Nodes: GraphArtifactNodeMappingConfig{
+				Model:  GraphArtifactNodeMappingConfigModelDocument,
+				Source: source,
+				Target: target,
+			},
+			Edge: GraphArtifactEdgeMappingConfig{
+				Type:     edgeType,
+				Weight:   weight,
+				Metadata: map[string]any{"source": "extractor"},
+			},
+			Context: GraphArtifactContextConfig{DocFields: []string{"title", "body"}},
 		},
 		Artifact: GraphArtifactProducerConfig{
 			Name: "relations_v1",
@@ -183,17 +194,6 @@ func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
 				BatchItems: 8,
 			},
 		},
-		Nodes: GraphArtifactNodeMappingConfig{
-			Model:  GraphArtifactNodeMappingConfigModelDocument,
-			Source: source,
-			Target: target,
-		},
-		Edge: GraphArtifactEdgeMappingConfig{
-			Type:     edgeType,
-			Weight:   weight,
-			Metadata: map[string]any{"source": "extractor"},
-		},
-		Context: GraphArtifactContextConfig{DocFields: []string{"title", "body"}},
 		AlgebraicPlanning: GraphAlgebraicPlanningConfig{
 			BoundedTraversal: GraphBoundedTraversalConfig{
 				Law: GraphBoundedTraversalConfigLawProvenanceSemiring,
@@ -214,7 +214,8 @@ func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
 	if body["type"] != "graph" {
 		t.Fatalf("type = %v, want graph: %s", body["type"], data)
 	}
-	edge := body["edge"].(map[string]any)
+	graphSource := body["source"].(map[string]any)
+	edge := graphSource["edge"].(map[string]any)
 	if edge["weight"] != 0.75 {
 		t.Fatalf("edge weight = %v, want 0.75: %s", edge["weight"], data)
 	}

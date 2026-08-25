@@ -272,7 +272,6 @@ type (
 	GraphIndexStats                       = oapi.GraphIndexStats
 	GraphArtifactSourceConfig             = oapi.GraphArtifactSourceConfig
 	GraphArtifactSourceConfigFormat       = oapi.GraphArtifactSourceConfigFormat
-	GraphArtifactSourceConfigKind         = oapi.GraphArtifactSourceConfigKind
 	GraphArtifactProducerConfig           = oapi.GraphArtifactProducerConfig
 	GraphArtifactProducerConfigKind       = oapi.GraphArtifactProducerConfigKind
 	GraphArtifactProducerSourceConfig     = oapi.GraphArtifactProducerSourceConfig
@@ -750,7 +749,6 @@ const (
 	EdgeTypeConfigTopologyTree  = oapi.EdgeTypeConfigTopologyTree
 
 	// Graph artifact mapping values
-	GraphArtifactSourceConfigKindArtifact             = oapi.GraphArtifactSourceConfigKindArtifact
 	GraphArtifactSourceConfigFormatExtractionGraph    = oapi.GraphArtifactSourceConfigFormatExtractionGraph
 	GraphArtifactSourceConfigFormatExtractionRelation = oapi.GraphArtifactSourceConfigFormatExtractionRelation
 	GraphArtifactProducerConfigKindAsset              = oapi.GraphArtifactProducerConfigKindAsset

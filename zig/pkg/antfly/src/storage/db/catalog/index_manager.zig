@@ -4378,9 +4378,11 @@ pub const IndexManager = struct {
         },
     };
 
-    const generated_artifact_cleanup_magic: u64 = 0x32504e4c43414641; // "AFACLNP2"
+    const generated_artifact_cleanup_v2_magic: u64 = 0x32504e4c43414641; // "AFACLNP2"
+    const generated_artifact_cleanup_magic: u64 = 0x33504e4c43414641; // "AFACLNP3"
     const generated_artifact_cleanup_null_len = std.math.maxInt(u32);
-    const generated_artifact_cleanup_header_len = @sizeOf(u64) + 4 * @sizeOf(u32);
+    const generated_artifact_cleanup_v2_header_len: usize = @sizeOf(u64) + 4 * @sizeOf(u32);
+    const generated_artifact_cleanup_header_len: usize = @sizeOf(u64) + 5 * @sizeOf(u32);
     const generated_artifact_cleanup_scan_limit: usize = 512;
 
     const GeneratedArtifactCleanupPhase = enum(u32) {
@@ -4406,6 +4408,8 @@ pub const IndexManager = struct {
         phase: GeneratedArtifactCleanupPhase,
         chunk_name: ?[]const u8,
         embedding_name: ?[]const u8,
+        embedding_names_payload: []const u8 = &.{},
+        embedding_name_count: u32 = 0,
         cursor: ?[]const u8,
     };
 
@@ -4863,6 +4867,7 @@ pub const IndexManager = struct {
         phase: GeneratedArtifactCleanupPhase,
         chunk_name: ?[]const u8,
         embedding_name: ?[]const u8,
+        embedding_names: []const []const u8,
         cursor: ?[]const u8,
     ) ![]u8 {
         const chunk_len = if (chunk_name) |value|
@@ -4873,19 +4878,30 @@ pub const IndexManager = struct {
             std.math.cast(u32, value.len) orelse return error.NameTooLong
         else
             generated_artifact_cleanup_null_len;
+        const embedding_name_count = std.math.cast(u32, embedding_names.len) orelse return error.InvalidArgument;
+        var embedding_names_payload_len: usize = 0;
+        for (embedding_names) |value| {
+            _ = std.math.cast(u32, value.len) orelse return error.NameTooLong;
+            embedding_names_payload_len = std.math.add(usize, embedding_names_payload_len, @sizeOf(u32) + value.len) catch
+                return error.InvalidArgument;
+        }
         const cursor_len = if (cursor) |value|
             std.math.cast(u32, value.len) orelse return error.KeyTooLong
         else
             generated_artifact_cleanup_null_len;
-        const payload_len = (if (chunk_name) |value| value.len else 0) +
-            (if (embedding_name) |value| value.len else 0) +
-            (if (cursor) |value| value.len else 0);
-        const out = try self.alloc.alloc(u8, generated_artifact_cleanup_header_len + payload_len);
+        var payload_len: usize = 0;
+        payload_len = std.math.add(usize, payload_len, if (chunk_name) |value| value.len else 0) catch return error.InvalidArgument;
+        payload_len = std.math.add(usize, payload_len, if (embedding_name) |value| value.len else 0) catch return error.InvalidArgument;
+        payload_len = std.math.add(usize, payload_len, embedding_names_payload_len) catch return error.InvalidArgument;
+        payload_len = std.math.add(usize, payload_len, if (cursor) |value| value.len else 0) catch return error.InvalidArgument;
+        const total_len = std.math.add(usize, generated_artifact_cleanup_header_len, payload_len) catch return error.InvalidArgument;
+        const out = try self.alloc.alloc(u8, total_len);
         std.mem.writeInt(u64, out[0..8], generated_artifact_cleanup_magic, .little);
         std.mem.writeInt(u32, out[8..12], @intFromEnum(phase), .little);
         std.mem.writeInt(u32, out[12..16], chunk_len, .little);
         std.mem.writeInt(u32, out[16..20], embedding_len, .little);
-        std.mem.writeInt(u32, out[20..24], cursor_len, .little);
+        std.mem.writeInt(u32, out[20..24], embedding_name_count, .little);
+        std.mem.writeInt(u32, out[24..28], cursor_len, .little);
         var offset: usize = generated_artifact_cleanup_header_len;
         if (chunk_name) |value| {
             @memcpy(out[offset .. offset + value.len], value);
@@ -4895,27 +4911,74 @@ pub const IndexManager = struct {
             @memcpy(out[offset .. offset + value.len], value);
             offset += value.len;
         }
+        for (embedding_names) |value| {
+            std.mem.writeInt(u32, out[offset..][0..4], @intCast(value.len), .little);
+            offset += @sizeOf(u32);
+            @memcpy(out[offset .. offset + value.len], value);
+            offset += value.len;
+        }
         if (cursor) |value| {
             @memcpy(out[offset .. offset + value.len], value);
         }
         return out;
     }
 
+    fn encodeGeneratedArtifactCleanupRecordFromDecoded(
+        self: *IndexManager,
+        phase: GeneratedArtifactCleanupPhase,
+        record: GeneratedArtifactCleanupRecord,
+        cursor: ?[]const u8,
+    ) ![]u8 {
+        const chunk_len = if (record.chunk_name) |value| std.math.cast(u32, value.len) orelse return error.NameTooLong else generated_artifact_cleanup_null_len;
+        const embedding_len = if (record.embedding_name) |value| std.math.cast(u32, value.len) orelse return error.NameTooLong else generated_artifact_cleanup_null_len;
+        const cursor_len = if (cursor) |value| std.math.cast(u32, value.len) orelse return error.KeyTooLong else generated_artifact_cleanup_null_len;
+        var payload_len: usize = 0;
+        payload_len = std.math.add(usize, payload_len, if (record.chunk_name) |value| value.len else 0) catch return error.InvalidArgument;
+        payload_len = std.math.add(usize, payload_len, if (record.embedding_name) |value| value.len else 0) catch return error.InvalidArgument;
+        payload_len = std.math.add(usize, payload_len, record.embedding_names_payload.len) catch return error.InvalidArgument;
+        payload_len = std.math.add(usize, payload_len, if (cursor) |value| value.len else 0) catch return error.InvalidArgument;
+        const total_len = std.math.add(usize, generated_artifact_cleanup_header_len, payload_len) catch return error.InvalidArgument;
+        const out = try self.alloc.alloc(u8, total_len);
+        std.mem.writeInt(u64, out[0..8], generated_artifact_cleanup_magic, .little);
+        std.mem.writeInt(u32, out[8..12], @intFromEnum(phase), .little);
+        std.mem.writeInt(u32, out[12..16], chunk_len, .little);
+        std.mem.writeInt(u32, out[16..20], embedding_len, .little);
+        std.mem.writeInt(u32, out[20..24], record.embedding_name_count, .little);
+        std.mem.writeInt(u32, out[24..28], cursor_len, .little);
+        var offset: usize = generated_artifact_cleanup_header_len;
+        if (record.chunk_name) |value| {
+            @memcpy(out[offset .. offset + value.len], value);
+            offset += value.len;
+        }
+        if (record.embedding_name) |value| {
+            @memcpy(out[offset .. offset + value.len], value);
+            offset += value.len;
+        }
+        @memcpy(out[offset .. offset + record.embedding_names_payload.len], record.embedding_names_payload);
+        offset += record.embedding_names_payload.len;
+        if (cursor) |value| @memcpy(out[offset .. offset + value.len], value);
+        return out;
+    }
+
     fn decodeGeneratedArtifactCleanupRecord(raw: []const u8) !GeneratedArtifactCleanupRecord {
-        if (raw.len < generated_artifact_cleanup_header_len) return error.InvalidGeneratedArtifactCleanup;
-        if (std.mem.readInt(u64, raw[0..8], .little) != generated_artifact_cleanup_magic)
-            return error.InvalidGeneratedArtifactCleanup;
+        if (raw.len < generated_artifact_cleanup_v2_header_len) return error.InvalidGeneratedArtifactCleanup;
+        const magic = std.mem.readInt(u64, raw[0..8], .little);
+        if (magic != generated_artifact_cleanup_magic and magic != generated_artifact_cleanup_v2_magic) return error.InvalidGeneratedArtifactCleanup;
+        const header_len = if (magic == generated_artifact_cleanup_magic) generated_artifact_cleanup_header_len else generated_artifact_cleanup_v2_header_len;
+        if (raw.len < header_len) return error.InvalidGeneratedArtifactCleanup;
         const phase = std.enums.fromInt(GeneratedArtifactCleanupPhase, std.mem.readInt(u32, raw[8..12], .little)) orelse
             return error.InvalidGeneratedArtifactCleanup;
         const chunk_len_raw = std.mem.readInt(u32, raw[12..16], .little);
         const embedding_len_raw = std.mem.readInt(u32, raw[16..20], .little);
-        const cursor_len_raw = std.mem.readInt(u32, raw[20..24], .little);
+        const embedding_name_count = if (magic == generated_artifact_cleanup_magic) std.mem.readInt(u32, raw[20..24], .little) else 0;
+        const cursor_len_raw = if (magic == generated_artifact_cleanup_magic) std.mem.readInt(u32, raw[24..28], .little) else std.mem.readInt(u32, raw[20..24], .little);
         const chunk_len: usize = if (chunk_len_raw == generated_artifact_cleanup_null_len) 0 else chunk_len_raw;
         const embedding_len: usize = if (embedding_len_raw == generated_artifact_cleanup_null_len) 0 else embedding_len_raw;
         const cursor_len: usize = if (cursor_len_raw == generated_artifact_cleanup_null_len) 0 else cursor_len_raw;
-        const expected_len = generated_artifact_cleanup_header_len + chunk_len + embedding_len + cursor_len;
-        if (raw.len != expected_len) return error.InvalidGeneratedArtifactCleanup;
-        var offset: usize = generated_artifact_cleanup_header_len;
+        const fixed_payload_len = std.math.add(usize, chunk_len, embedding_len) catch return error.InvalidGeneratedArtifactCleanup;
+        const fixed_len = std.math.add(usize, header_len, fixed_payload_len) catch return error.InvalidGeneratedArtifactCleanup;
+        if (fixed_len > raw.len or cursor_len > raw.len - fixed_len) return error.InvalidGeneratedArtifactCleanup;
+        var offset: usize = header_len;
         const chunk_name: ?[]const u8 = if (chunk_len_raw == generated_artifact_cleanup_null_len)
             null
         else blk: {
@@ -4930,11 +4993,46 @@ pub const IndexManager = struct {
             offset += embedding_len;
             break :blk value;
         };
+        const embedding_names_start = offset;
+        for (0..embedding_name_count) |_| {
+            const length_end = std.math.add(usize, offset, @sizeOf(u32)) catch return error.InvalidGeneratedArtifactCleanup;
+            if (length_end > raw.len - cursor_len) return error.InvalidGeneratedArtifactCleanup;
+            const value_len: usize = std.mem.readInt(u32, raw[offset..][0..4], .little);
+            offset += @sizeOf(u32);
+            if (value_len > raw.len - cursor_len - offset) return error.InvalidGeneratedArtifactCleanup;
+            offset += value_len;
+        }
+        const embedding_names_payload = raw[embedding_names_start..offset];
+        if ((std.math.add(usize, offset, cursor_len) catch return error.InvalidGeneratedArtifactCleanup) != raw.len) return error.InvalidGeneratedArtifactCleanup;
         const cursor: ?[]const u8 = if (cursor_len_raw == generated_artifact_cleanup_null_len)
             null
         else
             raw[offset .. offset + cursor_len];
-        return .{ .phase = phase, .chunk_name = chunk_name, .embedding_name = embedding_name, .cursor = cursor };
+        return .{
+            .phase = phase,
+            .chunk_name = chunk_name,
+            .embedding_name = embedding_name,
+            .embedding_names_payload = embedding_names_payload,
+            .embedding_name_count = embedding_name_count,
+            .cursor = cursor,
+        };
+    }
+
+    fn cleanupRecordMatchesEmbedding(record: GeneratedArtifactCleanupRecord, candidate: []const u8) bool {
+        if (record.embedding_name) |embedding_name| {
+            if ((internal_keys.isEmbeddingArtifactKey(candidate) and internal_keys.matchesEmbeddingArtifactName(candidate, embedding_name)) or
+                (internal_keys.isDerivedEmbeddingArtifactKey(candidate) and internal_keys.matchesDerivedEmbeddingArtifactName(candidate, embedding_name))) return true;
+        }
+        var offset: usize = 0;
+        for (0..record.embedding_name_count) |_| {
+            const value_len: usize = std.mem.readInt(u32, record.embedding_names_payload[offset..][0..4], .little);
+            offset += @sizeOf(u32);
+            const embedding_name = record.embedding_names_payload[offset .. offset + value_len];
+            offset += value_len;
+            if ((internal_keys.isEmbeddingArtifactKey(candidate) and internal_keys.matchesEmbeddingArtifactName(candidate, embedding_name)) or
+                (internal_keys.isDerivedEmbeddingArtifactKey(candidate) and internal_keys.matchesDerivedEmbeddingArtifactName(candidate, embedding_name))) return true;
+        }
+        return false;
     }
 
     fn prepareGeneratedArtifactCleanupPlan(
@@ -4944,6 +5042,7 @@ pub const IndexManager = struct {
         coverage_generation: u64,
         owned_chunk_name: ?[]const u8,
         owned_embedding_name: ?[]const u8,
+        owned_embedding_names: []const []const u8,
     ) !GeneratedArtifactCleanupPlan {
         var plan = GeneratedArtifactCleanupPlan{ .alloc = self.alloc };
         errdefer plan.deinit();
@@ -4953,7 +5052,7 @@ pub const IndexManager = struct {
             .graph => .graph_artifacts,
             else => .generated_artifacts,
         };
-        plan.value = try self.encodeGeneratedArtifactCleanupRecord(initial_phase, owned_chunk_name, owned_embedding_name, null);
+        plan.value = try self.encodeGeneratedArtifactCleanupRecord(initial_phase, owned_chunk_name, owned_embedding_name, owned_embedding_names, null);
         return plan;
     }
 
@@ -5023,8 +5122,8 @@ pub const IndexManager = struct {
         }
 
         const cleanup_graph = record.phase == .graph_artifacts;
-        if (!cleanup_graph and record.chunk_name == null and record.embedding_name == null) {
-            const next_value = try self.encodeGeneratedArtifactCleanupRecord(.dense_metadata, null, null, null);
+        if (!cleanup_graph and record.chunk_name == null and record.embedding_name == null and record.embedding_name_count == 0) {
+            const next_value = try self.encodeGeneratedArtifactCleanupRecord(.dense_metadata, null, null, &.{}, null);
             defer self.alloc.free(next_value);
             try store.put(key, next_value);
             return .{ .found = true, .completed = false };
@@ -5038,8 +5137,7 @@ pub const IndexManager = struct {
 
         const ScanState = struct {
             manager: *IndexManager,
-            chunk_name: ?[]const u8,
-            embedding_name: ?[]const u8,
+            record: GeneratedArtifactCleanupRecord,
             graph_index_name: ?[]const u8,
             deletes: std.ArrayListUnmanaged([]u8) = .empty,
             last_key: ?[]u8 = null,
@@ -5057,14 +5155,11 @@ pub const IndexManager = struct {
                 state.scanned += 1;
 
                 var should_delete = false;
-                if (state.chunk_name) |chunk_name| {
+                if (state.record.chunk_name) |chunk_name| {
                     should_delete = (internal_keys.isChunkArtifactRecordKey(candidate) and internal_keys.matchesChunkArtifactName(candidate, chunk_name)) or
                         (internal_keys.isDerivedEmbeddingArtifactKey(candidate) and try state.manager.derivedEmbeddingBaseMatchesChunk(candidate, chunk_name));
                 }
-                if (!should_delete) if (state.embedding_name) |embedding_name| {
-                    should_delete = (internal_keys.isEmbeddingArtifactKey(candidate) and internal_keys.matchesEmbeddingArtifactName(candidate, embedding_name)) or
-                        (internal_keys.isDerivedEmbeddingArtifactKey(candidate) and internal_keys.matchesDerivedEmbeddingArtifactName(candidate, embedding_name));
-                };
+                if (!should_delete) should_delete = cleanupRecordMatchesEmbedding(state.record, candidate);
                 if (!should_delete) if (state.graph_index_name) |index_name| {
                     should_delete = internal_keys.matchesGraphEdgeIndexName(candidate, index_name) or
                         internal_keys.matchesGraphAssetStateIndexName(candidate, index_name);
@@ -5082,8 +5177,7 @@ pub const IndexManager = struct {
 
         var state = ScanState{
             .manager = self,
-            .chunk_name = record.chunk_name,
-            .embedding_name = record.embedding_name,
+            .record = record,
             .graph_index_name = graph_index_name,
         };
         defer state.deinit();
@@ -5101,14 +5195,14 @@ pub const IndexManager = struct {
         for (state.deletes.items) |delete_key| delete_keys.appendAssumeCapacity(delete_key);
 
         if (state.stopped) {
-            const next_value = try self.encodeGeneratedArtifactCleanupRecord(record.phase, record.chunk_name, record.embedding_name, state.last_key.?);
+            const next_value = try self.encodeGeneratedArtifactCleanupRecordFromDecoded(record.phase, record, state.last_key.?);
             defer self.alloc.free(next_value);
             const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
             try store.putBatch(&writes, delete_keys.items);
             return .{ .found = true, .completed = false };
         }
 
-        const next_value = try self.encodeGeneratedArtifactCleanupRecord(.dense_metadata, record.chunk_name, record.embedding_name, null);
+        const next_value = try self.encodeGeneratedArtifactCleanupRecordFromDecoded(.dense_metadata, record, null);
         defer self.alloc.free(next_value);
         const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
         try store.putBatch(&writes, delete_keys.items);
@@ -5136,12 +5230,7 @@ pub const IndexManager = struct {
         for (rows, 0..) |row, i| delete_keys[i] = row.key;
 
         if (rows.len == generated_artifact_cleanup_scan_limit) {
-            const next_value = try self.encodeGeneratedArtifactCleanupRecord(
-                record.phase,
-                record.chunk_name,
-                record.embedding_name,
-                rows[rows.len - 1].key,
-            );
+            const next_value = try self.encodeGeneratedArtifactCleanupRecordFromDecoded(record.phase, record, rows[rows.len - 1].key);
             defer self.alloc.free(next_value);
             const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
             try store.putBatch(&writes, delete_keys);
@@ -5152,12 +5241,7 @@ pub const IndexManager = struct {
             if (delete_keys.len != 0) try store.putBatch(&.{}, delete_keys);
             return .{ .found = true, .completed = true };
         }
-        const next_value = try self.encodeGeneratedArtifactCleanupRecord(
-            next_phase,
-            record.chunk_name,
-            record.embedding_name,
-            null,
-        );
+        const next_value = try self.encodeGeneratedArtifactCleanupRecordFromDecoded(next_phase, record, null);
         defer self.alloc.free(next_value);
         const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
         try store.putBatch(&writes, delete_keys);
@@ -5376,7 +5460,7 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, entry.config.kind, coverageGenerationForConfig(entry.config), null, null);
+                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, entry.config.kind, coverageGenerationForConfig(entry.config), null, null, &.{});
                 defer cleanup.deinit();
                 try self.persistCatalogExcludingWithAtomicMutation(
                     store,
@@ -5408,6 +5492,11 @@ pub const IndexManager = struct {
                 else
                     null;
                 defer if (owned_embedding_name) |embedding_name| self.alloc.free(embedding_name);
+                var owned_embedding_names = std.ArrayListUnmanaged([]const u8).empty;
+                defer owned_embedding_names.deinit(self.alloc);
+                for (entry.embedding_names) |embedding_name| {
+                    if (self.ownsGeneratedEmbeddingArtifacts(name, embedding_name)) try owned_embedding_names.append(self.alloc, embedding_name);
+                }
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
                 var artifact_cleanup = try self.prepareGeneratedArtifactCleanupPlan(
                     name,
@@ -5415,6 +5504,7 @@ pub const IndexManager = struct {
                     coverageGenerationForConfig(entry.config),
                     owned_chunk_name,
                     owned_embedding_name,
+                    owned_embedding_names.items,
                 );
                 defer artifact_cleanup.deinit();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
@@ -5442,6 +5532,11 @@ pub const IndexManager = struct {
                 else
                     null;
                 defer if (owned_embedding_name) |embedding_name| self.alloc.free(embedding_name);
+                var owned_embedding_names = std.ArrayListUnmanaged([]const u8).empty;
+                defer owned_embedding_names.deinit(self.alloc);
+                for (entry.embedding_names) |embedding_name| {
+                    if (self.ownsGeneratedEmbeddingArtifacts(name, embedding_name)) try owned_embedding_names.append(self.alloc, embedding_name);
+                }
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
                 var artifact_cleanup = try self.prepareGeneratedArtifactCleanupPlan(
                     name,
@@ -5449,6 +5544,7 @@ pub const IndexManager = struct {
                     coverageGenerationForConfig(entry.config),
                     owned_chunk_name,
                     owned_embedding_name,
+                    owned_embedding_names.items,
                 );
                 defer artifact_cleanup.deinit();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
@@ -5467,7 +5563,7 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, entry.config.kind, coverageGenerationForConfig(entry.config), null, null);
+                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, entry.config.kind, coverageGenerationForConfig(entry.config), null, null, &.{});
                 defer cleanup.deinit();
                 try self.persistCatalogExcludingWithAtomicMutation(
                     store,
@@ -5488,7 +5584,7 @@ pub const IndexManager = struct {
                 const index_path = try self.indexPath(name);
                 defer self.alloc.free(index_path);
                 const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCacheExcluding(name, null);
-                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, entry.config.kind, coverageGenerationForConfig(entry.config), null, null);
+                var cleanup = try self.prepareGeneratedArtifactCleanupPlan(name, entry.config.kind, coverageGenerationForConfig(entry.config), null, null, &.{});
                 defer cleanup.deinit();
                 try self.persistCatalogExcludingWithAtomicMutation(
                     store,
@@ -5833,6 +5929,13 @@ pub const IndexManager = struct {
                 break :blk try self.alloc.dupe(u8, embedding_name);
             } else null;
             defer if (owned_embedding_name) |embedding_name| self.alloc.free(embedding_name);
+            var owned_embedding_names = std.ArrayListUnmanaged([]const u8).empty;
+            defer owned_embedding_names.deinit(self.alloc);
+            if (cleanup_artifacts) for (artifact_refs.embedding_names) |embedding_name| {
+                if (!try self.embeddingArtifactsReferencedElsewhereIncludingStatusOnly(name, embedding_name)) {
+                    try owned_embedding_names.append(self.alloc, embedding_name);
+                }
+            };
             const replacement: []types.IndexConfig = if (self.status_only_index_configs.len > 1)
                 try self.alloc.alloc(types.IndexConfig, self.status_only_index_configs.len - 1)
             else
@@ -5859,6 +5962,7 @@ pub const IndexManager = struct {
                 coverageGenerationForConfig(cfg),
                 owned_chunk_name,
                 owned_embedding_name,
+                owned_embedding_names.items,
             );
             defer artifact_cleanup.deinit();
             const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
@@ -6269,6 +6373,7 @@ pub const IndexManager = struct {
                 defer generator.deinit(alloc);
                 const chunk_cfg = resolveChunkGenerator(self, generator);
                 const embedding_name = entry.embedding_name orelse entry.config.name;
+                const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                 if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name)) {
                     try requests.append(alloc, .{
                         .kind = .chunk_text,
@@ -6298,6 +6403,7 @@ pub const IndexManager = struct {
                         .chunk_overlap = chunk_cfg.chunk_overlap,
                         .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                         .full_text_index = chunk_cfg.full_text_index,
+                        .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                         .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
                     });
                 }
@@ -6343,6 +6449,7 @@ pub const IndexManager = struct {
                                 .chunk_overlap = chunk_cfg.chunk_overlap,
                                 .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                                 .full_text_index = chunk_cfg.full_text_index,
+                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                                 .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                             });
                         }
@@ -6357,6 +6464,7 @@ pub const IndexManager = struct {
                                 .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                                 .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
                                 .expected_dims = entry.dims,
+                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                                 .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                             });
                         }
@@ -6376,6 +6484,8 @@ pub const IndexManager = struct {
             if (try parseSparseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
                 defer generator.deinit(alloc);
                 const chunk_cfg = resolveChunkGenerator(self, generator);
+                const embedding_name = if (chunk_cfg.embedding_name) |name| name else entry.config.name;
+                const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                 if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name)) {
                     try requests.append(alloc, .{
                         .kind = .chunk_text,
@@ -6395,7 +6505,7 @@ pub const IndexManager = struct {
                     .kind = .sparse_embedding,
                     .index_name = try alloc.dupe(u8, entry.config.name),
                     .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
-                    .embedding_name = if (chunk_cfg.embedding_name) |embedding_name| try alloc.dupe(u8, embedding_name) else try alloc.dupe(u8, entry.config.name),
+                    .embedding_name = try alloc.dupe(u8, embedding_name),
                     .doc_key = try alloc.dupe(u8, doc_key),
                     .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
                     .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
@@ -6403,6 +6513,7 @@ pub const IndexManager = struct {
                     .chunk_overlap = chunk_cfg.chunk_overlap,
                     .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                     .full_text_index = chunk_cfg.full_text_index,
+                    .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                     .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
                 });
             } else {
@@ -6446,6 +6557,7 @@ pub const IndexManager = struct {
                                 .chunk_overlap = chunk_cfg.chunk_overlap,
                                 .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
                                 .full_text_index = chunk_cfg.full_text_index,
+                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                                 .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                             });
                         }
@@ -6458,6 +6570,7 @@ pub const IndexManager = struct {
                             .doc_key = try alloc.dupe(u8, doc_key),
                             .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
                             .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                            .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
                             .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
                         });
                     }
@@ -7271,11 +7384,14 @@ pub const IndexManager = struct {
     const ArtifactRefs = struct {
         chunk_name: ?[]u8 = null,
         embedding_name: ?[]u8 = null,
+        embedding_names: [][]u8 = &.{},
         asset_name: ?[]u8 = null,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.chunk_name) |value| alloc.free(value);
             if (self.embedding_name) |value| alloc.free(value);
+            for (self.embedding_names) |value| alloc.free(value);
+            if (self.embedding_names.len > 0) alloc.free(self.embedding_names);
             if (self.asset_name) |value| alloc.free(value);
             self.* = undefined;
         }
@@ -7312,9 +7428,12 @@ pub const IndexManager = struct {
                         try self.alloc.dupe(u8, embedding_name)
                     else
                         null,
+                    .embedding_names = try cloneOwnedStrings(self.alloc, dense_cfg.embedding_names),
                 };
             },
             .sparse_vector => {
+                const sparse_cfg = try parseSparseConfig(self.alloc, cfg.config_json);
+                defer sparse_cfg.deinit(self.alloc);
                 const sparse_generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (sparse_generator) |generator| generator.deinit(self.alloc);
                 const referenced_embedding = if (sparse_generator == null)
@@ -7333,6 +7452,7 @@ pub const IndexManager = struct {
                         if (generator.embedding_name) |embedding_name| try self.alloc.dupe(u8, embedding_name) else try self.alloc.dupe(u8, cfg.name)
                     else
                         try self.alloc.dupe(u8, cfg.name),
+                    .embedding_names = try cloneOwnedStrings(self.alloc, sparse_cfg.embedding_names),
                 };
             },
             .graph => {
@@ -7422,6 +7542,9 @@ pub const IndexManager = struct {
             };
             defer refs.deinit(self.alloc);
             if (refs.embedding_name) |configured| {
+                if (std.mem.eql(u8, configured, embedding_name)) return true;
+            }
+            for (refs.embedding_names) |configured| {
                 if (std.mem.eql(u8, configured, embedding_name)) return true;
             }
         }
@@ -19466,10 +19589,7 @@ fn parseGraphArtifactSources(alloc: Allocator, root: std.json.Value) ![]GraphArt
     }
     for (sources_value.array.items, 0..) |source_value, i| {
         if (source_value != .object) return error.InvalidIndexConfig;
-        if (!objectHasOnlyFields(source_value.object, &.{ "kind", "artifact", "path", "format", "mention_edge_type", "nodes", "edge", "context" })) return error.InvalidIndexConfig;
-        if (source_value.object.get("kind")) |kind| {
-            if (kind != .string or !std.mem.eql(u8, kind.string, "artifact")) return error.InvalidIndexConfig;
-        }
+        if (!objectHasOnlyFields(source_value.object, &.{ "artifact", "path", "format", "mention_edge_type", "nodes", "edge", "context" })) return error.InvalidIndexConfig;
         const artifact = source_value.object.get("artifact") orelse return error.InvalidIndexConfig;
         if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
         for (sources[0..i]) |previous| {
@@ -19517,17 +19637,8 @@ fn initGraphArtifactSource(
 fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtifactSource {
     const source = root.object.get("source") orelse return null;
     if (source != .object) return error.InvalidIndexConfig;
-    const kind = source.object.get("kind");
-    if (kind) |value| {
-        if (value != .string) return error.InvalidIndexConfig;
-    }
-    if (kind != null and std.mem.eql(u8, kind.?.string, "document_field")) {
-        const field = source.object.get("field") orelse return error.InvalidIndexConfig;
-        if (field != .string or field.string.len == 0) return error.InvalidIndexConfig;
-        if (!std.mem.eql(u8, field.string, "_edges")) return error.InvalidIndexConfig;
-        return null;
-    }
-    if (kind != null and !std.mem.eql(u8, kind.?.string, "artifact")) return error.InvalidIndexConfig;
+    if (!objectHasOnlyFields(source.object, &.{ "artifact", "path", "format", "mention_edge_type", "nodes", "edge", "context" })) return error.InvalidIndexConfig;
+    if (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null) return error.InvalidIndexConfig;
 
     const artifact = source.object.get("artifact") orelse return error.InvalidIndexConfig;
     if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
@@ -19555,19 +19666,7 @@ fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtif
         .mention_edge_type = if (mention_edge_type.len > 0) try alloc.dupe(u8, mention_edge_type) else "",
     };
     errdefer out.deinit(alloc);
-    const mapping_fields = [_][]const u8{ "nodes", "edge", "context" };
-    var source_has_mapping = false;
-    var root_has_mapping = false;
-    for (mapping_fields) |field| {
-        if (source.object.get(field)) |value| {
-            if (value != .null) source_has_mapping = true;
-        }
-        if (root.object.get(field)) |value| {
-            if (value != .null) root_has_mapping = true;
-        }
-    }
-    if (source_has_mapping and root_has_mapping) return error.InvalidIndexConfig;
-    out.mapping = try parseGraphArtifactMapping(alloc, if (source_has_mapping) source else root);
+    out.mapping = try parseGraphArtifactMapping(alloc, source);
     return out;
 }
 
@@ -19779,7 +19878,7 @@ test "graph config parses artifact source and shorthand asset enrichment" {
     const alloc = std.testing.allocator;
     var cfg = try parseGraphConfig(alloc,
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"body"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"antfly"}},"execution":{"batch_items":8,"batch_bytes":262144}}
         \\}
     );
@@ -19834,7 +19933,7 @@ test "graph config parses multiple artifact sources with per-source mappings" {
     try std.testing.expectEqualStrings("title", cfg.artifact_sources[1].mapping.context_doc_fields[0]);
 
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"artifact","artifact":"legacy"},"sources":[{"artifact":"current"}]}
+        \\{"source":{"artifact":"legacy"},"sources":[{"artifact":"current"}]}
     ));
 }
 
@@ -19852,7 +19951,7 @@ test "graph shorthand asset uses artifact execution only" {
     const alloc = std.testing.allocator;
     var cfg = try parseGraphConfig(alloc,
         \\{
-        \\  "source":{"kind":"artifact","artifact":"pages_v1","path":"$.pages[*]","format":"extraction_relation"},
+        \\  "source":{"artifact":"pages_v1","path":"$.pages[*]","format":"extraction_relation"},
         \\  "artifact":{"name":"pages_v1","kind":"asset","source":{"type":"field","value":"image"},"producer_json":{"type":"reader","config":{"provider":"antfly"}},"execution":{"batch_items":3}}
         \\}
     );
@@ -19878,10 +19977,10 @@ test "graph config parses artifact mapping templates and context fields" {
     const alloc = std.testing.allocator;
     var cfg = try parseGraphConfig(alloc,
         \\{
-        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation"},
-        \\  "nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.to }}"},
-        \\  "edge":{"type":"{{ _item.rel }}","weight":"{{ default _item.score 1.0 }}","metadata":{"evidence":"{{ _item.evidence }}","tenant":"{{ _doc.value.tenant_id }}"}},
-        \\  "context":{"doc_fields":["tenant_id"]}
+        \\  "source":{"artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation",
+        \\    "nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.to }}"},
+        \\    "edge":{"type":"{{ _item.rel }}","weight":"{{ default _item.score 1.0 }}","metadata":{"evidence":"{{ _item.evidence }}","tenant":"{{ _doc.value.tenant_id }}"}},
+        \\    "context":{"doc_fields":["tenant_id"]}}
         \\}
     );
     defer cfg.deinit(alloc);
@@ -19900,31 +19999,28 @@ test "graph config parses artifact mapping templates and context fields" {
 test "graph config rejects undeclared doc value template fields and unsupported paths" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"edge":{"type":"{{ _doc.value.tenant_id }}"}}
+        \\{"source":{"artifact":"relations_v1"},"edge":{"type":"{{ _doc.value.tenant_id }}"}}
     ));
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}
+        \\{"source":{"artifact":"relations_v1","path":"$.relations[0]"}}
     ));
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"nodes":{"source":"{{ _item.source.document_id }}"}}
+        \\{"source":{"artifact":"relations_v1"},"nodes":{"source":"{{ _item.source.document_id }}"}}
     ));
 }
 
 test "graph config rejects artifact source combined with document field edge types" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"edge_types":[{"name":"mentions","field":"edges"}]}
+        \\{"source":{"artifact":"relations_v1"},"edge_types":[{"name":"mentions","field":"edges"}]}
     ));
 }
 
-test "graph config validates document field source shape" {
+test "graph config rejects removed source discriminator forms" {
     const alloc = std.testing.allocator;
-    var cfg = try parseGraphConfig(alloc,
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"document_field","field":"_edges"}}
-    );
-    defer cfg.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), cfg.artifact_sources.len);
-
+    ));
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"document_field"}}
     ));
@@ -22117,6 +22213,13 @@ test "dense index unions multiple embedding artifact sources without overwriting
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "title", "", "", "title_dense_v1"));
     try std.testing.expect(hasGeneratedChunkRequest(generated, "doc:generated", "body", "", "document_chunks_v1"));
     try std.testing.expect(hasGeneratedDenseEmbeddingRequest(generated, "doc:generated", "text", "", "document_chunks_v1", "body_dense_v1"));
+    var embedding_request_count: usize = 0;
+    for (generated) |request| {
+        if (request.kind != .dense_embedding) continue;
+        embedding_request_count += 1;
+        try std.testing.expectEqualStrings(producer_json, request.producer_json);
+    }
+    try std.testing.expectEqual(@as(usize, 2), embedding_request_count);
 
     const doc_key = "doc:multi";
     const title_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, "title_dense_v1");
@@ -22149,6 +22252,52 @@ test "dense index unions multiple embedding artifact sources without overwriting
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 2), results.getHits().len);
     try std.testing.expectEqualStrings(title_artifact, results.getHits()[0].metadata.?);
+}
+
+test "sparse multi-source requests carry semantic producer identity" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"sparse-test\"}";
+    try manager.addEnrichment(&store, .{
+        .name = "title_sparse_v1",
+        .kind = .embedding,
+        .field = "title",
+        .producer_json = producer_json,
+    });
+    try manager.addEnrichment(&store, .{
+        .name = "body_sparse_v1",
+        .kind = .embedding,
+        .field = "body",
+        .producer_json = producer_json,
+    });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "document_sparse",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse_embedding\",\"sources\":[{\"artifact\":\"title_sparse_v1\"},{\"artifact\":\"body_sparse_v1\"}]}",
+    }});
+
+    const generated = try manager.planGeneratedEnrichments(alloc, "doc:generated", "{\"title\":\"title text\",\"body\":\"body text\"}", &.{}, &.{});
+    defer {
+        for (generated) |request| enrichment_types.freeGeneratedRequest(alloc, request);
+        alloc.free(generated);
+    }
+    try std.testing.expectEqual(@as(usize, 2), generated.len);
+    for (generated) |request| {
+        try std.testing.expect(request.kind == .sparse_embedding);
+        try std.testing.expectEqualStrings(producer_json, request.producer_json);
+    }
 }
 
 test "parseSparseConfig accepts external embedding indexes" {
@@ -25548,6 +25697,130 @@ test "remove persists generated artifact cleanup debt until same-name recreation
     try manager.addManaged(&store, cfg, null);
 }
 
+test "multi-source vector retirement durably removes every unshared embedding stream" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "multi-source-artifact-remove-outbox");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"test\",\"dimensions\":3}";
+    for ([_]struct { name: []const u8, field: []const u8 }{
+        .{ .name = "title_dense_v1", .field = "title" },
+        .{ .name = "body_dense_v1", .field = "body" },
+        .{ .name = "summary_dense_v1", .field = "summary" },
+    }) |enrichment| {
+        try manager.addEnrichment(&store, .{
+            .name = enrichment.name,
+            .kind = .embedding,
+            .field = enrichment.field,
+            .expected_dims = 3,
+            .producer_json = producer_json,
+        });
+    }
+
+    const multi_cfg: types.IndexConfig = .{
+        .name = "document_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"title_dense_v1\"},{\"artifact\":\"body_dense_v1\"},{\"artifact\":\"summary_dense_v1\"}]}",
+    };
+    const shared_cfg: types.IndexConfig = .{
+        .name = "title_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"sources\":[{\"artifact\":\"title_dense_v1\"}]}",
+    };
+    try manager.addAllNoBackfill(&store, &.{ multi_cfg, shared_cfg });
+    const removed_generation = manager.coverageGenerationForIndex(multi_cfg.name) orelse return error.TestUnexpectedResult;
+
+    const title_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "title_dense_v1");
+    defer alloc.free(title_key);
+    const body_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
+    defer alloc.free(body_key);
+    const summary_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "summary_dense_v1");
+    defer alloc.free(summary_key);
+    try store.putBatch(&.{
+        .{ .key = title_key, .value = "shared" },
+        .{ .key = body_key, .value = "owned-body" },
+        .{ .key = summary_key, .value = "owned-summary" },
+    }, &.{});
+
+    try std.testing.expect(try manager.remove(&store, multi_cfg.name));
+    try std.testing.expectError(error.IndexArtifactCleanupPending, manager.addManaged(&store, multi_cfg, null));
+
+    const cleanup_key = try internal_keys.indexArtifactCleanupKeyAlloc(alloc, multi_cfg.name, removed_generation);
+    defer alloc.free(cleanup_key);
+    const raw_cleanup = try store.get(alloc, cleanup_key);
+    defer alloc.free(raw_cleanup);
+    const cleanup = try IndexManager.decodeGeneratedArtifactCleanupRecord(raw_cleanup);
+    try std.testing.expectEqual(@as(u32, 2), cleanup.embedding_name_count);
+    try std.testing.expect(IndexManager.cleanupRecordMatchesEmbedding(cleanup, body_key));
+    try std.testing.expect(IndexManager.cleanupRecordMatchesEmbedding(cleanup, summary_key));
+    try std.testing.expect(!IndexManager.cleanupRecordMatchesEmbedding(cleanup, title_key));
+
+    while (true) {
+        var result = try manager.drainGeneratedArtifactCleanupOutboxPage(&store);
+        defer result.deinit();
+        if (!result.found) break;
+        if (result.completed) {
+            try manager.finalizeRetiredIndexStorage(&store, result.index_name);
+            try store.delete(result.key);
+        }
+    }
+
+    const shared = try store.get(alloc, title_key);
+    defer alloc.free(shared);
+    try std.testing.expectEqualStrings("shared", shared);
+    try std.testing.expectError(error.NotFound, store.get(alloc, body_key));
+    try std.testing.expectError(error.NotFound, store.get(alloc, summary_key));
+    try manager.addManaged(&store, multi_cfg, null);
+}
+
+test "generated artifact cleanup upgrades v2 debt without losing its cursor or owner" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "artifact-cleanup-v2-upgrade");
+    defer cleanupIndexManagerDir(path);
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+
+    const chunk_name = "chunks_v1";
+    const embedding_name = "dense_v1";
+    const cursor = "doc:cursor";
+    const raw_len = IndexManager.generated_artifact_cleanup_v2_header_len + chunk_name.len + embedding_name.len + cursor.len;
+    const raw = try alloc.alloc(u8, raw_len);
+    defer alloc.free(raw);
+    std.mem.writeInt(u64, raw[0..8], IndexManager.generated_artifact_cleanup_v2_magic, .little);
+    std.mem.writeInt(u32, raw[8..12], @intFromEnum(IndexManager.GeneratedArtifactCleanupPhase.generated_artifacts), .little);
+    std.mem.writeInt(u32, raw[12..16], @intCast(chunk_name.len), .little);
+    std.mem.writeInt(u32, raw[16..20], @intCast(embedding_name.len), .little);
+    std.mem.writeInt(u32, raw[20..24], @intCast(cursor.len), .little);
+    var offset: usize = IndexManager.generated_artifact_cleanup_v2_header_len;
+    @memcpy(raw[offset .. offset + chunk_name.len], chunk_name);
+    offset += chunk_name.len;
+    @memcpy(raw[offset .. offset + embedding_name.len], embedding_name);
+    offset += embedding_name.len;
+    @memcpy(raw[offset .. offset + cursor.len], cursor);
+
+    const legacy = try IndexManager.decodeGeneratedArtifactCleanupRecord(raw);
+    try std.testing.expectEqualStrings(chunk_name, legacy.chunk_name.?);
+    try std.testing.expectEqualStrings(embedding_name, legacy.embedding_name.?);
+    try std.testing.expectEqualStrings(cursor, legacy.cursor.?);
+    try std.testing.expectEqual(@as(u32, 0), legacy.embedding_name_count);
+
+    const upgraded = try manager.encodeGeneratedArtifactCleanupRecordFromDecoded(.dense_metadata, legacy, "next");
+    defer alloc.free(upgraded);
+    const decoded = try IndexManager.decodeGeneratedArtifactCleanupRecord(upgraded);
+    try std.testing.expectEqual(IndexManager.GeneratedArtifactCleanupPhase.dense_metadata, decoded.phase);
+    try std.testing.expectEqualStrings(chunk_name, decoded.chunk_name.?);
+    try std.testing.expectEqualStrings(embedding_name, decoded.embedding_name.?);
+    try std.testing.expectEqualStrings("next", decoded.cursor.?);
+}
+
 test "graph retirement durably removes edge artifacts and source state before same-name recreation" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -25801,7 +26074,7 @@ test "generated artifact cleanup isolates malformed tombstones" {
     defer alloc.free(malformed_value_key);
     const valid_key = try internal_keys.indexArtifactCleanupKeyAlloc(alloc, "c_valid", 2);
     defer alloc.free(valid_key);
-    const valid_value = try manager.encodeGeneratedArtifactCleanupRecord(.finalization, null, null, null);
+    const valid_value = try manager.encodeGeneratedArtifactCleanupRecord(.finalization, null, null, &.{}, null);
     defer alloc.free(valid_value);
     const writes = [_]docstore_mod.KVPair{
         .{ .key = malformed_key, .value = valid_value },

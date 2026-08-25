@@ -227,7 +227,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Deprecated single-source artifact reference. Use sources with a matching embedding enrichment; accepted requests are normalized to sources.
+    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources.
     embedding_name: ?[]const u8 = null,
     /// Deprecated index-level description of an embedding producer input. Put this field on the matching embedding enrichment and select its output through sources.
     source_artifact_name: ?[]const u8 = null,
@@ -280,7 +280,7 @@ pub const CreateGraphIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// Chunk or JSON asset streams whose edge-like values are unioned into this graph index.
+    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Earlier sources win when multiple sources materialize the same edge identity.
     sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
@@ -293,12 +293,6 @@ pub const CreateGraphIndexRequest = struct {
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
-    /// Deprecated root-level single-source mapping. Put nodes inside source or each sources item.
-    nodes: ?GraphArtifactNodeMappingConfig = null,
-    /// Deprecated root-level single-source mapping. Put edge inside source or each sources item.
-    edge: ?GraphArtifactEdgeMappingConfig = null,
-    /// Deprecated root-level single-source mapping. Put context inside source or each sources item.
-    context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
@@ -849,7 +843,7 @@ pub const EmbeddingsIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Deprecated single-source artifact reference. Use sources with a matching embedding enrichment; accepted requests are normalized to sources.
+    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources.
     embedding_name: ?[]const u8 = null,
     /// Deprecated index-level description of an embedding producer input. Put this field on the matching embedding enrichment and select its output through sources.
     source_artifact_name: ?[]const u8 = null,
@@ -1252,8 +1246,6 @@ pub const GraphArtifactProducerSourceConfig = struct {
 
 /// Artifact stream materialized into graph edges.
 pub const GraphArtifactSourceConfig = struct {
-    /// Compatibility discriminator for the former graph source union. Omit it; artifact is the only public source kind.
-    kind: ?[]const u8 = null,
     artifact: []const u8,
     path: ?[]const u8 = null,
     format: ?[]const u8 = null,
@@ -1270,7 +1262,7 @@ pub const GraphBoundedTraversalConfig = struct {
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
-    /// Chunk or JSON asset streams whose edge-like values are unioned into this graph index.
+    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Earlier sources win when multiple sources materialize the same edge identity.
     sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
@@ -1283,12 +1275,6 @@ pub const GraphIndexConfig = struct {
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
-    /// Deprecated root-level single-source mapping. Put nodes inside source or each sources item.
-    nodes: ?GraphArtifactNodeMappingConfig = null,
-    /// Deprecated root-level single-source mapping. Put edge inside source or each sources item.
-    edge: ?GraphArtifactEdgeMappingConfig = null,
-    /// Deprecated root-level single-source mapping. Put context inside source or each sources item.
-    context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
 };
@@ -1590,7 +1576,7 @@ pub const IndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Deprecated single-source artifact reference. Use sources with a matching embedding enrichment; accepted requests are normalized to sources.
+    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources.
     embedding_name: ?[]const u8 = null,
     /// Deprecated index-level description of an embedding producer input. Put this field on the matching embedding enrichment and select its output through sources.
     source_artifact_name: ?[]const u8 = null,
@@ -1618,12 +1604,6 @@ pub const IndexConfig = struct {
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
     artifact: ?GraphArtifactProducerConfig = null,
-    /// Deprecated root-level single-source mapping. Put nodes inside source or each sources item.
-    nodes: ?GraphArtifactNodeMappingConfig = null,
-    /// Deprecated root-level single-source mapping. Put edge inside source or each sources item.
-    edge: ?GraphArtifactEdgeMappingConfig = null,
-    /// Deprecated root-level single-source mapping. Put context inside source or each sources item.
-    context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
@@ -1737,18 +1717,6 @@ pub const IndexConfig = struct {
         }
         if (self.artifact) |value| {
             try jw.objectField("artifact");
-            try jw.write(value);
-        }
-        if (self.nodes) |value| {
-            try jw.objectField("nodes");
-            try jw.write(value);
-        }
-        if (self.edge) |value| {
-            try jw.objectField("edge");
-            try jw.write(value);
-        }
-        if (self.context) |value| {
-            try jw.objectField("context");
             try jw.write(value);
         }
         if (self.algebraic_planning) |value| {

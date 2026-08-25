@@ -2211,7 +2211,7 @@ test "table provisioner registers a resolver declared in the table index config"
     const indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
@@ -2268,7 +2268,7 @@ test "table provisioner registers a resolver declared in the table index config"
     const bumped_indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",
@@ -2314,7 +2314,7 @@ test "table provisioner registers a resolver declared in the table index config"
     const removed_indexes_json =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[]
         \\}
@@ -2369,7 +2369,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
     const graph_only =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
         \\}
     ;
@@ -2388,7 +2388,7 @@ test "table provisioner can admit resolver backfill without draining corpus work
     const with_resolver =
         \\{
         \\  "relations_graph":{"type":"graph",
-        \\    "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\    "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
         \\    "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}},
         \\  "resolvers":[
         \\    {"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1",

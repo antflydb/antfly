@@ -9207,10 +9207,7 @@ export interface components {
             field?: string;
             /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. */
             sources?: components["schemas"]["ArtifactIndexSource"][];
-            /**
-             * @deprecated
-             * @description Deprecated single-source artifact reference. Use sources with a matching embedding enrichment; accepted requests are normalized to sources.
-             */
+            /** @description Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. */
             embedding_name?: string;
             /**
              * @deprecated
@@ -9288,12 +9285,6 @@ export interface components {
         };
         /** @description Artifact stream materialized into graph edges. */
         GraphArtifactSourceConfig: {
-            /**
-             * @deprecated
-             * @description Compatibility discriminator for the former graph source union. Omit it; artifact is the only public source kind.
-             * @enum {string}
-             */
-            kind?: "artifact";
             artifact: string;
             path?: string;
             /**
@@ -9408,7 +9399,7 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
-            /** @description Chunk or JSON asset streams whose edge-like values are unioned into this graph index. */
+            /** @description Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Earlier sources win when multiple sources materialize the same edge identity. */
             sources?: components["schemas"]["GraphArtifactSourceConfig"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];
@@ -9427,21 +9418,6 @@ export interface components {
             /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. */
             source?: components["schemas"]["GraphArtifactSourceConfig"];
             artifact?: components["schemas"]["GraphArtifactProducerConfig"];
-            /**
-             * @deprecated
-             * @description Deprecated root-level single-source mapping. Put nodes inside source or each sources item.
-             */
-            nodes?: components["schemas"]["GraphArtifactNodeMappingConfig"];
-            /**
-             * @deprecated
-             * @description Deprecated root-level single-source mapping. Put edge inside source or each sources item.
-             */
-            edge?: components["schemas"]["GraphArtifactEdgeMappingConfig"];
-            /**
-             * @deprecated
-             * @description Deprecated root-level single-source mapping. Put context inside source or each sources item.
-             */
-            context?: components["schemas"]["GraphArtifactContextConfig"];
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
         };

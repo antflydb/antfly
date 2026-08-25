@@ -8634,7 +8634,7 @@ test "serverless index catalog validation rejects malformed configs" {
     ));
 
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
-        \\{"relations":{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}}
+        \\{"relations":{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[0]"}}}
     ));
 }
 
