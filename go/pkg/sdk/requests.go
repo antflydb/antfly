@@ -210,6 +210,12 @@ type QueryRequest struct {
 // It converts the strongly-typed *query.Query fields to json.RawMessage
 // for compatibility with the OAPI layer.
 func (q QueryRequest) MarshalJSON() ([]byte, error) {
+	if q.GraphQueries != nil && q.GraphSearches != nil {
+		return nil, fmt.Errorf("antfly: query accepts either graph_queries or graph_searches, not both")
+	}
+	if err := validateNamedGraphQueries(q.GraphQueries); err != nil {
+		return nil, err
+	}
 	// Convert SDK QueryRequest to oapi.QueryRequest
 	oapiReq := oapi.QueryRequest{
 		Table:            q.Table,

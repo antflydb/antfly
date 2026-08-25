@@ -480,6 +480,29 @@ class TestAntflyClient:
         with pytest.raises(AntflyException, match="match.nodes key"):
             client.query(table="docs", graph_queries={"people": query})
 
+    @pytest.mark.parametrize(
+        ("start", "error"),
+        [
+            ({"result_ref": "$graph_results.bad\u200bname"}, "result_ref query name"),
+            (
+                {"result_ref": "$graph_results.people", "binding": "bad\u200bname"},
+                "traverse.start.binding",
+            ),
+            (
+                {"result_ref": "$query_results", "binding": "person"},
+                "binding requires a \\$graph_results",
+            ),
+        ],
+    )
+    def test_query_rejects_unsafe_graph_result_selectors(self, start: dict[str, object], error: str) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(AntflyException, match=error):
+            client.query(
+                table="docs",
+                graph_queries={"walk": {"index": "social", "traverse": {"start": start}}},
+            )
+
     def test_query_identifier_preflight_matches_graph_predicate_depth_limit(self) -> None:
         client = AntflyClient(base_url="http://localhost:8080")
         where: dict[str, object] = {"not_equal": {"left": {"alias": "person"}, "right": {"alias": "author"}}}

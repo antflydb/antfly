@@ -68,14 +68,15 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm
+.PHONY: build build-docs generate graph-identifier-generate graph-identifier-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm build-antfarm-main
 .PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
 
 build-antfarm-main:
 	@echo "Building antfarm frontend..."
-	cd ts && pnpm install && pnpm --filter antfarm... build
+	cd ts && node scripts/run-pinned-toolchain.mjs pnpm install --frozen-lockfile
+	cd ts && node scripts/run-pinned-toolchain.mjs pnpm --filter antfarm... build
 	@echo "Copying dist files to zig/pkg/antfly/antfarm..."
 	rm -rf zig/pkg/antfly/antfarm/*
 	cp -r ts/apps/antfarm/dist/* zig/pkg/antfly/antfarm/
@@ -93,8 +94,9 @@ generate: graph-identifier-generate build-docs tidy
 		echo "==> Generating in $$mod"; \
 		(cd $$mod && $(GO) generate ./...) || exit 1; \
 	done
-	cd ts && pnpm --filter @antfly/sdk generate
+	cd ts && node scripts/run-pinned-toolchain.mjs pnpm --filter @antfly/sdk generate
 	$(MAKE) -C ./py/packages/sdk generate
+	$(MAKE) build-antfarm
 
 graph-identifier-generate:
 	$(SCRIPTS_PY) scripts/generate_graph_identifier_policy.py

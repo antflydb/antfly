@@ -12103,7 +12103,7 @@ export interface components {
             /** @description `$query_results` selects the final ranked query results. `$graph_results.<query-name>` selects a prior graph query result. Prior MATCH results require `binding`; traversal and path results prohibit it. A path result selects the endpoint node of each returned path. */
             result_ref: string;
             /** @description Binding alias to select from a prior MATCH result. Valid only with `$graph_results.<query-name>` when that query returns MATCH rows. */
-            binding?: string;
+            binding?: components["schemas"]["GraphIdentifier"];
             /** @description Maximum referenced results to use. Omit only when the referenced result is complete. */
             limit?: number;
         };

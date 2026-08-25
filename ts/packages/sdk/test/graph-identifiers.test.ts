@@ -55,4 +55,25 @@ describe("graph identifier policy", () => {
       })
     ).toThrow("maximum graph predicate depth");
   });
+
+  it.each([
+    [{ result_ref: "$graph_results.bad\u200bname" }, "result_ref query name"],
+    [{ result_ref: "$graph_results.people", binding: "bad\u200bname" }, "traverse.start.binding"],
+    [{ result_ref: "$query_results", binding: "person" }, "binding requires a $graph_results"],
+  ])("rejects unsafe graph result selectors", (start, message) => {
+    expect(() =>
+      validateGraphQueryIdentifiers({
+        walk: { index: "social", traverse: { start } },
+      })
+    ).toThrow(message);
+  });
+
+  it("rejects more than the server maximum named operations", () => {
+    const graphQueries = Object.fromEntries(
+      Array.from({ length: 65 }, (_, index) => [`query_${index}`, {}])
+    );
+    expect(() => validateGraphQueryIdentifiers(graphQueries)).toThrow(
+      "at most 64 named operations"
+    );
+  });
 });

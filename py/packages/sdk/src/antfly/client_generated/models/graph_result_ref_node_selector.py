@@ -17,8 +17,10 @@ class GraphResultRefNodeSelector:
         result_ref (str): `$query_results` selects the final ranked query results. `$graph_results.<query-name>` selects
             a prior graph query result. Prior MATCH results require `binding`; traversal and path results prohibit it. A
             path result selects the endpoint node of each returned path.
-        binding (str | Unset): Binding alias to select from a prior MATCH result. Valid only with
-            `$graph_results.<query-name>` when that query returns MATCH rows.
+        binding (str | Unset): User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode
+            15.0.0). Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed.
+            The value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode
+            White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
         limit (int | Unset): Maximum referenced results to use. Omit only when the referenced result is complete.
     """
 

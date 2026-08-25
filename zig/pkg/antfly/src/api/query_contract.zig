@@ -10269,8 +10269,9 @@ const GraphNodeIdentitySet = std.HashMapUnmanaged(GraphNodeIdentityKey, void, Gr
 
 fn validateGraphResultRef(ref: []const u8) !void {
     if (std.mem.eql(u8, ref, "$query_results")) return;
-    if (std.mem.startsWith(u8, ref, "$graph_results.") and
-        ref.len > "$graph_results.".len) return;
+    const prefix = "$graph_results.";
+    if (std.mem.startsWith(u8, ref, prefix) and
+        graph_query_mod.isValidIdentifier(ref[prefix.len..])) return;
     return error.InvalidQueryRequest;
 }
 
@@ -14534,6 +14535,10 @@ test "canonical graph contract rejects modes without exact public execution" {
         "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}",
         "{\"graph_queries\":{\"path\":{\"index\":\"g\",\"shortest_path\":{\"from\":{\"key\":\"a\"},\"to\":{\"key\":\"b\"},\"direction\":\"both\"}}}}",
         "{\"graph_queries\":{\"rows\":{\"index\":\"g\",\"match\":{\"anchor\":\"a\",\"nodes\":{\"a\":{},\"b\":{}},\"edges\":[{\"from\":\"a\",\"to\":\"b\",\"direction\":\"in\"}]},\"return\":{\"bindings\":[\"b\"]}}}}",
+        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.\"}}}}}",
+        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.bad\u{200b}name\"}}}}}",
+        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.*\"}}}}}",
+        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.$reserved\"}}}}}",
     };
     for (cases) |body| {
         try std.testing.expectError(

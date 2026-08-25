@@ -3,6 +3,7 @@ package sdk
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"testing"
 )
 
@@ -16,6 +17,35 @@ func TestQueryRequestMarshalOmitsZeroJoin(t *testing.T) {
 	}
 	if bytes.Contains(body, []byte(`"join"`)) {
 		t.Fatalf("Marshal emitted zero join: %s", body)
+	}
+}
+
+func TestQueryRequestMarshalValidatesCanonicalGraphOperationNames(t *testing.T) {
+	for _, name := range []string{" bad", "bad\u200bname", "*", "$reserved"} {
+		_, err := json.Marshal(QueryRequest{GraphQueries: map[string]GraphQuery{name: {}}})
+		if err == nil {
+			t.Fatalf("expected invalid graph operation name %q to fail", name)
+		}
+	}
+}
+
+func TestQueryRequestMarshalEnforcesCanonicalGraphOperationLimit(t *testing.T) {
+	queries := make(map[string]GraphQuery, maxNamedGraphQueries+1)
+	for i := 0; i <= maxNamedGraphQueries; i++ {
+		queries[fmt.Sprintf("query_%d", i)] = GraphQuery{}
+	}
+	if _, err := json.Marshal(QueryRequest{GraphQueries: queries}); err == nil {
+		t.Fatal("expected too many canonical graph operations to fail")
+	}
+}
+
+func TestQueryRequestMarshalRejectsMixedGraphContracts(t *testing.T) {
+	_, err := json.Marshal(QueryRequest{
+		GraphQueries:  map[string]GraphQuery{},
+		GraphSearches: map[string]LegacyGraphQuery{},
+	})
+	if err == nil {
+		t.Fatal("expected mixed canonical and legacy graph contracts to fail")
 	}
 }
 

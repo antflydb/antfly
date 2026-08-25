@@ -176,6 +176,24 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
         match = encoded_query.get("match")
         if isinstance(match, Mapping):
             _validate_graph_match_identifiers(match, encoded_query.get("return"), f"graph_queries[{name!r}]")
+        traverse = encoded_query.get("traverse")
+        if isinstance(traverse, Mapping):
+            start = traverse.get("start")
+            if isinstance(start, Mapping) and "result_ref" in start:
+                path = f"graph_queries[{name!r}].traverse.start"
+                result_ref = start.get("result_ref")
+                if result_ref != "$query_results":
+                    prefix = "$graph_results."
+                    if not isinstance(result_ref, str) or not result_ref.startswith(prefix):
+                        raise AntflyException(
+                            f"{path}.result_ref must be $query_results or $graph_results.<query-name>"
+                        )
+                    _require_graph_identifier(result_ref[len(prefix) :], f"{path}.result_ref query name")
+                binding = start.get("binding")
+                if binding is not None:
+                    if result_ref == "$query_results":
+                        raise AntflyException(f"{path}.binding requires a $graph_results.<query-name> reference")
+                    _require_graph_identifier(binding, f"{path}.binding")
         encoded[name] = encoded_query
     return encoded
 

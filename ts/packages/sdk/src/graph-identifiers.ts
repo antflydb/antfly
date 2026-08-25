@@ -119,13 +119,47 @@ function validateMatch(query: JSONObject, path: string): void {
   }
 }
 
+function validateTraverse(query: JSONObject, path: string): void {
+  const traverse = object(query.traverse);
+  const start = object(traverse?.start);
+  if (!start || !("result_ref" in start)) return;
+
+  const resultRef = start.result_ref;
+  const selectorPath = `${path}.traverse.start`;
+  if (resultRef !== "$query_results") {
+    const prefix = "$graph_results.";
+    if (typeof resultRef !== "string" || !resultRef.startsWith(prefix)) {
+      throw new TypeError(
+        `${selectorPath}.result_ref must be $query_results or $graph_results.<query-name>`
+      );
+    }
+    requireIdentifier(resultRef.slice(prefix.length), `${selectorPath}.result_ref query name`);
+  }
+  if (start.binding !== undefined && start.binding !== null) {
+    if (resultRef === "$query_results") {
+      throw new TypeError(
+        `${selectorPath}.binding requires a $graph_results.<query-name> reference`
+      );
+    }
+    requireIdentifier(start.binding, `${selectorPath}.binding`);
+  }
+}
+
 /** Validate every identifier carried by canonical named graph operations. */
 export function validateGraphQueryIdentifiers(graphQueries: unknown): void {
   const operations = object(graphQueries);
   if (!operations) return;
-  for (const [name, candidate] of Object.entries(operations)) {
+  const entries = Object.entries(operations);
+  if (entries.length > 64) {
+    throw new TypeError("graph_queries accepts at most 64 named operations");
+  }
+  for (const [name, candidate] of entries) {
     requireIdentifier(name, "graph_queries key");
     const query = object(candidate);
-    if (query) validateMatch(query, `graph_queries[${JSON.stringify(name)}]`);
+    if (query) {
+      const path = `graph_queries[${JSON.stringify(name)}]`;
+      validateMatch(query, path);
+      validateTraverse(query, path);
+    }
   }
 }

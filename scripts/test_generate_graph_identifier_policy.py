@@ -47,6 +47,16 @@ class GraphIdentifierPolicyTest(unittest.TestCase):
         self.assertEqual(identifier_ref, indexes["GraphMatch"]["properties"]["anchor"])
         self.assertEqual(identifier_ref, indexes["GraphBindingsReturn"]["properties"]["bindings"]["items"])
         self.assertEqual(
+            identifier_ref["$ref"],
+            indexes["GraphResultRefNodeSelector"]["properties"]["binding"]["$ref"],
+        )
+        self.assertEqual(
+            identifier_ref,
+            indexes["GraphResultRefNodeSelector"]["properties"]["result_ref"][
+                "x-antfly-graph-result-name-schema"
+            ],
+        )
+        self.assertEqual(
             identifier_ref,
             indexes["GraphMatch"]["properties"]["nodes"]["x-antfly-property-name-schema"],
         )

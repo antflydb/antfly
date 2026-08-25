@@ -34,7 +34,20 @@ const (
 	maxGraphCountAggregates     = 64
 	maxGraphEdgeTypes           = 64
 	maxGraphEdgeTypeBytes       = 64 * 1024
+	maxNamedGraphQueries        = 64
 )
+
+func validateNamedGraphQueries(queries map[string]GraphQuery) error {
+	if len(queries) > maxNamedGraphQueries {
+		return fmt.Errorf("antfly: graph_queries accepts at most %d named operations", maxNamedGraphQueries)
+	}
+	for name := range queries {
+		if !validGraphQueryName(name) {
+			return invalidGraphIdentifier("graph_queries key")
+		}
+	}
+	return nil
+}
 
 // NewGraphDocumentFilter adapts the non-scoring stored-document subset of the
 // query DSL to a graph node filter. Query DSL dotted fields are converted to
