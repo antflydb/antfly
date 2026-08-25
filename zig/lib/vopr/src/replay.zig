@@ -49,6 +49,49 @@ pub fn exactWithContext(
     defer allocator.free(expected);
     const actual = try replayed.renderAlloc(allocator);
     defer allocator.free(actual);
-    if (!std.mem.eql(u8, expected, actual)) return error.ReplayArtifactDiverged;
+    if (!std.mem.eql(u8, expected, actual)) {
+        logFirstDivergence(expected, actual);
+        return error.ReplayArtifactDiverged;
+    }
     return replayed;
+}
+
+fn logFirstDivergence(expected: []const u8, actual: []const u8) void {
+    const common_len = @min(expected.len, actual.len);
+    var offset: usize = 0;
+    while (offset < common_len and expected[offset] == actual[offset]) : (offset += 1) {}
+    const expected_line = lineAt(expected, offset);
+    const actual_line = lineAt(actual, offset);
+    const max_diagnostic_bytes = 1024;
+    std.log.err(
+        "exact replay diverged at byte {d} (expected_len={d}, actual_len={d})\nexpected: {s}\nactual:   {s}",
+        .{
+            offset,
+            expected.len,
+            actual.len,
+            expected_line[0..@min(expected_line.len, max_diagnostic_bytes)],
+            actual_line[0..@min(actual_line.len, max_diagnostic_bytes)],
+        },
+    );
+}
+
+fn lineAt(bytes: []const u8, offset: usize) []const u8 {
+    const bounded = @min(offset, bytes.len);
+    const start = if (std.mem.lastIndexOfScalar(u8, bytes[0..bounded], '\n')) |newline|
+        newline + 1
+    else
+        0;
+    const end = if (std.mem.indexOfScalarPos(u8, bytes, bounded, '\n')) |newline|
+        newline
+    else
+        bytes.len;
+    return bytes[start..end];
+}
+
+test "exact replay diagnostics select the differing canonical line" {
+    const artifact = "header\nchoice\nobservation\n";
+    try std.testing.expectEqualStrings("header", lineAt(artifact, 2));
+    try std.testing.expectEqualStrings("choice", lineAt(artifact, 9));
+    try std.testing.expectEqualStrings("observation", lineAt(artifact, 18));
+    try std.testing.expectEqualStrings("", lineAt(artifact, artifact.len));
 }

@@ -5837,7 +5837,7 @@ fn PublicApiTestRig(comptime N: usize) type {
 /// explicit-step transport while every public listener, forwarding request,
 /// client, timeout, and shutdown task borrows the caller's single VoprIo.
 pub const VoprPublicClusterFixture = struct {
-    pub const FaultMode = enum { clean, metadata_partition, node_restart, partial_http_write };
+    pub const FaultMode = enum { clean, metadata_partition, node_restart, partial_http_write, resource_pressure };
     const node_count = 3;
     const metadata_group_id: u64 = 6840;
     const table_id: u64 = 6841;
@@ -5860,6 +5860,7 @@ pub const VoprPublicClusterFixture = struct {
     modeled_configurators: [node_count]ModeledDbOpenConfigurator = undefined,
     resource_managers: [node_count]resource_manager_mod.ResourceManager = undefined,
     resource_manager_count: usize = 0,
+    resource_reservations: [node_count]?resource_manager_mod.BatchReservation = .{null} ** node_count,
     cluster: MetadataHttpClusterSimulation = undefined,
     cluster_live: bool = false,
     cluster_started: bool = false,
@@ -5889,6 +5890,7 @@ pub const VoprPublicClusterFixture = struct {
     actual_host_count: usize = 0,
     write_done: std.Io.Event = .unset,
     tenant_write_done: std.Io.Event = .unset,
+    resource_recovered: std.Io.Event = .unset,
     write_finished: bool = false,
     read_finished: bool = false,
     tenant_write_finished: bool = false,
@@ -5900,6 +5902,10 @@ pub const VoprPublicClusterFixture = struct {
     tenant_read_sound: bool = false,
     table_isolation_sound: bool = false,
     topology_sound: bool = false,
+    resource_denial_sound: bool = false,
+    resource_recovery_sound: bool = false,
+    resource_pressure_observed: bool = false,
+    resource_denial_error_code: u64 = 0,
     cleanup_sound: bool = false,
     request_errors: u64 = 0,
     last_request_error_code: u64 = 0,
@@ -6114,18 +6120,28 @@ pub const VoprPublicClusterFixture = struct {
 
     pub fn start(self: *VoprPublicClusterFixture, mode: FaultMode) !void {
         switch (mode) {
-            .clean => self.fault_finished = true,
+            .clean => {
+                self.resource_recovered.set(self.sim.io());
+                self.fault_finished = true;
+            },
             .metadata_partition => {
+                self.resource_recovered.set(self.sim.io());
                 const leader_node_id = self.cluster.cluster.configs[self.metadata_leader_index].host.http.host.local_node_id;
                 try self.cluster.virtual_network.partitionNode(leader_node_id);
                 _ = self.sim.io().async(healMetadataPartition, .{ self, leader_node_id });
             },
             .node_restart => {
+                self.resource_recovered.set(self.sim.io());
                 _ = self.sim.io().async(restartNonHost, .{self});
             },
             .partial_http_write => {
+                self.resource_recovered.set(self.sim.io());
                 try self.sim.limitNextNetworkWrite(1);
                 self.fault_finished = true;
+            },
+            .resource_pressure => {
+                try self.saturateNodeMemory();
+                _ = self.sim.io().async(runResourcePressure, .{self});
             },
         }
         _ = self.sim.io().async(runWriter, .{self});
@@ -6136,6 +6152,7 @@ pub const VoprPublicClusterFixture = struct {
     }
 
     fn runWriter(self: *VoprPublicClusterFixture) void {
+        self.resource_recovered.waitUncancelable(self.sim.io());
         defer {
             self.write_finished = true;
             self.write_done.set(self.sim.io());
@@ -6180,6 +6197,7 @@ pub const VoprPublicClusterFixture = struct {
     }
 
     fn runTenantWriter(self: *VoprPublicClusterFixture) void {
+        self.resource_recovered.waitUncancelable(self.sim.io());
         defer {
             self.tenant_write_finished = true;
             self.tenant_write_done.set(self.sim.io());
@@ -6268,6 +6286,76 @@ pub const VoprPublicClusterFixture = struct {
         self.fault_finished = true;
     }
 
+    /// Model a node-local background owner (for example, resident inference
+    /// state) consuming every remaining byte in each production process
+    /// envelope. The reservation does not allocate host memory; it exercises
+    /// the same exactly-once accounting and admission contract as production
+    /// owners while public traffic continues over the real HTTP stack.
+    fn saturateNodeMemory(self: *VoprPublicClusterFixture) !void {
+        errdefer self.releaseNodeMemory();
+        for (self.resource_managers[0..self.resource_manager_count], 0..) |*manager, index| {
+            const stats = manager.snapshot().memory;
+            if (stats.hard_limit_bytes == 0 or stats.used_bytes >= stats.hard_limit_bytes)
+                return error.InvalidFullClusterResourceEnvelope;
+            self.resource_reservations[index] = try manager.reserveBatchClassified(&.{.{
+                .slice = .inference_model_residency,
+                .bytes = stats.hard_limit_bytes - stats.used_bytes,
+            }});
+        }
+    }
+
+    fn releaseNodeMemory(self: *VoprPublicClusterFixture) void {
+        for (&self.resource_reservations) |*slot| if (slot.*) |*reservation| {
+            reservation.release();
+            slot.* = null;
+        };
+    }
+
+    fn allNodeMemorySaturated(self: *VoprPublicClusterFixture) bool {
+        for (self.resource_managers[0..self.resource_manager_count]) |*manager| {
+            const memory = manager.snapshot().memory;
+            if (memory.hard_limit_bytes == 0 or memory.used_bytes != memory.hard_limit_bytes) return false;
+        }
+        return self.resource_manager_count == node_count;
+    }
+
+    fn runResourcePressure(self: *VoprPublicClusterFixture) void {
+        self.resource_pressure_observed = self.allNodeMemorySaturated();
+        if (self.client.fetchBatch(self.api_base_uris[self.client_index], "docs",
+            \\{"inserts":{"pressure:probe":{"title":"pressure","body":"node-local-resource-pressure"}}}
+        )) |response| {
+            var unexpected = response;
+            unexpected.deinit(self.alloc);
+        } else |err| {
+            self.resource_denial_error_code = @intFromError(err);
+            self.resource_denial_sound = self.resource_pressure_observed and
+                (err == error.LeaderUnavailable or err == error.UnexpectedHttpStatus);
+        }
+
+        self.releaseNodeMemory();
+        self.resource_recovered.set(self.sim.io());
+
+        var recovered = self.client.fetchBatch(self.api_base_uris[self.client_index], "docs",
+            \\{"inserts":{"pressure:probe":{"title":"pressure","body":"node-local-resource-pressure"}}}
+        ) catch {
+            self.fault_finished = true;
+            return;
+        };
+        recovered.deinit(self.alloc);
+        var lookup = self.client.fetchLookup(
+            self.api_base_uris[self.client_index],
+            "docs",
+            "pressure:probe",
+            null,
+        ) catch {
+            self.fault_finished = true;
+            return;
+        };
+        defer lookup.deinit(self.alloc);
+        self.resource_recovery_sound = std.mem.indexOf(u8, lookup.body, "node-local-resource-pressure") != null;
+        self.fault_finished = true;
+    }
+
     fn shutdownWhenComplete(self: *VoprPublicClusterFixture) void {
         while (!self.write_finished or !self.read_finished or !self.tenant_write_finished or
             !self.tenant_read_finished or !self.fault_finished)
@@ -6309,6 +6397,7 @@ pub const VoprPublicClusterFixture = struct {
     }
 
     pub fn deinit(self: *VoprPublicClusterFixture) void {
+        self.releaseNodeMemory();
         if (self.stack_live) {
             deinitPublicApiStack(node_count, &self.listeners, &self.servers, &self.write_sources);
             self.stack_live = false;
@@ -6355,13 +6444,17 @@ pub const VoprPublicClusterFixture = struct {
         }
     }
 
-    pub fn healthSnapshot(self: *const VoprPublicClusterFixture) struct {
+    pub fn healthSnapshot(self: *VoprPublicClusterFixture) struct {
         hosts: usize,
         requests_ok: bool,
         topology_ok: bool,
         cleanup_ok: bool,
         raft_wire_requests: u64,
         node_resource_managers: usize,
+        resource_denial_ok: bool,
+        resource_recovery_ok: bool,
+        resource_pressure_observed: bool,
+        resource_denial_error_code: u64,
     } {
         return .{
             .hosts = self.actual_host_count,
@@ -6371,6 +6464,10 @@ pub const VoprPublicClusterFixture = struct {
             .cleanup_ok = self.cleanup_sound,
             .raft_wire_requests = self.raft_wire_requests,
             .node_resource_managers = self.resource_manager_count,
+            .resource_denial_ok = self.resource_denial_sound,
+            .resource_recovery_ok = self.resource_recovery_sound,
+            .resource_pressure_observed = self.resource_pressure_observed,
+            .resource_denial_error_code = self.resource_denial_error_code,
         };
     }
 };

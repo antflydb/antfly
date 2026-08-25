@@ -13,7 +13,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 2;
+    pub const version: u32 = 3;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -23,6 +23,7 @@ pub const Scenario = struct {
     const shared_io_id = vopr.id.stable(name, "one-shared-vopr-io");
     const raft_wire_id = vopr.id.stable(name, "raft-crosses-vopr-http-wire");
     const node_resources_id = vopr.id.stable(name, "node-resource-owners-distinct");
+    const resource_recovery_id = vopr.id.stable(name, "node-resource-denial-recovers");
     const cleanup_id = vopr.id.stable(name, "cluster-resources-cleaned");
     const complete_id = vopr.id.stable(name, "history-completes");
 
@@ -35,6 +36,7 @@ pub const Scenario = struct {
         .{ .id = shared_io_id, .name = name ++ ".one-shared-vopr-io", .kind = .always },
         .{ .id = raft_wire_id, .name = name ++ ".raft-crosses-vopr-http-wire", .kind = .always },
         .{ .id = node_resources_id, .name = name ++ ".node-resource-owners-distinct", .kind = .always },
+        .{ .id = resource_recovery_id, .name = name ++ ".node-resource-denial-recovers", .kind = .always },
         .{ .id = cleanup_id, .name = name ++ ".cluster-resources-cleaned", .kind = .always },
         .{ .id = complete_id, .name = name ++ ".history-completes", .kind = .reachable },
     };
@@ -46,6 +48,7 @@ pub const Scenario = struct {
         node_restart,
         partial_http_write,
         serverless_stale_generation,
+        resource_pressure,
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
@@ -53,6 +56,7 @@ pub const Scenario = struct {
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .partial_http_write => .partial_http_write,
+                .resource_pressure => .resource_pressure,
             };
         }
 
@@ -69,6 +73,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "node-restart"),
         vopr.id.stable(name, "partial-http-write"),
         vopr.id.stable(name, "serverless-stale-generation"),
+        vopr.id.stable(name, "resource-pressure"),
     };
     const mode_names = [_][]const u8{
         name ++ ".clean",
@@ -76,6 +81,7 @@ pub const Scenario = struct {
         name ++ ".node-restart",
         name ++ ".partial-http-write",
         name ++ ".serverless-stale-generation",
+        name ++ ".resource-pressure",
     };
 
     const State = struct {
@@ -244,6 +250,10 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".serverless-visible", @intFromBool(state.serverless_sound));
         try builder.addNamed(allocator, name ++ ".raft-wire-requests", if (cluster) |snapshot| @intCast(snapshot.raft_wire_requests) else 0);
         try builder.addNamed(allocator, name ++ ".node-resource-managers", if (cluster) |snapshot| @intCast(snapshot.node_resource_managers) else 0);
+        try builder.addNamed(allocator, name ++ ".resource-denial-ok", @intFromBool(if (cluster) |snapshot| snapshot.resource_denial_ok else false));
+        try builder.addNamed(allocator, name ++ ".resource-recovery-ok", @intFromBool(if (cluster) |snapshot| snapshot.resource_recovery_ok else false));
+        try builder.addNamed(allocator, name ++ ".resource-pressure-observed", @intFromBool(if (cluster) |snapshot| snapshot.resource_pressure_observed else false));
+        try builder.addNamed(allocator, name ++ ".resource-denial-error", if (cluster) |snapshot| @intCast(snapshot.resource_denial_error_code) else 0);
         try builder.addNamed(allocator, name ++ ".initialization-failed", @intFromBool(state.initialization_failed));
         try builder.addNamed(allocator, name ++ ".open-sockets", @intCast(resources.open_sockets));
         try builder.addNamed(allocator, name ++ ".active-tasks", @intCast(resources.active_tasks));
@@ -263,6 +273,9 @@ pub const Scenario = struct {
         try sink.check(allocator, shared_io_id, !state.initialization_done or state.shared_io_sound);
         try sink.check(allocator, raft_wire_id, !state.complete or (cluster != null and cluster.?.raft_wire_requests > 0));
         try sink.check(allocator, node_resources_id, !state.initialization_done or (cluster != null and cluster.?.node_resource_managers == 3));
+        try sink.check(allocator, resource_recovery_id, !state.complete or state.mode.? != .resource_pressure or
+            (cluster != null and cluster.?.resource_pressure_observed and cluster.?.resource_denial_ok and
+                cluster.?.resource_recovery_ok));
         try sink.check(allocator, cleanup_id, !state.complete or
             (cluster != null and cluster.?.cleanup_ok and resources.open_sockets == 0));
         try sink.check(allocator, complete_id, state.complete);
@@ -306,7 +319,7 @@ test "full cluster VOPR exact replays metadata data serverless HTTP clients and 
             .transition_budget = 20_000,
             .resource_budget = 96,
             .backend_ids = &backend_ids,
-            .source_revision = "full-cluster-vopr-v2",
+            .source_revision = "full-cluster-vopr-v3",
             .target = "native",
             .optimize = @tagName(@import("builtin").mode),
         });
@@ -325,7 +338,13 @@ test "full cluster VOPR exact replays metadata data serverless HTTP clients and 
             };
         }
         try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
-        var replayed = try vopr.replay.exact(Scenario, history_alloc, &recorded);
+        var replayed = vopr.replay.exact(Scenario, history_alloc, &recorded) catch |err| {
+            std.debug.print("full cluster mode={s} exact replay failed: {s}\n", .{
+                Scenario.mode_names[mode_ordinal],
+                @errorName(err),
+            });
+            return err;
+        };
         replayed.deinit();
     }
 }
