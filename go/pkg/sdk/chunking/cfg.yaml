@@ -1,12 +1,14 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/oapi-codegen/oapi-codegen/v2.8.0/configuration-schema.json
-package: generating
+package: chunking
 generate:
-  models: true
   embedded-spec: true
+  models: true
 compatibility:
   always-prefix-enum-values: true
 output: openapi.gen.go
 output-options:
   skip-prune: true
-  prefer-skip-optional-pointer: false
-  prefer-skip-optional-pointer-with-omitzero: false
+  prefer-skip-optional-pointer: true
+  prefer-skip-optional-pointer-with-omitzero: true
+import-mapping:
+  generating.yaml: github.com/antflydb/antfly/go/pkg/sdk/oapi

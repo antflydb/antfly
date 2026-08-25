@@ -2,11 +2,7 @@ module github.com/antflydb/antfly/go/pkg/operator
 
 go 1.26.0
 
-replace (
-	github.com/antflydb/antfly/go/pkg/generating => ../generating
-	github.com/antflydb/antfly/go/pkg/libaf => ../libaf
-	github.com/antflydb/antfly/go/pkg/sdk => ../sdk
-)
+replace github.com/antflydb/antfly/go/pkg/sdk => ../sdk
 
 require (
 	github.com/antflydb/antfly/go/pkg/sdk v0.0.1
@@ -27,7 +23,6 @@ require (
 
 require (
 	github.com/Masterminds/semver/v3 v3.4.0 // indirect
-	github.com/antflydb/antfly/go/pkg/libaf v0.0.1 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
