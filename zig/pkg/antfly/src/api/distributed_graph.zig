@@ -2407,10 +2407,10 @@ fn executeDistributedConjunctivePattern(
     const pattern = graph_query.query.match_pattern orelse return error.InvalidArgument;
     var filter_evaluator = DistributedPatternFilterEvaluator{ .admission = admission };
     defer filter_evaluator.deinit();
-    // Source anchors are storage-scan input and do not consume this budget.
-    // Reached graph nodes and examined edges do, across every cursor page, so
-    // exact MATCH fails closed under bounded work without imposing an anchor
-    // cardinality ceiling.
+    // Source anchors, reached graph nodes, and examined edges consume distinct
+    // dimensions of the request-wide budget across every cursor page. This
+    // keeps exact MATCH exhaustive within explicit resource ceilings and fails
+    // closed instead of publishing a partial result as exact.
     const base_opts = graph_pattern_mod.MatchOptions{
         .max_results = if (graph_query.query.return_limit > 0)
             std.math.add(u32, graph_query.query.return_limit, 1) catch graph_query.query.return_limit

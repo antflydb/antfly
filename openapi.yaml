@@ -23507,15 +23507,20 @@ components:
           $ref: '#/components/schemas/GraphPathEndpoint'
         type:
           type: string
+          minLength: 1
+          maxLength: 65536
         weight:
           type: number
           format: double
+          minimum: 0
+          description: Finite durable edge weight. max_weight paths further require values in [0,1].
         metadata:
           type: object
           additionalProperties: true
     GraphResultNode:
       x-go-type-skip-optional-pointer: true
       type: object
+      additionalProperties: false
       description: A node in graph query results
       required:
         - key
@@ -23523,19 +23528,24 @@ components:
         key:
           x-go-type-skip-optional-pointer: true
           type: string
+          minLength: 1
           description: Document key
         table:
           x-go-type-skip-optional-pointer: true
           type: string
+          minLength: 1
           description: Owning table for a cross-table node; omitted for nodes in the queried table
         depth:
           x-go-type-skip-optional-pointer: true
           type: integer
+          minimum: 0
+          maximum: 64
           description: Distance from start node
         distance:
           x-go-type-skip-optional-pointer: true
           type: number
           format: double
+          minimum: 0
           description: Weighted distance
         document:
           x-go-type-skip-optional-pointer: true
@@ -23545,12 +23555,15 @@ components:
         path:
           x-go-type-skip-optional-pointer: true
           type: array
+          minItems: 1
+          maxItems: 65
           items:
             $ref: '#/components/schemas/GraphPathEndpoint'
           description: Exact ordered node identities in the path from the start node to this node
         path_edges:
           x-go-type-skip-optional-pointer: true
           type: array
+          maxItems: 64
           items:
             $ref: '#/components/schemas/GraphPathEdge'
           description: Ordered typed edges in path from start to this node
@@ -23663,11 +23676,14 @@ components:
       properties:
         nodes:
           type: array
+          minItems: 1
+          maxItems: 65
           items:
             $ref: '#/components/schemas/GraphPathEndpoint'
           description: Ordered node identities. Table is omitted for nodes in the query table.
         edges:
           type: array
+          maxItems: 64
           items:
             $ref: '#/components/schemas/GraphPathEdge'
           description: Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
@@ -23684,6 +23700,8 @@ components:
             for min_weight, and the raw edge-weight product for max_weight.
         length:
           type: integer
+          minimum: 0
+          maximum: 64
     GraphNodesResult:
       x-go-type-skip-optional-pointer: true
       type: object

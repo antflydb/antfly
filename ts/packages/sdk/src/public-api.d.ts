@@ -12357,7 +12357,10 @@ export interface components {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             type: string;
-            /** Format: double */
+            /**
+             * Format: double
+             * @description Finite durable edge weight. max_weight paths further require values in [0,1].
+             */
             weight: number;
             metadata?: {
                 [key: string]: unknown;

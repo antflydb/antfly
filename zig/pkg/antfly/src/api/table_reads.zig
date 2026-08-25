@@ -47,6 +47,7 @@ const db_query_search = @import("../storage/db/query/search_exec.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const introducer_mod = @import("../introducer.zig");
 const graph_mod = @import("../graph/graph.zig");
+const graph_edge_weight = @import("../graph/edge_weight.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
@@ -18427,6 +18428,13 @@ fn parseRemoteGraphNodeWithKey(
     key: []const u8,
     item: indexes_openapi.GraphResultNode,
 ) !graph_query_mod.GraphResultNode {
+    try validateRemoteCanonicalGraphIdentity(key, item.table);
+    const depth = std.math.cast(u32, item.depth orelse 0) orelse return error.InvalidQueryRequest;
+    const distance = item.distance orelse 0;
+    if (!std.math.isFinite(distance) or distance < 0) return error.InvalidQueryRequest;
+    if (item.path) |path| {
+        try validateRemoteCanonicalGraphPathNodes(path);
+    }
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_table = if (item.table) |table| try alloc.dupe(u8, table) else null;
@@ -18444,8 +18452,8 @@ fn parseRemoteGraphNodeWithKey(
     return .{
         .key = owned_key,
         .table = owned_table,
-        .depth = @intCast(item.depth orelse 0),
-        .distance = item.distance orelse 0,
+        .depth = depth,
+        .distance = distance,
         .path = if (owned_path) |value| value.nodes else null,
         .path_tables = if (owned_path) |value| value.tables else null,
         .path_edges = path_edges,
@@ -18458,6 +18466,7 @@ fn parseRemoteLegacyGraphNodeWithKey(
     key: []const u8,
     item: indexes_openapi.LegacyGraphResultNode,
 ) !graph_query_mod.GraphResultNode {
+    const depth = std.math.cast(u32, item.depth orelse 0) orelse return error.InvalidQueryRequest;
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_table = if (item.table) |table| try alloc.dupe(u8, table) else null;
@@ -18471,7 +18480,7 @@ fn parseRemoteLegacyGraphNodeWithKey(
     return .{
         .key = owned_key,
         .table = owned_table,
-        .depth = @intCast(item.depth orelse 0),
+        .depth = depth,
         .distance = item.distance orelse 0,
         .path = path,
         .path_edges = path_edges,
@@ -18789,9 +18798,20 @@ fn validateRemoteCanonicalGraphPathScores(item: indexes_openapi.GraphPath) !void
     var sum: f64 = 0;
     var product: f64 = 1;
     for (item.edges) |edge| {
-        if (!std.math.isFinite(edge.weight)) return error.InvalidQueryRequest;
+        graph_edge_weight.validateStored(edge.weight) catch return error.InvalidQueryRequest;
+        switch (item.weight_mode) {
+            .min_hops => {},
+            .min_weight => _ = graph_paths.pathEdgeCost(.min_weight, edge.weight) catch
+                return error.InvalidQueryRequest,
+            .max_weight => _ = graph_paths.pathEdgeCost(.max_weight, edge.weight) catch
+                return error.InvalidQueryRequest,
+        }
         sum += edge.weight;
-        product *= edge.weight;
+        if (!std.math.isFinite(sum)) return error.InvalidQueryRequest;
+        if (item.weight_mode == .max_weight) {
+            product *= edge.weight;
+            if (!std.math.isFinite(product)) return error.InvalidQueryRequest;
+        }
     }
     if (!graphPathScoreEql(item.weight_sum, sum)) return error.InvalidQueryRequest;
     const objective: f64 = switch (item.weight_mode) {
@@ -18804,6 +18824,7 @@ fn validateRemoteCanonicalGraphPathScores(item: indexes_openapi.GraphPath) !void
 }
 
 fn graphPathScoreEql(left: f64, right: f64) bool {
+    if (!std.math.isFinite(left) or !std.math.isFinite(right)) return false;
     const scale = @max(@as(f64, 1), @max(@abs(left), @abs(right)));
     return @abs(left - right) <= 1e-12 * scale;
 }
@@ -18863,16 +18884,29 @@ fn validateRemoteCanonicalGraphPathEdges(
     nodes: []const indexes_openapi.GraphPathEndpoint,
     edges: []const indexes_openapi.GraphPathEdge,
 ) !void {
-    if (nodes.len == 0) {
-        if (edges.len != 0) return error.InvalidQueryRequest;
-        return;
-    }
+    try validateRemoteCanonicalGraphPathNodes(nodes);
     if (edges.len != nodes.len - 1) return error.InvalidQueryRequest;
     for (edges, 0..) |edge, i| {
+        if (edge.type.len == 0) return error.InvalidQueryRequest;
+        graph_edge_weight.validateStored(edge.weight) catch return error.InvalidQueryRequest;
+        try validateRemoteCanonicalGraphIdentity(edge.from.key, edge.from.table);
+        try validateRemoteCanonicalGraphIdentity(edge.to.key, edge.to.table);
         if (!graphPathEndpointEql(edge.from, nodes[i]) or
             !graphPathEndpointEql(edge.to, nodes[i + 1]))
             return error.InvalidQueryRequest;
     }
+}
+
+fn validateRemoteCanonicalGraphPathNodes(
+    nodes: []const indexes_openapi.GraphPathEndpoint,
+) !void {
+    if (nodes.len == 0) return error.InvalidQueryRequest;
+    for (nodes) |node| try validateRemoteCanonicalGraphIdentity(node.key, node.table);
+}
+
+fn validateRemoteCanonicalGraphIdentity(key: []const u8, table: ?[]const u8) !void {
+    if (key.len == 0) return error.InvalidQueryRequest;
+    if (table) |value| if (value.len == 0) return error.InvalidQueryRequest;
 }
 
 fn graphPathEndpointEql(
@@ -18882,6 +18916,88 @@ fn graphPathEndpointEql(
     if (!std.mem.eql(u8, left.key, right.key)) return false;
     if (left.table == null or right.table == null) return left.table == null and right.table == null;
     return std.mem.eql(u8, left.table.?, right.table.?);
+}
+
+test "remote canonical graph nodes reject invalid identity and numeric domains" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "", .{ .key = "" }));
+    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .table = "",
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .depth = -1,
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .distance = -0.1,
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .distance = std.math.inf(f64),
+    }));
+}
+
+test "remote canonical graph paths reject impossible shapes and weight domains" {
+    const nodes = [_]indexes_openapi.GraphPathEndpoint{
+        .{ .key = "a" },
+        .{ .key = "b", .table = "entities" },
+    };
+    var edges = [_]indexes_openapi.GraphPathEdge{.{
+        .from = nodes[0],
+        .to = nodes[1],
+        .type = "related",
+        .weight = 0.5,
+    }};
+    var path = indexes_openapi.GraphPath{
+        .nodes = &nodes,
+        .edges = &edges,
+        .weight_mode = .max_weight,
+        .weight_sum = 0.5,
+        .objective_value = 0.5,
+        .length = 1,
+    };
+    try validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges);
+    try validateRemoteCanonicalGraphPathScores(path);
+
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        validateRemoteCanonicalGraphPathEdges(&.{}, &.{}),
+    );
+
+    edges[0].type = "";
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
+    );
+    edges[0].type = "related";
+
+    edges[0].weight = -0.1;
+    path.weight_mode = .min_hops;
+    path.weight_sum = -0.1;
+    path.objective_value = 1;
+    try std.testing.expectError(error.InvalidQueryRequest, validateRemoteCanonicalGraphPathScores(path));
+
+    edges[0].weight = 1.1;
+    path.weight_mode = .max_weight;
+    path.weight_sum = 1.1;
+    path.objective_value = 1.1;
+    try std.testing.expectError(error.InvalidQueryRequest, validateRemoteCanonicalGraphPathScores(path));
+
+    const overflow_edges = [_]indexes_openapi.GraphPathEdge{
+        .{ .from = .{ .key = "a" }, .to = .{ .key = "b" }, .type = "e", .weight = std.math.floatMax(f64) },
+        .{ .from = .{ .key = "b" }, .to = .{ .key = "c" }, .type = "e", .weight = std.math.floatMax(f64) },
+    };
+    try std.testing.expectError(error.InvalidQueryRequest, validateRemoteCanonicalGraphPathScores(.{
+        .nodes = &.{ .{ .key = "a" }, .{ .key = "b" }, .{ .key = "c" } },
+        .edges = &overflow_edges,
+        .weight_mode = .min_hops,
+        .weight_sum = 0,
+        .objective_value = 2,
+        .length = 2,
+    }));
+    try std.testing.expect(!graphPathScoreEql(0, std.math.inf(f64)));
 }
 
 fn appendJsonFieldName(

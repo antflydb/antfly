@@ -2,7 +2,15 @@
 Antfly SDK - Python client for Antfly distributed key-value store and search engine.
 """
 
-from .client import AntflyClient, CreatedIndex, CreateIndexRequest, IndexOperations, antfly_embedder
+from .client import (
+    AntflyClient,
+    CreatedIndex,
+    CreateIndexRequest,
+    GraphQueriesInput,
+    GraphQueryInput,
+    IndexOperations,
+    antfly_embedder,
+)
 from .client_generated.models import (
     CreateAlgebraicIndexRequest,
     CreateAlgebraicIndexRequestType,
@@ -47,6 +55,8 @@ __all__ = [
     "CreateAlgebraicIndexRequest",
     "CreateAlgebraicIndexRequestType",
     "CreatedIndex",
+    "GraphQueryInput",
+    "GraphQueriesInput",
     "CreatedFullTextIndex",
     "CreatedEmbeddingsIndex",
     "CreatedGraphIndex",

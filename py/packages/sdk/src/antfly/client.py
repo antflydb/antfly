@@ -28,9 +28,14 @@ from antfly.client_generated.models import (
     EmbedderConfig,
     EmbedderProvider,
     Error,
+    GraphKShortestPathsQuery,
+    GraphMatchQuery,
+    GraphShortestPathQuery,
+    GraphTraverseQuery,
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
+    QueryRequestGraphQueries,
     QueryResponses,
 )
 from antfly.client_generated.types import UNSET
@@ -49,6 +54,8 @@ CreateIndexRequest: TypeAlias = (
     CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
 )
 CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
+GraphQueryInput: TypeAlias = GraphMatchQuery | GraphTraverseQuery | GraphShortestPathQuery | GraphKShortestPathsQuery
+GraphQueriesInput: TypeAlias = QueryRequestGraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
 _CREATE_INDEX_REQUEST_TYPES = (
     CreateFullTextIndexRequest,
     CreateEmbeddingsIndexRequest,
@@ -61,6 +68,26 @@ _CREATED_INDEX_TYPES = {
     "graph": CreatedGraphIndex,
     "algebraic": CreatedAlgebraicIndex,
 }
+
+
+def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]:
+    """Serialize typed canonical graph operations while preserving raw-map compatibility."""
+    operations = graph_queries.to_dict() if isinstance(graph_queries, QueryRequestGraphQueries) else graph_queries
+    if len(operations) > 64:
+        raise AntflyException("graph_queries accepts at most 64 named operations")
+
+    encoded: dict[str, Any] = {}
+    typed_queries = (GraphMatchQuery, GraphTraverseQuery, GraphShortestPathQuery, GraphKShortestPathsQuery)
+    for name, query in operations.items():
+        if not name or len(name) > 128 or name.startswith("$"):
+            raise AntflyException("graph query names must contain 1-128 Unicode characters and must not begin with '$'")
+        if isinstance(query, typed_queries):
+            encoded[name] = query.to_dict()
+        elif isinstance(query, Mapping):
+            encoded[name] = dict(query)
+        else:
+            raise AntflyException(f"graph query {name!r} must be a generated graph query model or mapping")
+    return encoded
 
 
 def antfly_embedder(model: str, *, api_url: str | None = None) -> EmbedderConfig:
@@ -580,7 +607,7 @@ class AntflyClient:
         profile: bool | None = None,
         reranker: dict[str, Any] | None = None,
         analyses: dict[str, Any] | None = None,
-        graph_queries: dict[str, Any] | None = None,
+        graph_queries: GraphQueriesInput | None = None,
         graph_searches: dict[str, Any] | None = None,
         expand_strategy: str | None = None,
         document_renderer: str | None = None,
@@ -623,7 +650,8 @@ class AntflyClient:
             profile: Include execution profile when true
             reranker: Reranker configuration
             analyses: Analysis configuration
-            graph_queries: Graph query configuration
+            graph_queries: Named canonical graph operations. Accepts generated graph query models,
+                ``QueryRequestGraphQueries``, or raw mappings.
             graph_searches: Deprecated v0.2 graph query configuration. Use
                 ``graph_queries``; this compatibility argument will be removed
                 in the next major release.
@@ -645,6 +673,7 @@ class AntflyClient:
             raise AntflyException("query accepts either aggregations or facets, not both")
         if graph_queries is not None and graph_searches is not None:
             raise AntflyException("query accepts either graph_queries or graph_searches, not both")
+        encoded_graph_queries = _serialize_graph_queries(graph_queries) if graph_queries is not None else None
 
         body: dict[str, Any] = {}
         if extra is not None:
@@ -676,7 +705,7 @@ class AntflyClient:
             "profile": profile,
             "reranker": reranker,
             "analyses": analyses,
-            "graph_queries": graph_queries,
+            "graph_queries": encoded_graph_queries,
             "graph_searches": graph_searches,
             "expand_strategy": expand_strategy,
             "document_renderer": document_renderer,

@@ -29,6 +29,7 @@ from antfly.client_generated.models.graph_document_term_filter import (  # noqa:
     GraphDocumentTermFilter,
 )
 from antfly.client_generated.models.graph_match_node import GraphMatchNode  # noqa: E402
+from antfly.client_generated.models.graph_match_query import GraphMatchQuery  # noqa: E402
 from antfly.client_generated.models.inference_chat_message import InferenceChatMessage  # noqa: E402
 from antfly.client_generated.models.inference_generate_request import InferenceGenerateRequest  # noqa: E402
 from antfly.client_generated.models.inference_role import InferenceRole  # noqa: E402
@@ -420,6 +421,42 @@ class TestAntflyClient:
 
         with pytest.raises(AntflyException, match="either graph_queries or graph_searches"):
             client.query(table="docs", graph_queries={}, graph_searches={})
+
+    @patch("antfly.client.Client")
+    def test_query_serializes_typed_graph_operations(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        configure_response(mock_httpx, 200, {"responses": []})
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        graph_query = GraphMatchQuery.from_dict(
+            {
+                "index": "social",
+                "match": {"anchor": "a", "nodes": {"a": {}}, "edges": []},
+                "return": {"aggregates": {"rows": {"count": "*"}}},
+            }
+        )
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        client.query(table="docs", graph_queries={"count_rows": graph_query})
+
+        mock_httpx.stream.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/docs/query",
+            json={
+                "graph_queries": {
+                    "count_rows": {
+                        "index": "social",
+                        "match": {"anchor": "a", "nodes": {"a": {}}, "edges": []},
+                        "return": {"aggregates": {"rows": {"count": "*"}}},
+                    }
+                }
+            },
+        )
+
+    def test_query_rejects_invalid_graph_operation_values(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(AntflyException, match="generated graph query model or mapping"):
+            client.query(table="docs", graph_queries={"bad": 1})  # type: ignore[dict-item]
 
     @patch("antfly.client.Client")
     @patch("antfly.client.lookup_key")

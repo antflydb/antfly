@@ -24,7 +24,7 @@ class GraphPathEdge:
             from_ (GraphPathEndpoint):
             to (GraphPathEndpoint):
             type_ (str):
-            weight (float):
+            weight (float): Finite durable edge weight. max_weight paths further require values in [0,1].
             metadata (GraphPathEdgeMetadata | Unset):
     """
 

@@ -5053,6 +5053,7 @@ pub const GraphPathEdge = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     type: []const u8,
+    /// Finite durable edge weight. max_weight paths further require values in [0,1].
     weight: f64,
     metadata: ?std.json.Value = null,
 };

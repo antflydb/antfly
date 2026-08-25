@@ -18,6 +18,7 @@ const ant_json = @import("antfly-json");
 const db_mod = @import("../storage/db/mod.zig");
 const document_query = @import("../storage/db/document_query.zig");
 const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
+const graph_edge_weight = @import("../graph/edge_weight.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
 const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
@@ -5996,8 +5997,27 @@ fn toOpenApiGraphPaths(
     const out = try alloc.alloc(indexes_openapi.GraphPath, paths.len);
     for (paths, 0..) |path, i| {
         if (@as(usize, path.length) != path.edges.len) return error.InvalidRemoteResponse;
+        if (path.nodes.len == 0 or path.nodes.len > graph_pattern_mod.max_pattern_hops + 1)
+            return error.InvalidRemoteResponse;
         if (path.node_tables.len != 0 and path.node_tables.len != path.nodes.len) {
             return error.InvalidRemoteResponse;
+        }
+        for (path.nodes, 0..) |key, node_index| {
+            if (key.len == 0) return error.InvalidRemoteResponse;
+            if (path.node_tables.len != 0) {
+                if (path.node_tables[node_index]) |table| if (table.len == 0)
+                    return error.InvalidRemoteResponse;
+            }
+        }
+        for (path.edges) |edge| {
+            graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
+            switch (weight_mode) {
+                .min_hops => {},
+                .min_weight => _ = graph_paths_mod.pathEdgeCost(.min_weight, edge.weight) catch
+                    return error.InvalidRemoteResponse,
+                .max_weight => _ = graph_paths_mod.pathEdgeCost(.max_weight, edge.weight) catch
+                    return error.InvalidRemoteResponse,
+            }
         }
         const weight_sum = try graph_paths_mod.sumPathEdgeWeights(path.edges);
         const objective_value: f64 = switch (weight_mode) {
@@ -6089,6 +6109,8 @@ fn toOpenApiGraphPathEdges(
     const out = try alloc.alloc(indexes_openapi.GraphPathEdge, edges.len);
     errdefer if (out.len > 0) alloc.free(out);
     for (edges, 0..) |edge, i| {
+        if (edge.edge_type.len == 0) return error.InvalidRemoteResponse;
+        graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
         const left_key = nodes[i];
         const right_key = nodes[i + 1];
         const connects_in_order = std.mem.eql(u8, edge.source, left_key) and
