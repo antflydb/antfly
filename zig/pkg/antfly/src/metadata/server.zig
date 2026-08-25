@@ -75,6 +75,8 @@ pub const MetadataServer = struct {
         const svc = try alloc.create(service.MetadataHttpService);
         errdefer alloc.destroy(svc);
         var service_cfg = cfg.service;
+        service_cfg.internal_service_secret = cfg.api_server_cfg.internal_service_secret;
+        service_cfg.internal_service_issuer = cfg.api_server_cfg.internal_service_issuer;
         service_cfg.destination_authorizer = .{
             .manager = cfg.api_server_cfg.user_manager,
             .auth_enabled = cfg.api_server_cfg.auth_enabled,
@@ -104,6 +106,10 @@ pub const MetadataServer = struct {
                 },
                 local_ops,
             );
+            _ = hosted_ops.withInternalServiceAuth(
+                cfg.api_server_cfg.internal_service_secret,
+                cfg.api_server_cfg.internal_service_issuer,
+            );
             transition_ops_registration = try svc.raft.replaceTransitionOps(hosted_ops.adapter());
             owned_hosted_shard_ops = hosted_ops;
         }
@@ -116,6 +122,10 @@ pub const MetadataServer = struct {
                 metadataDataBearingStoreGroupRouter(svc),
                 svc.raft.host.http_host.request_executor,
                 local_db,
+            );
+            _ = hosted_db.withInternalServiceAuth(
+                cfg.api_server_cfg.internal_service_secret,
+                cfg.api_server_cfg.internal_service_issuer,
             );
             svc.setRoutedShardDbAdapter(hosted_db.adapter());
             owned_hosted_shard_db = hosted_db;
@@ -154,7 +164,15 @@ pub const MetadataServer = struct {
             const admin_http_server = try alloc.create(metadata_http_server.MetadataHttpServer);
             admin_http_server.* = metadata_http_server.MetadataHttpServer.init(
                 alloc,
-                .{},
+                .{
+                    .internal_service_auth_capability = if (cfg.api_server_cfg.internal_service_secret != null)
+                        if (cfg.api_server_cfg.internal_service_accept_legacy_unauthenticated)
+                            "v1; mode=migration"
+                        else
+                            "v1; mode=enforce"
+                    else
+                        null,
+                },
                 metadata_http_server.AdminSource.fromMetadataHttpService(svc),
             );
             owned_admin_http_server = admin_http_server;
@@ -171,6 +189,10 @@ pub const MetadataServer = struct {
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );
+            _ = public_read_source.withInternalServiceAuth(
+                cfg.api_server_cfg.internal_service_secret,
+                cfg.api_server_cfg.internal_service_issuer,
+            );
             owned_public_read_source = public_read_source;
 
             const public_write_source = try alloc.create(api_table_writes.HostedProvisionedTableWriteSource);
@@ -185,6 +207,10 @@ pub const MetadataServer = struct {
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
+            _ = public_write_source.withInternalServiceAuth(
+                cfg.api_server_cfg.internal_service_secret,
+                cfg.api_server_cfg.internal_service_issuer,
+            );
             _ = public_write_source.withDestinationAuthorization(.{
                 .manager = cfg.api_server_cfg.user_manager,
                 .auth_enabled = cfg.api_server_cfg.auth_enabled,

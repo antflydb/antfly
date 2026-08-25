@@ -3863,6 +3863,44 @@ func baseCluster() *AntflyCluster {
 	}
 }
 
+func TestValidateInternalServiceAuthDistributedContract(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.Mode = ClusterModeDistributed
+
+	err := cluster.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "spec.internalServiceAuth is required in Distributed mode") {
+		t.Fatalf("expected missing internal service auth to fail closed, got: %v", err)
+	}
+
+	optional := false
+	cluster.Spec.InternalServiceAuth = &InternalServiceAuthSpec{SecretKeyRef: corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "cluster-internal-service-auth"},
+		Key:                  "secret",
+		Optional:             &optional,
+	}}
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected a required namespaced Secret selector to be valid, got: %v", err)
+	}
+
+	optional = true
+	err = cluster.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "optional must be false") {
+		t.Fatalf("expected an optional signing key to be rejected, got: %v", err)
+	}
+}
+
+func TestValidateInternalServiceAuthForbiddenForStandalone(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.InternalServiceAuth = &InternalServiceAuthSpec{SecretKeyRef: corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "unused"},
+		Key:                  "secret",
+	}}
+	err := cluster.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "must be omitted in Standalone mode") {
+		t.Fatalf("expected standalone internal service auth to be rejected, got: %v", err)
+	}
+}
+
 func baseStandaloneCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{

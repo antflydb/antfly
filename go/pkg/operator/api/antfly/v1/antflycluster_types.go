@@ -388,6 +388,13 @@ type AntflyClusterSpec struct {
 	// +optional
 	SecretStore *SecretStoreSpec `json:"secretStore,omitempty"`
 
+	// InternalServiceAuth references the dedicated per-cluster signing key used
+	// for metadata/data internal RPC. Kubernetes injects the selected Secret key
+	// directly into runtime pods; the operator never reads the Secret value.
+	// Required for Distributed mode and forbidden for Standalone mode.
+	// +optional
+	InternalServiceAuth *InternalServiceAuthSpec `json:"internalServiceAuth,omitempty"`
+
 	// Storage defines the storage configuration
 	Storage StorageSpec `json:"storage"`
 
@@ -411,6 +418,17 @@ type AntflyClusterSpec struct {
 	// If not specified, the default ServiceAccount for the namespace is used
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+}
+
+// InternalServiceAuthSpec selects the Kubernetes Secret key used to authenticate
+// distributed node-to-node RPC. Issuer and rolling-upgrade mode are derived and
+// managed by the operator so every node in one cluster receives identical,
+// non-secret settings.
+type InternalServiceAuthSpec struct {
+	// SecretKeyRef selects a required key in a Secret in the AntflyCluster
+	// namespace. The value must contain at least 32 random bytes and must not be
+	// reused as an API key, trusted-principal key, or another cluster's key.
+	SecretKeyRef corev1.SecretKeySelector `json:"secretKeyRef"`
 }
 
 // SecretStoreSpec configures a mounted Antfly secrets.json file.

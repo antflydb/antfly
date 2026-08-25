@@ -26,6 +26,7 @@ const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
+const internal_service_auth = @import("../api/internal_service_auth.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
@@ -81,6 +82,8 @@ const ha_lease_min_grace_ms: u64 = 10_000;
 const ha_lease_api_host_env = "ANTFLY_HA_LEASE_API_HOST";
 const ha_lease_default_api_host = "kubernetes.default.svc";
 const ha_lease_max_response_bytes: usize = 256 * 1024;
+const internal_service_secret_key = "antfly.internal_service.secret";
+const internal_service_issuer_key = "antfly.internal_service.issuer";
 
 const StandaloneHttpContext = struct {
     api_server: ?*ApiHttpServer,
@@ -1914,6 +1917,23 @@ pub fn runFromIterator(
         secret_store_initialized = true;
     }
 
+    const internal_service_secret = try secret_store.getOwned(alloc, internal_service_secret_key);
+    defer if (internal_service_secret) |value| alloc.free(value);
+    const internal_service_issuer = try secret_store.getOwned(alloc, internal_service_issuer_key);
+    defer if (internal_service_issuer) |value| alloc.free(value);
+    if (internal_service_secret != null or internal_service_issuer != null) {
+        internal_service_auth.validateRuntimeConfig(
+            internal_service_secret,
+            internal_service_issuer,
+        ) catch |err| {
+            std.log.err(
+                "standalone internal service credential is incomplete or invalid: configure {s} with at least {d} bytes and a printable {s}; err={s}",
+                .{ internal_service_secret_key, internal_service_auth.minimum_secret_bytes, internal_service_issuer_key, @errorName(err) },
+            );
+            return err;
+        };
+    }
+
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
     var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
@@ -2125,6 +2145,8 @@ pub fn runFromIterator(
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
             .ard_public_catalog_enabled = cli.ard_public_catalog_enabled,
+            .internal_service_secret = internal_service_secret,
+            .internal_service_issuer = internal_service_issuer,
             .deployment_mode = .standalone,
             .storage_maintenance = &storage_maintenance,
             .admin_bearer_token = admin_bearer_token,

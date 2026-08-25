@@ -4947,6 +4947,8 @@ const SimAuthManager = struct {
     }
 };
 
+const sim_internal_service_secret = "metadata-simulation-internal-service-secret";
+
 fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, password: []const u8) ![]u8 {
     const raw = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ username, password });
     defer alloc.free(raw);
@@ -5000,17 +5002,24 @@ fn startPublicApiServers(
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(shared_io);
+        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
+        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         const server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
             .auth_enabled = true,
             .user_manager = &auth_managers[i].manager,
-        } else .{};
+            .internal_service_secret = sim_internal_service_secret,
+            .internal_service_issuer = "metadata-sim",
+        } else .{
+            .internal_service_secret = sim_internal_service_secret,
+            .internal_service_issuer = "metadata-sim",
+        };
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             alloc,
             http_alloc,
@@ -5159,6 +5168,7 @@ fn PublicApiTestRig(comptime N: usize) type {
             errdefer self.client_executor.deinit();
 
             self.client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, self.client_executor.executor());
+            _ = self.client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
             self.metadata_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, self.client_executor.executor());
 
             for (0..N) |i| try cluster.node(i).runRound();
@@ -6327,6 +6337,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
     var metadata_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, client_executor.executor());
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.heap.page_allocator, "split public docs");
@@ -6527,6 +6538,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
     var metadata_client = metadata_http_client.MetadataHttpClient.init(std.heap.page_allocator, client_executor.executor());
 
     const create_body = try test_contract_helpers.encodeCreateTableRequest(std.heap.page_allocator, "merge public docs");
@@ -9898,17 +9910,19 @@ test "metadata http cluster simulation forwards public table io from a non-host 
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(&http_io);
+        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
+        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
         servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(
             std.testing.allocator,
             http_alloc,
-            .{},
+            .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" },
             status_sources[i].iface(),
             read_sources[i].source(),
             write_sources[i].source(),
@@ -9923,6 +9937,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
     const client_base = api_base_uris[client_index];
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -10181,14 +10196,16 @@ test "metadata http cluster simulation forwards public table io across split ran
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(&http_io);
+        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
+        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" }, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
         listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -10203,6 +10220,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
     const client_base = api_base_uris[client_index];
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -10464,14 +10482,16 @@ test "metadata http cluster simulation forwards public table io after merge fina
             forward_executor.executor(),
         );
         _ = read_sources[i].withIo(&http_io);
+        _ = read_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
             roots[i],
             catalog_sources[i].iface(),
             routers[i].iface(),
             forward_executor.executor(),
         );
+        _ = write_sources[i].withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{}, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
+        servers[i] = api_http_server.ApiHttpServer.initForTestingWithRequestAllocator(std.testing.allocator, http_alloc, .{ .internal_service_secret = sim_internal_service_secret, .internal_service_issuer = "metadata-sim" }, status_sources[i].iface(), read_sources[i].source(), write_sources[i].source());
         listeners[i] = try api_http_test_runtime.Runtime.startShared(http_alloc, &http_io, &servers[i]);
     }
     for (0..3) |i| api_base_uris[i] = try listeners[i].baseUri(std.testing.allocator);
@@ -10484,6 +10504,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
     const client_base = api_base_uris[client_index];
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -11546,6 +11567,7 @@ test "metadata http cluster simulation load balanced backup retries a real elect
     client_executor.initSharedInPlace(std.heap.page_allocator, .{}, &http_io);
     defer client_executor.deinit();
     var client = api_http_client.ApiHttpClient.init(std.heap.page_allocator, client_executor.executor());
+    _ = client.withInternalServiceAuth(sim_internal_service_secret, "metadata-sim");
 
     const initial_leader_node_id = cluster.cluster.configs[initial_leader].host.http.host.local_node_id;
     try cluster.virtual_network.partitionNode(initial_leader_node_id);
