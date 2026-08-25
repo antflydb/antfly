@@ -254,7 +254,14 @@ fn appendFlatCentroidBlock(
     });
 }
 
-fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_count: u64, publish_generation: u64) !FlatCentroidDirectory {
+fn buildFlatCentroidDirectory(
+    self: anytype,
+    txn: anytype,
+    root_node: u64,
+    node_count: u64,
+    publish_generation: u64,
+    cancellation: ?search_types.CancellationToken,
+) !FlatCentroidDirectory {
     const dims: usize = @intCast(self.config.dims);
     const block_size = @max(self.config.flat_centroid_block_size, @as(usize, 1));
     var blocks = std.ArrayListUnmanaged(FlatCentroidBlock).empty;
@@ -272,6 +279,8 @@ fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_
     var pending = std.ArrayListUnmanaged(u64).empty;
     defer pending.deinit(self.alloc);
     try pending.append(self.alloc, root_node);
+    var visited = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer visited.deinit(self.alloc);
 
     var block_count: usize = 0;
     var posting_count: usize = 0;
@@ -281,6 +290,21 @@ fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_
     var cursor: usize = 0;
     while (cursor < pending.items.len) : (cursor += 1) {
         const node_id = pending.items[cursor];
+        if (cursor % 64 == 0) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        }
+        if (node_id == 0 or node_id > node_count) {
+            invalid_posting_count += 1;
+            continue;
+        }
+        const visited_entry = try visited.getOrPut(self.alloc, node_id);
+        if (visited_entry.found_existing) {
+            // A valid HBC topology is a strict tree. Reaching a node twice is
+            // either a cycle or shared-child corruption; count it as invalid
+            // and do not enqueue its descendants again.
+            invalid_posting_count += 1;
+            continue;
+        }
         var node = loadPublishedNode(self, txn, node_id) catch |err| {
             if (isNotFoundGeneric(err)) {
                 missing_node_count += 1;
@@ -338,6 +362,7 @@ fn acquireFlatCentroidDirectory(
     self: anytype,
     txn: anytype,
     expected_snapshot: ?PublishedSnapshot,
+    cancellation: ?search_types.CancellationToken,
 ) !*FlatCentroidDirectory {
     // Complete-snapshot callers already hold a generation-bound read txn. A
     // matching shared directory is safe to reuse; otherwise build privately
@@ -363,6 +388,7 @@ fn acquireFlatCentroidDirectory(
             snapshot.root_node,
             snapshot.node_count,
             snapshot.publish_generation,
+            cancellation,
         );
         return built;
     }
@@ -390,9 +416,9 @@ fn acquireFlatCentroidDirectory(
         if (comptime @hasDecl(Index, "beginRuntimeSearchTxn")) {
             var build_txn = try self.beginRuntimeSearchTxn();
             defer build_txn.abort();
-            built.* = try buildFlatCentroidDirectory(self, &build_txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
+            built.* = try buildFlatCentroidDirectory(self, &build_txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
         } else {
-            built.* = try buildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
+            built.* = try buildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
         }
         errdefer built.deinit(self.alloc);
 
@@ -440,11 +466,12 @@ pub fn selectFlatRabitqPostingsAlloc(
     profile: *search_types.SearchProfile,
     coverage_policy: search_types.CoveragePolicy,
     expected_snapshot: ?PublishedSnapshot,
+    cancellation: ?search_types.CancellationToken,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) ![]FlatCentroidProbe {
     const start = now_fn_u64();
-    const directory = try acquireFlatCentroidDirectory(self, txn, expected_snapshot);
+    const directory = try acquireFlatCentroidDirectory(self, txn, expected_snapshot, cancellation);
     defer directory.release(self.alloc);
     defer profile.child_expand_ns += elapsed_fn_u64(start);
     if (coverage_policy == .complete_snapshot and !directory.complete()) {

@@ -2122,6 +2122,11 @@ pub const HBCIndex = struct {
     /// Exact reachable-vector coverage is immutable within a published
     /// generation, so only the first complete search needs to validate it.
     complete_coverage_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(std.math.maxInt(u64)),
+    /// Serializes the first exact coverage validation for a generation. A
+    /// waiter rechecks the generation after acquiring the lock, so concurrent
+    /// effort=1 searches share one validation instead of multiplying its I/O
+    /// and governed workspace.
+    complete_coverage_mu: apply_rw_lock_mod.ApplyRwLock = .{},
     rng: go_rand.GoPcg,
     // Set when a write path observes a tree-link inconsistency (stale parent
     // pointer, dangling node reference); background maintenance runs a
@@ -3075,6 +3080,22 @@ pub const HBCIndex = struct {
 
     pub fn completeCoverageAlreadyValidated(self: *const HBCIndex, generation: u64) bool {
         return self.complete_coverage_generation.load(.acquire) == generation;
+    }
+
+    /// Returns with complete_coverage_mu held exclusively when this caller is
+    /// responsible for validation. A false return never retains the lock.
+    pub fn beginCompleteCoverageValidation(self: *HBCIndex, generation: u64) bool {
+        self.complete_coverage_mu.lockExclusive();
+        if (self.completeCoverageAlreadyValidated(generation)) {
+            self.complete_coverage_mu.unlockExclusive();
+            return false;
+        }
+        return true;
+    }
+
+    pub fn finishCompleteCoverageValidation(self: *HBCIndex, generation: u64, validated: bool) void {
+        if (validated) self.complete_coverage_generation.store(generation, .release);
+        self.complete_coverage_mu.unlockExclusive();
     }
 
     pub fn noteCompleteCoverageValidated(self: *HBCIndex, generation: u64) void {
@@ -7877,6 +7898,70 @@ test "flat rabitq complete snapshot rejects a directory built with dangling node
     );
 }
 
+test "flat rabitq complete snapshot rejects a cyclic directory topology" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 4,
+        .leaf_size = 4,
+        .branching_factor = 4,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .flat_centroid_block_size = 4,
+    });
+    defer idx.close();
+
+    var prng = std.Random.DefaultPrng.init(0xc1c1_e001);
+    const random = prng.random();
+    var id: u64 = 1;
+    while (id <= 60) : (id += 1) {
+        var vector: [4]f32 = undefined;
+        for (&vector) |*value| value.* = random.float(f32) * 2.0 - 1.0;
+        try idx.insert(id, &vector);
+    }
+
+    {
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try idx.loadNode(&txn, idx.metadata.root_node);
+        defer root.deinit(alloc);
+        try std.testing.expect(!root.is_leaf);
+        try root.ensureUnbacked(alloc);
+        const cyclic_children = try alloc.alloc(u64, root.children.len + 1);
+        @memcpy(cyclic_children[0..root.children.len], root.children);
+        cyclic_children[root.children.len] = root.id;
+        alloc.free(root.children);
+        root.children = cyclic_children;
+        // Bypass derived split-range maintenance so the test can persist the
+        // malformed edge and exercise read-side cycle hardening directly.
+        try idx.saveNodeBody(&txn, &root);
+        try txn.commit();
+    }
+
+    // The flat-directory builder must terminate, preserve best-effort
+    // availability, and reject the invalid topology for complete coverage.
+    var partial = try idx.searchWithRequest(.{
+        .query = &.{ 0.1, 0.2, 0.3, 0.4 },
+        .k = 5,
+        .load_metadata = false,
+    });
+    defer partial.deinit();
+    try std.testing.expect(partial.getHits().len > 0);
+
+    try std.testing.expectError(
+        error.IncompletePublishedSnapshot,
+        idx.searchWithRequest(.{
+            .query = &.{ 0.1, 0.2, 0.3, 0.4 },
+            .k = 5,
+            .search_effort = 1,
+            .load_metadata = false,
+        }),
+    );
+}
+
 test "complete snapshot rejects orphaned reachable coverage and schedules generation repair" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -7936,6 +8021,28 @@ test "complete snapshot rejects orphaned reachable coverage and schedules genera
     );
     try std.testing.expect(idx.generationRepairPending());
     try std.testing.expect(idx.treeLinkRepairPending());
+}
+
+test "complete coverage validation claim caches success and retries failure" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+
+    const generation = idx.publishedGeneration();
+    try std.testing.expect(idx.beginCompleteCoverageValidation(generation));
+    idx.finishCompleteCoverageValidation(generation, true);
+    try std.testing.expect(!idx.beginCompleteCoverageValidation(generation));
+
+    const next_generation = generation + 2;
+    try std.testing.expect(idx.beginCompleteCoverageValidation(next_generation));
+    idx.finishCompleteCoverageValidation(next_generation, false);
+    try std.testing.expect(idx.beginCompleteCoverageValidation(next_generation));
+    idx.finishCompleteCoverageValidation(next_generation, true);
+    try std.testing.expect(!idx.beginCompleteCoverageValidation(next_generation));
 }
 
 test "complete snapshot retries optimistic publication conflicts under a progress fence" {
@@ -8178,6 +8285,15 @@ test "hbc duplicate child links are dropped by unlink and repair" {
         const broken = try idx.verifyTreeLinks();
         try std.testing.expect(!broken.consistent());
     }
+    try std.testing.expectError(
+        error.IncompletePublishedSnapshot,
+        idx.searchWithRequest(.{
+            .query = &.{ 0.1, 0.2, 0.3, 0.4 },
+            .k = 5,
+            .search_effort = 1,
+            .load_metadata = false,
+        }),
+    );
     const repair = try idx.repairTreeLinks(10_000);
     try std.testing.expect(repair.completed);
     try std.testing.expect(repair.duplicate_children_removed >= 1);
@@ -9936,6 +10052,7 @@ test "searchWithRequest applies filter prefix and distance bounds" {
     try idx.insertWithMetadata(1, &[_]f32{ 1.0, 0.0 }, "keep:1");
     try idx.insertWithMetadata(2, &[_]f32{ 0.9, 0.1 }, "drop:2");
     try idx.insertWithMetadata(3, &[_]f32{ 0.8, 0.2 }, "keep:3");
+    try idx.insert(4, &[_]f32{ 0.7, 0.3 });
 
     var results = try idx.searchWithRequest(.{
         .query = &[_]f32{ 1.0, 0.0 },
@@ -9962,6 +10079,18 @@ test "searchWithRequest applies filter prefix and distance bounds" {
     try std.testing.expect(profiled.profile.filter_candidates >= 3);
     try std.testing.expect(profiled.profile.filter_rejected >= 1);
     try std.testing.expect(profiled.profile.filter_metadata_batches > 0);
+
+    // Missing metadata is a valid non-match. Exhaustive coverage validates
+    // vectors/topology independently and must not quarantine the generation.
+    var exhaustive = try idx.searchWithRequest(.{
+        .query = &[_]f32{ 1.0, 0.0 },
+        .k = 10,
+        .search_effort = 1,
+        .filter_prefix = "keep:",
+    });
+    defer exhaustive.deinit();
+    try std.testing.expectEqual(@as(usize, 2), exhaustive.items.items.len);
+    try std.testing.expect(!idx.generationRepairPending());
 
     var over_results = try idx.searchWithRequest(.{
         .query = &[_]f32{ 1.0, 0.0 },

@@ -2144,10 +2144,22 @@ fn searchProfiledRequestAttempt(
     const root_node_id = published_snapshot.root_node;
 
     var coverage_tracker = CompleteCoverageTracker.init(
-        exhaustive_coverage and !completeCoverageAlreadyValidatedIfSupported(self, published_snapshot.publish_generation),
+        beginCompleteCoverageValidationIfSupported(self, exhaustive_coverage, published_snapshot.publish_generation),
         published_snapshot.active_count,
     );
-    defer coverage_tracker.deinit(self.alloc);
+    defer if (coverage_tracker.claim_held) {
+        finishCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, false);
+    };
+    try coverage_tracker.prepare(self, scratch);
+    if (exhaustive_coverage) {
+        try scratch.resetCoverageVisited(self.alloc, published_snapshot.node_count);
+    }
+    if (exhaustive_coverage and comptime @hasDecl(Index, "refreshSearchScratchAccounting")) {
+        // Coverage storage is retained by SearchScratch and governed just like
+        // the rest of the request workspace. Account immediately after growth
+        // so a large first-generation validation is never invisible.
+        self.refreshSearchScratchAccounting(&scratch_handle);
+    }
 
     var candidates = std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan).initContext({});
     defer candidates.deinit(self.alloc);
@@ -2179,6 +2191,7 @@ fn searchProfiledRequestAttempt(
                 .node_count = published_snapshot.node_count,
                 .publish_generation = published_snapshot.publish_generation,
             } else null,
+            req.cancellation,
             now_fn_u64,
             elapsed_fn_u64,
         );
@@ -2260,7 +2273,7 @@ fn searchProfiledRequestAttempt(
         }
 
         if (flat_leaves_scored > 0) {
-            try validateCompleteCoverage(self, &coverage_tracker, published_snapshot.publish_generation);
+            try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
             if (should_rerank) {
                 const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
@@ -2294,6 +2307,9 @@ fn searchProfiledRequestAttempt(
     var root_handle_active = true;
     defer if (root_handle_active) root_handle.deinit(self.alloc);
     profile.root_load_ns += elapsed_fn_u64(root_start);
+    if (exhaustive_coverage and !scratch.markCoverageNodeVisited(root_node_id, published_snapshot.node_count)) {
+        return error.IncompletePublishedSnapshot;
+    }
 
     {
         const root = root_handle.ptr();
@@ -2319,7 +2335,7 @@ fn searchProfiledRequestAttempt(
                 },
                 else => return err,
             };
-            try validateCompleteCoverage(self, &coverage_tracker, published_snapshot.publish_generation);
+            try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
             if (should_rerank) {
                 const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
@@ -2351,6 +2367,10 @@ fn searchProfiledRequestAttempt(
     profile.traversal_initial_wave_leaves = initial_wave_leaves;
     while (true) {
         try search_types.checkCancelled(req);
+        // Best-effort search avoids the exhaustive visited bitmap on its hot
+        // path, but still needs a corruption ceiling: a valid strict tree can
+        // never pop more nodes than the published node high-water mark.
+        if (!exhaustive_coverage and profile.nodes_visited >= published_snapshot.node_count) break;
         if (!exhaustive_coverage and beam_state.leaves_explored >= next_wave_leaf) {
             profile.traversal_waves += 1;
             profile.traversal_max_wave_leaves = @max(profile.traversal_max_wave_leaves, next_wave_leaf - previous_wave_leaf);
@@ -2372,6 +2392,9 @@ fn searchProfiledRequestAttempt(
         }
         var candidate = candidates.pop() orelse break;
         if (!exhaustive_coverage and search_mod.shouldStopBeamSearch(&beam_state, search_width)) break;
+        if (exhaustive_coverage and !scratch.markCoverageNodeVisited(candidate.id, published_snapshot.node_count)) {
+            return error.IncompletePublishedSnapshot;
+        }
         profile.nodes_visited += 1;
 
         var node_handle = loadNodeReadHandleProfiled(self, &txn, candidate.id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| {
@@ -2442,7 +2465,7 @@ fn searchProfiledRequestAttempt(
         }
     }
 
-    try validateCompleteCoverage(self, &coverage_tracker, published_snapshot.publish_generation);
+    try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
 
     if (should_rerank) {
         const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
@@ -2564,41 +2587,69 @@ fn noteIncompletePublishedSnapshotIfSupported(self: anytype) void {
     }
 }
 
-fn completeCoverageAlreadyValidatedIfSupported(self: anytype, generation: u64) bool {
+const CompleteCoverageValidationClaim = struct {
+    enabled: bool,
+    held: bool,
+};
+
+fn beginCompleteCoverageValidationIfSupported(
+    self: anytype,
+    exhaustive: bool,
+    generation: u64,
+) CompleteCoverageValidationClaim {
+    if (!exhaustive) return .{ .enabled = false, .held = false };
     const Index = comptime childType(@TypeOf(self));
-    if (comptime @hasDecl(Index, "completeCoverageAlreadyValidated")) {
-        return self.completeCoverageAlreadyValidated(generation);
+    if (comptime @hasDecl(Index, "beginCompleteCoverageValidation")) {
+        const claimed = self.beginCompleteCoverageValidation(generation);
+        return .{ .enabled = claimed, .held = claimed };
     }
-    return false;
+    if (comptime @hasDecl(Index, "completeCoverageAlreadyValidated")) {
+        return .{
+            .enabled = !self.completeCoverageAlreadyValidated(generation),
+            .held = false,
+        };
+    }
+    return .{ .enabled = true, .held = false };
 }
 
-fn noteCompleteCoverageValidatedIfSupported(self: anytype, generation: u64) void {
+fn finishCompleteCoverageValidationIfSupported(self: anytype, generation: u64, validated: bool) void {
     const Index = comptime childType(@TypeOf(self));
-    if (comptime @hasDecl(Index, "noteCompleteCoverageValidated")) {
+    if (comptime @hasDecl(Index, "finishCompleteCoverageValidation")) {
+        self.finishCompleteCoverageValidation(generation, validated);
+    } else if (validated and comptime @hasDecl(Index, "noteCompleteCoverageValidated")) {
         self.noteCompleteCoverageValidated(generation);
     }
 }
 
 const CompleteCoverageTracker = struct {
     const max_collected_ids: u64 = 262_144;
+    const assignment_batch_size: usize = 8_192;
 
     enabled: bool,
+    claim_held: bool,
     expected_count: u64,
     observed_count: u64 = 0,
     collect_ids: bool,
-    member_ids: std.ArrayListUnmanaged(u64) = .empty,
+    collected_count: usize = 0,
+    assignment_count: usize = 0,
 
-    fn init(enabled: bool, expected_count: u64) CompleteCoverageTracker {
+    fn init(claim: CompleteCoverageValidationClaim, expected_count: u64) CompleteCoverageTracker {
         return .{
-            .enabled = enabled,
+            .enabled = claim.enabled,
+            .claim_held = claim.held,
             .expected_count = expected_count,
-            .collect_ids = enabled and expected_count <= max_collected_ids,
+            .collect_ids = claim.enabled and expected_count <= max_collected_ids,
         };
     }
 
-    fn deinit(self: *CompleteCoverageTracker, alloc: std.mem.Allocator) void {
-        self.member_ids.deinit(alloc);
-        self.* = undefined;
+    fn prepare(self: *CompleteCoverageTracker, index: anytype, scratch: anytype) !void {
+        if (!self.enabled) return;
+        if (self.collect_ids) {
+            try scratch.ensureCoverageIdCapacity(index.alloc, @intCast(self.expected_count));
+        } else {
+            try scratch.ensureCoverageMemberCapacity(index.alloc, assignment_batch_size);
+            try scratch.ensureLookupCapacity(index.alloc, assignment_batch_size);
+        }
     }
 
     fn observe(
@@ -2616,55 +2667,92 @@ const CompleteCoverageTracker = struct {
         if (member_ids.len == 0) return;
 
         if (self.collect_ids) {
-            try self.member_ids.appendSlice(index.alloc, member_ids);
+            const next = std.math.add(usize, self.collected_count, member_ids.len) catch
+                return error.IncompletePublishedSnapshot;
+            if (next > scratch.coverage_ids.len) return error.IncompletePublishedSnapshot;
+            @memcpy(scratch.coverage_ids[self.collected_count..next], member_ids);
+            self.collected_count = next;
             return;
         }
 
-        // Very large indexes validate exact membership with storage bounded
-        // by one posting. The global count catches unreachable members, local
-        // sorting catches a duplicate within one posting, and the authoritative
-        // vec->leaf map catches the same member appearing in different
-        // postings. Normal generations take the faster bounded collection path
-        // above, and successful validation is cached by publication generation.
-        try scratch.ensureVectorFetchCapacity(index.alloc, member_ids.len);
+        // Detect same-posting duplicates exactly without coupling the global
+        // validation batch size to a leaf's fanout.
+        try scratch.ensureVectorIdCapacity(index.alloc, member_ids.len);
         const sorted_ids = scratch.vector_ids[0..member_ids.len];
         @memcpy(sorted_ids, member_ids);
         std.mem.sort(u64, sorted_ids, {}, std.sort.asc(u64));
-        for (sorted_ids[1..], sorted_ids[0..sorted_ids.len -| 1]) |current, previous| {
+        for (sorted_ids[1..], sorted_ids[0 .. sorted_ids.len - 1]) |current, previous| {
             if (current == previous) return error.IncompletePublishedSnapshot;
         }
 
-        const lookups = scratch.lookups[0..sorted_ids.len];
-        const key_views = scratch.key_views[0..sorted_ids.len];
-        const values = scratch.values[0..sorted_ids.len];
-        for (sorted_ids, 0..) |member_id, i| {
-            lookups[i].vector_id = member_id;
-            _ = hbc.encodeVecLeafKey(&lookups[i].key, member_id);
-            key_views[i] = lookups[i].key[0..];
-        }
-        try txn.getManySorted(.vecs, key_views, values);
-        for (values) |maybe_value| {
-            const value = maybe_value orelse return error.IncompletePublishedSnapshot;
-            if (value.len < @sizeOf(u64) or std.mem.readInt(u64, value[0..8], .little) != leaf_id) {
-                return error.IncompletePublishedSnapshot;
+        for (member_ids) |member_id| {
+            if (self.assignment_count == assignment_batch_size) {
+                try self.flushAssignments(txn, scratch);
             }
+            scratch.coverage_members[self.assignment_count] = .{
+                .vector_id = member_id,
+                .leaf_id = leaf_id,
+            };
+            self.assignment_count += 1;
         }
     }
 
-    fn validate(self: *CompleteCoverageTracker) !void {
+    fn flushAssignments(self: *CompleteCoverageTracker, txn: anytype, scratch: anytype) !void {
+        if (self.assignment_count == 0) return;
+        const assignments = scratch.coverage_members[0..self.assignment_count];
+        std.mem.sort(search_runtime.CoverageMember, assignments, {}, struct {
+            fn lessThan(_: void, lhs: search_runtime.CoverageMember, rhs: search_runtime.CoverageMember) bool {
+                return lhs.vector_id < rhs.vector_id;
+            }
+        }.lessThan);
+        for (assignments[1..], assignments[0 .. assignments.len - 1]) |current, previous| {
+            if (current.vector_id == previous.vector_id) return error.IncompletePublishedSnapshot;
+        }
+
+        const lookups = scratch.lookups[0..assignments.len];
+        const key_views = scratch.key_views[0..assignments.len];
+        const values = scratch.values[0..assignments.len];
+        for (assignments, 0..) |assignment, i| {
+            lookups[i].vector_id = assignment.vector_id;
+            _ = hbc.encodeVecLeafKey(&lookups[i].key, assignment.vector_id);
+            key_views[i] = lookups[i].key[0..];
+        }
+        try txn.getManySorted(.vecs, key_views, values);
+        for (assignments, values) |assignment, maybe_value| {
+            const value = maybe_value orelse return error.IncompletePublishedSnapshot;
+            if (value.len < @sizeOf(u64) or std.mem.readInt(u64, value[0..8], .little) != assignment.leaf_id) {
+                return error.IncompletePublishedSnapshot;
+            }
+        }
+        self.assignment_count = 0;
+    }
+
+    fn validate(self: *CompleteCoverageTracker, txn: anytype, scratch: anytype) !void {
         if (!self.enabled) return;
         if (self.observed_count != self.expected_count) return error.IncompletePublishedSnapshot;
-        if (!self.collect_ids or self.member_ids.items.len < 2) return;
-        std.mem.sort(u64, self.member_ids.items, {}, std.sort.asc(u64));
-        for (self.member_ids.items[1..], self.member_ids.items[0 .. self.member_ids.items.len - 1]) |current, previous| {
+        if (!self.collect_ids) return self.flushAssignments(txn, scratch);
+        if (self.collected_count != self.expected_count) return error.IncompletePublishedSnapshot;
+        const member_ids = scratch.coverage_ids[0..self.collected_count];
+        if (member_ids.len < 2) return;
+        std.mem.sort(u64, member_ids, {}, std.sort.asc(u64));
+        for (member_ids[1..], member_ids[0 .. member_ids.len - 1]) |current, previous| {
             if (current == previous) return error.IncompletePublishedSnapshot;
         }
     }
 };
 
-fn validateCompleteCoverage(self: anytype, tracker: *CompleteCoverageTracker, generation: u64) !void {
-    try tracker.validate();
-    if (tracker.enabled) noteCompleteCoverageValidatedIfSupported(self, generation);
+fn validateCompleteCoverage(
+    self: anytype,
+    txn: anytype,
+    scratch: anytype,
+    tracker: *CompleteCoverageTracker,
+    generation: u64,
+) !void {
+    try tracker.validate(txn, scratch);
+    if (!tracker.enabled) return;
+    finishCompleteCoverageValidationIfSupported(self, generation, true);
+    tracker.claim_held = false;
+    tracker.enabled = false;
 }
 
 fn searchRootNode(self: anytype) u64 {
@@ -2840,7 +2928,9 @@ fn scoreLeafMemberIds(
         var prefix_count: usize = 0;
         for (candidates, scratch.metadata[0..filtered_count], scratch.positions[0..filtered_count]) |member_id, maybe_metadata, original_index| {
             const metadata = maybe_metadata orelse {
-                if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
+                // Metadata is optional. Absence is a valid non-match for a
+                // prefix predicate, not evidence that vector coverage is
+                // incomplete.
                 profile.filter_rejected += 1;
                 continue;
             };
