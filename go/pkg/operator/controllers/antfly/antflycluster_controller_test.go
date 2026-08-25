@@ -12239,6 +12239,106 @@ func TestRepairBlockedStatefulSetRolloutsDeletesStaleUnhealthyStandalonePod(t *t
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
+func TestRepairBlockedStatefulSetRolloutPreservesOnlyExactPromotedProcess(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		bindingUID   types.UID
+		wantRepaired bool
+	}{
+		{name: "exact receipt and Pod UID", bindingUID: types.UID("promoted-process-uid"), wantRepaired: false},
+		{name: "different Pod UID", bindingUID: types.UID("replaced-process-uid"), wantRepaired: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewWithT(t)
+			ctx := context.Background()
+			s := runtime.NewScheme()
+			g.Expect(corev1.AddToScheme(s)).To(Succeed())
+			g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+			g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+
+			receipt := strings.Repeat("a", 64)
+			cluster := &antflyv1.AntflyCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster",
+					Namespace: "default",
+					Annotations: map[string]string{
+						cloudHAPromotionReceiptAnnotation:   receipt,
+						cloudHATopologyGenerationAnnotation: "2",
+					},
+				},
+				Spec: antflyv1.AntflyClusterSpec{
+					Mode: antflyv1.ClusterModeStandalone,
+					HighAvailability: &antflyv1.HighAvailabilitySpec{
+						Mode: antflyv1.HAModeHotStandby,
+						Runtime: &antflyv1.HARuntimeSpec{
+							Role:   antflyv1.HARuntimeRolePrimary,
+							NodeID: "standby-a",
+						},
+					},
+				},
+			}
+			replicas := int32(1)
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster-standalone",
+					Namespace: "default",
+					UID:       types.UID("standalone-sts-uid"),
+					Annotations: map[string]string{
+						haPromotedProcessBindingAnnotation: receipt + ":" + string(tc.bindingUID),
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas: &replicas,
+					Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "antfly", Image: "antfly:new"}},
+					}},
+				},
+				Status: appsv1.StatefulSetStatus{UpdateRevision: "standalone-new"},
+			}
+			controller := true
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cluster-standalone-0",
+					Namespace: "default",
+					UID:       types.UID("promoted-process-uid"),
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name,
+						UID: sts.UID, Controller: &controller,
+					}},
+					Labels: mergeStringMaps(
+						serviceSelectorLabels(cluster.Name, "standalone"),
+						map[string]string{"controller-revision-hash": "standalone-old"},
+					),
+					Annotations: map[string]string{haNodeIDAnnotation: "standby-a"},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "antfly", Image: "antfly:old"}}},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					Conditions: []corev1.PodCondition{{
+						Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady",
+					}},
+				},
+			}
+			reconciler := &AntflyClusterReconciler{
+				Client: fake.NewClientBuilder().WithScheme(s).WithObjects(pod).Build(),
+				Scheme: s,
+			}
+
+			repaired, err := reconciler.repairBlockedStatefulSetRollout(ctx, cluster, sts, "standalone")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(repaired).To(Equal(tc.wantRepaired))
+			observed := &corev1.Pod{}
+			err = reconciler.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, observed)
+			if tc.wantRepaired {
+				g.Expect(errors.IsNotFound(err)).To(BeTrue())
+			} else {
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(observed.UID).To(Equal(pod.UID))
+			}
+		})
+	}
+}
+
 func TestRepairBlockedStatefulSetRolloutKeepsHealthyStalePod(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
@@ -14431,6 +14531,7 @@ func TestPromotedStandaloneRolloutRequiresExactReceiptAndOwnedPod(t *testing.T) 
 	controller := true
 	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
 		Name: statefulSet.Name + "-0", Namespace: statefulSet.Namespace,
+		UID:             types.UID("promoted-process-uid"),
 		Labels:          map[string]string{cloudHARoleLabel: cloudHAStandbyRole},
 		Annotations:     map[string]string{haNodeIDAnnotation: "standby-a"},
 		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: statefulSet.Name, UID: statefulSet.UID, Controller: &controller}},
@@ -14468,6 +14569,13 @@ func TestPromotedStandaloneRolloutRequiresExactReceiptAndOwnedPod(t *testing.T) 
 	g.Expect(deferRollout).To(BeTrue())
 
 	cluster.Annotations[cloudHAPromotionReceiptAnnotation] = "not-a-canonical-receipt"
+	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(deferRollout).To(BeFalse())
+
+	cluster.Annotations[cloudHAPromotionReceiptAnnotation] = strings.Repeat("a", 64)
+	pod.OwnerReferences[0].UID = types.UID("different-statefulset-uid")
+	g.Expect(client.Update(context.Background(), pod)).To(Succeed())
 	deferRollout, err = reconciler.shouldDeferPromotedStandaloneRollout(context.Background(), cluster, statefulSet)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(deferRollout).To(BeFalse())

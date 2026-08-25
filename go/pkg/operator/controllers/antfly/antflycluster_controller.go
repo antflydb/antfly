@@ -4211,13 +4211,13 @@ func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx conte
 		}
 		return false, fmt.Errorf("observe promoted standalone Pod before rollout: %w", err)
 	}
-	if pod.DeletionTimestamp != nil ||
-		!isPodControlledByStatefulSet(pod, statefulSet.Name) ||
+	if pod.UID == "" || pod.DeletionTimestamp != nil ||
+		!isPodControlledByExactStatefulSet(pod, statefulSet) ||
 		pod.Annotations[haNodeIDAnnotation] != strings.TrimSpace(ha.Runtime.NodeID) {
 		return false, nil
 	}
 	binding := promotionReceipt + ":" + string(pod.UID)
-	if strings.TrimSpace(statefulSet.Annotations[haPromotedProcessBindingAnnotation]) == binding {
+	if hasExactPromotedProcessBinding(cluster, statefulSet, pod) {
 		return true, nil
 	}
 	if pod.Labels[cloudHARoleLabel] != cloudHAStandbyRole {
@@ -4228,6 +4228,34 @@ func (r *AntflyClusterReconciler) shouldDeferPromotedStandaloneRollout(ctx conte
 	}
 	statefulSet.Annotations[haPromotedProcessBindingAnnotation] = binding
 	return true, nil
+}
+
+// hasExactPromotedProcessBinding identifies the one live process that adopted
+// the current promotion receipt. The binding deliberately combines the
+// receipt with Kubernetes' immutable Pod UID so a replacement Pod can never
+// inherit authority from mutable labels, names, or StatefulSet annotations.
+func hasExactPromotedProcessBinding(cluster *antflyv1.AntflyCluster, statefulSet *appsv1.StatefulSet, pod *corev1.Pod) bool {
+	if cluster == nil || statefulSet == nil || pod == nil || pod.UID == "" || pod.DeletionTimestamp != nil {
+		return false
+	}
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Runtime == nil || ha.Runtime.Role != antflyv1.HARuntimeRolePrimary {
+		return false
+	}
+	promotionReceipt := strings.TrimSpace(cluster.Annotations[cloudHAPromotionReceiptAnnotation])
+	if !isLowerHexDigest(promotionReceipt) {
+		return false
+	}
+	topologyGeneration, err := strconv.ParseUint(strings.TrimSpace(cluster.Annotations[cloudHATopologyGenerationAnnotation]), 10, 64)
+	if err != nil || topologyGeneration < 2 {
+		return false
+	}
+	if !isPodControlledByExactStatefulSet(pod, statefulSet) ||
+		strings.TrimSpace(pod.Annotations[haNodeIDAnnotation]) != strings.TrimSpace(ha.Runtime.NodeID) {
+		return false
+	}
+	want := promotionReceipt + ":" + string(pod.UID)
+	return strings.TrimSpace(statefulSet.Annotations[haPromotedProcessBindingAnnotation]) == want
 }
 
 const generatedConfigHashAnnotation = "antfly.io/config-hash"
@@ -12475,6 +12503,16 @@ func (r *AntflyClusterReconciler) repairBlockedStatefulSetRollout(ctx context.Co
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
+		if effectiveTopologyMode(cluster) == topologyModeStandalone && hasExactPromotedProcessBinding(cluster, sts, pod) {
+			log.FromContext(ctx).Info(
+				"Preserving exact promoted process during deferred StatefulSet rollout",
+				"statefulset", sts.Name,
+				"pod", pod.Name,
+				"podUID", pod.UID,
+				"component", component,
+			)
+			continue
+		}
 		log.FromContext(ctx).Info(
 			"Deleting stale unhealthy pod to unblock StatefulSet rollout",
 			"statefulset", sts.Name,
@@ -12499,6 +12537,14 @@ func isPodControlledByStatefulSet(pod *corev1.Pod, statefulSetName string) bool 
 	}
 	controller := metav1.GetControllerOf(pod)
 	return controller != nil && controller.Kind == "StatefulSet" && controller.Name == statefulSetName
+}
+
+func isPodControlledByExactStatefulSet(pod *corev1.Pod, statefulSet *appsv1.StatefulSet) bool {
+	if pod == nil || statefulSet == nil || statefulSet.UID == "" || pod.Namespace != statefulSet.Namespace {
+		return false
+	}
+	controller := metav1.GetControllerOf(pod)
+	return controller != nil && controller.Kind == "StatefulSet" && controller.Name == statefulSet.Name && controller.UID == statefulSet.UID
 }
 
 func isStaleStatefulSetPod(pod *corev1.Pod, updateRevision, desiredImage string) bool {
