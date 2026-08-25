@@ -4904,10 +4904,16 @@ pub fn writeMergedInvertedSectionSlotsWithDeletes(
     }
 
     var term_iters = try alloc.alloc(TermIterator, sections.len);
+    const term_iter_present = alloc.alloc(bool, sections.len) catch |err| {
+        alloc.free(term_iters);
+        return err;
+    };
+    @memset(term_iter_present, false);
     defer {
         for (term_iters, 0..) |*iter, i| {
-            if (reader_present[i]) iter.deinit();
+            if (term_iter_present[i]) iter.deinit();
         }
+        alloc.free(term_iter_present);
         alloc.free(term_iters);
     }
 
@@ -4918,6 +4924,7 @@ pub fn writeMergedInvertedSectionSlotsWithDeletes(
     for (readers, 0..) |*reader, seg_idx| {
         if (!reader_present[seg_idx]) continue;
         term_iters[seg_idx] = try reader.termIterator();
+        term_iter_present[seg_idx] = true;
         current_entries[seg_idx] = try nextTermIteratorEntry(term_iters, seg_idx);
     }
 
@@ -5010,10 +5017,16 @@ pub fn writeMergedInvertedSectionSlotsWithDocMaps(
     }
 
     var term_iters = try alloc.alloc(TermIterator, sections.len);
+    const term_iter_present = alloc.alloc(bool, sections.len) catch |err| {
+        alloc.free(term_iters);
+        return err;
+    };
+    @memset(term_iter_present, false);
     defer {
         for (term_iters, 0..) |*iter, i| {
-            if (reader_present[i]) iter.deinit();
+            if (term_iter_present[i]) iter.deinit();
         }
+        alloc.free(term_iter_present);
         alloc.free(term_iters);
     }
 
@@ -5024,6 +5037,7 @@ pub fn writeMergedInvertedSectionSlotsWithDocMaps(
     for (readers, 0..) |*reader, seg_idx| {
         if (!reader_present[seg_idx]) continue;
         term_iters[seg_idx] = try reader.termIterator();
+        term_iter_present[seg_idx] = true;
         current_entries[seg_idx] = try nextTermIteratorEntry(term_iters, seg_idx);
     }
 
@@ -6227,6 +6241,36 @@ test "merge with inverted doc_count less than segment doc_count" {
     // "root-b" should be remapped from doc 0 in seg2 to doc 4 in merged
     const root_b = reader.lookup("root-b") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u32, 1), root_b.docFreq());
+}
+
+test "merged inverted section cleans up partially initialized term iterators" {
+    const alloc = std.testing.allocator;
+
+    var first_builder = InvertedIndexBuilder.init(alloc, .{});
+    defer first_builder.deinit();
+    try first_builder.addDocument(0, &.{.{ .term = "alpha", .freq = 1, .norm = 1 }});
+    const first = try first_builder.build();
+    defer alloc.free(first);
+
+    var second_builder = InvertedIndexBuilder.init(alloc, .{});
+    defer second_builder.deinit();
+    try second_builder.addDocument(0, &.{.{ .term = "beta", .freq = 1, .norm = 1 }});
+    const second = try second_builder.build();
+    defer alloc.free(second);
+
+    const Runner = struct {
+        fn run(failing_alloc: Allocator, first_section: []const u8, second_section: []const u8) !void {
+            const merged = try mergeInvertedSectionSlotsWithDeletes(
+                failing_alloc,
+                &.{ first_section, second_section },
+                &.{ 1, 1 },
+                null,
+                .{},
+            );
+            defer failing_alloc.free(merged);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{ first, second });
 }
 
 test "sparse field postings beyond first chunk survive merge" {
