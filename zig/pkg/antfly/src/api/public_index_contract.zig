@@ -366,6 +366,7 @@ fn enrichmentFieldValueMatches(field: []const u8, value: std.json.Value) bool {
         std.mem.eql(u8, field, "chunk_overlap")) return isInteger(value);
     if (std.mem.eql(u8, field, "full_text_index")) return isBool(value);
     if (std.mem.eql(u8, field, "execution")) return value == .object;
+    if (std.mem.eql(u8, field, "vector_space")) return isNonEmptyString(value);
     return isString(value);
 }
 
@@ -573,6 +574,7 @@ pub fn isAllowedCreatedEnrichmentField(field: []const u8) bool {
         std.mem.eql(u8, field, "template") or
         std.mem.eql(u8, field, "source_artifact_name") or
         std.mem.eql(u8, field, "expected_dims") or
+        std.mem.eql(u8, field, "vector_space") or
         std.mem.eql(u8, field, "chunk_size") or
         std.mem.eql(u8, field, "chunk_overlap") or
         std.mem.eql(u8, field, "chunker_json") or

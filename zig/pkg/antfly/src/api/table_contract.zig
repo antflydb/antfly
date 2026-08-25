@@ -987,12 +987,24 @@ test "table contract admits and preserves multi-source index requests" {
     }
 }
 
+test "table contract admits and projects explicit embedding vector space" {
+    const config_json = try parseCreateIndexRequest(std.testing.allocator, "document_vectors", "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"},{\"artifact\":\"document_chunk_dense_v1\"}],\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"semantic_content\",\"chunk_size\":512},{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"semantic_content\",\"expected_dims\":3,\"vector_space\":\"searchaf:v1\"},{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"document_chunks_v1\",\"expected_dims\":3,\"vector_space\":\"searchaf:v1\"}]}");
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.count(u8, config_json, "\"vector_space\":\"searchaf:v1\"") == 2);
+
+    const response = try indexes_api.encodeCreatedIndexConfig(std.testing.allocator, "document_vectors", config_json);
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.count(u8, response, "\"vector_space\":\"searchaf:v1\"") == 2);
+}
+
 test "table contract rejects malformed multi-source members" {
     const invalid = [_][]const u8{
         "{\"type\":\"full_text\",\"sources\":[]}",
         "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"dense_v1\"},{\"artifact\":\"dense_v1\"}]}",
         "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\",\"path\":\"$.text\"}]}",
         "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{}]}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"dense_v1\"}],\"enrichments\":[{\"name\":\"dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"vector_space\":\"\"}]}",
+        "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\"}],\"enrichments\":[{\"name\":\"chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512,\"vector_space\":\"dense-v1\"}]}",
         "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"unknown\":true}]}",
     };
     for (invalid) |body| {

@@ -26,6 +26,7 @@ class QueryHitHierarchy:
         parent_doc_key (str | Unset): Source document key that owns this derived hit.
         parent_unit_id (str | Unset): Unit identifier when the hit is attached to a document unit.
         artifact (HierarchyArtifact | Unset):
+        matched_artifact (HierarchyArtifact | Unset):
         ancestors (QueryHitHierarchyAncestors | Unset):
         evidence (HierarchyEvidence | Unset):
         matches (list[HierarchyMatchHit] | Unset): Matching descendant hits attached by the canonical hierarchy.group_by
@@ -39,6 +40,7 @@ class QueryHitHierarchy:
     parent_doc_key: str | Unset = UNSET
     parent_unit_id: str | Unset = UNSET
     artifact: HierarchyArtifact | Unset = UNSET
+    matched_artifact: HierarchyArtifact | Unset = UNSET
     ancestors: QueryHitHierarchyAncestors | Unset = UNSET
     evidence: HierarchyEvidence | Unset = UNSET
     matches: list[HierarchyMatchHit] | Unset = UNSET
@@ -58,6 +60,10 @@ class QueryHitHierarchy:
         artifact: dict[str, Any] | Unset = UNSET
         if not isinstance(self.artifact, Unset):
             artifact = self.artifact.to_dict()
+
+        matched_artifact: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.matched_artifact, Unset):
+            matched_artifact = self.matched_artifact.to_dict()
 
         ancestors: dict[str, Any] | Unset = UNSET
         if not isinstance(self.ancestors, Unset):
@@ -96,6 +102,8 @@ class QueryHitHierarchy:
             field_dict["parent_unit_id"] = parent_unit_id
         if artifact is not UNSET:
             field_dict["artifact"] = artifact
+        if matched_artifact is not UNSET:
+            field_dict["matched_artifact"] = matched_artifact
         if ancestors is not UNSET:
             field_dict["ancestors"] = ancestors
         if evidence is not UNSET:
@@ -136,6 +144,13 @@ class QueryHitHierarchy:
             artifact = UNSET
         else:
             artifact = HierarchyArtifact.from_dict(_artifact)
+
+        _matched_artifact = d.pop("matched_artifact", UNSET)
+        matched_artifact: HierarchyArtifact | Unset
+        if isinstance(_matched_artifact, Unset):
+            matched_artifact = UNSET
+        else:
+            matched_artifact = HierarchyArtifact.from_dict(_matched_artifact)
 
         _ancestors = d.pop("ancestors", UNSET)
         ancestors: QueryHitHierarchyAncestors | Unset
@@ -178,6 +193,7 @@ class QueryHitHierarchy:
             parent_doc_key=parent_doc_key,
             parent_unit_id=parent_unit_id,
             artifact=artifact,
+            matched_artifact=matched_artifact,
             ancestors=ancestors,
             evidence=evidence,
             matches=matches,

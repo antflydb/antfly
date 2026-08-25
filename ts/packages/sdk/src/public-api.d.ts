@@ -7340,6 +7340,8 @@ export interface components {
             /** @description Unit identifier when the hit is attached to a document unit. */
             parent_unit_id?: string;
             artifact?: components["schemas"]["HierarchyArtifact"];
+            /** @description Artifact member that supplied the score for a source-level grouped hit. */
+            matched_artifact?: components["schemas"]["HierarchyArtifact"];
             ancestors?: components["schemas"]["QueryHitHierarchyAncestors"];
             evidence?: components["schemas"]["HierarchyEvidence"];
             /** @description Matching descendant hits attached by the canonical hierarchy.group_by request. */
@@ -7382,7 +7384,7 @@ export interface components {
              * @description Stable ancestry envelope for derived document hierarchy hits. Present when
              *     the hit is a derived unit/chunk/embedding artifact or when a source-level
              *     group includes nested matches. Standard fields include `level`,
-             *     `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
+             *     `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and
              *     `ancestors` with response-local or requested DB-backed source/unit context when available.
              *     Legacy rollup requests continue to use `chunks` instead of `matches`.
              */

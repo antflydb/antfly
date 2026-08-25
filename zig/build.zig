@@ -3804,6 +3804,7 @@ pub fn build(b: *std.Build) void {
 
     const api_http_runtime_default_filters = [_][]const u8{
         "table contract admits and preserves multi-source index requests",
+        "table contract admits and projects explicit embedding vector space",
         "table contract rejects malformed multi-source members",
         "created index configs normalize single-source input forms",
         "created graph index response projects closed nested schemas",
