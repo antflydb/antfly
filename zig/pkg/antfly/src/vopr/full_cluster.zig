@@ -13,7 +13,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 3;
+    pub const version: u32 = 4;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -24,6 +24,7 @@ pub const Scenario = struct {
     const raft_wire_id = vopr.id.stable(name, "raft-crosses-vopr-http-wire");
     const node_resources_id = vopr.id.stable(name, "node-resource-owners-distinct");
     const resource_recovery_id = vopr.id.stable(name, "node-resource-denial-recovers");
+    const deployment_id = vopr.id.stable(name, "registered-deployment-quiesces");
     const cleanup_id = vopr.id.stable(name, "cluster-resources-cleaned");
     const complete_id = vopr.id.stable(name, "history-completes");
 
@@ -37,6 +38,7 @@ pub const Scenario = struct {
         .{ .id = raft_wire_id, .name = name ++ ".raft-crosses-vopr-http-wire", .kind = .always },
         .{ .id = node_resources_id, .name = name ++ ".node-resource-owners-distinct", .kind = .always },
         .{ .id = resource_recovery_id, .name = name ++ ".node-resource-denial-recovers", .kind = .always },
+        .{ .id = deployment_id, .name = name ++ ".registered-deployment-quiesces", .kind = .always },
         .{ .id = cleanup_id, .name = name ++ ".cluster-resources-cleaned", .kind = .always },
         .{ .id = complete_id, .name = name ++ ".history-completes", .kind = .reachable },
     };
@@ -84,11 +86,74 @@ pub const Scenario = struct {
         name ++ ".resource-pressure",
     };
 
+    const metadata_role = vopr.id.stable(name, "role.metadata");
+    const public_data_role = vopr.id.stable(name, "role.public-data");
+    const serverless_role = vopr.id.stable(name, "role.serverless");
+    const deployment_node_ids = [_]vopr.id.StableId{
+        vopr.id.stable(name, "node.1"),
+        vopr.id.stable(name, "node.2"),
+        vopr.id.stable(name, "node.3"),
+        vopr.id.stable(name, "node.serverless"),
+    };
+    const process_domains = [_]vopr.id.StableId{
+        vopr.id.stable(name, "process.1"),
+        vopr.id.stable(name, "process.2"),
+        vopr.id.stable(name, "process.3"),
+        vopr.id.stable(name, "process.serverless"),
+    };
+    const storage_domains = [_]vopr.id.StableId{
+        vopr.id.stable(name, "storage.1"),
+        vopr.id.stable(name, "storage.2"),
+        vopr.id.stable(name, "storage.3"),
+        vopr.id.stable(name, "storage.serverless"),
+    };
+    const resource_domains = [_]vopr.id.StableId{
+        vopr.id.stable(name, "resource.1"),
+        vopr.id.stable(name, "resource.2"),
+        vopr.id.stable(name, "resource.3"),
+        vopr.id.stable(name, "resource.serverless"),
+    };
+    const deployment_roles = [_]vopr.deployment.Role{
+        .{ .id = metadata_role, .name = "metadata" },
+        .{ .id = public_data_role, .name = "public-data", .depends_on = &.{metadata_role} },
+        .{ .id = serverless_role, .name = "serverless", .depends_on = &.{metadata_role} },
+    };
+    const deployment_nodes = [_]vopr.deployment.Node{
+        .{ .id = deployment_node_ids[0], .name = "node-1", .process_domain = process_domains[0], .storage_domain = storage_domains[0], .resource_domain = resource_domains[0], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 64 * 1024 * 1024 } },
+        .{ .id = deployment_node_ids[1], .name = "node-2", .process_domain = process_domains[1], .storage_domain = storage_domains[1], .resource_domain = resource_domains[1], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 64 * 1024 * 1024 } },
+        .{ .id = deployment_node_ids[2], .name = "node-3", .process_domain = process_domains[2], .storage_domain = storage_domains[2], .resource_domain = resource_domains[2], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 64 * 1024 * 1024 } },
+        .{ .id = deployment_node_ids[3], .name = "serverless-worker", .process_domain = process_domains[3], .storage_domain = storage_domains[3], .resource_domain = resource_domains[3], .resources = .{ .memory_limit_bytes = 512 * 1024 * 1024, .disk_limit_bytes = 64 * 1024 * 1024 } },
+    };
+    const deployment_instances = [_]vopr.deployment.Instance{
+        .{ .id = vopr.id.stable(name, "instance.metadata.1"), .node_id = deployment_node_ids[0], .role_id = metadata_role },
+        .{ .id = vopr.id.stable(name, "instance.metadata.2"), .node_id = deployment_node_ids[1], .role_id = metadata_role },
+        .{ .id = vopr.id.stable(name, "instance.metadata.3"), .node_id = deployment_node_ids[2], .role_id = metadata_role },
+        .{ .id = vopr.id.stable(name, "instance.public-data.1"), .node_id = deployment_node_ids[0], .role_id = public_data_role },
+        .{ .id = vopr.id.stable(name, "instance.public-data.2"), .node_id = deployment_node_ids[1], .role_id = public_data_role },
+        .{ .id = vopr.id.stable(name, "instance.public-data.3"), .node_id = deployment_node_ids[2], .role_id = public_data_role },
+        .{ .id = vopr.id.stable(name, "instance.serverless"), .node_id = deployment_node_ids[3], .role_id = serverless_role },
+    };
+    const deployment_links = [_]vopr.deployment.Link{
+        .{ .id = vopr.id.stable(name, "link.1-2"), .name = "1-to-2", .from_node = deployment_node_ids[0], .to_node = deployment_node_ids[1] },
+        .{ .id = vopr.id.stable(name, "link.2-1"), .name = "2-to-1", .from_node = deployment_node_ids[1], .to_node = deployment_node_ids[0] },
+        .{ .id = vopr.id.stable(name, "link.1-3"), .name = "1-to-3", .from_node = deployment_node_ids[0], .to_node = deployment_node_ids[2] },
+        .{ .id = vopr.id.stable(name, "link.3-1"), .name = "3-to-1", .from_node = deployment_node_ids[2], .to_node = deployment_node_ids[0] },
+        .{ .id = vopr.id.stable(name, "link.2-3"), .name = "2-to-3", .from_node = deployment_node_ids[1], .to_node = deployment_node_ids[2] },
+        .{ .id = vopr.id.stable(name, "link.3-2"), .name = "3-to-2", .from_node = deployment_node_ids[2], .to_node = deployment_node_ids[1] },
+    };
+    const deployment_manifest: vopr.deployment.Manifest = .{
+        .roles = &deployment_roles,
+        .nodes = &deployment_nodes,
+        .instances = &deployment_instances,
+        .links = &deployment_links,
+    };
+
     const State = struct {
         owner_alloc: std.mem.Allocator,
         fixture_allocator: FixtureAllocator,
         sim: vopr.vopr_io.VoprIo,
         public_cluster: ?*metadata_sim.VoprPublicClusterFixture = null,
+        deployment: ?vopr.deployment.Composer = null,
         serverless: *serverless_workflow.Scenario.Fixture,
         mode: ?Mode = null,
         initialization_done: bool = false,
@@ -96,6 +161,7 @@ pub const Scenario = struct {
         serverless_done: bool = false,
         serverless_sound: bool = false,
         shared_io_sound: bool = false,
+        deployment_sound: bool = false,
         complete: bool = false,
 
         fn init(alloc: std.mem.Allocator) !*State {
@@ -117,17 +183,20 @@ pub const Scenario = struct {
             errdefer self.serverless.deinit();
             self.mode = null;
             self.public_cluster = null;
+            self.deployment = null;
             self.initialization_done = false;
             self.initialization_failed = false;
             self.serverless_done = false;
             self.serverless_sound = false;
             self.shared_io_sound = false;
+            self.deployment_sound = false;
             self.complete = false;
             _ = self.sim.io().async(initializeAndRun, .{self});
             return self;
         }
 
         fn deinit(self: *State) void {
+            if (self.deployment) |*deployment| deployment.deinit();
             self.serverless.deinit();
             if (self.public_cluster) |fixture| fixture.deinit();
             self.sim.deinit();
@@ -156,6 +225,21 @@ pub const Scenario = struct {
                 return;
             };
             self.public_cluster = fixture;
+            self.deployment = vopr.deployment.Composer.init(
+                self.fixture_allocator.allocator(),
+                deployment_manifest,
+            ) catch {
+                self.initialization_failed = true;
+                self.initialization_done = true;
+                self.complete = true;
+                return;
+            };
+            self.registerDeployment(mode, fixture) catch {
+                self.initialization_failed = true;
+                self.initialization_done = true;
+                self.complete = true;
+                return;
+            };
             self.shared_io_sound = self.serverless.sim == &self.sim and fixture.sim == &self.sim;
             fixture.start(mode.publicFault()) catch {
                 self.initialization_failed = true;
@@ -182,7 +266,62 @@ pub const Scenario = struct {
             while (!self.public_cluster.?.complete or !self.serverless_done) {
                 self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
             }
+            self.finishDeployment() catch {
+                self.complete = true;
+                return;
+            };
             self.complete = true;
+        }
+
+        fn registerDeployment(self: *State, mode: Mode, fixture: *metadata_sim.VoprPublicClusterFixture) !void {
+            const deployment = &self.deployment.?;
+            for (deployment_node_ids) |node_id| try deployment.startNode(node_id);
+            for (deployment_instances[0..3]) |instance| try deployment.publishReady(instance.id);
+            for (deployment_instances[3..6]) |instance| try deployment.publishReady(instance.id);
+            try deployment.publishReady(deployment_instances[6].id);
+            switch (mode) {
+                .clean => {},
+                .metadata_partition => {
+                    const leader = fixture.metadata_leader_index;
+                    for (deployment_links, 0..) |link, index| {
+                        if (link.from_node != deployment_node_ids[leader] and link.to_node != deployment_node_ids[leader]) continue;
+                        try deployment.activateFault(vopr.id.derive("full-cluster.partition", link.id, index), .network, link.id);
+                    }
+                },
+                .node_restart => try deployment.activateFault(
+                    vopr.id.stable(name, "fault.node-restart"),
+                    .node_pause,
+                    process_domains[fixture.client_index],
+                ),
+                .partial_http_write => try deployment.activateFault(
+                    vopr.id.stable(name, "fault.partial-http-write"),
+                    .network,
+                    deployment_links[0].id,
+                ),
+                .serverless_stale_generation => try deployment.activateFault(
+                    vopr.id.stable(name, "fault.serverless-stale-generation"),
+                    .storage,
+                    storage_domains[3],
+                ),
+                .resource_pressure => for (resource_domains[0..3], 0..) |domain_id, index| try deployment.activateFault(
+                    vopr.id.derive("full-cluster.resource-pressure", domain_id, index),
+                    .resource,
+                    domain_id,
+                ),
+            }
+        }
+
+        fn finishDeployment(self: *State) !void {
+            const deployment = &self.deployment.?;
+            deployment.healAll();
+            _ = try deployment.requestQuietSuffix();
+            for (deployment_node_ids[0..3], 0..) |node_id, index| {
+                try deployment.observeResources(node_id, try self.public_cluster.?.deploymentResourceUsage(index));
+                try deployment.acknowledgeNodeQuiet(node_id);
+            }
+            try deployment.observeResources(deployment_node_ids[3], .{});
+            try deployment.acknowledgeNodeQuiet(deployment_node_ids[3]);
+            self.deployment_sound = deployment.quietComplete();
         }
     };
 
@@ -254,6 +393,7 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".resource-recovery-ok", @intFromBool(if (cluster) |snapshot| snapshot.resource_recovery_ok else false));
         try builder.addNamed(allocator, name ++ ".resource-pressure-observed", @intFromBool(if (cluster) |snapshot| snapshot.resource_pressure_observed else false));
         try builder.addNamed(allocator, name ++ ".resource-denial-error", if (cluster) |snapshot| @intCast(snapshot.resource_denial_error_code) else 0);
+        try builder.addNamed(allocator, name ++ ".deployment-quiet", @intFromBool(state.deployment_sound));
         try builder.addNamed(allocator, name ++ ".initialization-failed", @intFromBool(state.initialization_failed));
         try builder.addNamed(allocator, name ++ ".open-sockets", @intCast(resources.open_sockets));
         try builder.addNamed(allocator, name ++ ".active-tasks", @intCast(resources.active_tasks));
@@ -276,6 +416,7 @@ pub const Scenario = struct {
         try sink.check(allocator, resource_recovery_id, !state.complete or state.mode.? != .resource_pressure or
             (cluster != null and cluster.?.resource_pressure_observed and cluster.?.resource_denial_ok and
                 cluster.?.resource_recovery_ok));
+        try sink.check(allocator, deployment_id, !state.complete or state.deployment_sound);
         try sink.check(allocator, cleanup_id, !state.complete or
             (cluster != null and cluster.?.cleanup_ok and resources.open_sockets == 0));
         try sink.check(allocator, complete_id, state.complete);
@@ -319,7 +460,7 @@ test "full cluster VOPR exact replays metadata data serverless HTTP clients and 
             .transition_budget = 20_000,
             .resource_budget = 96,
             .backend_ids = &backend_ids,
-            .source_revision = "full-cluster-vopr-v3",
+            .source_revision = "full-cluster-vopr-v4",
             .target = "native",
             .optimize = @tagName(@import("builtin").mode),
         });

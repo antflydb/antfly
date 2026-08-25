@@ -6470,6 +6470,19 @@ pub const VoprPublicClusterFixture = struct {
             .resource_denial_error_code = self.resource_denial_error_code,
         };
     }
+
+    pub fn deploymentResourceUsage(self: *VoprPublicClusterFixture, index: usize) !vopr.deployment.ResourceUsage {
+        if (index >= self.resource_manager_count or index >= self.modeled_device_count)
+            return error.InvalidFullClusterNodeIndex;
+        return .{
+            .memory_bytes = self.resource_managers[index].snapshot().memory.used_bytes,
+            .disk_bytes = self.modeled_devices[index].usedBytes(),
+            // Public listeners, forwarding clients, Raft drivers, and DB
+            // background owners have all joined before `complete` publishes.
+            .active_tasks = 0,
+            .open_sockets = 0,
+        };
+    }
 };
 
 fn startBootstrappedMetadataCluster(
