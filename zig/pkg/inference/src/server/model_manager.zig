@@ -4772,6 +4772,11 @@ pub const ModelManager = struct {
         component_paths: []const []const u8,
         contract: ComponentContract,
     ) !ComponentLoader {
+        var required_backend_scratch: [1]backends.BackendType = undefined;
+        const effective_backends = try self.session_manager.requiredBackendCandidates(
+            preferred_backends,
+            &required_backend_scratch,
+        );
         var loader = ComponentLoader{ .manager = self };
         for (component_paths) |path| try loader.addComponentPath(path);
         if (loader.component_path_count == 0) return error.IncompleteModelBundle;
@@ -4781,7 +4786,7 @@ pub const ModelManager = struct {
             const key = componentPlanKey(
                 model_dir,
                 &man,
-                preferred_backends,
+                effective_backends,
                 component_paths,
                 policy,
                 contract,
@@ -4803,13 +4808,13 @@ pub const ModelManager = struct {
             try validateComponentNativeArtifacts(
                 self.allocator,
                 component_paths,
-                preferred_backends,
+                effective_backends,
                 &inspection,
             );
             try validateComponentImportedGraphs(
                 self.allocator,
                 component_paths,
-                preferred_backends,
+                effective_backends,
                 &inspection,
             );
             const signature_after = try componentDependencySignature(
@@ -4823,7 +4828,7 @@ pub const ModelManager = struct {
             )) return error.ModelArtifactsChanging;
             const validated = try policyAllowedComponentBackendsFromInspection(
                 &loader.allowed_backends,
-                preferred_backends,
+                effective_backends,
                 policy,
                 &inspection,
             );
@@ -4834,7 +4839,7 @@ pub const ModelManager = struct {
                 inspection.dependencies.items,
             ) catch {};
             break :blk validated;
-        } else preferred_backends;
+        } else effective_backends;
         for (allowed) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             if (loader.allowed_backend_count == loader.allowed_backends.len) break;
@@ -8355,6 +8360,20 @@ test "component compatibility validates explicit split ONNX graphs" {
         .multistage_ocr,
     );
     try std.testing.expectEqual(@as(usize, 1), manager.component_plan_cache.count());
+
+    var required_session_manager = backends.SessionManager.init(allocator);
+    required_session_manager.required_backend = .cuda;
+    required_session_manager.required_backend_invalid = false;
+    var required_manager = ModelManager.init(allocator, required_session_manager);
+    defer required_manager.deinit();
+    const required_loader = try required_manager.componentLoaderForPathsWithContract(
+        root,
+        &.{.native},
+        &.{ encoder, decoder },
+        .multistage_ocr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), required_loader.allowed_backend_count);
+    try std.testing.expectEqual(backends.BackendType.cuda, required_loader.allowed_backends[0]);
 
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "encoder_model.onnx",
