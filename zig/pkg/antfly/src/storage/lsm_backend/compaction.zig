@@ -197,6 +197,47 @@ pub fn maybeCompactRunsScheduledWithL0Limit(
     return true;
 }
 
+/// Run only the leveled repair/pressure lanes. A size-tiered L0 owner uses
+/// this while its bytes remain below the promotion threshold: physical L0
+/// partition count must not make an otherwise healthy lower level wait, but
+/// neither should it trigger a whole-base L0 -> L1 rewrite.
+pub fn maybeCompactLowerLevelsScheduled(
+    comptime BackendType: type,
+    backend: *BackendType,
+    score: u64,
+) !bool {
+    var selection_stats: CompactionSelectionStats = .{};
+    var best: ?ScoredCompactionPlan = null;
+    maybeAdoptBest(&best, selectLowerLevelRepairCompactionCandidateWithStats(
+        backend.runs.items,
+        backend.options.max_compaction_input_bytes,
+        allowOversizedSingleCompactionInput(backend),
+        &selection_stats,
+    ));
+    maybeAdoptBest(&best, selectLowerLevelPressureCompactionCandidateWithStats(
+        backend.runs.items,
+        backend.options.level_target_runs_base,
+        backend.options.level_target_runs_multiplier,
+        backend.options.level_target_bytes_base,
+        backend.options.level_target_bytes_multiplier,
+        backend.options.max_compaction_input_bytes,
+        allowOversizedSingleCompactionInput(backend),
+        &selection_stats,
+    ));
+    noteCompactionSelectionStats(BackendType, backend, selection_stats);
+    const plan = if (best) |candidate| candidate.plan else return false;
+
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
+    var grant = backend.acquireCompactionGrant(work) orelse {
+        rememberDeniedCompaction(BackendType, backend, plan, score);
+        return false;
+    };
+    defer grant.complete();
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
+    return true;
+}
+
 pub fn compactOldestPair(comptime BackendType: type, backend: *BackendType) !void {
     const plan = selectL0Compaction(backend.runs.items, 0, 0, false) orelse return;
     try compactPlanAt(BackendType, backend, plan);
@@ -277,6 +318,158 @@ pub fn compactL0ToLimitScheduledWithinBudget(
     defer grant.complete();
     try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
     return true;
+}
+
+/// Merge one geometrically compatible set of L0 publication generations back
+/// into L0. Unlike leveled L0->L1 compaction this does not repeatedly rewrite
+/// the overlapping base during a sustained import. The output inherits the
+/// newest selected logical sequence, so intervening newer/older generations
+/// retain exactly the same read precedence.
+pub fn compactBulkL0TierScheduled(
+    comptime BackendType: type,
+    backend: *BackendType,
+    fan_in: usize,
+    score: u64,
+) !bool {
+    return compactBulkL0TierScheduledBeforeSequence(BackendType, backend, fan_in, score, 0);
+}
+
+/// Variant used while a bulk window is open. A non-zero sequence ceiling
+/// keeps the tier merger out of the request publications owned by that
+/// window; those are combined exactly once by `compactBulkL0WindowScheduled`.
+pub fn compactBulkL0TierScheduledBeforeSequence(
+    comptime BackendType: type,
+    backend: *BackendType,
+    fan_in: usize,
+    score: u64,
+    before_sequence: u64,
+) !bool {
+    const plan = selectBulkL0Tier(
+        backend.runs.items,
+        fan_in,
+        backend.options.max_compaction_input_bytes,
+        before_sequence,
+    ) orelse return false;
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
+    var grant = backend.acquireCompactionGrant(work) orelse return false;
+    defer grant.complete();
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
+    return true;
+}
+
+pub fn hasBulkL0Tier(runs: []const Run, fan_in: usize) bool {
+    return selectBulkL0Tier(runs, fan_in, 0, 0) != null;
+}
+
+pub fn hasBulkL0TierBeforeSequence(runs: []const Run, fan_in: usize, before_sequence: u64) bool {
+    return selectBulkL0Tier(runs, fan_in, 0, before_sequence) != null;
+}
+
+fn selectBulkL0Tier(runs: []const Run, fan_in: usize, max_input_bytes: u64, before_sequence: u64) ?CompactionPlan {
+    if (fan_in < 2) return null;
+    const l0_count = countLeadingL0Runs(runs);
+    if (l0_count < fan_in) return null;
+
+    var best: ?CompactionPlan = null;
+    var candidate_start: usize = 0;
+    while (candidate_start < l0_count) {
+        const first_end = l0GenerationEnd(runs, candidate_start, l0_count);
+        if (before_sequence != 0 and l0Sequence(runs[candidate_start]) >= before_sequence) {
+            candidate_start = first_end;
+            continue;
+        }
+        var source_end = candidate_start;
+        var group_count: usize = 0;
+        var max_group_bytes: u64 = 0;
+        var input_bytes: u64 = 0;
+        while (source_end < l0_count) {
+            const group_end = l0GenerationEnd(runs, source_end, l0_count);
+            const group_bytes = sumRunBytes(runs[source_end..group_end]);
+            group_count += 1;
+            max_group_bytes = @max(max_group_bytes, group_bytes);
+            input_bytes +|= group_bytes;
+            source_end = group_end;
+            const geometric_target = max_group_bytes *| @as(u64, @intCast(fan_in));
+            const geometric = group_count >= fan_in and input_bytes >= geometric_target;
+            const within_budget = max_input_bytes == 0 or input_bytes <= max_input_bytes;
+            if (geometric and within_budget) break;
+            if (!within_budget) break;
+        }
+        const geometric_target = max_group_bytes *| @as(u64, @intCast(fan_in));
+        const geometric = group_count >= fan_in and
+            max_group_bytes > 0 and
+            input_bytes >= geometric_target;
+        const within_budget = max_input_bytes == 0 or input_bytes <= max_input_bytes;
+        if (geometric and within_budget) {
+            // Keep walking so the oldest compatible window wins. Rewriting
+            // older tiers first bounds read amplification without disturbing
+            // the chronology of newer generations. Requiring the output to
+            // be at least `fan_in` times every input prevents an uneven stream
+            // from degenerating into repeated two-way rewrites.
+            best = .{
+                .source_level = 0,
+                .source_start = candidate_start,
+                .source_len = source_end - candidate_start,
+                .target_start = source_end,
+                .target_len = 0,
+                .output_level = 0,
+            };
+        }
+        candidate_start = first_end;
+    }
+    return best;
+}
+
+/// Collapse every publication created by one durable bulk window into a
+/// single logical L0 generation. The existing persisted k-way merger streams
+/// the inputs, so memory is bounded by cursors and one output file rather than
+/// by the size of the window. A crash before publication leaves the original
+/// manifest authoritative.
+pub fn compactBulkL0WindowScheduled(
+    comptime BackendType: type,
+    backend: *BackendType,
+    first_sequence: u64,
+    score: u64,
+) !bool {
+    if (first_sequence == 0) return false;
+    const l0_count = countLeadingL0Runs(backend.runs.items);
+    var source_len: usize = 0;
+    var generation_count: usize = 0;
+    var prior_sequence: u64 = 0;
+    while (source_len < l0_count) : (source_len += 1) {
+        const sequence = l0Sequence(backend.runs.items[source_len]);
+        if (sequence < first_sequence) break;
+        if (sequence != prior_sequence) {
+            generation_count += 1;
+            prior_sequence = sequence;
+        }
+    }
+    if (generation_count < 2) return false;
+
+    const plan: CompactionPlan = .{
+        .source_level = 0,
+        .source_start = 0,
+        .source_len = source_len,
+        .target_start = source_len,
+        .target_len = 0,
+        .output_level = 0,
+    };
+    var work = try compactionWorkForPlan(backend.allocator, backend.runs.items, plan, score);
+    defer work.deinit(backend.allocator);
+    if (backend.options.max_compaction_input_bytes > 0 and
+        work.input_bytes > backend.options.max_compaction_input_bytes) return false;
+    var grant = backend.acquireCompactionGrant(work) orelse return false;
+    defer grant.complete();
+    try compactPlanAtOptionalMaintenance(BackendType, backend, plan);
+    return true;
+}
+
+fn l0GenerationEnd(runs: []const Run, start: usize, l0_count: usize) usize {
+    const sequence = l0Sequence(runs[start]);
+    var end = start + 1;
+    while (end < l0_count and l0Sequence(runs[end]) == sequence) : (end += 1) {}
+    return end;
 }
 
 pub fn compactAllRuns(comptime BackendType: type, backend: *BackendType) !void {
@@ -504,7 +697,12 @@ pub fn sortRuns(runs: []Run) void {
     std.sort.pdq(Run, runs, {}, struct {
         fn lessThan(_: void, lhs: Run, rhs: Run) bool {
             if (lhs.level != rhs.level) return lhs.level < rhs.level;
-            if (lhs.level == 0) return lhs.id > rhs.id;
+            if (lhs.level == 0) {
+                const lhs_sequence = l0Sequence(lhs);
+                const rhs_sequence = l0Sequence(rhs);
+                if (lhs_sequence != rhs_sequence) return lhs_sequence > rhs_sequence;
+                return lhs.id > rhs.id;
+            }
             const bound_order = compareRunBound(
                 lhs.smallest_namespace_name,
                 lhs.smallest_key,
@@ -515,6 +713,16 @@ pub fn sortRuns(runs: []Run) void {
             return lhs.id < rhs.id;
         }
     }.lessThan);
+}
+
+pub fn l0Sequence(run: Run) u64 {
+    return if (run.l0_sequence != 0) run.l0_sequence else run.id;
+}
+
+pub fn setL0Sequence(runs: []Run, sequence: u64) void {
+    for (runs) |*run| {
+        if (run.level == 0) run.l0_sequence = sequence;
+    }
 }
 
 fn compactPlanAt(comptime BackendType: type, backend: *BackendType, plan: CompactionPlan) !void {
@@ -573,6 +781,7 @@ fn compactPlanAtLockedOnly(comptime BackendType: type, backend: *BackendType, pl
     else
         try makeStateRunsFromSelectedRuns(BackendType, backend, selected[0..selected_len], plan.output_level);
     errdefer discardOutputRuns(BackendType, backend, &compacted_runs);
+    inheritL0Sequence(&compacted_runs, selected[0..selected_len], plan.output_level);
 
     var retained = std.ArrayListUnmanaged(Run).empty;
     errdefer {
@@ -701,6 +910,7 @@ fn compactPlanAtWithUnlockedBuild(
         break :blk .empty;
     };
     if (build_err == null) {
+        inheritL0Sequence(&build_result, selected, plan.output_level);
         build_result_valid = true;
     }
 
@@ -857,6 +1067,16 @@ fn relocatePlanIfInputsStillMatch(runs: []const Run, plan: CompactionPlan, selec
     // rebuild the target overlap closure against the current run version.
     const source_ids = selected_run_ids[0..plan.source_len];
     const source_start = findContiguousRunIds(runs, plan.source_level, source_ids) orelse return null;
+    if (plan.output_level == plan.source_level and plan.target_len == 0) {
+        return .{
+            .source_level = plan.source_level,
+            .source_start = source_start,
+            .source_len = plan.source_len,
+            .target_start = source_start + plan.source_len,
+            .target_len = 0,
+            .output_level = plan.output_level,
+        };
+    }
     const relocated = buildPlanForSourceRange(runs, plan.source_level, source_start, plan.source_len) orelse return null;
     if (relocated.source_len != plan.source_len or
         relocated.output_level != plan.output_level or
@@ -867,6 +1087,13 @@ fn relocatePlanIfInputsStillMatch(runs: []const Run, plan: CompactionPlan, selec
         if (run.id != expected_id) return null;
     }
     return relocated;
+}
+
+fn inheritL0Sequence(output: *std.ArrayListUnmanaged(Run), inputs: []const *Run, output_level: u32) void {
+    if (output_level != 0 or output.items.len == 0) return;
+    var sequence: u64 = 0;
+    for (inputs) |run| sequence = @max(sequence, l0Sequence(run.*));
+    for (output.items) |*run| run.l0_sequence = sequence;
 }
 
 fn findContiguousRunIds(runs: []const Run, level: u32, ids: []const u64) ?usize {
@@ -1748,6 +1975,32 @@ fn testRun(id: u64, level: u32, smallest_key: []const u8, largest_key: []const u
         .owns_bloom_filter = false,
         .state = null,
     };
+}
+
+test "lsm geometric L0 carry tolerates uneven generations without two-way rewrites" {
+    const mib: u64 = 1024 * 1024;
+    const uneven = [_]Run{
+        testRun(7, 0, "doc:a", "doc:z", mib),
+        testRun(6, 0, "doc:a", "doc:z", mib),
+        testRun(5, 0, "doc:a", "doc:z", mib),
+        testRun(4, 0, "doc:a", "doc:z", 2 * mib),
+        testRun(3, 0, "doc:a", "doc:z", mib),
+        testRun(2, 0, "doc:a", "doc:z", mib),
+        testRun(1, 0, "doc:a", "doc:z", mib),
+    };
+
+    // Four uneven inputs would grow the largest generation by only 2.5x, so
+    // the planner waits. Once adjacent deltas provide a 4x output, it carries
+    // the whole chronological window in one streaming merge.
+    try std.testing.expect(selectBulkL0Tier(uneven[0..4], 4, 0, 0) == null);
+    const plan = selectBulkL0Tier(&uneven, 4, 0, 0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), plan.source_start);
+    try std.testing.expectEqual(@as(usize, 7), plan.source_len);
+    try std.testing.expectEqual(@as(u32, 0), plan.output_level);
+
+    // A strict input bound may postpone the carry, but must never silently
+    // select a smaller low-growth rewrite.
+    try std.testing.expect(selectBulkL0Tier(&uneven, 4, 7 * mib, 0) == null);
 }
 
 test "unlocked compaction publication relocates inputs after concurrent L0 prepend" {
@@ -2906,6 +3159,18 @@ fn deinitRunList(allocator: std.mem.Allocator, runs: *std.ArrayListUnmanaged(Run
 }
 
 pub fn appendOwnedRuns(dst: *std.ArrayListUnmanaged(Run), allocator: std.mem.Allocator, src: *std.ArrayListUnmanaged(Run)) !void {
+    // Files emitted by one sorted publication form one precedence generation.
+    // Keeping the generation common is what lets later size-tiered rewrites
+    // preserve chronology even when partitioning produces multiple files.
+    var publication_sequence: u64 = 0;
+    for (src.items) |run| {
+        if (run.level == 0 and run.l0_sequence == 0) publication_sequence = @max(publication_sequence, run.id);
+    }
+    if (publication_sequence != 0) {
+        for (src.items) |*run| {
+            if (run.level == 0 and run.l0_sequence == 0) run.l0_sequence = publication_sequence;
+        }
+    }
     try dst.ensureUnusedCapacity(allocator, src.items.len);
     for (src.items) |*run| {
         dst.appendAssumeCapacity(run.*);

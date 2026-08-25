@@ -336,6 +336,10 @@ pub const Options = struct {
     max_deferred_immutable_bytes: u64 = 0,
     background_maintenance_max_steps: usize = 64,
     direct_bulk_ingest: bool = true,
+    // Optional size-tiered L0 merge fan-in for sustained sorted publication.
+    // Zero disables it. The tier lane streams equal-sized publication
+    // generations without repeatedly rewriting the overlapping lower level.
+    bulk_ingest_tiered_l0_fan_in: usize = 0,
     level_target_runs_base: usize = 32,
     level_target_runs_multiplier: usize = 4,
     level_target_bytes_base: usize = 1024 * 1024,
@@ -1484,6 +1488,10 @@ pub const Backend = struct {
     read_snapshot_mutable_rotation_bytes_total: u64 = 0,
     read_snapshot_mutable_rotation_peak_bytes: u64 = 0,
     active_bulk_ingest_batches: usize = 0,
+    // Physical run ids allocated at or after this value belong to the current
+    // explicit bulk window. L0 logical sequences make the boundary stable even
+    // if an older generation is physically rewritten while the window is open.
+    bulk_ingest_window_first_sequence: u64 = 0,
     mutable: ActiveMemTable = .{},
     mutable_idle_flush_deadline_ns: u64 = 0,
     mutable_idle_flush_max_deadline_ns: u64 = 0,
@@ -2182,17 +2190,23 @@ pub const Backend = struct {
 
         const soft_limit_l0_runs = self.effectiveL0SoftLimitRuns();
         const hard_limit_l0_runs = self.effectiveL0HardLimitRuns();
+        const tiered_l0 = self.options.bulk_ingest_tiered_l0_fan_in >= 2;
+        const has_l0_tier = tiered_l0 and
+            compaction_mod.hasBulkL0Tier(self.runs.items, self.options.bulk_ingest_tiered_l0_fan_in);
         if (hard_limit_l0_runs > 0) {
             const l0_runs = countLevelRuns(self.runs.items, 0);
             if (l0_runs > hard_limit_l0_runs) {
                 score +|= (l0_runs - hard_limit_l0_runs) * 1_000_000;
-            } else if (l0_runs > soft_limit_l0_runs) {
+            } else if (l0_runs > soft_limit_l0_runs and (!tiered_l0 or has_l0_tier)) {
                 score +|= (l0_runs - soft_limit_l0_runs) * 10_000;
             }
-            if (l0_runs > self.options.compact_threshold_runs) {
+            if (!tiered_l0 and l0_runs > self.options.compact_threshold_runs) {
                 score +|= (l0_runs - self.options.compact_threshold_runs) * 1_000;
             }
-            score +|= self.largestL0OverlapRunCountLocked() * 2_000;
+            if (!tiered_l0) score +|= self.largestL0OverlapRunCountLocked() * 2_000;
+        }
+        if (self.l0SoftPressureLocked() and has_l0_tier) {
+            score +|= 2_500;
         }
 
         var l0_bytes: u64 = 0;
@@ -2225,7 +2239,10 @@ pub const Backend = struct {
 
         if (self.options.l0_hard_limit_bytes > 0 and l0_bytes > self.options.l0_hard_limit_bytes) {
             score +|= (l0_bytes - self.options.l0_hard_limit_bytes) / 1024;
-        } else if (self.options.l0_soft_limit_bytes > 0 and l0_bytes > self.options.l0_soft_limit_bytes) {
+        } else if (self.options.l0_soft_limit_bytes > 0 and
+            l0_bytes > self.options.l0_soft_limit_bytes and
+            (!tiered_l0 or has_l0_tier))
+        {
             score +|= (l0_bytes - self.options.l0_soft_limit_bytes) / (16 * 1024);
         }
 
@@ -2388,10 +2405,32 @@ pub const Backend = struct {
         if (self.wal_checkpoint_pending and self.walCheckpointRetryDueLocked()) {
             if (try self.runWalPressureMaintenanceStepLocked()) return true;
         }
-        // Bulk ingest suppresses compaction, not durability/resource bounds.
-        // This lane can only flush unpublished memtables and publish a
-        // checkpoint manifest; it deliberately cannot compact runs.
-        if (self.bulkIngestActive()) return false;
+        // Ordinary leveled compaction remains deferred during bulk ingest, but
+        // a pressured sorted-publication lane may stream one size-tier merge.
+        // This prevents the import from reaching hard L0 pressure and then
+        // repeatedly rewriting its entire overlapping lower-level base.
+        if (self.bulkIngestActive()) {
+            if (!self.bulkTieredL0MaintenanceDueLocked()) return false;
+            self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
+                self.options.background_io_budget_bytes
+            else
+                null;
+            defer self.maintenance_io_budget_remaining = null;
+            const compacted = try compaction_mod.compactBulkL0TierScheduledBeforeSequence(
+                Backend,
+                self,
+                self.options.bulk_ingest_tiered_l0_fan_in,
+                self.maintenanceScoreLocked(),
+                self.bulk_ingest_window_first_sequence,
+            );
+            if (compacted and self.root_dir != null and
+                (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()))
+            {
+                try self.persistManifest();
+            }
+            _ = self.refreshCachedMaintenanceHintLocked();
+            return compacted;
+        }
         self.maintenance_io_budget_remaining = if (self.options.background_io_budget_bytes > 0)
             self.options.background_io_budget_bytes
         else
@@ -2430,12 +2469,29 @@ pub const Backend = struct {
             else
                 false;
             if (!defer_soft_compaction) {
-                _ = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
-                    Backend,
-                    self,
-                    if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
-                    score,
-                );
+                const tiered = if (self.l0SoftPressureLocked() and self.options.bulk_ingest_tiered_l0_fan_in >= 2)
+                    try compaction_mod.compactBulkL0TierScheduled(
+                        Backend,
+                        self,
+                        self.options.bulk_ingest_tiered_l0_fan_in,
+                        score,
+                    )
+                else
+                    false;
+                if (!tiered) {
+                    const tier_owns_soft_l0 = self.options.bulk_ingest_tiered_l0_fan_in >= 2 and
+                        !self.l0HardPressureLocked();
+                    if (tier_owns_soft_l0) {
+                        _ = try compaction_mod.maybeCompactLowerLevelsScheduled(Backend, self, score);
+                    } else {
+                        _ = try compaction_mod.maybeCompactRunsScheduledWithL0Limit(
+                            Backend,
+                            self,
+                            if (soft_l0_runs > 0) soft_l0_runs else self.options.compact_threshold_runs,
+                            score,
+                        );
+                    }
+                }
             }
         }
         // Hard L0/WAL bounds remain authoritative even while latency-sensitive
@@ -2451,6 +2507,46 @@ pub const Backend = struct {
         return self.compaction_stats.compactions != before_compactions or
             self.write_stats.manifest_writes != before_manifest_writes or
             self.obsolete_paths.items.len != before_obsolete_paths;
+    }
+
+    fn bulkTieredL0MaintenanceDueLocked(self: *Backend) bool {
+        const fan_in = self.options.bulk_ingest_tiered_l0_fan_in;
+        if (fan_in < 2) return false;
+        if (!self.l0SoftPressureLocked()) return false;
+        const before_sequence = self.bulk_ingest_window_first_sequence;
+        if (before_sequence == 0) return false;
+        return compaction_mod.hasBulkL0TierBeforeSequence(self.runs.items, fan_in, before_sequence);
+    }
+
+    fn l0SoftPressureLocked(self: *const Backend) bool {
+        return self.l0RunSoftPressureLocked() or self.l0ByteSoftPressureLocked();
+    }
+
+    fn l0RunSoftPressureLocked(self: *const Backend) bool {
+        var l0_runs: usize = 0;
+        while (l0_runs < self.runs.items.len and self.runs.items[l0_runs].level == 0) : (l0_runs += 1) {}
+        return self.effectiveL0SoftLimitRuns() > 0 and
+            l0_runs > self.effectiveL0SoftLimitRuns();
+    }
+
+    fn l0ByteSoftPressureLocked(self: *const Backend) bool {
+        if (self.options.l0_soft_limit_bytes == 0) return false;
+        var l0_bytes: u64 = 0;
+        for (self.runs.items) |run| {
+            if (run.level != 0) break;
+            l0_bytes +|= run.size_bytes;
+        }
+        return l0_bytes > self.options.l0_soft_limit_bytes;
+    }
+
+    fn l0HardPressureLocked(self: *const Backend) bool {
+        var l0_runs: usize = 0;
+        var l0_bytes: u64 = 0;
+        while (l0_runs < self.runs.items.len and self.runs.items[l0_runs].level == 0) : (l0_runs += 1) {
+            l0_bytes +|= self.runs.items[l0_runs].size_bytes;
+        }
+        return (self.effectiveL0HardLimitRuns() > 0 and l0_runs > self.effectiveL0HardLimitRuns()) or
+            (self.options.l0_hard_limit_bytes > 0 and l0_bytes > self.options.l0_hard_limit_bytes);
     }
 
     fn runWalPressureMaintenanceStepLocked(self: *Backend) !bool {
@@ -3167,6 +3263,7 @@ pub const Backend = struct {
                     const source_runs = [_]*Run{run};
                     var child_runs = try compaction_mod.makePersistedRunsFromSelectedRuns(Backend, &dest, &source_runs, run.level);
                     defer compaction_mod.discardOutputRuns(Backend, &dest, &child_runs);
+                    compaction_mod.setL0Sequence(child_runs.items, compaction_mod.l0Sequence(run.*));
                     try compaction_mod.appendOwnedRuns(&dest.runs, dest.allocator, &child_runs);
                     wrote_any = true;
                 },
@@ -3177,6 +3274,7 @@ pub const Backend = struct {
                     if (split.right.entries.items.len == 0) continue;
                     var child_runs = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, &dest, &split.right, run.level);
                     defer compaction_mod.discardOutputRuns(Backend, &dest, &child_runs);
+                    compaction_mod.setL0Sequence(child_runs.items, compaction_mod.l0Sequence(run.*));
                     try compaction_mod.appendOwnedRuns(&dest.runs, dest.allocator, &child_runs);
                     wrote_any = true;
                 },
@@ -3238,7 +3336,9 @@ pub const Backend = struct {
                     if (split.left.entries.items.len == 0) {
                         actions[i] = .drop;
                     } else {
-                        actions[i] = .{ .replace = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, self, &split.left, run.level) };
+                        const replacements = try compaction_mod.makePersistedRunsFromStateBorrowedAtLevel(Backend, self, &split.left, run.level);
+                        compaction_mod.setL0Sequence(replacements.items, compaction_mod.l0Sequence(run.*));
+                        actions[i] = .{ .replace = replacements };
                     }
                     changed = true;
                 },
@@ -3486,7 +3586,9 @@ pub const Backend = struct {
     fn scheduleMaintenanceJobIfNeededLocked(self: *Backend) void {
         if (self.closing.load(.acquire)) return;
         if (self.options.backend.read_only) return;
-        if (self.bulkIngestActive() and !self.wal_checkpoint_pending) return;
+        if (self.bulkIngestActive() and
+            !self.wal_checkpoint_pending and
+            !self.bulkTieredL0MaintenanceDueLocked()) return;
         if (self.options.maintenance_waker != null) {
             if (self.maintenanceScoreLocked() != 0) self.wakeMaintenanceWorker();
             return;
@@ -5632,6 +5734,9 @@ pub const Backend = struct {
 
     fn beginBulkIngestSessionLocked(self: *Backend) !void {
         if (self.options.backend.read_only) return error.ReadOnly;
+        if (self.active_bulk_ingest_batches == 0) {
+            self.bulk_ingest_window_first_sequence = self.next_run_id;
+        }
         self.active_bulk_ingest_batches += 1;
     }
 
@@ -5675,6 +5780,7 @@ pub const Backend = struct {
                     try self.flushMutable();
                 }
             }
+            _ = try self.mergeBulkIngestWindowLocked();
             try self.runForegroundCompactionBudget(options);
             if (self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
                 try self.persistManifest();
@@ -5686,6 +5792,7 @@ pub const Backend = struct {
             if (self.active_bulk_ingest_batches == 0 and self.root_dir != null and (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked())) {
                 try self.persistManifest();
             }
+            self.bulk_ingest_window_first_sequence = 0;
             self.scheduleMaintenanceAfterBulkIngestLocked();
             return;
         }
@@ -5697,9 +5804,28 @@ pub const Backend = struct {
                     try self.flushMutable();
                 }
             }
+            _ = try self.mergeBulkIngestWindowLocked();
             try self.finalizeDeferredRunWork(.{ .force_soft_compaction = options.compact });
+            self.bulk_ingest_window_first_sequence = 0;
             self.scheduleMaintenanceAfterBulkIngestLocked();
         }
+    }
+
+    fn mergeBulkIngestWindowLocked(self: *Backend) !bool {
+        const first_sequence = self.bulk_ingest_window_first_sequence;
+        if (first_sequence == 0 or self.options.bulk_ingest_tiered_l0_fan_in < 2) return false;
+        const merged = try compaction_mod.compactBulkL0WindowScheduled(
+            Backend,
+            self,
+            first_sequence,
+            self.maintenanceScoreLocked(),
+        );
+        if (merged and self.root_dir != null and
+            (self.manifest_dirty or self.obsolete_manifest_dirty or self.hasReclaimableObsoletePathsLocked()))
+        {
+            try self.persistManifest();
+        }
+        return merged;
     }
 
     fn scheduleMaintenanceAfterBulkIngestLocked(self: *Backend) void {
@@ -5723,6 +5849,7 @@ pub const Backend = struct {
     fn abortBulkIngestSessionLocked(self: *Backend) void {
         std.debug.assert(self.active_bulk_ingest_batches > 0);
         self.active_bulk_ingest_batches -= 1;
+        if (self.active_bulk_ingest_batches == 0) self.bulk_ingest_window_first_sequence = 0;
         self.scheduleMaintenanceAfterBulkIngestLocked();
     }
 
@@ -6502,8 +6629,12 @@ fn validateRunLayoutForManifest(runs: []const Run) !void {
             }
             if (prev.level == run.level) {
                 if (prev.level == 0) {
-                    if (prev.id <= run.id) {
-                        logInvalidRunLayout("l0_id_order", prior, run);
+                    const prev_sequence = compaction_mod.l0Sequence(prev);
+                    const run_sequence = compaction_mod.l0Sequence(run);
+                    if (prev_sequence < run_sequence or
+                        (prev_sequence == run_sequence and prev.id <= run.id))
+                    {
+                        logInvalidRunLayout("l0_sequence_order", prior, run);
                         return error.InvalidTableFile;
                     }
                 } else {
@@ -9802,6 +9933,64 @@ test "lsm backend reopens overlapping direct ingest l0 runs with newest values v
     }
 }
 
+test "lsm backend linear bulk window merge preserves l0 chronology tombstones and reopen" {
+    var storage = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+    const options = Options{
+        .flush_threshold = 1,
+        .bulk_ingest_flush_threshold_multiplier = 1,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+        .compact_threshold_runs = 4,
+        .l0_soft_limit_runs = 4,
+        .l0_hard_limit_runs = 128,
+        .foreground_soft_compaction = false,
+        .storage = storage.storage(),
+    };
+
+    {
+        var backend = try Backend.open(std.testing.allocator, "/tiered-bulk-chronology", options);
+        defer backend.close();
+        try backend.beginBulkIngestSession();
+        var bulk_active = true;
+        errdefer if (bulk_active) backend.abortBulkIngestSession();
+
+        var generation: usize = 1;
+        while (generation <= 5) : (generation += 1) {
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            var pad_key_buf: [32]u8 = undefined;
+            const pad_key = try std.fmt.bufPrint(&pad_key_buf, "pad:{d}", .{generation});
+            const padding = [_]u8{'p'} ** 256;
+            try txn.put(.{ .name = "docs" }, pad_key, &padding);
+            switch (generation) {
+                1 => {
+                    try txn.put(.{ .name = "docs" }, "doc:overwrite", "old");
+                    try txn.put(.{ .name = "docs" }, "doc:deleted", "present");
+                },
+                2 => try txn.put(.{ .name = "docs" }, "doc:overwrite", "new"),
+                4 => try txn.delete(.{ .name = "docs" }, "doc:deleted"),
+                5 => try txn.put(.{ .name = "docs" }, "doc:newest", "visible"),
+                else => {},
+            }
+            try txn.commit();
+        }
+        try std.testing.expectEqual(@as(usize, 5), countLevelRuns(backend.runs.items, 0));
+        try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+        bulk_active = false;
+        try std.testing.expectEqual(@as(u64, 1), backend.compaction_stats.compactions);
+        try std.testing.expectEqual(@as(usize, 1), countLevelRuns(backend.runs.items, 0));
+        try std.testing.expectEqualStrings("new", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:overwrite"));
+        try std.testing.expectError(error.NotFound, backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:deleted"));
+        try std.testing.expectEqualStrings("visible", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:newest"));
+    }
+
+    var reopened = try Backend.open(std.testing.allocator, "/tiered-bulk-chronology", options);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(usize, 1), countLevelRuns(reopened.runs.items, 0));
+    try std.testing.expectEqualStrings("new", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:overwrite"));
+    try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:deleted"));
+    try std.testing.expectEqualStrings("visible", try reopened.getMergedWithMutable(&reopened.mutable, .{ .name = "docs" }, "doc:newest"));
+}
+
 test "lsm backend can disable direct bulk ingest for overwrite-heavy stores" {
     var backend = Backend.init(std.testing.allocator, .{
         .flush_threshold = 1,
@@ -10578,6 +10767,46 @@ test "lsm backend maintenance step compacts soft L0 debt" {
     try std.testing.expect(backend.maintenanceScore() > 0);
     try std.testing.expect(try backend.runMaintenanceStep());
     try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 1);
+}
+
+test "lsm backend tier-owned L0 avoids low-growth rewrite below hard pressure" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_soft_limit_runs = 1,
+        .l0_hard_limit_runs = 100,
+        .l0_soft_limit_bytes = 1,
+        .l0_hard_limit_bytes = 2 * 1024 * 1024,
+        .bulk_ingest_tiered_l0_fan_in = 4,
+    });
+    defer backend.close();
+
+    // Three publications exceed both soft limits but cannot form a four-way
+    // carry. That is bounded read amplification, not a reason to promote and
+    // rewrite an overlapping lower-level base with less than 4x growth.
+    for (0..3) |i| {
+        var key_buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, key, "value");
+        try txn.commit();
+    }
+    while (backend.activeImmutableMemtableCount() > 0) {
+        try std.testing.expect(try backend.runMaintenanceStep());
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+    const before_compactions = backend.compaction_stats.compactions;
+    try std.testing.expect(!(try backend.runMaintenanceStep()));
+    try std.testing.expectEqual(before_compactions, backend.compaction_stats.compactions);
+    try std.testing.expectEqual(@as(usize, 3), countLevelRuns(backend.runs.items, 0));
+
+    // Hard pressure remains authoritative and may use ordinary promotion to
+    // guarantee bounded write admission even when a complete tier is absent.
+    backend.options.l0_hard_limit_runs = 2;
+    try std.testing.expect(try backend.runMaintenanceStep());
+    try std.testing.expect(backend.compaction_stats.compactions > before_compactions);
+    try std.testing.expect(countLevelRuns(backend.runs.items, 0) <= 2);
 }
 
 test "lsm backend defers soft compaction behind latency-sensitive derived replay" {

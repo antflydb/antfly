@@ -48,6 +48,11 @@ pub const ObsoletePath = struct {
 
 pub const Run = struct {
     id: u64,
+    /// Logical newest-write precedence for L0. Physical rewrites allocate a
+    /// fresh id but retain the newest input sequence so tiered merges cannot
+    /// make older values shadow newer unmerged runs. Zero means `id` for
+    /// in-memory/legacy callers.
+    l0_sequence: u64 = 0,
     level: u32,
     size_bytes: u64,
     compression_stats: lsm_table_file.CompressionStats = .{},
@@ -159,6 +164,7 @@ pub fn cloneRunSnapshot(allocator: Allocator, source: Run) !Run {
 
     var out = Run{
         .id = source.id,
+        .l0_sequence = source.l0_sequence,
         .level = source.level,
         .size_bytes = source.size_bytes,
         .compression_stats = source.compression_stats,
@@ -196,6 +202,7 @@ pub fn cloneRunCompactionSnapshot(allocator: Allocator, source: Run) !Run {
 
     var out = Run{
         .id = source.id,
+        .l0_sequence = source.l0_sequence,
         .level = source.level,
         .size_bytes = source.size_bytes,
         .compression_stats = source.compression_stats,
@@ -281,6 +288,7 @@ pub fn loadManifestIfPresentWithStorage(
         errdefer if (path_owned) allocator.free(owned_path);
         try runs.append(allocator, .{
             .id = meta.id,
+            .l0_sequence = meta.l0_sequence,
             .level = meta.level,
             .size_bytes = meta.size_bytes,
             .compression_stats = meta.compression_stats,
@@ -493,6 +501,7 @@ pub fn persistManifestWithStorageCount(
     for (runs, 0..) |run, i| {
         metas[i] = .{
             .id = run.id,
+            .l0_sequence = if (run.l0_sequence != 0) run.l0_sequence else run.id,
             .level = run.level,
             .size_bytes = run.size_bytes,
             .compression_stats = run.compression_stats,

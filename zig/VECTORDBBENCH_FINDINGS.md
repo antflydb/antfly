@@ -1664,6 +1664,42 @@ generation/WAL design is no longer the dominant load or disk cost; making the
 primary append-heavy document/artifact path publish larger sorted runs with
 far fewer manifests is the highest-leverage next experiment.
 
+## Primary geometric-merge experiment
+
+The next 50K experiments changed only the primary LSM publication and
+compaction policy. They retained the public `/db/v1` server path, batch size
+100, twenty load workers, native HBC, the 2 GiB resource envelope, exact
+rerank, and the same recall/query matrix. The implementation publishes sorted
+bulk state at 8 MiB, assigns all partition files in one publication a durable
+logical L0 sequence, and performs same-level streaming carries. Manifest v10
+persists that chronology and remains able to read v9 manifests.
+
+An exact four-way carry recovered fast load (21.66--23.10 seconds total) but
+eventually fell through to generic L0-to-L1 compaction. That rewrote about
+710 MiB and left live RSS around 1.86--1.92 GB. Raising the optional
+foreground-query compaction pause from 2 to 25 milliseconds was rejected: it
+stretched 662 MiB of compaction from roughly 4.7 to 14.3 seconds, raised RSS to
+2.01 GB, and did not improve the first query lane.
+
+Giving the tier lane ownership of run-count-only soft pressure reduced
+compaction input to 75.4 MiB and load to 22.49 seconds, but retained 96 L0
+files. Live RSS reached 2.13 GB and restart memory/latency regressed. A
+two-to-four-way carry was also rejected earlier because it rewrote 1.02 GB in
+thirteen jobs. The accepted refinement is a universal geometric carry: an
+uneven contiguous generation window is eligible only when the output is at
+least four times every input generation. This preserves chronological
+overwrite/tombstone precedence and log-base-four write amplification while a
+hard L0 run/byte limit remains an authoritative leveled-promotion escape.
+
+Two fresh geometric-carry 50K runs were ready in 28.72 and 23.98 seconds. The
+repeat ended with 24 L0 files, no lower-level files, 323.3 MiB compaction input,
+321.4 MiB output, 2.38 seconds cumulative compaction, 134.9 MiB snapshot
+copying, no write-pressure events, and 402.6 MB total disk. Its live RSS peak
+was 1.54 GB and recall was 0.9854. Query results remained host/tree-sensitive:
+the repeat reached 1,161 QPS but had 50.8/14.5/14.2/30.4/46.9 ms p95 at
+concurrency 1/5/10/20/30, so the 1M gate must report query and restart
+latencies rather than treating the improved storage counters as sufficient.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
