@@ -29,6 +29,7 @@ import requests
 from helpers import assert_created_index, wait_until
 
 DOCUMENT_UNITS_ARTIFACT = "document_units_v1"
+DEFAULT_FULL_TEXT_INDEX = "full_text_index_v0"
 
 
 def _document_artifact_path(table_name: str, doc_key: str, artifact_name: str) -> str:
@@ -97,38 +98,6 @@ def _document_units_index_config() -> dict:
     }
 
 
-def _artifact_full_text_indexes(*, chunk_size: int) -> dict[str, dict]:
-    units = _document_units_index_config()
-    return {
-        "document_units": units,
-        "document_text": {
-            "type": "full_text",
-            "field": "text",
-            "artifact_name": "document_chunks_v1",
-            "enrichments": [
-                {
-                    "name": DOCUMENT_UNITS_ARTIFACT,
-                    "kind": "asset",
-                    "field": "url",
-                    "content_type": "application/json",
-                    "producer_json": json.dumps(
-                        units["artifact"]["producer_json"], separators=(",", ":")
-                    ),
-                },
-                {
-                    "name": "document_chunks_v1",
-                    "kind": "chunk",
-                    "field": "text",
-                    "source_artifact_name": DOCUMENT_UNITS_ARTIFACT,
-                    "chunk_size": chunk_size,
-                    "chunk_overlap": 0,
-                    "full_text_index": True,
-                },
-            ],
-        },
-    }
-
-
 def _manifest_ready(api, table_name: str, doc_key: str) -> dict | None:
     try:
         manifest = api.get(
@@ -156,6 +125,74 @@ def _table_has_artifact_enrichment(
         if enrichment.get("name") == artifact_name and enrichment.get("kind") == kind:
             return table
     return None
+
+
+def _provision_artifact_full_text(api, table_name: str, *, chunk_size: int) -> dict:
+    """Use the public enrichment UX to provision exactly one default text index."""
+
+    asset_enrichment = _document_units_asset_enrichment()
+    asset_enrichment["producer_json"] = json.dumps(
+        asset_enrichment["producer_json"], separators=(",", ":")
+    )
+    assert (
+        api.put(
+            f"{_table_artifact_path(table_name, DOCUMENT_UNITS_ARTIFACT)}/enrichment",
+            asset_enrichment,
+        )
+        == {}
+    )
+    assert (
+        wait_until(
+            lambda: _table_has_artifact_enrichment(
+                api, table_name, DOCUMENT_UNITS_ARTIFACT, "asset"
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        is not None
+    )
+
+    assert (
+        api.put(
+            f"{_table_artifact_path(table_name, 'document_chunks_v1')}/enrichment",
+            {
+                "kind": "chunk",
+                "source_artifact_name": DOCUMENT_UNITS_ARTIFACT,
+                "field": "text",
+                "chunk_size": chunk_size,
+                "chunk_overlap": 0,
+                "full_text_index": True,
+            },
+        )
+        == {}
+    )
+    assert (
+        wait_until(
+            lambda: _table_has_artifact_enrichment(
+                api, table_name, "document_chunks_v1", "chunk"
+            ),
+            timeout_s=30.0,
+            interval_s=0.25,
+        )
+        is not None
+    )
+
+    def default_index_ready() -> dict | None:
+        try:
+            current = api.get_index(table_name, DEFAULT_FULL_TEXT_INDEX)
+        except Exception:
+            return None
+        if current.get("config", {}).get("type") != "full_text":
+            return None
+        return current
+
+    detail = wait_until(
+        default_index_ready,
+        timeout_s=30.0,
+        interval_s=0.25,
+    )
+    assert detail is not None
+    return detail
 
 
 def test_document_artifact_manifest_and_reprocess_job_e2e(stateful_api):
@@ -702,9 +739,9 @@ def test_artifact_full_text_chunks_remain_with_parents_across_three_shards(
     created = stateful_api.create_table(
         table_name,
         num_shards=3,
-        indexes=_artifact_full_text_indexes(chunk_size=16),
     )
     assert created.get("name") == table_name or created.get("table_name") == table_name
+    _provision_artifact_full_text(stateful_api, table_name, chunk_size=16)
 
     # Three-shard tables start with lexical ranges. These parent keys
     # deliberately land below, between, and above the two initial boundaries.
@@ -755,7 +792,7 @@ def test_artifact_full_text_chunks_remain_with_parents_across_three_shards(
         manifests[parent_key] = manifest
 
     def distributed_index_status() -> dict | None:
-        detail = stateful_api.get_index(table_name, "document_text")
+        detail = stateful_api.get_index(table_name, DEFAULT_FULL_TEXT_INDEX)
         shards = detail.get("shard_status", {})
         counts = [
             int(status.get("total_indexed", 0))
@@ -771,7 +808,7 @@ def test_artifact_full_text_chunks_remain_with_parents_across_three_shards(
         interval_s=0.5,
     )
     assert detail is not None, json.dumps(
-        stateful_api.get_index(table_name, "document_text"),
+        stateful_api.get_index(table_name, DEFAULT_FULL_TEXT_INDEX),
         indent=2,
         sort_keys=True,
     )
@@ -804,9 +841,9 @@ def test_artifact_full_text_scale_exceeds_one_million_chunks_on_three_shards(
     created = stateful_api.create_table(
         table_name,
         num_shards=3,
-        indexes=_artifact_full_text_indexes(chunk_size=8),
     )
     assert created.get("name") == table_name or created.get("table_name") == table_name
+    _provision_artifact_full_text(stateful_api, table_name, chunk_size=8)
 
     # Keep each source close to the reported PG-19 reproduction's ~829 chunks
     # per book. Giant inline sources are not representative: the source field
@@ -894,7 +931,7 @@ def test_artifact_full_text_scale_exceeds_one_million_chunks_on_three_shards(
     )
 
     def million_chunks_visible_on_every_shard() -> dict | None:
-        detail = stateful_api.get_index(table_name, "document_text")
+        detail = stateful_api.get_index(table_name, DEFAULT_FULL_TEXT_INDEX)
         shards = detail.get("shard_status", {})
         counts = [
             int(status.get("total_indexed", 0))
@@ -914,7 +951,7 @@ def test_artifact_full_text_scale_exceeds_one_million_chunks_on_three_shards(
         interval_s=2.0,
     )
     assert detail is not None, json.dumps(
-        stateful_api.get_index(table_name, "document_text"),
+        stateful_api.get_index(table_name, DEFAULT_FULL_TEXT_INDEX),
         indent=2,
         sort_keys=True,
     )

@@ -1135,6 +1135,7 @@ pub const FSTIterator = struct {
             .aut_states_stack = .empty,
             .next_start = .empty,
         };
+        errdefer it.deinit();
         try it.pointTo(start_inclusive);
         return it;
     }

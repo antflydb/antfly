@@ -397,6 +397,13 @@ const TextMergeBudgetAllocator = struct {
         return self.budget_denied.load(.acquire);
     }
 
+    /// Task-owned bytes which are live inside the admitted merge reservation.
+    /// Capture this before charging persistent publication work when reporting
+    /// the task allocator's overlapping publication peak.
+    fn liveBytes(self: *const TextMergeBudgetAllocator) usize {
+        return self.live_bytes.load(.acquire);
+    }
+
     /// Account allocations which must be owned by the persistent index's
     /// allocator (and therefore cannot safely retain this task-local allocator
     /// after publication). The charge remains live across the external work so
@@ -11698,12 +11705,13 @@ pub const IndexManager = struct {
         }
         var merge_delta_locked = true;
         defer if (merge_delta_locked) entry.merge_delta_mutex.unlock();
+        const publication_task_live_bytes = task.deletion_state.budget.liveBytes();
         const publication_external_bytes = estimateTextMergePublicationExternalBytes(entry, task, result) catch |err| {
             return task.deletion_state.allocationError(err);
         };
         const publication_external_charge = try task.deletion_state.budget.chargeExternal(publication_external_bytes);
         defer task.deletion_state.budget.releaseExternal(publication_external_charge);
-        var publication_deletes = textMergePublicationDeletes(entry, task, result, task.deletion_state.deltas) catch |err| {
+        var publication_deletes = textMergePublicationDeletes(entry, task, result, publication_task_live_bytes, task.deletion_state.deltas) catch |err| {
             return task.deletion_state.allocationError(err);
         };
         defer publication_deletes.deinit(task.mergeAllocator());
@@ -12157,6 +12165,7 @@ pub const IndexManager = struct {
         entry: *TextIndex,
         task: *const TextMergeTask,
         result: *TextMergeResult,
+        publication_task_live_bytes: usize,
         deletion_deltas: []const TextMergeDeletionDelta,
     ) !TextMergePublicationDeletes {
         if (deletion_deltas.len != task.source.len) return error.InvalidDeletionSnapshot;
@@ -12184,7 +12193,14 @@ pub const IndexManager = struct {
             break;
         }
         if (has_deletion_deltas) {
-            var lookup_alloc_stats = PhaseAllocStats{};
+            // The merge output and task state remain live while publication
+            // constructs this lazy identity lookup. Seed the phase with that
+            // live baseline so telemetry reports the real overlapping peak,
+            // not merely the larger of two incorrectly disjoint phases.
+            var lookup_alloc_stats = PhaseAllocStats{
+                .current_bytes = publication_task_live_bytes,
+                .peak_bytes = publication_task_live_bytes,
+            };
             var lookup_tracking = PhaseTrackingAllocator.init(publication_alloc, &lookup_alloc_stats);
             try result.buildPublicationLookup(lookup_tracking.allocator());
             result.peak_task_alloc_bytes = @max(
@@ -26414,6 +26430,21 @@ test "text merge task carries concurrent deletes into publication" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_limit_bytes = 64 * 1024 * 1024,
+        .hard_limit_bytes = 64 * 1024 * 1024,
+    };
+    var policies = resource_manager_mod.Options.defaultPolicies();
+    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_action = .report,
+        .hard_action = .report,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .budgets = budgets,
+        .policies = policies,
+    });
+
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     const path_z = try alloc.dupeZ(u8, path);
@@ -26422,7 +26453,9 @@ test "text merge task carries concurrent deletes into publication" {
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
 
-    var manager = try IndexManager.init(alloc, path);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .resource_manager = &resource_manager,
+    });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });
 
@@ -26517,9 +26550,20 @@ test "text merge task carries concurrent deletes into publication" {
     // the later tombstone into the replacement rather than reject the useful
     // merge and retry forever under sustained mutation.
     try std.testing.expectEqual(frozen_live_docs, merged_docs);
+    // Keep a known task-local allocation live across publication. The peak
+    // must include this existing working set plus the lazy identity lookup,
+    // rather than treating build and publication as disjoint phases.
+    const build_peak = result.peak_task_alloc_bytes;
+    const telemetry_probe_len = std.math.cast(usize, build_peak +| 4096) orelse
+        return error.TestUnexpectedResult;
+    const telemetry_probe = try task.mergeAllocator().alloc(u8, telemetry_probe_len);
+    defer task.mergeAllocator().free(telemetry_probe);
+    const publication_task_live_bytes = task.deletion_state.budget.liveBytes();
+    try std.testing.expect(publication_task_live_bytes > build_peak);
     const applied = try manager.finishTextMergeTask(&task, &result);
     try std.testing.expect(applied);
     try std.testing.expect(result.output_ordinals.len + result.output_ids.len > 0);
+    try std.testing.expect(result.peak_task_alloc_bytes >= publication_task_live_bytes);
     const merge_stats = manager.textMergeStats();
     try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_merges);
     try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_segments);
