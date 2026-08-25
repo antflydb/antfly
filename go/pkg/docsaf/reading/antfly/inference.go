@@ -1,4 +1,4 @@
-package reading
+package antfly
 
 import (
 	"context"
@@ -6,8 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	libai "github.com/antflydb/antfly/go/pkg/libaf/ai"
-	libreading "github.com/antflydb/antfly/go/pkg/libaf/reading"
+	"github.com/antflydb/antfly/go/pkg/docsaf/reading"
 	inferenceclient "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
@@ -22,8 +21,8 @@ type Result struct {
 
 // ModelReader extends reading.Reader with model-aware results.
 type ModelReader interface {
-	libreading.Reader
-	ReadDetailed(ctx context.Context, pages []libai.BinaryContent, opts *libreading.ReadOptions) ([]Result, error)
+	reading.Reader
+	ReadDetailed(ctx context.Context, pages []reading.BinaryContent, opts *reading.ReadOptions) ([]Result, error)
 }
 
 // AntflyConfig configures Antfly-backed reading adapters.
@@ -107,7 +106,7 @@ func newInferenceBase(cfg AntflyConfig) (inferenceBase, error) {
 	}, nil
 }
 
-func (r *AntflyReadReader) Read(ctx context.Context, pages []libai.BinaryContent, opts *libreading.ReadOptions) ([]string, error) {
+func (r *AntflyReadReader) Read(ctx context.Context, pages []reading.BinaryContent, opts *reading.ReadOptions) ([]string, error) {
 	results, err := r.ReadDetailed(ctx, pages, opts)
 	if err != nil {
 		return nil, err
@@ -115,7 +114,7 @@ func (r *AntflyReadReader) Read(ctx context.Context, pages []libai.BinaryContent
 	return resultTexts(results), nil
 }
 
-func (r *AntflyReadReader) ReadDetailed(ctx context.Context, pages []libai.BinaryContent, opts *libreading.ReadOptions) ([]Result, error) {
+func (r *AntflyReadReader) ReadDetailed(ctx context.Context, pages []reading.BinaryContent, opts *reading.ReadOptions) ([]Result, error) {
 	results := make([]Result, len(pages))
 	for i, page := range pages {
 		dataURI, err := r.base.dataURI(page)
@@ -132,7 +131,7 @@ func (r *AntflyReadReader) ReadDetailed(ctx context.Context, pages []libai.Binar
 	return results, nil
 }
 
-func (r *AntflyGenerateReader) Read(ctx context.Context, pages []libai.BinaryContent, opts *libreading.ReadOptions) ([]string, error) {
+func (r *AntflyGenerateReader) Read(ctx context.Context, pages []reading.BinaryContent, opts *reading.ReadOptions) ([]string, error) {
 	results, err := r.ReadDetailed(ctx, pages, opts)
 	if err != nil {
 		return nil, err
@@ -140,7 +139,7 @@ func (r *AntflyGenerateReader) Read(ctx context.Context, pages []libai.BinaryCon
 	return resultTexts(results), nil
 }
 
-func (r *AntflyGenerateReader) ReadDetailed(ctx context.Context, pages []libai.BinaryContent, opts *libreading.ReadOptions) ([]Result, error) {
+func (r *AntflyGenerateReader) ReadDetailed(ctx context.Context, pages []reading.BinaryContent, opts *reading.ReadOptions) ([]Result, error) {
 	results := make([]Result, len(pages))
 	for i, page := range pages {
 		dataURI, err := r.base.dataURI(page)
@@ -173,7 +172,7 @@ func resultTexts(results []Result) []string {
 	return texts
 }
 
-func (b inferenceBase) dataURI(page libai.BinaryContent) (string, error) {
+func (b inferenceBase) dataURI(page reading.BinaryContent) (string, error) {
 	content := page
 	switch strings.TrimSpace(page.MIMEType) {
 	case "application/pdf":
@@ -191,7 +190,7 @@ func (b inferenceBase) dataURI(page libai.BinaryContent) (string, error) {
 	return EncodeDataURI(content)
 }
 
-func (b inferenceBase) readSingle(ctx context.Context, dataURI string, opts *libreading.ReadOptions) (Result, error) {
+func (b inferenceBase) readSingle(ctx context.Context, dataURI string, opts *reading.ReadOptions) (Result, error) {
 	prompt, maxTokens := resolveReadOptions(opts, b.defaultMaxTokens)
 	var lastErr error
 
@@ -239,7 +238,7 @@ func (b inferenceBase) readSingle(ctx context.Context, dataURI string, opts *lib
 	return Result{}, nil
 }
 
-func (b inferenceBase) generateSingle(ctx context.Context, dataURI string, opts *libreading.ReadOptions) (Result, error) {
+func (b inferenceBase) generateSingle(ctx context.Context, dataURI string, opts *reading.ReadOptions) (Result, error) {
 	prompt, maxTokens := resolveReadOptions(opts, b.defaultMaxTokens)
 	message, err := inferenceclient.NewMultimodalUserMessage(prompt, dataURI)
 	if err != nil {
@@ -272,7 +271,7 @@ func (b inferenceBase) generateSingle(ctx context.Context, dataURI string, opts 
 	return Result{}, nil
 }
 
-func resolveReadOptions(opts *libreading.ReadOptions, defaultMaxTokens int) (string, int) {
+func resolveReadOptions(opts *reading.ReadOptions, defaultMaxTokens int) (string, int) {
 	if opts == nil {
 		return "", defaultMaxTokens
 	}

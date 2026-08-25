@@ -31,9 +31,8 @@ import (
 
 	"github.com/ajroetker/pdf"
 	"github.com/antflydb/antfly/go/pkg/docsaf"
-	generatingreading "github.com/antflydb/antfly/go/pkg/generating/reading"
-	libai "github.com/antflydb/antfly/go/pkg/libaf/ai"
-	libreading "github.com/antflydb/antfly/go/pkg/libaf/reading"
+	"github.com/antflydb/antfly/go/pkg/docsaf/reading"
+	antflyreading "github.com/antflydb/antfly/go/pkg/docsaf/reading/antfly"
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
 	inferenceoapi "github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
@@ -69,27 +68,27 @@ type OCRConfig struct {
 
 // OCRClient wraps the Inference client for OCR operations.
 type OCRClient struct {
-	readReader    *generatingreading.AntflyReadReader
-	visionReader  *generatingreading.AntflyGenerateReader
+	readReader    *antflyreading.AntflyReadReader
+	visionReader  *antflyreading.AntflyGenerateReader
 	renderDPI     float64
 	lastUsedModel string
 }
 
 // NewOCRClient creates a new OCR client connected to Inference.
 func NewOCRClient(inferenceURL string, models []string, renderDPI float64) (*OCRClient, error) {
-	cfg := generatingreading.AntflyConfig{
+	cfg := antflyreading.AntflyConfig{
 		BaseURL:          inferenceURL,
 		Models:           models,
 		DefaultMaxTokens: 2048,
 		RenderDPI:        renderDPI,
 	}
 
-	readReader, err := generatingreading.NewAntflyReadReader(cfg)
+	readReader, err := antflyreading.NewAntflyReadReader(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create inference read reader: %w", err)
 	}
 
-	visionReader, err := generatingreading.NewAntflyGenerateReader(cfg)
+	visionReader, err := antflyreading.NewAntflyGenerateReader(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create inference generate reader: %w", err)
 	}
@@ -109,12 +108,12 @@ func (o *OCRClient) ProcessPage(ctx context.Context, pdfData []byte, pageNum int
 		return extractedText, false, nil
 	}
 
-	page, err := generatingreading.RenderPDFPage(pdfData, pageNum, o.renderDPI)
+	page, err := antflyreading.RenderPDFPage(pdfData, pageNum, o.renderDPI)
 	if err != nil {
 		return extractedText, false, fmt.Errorf("render page: %w", err)
 	}
 
-	results, err := o.readReader.ReadDetailed(ctx, []libai.BinaryContent{page}, &libreading.ReadOptions{
+	results, err := o.readReader.ReadDetailed(ctx, []reading.BinaryContent{page}, &reading.ReadOptions{
 		MaxTokens: 2048,
 	})
 	if err != nil {
@@ -142,12 +141,12 @@ func (o *OCRClient) LastUsedModel() string {
 // Returns (text, model_used, error). The page PDF is expected to be a single-page document
 // (as produced by split-pages mode).
 func (o *OCRClient) ReadPageWithPrompt(ctx context.Context, pdfData []byte, prompt string, maxTokens int) (string, string, error) {
-	page, err := generatingreading.RenderPDFPage(pdfData, 1, o.renderDPI)
+	page, err := antflyreading.RenderPDFPage(pdfData, 1, o.renderDPI)
 	if err != nil {
 		return "", "", fmt.Errorf("create renderer: %w", err)
 	}
 
-	results, err := o.readReader.ReadDetailed(ctx, []libai.BinaryContent{page}, &libreading.ReadOptions{
+	results, err := o.readReader.ReadDetailed(ctx, []reading.BinaryContent{page}, &reading.ReadOptions{
 		Prompt:    prompt,
 		MaxTokens: maxTokens,
 	})
@@ -165,11 +164,11 @@ func (o *OCRClient) ReadPageWithPrompt(ctx context.Context, pdfData []byte, prom
 // endpoint (e.g. Gemma 3 vision) instead of the reader endpoint. Used for vision captioning
 // of image pages. Returns (text, model_used, error).
 func (o *OCRClient) GeneratePageWithPrompt(ctx context.Context, pdfData []byte, prompt string, maxTokens int) (string, string, error) {
-	page, err := generatingreading.RenderPDFPage(pdfData, 1, o.renderDPI)
+	page, err := antflyreading.RenderPDFPage(pdfData, 1, o.renderDPI)
 	if err != nil {
 		return "", "", fmt.Errorf("create renderer: %w", err)
 	}
-	results, err := o.visionReader.ReadDetailed(ctx, []libai.BinaryContent{page}, &libreading.ReadOptions{
+	results, err := o.visionReader.ReadDetailed(ctx, []reading.BinaryContent{page}, &reading.ReadOptions{
 		Prompt:    prompt,
 		MaxTokens: maxTokens,
 	})

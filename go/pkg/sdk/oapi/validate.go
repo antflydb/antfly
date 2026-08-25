@@ -16,9 +16,9 @@ limitations under the License.
 package oapi
 
 import (
+	"encoding/json"
 	"fmt"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/kaptinlin/jsonschema"
 )
 
@@ -72,7 +72,7 @@ func (d *DocumentSchema) Validate(document any) (*ValidationResult, error) {
 		return &ValidationResult{Valid: true}, nil
 	}
 
-	// Create a new compiler with sonic JSON encoder/decoder for consistency
+	// Use the standard JSON encoder and decoder consistently with the SDK.
 	compiler := jsonschema.NewCompiler()
 	compiler.WithDecoderJSON(json.Unmarshal)
 	compiler.WithEncoderJSON(json.Marshal)

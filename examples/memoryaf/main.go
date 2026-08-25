@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/antflydb/antfly/go/pkg/docsaf"
-	"github.com/antflydb/antfly/go/pkg/libaf/s3"
 	"github.com/antflydb/antfly/go/pkg/memoryaf"
 	client "github.com/antflydb/antfly/go/pkg/sdk"
 	"github.com/fsnotify/fsnotify"
@@ -414,12 +413,12 @@ func buildSource(ctx context.Context, cfg config) (sourceHandle, error) {
 		}, nil
 	case "s3":
 		source, err := docsaf.NewS3Source(docsaf.S3SourceConfig{
-			Credentials: s3.Credentials{
-				AccessKeyId:     cfg.s3AccessKeyID,
+			Credentials: docsaf.S3Credentials{
+				AccessKeyID:     cfg.s3AccessKeyID,
 				SecretAccessKey: cfg.s3SecretKey,
 				SessionToken:    cfg.s3SessionToken,
 				Endpoint:        cfg.s3Endpoint,
-				UseSsl:          cfg.s3UseSSL,
+				UseSSL:          cfg.s3UseSSL,
 			},
 			Bucket:          cfg.s3Bucket,
 			Prefix:          cfg.s3Prefix,

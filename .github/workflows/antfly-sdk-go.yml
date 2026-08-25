@@ -8,8 +8,6 @@ on:
     branches: ["main"]
     paths:
       - "go/pkg/sdk/**"
-      - "go/pkg/generating/**"
-      - "go/pkg/libaf/**"
       - "specs/openapi/**"
       - "scripts/join_public_openapi.py"
       - "scripts/pyproject.toml"
@@ -21,8 +19,6 @@ on:
     branches: ["main"]
     paths:
       - "go/pkg/sdk/**"
-      - "go/pkg/generating/**"
-      - "go/pkg/libaf/**"
       - "specs/openapi/**"
       - "scripts/join_public_openapi.py"
       - "scripts/pyproject.toml"
@@ -57,8 +53,6 @@ jobs:
           cache: true
           cache-dependency-path: |
             go/pkg/sdk/go.sum
-            go/pkg/generating/go.sum
-            go/pkg/libaf/go.sum
 
       - name: Install race detector toolchain
         shell: bash
@@ -82,6 +76,7 @@ jobs:
           (cd go/pkg/sdk && GOWORK=off go generate ./...)
           status="$(git status --porcelain -- \
             openapi.yaml \
+            go/pkg/sdk/chunking/openapi.gen.go \
             go/pkg/sdk/oapi/client.gen.go \
             go/pkg/sdk/admin/oapi/client.gen.go \
             go/pkg/sdk/oapi/validate.go \
@@ -90,6 +85,7 @@ jobs:
             echo "$status"
             git diff -- \
               openapi.yaml \
+              go/pkg/sdk/chunking/openapi.gen.go \
               go/pkg/sdk/oapi/client.gen.go \
               go/pkg/sdk/admin/oapi/client.gen.go \
               go/pkg/sdk/oapi/validate.go \
