@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 )
@@ -303,6 +304,44 @@ func TestDedicatedLeaseRenewalAdvancesOnlyExactCommittedHandoff(t *testing.T) {
 				t.Fatalf("dedicated handoff renewal mutated authority: %#v", observed)
 			}
 		})
+	}
+}
+
+func TestLeaseRenewalControllerKeepsCommittedHandoffWhenProofEndpointIsUnavailable(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	cluster.Spec.HighAvailability.Admin.PrimaryURL = "://invalid-proof-url"
+	cluster.Spec.HighAvailability.Admin.PrimaryActionURL = "://invalid-proof-url"
+	lease := haFenceLease(cluster, now.Add(-time.Second), 30, 2, "standby-a")
+	lease.Annotations[haFencingLeaseAnnotationTransferCommitted] = "true"
+	lease.Annotations[haFencingLeaseAnnotationFormerHolder] = "primary-a"
+	lease.Annotations[haFencingLeaseAnnotationTransferOriginUID] = string(cluster.UID)
+	lease.Annotations[haFencingLeaseAnnotationCommittedTransition] = "2"
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
+	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] =
+		haFencingLeaseBootstrapReceipt("standby-a", 2, strings.Repeat("b", 64))
+	parent := testHAReconciler(t, cluster, lease)
+	parent.Now = func() time.Time { return now }
+	reconciler := &haLeaseRenewalReconciler{parent: parent}
+
+	result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
+	})
+	if err != nil {
+		t.Fatalf("periodic committed-handoff renewal: %v", err)
+	}
+	if result.RequeueAfter != haLeaseRenewalInterval {
+		t.Fatalf("requeueAfter = %s, want %s", result.RequeueAfter, haLeaseRenewalInterval)
+	}
+	observed := getOwnershipTestLease(t, parent)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(now) {
+		t.Fatalf("proof outage prevented exact handoff renewal: %#v", observed)
+	}
+	if observed.Spec.HolderIdentity == nil || *observed.Spec.HolderIdentity != "standby-a" ||
+		observed.Spec.LeaseTransitions == nil || *observed.Spec.LeaseTransitions != 2 ||
+		observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "true" {
+		t.Fatalf("periodic handoff renewal mutated authority: %#v", observed)
 	}
 }
 

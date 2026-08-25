@@ -80,10 +80,13 @@ func (r *haLeaseRenewalReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	proofCtx, cancel := context.WithTimeout(ctx, haLeaseProofTimeout)
 	defer cancel()
-	if err := r.parent.observeHACurrentPrimaryWatchdogProof(proofCtx, cluster); err == nil {
-		if err := r.parent.renewCurrentHAFencingLease(proofCtx, cluster); err != nil && !apierrors.IsConflict(err) {
-			return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, err
-		}
+	// Ordinary holder renewal independently rejects a missing or stale proof.
+	// Always run the narrow Lease path so an exact committed former-controller
+	// handoff can advance renewTime while the successor proof endpoint is
+	// intentionally transient during receipt binding.
+	_ = r.parent.observeHACurrentPrimaryWatchdogProof(proofCtx, cluster)
+	if err := r.parent.renewCurrentHAFencingLease(proofCtx, cluster); err != nil && !apierrors.IsConflict(err) {
+		return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, err
 	}
 	return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, nil
 }
