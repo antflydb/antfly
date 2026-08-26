@@ -420,7 +420,7 @@ pub const GraphQueryEngine = struct {
             defer traversal_mod.freeOwnedResults(self.alloc, trav_results);
 
             for (trav_results) |tr| {
-                var result_node = try traversalResultNodeAlloc(self.alloc, tr);
+                var result_node = try traversalResultNodeAlloc(self.alloc, tr, self.work_budget);
                 errdefer result_node.deinit(self.alloc);
                 try all_results.append(self.alloc, result_node);
 
@@ -552,7 +552,11 @@ pub const GraphQueryEngine = struct {
                 const path = try paths_mod.findShortestPath(self.alloc, graph_index, sk, tk, opts);
                 if (path) |p| {
                     defer paths_mod.freePath(self.alloc, p);
-                    try all_results.append(self.alloc, try pathToResultNode(self.alloc, &p));
+                    var node = try pathToResultNodeRetained(self.alloc, &p, self.work_budget);
+                    var node_owned = true;
+                    errdefer if (node_owned) node.deinit(self.alloc);
+                    try all_results.append(self.alloc, node);
+                    node_owned = false;
                 }
             }
         }
@@ -669,7 +673,11 @@ pub const GraphQueryEngine = struct {
                 defer paths_mod.freePaths(self.alloc, found);
 
                 for (found) |p| {
-                    try all_results.append(self.alloc, try pathToResultNode(self.alloc, &p));
+                    var node = try pathToResultNodeRetained(self.alloc, &p, self.work_budget);
+                    var node_owned = true;
+                    errdefer if (node_owned) node.deinit(self.alloc);
+                    try all_results.append(self.alloc, node);
+                    node_owned = false;
                 }
             }
         }
@@ -843,7 +851,13 @@ pub fn collectUniqueNodesFromMatches(
 fn traversalResultNodeAlloc(
     alloc: Allocator,
     result: traversal_mod.TraversalResult,
+    work_budget: ?*work_budget_mod.WorkBudget,
 ) !GraphResultNode {
+    if (work_budget) |budget| {
+        const retained_bytes = traversalGraphResultNodeOwnedBytes(result) catch
+            return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+        try budget.retainStateBytes(retained_bytes);
+    }
     const key = try alloc.dupe(u8, result.key);
     errdefer alloc.free(key);
     const table = if (result.target_table) |value| try alloc.dupe(u8, value) else null;
@@ -865,6 +879,18 @@ fn traversalResultNodeAlloc(
         .path_tables = path_tables,
         .path_edges = null,
     };
+}
+
+fn traversalGraphResultNodeOwnedBytes(result: traversal_mod.TraversalResult) !usize {
+    var total = try std.math.add(usize, @sizeOf(GraphResultNode), result.key.len);
+    if (result.target_table) |table| total = try std.math.add(usize, total, table.len);
+    if (result.path) |items| {
+        total = try std.math.add(usize, total, try std.math.mul(usize, items.len, @sizeOf([]const u8)));
+        for (items) |item| total = try std.math.add(usize, total, item.len);
+        total = try std.math.add(usize, total, try std.math.mul(usize, items.len, @sizeOf(?[]const u8)));
+        if (result.target_table) |table| total = try std.math.add(usize, total, table.len);
+    }
+    return total;
 }
 
 fn clonePathNodesAlloc(alloc: Allocator, source: []const []const u8) ![]const []const u8 {
@@ -1102,6 +1128,19 @@ fn resolveTargetKeys(gq: GraphQuery) []const []const u8 {
 }
 
 pub fn pathToResultNode(alloc: Allocator, path: *const paths_mod.Path) !GraphResultNode {
+    return pathToResultNodeRetained(alloc, path, null);
+}
+
+fn pathToResultNodeRetained(
+    alloc: Allocator,
+    path: *const paths_mod.Path,
+    work_budget: ?*work_budget_mod.WorkBudget,
+) !GraphResultNode {
+    if (work_budget) |budget| {
+        const retained_bytes = pathGraphResultNodeOwnedBytes(path) catch
+            return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+        try budget.retainStateBytes(retained_bytes);
+    }
     // Target is last node
     const target_key = if (path.nodes.len > 0) path.nodes[path.nodes.len - 1] else "";
 
@@ -1140,6 +1179,7 @@ pub fn pathToResultNode(alloc: Allocator, path: *const paths_mod.Path) !GraphRes
     }
 
     const key = try alloc.dupe(u8, target_key);
+    errdefer alloc.free(key);
     return .{
         .key = key,
         .depth = path.length,
@@ -1148,6 +1188,25 @@ pub fn pathToResultNode(alloc: Allocator, path: *const paths_mod.Path) !GraphRes
         .path_tables = path_tables,
         .path_edges = path_edges,
     };
+}
+
+fn pathGraphResultNodeOwnedBytes(path: *const paths_mod.Path) !usize {
+    const target_key = if (path.nodes.len > 0) path.nodes[path.nodes.len - 1] else "";
+    var total = try std.math.add(usize, @sizeOf(GraphResultNode), target_key.len);
+    total = try std.math.add(usize, total, try std.math.mul(usize, path.nodes.len, @sizeOf([]const u8)));
+    for (path.nodes) |node| total = try std.math.add(usize, total, node.len);
+    if (path.node_tables.len > 0) {
+        total = try std.math.add(usize, total, try std.math.mul(usize, path.node_tables.len, @sizeOf(?[]const u8)));
+        for (path.node_tables) |table| if (table) |value| {
+            total = try std.math.add(usize, total, value.len);
+        };
+    }
+    total = try std.math.add(usize, total, try std.math.mul(usize, path.edges.len, @sizeOf(PathEdgeInfo)));
+    for (path.edges) |edge| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.metadata }) |part|
+            total = try std.math.add(usize, total, part.len);
+    }
+    return total;
 }
 
 fn pathTablesFromTerminalAlloc(
@@ -1393,22 +1452,8 @@ fn freePathEdgeItems(alloc: Allocator, edges: []const PathEdgeInfo, initialized:
 }
 
 fn freeResultNode(alloc: Allocator, node: GraphResultNode) void {
-    alloc.free(node.key);
-    if (node.table) |t| alloc.free(t);
-    if (node.path) |p| {
-        for (p) |s| alloc.free(s);
-        alloc.free(p);
-    }
-    if (node.path_edges) |pe| {
-        for (pe) |e| {
-            alloc.free(e.source);
-            alloc.free(e.target);
-            alloc.free(e.edge_type);
-            if (e.metadata.len > 0) alloc.free(e.metadata);
-        }
-        alloc.free(pe);
-    }
-    if (node.provenance) |items| freeProvenanceLabels(alloc, items);
+    var owned = node;
+    owned.deinit(alloc);
 }
 
 fn freeProvenanceLabels(alloc: Allocator, labels: []const []const u8) void {
