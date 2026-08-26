@@ -1048,8 +1048,7 @@ pub const Cache = struct {
 
     fn reclaimForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
         const self: *Cache = @ptrCast(@alignCast(context));
-        if (target_bytes == 0) return 0;
-        self.mutex.lockExclusive();
+        if (target_bytes == 0 or !self.mutex.tryLockExclusive()) return 0;
         defer self.mutex.unlockExclusive();
         const before = self.physical_accounting.current();
         while (before -| self.physical_accounting.current() < target_bytes) {
@@ -3676,8 +3675,7 @@ pub const HBCIndex = struct {
 
     fn reclaimLocalForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
         const self: *HBCIndex = @ptrCast(@alignCast(context));
-        if (target_bytes == 0 or self.shared_cache != null) return 0;
-        self.cache_mu.lockExclusive();
+        if (target_bytes == 0 or self.shared_cache != null or !self.cache_mu.tryLockExclusive()) return 0;
         defer self.cache_mu.unlockExclusive();
         const before = self.hbcCacheBytes() +| self.detached_hbc_accounting.current();
         while (before -| (self.hbcCacheBytes() +| self.detached_hbc_accounting.current()) < target_bytes) {
@@ -3725,9 +3723,12 @@ pub const HBCIndex = struct {
 
     fn reclaimFlatCentroidDirectoryForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
         const self: *HBCIndex = @ptrCast(@alignCast(context));
-        if (target_bytes == 0) return 0;
+        if (target_bytes == 0 or !self.flat_centroid_mu.tryLock()) return 0;
         const before = self.flatCentroidDirectoryAccountedBytes();
-        vectorindex_spfresh_index.clearFlatCentroidDirectory(self);
+        const stale = self.flat_centroid_directory;
+        self.flat_centroid_directory = null;
+        self.flat_centroid_mu.unlock();
+        if (stale) |directory| directory.release(self.alloc);
         return before -| self.flatCentroidDirectoryAccountedBytes();
     }
 
