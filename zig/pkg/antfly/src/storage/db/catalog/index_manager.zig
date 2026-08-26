@@ -7823,6 +7823,10 @@ pub const IndexManager = struct {
         return null;
     }
 
+    fn textEntryHasExplicitArtifactSources(entry: *const TextIndex) bool {
+        return entry.chunk_name != null or entry.source_artifact_names.len > 0;
+    }
+
     pub fn textIndexIsChunkBacked(self: *const IndexManager, alloc: Allocator, name: ?[]const u8) !bool {
         const entry = if (name) |index_name| blk: {
             for (self.text_indexes.items) |*text_entry| {
@@ -7834,7 +7838,7 @@ pub const IndexManager = struct {
         else
             null;
         const resolved = entry orelse return false;
-        if (resolved.chunk_name != null or resolved.source_artifact_names.len > 0) return true;
+        if (textEntryHasExplicitArtifactSources(resolved)) return true;
 
         for (self.enrichments.items) |cfg| {
             if (cfg.kind == .asset and cfg.full_text_index) return true;
@@ -9066,7 +9070,7 @@ pub const IndexManager = struct {
             .alloc = alloc,
             .instance_id = entry.instance_id,
             .projection_revision = entry.projection_revision,
-            .chunk_backed = entry.chunk_name != null,
+            .chunk_backed = textEntryHasExplicitArtifactSources(entry),
         };
     }
 
@@ -9100,7 +9104,7 @@ pub const IndexManager = struct {
         defer entry.unlockAnalysisShared();
         if (entry.projection_revision == context.projection_revision) return .current;
         context.projection_revision = entry.projection_revision;
-        context.chunk_backed = entry.chunk_name != null;
+        context.chunk_backed = textEntryHasExplicitArtifactSources(entry);
         return .projection_changed;
     }
 

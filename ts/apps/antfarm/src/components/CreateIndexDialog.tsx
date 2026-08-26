@@ -84,11 +84,47 @@ export function parseAdvancedIndexConfig(source: string): IndexConfig {
   if (config.type !== "embeddings" && config.type !== "full_text" && config.type !== "graph") {
     throw new Error('Index configuration type must be "embeddings", "full_text", or "graph".');
   }
-  if (
-    Array.isArray(config.sources) &&
-    (config.sources.length === 0 || config.sources.length > 64)
-  ) {
-    throw new Error("Index sources must contain between 1 and 64 items.");
+  if (config.sources !== undefined) {
+    if (!Array.isArray(config.sources)) {
+      throw new Error("Index sources must be an array.");
+    }
+    if (config.sources.length === 0 || config.sources.length > 64) {
+      throw new Error("Index sources must contain between 1 and 64 items.");
+    }
+    if (config.type === "graph") {
+      graphIndexSources(...(config.sources as Parameters<typeof graphIndexSources>));
+    } else {
+      const seen = new Set<string>();
+      config.sources.forEach((source, index) => {
+        if (!source || typeof source !== "object" || Array.isArray(source)) {
+          throw new Error(`Index sources[${index}] must be an object.`);
+        }
+        const keys = Object.keys(source);
+        if (keys.some((key) => key !== "artifact")) {
+          throw new Error(`Index sources[${index}] only supports artifact.`);
+        }
+        const artifact = (source as Record<string, unknown>).artifact;
+        if (typeof artifact !== "string" || !artifact.trim()) {
+          throw new Error(`Index sources[${index}].artifact must be a non-empty string.`);
+        }
+        if (seen.has(artifact)) {
+          throw new Error(`Index sources contains duplicate artifact ${JSON.stringify(artifact)}.`);
+        }
+        seen.add(artifact);
+      });
+    }
+  }
+  const mutuallyExclusiveWithSources =
+    config.type === "full_text"
+      ? ["artifact_name"]
+      : config.type === "graph"
+        ? ["source"]
+        : ["external", "field", "template", "chunker", "embedding_name", "source_artifact_name"];
+  if (config.sources !== undefined) {
+    const conflict = mutuallyExclusiveWithSources.find((field) => config[field] !== undefined);
+    if (conflict) {
+      throw new Error(`Index sources cannot be combined with ${conflict}.`);
+    }
   }
   return value as IndexConfig;
 }
@@ -685,9 +721,29 @@ const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) =
                 />
               </div>
               {graphSources.fields.length > 1 && (
-                <Button type="button" variant="ghost" onClick={() => graphSources.remove(index)}>
-                  Remove source
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={index === 0}
+                    aria-label={`Move graph source ${index + 1} earlier`}
+                    onClick={() => graphSources.move(index, index - 1)}
+                  >
+                    Move earlier
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={index === graphSources.fields.length - 1}
+                    aria-label={`Move graph source ${index + 1} later`}
+                    onClick={() => graphSources.move(index, index + 1)}
+                  >
+                    Move later
+                  </Button>
+                  <Button type="button" variant="ghost" onClick={() => graphSources.remove(index)}>
+                    Remove source
+                  </Button>
+                </div>
               )}
             </div>
           ))}
@@ -1050,7 +1106,8 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
                 </p>
               ) : (
                 <p className="text-xs text-muted-foreground">
-                  Validated advanced mode. All supported index options are accepted.
+                  JSON syntax and source structure are valid. The server validates all advanced
+                  options when you create the index.
                 </p>
               )}
             </div>

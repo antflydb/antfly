@@ -65373,6 +65373,42 @@ test "db index inspection lists graph indexes" {
     try std.testing.expectEqual(types.IndexKind.graph, indexes[0].kind);
 }
 
+test "db preflight classifies canonical artifact full-text sources consistently" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 64,
+    });
+    try db.addIndex(.{
+        .name = "artifact_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"}]}",
+    });
+
+    var summary = try db.preflightSearchRequest(alloc, .{
+        .index_name = "artifact_text",
+        .full_text = .{ .match_all = {} },
+    }, 0);
+    defer summary.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), summary.text_indexes.len);
+    try std.testing.expect(summary.text_indexes[0].chunk_backed);
+    try std.testing.expect(summary.text_indexes[0].group_chunk_parents);
+
+    var publication = try db.core.index_manager.acquireTextPublicationContext(alloc, "artifact_text");
+    defer publication.deinit();
+    try std.testing.expect(publication.chunk_backed);
+}
+
 test "db preflightSearchRequest validates live lane bindings" {
     const alloc = std.testing.allocator;
 

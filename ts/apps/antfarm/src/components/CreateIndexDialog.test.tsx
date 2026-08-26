@@ -95,6 +95,39 @@ describe("CreateIndexDialog", () => {
         JSON.stringify({ name: "too_many", type: "graph", sources: Array(65).fill({}) })
       )
     ).toThrow("between 1 and 64");
+    expect(() =>
+      parseAdvancedIndexConfig(
+        JSON.stringify({ name: "not_an_array", type: "full_text", sources: "chunks_v1" })
+      )
+    ).toThrow("must be an array");
+    expect(() =>
+      parseAdvancedIndexConfig(
+        JSON.stringify({
+          name: "duplicate_sources",
+          type: "embeddings",
+          sources: [{ artifact: "dense_v1" }, { artifact: "dense_v1" }],
+        })
+      )
+    ).toThrow("duplicate artifact");
+    expect(() =>
+      parseAdvancedIndexConfig(
+        JSON.stringify({
+          name: "ambiguous_sources",
+          type: "embeddings",
+          sources: [{ artifact: "dense_v1" }],
+          field: "body",
+        })
+      )
+    ).toThrow("cannot be combined with field");
+    expect(() =>
+      parseAdvancedIndexConfig(
+        JSON.stringify({
+          name: "invalid_graph_source",
+          type: "graph",
+          sources: [{ artifact: "relations_v1", path: "relations[*]" }],
+        })
+      )
+    ).toThrow("path must be");
   });
 
   it("preserves an external graph node model without custom templates", () => {
@@ -187,5 +220,36 @@ describe("CreateIndexDialog", () => {
     confirm.mockReturnValue(true);
     fireEvent.click(modeSwitch);
     expect(screen.getByTestId("index-form")).toBeTruthy();
+  });
+
+  it("lets operators reorder graph sources to control precedence", () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      }
+    );
+    render(
+      <CreateIndexDialog
+        open
+        onClose={() => undefined}
+        tableName="docs"
+        onIndexCreated={() => undefined}
+        schema={null}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("radio", { name: "Graph" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add graph source" }));
+    const artifacts = screen.getAllByPlaceholderText("relations_v1");
+    fireEvent.change(artifacts[0], { target: { value: "primary_relations" } });
+    fireEvent.change(artifacts[1], { target: { value: "fallback_relations" } });
+    fireEvent.click(screen.getByRole("button", { name: "Move graph source 2 earlier" }));
+
+    expect(
+      screen.getAllByPlaceholderText("relations_v1").map((input) => input.getAttribute("value"))
+    ).toEqual(["fallback_relations", "primary_relations"]);
   });
 });
