@@ -20854,10 +20854,16 @@ pub const DB = struct {
             item.index_repair_phase,
             item.index_repair_wait_reason,
         );
-        // Keep status available when the optional bounded proof cannot be
+        // Keep status available when either optional bounded proof cannot be
         // read; query admission independently retries it and remains closed.
-        item.index_repair_active_generation_serviceable =
-            self.managedAdmissionGenerationIsQueryable(alloc, intent) catch false;
+        // A complete active generation makes managed-admission repair debt
+        // redundant even before its scheduler quantum removes the intent.
+        // Preserve degradation for merely queryable progressive generations:
+        // their physical artifact count can still be advancing.
+        const active_generation_complete =
+            self.managedAdmissionGenerationIsServiceable(alloc, intent) catch false;
+        item.index_repair_active_generation_serviceable = active_generation_complete or
+            (self.managedAdmissionGenerationIsQueryable(alloc, intent) catch false);
         switch (intent.trigger) {
             .incomplete_bulk_publish,
             .root_generation_rebuild,
@@ -20881,6 +20887,7 @@ pub const DB = struct {
                     intent.phase == .terminal;
             },
         }
+        if (active_generation_complete) item.repair_degraded = false;
     }
 
     fn durableGenerationBuildActive(item: *const types.DBIndexStats) bool {
@@ -21391,7 +21398,10 @@ pub const DB = struct {
         return enrichment_status;
     }
 
-    fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
+    /// Refresh lock-free worker diagnostics on a retained status snapshot.
+    /// Callers that only need runtime lifecycle facts can use this without
+    /// contending on the index apply lock or replacing durable coverage data.
+    pub fn overlayRuntimeStatusRuntimeBestEffort(self: *DB, runtime_stats: *types.DBStats) void {
         runtime_stats.async_indexing = self.snapshotAsyncIndexingStats();
         runtime_stats.enrichment = self.enrichmentStatsWithSupervisorState(runtime_stats.enrichment);
         runtime_stats.resolution = self.resolutionStageStats();
@@ -21610,12 +21620,12 @@ pub const DB = struct {
     }
 
     pub fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) void {
-        self.overlayRuntimeStatusRuntimeOnly(runtime_stats);
+        self.overlayRuntimeStatusRuntimeBestEffort(runtime_stats);
         self.overlayRuntimeStatusIndexesAssumeApplyLockHeld(stats_alloc, runtime_stats);
     }
 
     pub fn overlayRuntimeStatusConsistent(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) !void {
-        self.overlayRuntimeStatusRuntimeOnly(runtime_stats);
+        self.overlayRuntimeStatusRuntimeBestEffort(runtime_stats);
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         try self.overlayRuntimeStatusIndexesLocked(stats_alloc, runtime_stats);
@@ -46643,6 +46653,27 @@ test "db enrichment status does not wait for lifecycle mutation" {
     try std.testing.expectEqual(@as(u64, 37), status.applied_sequence);
     try std.testing.expect(status.retrying);
     try std.testing.expect(!status.worker_failed);
+}
+
+test "db runtime-only status overlay preserves a resident enrichment worker" {
+    const alloc = std.testing.allocator;
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+
+    // Model a durable/query-only recovery snapshot. A resident writer overlay
+    // must replace its absent producer diagnostics immediately rather than
+    // waiting for the periodic full status refresh.
+    var recovered: types.DBStats = .{};
+    db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
+    try std.testing.expect(recovered.enrichment.enabled);
+    try std.testing.expect(recovered.enrichment.worker_started);
 }
 
 test "db ttl cleanup enabled requires backend runtime io" {
@@ -74097,6 +74128,15 @@ test "db progressive managed admission serves a checkpointed partial generation"
     });
     try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     try std.testing.expect(!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
+    const partial_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, partial_stats);
+    var saw_partial_repair_degraded = false;
+    for (partial_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
+        saw_partial_repair_degraded = index_stats.repair_degraded;
+    }
+    try std.testing.expect(saw_partial_repair_degraded);
     try db.failIfIndexQuarantined(cfg.name);
 
     var partial = try db.search(alloc, .{
@@ -74264,11 +74304,14 @@ test "db completed partial managed admission serves and retires redundant repair
     const runtime_stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, runtime_stats);
     var saw_serviceable_generation = false;
+    var saw_redundant_repair_degraded = true;
     for (runtime_stats.indexes) |index_stats| {
         if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
         saw_serviceable_generation = index_stats.index_repair_active_generation_serviceable;
+        saw_redundant_repair_degraded = index_stats.repair_degraded;
     }
     try std.testing.expect(saw_serviceable_generation);
+    try std.testing.expect(!saw_redundant_repair_degraded);
 
     // Query admission may prove the pinned active generation independently of
     // the background scheduler, while the next scheduler quantum durably
