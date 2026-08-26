@@ -192,6 +192,7 @@ var test_before_restore_work_hook: ?TestExecutionHook = null;
 var test_before_restore_repair_retry_sleep_hook: ?TestExecutionHook = null;
 var test_before_restore_repair_step_hook: ?TestRestoreRepairStepHook = null;
 var test_before_runtime_status_publish_hook: ?TestExecutionHook = null;
+var test_after_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_before_post_create_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_writer_open_persistent_descriptor_failures_remaining: std.atomic.Value(u32) = .init(0);
@@ -310,6 +311,12 @@ fn runTestBeforeRestoreRepairStepHook() !void {
 fn runTestBeforeRuntimeStatusPublishHook() void {
     if (comptime builtin.is_test) {
         if (test_before_runtime_status_publish_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestAfterRuntimeStatusPublishHook() void {
+    if (comptime builtin.is_test) {
+        if (test_after_runtime_status_publish_hook) |hook| hook.run(hook.ptr);
     }
 }
 
@@ -5499,6 +5506,10 @@ pub const ProvisionedTableWriteSource = struct {
     quiesced: bool = false,
     startup_catch_up_backoffs: std.AutoHashMapUnmanaged(u64, StartupCatchUpBackoff) = .empty,
     active_table_activities: std.ArrayListUnmanaged(TableActivity) = .empty,
+    // Protected by table_activity_mutex. Repair handoff publications capture
+    // this node-local generation before observing status and may retire only
+    // that exact edge, including across activity-entry prune/recreate (ABA).
+    next_repair_handoff_generation: u64 = 1,
 
     const TableActivity = struct {
         // Owned by active_table_activities; entries must be created via activityEntryLocked.
@@ -5545,6 +5556,7 @@ pub const ProvisionedTableWriteSource = struct {
         // repaired generation publishes its final visibility boundary.
         repair_handoff_status_pending: usize = 0,
         repair_handoff_clear_observed: bool = false,
+        repair_handoff_generation: u64 = 0,
         // Managed index creation can synchronously append durable replay work
         // while leaving its execution to the resident asynchronous owner. Keep
         // status fail-closed across that handoff until the owner publishes a
@@ -6542,6 +6554,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (group_entry.repair_handoff_status_pending == 0) {
             group_entry.repair_handoff_status_pending = 1;
             group_entry.repair_handoff_clear_observed = false;
+            group_entry.repair_handoff_generation = self.nextRepairHandoffGenerationLocked();
         }
     }
 
@@ -6616,6 +6629,7 @@ pub const ProvisionedTableWriteSource = struct {
             const group_id = entry.group_id;
             entry.repair_handoff_status_pending = 0;
             entry.repair_handoff_clear_observed = false;
+            entry.repair_handoff_generation = 0;
             for (entry.publication_handoffs.items) |*handoff| handoff.deinit();
             entry.publication_handoffs.deinit(std.heap.page_allocator);
             entry.publication_handoffs = .empty;
@@ -6693,43 +6707,86 @@ pub const ProvisionedTableWriteSource = struct {
         return true;
     }
 
-    fn settleRepairHandoffStatusBestEffort(
+    const RepairHandoffPublicationToken = struct {
+        generation: u64,
+    };
+
+    fn nextRepairHandoffGenerationLocked(self: *ProvisionedTableWriteSource) u64 {
+        const generation = self.next_repair_handoff_generation;
+        self.next_repair_handoff_generation +%= 1;
+        if (self.next_repair_handoff_generation == 0) self.next_repair_handoff_generation = 1;
+        return generation;
+    }
+
+    fn captureRepairHandoffPublicationTokenBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
+        require_clear: bool,
+    ) ?RepairHandoffPublicationToken {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return null;
+        const entry = self.active_table_activities.items[index];
+        if (entry.repair_handoff_status_pending == 0) return null;
+        if (require_clear and !entry.repair_handoff_clear_observed) return null;
+        std.debug.assert(entry.repair_handoff_generation != 0);
+        return .{ .generation = entry.repair_handoff_generation };
+    }
+
+    fn settleRepairHandoffStatusIfUnchangedBestEffort(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        token: RepairHandoffPublicationToken,
     ) bool {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
         const entry = &self.active_table_activities.items[index];
-        if (entry.repair_handoff_status_pending == 0 or !entry.repair_handoff_clear_observed) return false;
+        if (entry.repair_handoff_status_pending == 0 or
+            !entry.repair_handoff_clear_observed or
+            entry.repair_handoff_generation != token.generation)
+        {
+            return false;
+        }
         // One group-wide consistent publication covers all coalesced
         // structural handoffs that preceded the observed durable clear.
         entry.repair_handoff_status_pending = 0;
         entry.repair_handoff_clear_observed = false;
+        entry.repair_handoff_generation = 0;
         self.pruneTableActivityLocked(table_name, group_id);
         self.table_activity_ready.broadcast(io);
         return true;
     }
 
-    fn settleTerminalRepairHandoffStatusBestEffort(
+    fn settleTerminalRepairHandoffStatusIfUnchangedBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
+        token: RepairHandoffPublicationToken,
     ) bool {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
         const entry = &self.active_table_activities.items[index];
-        if (entry.repair_handoff_status_pending == 0) return false;
+        if (entry.repair_handoff_status_pending == 0 or
+            entry.repair_handoff_generation != token.generation)
+        {
+            return false;
+        }
         // A terminal intent deliberately remains durable, so no aggregate
         // repair-clear edge is guaranteed to follow it. Its authoritative
-        // terminal snapshot is the fail-closed completion proof for the status
-        // handoff and must retire that authority directly.
+        // terminal snapshot is the fail-closed completion proof for exactly
+        // the status handoff generation captured before observation. A later
+        // clear or pending callback advances the generation and remains owned
+        // by its newer scheduler wake.
         entry.repair_handoff_status_pending = 0;
         entry.repair_handoff_clear_observed = false;
+        entry.repair_handoff_generation = 0;
         self.pruneTableActivityLocked(table_name, group_id);
         self.table_activity_ready.broadcast(io);
         return true;
@@ -6768,6 +6825,7 @@ pub const ProvisionedTableWriteSource = struct {
         const entry = &self.active_table_activities.items[index];
         if (entry.repair_handoff_status_pending == 0) return;
         entry.repair_handoff_clear_observed = true;
+        entry.repair_handoff_generation = self.nextRepairHandoffGenerationLocked();
     }
 
     fn markRepairHandoffPendingBestEffort(
@@ -6782,6 +6840,7 @@ pub const ProvisionedTableWriteSource = struct {
             const entry = &self.active_table_activities.items[index];
             if (entry.repair_handoff_status_pending > 0) {
                 entry.repair_handoff_clear_observed = false;
+                entry.repair_handoff_generation = self.nextRepairHandoffGenerationLocked();
                 return;
             }
         }
@@ -6794,6 +6853,7 @@ pub const ProvisionedTableWriteSource = struct {
         const entry = self.activityEntryLocked(table_name, group_id);
         entry.repair_handoff_status_pending = 1;
         entry.repair_handoff_clear_observed = false;
+        entry.repair_handoff_generation = self.nextRepairHandoffGenerationLocked();
     }
 
     fn cancelStructuralReconcileReservation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -8747,7 +8807,9 @@ pub const ProvisionedTableWriteSource = struct {
         // status cache have no publication plane to wait for: their next live
         // status request is itself authoritative.
         defer if (self.runtime_status_cache == null) switch (change) {
-            .status, .publish, .publish_consistent, .publish_blocking => _ = self.settleRepairHandoffStatusBestEffort(table_name, group_id),
+            .status, .publish, .publish_consistent, .publish_blocking => if (self.captureRepairHandoffPublicationTokenBestEffort(table_name, group_id, true)) |token| {
+                _ = self.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token);
+            },
             else => {},
         };
         switch (change) {
@@ -9694,8 +9756,12 @@ pub const ProvisionedTableWriteSource = struct {
                 }) catch |err| {
                     if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
                     if (isTerminalStartupCatchUpOpenFailure(err)) {
-                        try finishManagedMaintenanceStatusPublication(publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err));
-                        return .{ .had_debt = true, .terminal_degraded = true };
+                        const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
+                        return .{
+                            .had_debt = true,
+                            .terminal_degraded = true,
+                            .index_repair_pending = !terminal_status_published,
+                        };
                     }
                     return err;
                 };
@@ -9729,8 +9795,12 @@ pub const ProvisionedTableWriteSource = struct {
                 ) catch |err| {
                     if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
                     if (isTerminalStartupCatchUpOpenFailure(err)) {
-                        try finishManagedMaintenanceStatusPublication(publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err));
-                        return .{ .had_debt = true, .terminal_degraded = true };
+                        const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
+                        return .{
+                            .had_debt = true,
+                            .terminal_degraded = true,
+                            .index_repair_pending = !terminal_status_published,
+                        };
                     }
                     return err;
                 }
@@ -9753,8 +9823,12 @@ pub const ProvisionedTableWriteSource = struct {
                 }) catch |err| {
                     if (err == error.LsmRootWriterAlreadyOpen) return busy_result;
                     if (isTerminalStartupCatchUpOpenFailure(err)) {
-                        try finishManagedMaintenanceStatusPublication(publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err));
-                        return .{ .had_debt = true, .terminal_degraded = true };
+                        const terminal_status_published = try publishTerminalStartupCatchUpRuntimeStatus(self, alloc, table_name, group_id, opening_db_startup, configured_indexes, err);
+                        return .{
+                            .had_debt = true,
+                            .terminal_degraded = true,
+                            .index_repair_pending = !terminal_status_published,
+                        };
                     }
                     return err;
                 };
@@ -21940,7 +22014,17 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     mode: RuntimeStatusSnapshotMode,
     db: *db_mod.DB,
 ) !void {
-    const snapshot_cache = source.runtime_status_cache orelse return;
+    const repair_handoff_token = source.captureRepairHandoffPublicationTokenBestEffort(
+        table_name,
+        group_id,
+        true,
+    );
+    const snapshot_cache = source.runtime_status_cache orelse {
+        if (repair_handoff_token) |token| {
+            _ = source.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token);
+        }
+        return;
+    };
     const publication_token = try snapshot_cache.capturePublicationToken(table_name);
     const visible_root_generation = source.visibleRootGeneration(group_id);
     const opened_root_generation = db.core.index_manager.lsm_root_generation;
@@ -21965,7 +22049,9 @@ fn publishRuntimeStatusSnapshotWithStartupPhaseMode(
     // causal boundary that makes status authoritative again. Unrelated dense
     // or enrichment work remains visible as ordinary catch-up diagnostics and
     // cannot indefinitely hold another index's status fence.
-    _ = source.settleRepairHandoffStatusBestEffort(table_name, group_id);
+    if (repair_handoff_token) |token| {
+        _ = source.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token);
+    }
     _ = source.settlePublicationHandoffStatusBestEffort(snapshot_cache, table_name, group_id, false);
 }
 
@@ -21976,11 +22062,18 @@ fn publishTerminalStartupRuntimeStatusSnapshot(
     group_id: u64,
     db: *db_mod.DB,
 ) !bool {
+    const repair_handoff_token = source.captureRepairHandoffPublicationTokenBestEffort(
+        table_name,
+        group_id,
+        false,
+    );
     const snapshot_cache = source.runtime_status_cache orelse {
         // Uncached sources serve their next status directly from the DB. The
         // durable terminal state is already authoritative and has no cached
         // publication plane that can fence it.
-        _ = source.settleTerminalRepairHandoffStatusBestEffort(table_name, group_id);
+        if (repair_handoff_token) |token| {
+            if (!source.settleTerminalRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token)) return false;
+        }
         return true;
     };
     const publication_token = try snapshot_cache.capturePublicationToken(table_name);
@@ -22002,7 +22095,9 @@ fn publishTerminalStartupRuntimeStatusSnapshot(
         error.RuntimeStatusPublicationFenced => return false,
         else => return err,
     };
-    _ = source.settleTerminalRepairHandoffStatusBestEffort(table_name, group_id);
+    if (repair_handoff_token) |token| {
+        if (!source.settleTerminalRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token)) return false;
+    }
     return true;
 }
 
@@ -22202,6 +22297,9 @@ fn publishRuntimeStatusGroupAfterObservation(
         return error.RuntimeStatusPublicationFenced;
     }
     try acceptRuntimeStatusPublication(try snapshot_cache.publishGroup(completed, table_name, status));
+    // Exercise and document the real concurrency boundary: lifecycle edges
+    // may arrive after cache publication but before handoff settlement.
+    runTestAfterRuntimeStatusPublishHook();
 }
 
 fn acceptRuntimeStatusPublication(result: runtime_status.TableRuntimeSnapshotCache.PublishResult) !void {
@@ -22889,10 +22987,23 @@ fn publishTerminalStartupCatchUpRuntimeStatus(
     startup: db_mod.types.StartupCatchUpStats,
     configured_indexes: ?*const StartupConfiguredIndexes,
     err: anyerror,
-) !void {
-    const snapshot_cache = source.runtime_status_cache orelse return;
+) !bool {
+    const repair_handoff_token = source.captureRepairHandoffPublicationTokenBestEffort(
+        table_name,
+        group_id,
+        false,
+    );
+    const snapshot_cache = source.runtime_status_cache orelse {
+        if (repair_handoff_token) |token| {
+            if (!source.settleTerminalRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token)) return false;
+        }
+        return true;
+    };
     const publication_token = try snapshot_cache.capturePublicationToken(table_name);
-    const summary = configured_indexes orelse return;
+    // Without configured index metadata there is no synthetic observation to
+    // publish. That is harmless when no structural handoff is waiting, but a
+    // waiting handoff must retain its exact retry route.
+    const summary = configured_indexes orelse return repair_handoff_token == null;
     const message = try std.fmt.allocPrint(alloc, "startup catch-up open failed: {s}", .{@errorName(err)});
     defer alloc.free(message);
     var terminal_startup = startup;
@@ -22902,7 +23013,14 @@ fn publishTerminalStartupCatchUpRuntimeStatus(
     var status = try syntheticStartupRuntimeStatusFromConfiguredIndexes(alloc, group_id, summary, terminal_startup, message);
     defer status.deinit(alloc);
     setRuntimeStatusMetadata(&status, .startup_catch_up, .stale);
-    _ = try snapshot_cache.publishGroup(publication_token, table_name, status);
+    publishRuntimeStatusGroupAfterObservation(snapshot_cache, publication_token, table_name, status) catch |publish_err| switch (publish_err) {
+        error.RuntimeStatusPublicationFenced => return false,
+        else => return publish_err,
+    };
+    if (repair_handoff_token) |token| {
+        if (!source.settleTerminalRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token)) return false;
+    }
+    return true;
 }
 
 fn finishManagedMaintenanceStatusPublication(publication: anyerror!void) !void {
@@ -34283,7 +34401,7 @@ test "repair handoff status settles after authoritative cached publication" {
     };
     source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &stale_completion);
     try std.testing.expect(!stale_completion.index_repair_pending);
-    try std.testing.expect(!source.settleRepairHandoffStatusBestEffort("docs", 7001));
+    try std.testing.expect(source.captureRepairHandoffPublicationTokenBestEffort("docs", 7001, true) == null);
 
     source.markRepairHandoffClearBestEffort("docs", 7001);
     var publication_retry = ProvisionedTableWriteSource.StartupCatchUpResult{};
@@ -34338,6 +34456,40 @@ test "terminal repair publication settles handoff or retains one fenced retry" {
     source.releaseStructuralReconcileStatus("docs");
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
     try std.testing.expect(try publishTerminalStartupRuntimeStatusSnapshot(&source, alloc, "docs", 7001, &db));
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+
+    // A later pending edge can land after the terminal snapshot reaches the
+    // cache but before the publisher reacquires handoff state. The generation
+    // token must reject settlement of that causally newer authority.
+    source.reserveStructuralReconcileStatus("docs");
+    source.ensureStructuralRepairHandoffStatus("docs", 7003);
+    source.releaseStructuralReconcileStatus("docs");
+    const PendingAfterPublish = struct {
+        source: *ProvisionedTableWriteSource,
+        calls: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+                self.source,
+                "docs",
+                7003,
+                null,
+                .index_repair_pending,
+            );
+        }
+    };
+    var pending_after_publish = PendingAfterPublish{ .source = &source };
+    {
+        const previous_hook = test_after_runtime_status_publish_hook;
+        test_after_runtime_status_publish_hook = .{ .ptr = &pending_after_publish, .run = PendingAfterPublish.run };
+        defer test_after_runtime_status_publish_hook = previous_hook;
+        try std.testing.expect(!try publishTerminalStartupRuntimeStatusSnapshot(&source, alloc, "docs", 7003, &db));
+    }
+    try std.testing.expectEqual(@as(usize, 1), pending_after_publish.calls);
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expect(try publishTerminalStartupRuntimeStatusSnapshot(&source, alloc, "docs", 7003, &db));
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
     // A prior per-intent clear can exist while another intent becomes terminal.
@@ -39613,16 +39765,50 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
     var startup_write_cache = ProvisionedTableWriteCache.init(alloc);
     defer startup_write_cache.deinit();
     var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    defer source.deinit();
     source.runtime_status_cache = &snapshot_cache;
     source.startup_write_cache = &startup_write_cache;
 
+    source.reserveStructuralReconcileStatus("docs");
+    source.ensureStructuralRepairHandoffStatus("docs", 7001);
+    source.releaseStructuralReconcileStatus("docs");
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+
     index_manager_mod.test_inject_index_open_error = error.FileNotFound;
     defer index_manager_mod.test_inject_index_open_error = null;
+
+    const Fence = struct {
+        cache: *runtime_status.TableRuntimeSnapshotCache,
+        calls: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.cache.invalidateTable("docs");
+        }
+    };
+    var fence = Fence{ .cache = &snapshot_cache };
+    const fenced_result = fenced: {
+        const previous_hook = test_before_runtime_status_publish_hook;
+        test_before_runtime_status_publish_hook = .{ .ptr = &fence, .run = Fence.run };
+        defer test_before_runtime_status_publish_hook = previous_hook;
+        break :fenced try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+            .indexes_json = indexes_json,
+            .schema_json = "",
+            .identity_namespace = identity_namespace,
+            .advance_index_repairs = true,
+        });
+    };
+    try std.testing.expectEqual(@as(usize, 1), fence.calls);
+    try std.testing.expect(fenced_result.terminal_degraded);
+    try std.testing.expect(fenced_result.index_repair_pending);
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
     const result = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
         .indexes_json = indexes_json,
         .schema_json = "",
         .identity_namespace = identity_namespace,
+        .advance_index_repairs = true,
     });
 
     try std.testing.expectEqual(@as(usize, 0), catalog.calls);
@@ -39630,6 +39816,8 @@ test "managed startup catch-up marks FileNotFound index open terminal degraded" 
     try std.testing.expect(result.had_debt);
     try std.testing.expect(result.terminal_degraded);
     try std.testing.expect(!result.cleared_debt);
+    try std.testing.expect(!result.index_repair_pending);
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
     var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
     defer statuses.deinit(alloc);
