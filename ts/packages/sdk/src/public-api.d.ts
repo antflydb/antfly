@@ -9428,7 +9428,7 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
-            /** @description Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Earlier sources win when multiple sources materialize the same edge identity. */
+            /** @description Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. */
             sources?: components["schemas"]["GraphArtifactSourceConfig"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];

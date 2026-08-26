@@ -2348,36 +2348,27 @@ func createArtifactGraphIndex(indexName, artifactName, producerType, model, infe
 
 	producerJSON := artifactProducerConfig(producerType, model, inferenceAPIURL, labelEnum, relationEnum, relationSchemas)
 
-	raw := map[string]any{
-		"name": indexName,
-		"type": antfly.IndexTypeGraph,
-		"source": map[string]any{
-			"kind":     "artifact",
-			"artifact": artifactName,
-			"path":     "$.relations[*]",
-			"format":   "extraction_relation",
-		},
-		"artifact": map[string]any{
-			"name":          artifactName,
-			"kind":          "asset",
-			"field":         "content",
-			"content_type":  "application/json",
-			"producer_json": producerJSON,
-		},
-		"algebraic_planning": map[string]any{
-			"bounded_traversal": map[string]any{
-				"law": "provenance_semiring",
-			},
-		},
+	graphSource := antfly.GraphArtifactSourceConfig{
+		Artifact: artifactName,
+		Path:     "$.relations[*]",
+		Format:   antfly.GraphArtifactSourceConfigFormatExtractionRelation,
 	}
 	if producerType == "extractor" {
-		raw["nodes"] = map[string]any{
-			"model":  "document",
-			"target": "{{ _item.target.text }}",
+		target, err := antfly.NewGraphTemplateValue("{{ _item.target.text }}")
+		if err != nil {
+			return nil, fmt.Errorf("build graph target mapping: %w", err)
 		}
-		raw["edge"] = map[string]any{
-			"weight": "{{ _item.score }}",
-			"metadata": map[string]any{
+		weight, err := antfly.NewGraphTemplateValue("{{ _item.score }}")
+		if err != nil {
+			return nil, fmt.Errorf("build graph weight mapping: %w", err)
+		}
+		graphSource.Nodes = antfly.GraphArtifactNodeMappingConfig{
+			Model:  antfly.GraphArtifactNodeMappingConfigModelDocument,
+			Target: target,
+		}
+		graphSource.Edge = antfly.GraphArtifactEdgeMappingConfig{
+			Weight: weight,
+			Metadata: map[string]any{
 				"type":          "{{ _item.type }}",
 				"source_entity": "{{ _item.source.text }}",
 				"target_entity": "{{ _item.target.text }}",
@@ -2385,16 +2376,28 @@ func createArtifactGraphIndex(indexName, artifactName, producerType, model, infe
 			},
 		}
 	}
-
-	encoded, err := json.Marshal(raw)
+	graphSources, err := antfly.NewGraphIndexSources(graphSource)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("build graph artifact source: %w", err)
 	}
-	var cfg antfly.IndexConfig
-	if err := json.Unmarshal(encoded, &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
+	return antfly.NewIndexConfig(indexName, antfly.GraphIndexConfig{
+		Source: graphSources[0],
+		Artifact: antfly.GraphArtifactProducerConfig{
+			Name: artifactName,
+			Kind: antfly.GraphArtifactProducerConfigKindAsset,
+			Source: antfly.GraphArtifactProducerSourceConfig{
+				Type:  antfly.GraphArtifactProducerSourceConfigTypeField,
+				Value: "content",
+			},
+			ContentType:  "application/json",
+			ProducerJson: producerJSON,
+		},
+		AlgebraicPlanning: antfly.GraphAlgebraicPlanningConfig{
+			BoundedTraversal: antfly.GraphBoundedTraversalConfig{
+				Law: antfly.GraphBoundedTraversalConfigLawProvenanceSemiring,
+			},
+		},
+	})
 }
 
 func artifactProducerConfig(producerType, model, inferenceAPIURL string, labels, relationLabels []string, relationSchemas []map[string]any) map[string]any {

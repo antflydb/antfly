@@ -26,7 +26,8 @@ class GraphIndexConfig:
 
     Attributes:
         sources (list[GraphArtifactSourceConfig] | Unset): Ordered chunk or JSON asset streams whose edge-like values
-            are unioned into this graph index. Earlier sources win when multiple sources materialize the same edge identity.
+            are unioned into this graph index. Artifact names must be unique within the array because the artifact name is
+            the source identity. Earlier sources win when multiple sources materialize the same edge identity.
         summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
              Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
         template (str | Unset): Handlebars template for generating summarizer input text.

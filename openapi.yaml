@@ -18478,7 +18478,8 @@ components:
             $ref: '#/components/schemas/GraphArtifactSourceConfig'
           x-go-type-skip-optional-pointer: true
           description: Ordered chunk or JSON asset streams whose edge-like values are unioned into this
-            graph index. Earlier sources win when multiple sources materialize the same edge identity.
+            graph index. Artifact names must be unique within the array because the artifact name is the
+            source identity. Earlier sources win when multiple sources materialize the same edge identity.
         summarizer:
           description: Configuration for generating node summaries (enables tree navigation in Retrieval
             Agent)

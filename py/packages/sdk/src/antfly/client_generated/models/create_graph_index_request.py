@@ -32,7 +32,8 @@ class CreateGraphIndexRequest:
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
         sources (list[GraphArtifactSourceConfig] | Unset): Ordered chunk or JSON asset streams whose edge-like values
-            are unioned into this graph index. Earlier sources win when multiple sources materialize the same edge identity.
+            are unioned into this graph index. Artifact names must be unique within the array because the artifact name is
+            the source identity. Earlier sources win when multiple sources materialize the same edge identity.
         summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
              Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
         template (str | Unset): Handlebars template for generating summarizer input text.

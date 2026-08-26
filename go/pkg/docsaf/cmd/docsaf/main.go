@@ -490,10 +490,11 @@ func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingProvider, embe
 		}
 	}
 
-	producerJSON, err := json.Marshal(map[string]any{
+	producerConfig := map[string]any{
 		"type":   "document_extraction",
 		"config": extractionConfig,
-	})
+	}
+	producerJSON, err := json.Marshal(producerConfig)
 	if err != nil {
 		return nil, fmt.Errorf("marshal document extraction producer: %w", err)
 	}
@@ -519,28 +520,38 @@ func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingProvider, embe
 	if err != nil {
 		return nil, fmt.Errorf("marshal vector index config: %w", err)
 	}
+	graphSources, err := antfly.NewGraphIndexSources(antfly.GraphArtifactSourceConfig{
+		Artifact: documentUnits,
+		Path:     "$.edges[*]",
+		Format:   antfly.GraphArtifactSourceConfigFormatExtractionRelation,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build hierarchy graph source: %w", err)
+	}
+	graphIndex, err := antfly.NewIndexConfig("document_units", antfly.GraphIndexConfig{
+		Source: graphSources[0],
+		Artifact: antfly.GraphArtifactProducerConfig{
+			Name: documentUnits,
+			Kind: antfly.GraphArtifactProducerConfigKindAsset,
+			Source: antfly.GraphArtifactProducerSourceConfig{
+				Type:  antfly.GraphArtifactProducerSourceConfigTypeField,
+				Value: "url",
+			},
+			ContentType:  "application/json",
+			ProducerJson: producerConfig,
+		},
+		EdgeTypes: []antfly.EdgeTypeConfig{{Name: "mentions"}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build hierarchy graph index config: %w", err)
+	}
+	graphIndexBody, err := indexConfigMap(*graphIndex)
+	if err != nil {
+		return nil, fmt.Errorf("marshal hierarchy graph index config: %w", err)
+	}
 
 	return map[string]any{
-		"document_units": map[string]any{
-			"type": "graph",
-			"source": map[string]any{
-				"kind":     "artifact",
-				"artifact": documentUnits,
-				"path":     "$.edges[*]",
-				"format":   "extraction_relation",
-			},
-			"artifact": map[string]any{
-				"name":         documentUnits,
-				"kind":         "asset",
-				"field":        "url",
-				"content_type": "application/json",
-				"producer_json": map[string]any{
-					"type":   "document_extraction",
-					"config": extractionConfig,
-				},
-			},
-			"edge_types": []map[string]any{{"name": "mentions"}},
-		},
+		"document_units": graphIndexBody,
 		"document_text": map[string]any{
 			"type":          "full_text",
 			"field":         "text",

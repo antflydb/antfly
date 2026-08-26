@@ -1909,7 +1909,7 @@ pub const CreateGraphIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Earlier sources win when multiple sources materialize the same edge identity.
+    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity.
     sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?GeneratorConfig = null,
@@ -4356,7 +4356,7 @@ pub const GraphBoundedTraversalConfig = struct {
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
-    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Earlier sources win when multiple sources materialize the same edge identity.
+    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity.
     sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?GeneratorConfig = null,

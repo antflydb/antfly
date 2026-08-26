@@ -624,7 +624,6 @@ relations.
 {
   "type": "graph",
   "source": {
-    "kind": "artifact",
     "artifact": "relations_v1",
     "path": "$.relations[*]",
     "format": "extraction_relation"
@@ -662,7 +661,6 @@ artifact producer policy under graph root `execution`:
     }
   },
   "source": {
-    "kind": "artifact",
     "artifact": "relations_v1",
     "path": "$.relations[*]",
     "format": "extraction_relation"
@@ -760,9 +758,9 @@ Example:
 ```json
 {
   "name": "relations_graph",
-  "kind": "graph",
+  "type": "graph",
   "source": {
-    "artifact_name": "relations_v1"
+    "artifact": "relations_v1"
   }
 }
 ```

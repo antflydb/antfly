@@ -121,7 +121,6 @@ The shorthand shape should reuse Antfly's public enrichment config fields:
   "name": "relations_graph",
   "type": "graph",
   "source": {
-    "kind": "artifact",
     "artifact": "relations_v1",
     "path": "$.relations[*]",
     "format": "extraction_relation"
@@ -180,23 +179,21 @@ catalog references, not on who originally created the enrichment:
 
 ## Source Families
 
-V1 graph indexes support two source families.
+Graph indexes accept direct document edges and artifact-backed edge streams.
+The public API keeps those forms distinct instead of using a source-kind
+discriminator.
 
 Document field edges:
 
 ```json
 {
   "name": "doc_graph",
-  "type": "graph",
-  "source": {
-    "kind": "document_field",
-    "field": "_edges"
-  }
+  "type": "graph"
 }
 ```
 
-The existing `edge_types[].field` config should normalize to this source family
-internally.
+Documents may write explicit `_edges`; `edge_types[].field` remains the typed
+configuration for deriving edges from another document field.
 
 Artifact relation edges:
 
@@ -205,7 +202,6 @@ Artifact relation edges:
   "name": "relations_graph",
   "type": "graph",
   "source": {
-    "kind": "artifact",
     "artifact": "relations_v1",
     "path": "$.relations[*]",
     "format": "extraction_relation"
@@ -218,11 +214,10 @@ name. When that artifact changes for a document, the materializer reads the
 artifact value, selects items with `path`, renders edges, and replaces the graph
 edge artifact rows for that document/index/source.
 
-V1 should keep one materialized source per graph index. A source may be a
-document field source or an artifact/enrichment source, but not both in the same
-graph index. Combining multiple sources safely requires either source ownership
-in graph edge keys or a materializer state row that tracks the exact edge keys
-owned by each source.
+`source` is the single-source convenience form. `sources` accepts up to 64
+uniquely named artifact streams with deterministic precedence: earlier sources
+win edge-identity collisions. Per-source manifests retain ownership so deleting
+a winning source restores the next source without a full graph rescan.
 
 ## Template Mapping
 
@@ -232,22 +227,25 @@ Example:
 
 ```json
 {
-  "nodes": {
-    "model": "document",
-    "source": "{{ _doc.key }}",
-    "target": "{{ _item.target.document_id }}"
-  },
-  "edge": {
-    "type": "{{ _item.type }}",
-    "weight": "{{ default _item.confidence 1.0 }}",
-    "metadata": {
-      "source_text": "{{ _item.source.text }}",
-      "target_text": "{{ _item.target.text }}",
-      "evidence": "{{ _item.evidence.text }}"
+  "source": {
+    "artifact": "relations_v1",
+    "nodes": {
+      "model": "document",
+      "source": "{{ _doc.key }}",
+      "target": "{{ _item.target.document_id }}"
+    },
+    "edge": {
+      "type": "{{ _item.type }}",
+      "weight": "{{ default _item.confidence 1.0 }}",
+      "metadata": {
+        "source_text": "{{ _item.source.text }}",
+        "target_text": "{{ _item.target.text }}",
+        "evidence": "{{ _item.evidence.text }}"
+      }
+    },
+    "context": {
+      "doc_fields": ["tenant_id", "visibility"]
     }
-  },
-  "context": {
-    "doc_fields": ["tenant_id", "visibility"]
   }
 }
 ```
@@ -436,7 +434,6 @@ Graph index shorthand may declare this dependency chain:
   "name": "knowledge_graph",
   "type": "graph",
   "source": {
-    "kind": "artifact",
     "artifact": "relations_v1",
     "format": "extraction_graph"
   },

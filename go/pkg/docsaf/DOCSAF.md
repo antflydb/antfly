@@ -151,7 +151,7 @@ of assuming docsaf section rows:
 ```json
 {
   "semantic_search": "termination clause",
-  "fields": ["url", "title"],
+  "fields": ["url", "filename"],
   "hierarchy": {
     "group_by": {
       "level": "source",

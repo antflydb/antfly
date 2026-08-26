@@ -1043,6 +1043,7 @@ test "table contract rejects malformed multi-source members" {
     const invalid = [_][]const u8{
         "{\"type\":\"full_text\",\"sources\":[]}",
         "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"dense_v1\"},{\"artifact\":\"dense_v1\"}]}",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"},{\"artifact\":\"relations_v1\",\"path\":\"$.links[*]\"}]}",
         "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\",\"path\":\"$.text\"}]}",
         "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{}]}",
         "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"dense_v1\"}],\"enrichments\":[{\"name\":\"dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"vector_space\":\"\"}]}",
