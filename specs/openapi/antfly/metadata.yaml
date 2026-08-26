@@ -2443,6 +2443,7 @@ components:
         - corrupt_artifact
         - unreadable_artifact
         - enrichment_failed
+        - resource_limit_exceeded
     RepairTarget:
       type: string
       description: Repair subsystem to inspect or run.

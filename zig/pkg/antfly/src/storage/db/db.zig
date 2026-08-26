@@ -9634,9 +9634,9 @@ pub const DB = struct {
         defer stored.deinit(alloc);
 
         stored.artifact_kind = issue.artifact_kind;
-        stored.repairable = artifactRepairKindHasAutomatedReprocessor(issue.artifact_kind);
         stored.sequence = issue.sequence;
         stored.reason = issue.reason;
+        try applyArtifactRepairability(alloc, &stored);
         if (stored.first_seen_ns == 0) stored.first_seen_ns = now_ns;
         stored.last_seen_ns = nextArtifactRepairIssueTimestamp(stored.last_seen_ns, now_ns);
         if (stored.artifact_key.len == 0 and issue.artifact_key.len > 0) {
@@ -9650,9 +9650,6 @@ pub const DB = struct {
         }
         if (stored.source_artifact_name.len == 0 and issue.source_artifact_name.len > 0) {
             stored.source_artifact_name = try alloc.dupe(u8, issue.source_artifact_name);
-        }
-        if (stored.unsupported_reason.len == 0 and !stored.repairable) {
-            stored.unsupported_reason = try alloc.dupe(u8, artifactRepairUnsupportedReason(stored.artifact_kind));
         }
 
         const completion_key = try self.artifactRepairCompletionKeyForIssueAlloc(alloc, stored);
@@ -9758,7 +9755,7 @@ pub const DB = struct {
                 .artifact_name = try alloc.dupe(u8, identity.embedding_name),
                 .artifact_key = try alloc.dupe(u8, artifact_key_hex),
                 .chunk_id = identity.chunk_id,
-                .repairable = true,
+                .repairable = artifactRepairReasonHasAutomatedReprocessor(.embedding, reason),
                 .first_seen_ns = now_ns,
             };
         defer issue.deinit(alloc);
@@ -9766,7 +9763,7 @@ pub const DB = struct {
         issue.sequence = sequence;
         issue.reason = reason;
         issue.chunk_id = identity.chunk_id;
-        issue.repairable = true;
+        try applyArtifactRepairability(alloc, &issue);
         issue.last_seen_ns = nextArtifactRepairIssueTimestamp(issue.last_seen_ns, now_ns);
         if (issue.artifact_key.len == 0) {
             issue.artifact_key = try alloc.dupe(u8, artifact_key_hex);
@@ -12970,8 +12967,8 @@ pub const DB = struct {
             issue.attempts += 1;
             issue.last_seen_ns = currentTimeNs();
 
-            if (!artifactRepairKindHasReprocessor(issue.artifact_kind)) {
-                const unsupported_reason = artifactRepairUnsupportedReason(issue.artifact_kind);
+            if (!issue.repairable or !artifactRepairKindHasReprocessor(issue.artifact_kind)) {
+                const unsupported_reason = artifactRepairUnsupportedReasonForIssue(issue.*);
                 issue.repairable = false;
                 if (issue.unsupported_reason.len == 0) {
                     issue.unsupported_reason = try alloc.dupe(u8, unsupported_reason);
@@ -31072,6 +31069,7 @@ fn addGraphStateManifest(
     alloc: Allocator,
     store: ?*docstore_mod.DocStore,
     winners: *GraphEdgeWinners,
+    budget: *graph_asset_state.ReconcileBudget,
     state_key: []const u8,
     source_priority: usize,
     raw: []const u8,
@@ -31083,10 +31081,10 @@ fn addGraphStateManifest(
     // Retain its key list for the next source replay's delete set, but never
     // bless generation-less edge payloads into the current generation.
     if (generation == null or generation.? != expected_generation) return;
+    try budget.charge(raw);
 
-    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
-    defer graph_asset_state.freeEntries(alloc, entries);
-    for (entries) |entry| {
+    var entries = try graph_asset_state.entryIterator(raw);
+    while (try entries.next()) |entry| {
         const key = entry.key;
         const payload = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(
             alloc,
@@ -31128,28 +31126,15 @@ fn graphStateSourcePriorityAlloc(
     const state_name = try internal_keys.decodeBodyAlloc(alloc, state_key[state_prefix.len..terminator]);
     defer alloc.free(state_name);
 
-    if (try graph_state_name.sourceArtifact(state_name)) |artifact_name| {
+    if (try graph_state_name.identity(state_name)) |identity| {
+        if (identity.role == .resolution_mention_artifacts) return null;
         for (sources, 0..) |source, i| {
-            if (std.mem.eql(u8, source.artifact_name, artifact_name)) return i;
+            if (std.mem.eql(u8, source.artifact_name, identity.source_artifact)) return i;
         }
         return null;
     }
 
-    // Legacy separator-delimited state is read only for migration. Longest
-    // matching avoids prefix truncation until replay replaces it with GSN1.
-    var best: ?usize = null;
-    var best_len: usize = 0;
-    for (sources, 0..) |source, i| {
-        if (source.artifact_name.len < best_len or !std.mem.startsWith(u8, state_name, source.artifact_name)) continue;
-        const boundary_matches = source.artifact_name.len == state_name.len or
-            (source.artifact_name.len < state_name.len and state_name[source.artifact_name.len] == '\x1f');
-        if (!boundary_matches) continue;
-        if (best == null or source.artifact_name.len > best_len) {
-            best = i;
-            best_len = source.artifact_name.len;
-        }
-    }
-    return best;
+    return graph_state_name.legacySourcePriority(state_name, sources);
 }
 
 fn loadGraphEdgeWinners(
@@ -31183,6 +31168,7 @@ fn loadGraphEdgeWinnersWithOverrides(
 ) !GraphEdgeWinners {
     var winners = GraphEdgeWinners{};
     errdefer winners.deinit(alloc);
+    var budget = graph_asset_state.ReconcileBudget{};
     const prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(alloc, doc_key, index_name);
     defer alloc.free(prefix);
     const existing = try store.scanPrefix(alloc, prefix);
@@ -31198,14 +31184,14 @@ fn loadGraphEdgeWinnersWithOverrides(
             _ = override_values.remove(entry.key);
         }
         const source_priority = try graphStateSourcePriorityAlloc(alloc, entry.key, prefix, sources) orelse continue;
-        try addGraphStateManifest(alloc, store, &winners, entry.key, source_priority, raw, expected_generation);
+        try addGraphStateManifest(alloc, store, &winners, &budget, entry.key, source_priority, raw, expected_generation);
     }
     var override_it = override_values.iterator();
     while (override_it.next()) |override| {
         if (!std.mem.startsWith(u8, override.key_ptr.*, prefix)) continue;
         if (containsDeleteKey(retired_alias_keys, override.key_ptr.*)) continue;
         const source_priority = try graphStateSourcePriorityAlloc(alloc, override.key_ptr.*, prefix, sources) orelse continue;
-        try addGraphStateManifest(alloc, store, &winners, override.key_ptr.*, source_priority, override.value_ptr.*, expected_generation);
+        try addGraphStateManifest(alloc, store, &winners, &budget, override.key_ptr.*, source_priority, override.value_ptr.*, expected_generation);
     }
     return winners;
 }
@@ -33322,7 +33308,7 @@ fn preparePrecomputedGraphSourceArtifactMutation(
         if (mutation.value) |value| {
             const raw_doc = try batchDocumentValueForGraphSource(scratch, self.core.store, store_writes.items, artifact_ref.document_id);
             defer if (raw_doc) |doc_value| scratch.free(doc_value);
-            const graph_writes = try graphWritesFromArtifactValueAlloc(scratch, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc, graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document));
+            const graph_writes = try graphWritesFromArtifactValueAlloc(scratch, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc, graph_asset_state.hard_max_relation_items_per_artifact);
             defer freeGraphWrites(scratch, graph_writes);
             for (graph_writes) |write| {
                 const key = try internal_keys.graphEdgeArtifactKeyAlloc(scratch, write.source, write.index_name, write.edge_type, write.target);
@@ -38408,6 +38394,42 @@ fn artifactRepairUnsupportedReason(kind: types.ArtifactRepairKind) []const u8 {
     };
 }
 
+fn artifactRepairReasonHasAutomatedReprocessor(kind: types.ArtifactRepairKind, reason: types.ArtifactRepairReason) bool {
+    return artifactRepairKindHasAutomatedReprocessor(kind) and reason != .resource_limit_exceeded;
+}
+
+fn artifactRepairUnsupportedReasonForIssue(issue: types.ArtifactRepairIssue) []const u8 {
+    if (issue.reason == .resource_limit_exceeded) return "resource_limit_requires_source_or_config_change";
+    return artifactRepairUnsupportedReason(issue.artifact_kind);
+}
+
+fn applyArtifactRepairability(alloc: Allocator, issue: *types.ArtifactRepairIssue) !void {
+    issue.repairable = artifactRepairReasonHasAutomatedReprocessor(issue.artifact_kind, issue.reason);
+    const desired = if (issue.repairable) "" else artifactRepairUnsupportedReasonForIssue(issue.*);
+    if (std.mem.eql(u8, issue.unsupported_reason, desired)) return;
+    const owned = if (desired.len > 0) try alloc.dupe(u8, desired) else "";
+    if (issue.unsupported_reason.len > 0) alloc.free(@constCast(issue.unsupported_reason));
+    issue.unsupported_reason = owned;
+}
+
+test "artifact repair resource limits remain terminal until input changes" {
+    const alloc = std.testing.allocator;
+    var issue = types.ArtifactRepairIssue{
+        .artifact_kind = .asset,
+        .reason = .resource_limit_exceeded,
+    };
+    defer issue.deinit(alloc);
+
+    try applyArtifactRepairability(alloc, &issue);
+    try std.testing.expect(!issue.repairable);
+    try std.testing.expectEqualStrings("resource_limit_requires_source_or_config_change", issue.unsupported_reason);
+
+    issue.reason = .corrupt_artifact;
+    try applyArtifactRepairability(alloc, &issue);
+    try std.testing.expect(issue.repairable);
+    try std.testing.expectEqualStrings("", issue.unsupported_reason);
+}
+
 fn encodeArtifactRepairIssueValueAlloc(alloc: Allocator, issue: types.ArtifactRepairIssue) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, issue, .{ .emit_null_optional_fields = false });
 }
@@ -38465,6 +38487,7 @@ fn decodeArtifactRepairIssueValueAlloc(alloc: Allocator, raw: []const u8) !types
     issue.unsupported_reason = try alloc.dupe(u8, Fields.string(obj, "unsupported_reason"));
     issue.generation_error = try alloc.dupe(u8, Fields.string(obj, "generation_error"));
     issue.last_error = try alloc.dupe(u8, Fields.string(obj, "last_error"));
+    try applyArtifactRepairability(alloc, &issue);
     return issue;
 }
 
@@ -38749,7 +38772,7 @@ fn recordEmbeddingArtifactRepairIssueContext(
             .artifact_name = try ctx.alloc.dupe(u8, identity.embedding_name),
             .artifact_key = try ctx.alloc.dupe(u8, artifact_key_hex),
             .chunk_id = identity.chunk_id,
-            .repairable = true,
+            .repairable = artifactRepairReasonHasAutomatedReprocessor(.embedding, reason),
             .first_seen_ns = now_ns,
         };
     defer issue.deinit(ctx.alloc);
@@ -38757,7 +38780,7 @@ fn recordEmbeddingArtifactRepairIssueContext(
     issue.sequence = sequence;
     issue.reason = reason;
     issue.chunk_id = identity.chunk_id;
-    issue.repairable = true;
+    try applyArtifactRepairability(ctx.alloc, &issue);
     issue.last_seen_ns = nextArtifactRepairIssueTimestamp(issue.last_seen_ns, now_ns);
     if (issue.artifact_key.len == 0) {
         issue.artifact_key = try ctx.alloc.dupe(u8, artifact_key_hex);
@@ -38961,8 +38984,7 @@ fn recordArtifactRepairIssueContextDetailed(
             .artifact_name = try ctx.alloc.dupe(u8, artifact_name),
             .artifact_key = if (artifact_key_hex.len > 0) try ctx.alloc.dupe(u8, artifact_key_hex) else "",
             .chunk_id = chunk_id,
-            .repairable = artifactRepairKindHasAutomatedReprocessor(artifact_kind),
-            .unsupported_reason = try ctx.alloc.dupe(u8, artifactRepairUnsupportedReason(artifact_kind)),
+            .repairable = artifactRepairReasonHasAutomatedReprocessor(artifact_kind, reason),
             .first_seen_ns = now_ns,
         };
     defer issue.deinit(ctx.alloc);
@@ -38982,7 +39004,7 @@ fn recordArtifactRepairIssueContextDetailed(
     issue.reason = reason;
     issue.generation_attempts = merged_generation_attempts;
     issue.chunk_id = chunk_id;
-    issue.repairable = artifactRepairKindHasAutomatedReprocessor(artifact_kind);
+    try applyArtifactRepairability(ctx.alloc, &issue);
     issue.last_seen_ns = nextArtifactRepairIssueTimestamp(issue.last_seen_ns, now_ns);
     if (issue.artifact_key.len == 0 and artifact_key_hex.len > 0) {
         issue.artifact_key = try ctx.alloc.dupe(u8, artifact_key_hex);
@@ -38995,9 +39017,6 @@ fn recordArtifactRepairIssueContextDetailed(
     }
     if (issue.source_artifact_name.len == 0 and source_artifact_name.len > 0) {
         issue.source_artifact_name = try ctx.alloc.dupe(u8, source_artifact_name);
-    }
-    if (issue.unsupported_reason.len == 0 and !issue.repairable) {
-        issue.unsupported_reason = try ctx.alloc.dupe(u8, artifactRepairUnsupportedReason(artifact_kind));
     }
     if (!std.mem.eql(u8, issue.generation_error, generation_error)) {
         const owned_generation_error = if (generation_error.len > 0)
@@ -40894,6 +40913,52 @@ const GraphMaterializationOptions = struct {
     sequence: u64 = 0,
 };
 
+fn recordGraphResourceLimitForRepair(
+    options: GraphMaterializationOptions,
+    index_name: []const u8,
+    artifact_ref: types.ArtifactRef,
+    artifact_key: []const u8,
+) !bool {
+    const repair_ctx = options.repair_ctx orelse return false;
+    try recordArtifactRepairIssueForRefContext(
+        repair_ctx,
+        index_name,
+        artifact_ref,
+        artifact_key,
+        options.sequence,
+        .resource_limit_exceeded,
+    );
+    return true;
+}
+
+fn recordGraphResolutionResourceLimitForRepair(
+    alloc: Allocator,
+    options: GraphMaterializationOptions,
+    index_name: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+    resolution_key: []const u8,
+) !bool {
+    const repair_ctx = options.repair_ctx orelse return false;
+    const parsed = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, resolution_key)) orelse return false;
+    defer alloc.free(parsed.doc_key);
+    defer alloc.free(parsed.artifact_name);
+    try recordArtifactRepairIssueContext(
+        repair_ctx,
+        .graph,
+        index_name,
+        parsed.doc_key,
+        "",
+        "",
+        source.artifact_name,
+        parsed.artifact_name,
+        resolution_key,
+        null,
+        options.sequence,
+        .resource_limit_exceeded,
+    );
+    return true;
+}
+
 fn materializeGraphSourceArtifactsForIndex(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -40913,7 +40978,13 @@ fn materializeGraphSourceArtifactsForIndex(
         if (internal_keys.isResolutionArtifactKey(artifact_key)) {
             for (sources) |source| {
                 if (source.mention_edge_type.len == 0) continue;
-                try materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options);
+                materializeMentionEdgesForResolutionKey(alloc, store, index_manager, &changed, index_name, source, artifact_key, options) catch |err| switch (err) {
+                    error.ResourceLimitExceeded => {
+                        if (try recordGraphResolutionResourceLimitForRepair(alloc, options, index_name, source, artifact_key)) return error.ArtifactRepairRequired;
+                        return err;
+                    },
+                    else => return err,
+                };
             }
             continue;
         }
@@ -40952,8 +41023,12 @@ fn materializeGraphSourceArtifactsForIndex(
         if (raw) |value| {
             const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id);
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
-            const graph_writes = graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc, graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) catch |err| switch (err) {
+            const graph_writes = graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc, graph_asset_state.hard_max_relation_items_per_artifact) catch |err| switch (err) {
                 error.OutOfMemory => return err,
+                error.ResourceLimitExceeded => {
+                    if (try recordGraphResourceLimitForRepair(options, index_name, artifact_ref, artifact_key)) return error.ArtifactRepairRequired;
+                    return err;
+                },
                 else => {
                     if (options.repair_ctx) |repair_ctx| {
                         try recordArtifactRepairIssueForRefContext(repair_ctx, index_name, artifact_ref, artifact_key, options.sequence, .corrupt_artifact);
@@ -41003,12 +41078,27 @@ fn materializeGraphSourceArtifactsForIndex(
         }
 
         const graph_write_count = writes.items.len;
-        const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
+        const state_value = encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]) catch |err| switch (err) {
+            error.ResourceLimitExceeded => {
+                if (try recordGraphResourceLimitForRepair(options, index_name, artifact_ref, artifact_key)) return error.ArtifactRepairRequired;
+                return err;
+            },
+            else => return err,
+        };
         var state_value_owned = true;
         defer if (state_value_owned) alloc.free(state_value);
-        var winners = try loadGraphEdgeWinners(alloc, store, artifact_ref.document_id, index_name, state_key, state_value, &.{}, &.{legacy_state_key}, sources, generation);
+        var winners = loadGraphEdgeWinners(alloc, store, artifact_ref.document_id, index_name, state_key, state_value, &.{}, &.{legacy_state_key}, sources, generation) catch |err| switch (err) {
+            error.ResourceLimitExceeded => {
+                if (try recordGraphResourceLimitForRepair(options, index_name, artifact_ref, artifact_key)) return error.ArtifactRepairRequired;
+                return err;
+            },
+            else => return err,
+        };
         defer winners.deinit(alloc);
-        if (raw != null and winners.map.count() > graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) return error.ResourceLimitExceeded;
+        if (raw != null and winners.map.count() > graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) {
+            if (try recordGraphResourceLimitForRepair(options, index_name, artifact_ref, artifact_key)) return error.ArtifactRepairRequired;
+            return error.ResourceLimitExceeded;
+        }
         var affected = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (affected.items) |key| alloc.free(key);
@@ -52132,10 +52222,11 @@ test "graph state winner arbitration ignores stale index generations" {
 
     var winners = GraphEdgeWinners{};
     defer winners.deinit(alloc);
-    try addGraphStateManifest(alloc, null, &winners, "state:stale", 0, stale, 42);
+    var budget = graph_asset_state.ReconcileBudget{};
+    try addGraphStateManifest(alloc, null, &winners, &budget, "state:stale", 0, stale, 42);
     try std.testing.expectEqual(@as(usize, 0), winners.map.count());
 
-    try addGraphStateManifest(alloc, null, &winners, "state:current", 1, current, 42);
+    try addGraphStateManifest(alloc, null, &winners, &budget, "state:current", 1, current, 42);
     try std.testing.expectEqualSlices(u8, current_payload, winners.map.get("edge:a").?.payload);
 }
 
@@ -52170,14 +52261,15 @@ test "graph state winner arbitration rejects unauthenticated v0.2.0 manifests bu
 
     var winners = GraphEdgeWinners{};
     defer winners.deinit(alloc);
-    try addGraphStateManifest(alloc, &store, &winners, legacy_state_key, 0, legacy_state.items, 42);
+    var budget = graph_asset_state.ReconcileBudget{};
+    try addGraphStateManifest(alloc, &store, &winners, &budget, legacy_state_key, 0, legacy_state.items, 42);
     try std.testing.expectEqual(@as(usize, 0), winners.map.count());
 
     const authenticated_state = try encodeGraphAssetStateKeysAlloc(alloc, 42, &.{
         .{ .key = edge_key, .value = legacy_edge },
     });
     defer alloc.free(authenticated_state);
-    try addGraphStateManifest(alloc, &store, &winners, "state:current", 0, authenticated_state, 42);
+    try addGraphStateManifest(alloc, &store, &winners, &budget, "state:current", 0, authenticated_state, 42);
     const authenticated = winners.map.get(edge_key) orelse return error.TestUnexpectedResult;
     var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, authenticated.payload);
     defer decoded.deinit(alloc);
@@ -53895,7 +53987,7 @@ test "db graph relation artifact materializer uses mapping templates" {
     try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"tenant\":\"tenant-a\"") != null);
 }
 
-test "graph artifact parser enforces the configured edge limit before persistence" {
+test "graph artifact parser enforces its independent raw item safety limit" {
     const alloc = std.testing.allocator;
     const source = index_manager_mod.GraphArtifactSource{
         .artifact_name = @constCast("relations_v1"),
@@ -53911,6 +54003,46 @@ test "graph artifact parser enforces the configured edge limit before persistenc
         null,
         1,
     ));
+}
+
+test "db graph visible edge limit applies after identity deduplication" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "max_edges_per_document":1,
+        \\  "source":{"artifact":"relations_v1","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":[{"type":"mentions","target":"doc:b","weight":0.5},{"type":"mentions","target":"doc:b","weight":0.9}]}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("doc:b", edges[0].target);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), edges[0].weight, 0.0001);
 }
 
 test "db graph relation artifact materializer resolves entity refs and artifact template values" {

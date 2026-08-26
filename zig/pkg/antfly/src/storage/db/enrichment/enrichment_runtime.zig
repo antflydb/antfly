@@ -7342,7 +7342,7 @@ fn materializeGraphAssetForRuntime(
         const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         const edge_limit = graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document);
-        const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc, edge_limit);
+        const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc, graph_asset_state.hard_max_relation_items_per_artifact);
         defer runtimeFreeGraphWrites(runtime.alloc, graph_writes);
 
         var writes = std.ArrayListUnmanaged(KVPair).empty;
@@ -7598,6 +7598,7 @@ const RuntimeGraphEdgeWinners = struct {
 fn runtimeAddGraphStateManifest(
     runtime: *EnrichmentRuntime,
     winners: *RuntimeGraphEdgeWinners,
+    budget: *graph_asset_state.ReconcileBudget,
     state_key: []const u8,
     source_priority: usize,
     raw: []const u8,
@@ -7609,9 +7610,9 @@ fn runtimeAddGraphStateManifest(
     // from debris left by a delete/recreate. Ordinary source replay rewrites
     // them with authenticated payloads before they can become winners.
     if (generation == null or generation.? != expected_generation) return;
-    const entries = try graph_asset_state.decodeAlloc(alloc, raw);
-    defer graph_asset_state.freeEntries(alloc, entries);
-    for (entries) |entry| {
+    try budget.charge(raw);
+    var entries = try graph_asset_state.entryIterator(raw);
+    while (try entries.next()) |entry| {
         const key = entry.key;
         const payload = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(
             alloc,
@@ -7647,18 +7648,21 @@ fn runtimeGraphStateSourcePriorityAlloc(
     state_key: []const u8,
     state_prefix: []const u8,
     index_name: []const u8,
-) !usize {
+) !?usize {
     const sources = runtime.index_manager.graphArtifactSources(index_name);
-    if (!std.mem.startsWith(u8, state_key, state_prefix)) return sources.len;
-    const terminator = internal_keys.findComponentTerminator(state_key, state_prefix.len) orelse return sources.len;
+    if (!std.mem.startsWith(u8, state_key, state_prefix)) return null;
+    const terminator = internal_keys.findComponentTerminator(state_key, state_prefix.len) orelse return null;
     const state_name = try internal_keys.decodeBodyAlloc(runtime.alloc, state_key[state_prefix.len..terminator]);
     defer runtime.alloc.free(state_name);
-    const artifact_name = (try graph_state_name.sourceArtifact(state_name)) orelse
-        if (std.mem.indexOfScalar(u8, state_name, '\x1f')) |end| state_name[0..end] else state_name;
-    for (sources, 0..) |source, i| {
-        if (std.mem.eql(u8, source.artifact_name, artifact_name)) return i;
+    if (try graph_state_name.identity(state_name)) |identity| {
+        if (identity.role == .resolution_mention_artifacts) return null;
+        for (sources, 0..) |source, i| {
+            if (std.mem.eql(u8, source.artifact_name, identity.source_artifact)) return i;
+        }
+        return null;
     }
-    return sources.len;
+
+    return graph_state_name.legacySourcePriority(state_name, sources);
 }
 
 fn runtimeLoadGraphEdgeWinners(
@@ -7671,6 +7675,7 @@ fn runtimeLoadGraphEdgeWinners(
 ) !RuntimeGraphEdgeWinners {
     var winners = RuntimeGraphEdgeWinners{};
     errdefer winners.deinit(runtime.alloc);
+    var budget = graph_asset_state.ReconcileBudget{};
     const prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(runtime.alloc, doc_key, index_name);
     defer runtime.alloc.free(prefix);
     const expected_generation = (runtime.index_manager.graphIndex(index_name) orelse return error.IndexNotFound).config.coverage_generation;
@@ -7683,9 +7688,13 @@ fn runtimeLoadGraphEdgeWinners(
             saw_current = true;
             break :blk current_state_value;
         } else entry.value;
-        try runtimeAddGraphStateManifest(runtime, &winners, entry.key, try runtimeGraphStateSourcePriorityAlloc(runtime, entry.key, prefix, index_name), raw, expected_generation);
+        const source_priority = try runtimeGraphStateSourcePriorityAlloc(runtime, entry.key, prefix, index_name) orelse continue;
+        try runtimeAddGraphStateManifest(runtime, &winners, &budget, entry.key, source_priority, raw, expected_generation);
     }
-    if (!saw_current) try runtimeAddGraphStateManifest(runtime, &winners, current_state_key, try runtimeGraphStateSourcePriorityAlloc(runtime, current_state_key, prefix, index_name), current_state_value, expected_generation);
+    if (!saw_current) {
+        const source_priority = try runtimeGraphStateSourcePriorityAlloc(runtime, current_state_key, prefix, index_name) orelse return error.InvalidGraphStateName;
+        try runtimeAddGraphStateManifest(runtime, &winners, &budget, current_state_key, source_priority, current_state_value, expected_generation);
+    }
     return winners;
 }
 

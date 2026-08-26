@@ -42,8 +42,9 @@ class CreateGraphIndexRequest:
              Example: {{title}}
             {{content}}.
         edge_types (list[EdgeTypeConfig] | Unset): List of edge types with their configurations
-        max_edges_per_document (int | Unset): Maximum number of visible edges materialized per document. Zero uses the
-            server safety limit (currently 1,000,000).
+        max_edges_per_document (int | Unset): Maximum number of distinct visible edges materialized per document after
+            source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000).
+            Independent aggregate reconciliation budgets bound work across overlapping source manifests.
         source (GraphArtifactSourceConfig | Unset): Artifact stream materialized into graph edges.
         artifact (GraphArtifactProducerConfig | Unset): Asset producer used by an artifact-backed graph index.
         algebraic_planning (GraphAlgebraicPlanningConfig | Unset): Optional algebraic planning features for graph

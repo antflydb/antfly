@@ -9031,6 +9031,7 @@ components:
         - corrupt_artifact
         - unreadable_artifact
         - enrichment_failed
+        - resource_limit_exceeded
     RepairTarget:
       type: string
       description: Repair subsystem to inspect or run.
@@ -18518,8 +18519,9 @@ components:
           type: integer
           minimum: 0
           maximum: 1000000
-          description: Maximum number of visible edges materialized per document. Zero uses the server
-            safety limit (currently 1,000,000).
+          description: Maximum number of distinct visible edges materialized per document after source
+            precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000).
+            Independent aggregate reconciliation budgets bound work across overlapping source manifests.
         source:
           description: Single-source convenience form. Mutually exclusive with sources; normalized responses
             use sources.
@@ -22914,8 +22916,9 @@ components:
           type: integer
           minimum: 0
           maximum: 1000000
-          description: Maximum number of visible edges materialized per document. Zero uses the server
-            safety limit (currently 1,000,000).
+          description: Maximum number of distinct visible edges materialized per document after source
+            precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000).
+            Independent aggregate reconciliation budgets bound work across overlapping source manifests.
         sources:
           type: array
           maxItems: 64

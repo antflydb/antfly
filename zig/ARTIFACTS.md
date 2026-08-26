@@ -415,10 +415,12 @@ v0.2.0 public API and are rejected rather than introduced as compatibility
 surface area.
 
 The embeddings root field `embedding_name` is a supported single-source
-convenience input. The index-level `source_artifact_name` field is deprecated:
-new artifact-backed vector indexes use `sources` to select embedding outputs
-and put `source_artifact_name` only on the matching embedding enrichment.
-Normalized responses represent the consumed embedding through `sources`.
+convenience input. The index-level `source_artifact_name` is also supported: it
+selects the upstream artifact consumed by that single embedding producer, while
+`embedding_name`/`sources` select the producer output consumed by the vector
+index. Multi-source configurations put `source_artifact_name` on each matching
+embedding enrichment because producer inputs can differ. Normalized responses
+represent consumed embedding outputs through `sources`.
 
 For example, one full-text index can search both extracted units and derived
 chunks:
@@ -522,6 +524,10 @@ during upgrade; the first source materialization rewrites them in the current
 generation-bound format. Missing or malformed legacy payloads are ignored, and
 index retirement durably removes both edge payloads and source manifests before
 same-name recreation is admitted.
+Each manifest has independent entry and byte limits, and one reconciliation is
+also subject to aggregate entry and byte budgets. Those aggregate budgets bound
+overlap-heavy workloads where many sources emit the same visible identities;
+exceeding them is terminal repair debt until the source set or payload changes.
 Graph status echoes the configured artifact, path, and format in that same
 precedence order and uses `artifact` as the source identity. Catch-up and repair
 state remains index-wide; clients use the enclosing catch-up and repair fields.

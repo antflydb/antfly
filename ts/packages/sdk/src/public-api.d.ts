@@ -3342,7 +3342,7 @@ export interface components {
          * @description Reason an artifact was added to the repair queue.
          * @enum {string}
          */
-        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact" | "enrichment_failed";
+        ArtifactRepairReason: "missing_artifact" | "corrupt_artifact" | "unreadable_artifact" | "enrichment_failed" | "resource_limit_exceeded";
         /**
          * @description Repair subsystem to inspect or run.
          * @enum {string}
@@ -9446,7 +9446,7 @@ export interface components {
             template?: string;
             /** @description List of edge types with their configurations */
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
-            /** @description Maximum number of visible edges materialized per document. Zero uses the server safety limit (currently 1,000,000). */
+            /** @description Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests. */
             max_edges_per_document?: number;
             /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. */
             source?: components["schemas"]["GraphArtifactSourceConfig"];
@@ -12132,7 +12132,7 @@ export interface components {
             summarizer?: components["schemas"]["CreatedProviderConfig"];
             template?: string;
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
-            /** @description Maximum number of visible edges materialized per document. Zero uses the server safety limit (currently 1,000,000). */
+            /** @description Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests. */
             max_edges_per_document?: number;
             sources?: components["schemas"]["CreatedGraphArtifactSourceConfig"][];
             artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];

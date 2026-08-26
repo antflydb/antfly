@@ -7720,6 +7720,7 @@ pub fn build(b: *std.Build) void {
             "storage.db.document_query.",
             "storage.db.generation_lifecycle.",
             "storage.db.graph_asset_state.",
+            "storage.db.graph_state_name.",
             "storage.db.lease.",
             "storage.db.mod.",
             "storage.db.ownership.",

@@ -2389,6 +2389,7 @@ pub const ArtifactRepairReason = enum {
     corrupt_artifact,
     unreadable_artifact,
     enrichment_failed,
+    resource_limit_exceeded,
 };
 
 /// Policy-independent coverage health shared by status and repair reporting.
@@ -2769,7 +2770,7 @@ pub const EmbeddingArtifactRepairResult = ArtifactRepairResult;
 pub fn embeddingArtifactRepairReasonFromArtifact(reason: ArtifactRepairReason) EmbeddingArtifactRepairReason {
     return switch (reason) {
         .missing_artifact => .missing_embedding_artifact,
-        .corrupt_artifact, .unreadable_artifact, .enrichment_failed => .corrupt_embedding_artifact,
+        .corrupt_artifact, .unreadable_artifact, .enrichment_failed, .resource_limit_exceeded => .corrupt_embedding_artifact,
     };
 }
 

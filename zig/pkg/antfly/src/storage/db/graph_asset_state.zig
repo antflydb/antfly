@@ -9,7 +9,12 @@ const Allocator = std.mem.Allocator;
 const version_3_magic = "AGS3";
 const header_len = version_3_magic.len + @sizeOf(u64);
 pub const hard_max_edges_per_document: usize = 1_000_000;
+pub const hard_max_relation_items_per_artifact: usize = 1_000_000;
 pub const hard_max_manifest_bytes: usize = 64 * 1024 * 1024;
+/// Aggregate guardrails for one precedence-reconciliation pass. A visible-edge
+/// limit alone cannot bound work when many sources contain the same identities.
+pub const hard_max_reconcile_entries: usize = 4_000_000;
+pub const hard_max_reconcile_bytes: usize = 256 * 1024 * 1024;
 
 pub fn effectiveEdgeLimit(configured: u32) usize {
     return if (configured == 0) hard_max_edges_per_document else @min(@as(usize, configured), hard_max_edges_per_document);
@@ -29,6 +34,51 @@ pub const Entry = struct {
         alloc.free(self.key);
         alloc.free(self.value);
         self.* = undefined;
+    }
+};
+
+pub const EntryView = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+pub const EntryIterator = struct {
+    raw: []const u8,
+    pos: usize,
+    remaining: u32,
+
+    pub fn next(self: *EntryIterator) !?EntryView {
+        if (self.remaining == 0) {
+            if (self.pos != self.raw.len) return error.InvalidGraphAssetState;
+            return null;
+        }
+        const key_len = readU32Big(self.raw, &self.pos) catch return error.InvalidGraphAssetState;
+        if (key_len > self.raw.len - self.pos) return error.InvalidGraphAssetState;
+        const key = self.raw[self.pos..][0..key_len];
+        self.pos += key_len;
+        const value_len = readU32Big(self.raw, &self.pos) catch return error.InvalidGraphAssetState;
+        if (value_len > self.raw.len - self.pos) return error.InvalidGraphAssetState;
+        const value = self.raw[self.pos..][0..value_len];
+        self.pos += value_len;
+        self.remaining -= 1;
+        if (self.remaining == 0 and self.pos != self.raw.len) return error.InvalidGraphAssetState;
+        return .{ .key = key, .value = value };
+    }
+};
+
+pub const ReconcileBudget = struct {
+    max_entries: usize = hard_max_reconcile_entries,
+    max_bytes: usize = hard_max_reconcile_bytes,
+    entries: usize = 0,
+    bytes: usize = 0,
+
+    pub fn charge(self: *ReconcileBudget, raw: []const u8) !void {
+        const count = try v3EntryCount(raw);
+        const next_entries = std.math.add(usize, self.entries, count) catch return error.ResourceLimitExceeded;
+        const next_bytes = std.math.add(usize, self.bytes, raw.len) catch return error.ResourceLimitExceeded;
+        if (next_entries > self.max_entries or next_bytes > self.max_bytes) return error.ResourceLimitExceeded;
+        self.entries = next_entries;
+        self.bytes = next_bytes;
     }
 };
 
@@ -117,13 +167,8 @@ pub fn encodeAlloc(alloc: Allocator, generation: u64, writes: anytype) ![]u8 {
 }
 
 pub fn decodeAlloc(alloc: Allocator, raw: []const u8) ![]Entry {
-    if (!std.mem.startsWith(u8, raw, version_3_magic) or raw.len < header_len) return error.UnsupportedGraphAssetStateVersion;
-    if (raw.len > hard_max_manifest_bytes) return error.ResourceLimitExceeded;
-    var pos: usize = header_len;
-    const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-    if (@as(usize, count) > hard_max_edges_per_document) return error.ResourceLimitExceeded;
-    const minimum_entry_bytes: usize = 2 * @sizeOf(u32);
-    if (@as(usize, count) > (raw.len - pos) / minimum_entry_bytes) return error.InvalidGraphAssetState;
+    var iterator = try entryIterator(raw);
+    const count = iterator.remaining;
     const entries = if (count > 0) try alloc.alloc(Entry, count) else return &.{};
     var initialized: usize = 0;
     errdefer {
@@ -132,21 +177,31 @@ pub fn decodeAlloc(alloc: Allocator, raw: []const u8) ![]Entry {
     }
 
     for (entries) |*entry| {
-        const key_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-        if (key_len > raw.len - pos) return error.InvalidGraphAssetState;
-        const key = try alloc.dupe(u8, raw[pos..][0..key_len]);
-        pos += key_len;
+        const view = (try iterator.next()) orelse return error.InvalidGraphAssetState;
+        const key = try alloc.dupe(u8, view.key);
         errdefer alloc.free(key);
-
-        const value_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-        if (value_len > raw.len - pos) return error.InvalidGraphAssetState;
-        const value = try alloc.dupe(u8, raw[pos..][0..value_len]);
-        pos += value_len;
+        const value = try alloc.dupe(u8, view.value);
         entry.* = .{ .key = key, .value = value };
         initialized += 1;
     }
-    if (pos != raw.len) return error.InvalidGraphAssetState;
+    if (try iterator.next() != null) return error.InvalidGraphAssetState;
     return entries;
+}
+
+pub fn entryIterator(raw: []const u8) !EntryIterator {
+    if (!std.mem.startsWith(u8, raw, version_3_magic) or raw.len < header_len) return error.UnsupportedGraphAssetStateVersion;
+    if (raw.len > hard_max_manifest_bytes) return error.ResourceLimitExceeded;
+    var pos: usize = header_len;
+    const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+    if (@as(usize, count) > hard_max_edges_per_document) return error.ResourceLimitExceeded;
+    const minimum_entry_bytes: usize = 2 * @sizeOf(u32);
+    if (@as(usize, count) > (raw.len - pos) / minimum_entry_bytes) return error.InvalidGraphAssetState;
+    return .{ .raw = raw, .pos = pos, .remaining = count };
+}
+
+fn v3EntryCount(raw: []const u8) !usize {
+    const iterator = try entryIterator(raw);
+    return iterator.remaining;
 }
 
 pub fn containsKey(raw: []const u8, target_key: []const u8) !bool {
@@ -236,4 +291,18 @@ test "graph asset state rejects excessive entry counts before allocation" {
 test "graph asset state applies a finite safety limit when zero is configured" {
     try std.testing.expectEqual(hard_max_edges_per_document, effectiveEdgeLimit(0));
     try std.testing.expectEqual(@as(usize, 25), effectiveEdgeLimit(25));
+}
+
+test "graph reconciliation budget bounds overlapping manifest work" {
+    const alloc = std.testing.allocator;
+    const Pair = struct { key: []const u8, value: []const u8 };
+    const raw = try encodeAlloc(alloc, 42, &[_]Pair{
+        .{ .key = "edge:a", .value = "payload:a" },
+        .{ .key = "edge:b", .value = "payload:b" },
+    });
+    defer alloc.free(raw);
+
+    var budget = ReconcileBudget{ .max_entries = 3, .max_bytes = raw.len * 2 };
+    try budget.charge(raw);
+    try std.testing.expectError(error.ResourceLimitExceeded, budget.charge(raw));
 }

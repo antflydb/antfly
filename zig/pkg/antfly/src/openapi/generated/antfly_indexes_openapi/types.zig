@@ -289,7 +289,7 @@ pub const CreateGraphIndexRequest = struct {
     template: ?[]const u8 = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of visible edges materialized per document. Zero uses the server safety limit (currently 1,000,000).
+    /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
@@ -496,7 +496,7 @@ pub const CreatedGraphIndex = struct {
     summarizer: ?CreatedProviderConfig = null,
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of visible edges materialized per document. Zero uses the server safety limit (currently 1,000,000).
+    /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
     sources: ?[]const CreatedGraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
@@ -510,7 +510,7 @@ pub const CreatedGraphIndexConfig = struct {
     summarizer: ?CreatedProviderConfig = null,
     template: ?[]const u8 = null,
     edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of visible edges materialized per document. Zero uses the server safety limit (currently 1,000,000).
+    /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
     sources: ?[]const CreatedGraphArtifactSourceConfig = null,
     artifact: ?CreatedGraphArtifactProducerConfig = null,
@@ -1278,7 +1278,7 @@ pub const GraphIndexConfig = struct {
     template: ?[]const u8 = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of visible edges materialized per document. Zero uses the server safety limit (currently 1,000,000).
+    /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
@@ -1609,7 +1609,7 @@ pub const IndexConfig = struct {
     execution: ?IndexExecutionConfig = null,
     /// List of edge types with their configurations
     edge_types: ?[]const EdgeTypeConfig = null,
-    /// Maximum number of visible edges materialized per document. Zero uses the server safety limit (currently 1,000,000).
+    /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
     /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
     source: ?GraphArtifactSourceConfig = null,
