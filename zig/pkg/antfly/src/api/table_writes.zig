@@ -6814,6 +6814,30 @@ pub const ProvisionedTableWriteSource = struct {
         result.index_repair_pending = true;
     }
 
+    fn finishRepairHandoffPublicationAttemptBestEffort(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        result: *StartupCatchUpResult,
+    ) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return;
+        const entry = &self.active_table_activities.items[index];
+        if (entry.repair_handoff_status_pending == 0) return;
+
+        // The caller still owns group mutation admission here. If publication
+        // did not settle the handoff, retain its exact scheduler route but do
+        // not let a generic publisher borrow this audit after that ownership
+        // is released. The next pass must reacquire the group operation and
+        // repeat the durable audit before becoming publishable.
+        result.index_repair_pending = true;
+        if (!entry.repair_handoff_clear_observed) return;
+        entry.repair_handoff_clear_observed = false;
+        entry.repair_handoff_generation = self.nextRepairHandoffGenerationLocked();
+    }
+
     fn markRepairHandoffOwnerAuditCompleteBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
@@ -9632,6 +9656,11 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(path);
         const lsm_root_generation = self.visibleRootGeneration(group_id);
 
+        // Fence any publisher that captured an older clear audit before this
+        // pass attempts admission. Doing this before the fallible operation
+        // and cache leases also makes a busy return retain publication debt
+        // without leaving the old audit available to an unlocked publisher.
+        self.invalidateRepairHandoffOwnerAuditBestEffort(table_name, group_id);
         if (!self.tryBeginStartupCatchUpGroupOperation(table_name, group_id, metadata.advance_index_repairs)) return busy_result;
         if (!self.local_db_mutex.tryLock()) {
             self.endGroupOperation(table_name, group_id);
@@ -9694,11 +9723,6 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (group_operation_active) self.endGroupOperation(table_name, group_id);
         }
-        // Revoke any publication retry inherited from an older audit while
-        // mutation admission is excluded. Intermediate progress snapshots
-        // remain useful, but only this pass's final durable re-audit may
-        // settle the structural repair handoff.
-        self.invalidateRepairHandoffOwnerAuditBestEffort(table_name, group_id);
         self.startup_catch_up_active.store(true, .monotonic);
         defer self.startup_catch_up_active.store(false, .monotonic);
 
@@ -10070,11 +10094,10 @@ pub const ProvisionedTableWriteSource = struct {
             try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db));
             startup_status_active = false;
         }
-        // A fenced status observation cannot be the last owner of a
-        // structural repair handoff. Retain the exact scheduler route until a
-        // later pass publishes after the causally observed clear edge and
-        // settles snapshot-only authority, even when durable repair is done.
-        self.retainRepairRouteForPendingHandoffBestEffort(table_name, group_id, &result);
+        // A fenced status observation cannot carry its clear authorization
+        // beyond the operation lease. Retain the exact route, revoke that
+        // authorization, and require the next pass to audit again.
+        self.finishRepairHandoffPublicationAttemptBestEffort(table_name, group_id, &result);
         self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &result);
         preserve_startup_cache = shouldPreserveStartupWriteCache(result);
         return result;
@@ -34586,6 +34609,7 @@ test "live repair final audit excludes concurrent group mutation through publica
 
     const PublicationProbe = struct {
         source: *ProvisionedTableWriteSource,
+        cache: *runtime_status.TableRuntimeSnapshotCache,
         final_publications: usize = 0,
         competing_admissions: usize = 0,
 
@@ -34605,9 +34629,13 @@ test "live repair final audit excludes concurrent group mutation through publica
                 self.competing_admissions += 1;
                 self.source.endGroupOperation("docs", 7001);
             }
+            // Force the first final publication to miss its captured table
+            // epoch. The owner must revoke this audit before releasing group
+            // admission, so no generic publisher can settle it afterward.
+            if (self.final_publications == 1) self.cache.invalidateTable("docs");
         }
     };
-    var probe = PublicationProbe{ .source = &source };
+    var probe = PublicationProbe{ .source = &source, .cache = &snapshot_cache };
     const result = result: {
         const previous_hook = test_before_runtime_status_publish_hook;
         test_before_runtime_status_publish_hook = .{ .ptr = &probe, .run = PublicationProbe.run };
@@ -34620,9 +34648,23 @@ test "live repair final audit excludes concurrent group mutation through publica
     };
 
     try std.testing.expect(!result.busy);
-    try std.testing.expect(!result.index_repair_pending);
+    try std.testing.expect(result.index_repair_pending);
     try std.testing.expectEqual(@as(usize, 1), probe.final_publications);
     try std.testing.expectEqual(@as(usize, 0), probe.competing_admissions);
+    try std.testing.expect(source.captureRepairHandoffPublicationTokenBestEffort("docs", 7001, true) == null);
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+
+    // A later generic publication has no audit token to borrow. Only another
+    // admitted owner can repeat the durable audit and settle the handoff.
+    try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, &write_cache.entries.items[0].db);
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    const retry = try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+        .indexes_json = "{}",
+        .schema_json = "",
+        .advance_index_repairs = true,
+    });
+    try std.testing.expect(!retry.busy);
+    try std.testing.expect(!retry.index_repair_pending);
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
 }
 
