@@ -53,6 +53,11 @@ export {
   GRAPH_IDENTIFIER_UNICODE_VERSION,
   isValidGraphIdentifier,
 } from "./graph-identifier-policy.generated.js";
+export type {
+  GraphDateRangeOptions,
+  GraphNumericRangeOptions,
+  GraphTermRangeOptions,
+} from "./graph-identifiers.js";
 export {
   countGraphAlias,
   countGraphRows,

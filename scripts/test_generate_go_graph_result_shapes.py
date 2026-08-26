@@ -16,6 +16,7 @@ from __future__ import annotations
 import unittest
 
 import generate_go_graph_result_shapes as generator
+from jsonschema import Draft4Validator
 
 
 class GoGraphResultShapesTest(unittest.TestCase):
@@ -32,6 +33,14 @@ class GoGraphResultShapesTest(unittest.TestCase):
         self.assertIn(
             'name: "GraphBindingNode.document", opaqueObject: true', generated
         )
+        self.assertIn("maxProperties: 64, hasMaxProperties: true", generated)
+        self.assertIn("minItems: 1, maxItems: 65, hasMaxItems: true", generated)
+        self.assertIn(
+            'allowedStrings: []string{"min_hops", "min_weight", "max_weight"}',
+            generated,
+        )
+        self.assertIn("unsignedDecimalString: true", generated)
+        self.assertIn("maximum: 10000, hasMaximum: true", generated)
 
     def test_all_canonical_roots_and_dependencies_are_reachable(self) -> None:
         schemas = generator.load_schemas()
@@ -55,6 +64,39 @@ class GoGraphResultShapesTest(unittest.TestCase):
         ):
             with self.subTest(schema=schema), self.assertRaises(ValueError):
                 generator.render_shape(schema, "Unsupported")
+
+    def test_unsupported_or_misplaced_constraints_fail_generation(self) -> None:
+        for schema in (
+            {"type": "string", "pattern": "^custom$"},
+            {"type": "integer", "enum": [1, 2]},
+            {"type": "array", "items": {"type": "string"}, "minLength": 1},
+            {"type": "object", "additionalProperties": True, "minimum": 0},
+            {"type": "string", "futureConstraint": 1},
+            {},
+        ):
+            with self.subTest(schema=schema), self.assertRaises(ValueError):
+                generator.render_shape(schema, "Unsupported")
+
+    def test_graph_range_schemas_require_a_semantic_bound(self) -> None:
+        schemas = generator.load_schemas()
+        cases = (
+            ("GraphDocumentNumericRangeBody", "min", 1, "inclusive_min"),
+            ("GraphDocumentTermRangeBody", "max", "z", "inclusive_max"),
+            (
+                "GraphDocumentDateRangeBody",
+                "start",
+                "2026-01-01T00:00:00Z",
+                "inclusive_start",
+            ),
+        )
+        for name, bound, value, inclusive in cases:
+            validator = Draft4Validator(schemas[name])
+            with self.subTest(name=name):
+                self.assertTrue(validator.is_valid({"path": "/value", bound: value}))
+                self.assertFalse(validator.is_valid({"path": "/value"}))
+                self.assertFalse(
+                    validator.is_valid({"path": "/value", inclusive: True})
+                )
 
 
 if __name__ == "__main__":

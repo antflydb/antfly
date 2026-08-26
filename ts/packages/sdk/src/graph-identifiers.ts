@@ -26,15 +26,18 @@ function requireIdentifier(value: unknown, path: string): asserts value is strin
   }
 }
 
-function requireGraphDocumentPath(path: string): void {
-  if (!path.startsWith("/") || /~(?:[^01]|$)/.test(path)) {
+function requireGraphDocumentPath(path: unknown): asserts path is string {
+  if (typeof path !== "string" || !path.startsWith("/") || /~(?:[^01]|$)/.test(path)) {
     throw new TypeError("graph document filter path must be a valid RFC 6901 JSON Pointer");
   }
 }
 
-function requireRfc3339DateTime(value: string, path: string): void {
+function requireRfc3339DateTime(value: unknown, path: string): asserts value is string {
+  if (typeof value !== "string") {
+    throw new TypeError(`${path} must be an RFC 3339 date-time with a UTC offset`);
+  }
   const match =
-    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(
+    /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:[Zz]|[+-](\d{2}):(\d{2}))$/.exec(
       value
     );
   if (!match) {
@@ -58,6 +61,7 @@ function requireRfc3339DateTime(value: string, path: string): void {
   const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
   const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
   const valid =
+    year >= 1 &&
     month >= 1 &&
     month <= 12 &&
     day >= 1 &&
@@ -72,17 +76,47 @@ function requireRfc3339DateTime(value: string, path: string): void {
   }
 }
 
+function requireRangeOptions(value: unknown, name: string): void {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(`${name} options must be an object`);
+  }
+}
+
+function optionalBoolean(value: unknown, path: string): boolean | undefined {
+  if (value !== undefined && typeof value !== "boolean") {
+    throw new TypeError(`${path} must be a boolean`);
+  }
+  return value;
+}
+
+export interface GraphNumericRangeOptions {
+  min?: number;
+  max?: number;
+  inclusiveMin?: boolean;
+  inclusiveMax?: boolean;
+}
+
+export interface GraphTermRangeOptions {
+  min?: string;
+  max?: string;
+  inclusiveMin?: boolean;
+  inclusiveMax?: boolean;
+}
+
+export interface GraphDateRangeOptions {
+  start?: string;
+  end?: string;
+  inclusiveStart?: boolean;
+  inclusiveEnd?: boolean;
+}
+
 /** Construct a validated non-scoring numeric range predicate for a graph node. */
 export function graphNumericRangeFilter(
   path: string,
-  options: {
-    min?: number;
-    max?: number;
-    inclusive_min?: boolean;
-    inclusive_max?: boolean;
-  }
+  options: GraphNumericRangeOptions
 ): GraphDocumentFilter {
   requireGraphDocumentPath(path);
+  requireRangeOptions(options, "graph numeric range");
   if (options.min === undefined && options.max === undefined) {
     throw new TypeError("graph numeric range requires min or max");
   }
@@ -92,43 +126,71 @@ export function graphNumericRangeFilter(
   ) {
     throw new TypeError("graph numeric range bounds must be finite numbers");
   }
-  return { numeric_range: { path, ...options } };
+  const inclusiveMin = optionalBoolean(options.inclusiveMin, "graph numeric range inclusiveMin");
+  const inclusiveMax = optionalBoolean(options.inclusiveMax, "graph numeric range inclusiveMax");
+  return {
+    numeric_range: {
+      path,
+      ...(options.min === undefined ? {} : { min: options.min }),
+      ...(options.max === undefined ? {} : { max: options.max }),
+      ...(inclusiveMin === undefined ? {} : { inclusive_min: inclusiveMin }),
+      ...(inclusiveMax === undefined ? {} : { inclusive_max: inclusiveMax }),
+    },
+  };
 }
 
 /** Construct a validated non-scoring lexical range predicate for a graph node. */
 export function graphTermRangeFilter(
   path: string,
-  options: {
-    min?: string;
-    max?: string;
-    inclusive_min?: boolean;
-    inclusive_max?: boolean;
-  }
+  options: GraphTermRangeOptions
 ): GraphDocumentFilter {
   requireGraphDocumentPath(path);
+  requireRangeOptions(options, "graph term range");
   if (options.min === undefined && options.max === undefined) {
     throw new TypeError("graph term range requires min or max");
   }
-  return { term_range: { path, ...options } };
+  if (
+    (options.min !== undefined && typeof options.min !== "string") ||
+    (options.max !== undefined && typeof options.max !== "string")
+  ) {
+    throw new TypeError("graph term range bounds must be strings");
+  }
+  const inclusiveMin = optionalBoolean(options.inclusiveMin, "graph term range inclusiveMin");
+  const inclusiveMax = optionalBoolean(options.inclusiveMax, "graph term range inclusiveMax");
+  return {
+    term_range: {
+      path,
+      ...(options.min === undefined ? {} : { min: options.min }),
+      ...(options.max === undefined ? {} : { max: options.max }),
+      ...(inclusiveMin === undefined ? {} : { inclusive_min: inclusiveMin }),
+      ...(inclusiveMax === undefined ? {} : { inclusive_max: inclusiveMax }),
+    },
+  };
 }
 
 /** Construct a validated non-scoring RFC 3339 date range predicate for a graph node. */
 export function graphDateRangeFilter(
   path: string,
-  options: {
-    start?: string;
-    end?: string;
-    inclusive_start?: boolean;
-    inclusive_end?: boolean;
-  }
+  options: GraphDateRangeOptions
 ): GraphDocumentFilter {
   requireGraphDocumentPath(path);
+  requireRangeOptions(options, "graph date range");
   if (options.start === undefined && options.end === undefined) {
     throw new TypeError("graph date range requires start or end");
   }
   if (options.start !== undefined) requireRfc3339DateTime(options.start, "graph date range start");
   if (options.end !== undefined) requireRfc3339DateTime(options.end, "graph date range end");
-  return { date_range: { path, ...options } };
+  const inclusiveStart = optionalBoolean(options.inclusiveStart, "graph date range inclusiveStart");
+  const inclusiveEnd = optionalBoolean(options.inclusiveEnd, "graph date range inclusiveEnd");
+  return {
+    date_range: {
+      path,
+      ...(options.start === undefined ? {} : { start: options.start }),
+      ...(options.end === undefined ? {} : { end: options.end }),
+      ...(inclusiveStart === undefined ? {} : { inclusive_start: inclusiveStart }),
+      ...(inclusiveEnd === undefined ? {} : { inclusive_end: inclusiveEnd }),
+    },
+  };
 }
 
 function validateEdges(value: unknown, path: string): void {

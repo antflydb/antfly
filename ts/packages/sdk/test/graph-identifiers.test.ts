@@ -103,7 +103,7 @@ describe("graph identifier policy", () => {
   });
 
   it("constructs operation-keyed graph range filters", () => {
-    expect(graphNumericRangeFilter("/score", { min: 0, inclusive_min: true })).toEqual({
+    expect(graphNumericRangeFilter("/score", { min: 0, inclusiveMin: true })).toEqual({
       numeric_range: { path: "/score", min: 0, inclusive_min: true },
     });
     expect(graphTermRangeFilter("/status", { max: "z" })).toEqual({
@@ -111,6 +111,15 @@ describe("graph identifier policy", () => {
     });
     expect(graphDateRangeFilter("/created_at", { start: "2026-01-01T00:00:00Z" })).toEqual({
       date_range: { path: "/created_at", start: "2026-01-01T00:00:00Z" },
+    });
+    expect(
+      graphDateRangeFilter("/created_at", { end: "2026-01-01t00:00:00z", inclusiveEnd: true })
+    ).toEqual({
+      date_range: {
+        path: "/created_at",
+        end: "2026-01-01t00:00:00z",
+        inclusive_end: true,
+      },
     });
     expect(() => graphNumericRangeFilter("/score", {})).toThrow("requires min or max");
     expect(() => graphTermRangeFilter("score", { min: "a" })).toThrow("RFC 6901");
@@ -123,5 +132,15 @@ describe("graph identifier policy", () => {
     expect(() => graphDateRangeFilter("/created_at", { start: "2026-01-01T00:00:00" })).toThrow(
       "with a UTC offset"
     );
+    expect(() =>
+      graphNumericRangeFilter("/score", { min: 1, path: "not-a-pointer" } as never)
+    ).not.toThrow();
+    expect(graphNumericRangeFilter("/score", { min: 1, path: "not-a-pointer" } as never)).toEqual({
+      numeric_range: { path: "/score", min: 1 },
+    });
+    expect(() => graphTermRangeFilter("/status", { min: 1 } as never)).toThrow(
+      "bounds must be strings"
+    );
+    expect(() => graphDateRangeFilter("/created_at", { start: 1 } as never)).toThrow("RFC 3339");
   });
 });

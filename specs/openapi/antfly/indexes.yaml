@@ -2780,7 +2780,13 @@ components:
       type: object
       additionalProperties: false
       required: [path]
-      minProperties: 2
+      # OpenAPI 3.0 code generators commonly turn a validation-only anyOf into
+      # an unusable model union. This equivalent boolean schema keeps the
+      # object model stable while requiring min or max for standard validators.
+      not:
+        allOf:
+          - not: { required: [min] }
+          - not: { required: [max] }
       description: At least one of min or max is required and enforced by every Antfly execution boundary.
       properties:
         path:
@@ -2814,7 +2820,10 @@ components:
       type: object
       additionalProperties: false
       required: [path]
-      minProperties: 2
+      not:
+        allOf:
+          - not: { required: [min] }
+          - not: { required: [max] }
       description: At least one of min or max is required and enforced by every Antfly execution boundary.
       properties:
         path:
@@ -2846,7 +2855,10 @@ components:
       type: object
       additionalProperties: false
       required: [path]
-      minProperties: 2
+      not:
+        allOf:
+          - not: { required: [start] }
+          - not: { required: [end] }
       description: At least one of start or end is required and enforced by every Antfly execution boundary.
       properties:
         path:

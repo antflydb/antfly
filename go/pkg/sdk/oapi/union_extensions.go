@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // DecodeInto decodes the retained GraphResult JSON directly into value.
@@ -98,7 +99,22 @@ type requiredJSONShape struct {
 	opaqueObject              bool
 	array                     bool
 	nullable                  bool
-	nonEmptyString            bool
+	minLength                 int
+	maxLength                 int
+	hasMaxLength              bool
+	minItems                  int
+	maxItems                  int
+	hasMaxItems               bool
+	minProperties             int
+	maxProperties             int
+	hasMaxProperties          bool
+	unsignedDecimalString     bool
+	allowedStrings            []string
+	allowedBools              uint8
+	minimum                   float64
+	maximum                   float64
+	hasMinimum                bool
+	hasMaximum                bool
 	required                  []string
 	properties                map[string]*requiredJSONShape
 	allowAdditionalProperties bool
@@ -169,12 +185,34 @@ func decodeJSONScalar(decoder *json.Decoder, shape *requiredJSONShape, destinati
 			return fmt.Errorf("%s must be a string", shape.name)
 		}
 		destination.SetString(value)
+		length := utf8.RuneCountInString(value)
+		if length < shape.minLength {
+			return fmt.Errorf("%s must contain at least %d Unicode code points", shape.name, shape.minLength)
+		}
+		if shape.hasMaxLength && length > shape.maxLength {
+			return fmt.Errorf("%s must contain at most %d Unicode code points", shape.name, shape.maxLength)
+		}
+		if shape.unsignedDecimalString && !isUnsignedDecimalJSON(value) {
+			return fmt.Errorf("%s must contain only decimal digits", shape.name)
+		}
+		if len(shape.allowedStrings) > 0 && !containsJSONString(shape.allowedStrings, value) {
+			return fmt.Errorf("%s contains an unsupported string value", shape.name)
+		}
 	case reflect.Bool:
 		value, ok := token.(bool)
 		if !ok {
 			return fmt.Errorf("%s must be a boolean", shape.name)
 		}
 		destination.SetBool(value)
+		if shape.allowedBools != 0 {
+			mask := uint8(1)
+			if value {
+				mask = 2
+			}
+			if shape.allowedBools&mask == 0 {
+				return fmt.Errorf("%s contains an unsupported boolean value", shape.name)
+			}
+		}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		value, ok := token.(float64)
 		if !ok || math.Trunc(value) != value || value < math.MinInt64 || value >= -float64(math.MinInt64) {
@@ -185,6 +223,9 @@ func decodeJSONScalar(decoder *json.Decoder, shape *requiredJSONShape, destinati
 			return fmt.Errorf("%s integer is out of range", shape.name)
 		}
 		destination.SetInt(parsed)
+		if err := validateJSONNumberBounds(shape, value); err != nil {
+			return err
+		}
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		value, ok := token.(float64)
 		if !ok || math.Trunc(value) != value || value < 0 || value >= math.Exp2(64) {
@@ -195,6 +236,9 @@ func decodeJSONScalar(decoder *json.Decoder, shape *requiredJSONShape, destinati
 			return fmt.Errorf("%s unsigned integer is out of range", shape.name)
 		}
 		destination.SetUint(parsed)
+		if err := validateJSONNumberBounds(shape, value); err != nil {
+			return err
+		}
 	case reflect.Float32, reflect.Float64:
 		value, ok := token.(float64)
 		if !ok {
@@ -204,15 +248,44 @@ func decodeJSONScalar(decoder *json.Decoder, shape *requiredJSONShape, destinati
 			return fmt.Errorf("%s must be a representable number", shape.name)
 		}
 		destination.SetFloat(value)
+		if err := validateJSONNumberBounds(shape, value); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("%s cannot decode scalar into %s", shape.name, destination.Type())
 	}
-	if shape.nonEmptyString {
-		if destination.Kind() != reflect.String || destination.Len() == 0 {
-			return fmt.Errorf("%s must be a non-empty string", shape.name)
-		}
+	return nil
+}
+
+func validateJSONNumberBounds(shape *requiredJSONShape, value float64) error {
+	if shape.hasMinimum && value < shape.minimum {
+		return fmt.Errorf("%s must be at least %v", shape.name, shape.minimum)
+	}
+	if shape.hasMaximum && value > shape.maximum {
+		return fmt.Errorf("%s must be at most %v", shape.name, shape.maximum)
 	}
 	return nil
+}
+
+func containsJSONString(values []string, candidate string) bool {
+	for _, value := range values {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func isUnsignedDecimalJSON(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, digit := range value {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeJSONShapeToken(
@@ -272,6 +345,9 @@ func decodeJSONObject(decoder *json.Decoder, shape *requiredJSONShape, destinati
 			return fmt.Errorf("%s contains duplicate field %q", shape.name, key)
 		}
 		seen[key] = struct{}{}
+		if shape.hasMaxProperties && len(seen) > shape.maxProperties {
+			return fmt.Errorf("%s must contain at most %d properties", shape.name, shape.maxProperties)
+		}
 
 		child, declared := shape.properties[key]
 		if !declared {
@@ -319,6 +395,9 @@ func decodeJSONObject(decoder *json.Decoder, shape *requiredJSONShape, destinati
 			return fmt.Errorf("%s requires field %q", shape.name, required)
 		}
 	}
+	if len(seen) < shape.minProperties {
+		return fmt.Errorf("%s must contain at least %d properties", shape.name, shape.minProperties)
+	}
 	return nil
 }
 
@@ -331,12 +410,17 @@ func decodeJSONArray(decoder *json.Decoder, shape *requiredJSONShape, destinatio
 	} else {
 		destination.SetLen(0)
 	}
+	count := 0
 	for decoder.More() {
+		if shape.hasMaxItems && count >= shape.maxItems {
+			return fmt.Errorf("%s must contain at most %d items", shape.name, shape.maxItems)
+		}
 		value := reflect.New(destination.Type().Elem()).Elem()
 		if err := decodeJSONShapeValue(decoder, shape.items, value); err != nil {
 			return err
 		}
 		destination.Set(reflect.Append(destination, value))
+		count++
 	}
 	closing, err := decoder.Token()
 	if err != nil {
@@ -344,6 +428,9 @@ func decodeJSONArray(decoder *json.Decoder, shape *requiredJSONShape, destinatio
 	}
 	if closing != json.Delim(']') {
 		return fmt.Errorf("%s has an invalid array terminator", shape.name)
+	}
+	if count < shape.minItems {
+		return fmt.Errorf("%s must contain at least %d items", shape.name, shape.minItems)
 	}
 	return nil
 }

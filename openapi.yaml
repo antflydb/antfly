@@ -22646,7 +22646,14 @@ components:
       additionalProperties: false
       required:
         - path
-      minProperties: 2
+      not:
+        allOf:
+          - not:
+              required:
+                - min
+          - not:
+              required:
+                - max
       description: At least one of min or max is required and enforced by every Antfly execution boundary.
       properties:
         path:
@@ -22683,7 +22690,14 @@ components:
       additionalProperties: false
       required:
         - path
-      minProperties: 2
+      not:
+        allOf:
+          - not:
+              required:
+                - min
+          - not:
+              required:
+                - max
       description: At least one of min or max is required and enforced by every Antfly execution boundary.
       properties:
         path:
@@ -22718,7 +22732,14 @@ components:
       additionalProperties: false
       required:
         - path
-      minProperties: 2
+      not:
+        allOf:
+          - not:
+              required:
+                - start
+          - not:
+              required:
+                - end
       description: At least one of start or end is required and enforced by every Antfly execution boundary.
       properties:
         path:

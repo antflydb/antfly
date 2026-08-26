@@ -512,6 +512,28 @@ func TestCanonicalGraphResultPreservesOpaqueHydratedJSON(t *testing.T) {
 	}
 }
 
+func TestCanonicalGraphResultRejectsRowsOverSchemaPropertyLimit(t *testing.T) {
+	row := make(map[string]any, maxGraphMatchNodes+1)
+	for i := range maxGraphMatchNodes + 1 {
+		row[fmt.Sprintf("alias%d", i)] = map[string]any{"key": fmt.Sprintf("key%d", i)}
+	}
+	encoded, err := json.Marshal(map[string]any{
+		"kind":  "bindings",
+		"rows":  []any{row},
+		"stats": map[string]any{"returned_items": 1, "truncated": false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var canonical GraphQueryResult
+	if err := json.Unmarshal(encoded, &canonical); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeGraphQueryResult(canonical); err == nil || !strings.Contains(err.Error(), "at most 64 properties") {
+		t.Fatalf("expected row property limit error, got %v", err)
+	}
+}
+
 func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 	malformed := []string{
 		`{"kind":"nodes"}`,

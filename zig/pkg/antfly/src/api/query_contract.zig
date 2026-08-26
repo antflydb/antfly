@@ -9926,6 +9926,7 @@ test "graph date filters accept RFC3339 offsets and reject normalized invalid da
     try std.testing.expectEqual(utc, (try parseDateTimeOptionalToNs("2026-08-24T12:00:00-07:00")).?);
     try std.testing.expect((try parseDateTimeOptionalToNs("2026-02-29T00:00:00Z")) == null);
     try std.testing.expect((try parseDateTimeOptionalToNs("2026-04-31")) == null);
+    try std.testing.expect((try parseRfc3339ToNs("2026-08-24")) == null);
 }
 
 test "canonical graph date filters are operation keyed and require a bound" {
@@ -9945,6 +9946,9 @@ test "canonical graph date filters are operation keyed and require a bound" {
     ));
     try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
         \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"date_range":{"path":"/created_at"}}}}}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"date_range":{"path":"/created_at","start":"2026-01-01"}}}}}}
     ));
 }
 
@@ -10098,34 +10102,31 @@ fn parseGraphFilterValue(alloc: std.mem.Allocator, value: ?indexes_openapi.Graph
     // the generic tree before this recursive inspection; the normalizer also
     // validates the tree, but this ordering is what makes recursion safe.
     try validatePublicQueryTraversalBudgetAlloc(alloc, parsed.value);
-    if (!graphDocumentFilterPathsAreCanonical(parsed.value)) {
-        return error.InvalidQueryRequest;
-    }
-    if (graphDocumentFilterContainsAnalyzerBackedClause(parsed.value)) {
-        return error.UnsupportedQueryRequest;
-    }
+    try validateGraphDocumentFilterContract(parsed.value);
     return .{ .filter_query_json = try normalizePublicStoredFilterQueryAlloc(alloc, parsed.value) };
 }
 
-fn graphDocumentFilterPathsAreCanonical(value: std.json.Value) bool {
+fn validateGraphDocumentFilterContract(value: std.json.Value) !void {
     switch (value) {
         .array => |array| {
             for (array.items) |child| {
-                if (!graphDocumentFilterPathsAreCanonical(child)) return false;
+                try validateGraphDocumentFilterContract(child);
             }
         },
         .object => |object| {
             if (object.get("path")) |path| {
-                if (path != .string or !validGraphDocumentJsonPointer(path.string)) return false;
+                if (path != .string or !validGraphDocumentJsonPointer(path.string))
+                    return error.InvalidQueryRequest;
             }
+            if (object.get("match") != null) return error.UnsupportedQueryRequest;
+            if (object.get("date_range")) |range| try validateCanonicalGraphDateRange(range);
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (!graphDocumentFilterPathsAreCanonical(entry.value_ptr.*)) return false;
+                try validateGraphDocumentFilterContract(entry.value_ptr.*);
             }
         },
         else => {},
     }
-    return true;
 }
 
 fn validGraphDocumentJsonPointer(path: []const u8) bool {
@@ -10139,23 +10140,19 @@ fn validGraphDocumentJsonPointer(path: []const u8) bool {
     return true;
 }
 
-fn graphDocumentFilterContainsAnalyzerBackedClause(value: std.json.Value) bool {
-    switch (value) {
-        .array => |array| {
-            for (array.items) |child| {
-                if (graphDocumentFilterContainsAnalyzerBackedClause(child)) return true;
-            }
-        },
-        .object => |object| {
-            if (object.get("match") != null) return true;
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                if (graphDocumentFilterContainsAnalyzerBackedClause(entry.value_ptr.*)) return true;
-            }
-        },
-        else => {},
+fn validateCanonicalGraphDateRange(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidQueryRequest;
+    const start = value.object.get("start");
+    const end = value.object.get("end");
+    if (start == null and end == null) return error.InvalidQueryRequest;
+    if (start) |bound| {
+        if (bound != .string or (try parseRfc3339ToNs(bound.string)) == null)
+            return error.InvalidQueryRequest;
     }
-    return false;
+    if (end) |bound| {
+        if (bound != .string or (try parseRfc3339ToNs(bound.string)) == null)
+            return error.InvalidQueryRequest;
+    }
 }
 
 fn parseGraphDirection(value: ?indexes_openapi.EdgeDirection) graph_mod.EdgeDirection {

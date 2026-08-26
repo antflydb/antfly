@@ -28,6 +28,37 @@ SOURCE_PATH = ROOT / "specs/openapi/antfly/indexes.yaml"
 OUTPUT_PATH = ROOT / "go/pkg/sdk/oapi/graph_result_shapes_generated.go"
 ROOT_SCHEMAS = ("GraphBindingsResult", "GraphAggregatesResult", "GraphNodesResult")
 REF_PREFIX = "#/components/schemas/"
+ANNOTATION_KEYS = {
+    "default",
+    "deprecated",
+    "description",
+    "example",
+    "format",
+    "readOnly",
+    "title",
+    "writeOnly",
+}
+SUPPORTED_SHAPE_KEYS = {
+    "$ref",
+    "additionalProperties",
+    "allOf",
+    "anyOf",
+    "enum",
+    "items",
+    "maxItems",
+    "maxLength",
+    "maxProperties",
+    "maximum",
+    "minItems",
+    "minLength",
+    "minProperties",
+    "minimum",
+    "oneOf",
+    "pattern",
+    "properties",
+    "required",
+    "type",
+}
 
 
 def load_schemas() -> dict[str, dict[str, Any]]:
@@ -74,6 +105,117 @@ def go_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def validate_shape_keywords(schema: dict[str, Any], name: str) -> None:
+    unsupported = sorted(
+        key
+        for key in schema
+        if key not in SUPPORTED_SHAPE_KEYS
+        and key not in ANNOTATION_KEYS
+        and not key.startswith("x-")
+    )
+    if unsupported:
+        raise ValueError(f"unsupported schema keywords for {name!r}: {unsupported!r}")
+
+
+def integer_constraint(schema: dict[str, Any], key: str, name: str) -> int | None:
+    value = schema.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name}.{key} must be a non-negative integer")
+    return value
+
+
+def numeric_constraint(
+    schema: dict[str, Any], key: str, name: str
+) -> float | int | None:
+    value = schema.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name}.{key} must be numeric")  # noqa: TRY004
+    return value
+
+
+def append_collection_constraints(
+    fields: list[str], schema: dict[str, Any], name: str, noun: str
+) -> None:
+    minimum = integer_constraint(schema, f"min{noun}", name)
+    maximum = integer_constraint(schema, f"max{noun}", name)
+    if minimum is not None:
+        fields.append(f"min{noun}: {minimum}")
+    if maximum is not None:
+        fields.extend((f"max{noun}: {maximum}", f"hasMax{noun}: true"))
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError(f"{name} has min{noun} greater than max{noun}")
+
+
+def append_scalar_constraints(
+    fields: list[str], schema: dict[str, Any], name: str, schema_type: str
+) -> None:
+    schema_format = schema.get("format")
+    allowed_formats = {
+        "string": set(),
+        "boolean": set(),
+        "integer": {"uint64"},
+        "number": {"double"},
+    }[schema_type]
+    if schema_format is not None and schema_format not in allowed_formats:
+        raise ValueError(
+            f"unsupported {schema_type} format in result schema {name!r}: {schema_format!r}"
+        )
+    if schema_type == "string":
+        append_collection_constraints(fields, schema, name, "Length")
+        pattern = schema.get("pattern")
+        if pattern is not None:
+            if pattern != "^[0-9]+$":
+                raise ValueError(
+                    f"unsupported string pattern in result schema {name!r}: {pattern!r}"
+                )
+            fields.append("unsignedDecimalString: true")
+    elif any(key in schema for key in ("minLength", "maxLength", "pattern")):
+        raise ValueError(
+            f"string constraints used by non-string result schema {name!r}"
+        )
+
+    minimum = numeric_constraint(schema, "minimum", name)
+    maximum = numeric_constraint(schema, "maximum", name)
+    if minimum is not None or maximum is not None:
+        if schema_type not in ("integer", "number"):
+            raise ValueError(
+                f"numeric constraints used by non-numeric result schema {name!r}"
+            )
+        if minimum is not None:
+            fields.extend((f"minimum: {minimum!r}", "hasMinimum: true"))
+        if maximum is not None:
+            fields.extend((f"maximum: {maximum!r}", "hasMaximum: true"))
+        if minimum is not None and maximum is not None and minimum > maximum:
+            raise ValueError(f"{name} has minimum greater than maximum")
+
+    enum = schema.get("enum")
+    if enum is None:
+        return
+    if not isinstance(enum, list) or not enum:
+        raise ValueError(f"{name}.enum must be a non-empty list")
+    if schema_type == "string" and all(isinstance(value, str) for value in enum):
+        values = ", ".join(go_string(value) for value in enum)
+        fields.append(f"allowedStrings: []string{{{values}}}")
+        return
+    if schema_type == "boolean" and all(isinstance(value, bool) for value in enum):
+        mask = (1 if False in enum else 0) | (2 if True in enum else 0)
+        fields.append(f"allowedBools: {mask}")
+        return
+    raise ValueError(f"unsupported enum in result schema {name!r}: {enum!r}")
+
+
+def reject_constraints(
+    schema: dict[str, Any], name: str, keys: tuple[str, ...]
+) -> None:
+    present = sorted(key for key in keys if key in schema)
+    if present:
+        raise ValueError(f"invalid constraints for result schema {name!r}: {present!r}")
+
+
 def nullable_branch(schema: dict[str, Any]) -> dict[str, Any] | None:
     alternatives = schema.get("oneOf")
     if not isinstance(alternatives, list):
@@ -91,6 +233,7 @@ def nullable_branch(schema: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def render_shape(schema: dict[str, Any], name: str, indent: str = "") -> str:
+    validate_shape_keywords(schema, name)
     nullable = nullable_branch(schema)
     if nullable is not None:
         return (
@@ -116,25 +259,69 @@ def render_shape(schema: dict[str, Any], name: str, indent: str = "") -> str:
 
     schema_type = schema.get("type")
     if schema_type == "array":
-        item = render_shape(schema.get("items", {}), f"{name}.items", indent + "\t")
-        return (
-            f"&requiredJSONShape{{name: {go_string(name)}, array: true, items: {item}}}"
+        reject_constraints(
+            schema,
+            name,
+            (
+                "enum",
+                "format",
+                "maxLength",
+                "maxProperties",
+                "maximum",
+                "minLength",
+                "minProperties",
+                "minimum",
+                "pattern",
+                "properties",
+                "required",
+            ),
         )
+        item = render_shape(schema.get("items", {}), f"{name}.items", indent + "\t")
+        fields = [f"name: {go_string(name)}", "array: true", f"items: {item}"]
+        append_collection_constraints(fields, schema, name, "Items")
+        return "&requiredJSONShape{" + ", ".join(fields) + "}"
 
+    if schema_type not in (None, "object") and (
+        "properties" in schema or "additionalProperties" in schema
+    ):
+        raise ValueError(
+            f"object constraints used by {schema_type!r} result schema {name!r}"
+        )
     if (
         schema_type == "object"
         or "properties" in schema
         or "additionalProperties" in schema
     ):
+        reject_constraints(
+            schema,
+            name,
+            (
+                "enum",
+                "format",
+                "items",
+                "maxItems",
+                "maxLength",
+                "maximum",
+                "minItems",
+                "minLength",
+                "minimum",
+                "pattern",
+            ),
+        )
         required = schema.get("required", [])
         properties = schema.get("properties", {})
         additional = schema.get("additionalProperties", True)
-        if not required and not properties and additional is True:
-            return (
-                f"&requiredJSONShape{{name: {go_string(name)}, opaqueObject: true}}"
-            )
+        if (
+            not required
+            and not properties
+            and additional is True
+            and "minProperties" not in schema
+            and "maxProperties" not in schema
+        ):
+            return f"&requiredJSONShape{{name: {go_string(name)}, opaqueObject: true}}"
 
         fields = [f"name: {go_string(name)}", "object: true"]
+        append_collection_constraints(fields, schema, name, "Properties")
         if required:
             values = ", ".join(go_string(value) for value in required)
             fields.append(f"required: []string{{{values}}}")
@@ -155,9 +342,18 @@ def render_shape(schema: dict[str, Any], name: str, indent: str = "") -> str:
                 )
         return "&requiredJSONShape{" + ", ".join(fields) + "}"
 
+    if schema_type not in ("string", "boolean", "integer", "number"):
+        raise ValueError(
+            f"unsupported or missing type in result schema {name!r}: {schema_type!r}"
+        )
+    if "items" in schema or any(key in schema for key in ("minItems", "maxItems")):
+        raise ValueError(f"array constraints used by non-array result schema {name!r}")
+    if any(key in schema for key in ("minProperties", "maxProperties")):
+        raise ValueError(
+            f"object constraints used by non-object result schema {name!r}"
+        )
     fields = [f"name: {go_string(name)}"]
-    if schema_type == "string" and schema.get("minLength", 0) >= 1:
-        fields.append("nonEmptyString: true")
+    append_scalar_constraints(fields, schema, name, schema_type)
     return "&requiredJSONShape{" + ", ".join(fields) + "}"
 
 
