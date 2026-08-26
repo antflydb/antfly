@@ -269,6 +269,7 @@ func TestDedicatedLeaseRenewalClosesExactSuccessorHandoff(t *testing.T) {
 	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
 	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] =
 		haFencingLeaseBootstrapReceipt("standby-a", 2, proof.ProcessBootID)
+	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "11"
 	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(now, "standby-a-pod-uid"))
 	reconciler.Now = func() time.Time { return now }
 
@@ -293,6 +294,9 @@ func TestDedicatedLeaseRenewalClosesExactSuccessorHandoff(t *testing.T) {
 	if observed.Spec.HolderIdentity == nil || *observed.Spec.HolderIdentity != "standby-a" ||
 		observed.Spec.LeaseTransitions == nil || *observed.Spec.LeaseTransitions != 2 {
 		t.Fatalf("successor takeover changed authority: %#v", observed.Spec)
+	}
+	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "12" {
+		t.Fatalf("successor takeover did not advance the monotonic runtime boundary: %#v", observed.Annotations)
 	}
 }
 

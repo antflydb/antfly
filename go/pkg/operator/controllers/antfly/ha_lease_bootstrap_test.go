@@ -518,7 +518,10 @@ func TestCommittedTransferBindsSuccessorProcessDespiteFormerHolderRenewals(t *te
 	proof.ObservedAt = metav1.NewTime(leaseTime.Add(8 * time.Second))
 	successor.Status.HAStatus.PrimaryAdminReachable = true
 	successor.Status.HAStatus.PrimaryAdminLastError = ""
-	successor.Status.HAStatus.PrimaryLSN = 711
+	// The bound runtime can accept a local write before its controller consumes
+	// the one-shot receipt. That monotonic progress must not strand the transfer
+	// annotations or be regressed to the promotion boundary.
+	successor.Status.HAStatus.PrimaryLSN = 712
 	ready, err := reconciler.haCurrentPrimaryRuntimeWatchdogReady(
 		context.Background(), successor, "standby-a", 2, observed.Spec.AcquireTime.Time, true,
 	)
@@ -531,7 +534,7 @@ func TestCommittedTransferBindsSuccessorProcessDespiteFormerHolderRenewals(t *te
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
 		t.Fatal(err)
 	}
-	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "711" ||
+	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "712" ||
 		observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != "" ||
 		observed.Annotations[haFencingLeaseAnnotationTransferCommitted] != "" ||
 		observed.Annotations[haFencingLeaseAnnotationFormerHolder] != "" ||
@@ -544,14 +547,14 @@ func TestCommittedTransferBindsSuccessorProcessDespiteFormerHolderRenewals(t *te
 	// through the ordinary owner-renewal path.
 	now = leaseTime.Add(15 * time.Second)
 	proof.ObservedAt = metav1.NewTime(now.Add(-time.Second))
-	successor.Status.HAStatus.PrimaryLSN = 712
+	successor.Status.HAStatus.PrimaryLSN = 713
 	if err := reconciler.reconcileHAFencingLease(context.Background(), successor); err != nil {
 		t.Fatalf("advance exact successor positive boundary: %v", err)
 	}
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
 		t.Fatal(err)
 	}
-	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "712" {
+	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "713" {
 		t.Fatalf("ordinary successor renewal did not advance the positive boundary: %#v", observed)
 	}
 
@@ -566,7 +569,7 @@ func TestCommittedTransferBindsSuccessorProcessDespiteFormerHolderRenewals(t *te
 	if err := reconciler.Get(context.Background(), client.ObjectKeyFromObject(lease), observed); err != nil {
 		t.Fatal(err)
 	}
-	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "712" {
+	if observed.Annotations[haFencingLeaseAnnotationPrimaryLSN] != "713" {
 		t.Fatalf("ordinary successor renewal regressed the durable positive boundary: %#v", observed)
 	}
 }

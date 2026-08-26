@@ -500,9 +500,10 @@ func (r *AntflyClusterReconciler) reconcileHAFencingLease(ctx context.Context, c
 		bootstrapReceipt == haFencingLeaseBootstrapReceipt(
 			currentHolder, transitions, lease.Annotations[haFencingLeaseAnnotationProcessBootID],
 		) &&
-		haLeaseFenceScopeMatches(lease, scope)
+		haLeaseFenceBoundSuccessorScopeMatches(lease, scope)
 	if (bootstrapReceipt != "" || (bootstrapUnknownBoundary && scope.primaryLSN == 0)) && !boundHandoffReceipt {
-		if lease.Spec.RenewTime == nil || !haLeaseFenceScopeMatches(lease, scope) {
+		if lease.Spec.RenewTime == nil ||
+			(!haLeaseFenceScopeMatches(lease, scope) && !boundSuccessorReceipt) {
 			return nil
 		}
 		proofBoundary := lease.Spec.RenewTime.Time
@@ -704,7 +705,7 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 		successorScope := haFencingLeaseScope{}
 		if identity != nil {
 			successorScope = haFencingLeaseScopeWithMonotonicBoundary(
-				lease, haFencingLeaseScopeForIdentity(identity, 0),
+				lease, haFencingLeaseScopeForIdentity(identity, cluster.Status.HAStatus.PrimaryLSN),
 			)
 		}
 		boundSuccessor := identity != nil && cluster.UID != "" && currentHolder == localNodeID &&
@@ -718,7 +719,7 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 			proof != nil && haWatchdogProcessBootIDValid(strings.TrimSpace(proof.ProcessBootID)) &&
 			strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationProcessBootID]) == strings.TrimSpace(proof.ProcessBootID) &&
 			bootstrapReceipt == haFencingLeaseBootstrapReceipt(currentHolder, transitions, proof.ProcessBootID) &&
-			haLeaseFenceScopeMatches(lease, successorScope) &&
+			haLeaseFenceBoundSuccessorScopeMatches(lease, successorScope) &&
 			lease.Spec.AcquireTime != nil
 		if !boundSuccessor {
 			// Initial bootstrap and any incomplete or mismatched handoff remain on
@@ -733,6 +734,9 @@ func (r *AntflyClusterReconciler) renewCurrentHAFencingLease(ctx context.Context
 		}
 		now := metav1.NewMicroTime(r.haNow())
 		lease.Spec.RenewTime = &now
+		for key, value := range successorScope.annotations() {
+			lease.Annotations[key] = value
+		}
 		delete(lease.Annotations, haFencingLeaseAnnotationBootstrapReceipt)
 		delete(lease.Annotations, haFencingLeaseAnnotationTransferCommitted)
 		delete(lease.Annotations, haFencingLeaseAnnotationFormerHolder)
@@ -1291,6 +1295,34 @@ func haLeaseFenceScopeMatches(lease *coordinationv1.Lease, scope haFencingLeaseS
 		}
 	}
 	return true
+}
+
+// haLeaseFenceBoundSuccessorScopeMatches is only for closing an already-bound
+// successor handoff. Once the exact successor process has acquired runtime
+// authority, accepted-but-unacknowledged writes may advance its local HA tail
+// before the controller consumes the bootstrap receipt. Identity must remain
+// exact and the observed boundary may only advance the durable Lease boundary.
+func haLeaseFenceBoundSuccessorScopeMatches(lease *coordinationv1.Lease, scope haFencingLeaseScope) bool {
+	if lease == nil || lease.Annotations == nil || scope.primaryLSN == 0 {
+		return false
+	}
+	annotations := scope.annotations()
+	for _, key := range []string{
+		haFencingLeaseAnnotationClusterID,
+		haFencingLeaseAnnotationShardID,
+		haFencingLeaseAnnotationTableID,
+		haFencingLeaseAnnotationTimelineID,
+		haFencingLeaseAnnotationEpoch,
+		haFencingLeaseAnnotationCurrentPrimaryID,
+	} {
+		if lease.Annotations[key] != annotations[key] {
+			return false
+		}
+	}
+	persisted, err := strconv.ParseUint(
+		strings.TrimSpace(lease.Annotations[haFencingLeaseAnnotationPrimaryLSN]), 10, 64,
+	)
+	return err == nil && persisted > 0 && scope.primaryLSN >= persisted
 }
 
 // haCommittedTransferSuccessorScopeMatches recognizes the one safe scope
