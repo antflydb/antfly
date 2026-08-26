@@ -286,9 +286,61 @@ fn credentialSourceKey(region: []const u8, source: CredentialSource) u64 {
     return hash.final();
 }
 
+pub const RequestFormat = enum {
+    auto,
+    titan_text,
+    titan_multimodal,
+    cohere_v3,
+    cohere_v4,
+};
+
+pub fn parseRequestFormat(value: []const u8) !RequestFormat {
+    if (value.len == 0) return .auto;
+    return std.meta.stringToEnum(RequestFormat, value) orelse error.InvalidBedrockRequestFormat;
+}
+
+/// Resolve the provider-specific JSON contract independently from the Bedrock
+/// invocation target. Application profiles and provisioned/custom model ARNs
+/// can have opaque names, so callers must configure those explicitly.
+pub fn resolveRequestFormat(model: []const u8, configured: RequestFormat) !RequestFormat {
+    if (configured != .auto) return configured;
+
+    var identifier = std.mem.trim(u8, model, " \t\r\n");
+    if (identifier.len == 0) return error.BedrockRequestFormatRequired;
+    // These resources intentionally decouple the invocation target name from
+    // the underlying foundation model. Guessing from an operator-chosen name
+    // can silently send a valid payload for the wrong provider contract.
+    for ([_][]const u8{
+        ":application-inference-profile/",
+        ":provisioned-model/",
+        ":custom-model/",
+        ":custom-model-deployment/",
+        ":imported-model/",
+    }) |opaque_resource| {
+        if (std.mem.indexOf(u8, identifier, opaque_resource) != null)
+            return error.BedrockRequestFormatRequired;
+    }
+    if (std.mem.lastIndexOfScalar(u8, identifier, '/')) |separator| {
+        identifier = identifier[separator + 1 ..];
+    }
+    for ([_][]const u8{ "global.", "us.", "eu.", "apac." }) |prefix| {
+        if (std.mem.startsWith(u8, identifier, prefix)) {
+            identifier = identifier[prefix.len..];
+            break;
+        }
+    }
+
+    if (std.mem.startsWith(u8, identifier, "amazon.titan-embed-image")) return .titan_multimodal;
+    if (std.mem.startsWith(u8, identifier, "amazon.titan-embed-text")) return .titan_text;
+    if (std.mem.startsWith(u8, identifier, "cohere.embed-v4")) return .cohere_v4;
+    if (std.mem.startsWith(u8, identifier, "cohere.embed-")) return .cohere_v3;
+    return error.BedrockRequestFormatRequired;
+}
+
 pub const Options = struct {
     region: []const u8,
     endpoint: []const u8,
+    request_format: RequestFormat = .auto,
     input_type: []const u8 = "",
     truncate: []const u8 = "",
     dimension: u32 = 0,
@@ -320,8 +372,9 @@ pub const Provider = struct {
     }
 
     pub fn embedText(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) !inference.EmbedResult {
-        if (std.mem.startsWith(u8, model, "cohere.embed-")) {
-            return try self.embedCohereText(alloc, model, texts);
+        const request_format = try resolveRequestFormat(model, self.options.request_format);
+        if (request_format == .cohere_v3 or request_format == .cohere_v4) {
+            return try self.embedCohereText(alloc, model, texts, request_format);
         }
 
         const vectors = try alloc.alloc([]const f32, texts.len);
@@ -335,7 +388,7 @@ pub const Provider = struct {
             defer arena_state.deinit();
             const arena = arena_state.allocator();
 
-            const body = try textEmbeddingBody(arena, model, text, self.options.dimension);
+            const body = try textEmbeddingBody(arena, request_format, text, self.options.dimension);
             var result = try self.invokeEmbeddingsValue(alloc, model, .{ .object = body });
             defer result.deinit();
             if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
@@ -346,13 +399,14 @@ pub const Provider = struct {
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
-        if (std.mem.startsWith(u8, model, "amazon.titan-embed-image")) {
+        const request_format = try resolveRequestFormat(model, self.options.request_format);
+        if (request_format == .titan_multimodal) {
             var arena_state = std.heap.ArenaAllocator.init(alloc);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
             return try self.invokeEmbeddingsValue(alloc, model, .{ .object = try titanMultimodalBody(arena, parts, self.options.dimension) });
         }
-        if (isCohereV4(model)) {
+        if (request_format == .cohere_v4) {
             var arena_state = std.heap.ArenaAllocator.init(alloc);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -400,9 +454,9 @@ pub const Provider = struct {
         return try parseEmbeddingResponse(alloc, response_body);
     }
 
-    fn embedCohereText(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) !inference.EmbedResult {
+    fn embedCohereText(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, request_format: RequestFormat) !inference.EmbedResult {
         if (texts.len <= cohere_max_batch_size) {
-            return try self.embedCohereTextBatch(alloc, model, texts);
+            return try self.embedCohereTextBatch(alloc, model, texts, request_format);
         }
 
         var out = std.ArrayListUnmanaged([]const f32).empty;
@@ -414,7 +468,7 @@ pub const Provider = struct {
         var offset: usize = 0;
         while (offset < texts.len) {
             const end = @min(texts.len, offset + cohere_max_batch_size);
-            var result = try self.embedCohereTextBatch(alloc, model, texts[offset..end]);
+            var result = try self.embedCohereTextBatch(alloc, model, texts[offset..end], request_format);
             {
                 errdefer result.deinit();
                 try out.ensureUnusedCapacity(alloc, result.vectors.len);
@@ -429,7 +483,7 @@ pub const Provider = struct {
         return .{ .vectors = vectors, .dimension = dimension, .allocator = alloc };
     }
 
-    fn embedCohereTextBatch(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) !inference.EmbedResult {
+    fn embedCohereTextBatch(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, request_format: RequestFormat) !inference.EmbedResult {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -441,7 +495,7 @@ pub const Provider = struct {
         try body.put(arena, "texts", .{ .array = values });
         try body.put(arena, "input_type", .{ .string = if (self.options.input_type.len > 0) self.options.input_type else "search_document" });
         if (self.options.truncate.len > 0) try body.put(arena, "truncate", .{ .string = self.options.truncate });
-        if (self.options.dimension > 0 and isCohereV4(model)) try body.put(arena, "output_dimension", .{ .integer = self.options.dimension });
+        if (self.options.dimension > 0 and request_format == .cohere_v4) try body.put(arena, "output_dimension", .{ .integer = self.options.dimension });
         return try self.invokeEmbeddingsValue(alloc, model, .{ .object = body });
     }
 };
@@ -472,12 +526,12 @@ pub fn listFoundationModelsBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Clie
     return try alloc.dupe(u8, body);
 }
 
-fn isCohereV4(model: []const u8) bool {
-    return std.mem.startsWith(u8, model, "cohere.embed-v4");
-}
-
 pub fn maxBatchSize(model: []const u8) usize {
     return requestShape(model).text_inputs_per_request;
+}
+
+pub fn maxBatchSizeForFormat(request_format: RequestFormat) usize {
+    return requestShapeForFormat(request_format).text_inputs_per_request;
 }
 
 pub const RequestShape = struct {
@@ -486,7 +540,12 @@ pub const RequestShape = struct {
 };
 
 pub fn requestShape(model: []const u8) RequestShape {
-    if (std.mem.startsWith(u8, model, "cohere.embed-")) {
+    const request_format = resolveRequestFormat(model, .auto) catch return requestShapeForFormat(.titan_text);
+    return requestShapeForFormat(request_format);
+}
+
+pub fn requestShapeForFormat(request_format: RequestFormat) RequestShape {
+    if (request_format == .cohere_v3 or request_format == .cohere_v4) {
         return .{
             .text_inputs_per_request = cohere_max_batch_size,
             .multimodal_inputs_per_request = cohere_max_batch_size,
@@ -546,8 +605,8 @@ fn titanMultimodalBody(alloc: std.mem.Allocator, parts: []const template_mod.Con
     return body;
 }
 
-fn textEmbeddingBody(alloc: std.mem.Allocator, model: []const u8, text: []const u8, dimension: u32) !std.json.ObjectMap {
-    if (std.mem.startsWith(u8, model, "amazon.titan-embed-image")) {
+fn textEmbeddingBody(alloc: std.mem.Allocator, request_format: RequestFormat, text: []const u8, dimension: u32) !std.json.ObjectMap {
+    if (request_format == .titan_multimodal) {
         return try titanMultimodalBody(alloc, &.{.{ .text = text }}, dimension);
     }
 
@@ -1278,7 +1337,7 @@ pub fn testTitanMultimodalTextBodyUsesEmbeddingConfig() !void {
     const alloc = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
-    const body = try textEmbeddingBody(arena_state.allocator(), "amazon.titan-embed-image-v1", "text only", 1024);
+    const body = try textEmbeddingBody(arena_state.allocator(), .titan_multimodal, "text only", 1024);
     try std.testing.expectEqualStrings("text only", body.get("inputText").?.string);
     try std.testing.expect(body.get("dimensions") == null);
     try std.testing.expectEqual(@as(i64, 1024), body.get("embeddingConfig").?.object.get("outputEmbeddingLength").?.integer);
@@ -1411,6 +1470,33 @@ pub fn testRequestShapeBatchesByProviderRequest() !void {
     try std.testing.expectEqual(@as(usize, cohere_max_batch_size), maxBatchSize("cohere.embed-english-v3"));
     try std.testing.expectEqual(@as(usize, single_input_batch_size), maxBatchSize("amazon.titan-embed-text-v2:0"));
     try std.testing.expectEqual(@as(usize, single_input_batch_size), maxBatchSize("amazon.titan-embed-image-v1"));
+    try std.testing.expectEqual(@as(usize, cohere_max_batch_size), maxBatchSize("us.cohere.embed-v4:0"));
+}
+
+pub fn testBedrockRequestFormatResolution() !void {
+    try std.testing.expectEqual(RequestFormat.titan_text, try resolveRequestFormat("amazon.titan-embed-text-v2:0", .auto));
+    try std.testing.expectEqual(RequestFormat.titan_multimodal, try resolveRequestFormat("us.amazon.titan-embed-image-v1:0", .auto));
+    try std.testing.expectEqual(RequestFormat.cohere_v4, try resolveRequestFormat(
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.cohere.embed-v4:0",
+        .auto,
+    ));
+    try std.testing.expectEqual(RequestFormat.titan_text, try resolveRequestFormat(
+        "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0",
+        .auto,
+    ));
+    try std.testing.expectEqual(RequestFormat.titan_multimodal, try resolveRequestFormat(
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings",
+        .titan_multimodal,
+    ));
+    try std.testing.expectError(
+        error.BedrockRequestFormatRequired,
+        resolveRequestFormat("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings", .auto),
+    );
+    try std.testing.expectError(
+        error.BedrockRequestFormatRequired,
+        resolveRequestFormat("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/us.amazon.titan-embed-image-v1:0", .auto),
+    );
+    try std.testing.expectError(error.InvalidBedrockRequestFormat, parseRequestFormat("future_format"));
 }
 
 pub fn testBedrockInvokePathEscapesModelId() !void {

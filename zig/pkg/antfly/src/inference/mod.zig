@@ -63,11 +63,13 @@ test "bedrock provider request helpers" {
     try bedrock.testMetadataCredentialParsers();
     try bedrock.testCredentialUrlEncoding();
     try bedrock.testRequestShapeBatchesByProviderRequest();
+    try bedrock.testBedrockRequestFormatResolution();
     try bedrock.testBedrockInvokePathEscapesModelId();
     try bedrock.testBedrockCanonicalUriDoubleEncodesEscapedModelId();
     try bedrock.testBedrockSignerUsesBedrockServiceScope();
     try bedrock.testBedrockSignerSignsGetRequests();
     try bedrock.testEndpointHostIncludesExplicitPort();
+    try managed_embedder.testBedrockRequestFormatConfiguration();
 }
 
 test "managed embedder resolves file-backed api key rotation at request time" {
