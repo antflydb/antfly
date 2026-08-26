@@ -1012,6 +1012,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/destination-authorization": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table whose stored destinations should be adopted */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Adopt stored write destinations with the current credential
+         * @description Reauthorizes the table's existing CDC routes and graph resolver destinations
+         *     using the caller's current permissions. This idempotent operation is intended
+         *     for upgrading tables created before durable destination authorization was
+         *     introduced, and for explicitly transferring destination ownership after a
+         *     credential is rotated. The caller needs admin permission on the source table
+         *     and write permission on every eventual destination table.
+         */
+        post: operations["reauthorizeTableDestinations"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/schema": {
         parameters: {
             query?: never;
@@ -8249,6 +8277,12 @@ export interface components {
             type: "full_text";
         };
         /**
+         * @description Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
+         * @default progressive
+         * @enum {string}
+         */
+        IndexPublicationPolicy: "progressive" | "atomic";
+        /**
          * @description How generation-scoped source outcomes determine derived-index completeness.
          * @default strict
          * @enum {string}
@@ -9178,6 +9212,7 @@ export interface components {
         };
         /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
         EmbeddingsIndexConfig: {
+            publication_policy?: components["schemas"]["IndexPublicationPolicy"];
             /** @description Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field. */
             coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
             /**
@@ -9668,12 +9703,16 @@ export interface components {
             enrichments?: components["schemas"]["EnrichmentConfig"][];
         } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
         /**
-         * @description Authoritative query-readiness state for the desired index incarnation.
+         * @description Authoritative query-readiness and completeness state for the desired index incarnation.
          * @enum {string}
          */
-        IndexReadinessState: "pending" | "ready" | "failed";
+        IndexReadinessState: "pending" | "queryable_partial" | "ready" | "failed";
         IndexReadinessStatus: {
             state: components["schemas"]["IndexReadinessState"];
+            /** @description Whether the published generation can safely answer queries. */
+            queryable: boolean;
+            /** @description Whether the desired incarnation has complete coverage and publication according to its configured policies. */
+            complete: boolean;
             /** @description Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents. */
             incarnation?: string;
             /**
@@ -11993,6 +12032,7 @@ export interface components {
         };
         /** @description Credential-free normalized embeddings configuration returned after creation. */
         CreatedEmbeddingsIndexConfig: {
+            publication_policy?: components["schemas"]["IndexPublicationPolicy"];
             coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
             /** @default false */
             external?: boolean;
@@ -14857,6 +14897,15 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             409: components["responses"]["Conflict"];
+            /** @description The selected backup contains durable destinations that cannot be bound to this credential type */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
         };
@@ -15229,6 +15278,15 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            /** @description Durable destinations cannot be bound to this credential type */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     dropTable: {
@@ -15452,8 +15510,66 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             409: components["responses"]["Conflict"];
+            /** @description The backup contains durable destinations that cannot be bound to this credential type */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    reauthorizeTableDestinations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table whose stored destinations should be adopted */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Destination authorization was durably adopted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        table: string;
+                        /** @enum {string} */
+                        status: "authorized";
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Caller lacks authority on the source or a destination table */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            /** @description Durable destinations cannot be bound to this credential type */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
         };
     };
     updateSchema: {
@@ -16230,6 +16346,15 @@ export interface operations {
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["Conflict"];
+            /** @description Graph resolver destinations cannot be bound to this credential type */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             429: components["responses"]["StorageResourceExhausted"];
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];

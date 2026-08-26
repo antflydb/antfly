@@ -23,4 +23,5 @@ markers = [
     "real_model: requires local or downloadable model weights",
     "postgres_integration: requires a local PostgreSQL instance",
     "slow: marks tests that are too long-running for required E2E base CI",
+    "scale: marks corpus-scale correctness gates run by dedicated scale CI",
 ]

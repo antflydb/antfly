@@ -2954,6 +2954,7 @@ pub fn build(b: *std.Build) void {
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
+            "failed destination authorization refresh reuses the idempotent restore job",
             "delayed replicated restore refresh cannot regress a running job",
             "restore job store is idempotent and fenced",
             "restore idempotency keys are scoped by principal and resource",
@@ -3608,6 +3609,7 @@ pub fn build(b: *std.Build) void {
         "partial coverage embeddings readiness counts skipped source units",
         "partial coverage embeddings readiness does not mask pending enrichment",
         "complete partial embeddings coverage is ready after active generation proof",
+        "progressive embeddings readiness exposes a queryable partial generation",
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
         "table contract rejects unsupported index kinds before admission",
@@ -5340,6 +5342,47 @@ pub fn build(b: *std.Build) void {
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
 
+    const authorization_sink_filters = [_][]const u8{
+        "api http server document scan requires table read permission",
+        "transaction principals bind sessions to credential identity",
+        "api transaction sessions enforce principal permissions and row filters",
+        "query builder runtime preflight injects mandatory row filter",
+        "MCP document sampling pushes mandatory row filters into storage scans",
+        "usermgr api key permission intersection narrows owner and key wildcards",
+        "stored destination admission requires write permission on every eventual sink",
+        "stored destination envelopes cannot be forged and validate on resume",
+        "stored destination grants bind credential source and live permissions",
+        "legacy restore jobs resume only when backed-up definitions are sink free",
+        "failed destination authorization refresh reuses the idempotent restore job",
+        "destination authorization adoption requires source table admin",
+        "legacy stored destinations can be adopted idempotently",
+        "api http server cluster restore",
+        "cluster restore repository errors preserve operational failure semantics",
+    };
+    const authorization_sink_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &authorization_sink_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_authorization_sink_tests = addFilteredTestRunArtifact(b, authorization_sink_tests);
+    run_authorization_sink_tests.step.dependOn(&openapi_root_check.step);
+    const authorization_sink_test_step = b.step(
+        "lib-api-authorization-sink-test",
+        "Run exploit regressions for API authorization sinks",
+    );
+    authorization_sink_test_step.dependOn(&run_authorization_sink_tests.step);
+    authorization_sink_test_step.dependOn(&run_lib_usermgr_tests.step);
+
+    const authorization_audit_step = b.step(
+        "authorization-audit",
+        "Run the authorization sink audit and broader API auth suite",
+    );
+    authorization_audit_step.dependOn(authorization_sink_test_step);
+    authorization_audit_step.dependOn(lib_api_auth_test_step);
+
     const algebraic_dynamic_template_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -6088,6 +6131,8 @@ pub fn build(b: *std.Build) void {
             "runtime status cache stable absence removal retires the old table epoch",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
+            "progressive embeddings readiness exposes a queryable partial generation",
+            "managed embedder preserves atomic publication policy",
             "derived coverage reasons deduplicate overlapping freshness signals",
             "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
             "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
@@ -6943,6 +6988,7 @@ pub fn build(b: *std.Build) void {
             "inference admission bridge charges combined native residency to resource manager",
             "standalone tokenizer bridge enforces growth and permits exact teardown",
             "standalone inference keep alive parses compound durations and zero",
+            "standalone data directory does not change the default models directory",
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",

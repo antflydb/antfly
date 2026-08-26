@@ -375,6 +375,7 @@ from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
+from .index_publication_policy import IndexPublicationPolicy
 from .index_readiness_state import IndexReadinessState
 from .index_readiness_status import IndexReadinessStatus
 from .index_repair_status import IndexRepairStatus
@@ -659,6 +660,8 @@ from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
+from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
+from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -1202,6 +1205,7 @@ __all__ = (
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexExecutionConfig",
+    "IndexPublicationPolicy",
     "IndexReadinessState",
     "IndexReadinessStatus",
     "IndexRepairStatus",
@@ -1482,6 +1486,8 @@ __all__ = (
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",
     "QueryTemporarilyUnavailableErrorCode",
+    "ReauthorizeTableDestinationsResponse200",
+    "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
     "RepairIssueListRequest",
     "RepairRunRequest",

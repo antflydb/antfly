@@ -828,8 +828,9 @@ pub const RuntimeIndexStatusReport = struct {
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
     repair_status: ?IndexRepairStatus = null,
-    /// This proof is meaningful only while repair_status is non-null. Missing
-    /// proof is deliberately false so mixed-version reports fail closed.
+    /// This proof is meaningful only while repair_status is non-null. It means
+    /// the active generation is safe to query, not necessarily complete.
+    /// Missing proof is deliberately false so mixed-version reports fail closed.
     repair_active_generation_serviceable: bool = false,
 };
 
