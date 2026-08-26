@@ -134,6 +134,43 @@ pub const WorkBudget = struct {
     }
 };
 
+/// A byte reservation tied to the lifetime of one transient owner. Reserve
+/// before allocating, transfer the lease with the owner, and release it from
+/// deinit. A null budget keeps internal/test callers lightweight.
+pub const RetainedLease = struct {
+    budget: ?*WorkBudget = null,
+    bytes: usize = 0,
+
+    pub fn init(budget: ?*WorkBudget, bytes: usize) !RetainedLease {
+        if (budget) |value| try value.retainStateBytes(bytes);
+        return .{ .budget = budget, .bytes = bytes };
+    }
+
+    pub fn resize(self: *RetainedLease, bytes: usize) !void {
+        const budget = self.budget orelse {
+            self.bytes = bytes;
+            return;
+        };
+        if (bytes > self.bytes) {
+            try budget.retainStateBytes(bytes - self.bytes);
+        } else if (bytes < self.bytes) {
+            budget.releaseStateBytes(self.bytes - bytes);
+        }
+        self.bytes = bytes;
+    }
+
+    pub fn deinit(self: *RetainedLease) void {
+        if (self.budget) |budget| budget.releaseStateBytes(self.bytes);
+        self.* = .{};
+    }
+
+    /// Convert a live reservation into a request-consumptive output charge.
+    /// Use only when the owned bytes escape the budget's lifetime.
+    pub fn consume(self: *RetainedLease) void {
+        self.* = .{};
+    }
+};
+
 fn edgeOwnedBytes(edges: []const graph_mod.Edge) !usize {
     var total: usize = 0;
     for (edges) |edge| {

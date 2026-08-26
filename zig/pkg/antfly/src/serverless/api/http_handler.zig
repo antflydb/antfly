@@ -5938,7 +5938,7 @@ fn graphResultNodeFromTraversalAlloc(
         .key = key,
         .table = table,
         .depth = node.depth,
-        .distance = node.total_weight,
+        .distance = node.distance,
         .path = path,
         .path_tables = path_tables,
         .path_edges = null,

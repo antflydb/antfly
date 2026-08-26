@@ -30,9 +30,13 @@ func TestGraphQueryConstructors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	neighborCount, err := CountGraphAlias("b", true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	graphReturn, err := NewGraphAggregatesReturn(map[string]GraphCountAggregate{
 		"rows":      CountGraphRows(),
-		"neighbors": CountGraphAlias("b", true),
+		"neighbors": neighborCount,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -359,11 +363,21 @@ func TestGraphAggregateConstructorEnforcesComplexityBudget(t *testing.T) {
 }
 
 func TestGraphAggregateConstructorAllowsDuplicateExpressionsUnderDifferentNames(t *testing.T) {
+	personCount, err := CountGraphAlias("person", true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := NewGraphAggregatesReturn(map[string]GraphCountAggregate{
-		"first":  CountGraphAlias("person", true),
-		"second": CountGraphAlias("person", true),
+		"first":  personCount,
+		"second": personCount,
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCountGraphAliasRejectsInvalidIdentifier(t *testing.T) {
+	if _, err := CountGraphAlias("$internal", true); err == nil {
+		t.Fatal("expected invalid graph count alias error")
 	}
 }
 

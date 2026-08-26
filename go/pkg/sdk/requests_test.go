@@ -49,6 +49,24 @@ func TestQueryRequestMarshalRejectsMixedGraphContracts(t *testing.T) {
 	}
 }
 
+func TestQueryRequestMarshalValidatesDirectGraphUnionValues(t *testing.T) {
+	start, err := NewGraphKeySelector("doc:a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var direct GraphQuery
+	if err := direct.FromGraphTraverseQuery(GraphTraverseQuery{
+		Traverse: GraphTraversal{Start: start, MaxDepth: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := json.Marshal(QueryRequest{
+		GraphQueries: map[string]GraphQuery{"walk": direct},
+	}); err == nil {
+		t.Fatal("expected direct graph union value with an empty index to fail locally")
+	}
+}
+
 func TestQueryRequestMarshalPreservesHierarchy(t *testing.T) {
 	body, err := json.Marshal(QueryRequest{
 		Hierarchy: &QueryHierarchy{

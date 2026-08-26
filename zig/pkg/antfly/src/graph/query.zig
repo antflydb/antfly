@@ -874,7 +874,7 @@ fn traversalResultNodeAlloc(
         .key = key,
         .table = table,
         .depth = result.depth,
-        .distance = result.total_weight,
+        .distance = result.distance,
         .path = path,
         .path_tables = path_tables,
         .path_edges = null,

@@ -25,7 +25,7 @@ class GraphResultNode:
         key (str): Document key
         table (str | Unset): Owning table for a cross-table node; omitted for nodes in the queried table
         depth (int | Unset): Distance from start node
-        distance (float | Unset): Weighted distance
+        distance (float | Unset): Hop distance for traversal results, or the selected edge-weight cost for path results
         document (GraphResultNodeDocument | Unset): Full document (if include_documents=true)
         path (list[GraphPathEndpoint] | Unset): Exact ordered node identities in the path from the start node to this
             node

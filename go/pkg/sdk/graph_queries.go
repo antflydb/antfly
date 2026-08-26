@@ -45,12 +45,69 @@ func validateNamedGraphQueries(queries map[string]GraphQuery) error {
 	if len(queries) > maxNamedGraphQueries {
 		return fmt.Errorf("antfly: graph_queries accepts at most %d named operations", maxNamedGraphQueries)
 	}
-	for name := range queries {
+	for name, query := range queries {
 		if !validGraphQueryName(name) {
 			return invalidGraphIdentifier("graph_queries key")
 		}
+		if err := validateGraphQuery(query); err != nil {
+			return fmt.Errorf("antfly: graph_queries[%q]: %w", name, err)
+		}
 	}
 	return nil
+}
+
+func validateGraphQuery(query GraphQuery) error {
+	encoded, err := json.Marshal(query)
+	if err != nil {
+		return fmt.Errorf("invalid graph query: %w", err)
+	}
+	var shape struct {
+		Match          json.RawMessage `json:"match"`
+		Traverse       json.RawMessage `json:"traverse"`
+		ShortestPath   json.RawMessage `json:"shortest_path"`
+		KShortestPaths json.RawMessage `json:"k_shortest_paths"`
+	}
+	if err := json.Unmarshal(encoded, &shape); err != nil {
+		return fmt.Errorf("invalid graph query: %w", err)
+	}
+	variants := 0
+	for _, value := range []json.RawMessage{shape.Match, shape.Traverse, shape.ShortestPath, shape.KShortestPaths} {
+		if value != nil {
+			variants++
+		}
+	}
+	if variants != 1 {
+		return fmt.Errorf("graph query must contain exactly one of match, traverse, shortest_path, or k_shortest_paths")
+	}
+	switch {
+	case shape.Match != nil:
+		value, err := query.AsGraphMatchQuery()
+		if err != nil {
+			return err
+		}
+		return validateGraphMatchQuery(value)
+	case shape.Traverse != nil:
+		value, err := query.AsGraphTraverseQuery()
+		if err != nil {
+			return err
+		}
+		return validateGraphTraverseQuery(value)
+	case shape.ShortestPath != nil:
+		value, err := query.AsGraphShortestPathQuery()
+		if err != nil {
+			return err
+		}
+		return validateGraphPathQuery(value.Index, value.ShortestPath.From, value.ShortestPath.To, value.ShortestPath.EdgeTypes, value.ShortestPath.MaxDepth, value.ShortestPath.MinWeight, value.ShortestPath.MaxWeight, value.ShortestPath.IncludeDocuments, value.ShortestPath.Fields)
+	default:
+		value, err := query.AsGraphKShortestPathsQuery()
+		if err != nil {
+			return err
+		}
+		if value.KShortestPaths.K < 1 || value.KShortestPaths.K > 100 {
+			return fmt.Errorf("graph k must be between 1 and 100")
+		}
+		return validateGraphPathQuery(value.Index, value.KShortestPaths.From, value.KShortestPaths.To, value.KShortestPaths.EdgeTypes, value.KShortestPaths.MaxDepth, value.KShortestPaths.MinWeight, value.KShortestPaths.MaxWeight, value.KShortestPaths.IncludeDocuments, value.KShortestPaths.Fields)
+	}
 }
 
 // NewGraphDocumentFilter adapts the non-scoring stored-document subset of the
@@ -475,15 +532,18 @@ func CountGraphRows() GraphCountAggregate {
 
 // CountGraphAlias counts non-null bindings for alias. Set distinct to count
 // unique (table, key) node identities.
-func CountGraphAlias(alias string, distinct bool) GraphCountAggregate {
+func CountGraphAlias(alias string, distinct bool) (GraphCountAggregate, error) {
+	if !validGraphIdentifier(alias) {
+		return GraphCountAggregate{}, invalidGraphIdentifier("graph count alias")
+	}
 	var aggregate GraphCountAggregate
 	if err := aggregate.FromGraphAliasCountAggregate(GraphAliasCountAggregate{
 		Count:    alias,
 		Distinct: distinct,
 	}); err != nil {
-		panic(fmt.Sprintf("antfly: construct count(%s): %v", alias, err))
+		return GraphCountAggregate{}, fmt.Errorf("antfly: construct count(%s): %w", alias, err)
 	}
-	return aggregate
+	return aggregate, nil
 }
 
 // NewGraphNotEqual rejects rows where two aliases resolve to the same exact

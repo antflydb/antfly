@@ -100,6 +100,8 @@ pub const PatternMatch = struct {
     /// binding representation while giving the public row encoder true null
     /// semantics.
     null_aliases: [][]u8 = &.{},
+    retained_budget: ?*WorkBudget = null,
+    retained_state_bytes: usize = 0,
 
     /// Transfer every owned slice out of this match and leave it safe to
     /// deinitialize. Keeping the move operation with the owning type prevents
@@ -116,6 +118,7 @@ pub const PatternMatch = struct {
         freePathEdges(alloc, self.path);
         for (self.null_aliases) |alias| alloc.free(alias);
         if (self.null_aliases.len > 0) alloc.free(self.null_aliases);
+        if (self.retained_budget) |budget| budget.releaseStateBytes(self.retained_state_bytes);
         self.* = undefined;
     }
 };
@@ -1604,6 +1607,8 @@ pub fn matchConjunctivePatternWithEdgeReader(
         );
     }
 
+    var local_output_work_budget = WorkBudget.init(opts.max_explored_nodes, opts.max_explored_edges);
+    const output_work_budget = opts.work_budget orelse &local_output_work_budget;
     var current = try buildConjunctiveStates(alloc, edge_reader, start_keys, pattern, opts);
     defer freeConjunctiveStates(alloc, &current);
 
@@ -1617,7 +1622,13 @@ pub fn matchConjunctivePatternWithEdgeReader(
     var projection = try AliasProjection.init(alloc, opts.return_aliases);
     defer projection.deinit(alloc);
     for (current.items[0..result_len], 0..) |state, i| {
-        results[i] = try projectConjunctiveState(alloc, state, &projection);
+        results[i] = try projectConjunctiveState(
+            alloc,
+            state,
+            &projection,
+            output_work_budget,
+            opts.work_budget,
+        );
         initialized += 1;
     }
     return results;
@@ -1651,7 +1662,13 @@ fn matchConjunctivePatternLimitedWithEdgeReader(
     } else null;
     defer if (filtered_starts) |mask| alloc.free(mask);
 
-    var sink = try ConjunctiveBindingSink.init(alloc, opts.return_aliases, opts.max_results);
+    var sink = try ConjunctiveBindingSink.init(
+        alloc,
+        opts.return_aliases,
+        opts.max_results,
+        work_budget,
+        opts.work_budget,
+    );
     defer sink.deinit(alloc);
     const processed = try alloc.alloc(bool, pattern.edges.len);
     defer alloc.free(processed);
@@ -2108,16 +2125,22 @@ const ConjunctiveAggregateSink = struct {
 const ConjunctiveBindingSink = struct {
     projection: AliasProjection,
     max_results: u32,
+    work_budget: *WorkBudget,
+    returned_state_budget: ?*WorkBudget,
     matches: std.ArrayListUnmanaged(PatternMatch) = .empty,
 
     fn init(
         alloc: Allocator,
         return_aliases: []const []const u8,
         max_results: u32,
+        work_budget: *WorkBudget,
+        returned_state_budget: ?*WorkBudget,
     ) !@This() {
         return .{
             .projection = try AliasProjection.init(alloc, return_aliases),
             .max_results = max_results,
+            .work_budget = work_budget,
+            .returned_state_budget = returned_state_budget,
         };
     }
 
@@ -2127,9 +2150,17 @@ const ConjunctiveBindingSink = struct {
 
     fn observe(self: *@This(), alloc: Allocator, state: ConjunctiveState) !void {
         if (self.full()) return;
-        var projected = try projectConjunctiveState(alloc, state, &self.projection);
+        var projected = try projectConjunctiveState(
+            alloc,
+            state,
+            &self.projection,
+            self.work_budget,
+            self.returned_state_budget,
+        );
         errdefer projected.deinit(alloc);
-        try self.matches.append(alloc, projected);
+        if (self.matches.capacity == self.matches.items.len)
+            try self.matches.ensureTotalCapacityPrecise(alloc, self.matches.items.len + 1);
+        self.matches.appendAssumeCapacity(projected);
     }
 
     fn finish(self: *@This(), alloc: Allocator) ![]PatternMatch {
@@ -2855,7 +2886,17 @@ const AliasProjection = struct {
     }
 };
 
-fn projectConjunctiveState(alloc: Allocator, state: ConjunctiveState, projection: *const AliasProjection) !PatternMatch {
+fn projectConjunctiveState(
+    alloc: Allocator,
+    state: ConjunctiveState,
+    projection: *const AliasProjection,
+    work_budget: *WorkBudget,
+    returned_state_budget: ?*WorkBudget,
+) !PatternMatch {
+    const retained_bytes = projectedConjunctiveStateRetainedBytes(state, projection) catch
+        return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    try work_budget.retainStateBytes(retained_bytes);
+    errdefer work_budget.releaseStateBytes(retained_bytes);
     var bindings = std.ArrayListUnmanaged(PatternBinding).empty;
     errdefer {
         for (bindings.items) |*binding| binding.deinit(alloc);
@@ -2880,11 +2921,77 @@ fn projectConjunctiveState(alloc: Allocator, state: ConjunctiveState, projection
         if (!projection.contains(alias)) continue;
         try null_aliases.append(alloc, try alloc.dupe(u8, alias));
     }
+
+    const owned_bindings = try bindings.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_bindings) |*binding| binding.deinit(alloc);
+        if (owned_bindings.len > 0) alloc.free(owned_bindings);
+    }
+    const owned_null_aliases = try null_aliases.toOwnedSlice(alloc);
     return .{
-        .bindings = try bindings.toOwnedSlice(alloc),
+        .bindings = owned_bindings,
         .path = &.{},
-        .null_aliases = try null_aliases.toOwnedSlice(alloc),
+        .null_aliases = owned_null_aliases,
+        .retained_budget = returned_state_budget,
+        .retained_state_bytes = retained_bytes,
     };
+}
+
+fn projectedConjunctiveStateRetainedBytes(
+    state: ConjunctiveState,
+    projection: *const AliasProjection,
+) !usize {
+    var total: usize = @sizeOf(PatternMatch);
+    var binding_count: usize = 0;
+    for (state.bindings) |binding| {
+        if (!projection.contains(binding.alias)) continue;
+        binding_count = try std.math.add(usize, binding_count, 1);
+        total = try std.math.add(usize, total, binding.alias.len);
+        total = try std.math.add(usize, total, binding.key.len);
+        if (binding.table) |table| total = try std.math.add(usize, total, table.len);
+    }
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, binding_count, @sizeOf(PatternBinding)),
+    );
+    var null_count: usize = 0;
+    for (state.null_aliases) |alias| {
+        if (!projection.contains(alias)) continue;
+        null_count = try std.math.add(usize, null_count, 1);
+        total = try std.math.add(usize, total, alias.len);
+    }
+    return try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, null_count, @sizeOf([]u8)),
+    );
+}
+
+test "projected MATCH rows reserve and release retained output bytes" {
+    const alloc = std.testing.allocator;
+    var source_bindings = [_]PatternBinding{.{
+        .alias = @constCast("person"),
+        .key = @constCast("person:1"),
+        .depth = 0,
+    }};
+    const state = ConjunctiveState{ .bindings = source_bindings[0..] };
+    var projection = try AliasProjection.init(alloc, &.{});
+    defer projection.deinit(alloc);
+
+    var budget = WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 1;
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        projectConjunctiveState(alloc, state, &projection, &budget, &budget),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+
+    budget.max_retained_state_bytes = default_max_retained_state_bytes;
+    var result = try projectConjunctiveState(alloc, state, &projection, &budget, &budget);
+    try std.testing.expect(budget.retained_state_bytes > 0);
+    result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
 }
 
 fn freeConjunctiveStates(alloc: Allocator, states: *std.ArrayListUnmanaged(ConjunctiveState)) void {

@@ -5467,7 +5467,7 @@ pub const GraphResultNode = struct {
     table: ?[]const u8 = null,
     /// Distance from start node
     depth: ?i64 = null,
-    /// Weighted distance
+    /// Hop distance for traversal results, or the selected edge-weight cost for path results
     distance: ?f64 = null,
     /// Full document (if include_documents=true)
     document: ?std.json.Value = null,

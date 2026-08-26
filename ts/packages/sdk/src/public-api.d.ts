@@ -12484,7 +12484,7 @@ export interface components {
             depth?: number;
             /**
              * Format: double
-             * @description Weighted distance
+             * @description Hop distance for traversal results, or the selected edge-weight cost for path results
              */
             distance?: number;
             /** @description Full document (if include_documents=true) */

@@ -68,6 +68,11 @@ pub const ResultAdmission = struct {
 pub const TraversalResult = struct {
     key: []const u8,
     depth: u32,
+    /// Hop distance from the start node. Traversal is breadth-first; callers
+    /// that need an edge-weight cost must use a path query.
+    distance: f64,
+    /// Sum of raw edge weights along the selected BFS path. Kept separately
+    /// from distance for the legacy direct traversal response.
     total_weight: f64,
     path: ?[]const []const u8, // if include_paths
     /// Table of the reached node, when the edge that reached it declared a
@@ -225,7 +230,7 @@ pub fn traverseWithEdgeReader(
     try queue.append(alloc, .{
         .ancestry = start_ancestry,
         .depth = 0,
-        .total_weight = 1.0,
+        .total_weight = 0,
     });
 
     if (effective_rules.deduplicate) {
@@ -332,10 +337,12 @@ pub fn traverseWithEdgeReader(
             try work_budget.checkIntermediateStates(pending_states + 1, effective_rules.max_intermediate_states);
             try work_budget.consumeNode();
             const next_ancestry = try ancestry.append(next_key, target_table, current.ancestry);
+            const total_weight = current.total_weight + edge.weight;
+            if (!std.math.isFinite(total_weight)) return error.GraphPathWeightOverflow;
             try queue.append(alloc, .{
                 .ancestry = next_ancestry,
                 .depth = current.depth + 1,
-                .total_weight = current.total_weight * edge.weight,
+                .total_weight = total_weight,
             });
         }
     }
@@ -388,6 +395,7 @@ fn traversalResultFromQueueEntry(
     return .{
         .key = key,
         .depth = entry.depth,
+        .distance = @floatFromInt(entry.depth),
         .total_weight = entry.total_weight,
         .path = path,
         .target_table = target_table,
@@ -635,8 +643,8 @@ test "traversal max_depth limiting" {
     defer g.close();
 
     // A -> B -> C -> D (chain)
-    try g.addEdge("A", "B", "next", 1.0, 0, 0, "");
-    try g.addEdge("B", "C", "next", 1.0, 0, 0, "");
+    try g.addEdge("A", "B", "next", 2.0, 0, 0, "");
+    try g.addEdge("B", "C", "next", 3.0, 0, 0, "");
     try g.addEdge("C", "D", "next", 1.0, 0, 0, "");
 
     // Depth 2: should reach B and C but not D
@@ -646,8 +654,11 @@ test "traversal max_depth limiting" {
     try std.testing.expectEqual(@as(usize, 2), results.len);
     try std.testing.expectEqualStrings("B", results[0].key);
     try std.testing.expectEqual(@as(u32, 1), results[0].depth);
+    try std.testing.expectEqual(@as(f64, 1), results[0].distance);
     try std.testing.expectEqualStrings("C", results[1].key);
     try std.testing.expectEqual(@as(u32, 2), results[1].depth);
+    try std.testing.expectEqual(@as(f64, 2), results[1].distance);
+    try std.testing.expectEqual(@as(f64, 5), results[1].total_weight);
 }
 
 test "traversal deduplication" {

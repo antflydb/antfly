@@ -3437,7 +3437,7 @@ components:
           type: number
           format: double
           minimum: 0
-          description: "Weighted distance"
+          description: "Hop distance for traversal results, or the selected edge-weight cost for path results"
         document:
           x-go-type-skip-optional-pointer: true
           type: object

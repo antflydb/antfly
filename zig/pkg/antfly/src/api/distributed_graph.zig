@@ -29,6 +29,7 @@ const graph_node_identity = @import("../graph/node_identity.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
 const graph_traversal_mod = @import("../graph/traversal.zig");
+const graph_work_budget = @import("../graph/work_budget.zig");
 const graph_work_budget_diagnostic = @import("../graph/work_budget_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
@@ -1053,6 +1054,46 @@ const QueryState = struct {
     hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
     path_states: std.ArrayListUnmanaged(PathState) = .empty,
     seen: graph_node_identity.Map(void) = .{},
+    work_budget: ?*graph_pattern_mod.WorkBudget = null,
+    seen_retained_bytes: usize = 0,
+
+    fn putSeenIfAbsent(
+        self: *QueryState,
+        alloc: std.mem.Allocator,
+        ref: graph_node_identity.Ref,
+    ) !bool {
+        if (self.seen.contains(ref)) return false;
+        var retained_bytes = std.math.add(usize, @sizeOf(graph_node_identity.Key), ref.key.len) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        if (ref.table) |table| retained_bytes = std.math.add(usize, retained_bytes, table.len) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        // Account conservatively for the hash-table bucket and control data,
+        // not only the separately allocated identity bytes.
+        retained_bytes = std.math.add(usize, retained_bytes, 3 * @sizeOf(usize)) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        if (self.work_budget) |budget| try budget.retainStateBytes(retained_bytes);
+        errdefer if (self.work_budget) |budget| budget.releaseStateBytes(retained_bytes);
+        if (!try self.seen.putIfAbsent(alloc, ref, {})) {
+            if (self.work_budget) |budget| budget.releaseStateBytes(retained_bytes);
+            return false;
+        }
+        self.seen_retained_bytes += retained_bytes;
+        return true;
+    }
+
+    fn releaseSeenBudget(self: *QueryState) void {
+        if (self.work_budget) |budget| budget.releaseStateBytes(self.seen_retained_bytes);
+        self.seen_retained_bytes = 0;
+    }
 
     fn deinit(self: *QueryState, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -1063,6 +1104,7 @@ const QueryState = struct {
         for (self.path_states.items) |*path_state| path_state.deinit(alloc);
         self.path_states.deinit(alloc);
         self.seen.deinit(alloc);
+        self.releaseSeenBudget();
         self.* = undefined;
     }
 
@@ -1070,6 +1112,7 @@ const QueryState = struct {
         for (self.path_states.items) |*path_state| path_state.deinit(alloc);
         self.path_states.deinit(alloc);
         self.seen.deinit(alloc);
+        self.releaseSeenBudget();
         self.path_states = .empty;
         self.seen = .{};
     }
@@ -1078,6 +1121,8 @@ const QueryState = struct {
 const TargetNodeSet = struct {
     exact: graph_node_identity.Map(void) = .{},
     wildcard_keys: std.StringHashMapUnmanaged(void) = .empty,
+    work_budget: ?*graph_pattern_mod.WorkBudget = null,
+    retained_state_bytes: usize = 0,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -1086,6 +1131,7 @@ const TargetNodeSet = struct {
         base_result: db_mod.types.SearchResult,
         prior_results: []const db_mod.types.GraphSearchResult,
         selector: graph_query_mod.NodeSelector,
+        work_budget: ?*graph_pattern_mod.WorkBudget,
     ) !TargetNodeSet {
         const nodes = try resolveSelectorNodes(
             alloc,
@@ -1097,22 +1143,49 @@ const TargetNodeSet = struct {
         );
         defer freeNodeIdentities(alloc, nodes);
 
-        var out = TargetNodeSet{};
+        var out = TargetNodeSet{ .work_budget = work_budget };
         errdefer out.deinit(alloc);
         switch (selector) {
             .keys => {
                 for (nodes) |node| {
                     if (out.wildcard_keys.contains(node.key)) continue;
+                    const retained_bytes = std.math.add(usize, node.key.len, 3 * @sizeOf(usize)) catch
+                        return if (work_budget) |budget|
+                            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+                        else
+                            error.OutOfMemory;
+                    if (work_budget) |budget| try budget.retainStateBytes(retained_bytes);
+                    errdefer if (work_budget) |budget| budget.releaseStateBytes(retained_bytes);
                     const key = try alloc.dupe(u8, node.key);
                     out.wildcard_keys.putNoClobber(alloc, key, {}) catch |err| {
                         alloc.free(key);
                         return err;
                     };
+                    out.retained_state_bytes += retained_bytes;
                 }
             },
             .identities, .result_ref => {
                 for (nodes) |node| {
+                    if (out.exact.contains(node.ref())) continue;
+                    var retained_bytes = std.math.add(usize, @sizeOf(graph_node_identity.Key), node.key.len) catch
+                        return if (work_budget) |budget|
+                            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+                        else
+                            error.OutOfMemory;
+                    if (node.table) |table| retained_bytes = std.math.add(usize, retained_bytes, table.len) catch
+                        return if (work_budget) |budget|
+                            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+                        else
+                            error.OutOfMemory;
+                    retained_bytes = std.math.add(usize, retained_bytes, 3 * @sizeOf(usize)) catch
+                        return if (work_budget) |budget|
+                            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+                        else
+                            error.OutOfMemory;
+                    if (work_budget) |budget| try budget.retainStateBytes(retained_bytes);
+                    errdefer if (work_budget) |budget| budget.releaseStateBytes(retained_bytes);
                     _ = try out.exact.putIfAbsent(alloc, node.ref(), {});
+                    out.retained_state_bytes += retained_bytes;
                 }
             },
         }
@@ -1133,6 +1206,7 @@ const TargetNodeSet = struct {
         var it = self.wildcard_keys.keyIterator();
         while (it.next()) |key| alloc.free(key.*);
         self.wildcard_keys.deinit(alloc);
+        if (self.work_budget) |budget| budget.releaseStateBytes(self.retained_state_bytes);
         self.* = .{};
     }
 };
@@ -1474,11 +1548,13 @@ const PathState = struct {
     cost: f64,
     parent: ?u32 = null,
     incoming_edge: ?graph_query_mod.PathEdgeInfo = null,
+    retained_lease: graph_work_budget.RetainedLease = .{},
 
     fn deinit(self: *PathState, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
         if (self.incoming_edge) |edge| freeOwnedPathEdge(alloc, edge);
+        self.retained_lease.deinit();
         self.* = undefined;
     }
 };
@@ -1490,10 +1566,12 @@ const FrontierState = struct {
     distance: f64 = 0,
     cost: f64 = 0,
     path_state_id: ?u32 = null,
+    retained_lease: graph_work_budget.RetainedLease = .{},
 
     fn deinit(self: *FrontierState, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
+        self.retained_lease.deinit();
         self.* = undefined;
     }
 };
@@ -1506,15 +1584,18 @@ const PathCostLabels = struct {
 
     values: graph_node_identity.Map(std.ArrayListUnmanaged(Label)) = .{},
     max_depth: u32,
+    work_budget: ?*graph_pattern_mod.WorkBudget = null,
+    retained_state_bytes: usize = 0,
 
-    fn init(max_depth: u32) PathCostLabels {
-        return .{ .max_depth = max_depth };
+    fn init(max_depth: u32, work_budget: ?*graph_pattern_mod.WorkBudget) PathCostLabels {
+        return .{ .max_depth = max_depth, .work_budget = work_budget };
     }
 
     fn deinit(self: *PathCostLabels, alloc: std.mem.Allocator) void {
         var it = self.values.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.values.deinit(alloc);
+        if (self.work_budget) |budget| budget.releaseStateBytes(self.retained_state_bytes);
         self.* = undefined;
     }
 
@@ -1542,14 +1623,38 @@ const PathCostLabels = struct {
                     index += 1;
                 }
             }
-            try labels.append(alloc, .{ .depth = depth, .cost = cost });
+            const added_bytes: usize = if (labels.capacity == labels.items.len) @sizeOf(Label) else 0;
+            if (self.work_budget) |budget| try budget.retainStateBytes(added_bytes);
+            errdefer if (self.work_budget) |budget| budget.releaseStateBytes(added_bytes);
+            if (added_bytes > 0) try labels.ensureTotalCapacityPrecise(alloc, labels.items.len + 1);
+            labels.appendAssumeCapacity(.{ .depth = depth, .cost = cost });
+            self.retained_state_bytes += added_bytes;
             return true;
         }
 
+        var added_bytes = std.math.add(usize, @sizeOf(graph_node_identity.Key), ref.key.len) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        if (ref.table) |table| added_bytes = std.math.add(usize, added_bytes, table.len) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        added_bytes = std.math.add(usize, added_bytes, 3 * @sizeOf(usize) + @sizeOf(Label)) catch
+            return if (self.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        if (self.work_budget) |budget| try budget.retainStateBytes(added_bytes);
+        errdefer if (self.work_budget) |budget| budget.releaseStateBytes(added_bytes);
         var labels = std.ArrayListUnmanaged(Label).empty;
         errdefer labels.deinit(alloc);
-        try labels.append(alloc, .{ .depth = depth, .cost = cost });
+        try labels.ensureTotalCapacityPrecise(alloc, 1);
+        labels.appendAssumeCapacity(.{ .depth = depth, .cost = cost });
         _ = try self.values.putIfAbsent(alloc, ref, labels);
+        self.retained_state_bytes += added_bytes;
         return true;
     }
 
@@ -1571,7 +1676,7 @@ const PathCostLabels = struct {
 };
 
 test "distributed bounded paths retain non-dominated cost and depth labels" {
-    var labels = PathCostLabels.init(2);
+    var labels = PathCostLabels.init(2, null);
     defer labels.deinit(std.testing.allocator);
     const node = graph_node_identity.Ref{ .table = "docs", .key = "X" };
     try std.testing.expect(try labels.recordIfPareto(std.testing.allocator, node, 2, 0));
@@ -1579,6 +1684,23 @@ test "distributed bounded paths retain non-dominated cost and depth labels" {
     try std.testing.expect(!try labels.recordIfPareto(std.testing.allocator, node, 2, 1));
     try std.testing.expect(labels.isCurrentPareto(node, 2, 0));
     try std.testing.expect(labels.isCurrentPareto(node, 1, 1));
+
+    var budget = graph_pattern_mod.WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 1;
+    var bounded = PathCostLabels.init(2, &budget);
+    var bounded_owned = true;
+    defer if (bounded_owned) bounded.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        bounded.recordIfPareto(std.testing.allocator, node, 1, 0),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    budget.max_retained_state_bytes = graph_pattern_mod.default_max_retained_state_bytes;
+    try std.testing.expect(try bounded.recordIfPareto(std.testing.allocator, node, 1, 0));
+    try std.testing.expect(budget.retained_state_bytes > 0);
+    bounded.deinit(std.testing.allocator);
+    bounded_owned = false;
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
 }
 
 fn graphNodeAdmissionRequest(
@@ -2137,7 +2259,10 @@ fn executeDistributedPattern(
     request_distinct_budget: *graph_pattern_mod.DistinctBudget,
 ) !db_mod.types.GraphSearchResult {
     // Resolve start keys.
-    var state = QueryState{ .name = try alloc.dupe(u8, graph_query.name) };
+    var state = QueryState{
+        .name = try alloc.dupe(u8, graph_query.name),
+        .work_budget = request_work_budget,
+    };
     errdefer state.deinit(alloc);
     const edge_reader = DistributedEdgeReader{
         .catalog = catalog,
@@ -2204,13 +2329,15 @@ fn executeDistributedPattern(
     defer graph_pattern_mod.freeMatches(alloc, raw_matches);
 
     // Convert PatternMatch to GraphPatternMatch.
-    const matches = try convertPatternMatches(alloc, raw_matches);
+    const matches = try convertPatternMatches(alloc, raw_matches, request_work_budget);
     errdefer {
         for (matches) |*m| m.deinit(alloc);
         if (matches.len > 0) alloc.free(matches);
     }
 
     // Collect unique node keys from all bindings for hydration.
+    const unique_nodes_reservation = try reserveUniqueMatchNodeUpperBound(raw_matches, request_work_budget);
+    defer request_work_budget.releaseStateBytes(unique_nodes_reservation);
     const unique_nodes = try graph_query_mod.collectUniqueNodesFromMatches(alloc, raw_matches);
     defer {
         for (unique_nodes) |*n| n.deinit(alloc);
@@ -2553,11 +2680,20 @@ fn executeDistributedConjunctivePattern(
     }
 
     const result_len = @min(collected_matches.items.len, graph_query.query.return_limit);
-    const matches = try convertPatternMatches(alloc, collected_matches.items[0..result_len]);
+    const matches = try convertPatternMatches(
+        alloc,
+        collected_matches.items[0..result_len],
+        request_work_budget,
+    );
     errdefer {
         for (matches) |*match| match.deinit(alloc);
         if (matches.len > 0) alloc.free(matches);
     }
+    const unique_nodes_reservation = try reserveUniqueMatchNodeUpperBound(
+        collected_matches.items[0..result_len],
+        request_work_budget,
+    );
+    defer request_work_budget.releaseStateBytes(unique_nodes_reservation);
     const unique_nodes = try graph_query_mod.collectUniqueNodesFromMatches(alloc, collected_matches.items[0..result_len]);
     defer {
         for (unique_nodes) |*node| node.deinit(alloc);
@@ -2643,7 +2779,12 @@ const DistributedPatternFilterEvaluator = struct {
 fn convertPatternMatches(
     alloc: std.mem.Allocator,
     raw_matches: []const graph_pattern_mod.PatternMatch,
+    work_budget: *graph_pattern_mod.WorkBudget,
 ) ![]db_mod.types.GraphPatternMatch {
+    const retained_bytes = convertedPatternMatchesRetainedBytes(raw_matches) catch
+        return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    try work_budget.retainStateBytes(retained_bytes);
+    errdefer work_budget.releaseStateBytes(retained_bytes);
     const matches = try alloc.alloc(db_mod.types.GraphPatternMatch, raw_matches.len);
     var initialized: usize = 0;
     errdefer {
@@ -2696,6 +2837,65 @@ fn convertPatternMatches(
     }
 
     return matches;
+}
+
+/// Final graph matches outlive the request-local WorkBudget, so their charge is
+/// intentionally consumptive. This preflight happens before any output clone,
+/// bounding the temporary source+destination peak as well as the response.
+fn convertedPatternMatchesRetainedBytes(
+    raw_matches: []const graph_pattern_mod.PatternMatch,
+) !usize {
+    var total = try std.math.mul(usize, raw_matches.len, @sizeOf(db_mod.types.GraphPatternMatch));
+    for (raw_matches) |match| {
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, match.bindings.len, @sizeOf(db_mod.types.GraphPatternBinding)),
+        );
+        for (match.bindings) |binding| {
+            total = try std.math.add(usize, total, binding.alias.len);
+            total = try std.math.add(usize, total, @sizeOf(graph_query_mod.GraphResultNode));
+            total = try std.math.add(usize, total, binding.key.len);
+            if (binding.table) |table| total = try std.math.add(usize, total, table.len);
+        }
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, match.path.len, @sizeOf(graph_query_mod.PathEdgeInfo)),
+        );
+        for (match.path) |edge| {
+            total = try std.math.add(usize, total, edge.source.len);
+            total = try std.math.add(usize, total, edge.target.len);
+            total = try std.math.add(usize, total, edge.edge_type.len);
+            total = try std.math.add(usize, total, edge.metadata.len);
+        }
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, match.null_aliases.len, @sizeOf([]u8)),
+        );
+        for (match.null_aliases) |alias| total = try std.math.add(usize, total, alias.len);
+    }
+    return total;
+}
+
+fn reserveUniqueMatchNodeUpperBound(
+    raw_matches: []const graph_pattern_mod.PatternMatch,
+    work_budget: *graph_pattern_mod.WorkBudget,
+) !usize {
+    var total: usize = 0;
+    for (raw_matches) |match| {
+        for (match.bindings) |binding| {
+            total = std.math.add(usize, total, @sizeOf(graph_query_mod.GraphResultNode)) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+            total = std.math.add(usize, total, binding.key.len) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+            if (binding.table) |table| total = std.math.add(usize, total, table.len) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+        }
+    }
+    try work_budget.retainStateBytes(total);
+    return total;
 }
 
 fn convertPatternBinding(
@@ -2768,10 +2968,14 @@ fn executeDistributedTraverse(
             base_result,
             prior_results,
             selector,
+            request_work_budget,
         );
     }
 
-    var state = QueryState{ .name = try alloc.dupe(u8, graph_query.name) };
+    var state = QueryState{
+        .name = try alloc.dupe(u8, graph_query.name),
+        .work_budget = request_work_budget,
+    };
     errdefer state.deinit(alloc);
 
     var frontier = try resolveStartFrontier(alloc, &state, table_name, req, base_result, prior_results, graph_query.query.start_nodes, include_paths);
@@ -2781,10 +2985,9 @@ fn executeDistributedTraverse(
     try request_work_budget.checkIntermediateStates(frontier.len, graph_pattern_mod.default_max_intermediate_states);
 
     for (frontier) |item| {
-        _ = try state.seen.putIfAbsent(
+        _ = try state.putSeenIfAbsent(
             alloc,
             .{ .table = item.table, .key = item.key },
-            {},
         );
     }
 
@@ -2853,13 +3056,12 @@ fn executeDistributedTraverse(
                                 batch_table,
                                 node.table,
                             );
-                            if (!try state.seen.putIfAbsent(
+                            if (!try state.putSeenIfAbsent(
                                 alloc,
                                 .{
                                     .table = node_table,
                                     .key = node.key,
                                 },
-                                {},
                             )) continue;
                             const return_node = if (target_nodes) |*targets|
                                 targets.contains(node_table, node.key)
@@ -2870,6 +3072,16 @@ fn executeDistributedTraverse(
                                 try appendPathStateFromStep(alloc, &state, item, node, node_table)
                             else
                                 null;
+                            const merged_node_retained_bytes = try reserveMaterializedResultNode(
+                                &state,
+                                node,
+                                node_table,
+                                include_paths,
+                                path_state_id,
+                                request_work_budget,
+                            );
+                            var merged_node_budget_owned = true;
+                            errdefer if (merged_node_budget_owned) request_work_budget.releaseStateBytes(merged_node_retained_bytes);
                             var merged_node = try materializeResultNode(alloc, &state, item, node, node_table, include_paths, path_state_id);
                             var merged_node_owned = true;
                             errdefer if (merged_node_owned) merged_node.deinit(alloc);
@@ -2881,10 +3093,13 @@ fn executeDistributedTraverse(
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
                                 merged_node_owned = false;
+                                merged_node_budget_owned = false;
                                 if (state.nodes.items.len >= collection_limit) break;
                             } else {
                                 merged_node.deinit(alloc);
                                 merged_node_owned = false;
+                                request_work_budget.releaseStateBytes(merged_node_retained_bytes);
+                                merged_node_budget_owned = false;
                             }
                         }
 
@@ -2936,13 +3151,12 @@ fn executeDistributedTraverse(
                                 batch_entry.table_name,
                                 node.table,
                             );
-                            if (!try state.seen.putIfAbsent(
+                            if (!try state.putSeenIfAbsent(
                                 alloc,
                                 .{
                                     .table = node_table,
                                     .key = node.key,
                                 },
-                                {},
                             )) continue;
                             const return_node = if (target_nodes) |*targets|
                                 targets.contains(node_table, node.key)
@@ -2953,6 +3167,16 @@ fn executeDistributedTraverse(
                                 try appendPathStateFromStep(alloc, &state, item, node, node_table)
                             else
                                 null;
+                            const merged_node_retained_bytes = try reserveMaterializedResultNode(
+                                &state,
+                                node,
+                                node_table,
+                                include_paths,
+                                path_state_id,
+                                request_work_budget,
+                            );
+                            var merged_node_budget_owned = true;
+                            errdefer if (merged_node_budget_owned) request_work_budget.releaseStateBytes(merged_node_retained_bytes);
                             var merged_node = try materializeResultNode(alloc, &state, item, node, node_table, include_paths, path_state_id);
                             var merged_node_owned = true;
                             errdefer if (merged_node_owned) merged_node.deinit(alloc);
@@ -2964,10 +3188,13 @@ fn executeDistributedTraverse(
                             if (return_node) {
                                 try state.nodes.append(alloc, merged_node);
                                 merged_node_owned = false;
+                                merged_node_budget_owned = false;
                                 if (state.nodes.items.len >= collection_limit) break;
                             } else {
                                 merged_node.deinit(alloc);
                                 merged_node_owned = false;
+                                request_work_budget.releaseStateBytes(merged_node_retained_bytes);
+                                merged_node_budget_owned = false;
                             }
                         }
 
@@ -3012,13 +3239,12 @@ fn executeDistributedTraverse(
                             batch_table,
                             node.table,
                         );
-                        if (!try state.seen.putIfAbsent(
+                        if (!try state.putSeenIfAbsent(
                             alloc,
                             .{
                                 .table = node_table,
                                 .key = node.key,
                             },
-                            {},
                         )) continue;
                         const return_node = if (target_nodes) |*targets|
                             targets.contains(node_table, node.key)
@@ -3029,6 +3255,16 @@ fn executeDistributedTraverse(
                             try appendPathStateFromStep(alloc, &state, item, node, node_table)
                         else
                             null;
+                        const merged_node_retained_bytes = try reserveMaterializedResultNode(
+                            &state,
+                            node,
+                            node_table,
+                            include_paths,
+                            path_state_id,
+                            request_work_budget,
+                        );
+                        var merged_node_budget_owned = true;
+                        errdefer if (merged_node_budget_owned) request_work_budget.releaseStateBytes(merged_node_retained_bytes);
                         var merged_node = try materializeResultNode(alloc, &state, item, node, node_table, include_paths, path_state_id);
                         var merged_node_owned = true;
                         errdefer if (merged_node_owned) merged_node.deinit(alloc);
@@ -3040,10 +3276,13 @@ fn executeDistributedTraverse(
                         if (return_node) {
                             try state.nodes.append(alloc, merged_node);
                             merged_node_owned = false;
+                            merged_node_budget_owned = false;
                             if (state.nodes.items.len >= collection_limit) break;
                         } else {
                             merged_node.deinit(alloc);
                             merged_node_owned = false;
+                            request_work_budget.releaseStateBytes(merged_node_retained_bytes);
+                            merged_node_budget_owned = false;
                         }
                     }
 
@@ -3113,6 +3352,20 @@ fn executeDistributedShortestPath(
     var path_result = try findDistributedShortestPath(alloc, catalog, worker, table_name, req, base_result, prior_results, graph_query, consistency, admission, request_work_budget, null, null, null);
     defer if (path_result) |*result| result.deinit(alloc);
 
+    var output_retained_bytes: usize = 0;
+    if (path_result) |result| {
+        output_retained_bytes = graphResultNodeFromPathRetainedBytes(result.path) catch
+            return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
+        output_retained_bytes = std.math.add(
+            usize,
+            output_retained_bytes,
+            graphPathRetainedBytes(result.path) catch
+                return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
+        ) catch return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
+    }
+    var output_lease = try graph_work_budget.RetainedLease.init(request_work_budget, output_retained_bytes);
+    errdefer output_lease.deinit();
+
     const nodes = if (path_result) |result| blk: {
         var node = try graphPathToResultNode(alloc, result.path);
         errdefer node.deinit(alloc);
@@ -3145,8 +3398,11 @@ fn executeDistributedShortestPath(
         if (hits.len > 0) alloc.free(hits);
     }
 
+    const name = try alloc.dupe(u8, graph_query.name);
+    errdefer alloc.free(name);
+    output_lease.consume();
     return .{
-        .name = try alloc.dupe(u8, graph_query.name),
+        .name = name,
         .nodes = nodes,
         .paths = paths,
         .hits = hits,
@@ -3189,10 +3445,10 @@ fn executeDistributedKShortestPaths(
     if (start_nodes.len != 1 or target_nodes.len != 1)
         return error.UnsupportedQueryRequest;
 
-    var results = std.ArrayListUnmanaged(db_mod.types.GraphPath).empty;
+    var results = std.ArrayListUnmanaged(BudgetedGraphPath).empty;
     defer results.deinit(alloc);
     errdefer {
-        for (results.items) |path| graph_paths_mod.freePath(alloc, path);
+        for (results.items) |*path| path.deinit(alloc);
     }
 
     var seen_paths = std.StringHashMapUnmanaged(void).empty;
@@ -3213,27 +3469,30 @@ fn executeDistributedKShortestPaths(
         };
     }
     var first_result = first.?;
-    defer first_result.deinit(alloc);
-    const first_path = try cloneGraphPath(alloc, first_result.path);
-    results.append(alloc, first_path) catch |err| {
-        graph_paths_mod.freePath(alloc, first_path);
+    var first_result_owned = true;
+    defer if (first_result_owned) first_result.deinit(alloc);
+    const first_key = try graphPathToKey(alloc, first_result.path);
+    var first_path = first_result.take();
+    first_result_owned = false;
+    results.ensureTotalCapacityPrecise(alloc, 1) catch |err| {
+        first_path.deinit(alloc);
         return err;
     };
-    const first_key = try graphPathToKey(alloc, first_result.path);
+    results.appendAssumeCapacity(first_path);
     seen_paths.put(alloc, first_key, {}) catch |err| {
         alloc.free(first_key);
         return err;
     };
 
-    var candidates = std.ArrayListUnmanaged(db_mod.types.GraphPath).empty;
+    var candidates = std.ArrayListUnmanaged(BudgetedGraphPath).empty;
     defer {
-        for (candidates.items) |path| graph_paths_mod.freePath(alloc, path);
+        for (candidates.items) |*path| path.deinit(alloc);
         candidates.deinit(alloc);
     }
 
     var ki: u32 = 1;
     while (ki < graph_query.query.k) : (ki += 1) {
-        const prev_path = &results.items[results.items.len - 1];
+        const prev_path = &results.items[results.items.len - 1].path;
         if (prev_path.nodes.len <= 1) break;
 
         for (0..prev_path.nodes.len - 1) |spur_idx| {
@@ -3247,7 +3506,8 @@ fn executeDistributedKShortestPaths(
             var excluded_nodes = graph_node_identity.Map(void){};
             defer excluded_nodes.deinit(alloc);
 
-            for (results.items) |result_path| {
+            for (results.items) |result| {
+                const result_path = result.path;
                 if (result_path.nodes.len <= spur_idx + 1) continue;
                 if (!rootPathMatches(prev_path.*, result_path, spur_idx)) continue;
 
@@ -3315,48 +3575,68 @@ fn executeDistributedKShortestPaths(
             defer if (spur) |*result| result.deinit(alloc);
             if (spur == null) continue;
 
-            const total_path = try joinDistributedPaths(
+            var total_path = try joinDistributedPathsBudgeted(
                 alloc,
                 root_prefix,
                 root_table_prefix,
                 root_edges,
                 spur.?.path,
+                request_work_budget,
             );
             var total_path_owned = true;
-            errdefer if (total_path_owned) graph_paths_mod.freePath(alloc, total_path);
-            if (total_path.length > graph_query.query.params.max_depth) {
-                graph_paths_mod.freePath(alloc, total_path);
+            errdefer if (total_path_owned) total_path.deinit(alloc);
+            if (total_path.path.length > graph_query.query.params.max_depth) {
+                total_path.deinit(alloc);
                 total_path_owned = false;
                 continue;
             }
-            const pkey = try graphPathToKey(alloc, total_path);
+            const pkey = try graphPathToKey(alloc, total_path.path);
             if (!seen_paths.contains(pkey)) {
                 seen_paths.put(alloc, pkey, {}) catch |err| {
                     alloc.free(pkey);
                     return err;
                 };
-                candidates.append(alloc, total_path) catch |err| {
+                if (candidates.capacity == candidates.items.len) candidates.ensureTotalCapacityPrecise(
+                    alloc,
+                    candidates.items.len + 1,
+                ) catch |err| {
                     _ = seen_paths.remove(pkey);
                     alloc.free(pkey);
                     return err;
                 };
+                candidates.appendAssumeCapacity(total_path);
                 total_path_owned = false;
             } else {
                 alloc.free(pkey);
-                graph_paths_mod.freePath(alloc, total_path);
+                total_path.deinit(alloc);
                 total_path_owned = false;
             }
         }
 
         if (candidates.items.len == 0) break;
-        const best_idx = bestPathIndex(candidates.items, graph_query.query.params.weight_mode);
-        const best = candidates.swapRemove(best_idx);
-        results.append(alloc, best) catch |err| {
-            graph_paths_mod.freePath(alloc, best);
+        const best_idx = bestBudgetedPathIndex(candidates.items, graph_query.query.params.weight_mode);
+        var best = candidates.swapRemove(best_idx);
+        if (results.capacity == results.items.len) results.ensureTotalCapacityPrecise(
+            alloc,
+            results.items.len + 1,
+        ) catch |err| {
+            best.deinit(alloc);
             return err;
         };
+        results.appendAssumeCapacity(best);
     }
 
+    var out_nodes_retained_bytes: usize = 0;
+    for (results.items) |result| {
+        out_nodes_retained_bytes = std.math.add(
+            usize,
+            out_nodes_retained_bytes,
+            graphResultNodeFromPathRetainedBytes(result.path) catch
+                return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes),
+        ) catch return request_work_budget.exhaust(.retained_state_bytes, request_work_budget.max_retained_state_bytes);
+    }
+    var out_nodes_lease = try graph_work_budget.RetainedLease.init(request_work_budget, out_nodes_retained_bytes);
+    errdefer out_nodes_lease.deinit();
     const out_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, results.items.len);
     var out_nodes_initialized: usize = 0;
     errdefer {
@@ -3364,12 +3644,19 @@ fn executeDistributedKShortestPaths(
         alloc.free(out_nodes);
     }
     for (results.items, 0..) |path, i| {
-        out_nodes[i] = try graphPathToResultNode(alloc, path);
+        out_nodes[i] = try graphPathToResultNode(alloc, path.path);
         out_nodes_initialized += 1;
     }
 
     const out_paths = try alloc.alloc(db_mod.types.GraphPath, results.items.len);
-    for (results.items, 0..) |path, i| out_paths[i] = path;
+    var final_paths_lease = graph_work_budget.RetainedLease{ .budget = request_work_budget };
+    errdefer final_paths_lease.deinit();
+    for (results.items, 0..) |*path, i| {
+        out_paths[i] = path.path;
+        final_paths_lease.bytes += path.retained_lease.bytes;
+        path.retained_lease = .{};
+        path.* = undefined;
+    }
     results.clearRetainingCapacity();
     errdefer {
         for (out_paths) |path| graph_paths_mod.freePath(alloc, path);
@@ -3385,8 +3672,12 @@ fn executeDistributedKShortestPaths(
         if (hits.len > 0) alloc.free(hits);
     }
 
+    const name = try alloc.dupe(u8, graph_query.name);
+    errdefer alloc.free(name);
+    final_paths_lease.consume();
+    out_nodes_lease.consume();
     return .{
-        .name = try alloc.dupe(u8, graph_query.name),
+        .name = name,
         .nodes = out_nodes,
         .paths = out_paths,
         .hits = hits,
@@ -3396,9 +3687,31 @@ fn executeDistributedKShortestPaths(
 
 const ShortestPathResult = struct {
     path: db_mod.types.GraphPath,
+    retained_lease: graph_work_budget.RetainedLease,
 
     fn deinit(self: *ShortestPathResult, alloc: std.mem.Allocator) void {
         graph_paths_mod.freePath(alloc, self.path);
+        self.retained_lease.deinit();
+        self.* = undefined;
+    }
+
+    fn take(self: *ShortestPathResult) BudgetedGraphPath {
+        const out = BudgetedGraphPath{
+            .path = self.path,
+            .retained_lease = self.retained_lease,
+        };
+        self.* = undefined;
+        return out;
+    }
+};
+
+const BudgetedGraphPath = struct {
+    path: db_mod.types.GraphPath,
+    retained_lease: graph_work_budget.RetainedLease,
+
+    fn deinit(self: *BudgetedGraphPath, alloc: std.mem.Allocator) void {
+        graph_paths_mod.freePath(alloc, self.path);
+        self.retained_lease.deinit();
         self.* = undefined;
     }
 };
@@ -3421,7 +3734,10 @@ fn findDistributedShortestPath(
 ) !?ShortestPathResult {
     const algebraic_semiring_selected = graph_query.query.params.algebraic_semiring or
         try catalogGraphIndexEnablesAlgebraicSemiring(alloc, catalog, table_name, graph_query.query.index_name);
-    var state = QueryState{ .name = try alloc.dupe(u8, graph_query.name) };
+    var state = QueryState{
+        .name = try alloc.dupe(u8, graph_query.name),
+        .work_budget = request_work_budget,
+    };
     defer state.deinit(alloc);
 
     var target_set = try TargetNodeSet.init(
@@ -3431,6 +3747,7 @@ fn findDistributedShortestPath(
         base_result,
         prior_results,
         graph_query.query.target_nodes.?,
+        request_work_budget,
     );
     defer target_set.deinit(alloc);
 
@@ -3448,7 +3765,7 @@ fn findDistributedShortestPath(
     defer alloc.free(admitted_roots);
 
     const max_depth = graph_query.query.params.max_depth;
-    var best_cost = PathCostLabels.init(max_depth);
+    var best_cost = PathCostLabels.init(max_depth, request_work_budget);
     defer best_cost.deinit(alloc);
 
     for (roots, admitted_roots) |item, allowed| {
@@ -3464,6 +3781,7 @@ fn findDistributedShortestPath(
             item.distance,
             item.cost,
             item.path_state_id,
+            request_work_budget,
         );
         errdefer owned_item.deinit(alloc);
         try frontier.push(alloc, owned_item);
@@ -3489,9 +3807,14 @@ fn findDistributedShortestPath(
 
         if (target_set.contains(item.table, item.key) and item.depth > 0) {
             const path_state_id = item.path_state_id orelse return error.InvalidQueryRequest;
-            const path = try pathStateToGraphPath(alloc, state.path_states.items, path_state_id);
-            errdefer graph_paths_mod.freePath(alloc, path);
-            return .{ .path = path };
+            var path_result = try pathStateToGraphPath(
+                alloc,
+                state.path_states.items,
+                path_state_id,
+                request_work_budget,
+            );
+            errdefer path_result.deinit(alloc);
+            return path_result;
         }
 
         if (max_depth > 0 and item.depth >= max_depth) continue;
@@ -3572,6 +3895,7 @@ fn findDistributedShortestPath(
                 path_state.distance,
                 path_state.cost,
                 path_state_id,
+                request_work_budget,
             );
             errdefer next_item.deinit(alloc);
             try frontier.push(alloc, next_item);
@@ -4720,37 +5044,141 @@ fn graphPathToResultNode(
     );
 }
 
+fn graphResultNodeFromPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
+    var total: usize = @sizeOf(graph_query_mod.GraphResultNode);
+    if (path.nodes.len > 0) {
+        const target_key = path.nodes[path.nodes.len - 1];
+        total = try std.math.add(usize, total, target_key.len);
+        const target_table: ?[]const u8 = if (graphPathNodeTable(path, path.nodes.len - 1)) |table|
+            table
+        else if (path.edges.len > 0 and std.mem.eql(u8, path.edges[path.edges.len - 1].target, target_key))
+            graph_traversal_mod.metadataTargetTable(path.edges[path.edges.len - 1].metadata)
+        else
+            null;
+        if (target_table) |table|
+            total = try std.math.add(usize, total, table.len);
+    }
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, path.nodes.len, @sizeOf([]const u8)),
+    );
+    for (path.nodes) |node| total = try std.math.add(usize, total, node.len);
+    if (path.node_tables.len > 0) {
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, path.node_tables.len, @sizeOf(?[]const u8)),
+        );
+        for (path.node_tables) |table| if (table) |value| {
+            total = try std.math.add(usize, total, value.len);
+        };
+    }
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, path.edges.len, @sizeOf(graph_query_mod.PathEdgeInfo)),
+    );
+    for (path.edges) |edge| {
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    return total;
+}
+
 fn pathStateToGraphPath(
     alloc: std.mem.Allocator,
     path_states: []const PathState,
     path_state_id: u32,
-) !db_mod.types.GraphPath {
+    work_budget: *graph_pattern_mod.WorkBudget,
+) !ShortestPathResult {
+    const retained_bytes = graphPathFromStatesRetainedBytes(path_states, path_state_id) catch
+        return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    var retained_lease = try graph_work_budget.RetainedLease.init(work_budget, retained_bytes);
+    errdefer retained_lease.deinit();
     const nodes = try reconstructPath(alloc, path_states, path_state_id);
     errdefer freePathArray(alloc, nodes);
     const node_tables = try reconstructPathTables(alloc, path_states, path_state_id);
     errdefer freeOptionalStrings(alloc, node_tables);
-    const edges_info = try reconstructPathEdges(alloc, path_states, path_state_id);
-    errdefer freePathEdges(alloc, edges_info);
-
-    const edges = try alloc.alloc(graph_paths_mod.PathEdge, edges_info.len);
-    var initialized: usize = 0;
+    const edges = try reconstructGraphPathEdges(alloc, path_states, path_state_id);
     errdefer {
-        for (edges[0..initialized]) |edge| freeOwnedGraphPathEdge(alloc, edge);
-        alloc.free(edges);
+        for (edges) |edge| freeOwnedGraphPathEdge(alloc, edge);
+        if (edges.len > 0) alloc.free(edges);
     }
-    for (edges_info, 0..) |edge, i| {
-        edges[i] = try dupeGraphPathEdge(alloc, edge);
-        initialized += 1;
-    }
-    freePathEdges(alloc, edges_info);
 
     return .{
-        .nodes = nodes,
-        .node_tables = node_tables,
-        .edges = edges,
-        .total_weight = try graph_paths_mod.sumPathEdgeWeights(edges),
-        .length = @intCast(edges.len),
+        .path = .{
+            .nodes = nodes,
+            .node_tables = node_tables,
+            .edges = edges,
+            .total_weight = try graph_paths_mod.sumPathEdgeWeights(edges),
+            .length = @intCast(edges.len),
+        },
+        .retained_lease = retained_lease,
     };
+}
+
+fn graphPathFromStatesRetainedBytes(path_states: []const PathState, id: u32) !usize {
+    const node_count = pathLength(path_states, id);
+    const edge_count = pathEdgeLength(path_states, id);
+    var total: usize = @sizeOf(BudgetedGraphPath);
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, node_count, @sizeOf([]const u8)),
+    );
+    var has_tables = false;
+    var cursor: ?u32 = id;
+    while (cursor) |current_id| {
+        const state = path_states[current_id];
+        total = try std.math.add(usize, total, state.key.len);
+        if (state.table) |table| {
+            has_tables = true;
+            total = try std.math.add(usize, total, table.len);
+        }
+        if (state.incoming_edge) |edge| {
+            total = try std.math.add(usize, total, edge.source.len);
+            total = try std.math.add(usize, total, edge.target.len);
+            total = try std.math.add(usize, total, edge.edge_type.len);
+            total = try std.math.add(usize, total, edge.metadata.len);
+        }
+        cursor = state.parent;
+    }
+    if (has_tables) total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, node_count, @sizeOf(?[]const u8)),
+    );
+    return try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, edge_count, @sizeOf(graph_paths_mod.PathEdge)),
+    );
+}
+
+fn reconstructGraphPathEdges(
+    alloc: std.mem.Allocator,
+    path_states: []const PathState,
+    id: u32,
+) ![]graph_paths_mod.PathEdge {
+    const out = try alloc.alloc(graph_paths_mod.PathEdge, pathEdgeLength(path_states, id));
+    var write_index: usize = out.len;
+    errdefer {
+        for (out[write_index..]) |edge| freeOwnedGraphPathEdge(alloc, edge);
+        if (out.len > 0) alloc.free(out);
+    }
+    var cursor: ?u32 = id;
+    while (cursor) |current_id| {
+        if (path_states[current_id].incoming_edge) |edge| {
+            const owned_edge = try dupeGraphPathEdge(alloc, edge);
+            write_index -= 1;
+            out[write_index] = owned_edge;
+        }
+        cursor = path_states[current_id].parent;
+    }
+    return out;
 }
 
 fn cloneGraphPath(
@@ -4778,6 +5206,38 @@ fn cloneGraphPath(
         .total_weight = source.total_weight,
         .length = source.length,
     };
+}
+
+fn graphPathRetainedBytes(path: db_mod.types.GraphPath) !usize {
+    var total: usize = @sizeOf(BudgetedGraphPath);
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, path.nodes.len, @sizeOf([]const u8)),
+    );
+    for (path.nodes) |node| total = try std.math.add(usize, total, node.len);
+    if (path.node_tables.len > 0) {
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, path.node_tables.len, @sizeOf(?[]const u8)),
+        );
+        for (path.node_tables) |table| if (table) |value| {
+            total = try std.math.add(usize, total, value.len);
+        };
+    }
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, path.edges.len, @sizeOf(graph_paths_mod.PathEdge)),
+    );
+    for (path.edges) |edge| {
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    return total;
 }
 
 fn dupeGraphPathEdge(
@@ -5017,6 +5477,101 @@ fn joinDistributedPaths(
     };
 }
 
+fn joinDistributedPathsBudgeted(
+    alloc: std.mem.Allocator,
+    root_nodes: []const []const u8,
+    root_node_tables: []const ?[]const u8,
+    root_edges: []const graph_paths_mod.PathEdge,
+    spur_path: db_mod.types.GraphPath,
+    work_budget: *graph_pattern_mod.WorkBudget,
+) !BudgetedGraphPath {
+    const retained_bytes = joinedGraphPathRetainedBytes(
+        root_nodes,
+        root_node_tables,
+        root_edges,
+        spur_path,
+    ) catch return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    var retained_lease = try graph_work_budget.RetainedLease.init(work_budget, retained_bytes);
+    errdefer retained_lease.deinit();
+    return .{
+        .path = try joinDistributedPaths(
+            alloc,
+            root_nodes,
+            root_node_tables,
+            root_edges,
+            spur_path,
+        ),
+        .retained_lease = retained_lease,
+    };
+}
+
+fn joinedGraphPathRetainedBytes(
+    root_nodes: []const []const u8,
+    root_node_tables: []const ?[]const u8,
+    root_edges: []const graph_paths_mod.PathEdge,
+    spur_path: db_mod.types.GraphPath,
+) !usize {
+    const node_count = try std.math.add(usize, root_nodes.len, spur_path.nodes.len);
+    var total: usize = @sizeOf(BudgetedGraphPath);
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, node_count, @sizeOf([]const u8)),
+    );
+    for (root_nodes) |node| total = try std.math.add(usize, total, node.len);
+    for (spur_path.nodes) |node| total = try std.math.add(usize, total, node.len);
+
+    const has_root_tables = root_node_tables.len == root_nodes.len and
+        optionalStringsContainValue(root_node_tables);
+    const has_spur_tables = spur_path.node_tables.len == spur_path.nodes.len and
+        optionalStringsContainValue(spur_path.node_tables);
+    if (has_root_tables or has_spur_tables) {
+        total = try std.math.add(
+            usize,
+            total,
+            try std.math.mul(usize, node_count, @sizeOf(?[]const u8)),
+        );
+        if (root_node_tables.len == root_nodes.len) {
+            for (root_node_tables) |table| if (table) |value| {
+                total = try std.math.add(usize, total, value.len);
+            };
+        }
+        if (spur_path.node_tables.len == spur_path.nodes.len) {
+            for (spur_path.node_tables) |table| if (table) |value| {
+                total = try std.math.add(usize, total, value.len);
+            };
+        }
+    }
+
+    const edge_count = try std.math.add(usize, root_edges.len, spur_path.edges.len);
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, edge_count, @sizeOf(graph_paths_mod.PathEdge)),
+    );
+    for (root_edges) |edge| {
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    for (spur_path.edges) |edge| {
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    return total;
+}
+
+fn bestBudgetedPathIndex(paths: []const BudgetedGraphPath, mode: graph_paths_mod.PathWeightMode) usize {
+    var best_idx: usize = 0;
+    for (paths[1..], 1..) |path, i| {
+        if (comparePathScore(path.path, paths[best_idx].path, mode) < 0) best_idx = i;
+    }
+    return best_idx;
+}
+
 fn bestPathIndex(paths: []const db_mod.types.GraphPath, mode: graph_paths_mod.PathWeightMode) usize {
     var best_idx: usize = 0;
     for (paths[1..], 1..) |path, i| {
@@ -5232,6 +5787,22 @@ test "distributed graph target refs are table exact while raw keys remain wildca
         .total_hits = 0,
     };
 
+    var budget = graph_pattern_mod.WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 1;
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        TargetNodeSet.init(
+            alloc,
+            "docs",
+            req,
+            base_result,
+            prior_results[0..],
+            .{ .result_ref = .{ .ref = "$graph_results.prior" } },
+            &budget,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+
     var exact = try TargetNodeSet.init(
         alloc,
         "docs",
@@ -5239,6 +5810,7 @@ test "distributed graph target refs are table exact while raw keys remain wildca
         base_result,
         prior_results[0..],
         .{ .result_ref = .{ .ref = "$graph_results.prior" } },
+        null,
     );
     defer exact.deinit(alloc);
     try std.testing.expect(exact.contains("entities", "shared"));
@@ -5251,6 +5823,7 @@ test "distributed graph target refs are table exact while raw keys remain wildca
         base_result,
         prior_results[0..],
         .{ .keys = &.{"shared"} },
+        null,
     );
     defer wildcard.deinit(alloc);
     try std.testing.expect(wildcard.contains(null, "shared"));
@@ -5263,6 +5836,7 @@ test "distributed graph target refs are table exact while raw keys remain wildca
         base_result,
         &.{},
         .{ .identities = &.{.{ .key = "doc:b", .table = "docs" }} },
+        null,
     );
     defer same_table.deinit(alloc);
     try std.testing.expect(same_table.contains(null, "doc:b"));
@@ -5727,6 +6301,7 @@ fn appendPathStateFromWeightedStep(
         parent.cost + try edgeCost(parent, node, mode),
         parent_id,
         if (local_path_edges.len > 0) local_path_edges[0] else null,
+        state.work_budget,
     );
     errdefer path_state.deinit(alloc);
     try state.path_states.append(alloc, path_state);
@@ -5785,6 +6360,27 @@ fn resolveStartFrontier(
         if (nodes.len > 0) alloc.free(nodes);
     }
 
+    var frontier_retained_bytes: usize = 0;
+    for (nodes) |node| {
+        const node_retained_bytes = frontierStateRetainedBytes(node.key, node.table) catch
+            return if (state.work_budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.OutOfMemory;
+        frontier_retained_bytes = std.math.add(
+            usize,
+            frontier_retained_bytes,
+            node_retained_bytes,
+        ) catch return if (state.work_budget) |budget|
+            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+        else
+            error.OutOfMemory;
+    }
+    var frontier_reservation = try graph_work_budget.RetainedLease.init(
+        state.work_budget,
+        frontier_retained_bytes,
+    );
+    errdefer frontier_reservation.deinit();
     const out = try alloc.alloc(FrontierState, nodes.len);
     var initialized: usize = 0;
     errdefer {
@@ -5796,6 +6392,7 @@ fn resolveStartFrontier(
             try appendRootPathState(alloc, state, node.key, node.table)
         else
             null;
+        const retained_bytes = frontierStateRetainedBytes(node.key, node.table) catch unreachable;
         out[i] = .{
             .key = node.key,
             .table = node.table,
@@ -5803,7 +6400,9 @@ fn resolveStartFrontier(
             .distance = 0,
             .cost = 0,
             .path_state_id = path_state_id,
+            .retained_lease = .{ .budget = state.work_budget, .bytes = retained_bytes },
         };
+        frontier_reservation.bytes -= retained_bytes;
         transferred += 1;
         initialized += 1;
     }
@@ -7168,7 +7767,7 @@ fn appendRootPathState(
     key: []const u8,
     table: ?[]const u8,
 ) !u32 {
-    var path_state = try initPathState(alloc, key, table, 0, 0, 0, null, null);
+    var path_state = try initPathState(alloc, key, table, 0, 0, 0, null, null, state.work_budget);
     errdefer path_state.deinit(alloc);
     try state.path_states.append(alloc, path_state);
     return @intCast(state.path_states.items.len - 1);
@@ -7183,7 +7782,15 @@ fn initPathState(
     cost: f64,
     parent: ?u32,
     incoming_edge: ?graph_query_mod.PathEdgeInfo,
+    work_budget: ?*graph_pattern_mod.WorkBudget,
 ) !PathState {
+    const retained_bytes = pathStateRetainedBytes(key, table, incoming_edge) catch
+        return if (work_budget) |budget|
+            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+        else
+            error.OutOfMemory;
+    var retained_lease = try graph_work_budget.RetainedLease.init(work_budget, retained_bytes);
+    errdefer retained_lease.deinit();
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_table = if (table) |value| try alloc.dupe(u8, value) else null;
@@ -7199,7 +7806,24 @@ fn initPathState(
         .cost = cost,
         .parent = parent,
         .incoming_edge = owned_edge,
+        .retained_lease = retained_lease,
     };
+}
+
+fn pathStateRetainedBytes(
+    key: []const u8,
+    table: ?[]const u8,
+    incoming_edge: ?graph_query_mod.PathEdgeInfo,
+) !usize {
+    var total = try std.math.add(usize, @sizeOf(PathState), key.len);
+    if (table) |value| total = try std.math.add(usize, total, value.len);
+    if (incoming_edge) |edge| {
+        total = try std.math.add(usize, total, edge.source.len);
+        total = try std.math.add(usize, total, edge.target.len);
+        total = try std.math.add(usize, total, edge.edge_type.len);
+        total = try std.math.add(usize, total, edge.metadata.len);
+    }
+    return total;
 }
 
 fn appendPathStateFromStep(
@@ -7218,10 +7842,11 @@ fn appendPathStateFromStep(
         node.key,
         node_table,
         parent.depth + 1,
-        parent.distance + node.distance,
+        @floatFromInt(parent.depth + 1),
         parent.cost + try edgeCost(parent, node, .min_hops),
         parent_id,
         if (local_path_edges.len > 0) local_path_edges[0] else null,
+        state.work_budget,
     );
     errdefer path_state.deinit(alloc);
     try state.path_states.append(alloc, path_state);
@@ -7243,7 +7868,7 @@ fn materializeResultNode(
             node.key,
             node_table,
             parent.depth + 1,
-            parent.distance + node.distance,
+            @floatFromInt(parent.depth + 1),
             null,
             null,
             null,
@@ -7281,6 +7906,68 @@ fn materializeResultNode(
     );
 }
 
+fn reserveMaterializedResultNode(
+    state: *const QueryState,
+    node: graph_query_mod.GraphResultNode,
+    node_table: ?[]const u8,
+    include_paths: bool,
+    path_state_id: ?u32,
+    work_budget: *graph_pattern_mod.WorkBudget,
+) !usize {
+    var total = std.math.add(usize, @sizeOf(graph_query_mod.GraphResultNode), node.key.len) catch
+        return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    if (node_table) |table| total = std.math.add(usize, total, table.len) catch
+        return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    if (include_paths) {
+        const id = path_state_id orelse return error.InvalidQueryRequest;
+        const node_count = pathLength(state.path_states.items, id);
+        const edge_count = pathEdgeLength(state.path_states.items, id);
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, node_count, @sizeOf([]const u8)) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes),
+        ) catch return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+        total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, edge_count, @sizeOf(graph_query_mod.PathEdgeInfo)) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes),
+        ) catch return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+        var has_tables = false;
+        var cursor: ?u32 = id;
+        while (cursor) |current_id| {
+            const path_state = state.path_states.items[current_id];
+            total = std.math.add(usize, total, path_state.key.len) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+            if (path_state.table) |table| {
+                has_tables = true;
+                total = std.math.add(usize, total, table.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+            }
+            if (path_state.incoming_edge) |edge| {
+                total = std.math.add(usize, total, edge.source.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+                total = std.math.add(usize, total, edge.target.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+                total = std.math.add(usize, total, edge.edge_type.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+                total = std.math.add(usize, total, edge.metadata.len) catch
+                    return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+            }
+            cursor = path_state.parent;
+        }
+        if (has_tables) total = std.math.add(
+            usize,
+            total,
+            std.math.mul(usize, node_count, @sizeOf(?[]const u8)) catch
+                return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes),
+        ) catch return work_budget.exhaust(.retained_state_bytes, work_budget.max_retained_state_bytes);
+    }
+    try work_budget.retainStateBytes(total);
+    return total;
+}
+
 fn frontierFromState(
     alloc: std.mem.Allocator,
     state: *QueryState,
@@ -7297,6 +7984,7 @@ fn frontierFromState(
             path_state.distance,
             path_state.cost,
             id,
+            state.work_budget,
         );
     }
 
@@ -7308,6 +7996,7 @@ fn frontierFromState(
         node.distance,
         node.distance,
         null,
+        state.work_budget,
     );
 }
 
@@ -7318,6 +8007,21 @@ fn overrideFrontierTables(
     table: []const u8,
 ) !void {
     for (frontier) |*item| {
+        const old_frontier_bytes = item.retained_lease.bytes;
+        const old_frontier_table_len = if (item.table) |old| old.len else 0;
+        const new_frontier_bytes = old_frontier_bytes - old_frontier_table_len + table.len;
+        try item.retained_lease.resize(new_frontier_bytes);
+        errdefer item.retained_lease.resize(old_frontier_bytes) catch unreachable;
+
+        var old_path_bytes: ?usize = null;
+        if (item.path_state_id) |id| {
+            const path_state = &state.path_states.items[id];
+            old_path_bytes = path_state.retained_lease.bytes;
+            const old_path_table_len = if (path_state.table) |old| old.len else 0;
+            try path_state.retained_lease.resize(old_path_bytes.? - old_path_table_len + table.len);
+            errdefer path_state.retained_lease.resize(old_path_bytes.?) catch unreachable;
+        }
+
         const frontier_table = try alloc.dupe(u8, table);
         errdefer alloc.free(frontier_table);
         var path_table: ?[]u8 = null;
@@ -7368,7 +8072,15 @@ fn initFrontierState(
     distance: f64,
     cost: f64,
     path_state_id: ?u32,
+    work_budget: ?*graph_pattern_mod.WorkBudget,
 ) !FrontierState {
+    const retained_bytes = frontierStateRetainedBytes(key, table) catch
+        return if (work_budget) |budget|
+            budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+        else
+            error.OutOfMemory;
+    var retained_lease = try graph_work_budget.RetainedLease.init(work_budget, retained_bytes);
+    errdefer retained_lease.deinit();
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
     const owned_table = if (table) |value| try alloc.dupe(u8, value) else null;
@@ -7381,7 +8093,31 @@ fn initFrontierState(
         .distance = distance,
         .cost = cost,
         .path_state_id = path_state_id,
+        .retained_lease = retained_lease,
     };
+}
+
+fn frontierStateRetainedBytes(key: []const u8, table: ?[]const u8) !usize {
+    var total = try std.math.add(usize, @sizeOf(FrontierState), key.len);
+    if (table) |value| total = try std.math.add(usize, total, value.len);
+    return total;
+}
+
+test "distributed frontier reservations precede allocation and release on deinit" {
+    const alloc = std.testing.allocator;
+    var budget = graph_pattern_mod.WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 1;
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        initFrontierState(alloc, "node", "table", 0, 0, 0, null, &budget),
+    );
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+
+    budget.max_retained_state_bytes = graph_pattern_mod.default_max_retained_state_bytes;
+    var frontier = try initFrontierState(alloc, "node", "table", 0, 0, 0, null, &budget);
+    try std.testing.expect(budget.retained_state_bytes > 0);
+    frontier.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
 }
 
 fn cloneGraphFrontierItemParts(
@@ -10450,14 +11186,14 @@ test "distributed graph path materialization preserves table provenance" {
     defer state.deinit(alloc);
 
     const root = try appendRootPathState(alloc, &state, "doc:a", null);
-    var shared = try initPathState(alloc, "shared", "entities", 1, 1, 1, root, null);
+    var shared = try initPathState(alloc, "shared", "entities", 1, 1, 1, root, null, null);
     var shared_owned = true;
     errdefer if (shared_owned) shared.deinit(alloc);
     try state.path_states.append(alloc, shared);
     shared_owned = false;
     const shared_id: u32 = @intCast(state.path_states.items.len - 1);
 
-    var target = try initPathState(alloc, "doc:c", "entities", 2, 2, 2, shared_id, null);
+    var target = try initPathState(alloc, "doc:c", "entities", 2, 2, 2, shared_id, null, null);
     var target_owned = true;
     errdefer if (target_owned) target.deinit(alloc);
     try state.path_states.append(alloc, target);
