@@ -911,6 +911,8 @@ fn graphQueryUnsupportedBodyForDiagnostic(
 }
 
 fn graphQueryUnsupportedMessage(reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, reason, "expand_strategy_not_supported"))
+        return "expand_strategy is a legacy graph_searches result-merging control; remove it when using graph_queries and consume the named typed graph_results directly";
     if (std.mem.eql(u8, reason, "legacy_graph_searches_not_supported"))
         return "serverless graph queries require graph_queries; graph_searches is available only on stateful/provisioned Antfly during its compatibility window";
     if (std.mem.eql(u8, reason, "request_control_not_supported"))
@@ -927,7 +929,10 @@ fn graphQueryUnsupportedMessage(reason: []const u8) []const u8 {
 fn graphQueryUnsupportedDiagnostic(root: std.json.Value) GraphQueryUnsupportedDiagnostic {
     if (root != .object) return .{};
     if (root.object.get("expand_strategy")) |value| {
-        if (value != .null) return .{ .reason = "expand_strategy_not_supported" };
+        if (value != .null) return .{
+            .feature = "expand_strategy",
+            .reason = "expand_strategy_not_supported",
+        };
     }
     if (root.object.get("graph_queries")) |queries| {
         if (queries == .object) return canonicalGraphUnsupportedDiagnostic(queries.object);
@@ -3906,13 +3911,15 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
         operation: []const u8,
         feature: []const u8,
         reason: []const u8,
+        message: ?[]const u8 = null,
     };
     const cases = [_]Case{
         .{
             .body = "{\"expand_strategy\":\"union\",\"graph_queries\":{}}",
             .operation = "$request",
-            .feature = "graph_queries",
+            .feature = "expand_strategy",
             .reason = "expand_strategy_not_supported",
+            .message = "expand_strategy is a legacy graph_searches result-merging control; remove it when using graph_queries and consume the named typed graph_results directly",
         },
         .{
             .body = "{\"graph_searches\":{\"walk\":{\"type\":\"traverse\",\"params\":{\"deduplicate_nodes\":false}}}}",
@@ -3977,6 +3984,7 @@ test "unsupported graph diagnostics identify the rejected operation feature" {
         try std.testing.expectEqualStrings(case.operation, parsed.value.operation);
         try std.testing.expectEqualStrings(case.feature, parsed.value.feature);
         try std.testing.expectEqualStrings(case.reason, parsed.value.reason);
+        if (case.message) |message| try std.testing.expectEqualStrings(message, parsed.value.message);
     }
 }
 

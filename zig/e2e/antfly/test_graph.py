@@ -1247,6 +1247,27 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
                 },
                 "return": {"bindings": ["b", "liked"], "limit": 10},
             },
+            "optional_counts": {
+                "index": "graph_idx",
+                "match": {
+                    "anchor": "a",
+                    "nodes": {"a": {"filter": {"ids": ["doc-a"]}}, "b": {}},
+                    "edges": [{"from": "a", "to": "b", "types": ["knows"]}],
+                    "optional": [
+                        {
+                            "nodes": {"liked": {}},
+                            "edges": [{"from": "b", "to": "liked", "types": ["likes"]}],
+                        }
+                    ],
+                },
+                "return": {
+                    "aggregates": {
+                        "rows": {"count": "*"},
+                        "liked": {"count": "liked"},
+                        "unique_liked": {"count": "liked", "distinct": True},
+                    }
+                },
+            },
             "counts": {
                 "index": "graph_idx",
                 "match": {
@@ -1289,6 +1310,11 @@ def test_stateful_graph_conjunctive_optional_negative_and_aggregates(backup_api)
     assert {row["b"]["key"] for row in optional_rows} == {"doc-b", "doc-c"}
     assert any(row["liked"] is None for row in optional_rows)
     assert any(row["liked"] and row["liked"]["key"] == "doc-d" for row in optional_rows)
+    assert graph_results["optional_counts"]["aggregates"] == {
+        "rows": {"value": "2", "exact": True},
+        "liked": {"value": "1", "exact": True},
+        "unique_liked": {"value": "1", "exact": True},
+    }
     assert graph_results["counts"]["aggregates"]["neighbors"] == {"value": "2", "exact": True}
 
 

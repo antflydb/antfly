@@ -3566,7 +3566,12 @@ test "conjunctive match supports branches anti joins inequality and optional nul
     try std.testing.expect(saw_follower);
     try std.testing.expect(saw_null);
 
-    const specs = [_]CountAggregateSpec{ .{}, .{ .alias = "left", .distinct = true } };
+    const specs = [_]CountAggregateSpec{
+        .{},
+        .{ .alias = "left", .distinct = true },
+        .{ .alias = "liker" },
+        .{ .alias = "liker", .distinct = true },
+    };
     const aggregates = try aggregateConjunctivePatternWithEdgeReader(
         alloc,
         Reader{},
@@ -3581,6 +3586,8 @@ test "conjunctive match supports branches anti joins inequality and optional nul
     }
     try std.testing.expectEqual(@as(u128, 4), aggregates[0].value);
     try std.testing.expectEqual(@as(u128, 4), aggregates[1].value);
+    try std.testing.expectEqual(@as(u128, 2), aggregates[2].value);
+    try std.testing.expectEqual(@as(u128, 1), aggregates[3].value);
 
     const streamed = try aggregateConjunctivePatternWithEdgeReader(
         alloc,
@@ -3596,6 +3603,8 @@ test "conjunctive match supports branches anti joins inequality and optional nul
     }
     try std.testing.expectEqual(@as(u128, 4), streamed[0].value);
     try std.testing.expectEqual(@as(u128, 4), streamed[1].value);
+    try std.testing.expectEqual(@as(u128, 2), streamed[2].value);
+    try std.testing.expectEqual(@as(u128, 1), streamed[3].value);
 
     var page_distinct_budget = DistinctBudget.init(
         default_max_distinct_identities,
@@ -3618,6 +3627,8 @@ test "conjunctive match supports branches anti joins inequality and optional nul
     }
     try std.testing.expectEqual(@as(u128, 4), paged[0].value);
     try std.testing.expectEqual(@as(u128, 4), paged[1].value);
+    try std.testing.expectEqual(@as(u128, 2), paged[2].value);
+    try std.testing.expectEqual(@as(u128, 1), paged[3].value);
 }
 
 test "serverless paged conjunctive aggregate preserves exact state across anchor pages" {

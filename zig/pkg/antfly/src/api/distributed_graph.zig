@@ -2368,96 +2368,15 @@ fn executeDistributedPattern(
     };
 }
 
-const AggregatePageAccumulator = struct {
-    distinct: bool,
-    value: u128 = 0,
-    seen: graph_node_identity.BorrowedMap(void) = .{},
-    distinct_values: std.ArrayListUnmanaged(graph_node_identity.Ref) = .empty,
-
-    fn observe(
-        self: *@This(),
-        alloc: std.mem.Allocator,
-        page: graph_pattern_mod.CountAggregateResult,
-        distinct_budget: *graph_pattern_mod.DistinctBudget,
-    ) !void {
-        if (!self.distinct) {
-            self.value = std.math.add(u128, self.value, page.value) catch return error.QueryCandidateBudgetExceeded;
-            return;
-        }
-        for (page.distinct_values) |identity| {
-            if (self.seen.contains(identity)) continue;
-            try distinct_budget.consume(identity);
-            try graph_pattern_mod.ensureDistinctValueCapacity(
-                alloc,
-                distinct_budget,
-                &self.distinct_values,
-                self.distinct_values.items.len + 1,
-            );
-            try graph_pattern_mod.ensureBorrowedDistinctMapCapacity(
-                alloc,
-                distinct_budget,
-                &self.seen,
-                self.distinct_values.items.len + 1,
-            );
-            try appendOwnedGraphNodeRef(alloc, &self.distinct_values, identity);
-            const owned = self.distinct_values.items[self.distinct_values.items.len - 1];
-            self.seen.putAssumeCapacityNoClobber(owned, {});
-        }
-        self.value = @intCast(self.distinct_values.items.len);
-    }
-
-    fn takeDistinctValues(
-        self: *@This(),
-        alloc: std.mem.Allocator,
-        distinct_budget: *graph_pattern_mod.DistinctBudget,
-    ) ![]graph_node_identity.Ref {
-        if (!self.distinct) return &.{};
-        const output_bytes = std.math.mul(
-            usize,
-            self.distinct_values.items.len,
-            @sizeOf(graph_node_identity.Ref),
-        ) catch return error.GraphDistinctBudgetExceeded;
-        try distinct_budget.consumeRetainedBytes(output_bytes);
-        const values = try self.distinct_values.toOwnedSlice(alloc);
-        self.distinct_values = .empty;
-        self.seen.deinit(alloc);
-        self.seen = .{};
-        return values;
-    }
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        self.seen.deinit(alloc);
-        for (self.distinct_values.items) |identity| {
-            if (identity.table) |table| alloc.free(table);
-            alloc.free(identity.key);
-        }
-        self.distinct_values.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-fn appendOwnedGraphNodeRef(
-    alloc: std.mem.Allocator,
-    values: *std.ArrayListUnmanaged(graph_node_identity.Ref),
-    identity: graph_node_identity.Ref,
-) !void {
-    const table = if (identity.table) |table_name| try alloc.dupe(u8, table_name) else null;
-    errdefer if (table) |table_name| alloc.free(table_name);
-    const key = try alloc.dupe(u8, identity.key);
-    errdefer alloc.free(key);
-    values.appendAssumeCapacity(.{ .table = table, .key = key });
-}
-
 fn materializeAggregateResults(
     alloc: std.mem.Allocator,
     requested: []const graph_query_mod.NamedCountAggregate,
     aggregate_indexes: []const usize,
-    accumulators: []AggregatePageAccumulator,
-    distinct_budget: *graph_pattern_mod.DistinctBudget,
+    computed: []graph_pattern_mod.CountAggregateResult,
 ) ![]db_mod.types.GraphAggregateResult {
     if (requested.len != aggregate_indexes.len) return error.InvalidArgument;
     const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, requested.len);
-    const distinct_value_owners = try alloc.alloc(?usize, accumulators.len);
+    const distinct_value_owners = try alloc.alloc(?usize, computed.len);
     defer alloc.free(distinct_value_owners);
     @memset(distinct_value_owners, null);
     var initialized: usize = 0;
@@ -2467,12 +2386,12 @@ fn materializeAggregateResults(
     }
     for (requested, 0..) |aggregate, i| {
         const accumulator_index = aggregate_indexes[i];
-        if (accumulator_index >= accumulators.len) return error.InvalidArgument;
-        const accumulator = &accumulators[accumulator_index];
+        if (accumulator_index >= computed.len) return error.InvalidArgument;
+        const accumulator = &computed[accumulator_index];
         aggregates[i] = blk: {
             const name = try alloc.dupe(u8, aggregate.name);
             errdefer alloc.free(name);
-            if (accumulator.distinct) {
+            if (aggregate.distinct) {
                 if (distinct_value_owners[accumulator_index]) |owner| {
                     break :blk .{
                         .name = name,
@@ -2481,14 +2400,8 @@ fn materializeAggregateResults(
                         .distinct_values_owned = false,
                     };
                 }
-                const values = try accumulator.takeDistinctValues(alloc, distinct_budget);
-                errdefer {
-                    for (values) |value| {
-                        if (value.table) |table| alloc.free(table);
-                        alloc.free(value.key);
-                    }
-                    if (values.len > 0) alloc.free(values);
-                }
+                const values = accumulator.distinct_values;
+                accumulator.distinct_values = &.{};
                 distinct_value_owners[accumulator_index] = i;
                 break :blk .{
                     .name = name,
@@ -2602,14 +2515,19 @@ fn executeDistributedConjunctivePattern(
     }
     var aggregate_plan = try graph_pattern_mod.CountAggregatePlan.init(alloc, requested_specs);
     defer aggregate_plan.deinit(alloc);
-    const aggregate_accumulators = try alloc.alloc(AggregatePageAccumulator, aggregate_plan.unique_specs.len);
-    defer if (aggregate_accumulators.len > 0) alloc.free(aggregate_accumulators);
-    var initialized_accumulators: usize = 0;
-    defer for (aggregate_accumulators[0..initialized_accumulators]) |*accumulator| accumulator.deinit(alloc);
-    for (aggregate_plan.unique_specs, 0..) |spec, i| {
-        aggregate_accumulators[i] = .{ .distinct = spec.distinct };
-        initialized_accumulators += 1;
-    }
+    // Keep one accumulator set for the complete snapshot-pinned anchor
+    // relation. In particular, exact distinct identities are retained once
+    // under the request-wide budget instead of being built in a page-local set
+    // and copied into a second cross-page set.
+    var aggregate_stream: ?graph_pattern_mod.ConjunctiveCountAggregateStream = if (aggregate_plan.unique_specs.len > 0)
+        try graph_pattern_mod.ConjunctiveCountAggregateStream.init(
+            alloc,
+            aggregate_plan.unique_specs,
+            request_distinct_budget,
+        )
+    else
+        null;
+    defer if (aggregate_stream) |*stream| stream.deinit(alloc);
     var collected_matches = std.ArrayListUnmanaged(graph_pattern_mod.PatternMatch).empty;
     defer {
         for (collected_matches.items) |*match| match.deinit(alloc);
@@ -2651,23 +2569,13 @@ fn executeDistributedConjunctivePattern(
         defer alloc.free(start_keys);
         for (page.hits, 0..) |hit, i| start_keys[i] = hit.id;
 
-        if (aggregate_plan.unique_specs.len > 0) {
-            const computed = try graph_pattern_mod.aggregateConjunctivePatternWithEdgeReader(
+        if (aggregate_stream) |*stream| {
+            try stream.consumePageWithEdgeReader(
                 alloc,
                 edge_reader,
                 start_keys,
                 pattern,
-                aggregate_plan.unique_specs,
                 base_opts,
-            );
-            defer {
-                for (computed) |*aggregate| aggregate.deinit(alloc);
-                if (computed.len > 0) alloc.free(computed);
-            }
-            for (computed, 0..) |aggregate, i| try aggregate_accumulators[i].observe(
-                alloc,
-                aggregate,
-                request_distinct_budget,
             );
         } else {
             var page_opts = base_opts;
@@ -2698,13 +2606,17 @@ fn executeDistributedConjunctivePattern(
         cursor_key = next_cursor;
     }
 
-    if (aggregate_plan.unique_specs.len > 0) {
+    if (aggregate_stream) |*stream| {
+        const computed = try stream.finishAlloc(alloc);
+        defer {
+            for (computed) |*aggregate| aggregate.deinit(alloc);
+            if (computed.len > 0) alloc.free(computed);
+        }
         const aggregates = try materializeAggregateResults(
             alloc,
             graph_query.query.aggregates,
             aggregate_plan.output_indexes,
-            aggregate_accumulators,
-            request_distinct_budget,
+            computed,
         );
         const name = state.name;
         state.name = &.{};
@@ -6575,16 +6487,22 @@ test "distributed graph paged execution trusts only source-filtered anchors acro
     try std.testing.expectEqual(@as(usize, 1), pager.match_filter_rejections);
 }
 
-test "distributed graph duplicate distinct aggregates share one merge payload" {
+test "distributed graph duplicate distinct aggregates share one result payload" {
     const alloc = std.testing.allocator;
-    var distinct_budget = graph_pattern_mod.DistinctBudget.init(2, 4096);
-    var accumulators = [_]AggregatePageAccumulator{.{ .distinct = true }};
-    defer accumulators[0].deinit(alloc);
-    const distinct_values = [_]graph_node_identity.Ref{.{ .table = "users", .key = "user:1" }};
-    try accumulators[0].observe(alloc, .{
-        .value = 1,
-        .distinct_values = @constCast(distinct_values[0..]),
-    }, &distinct_budget);
+    const Fixture = struct {
+        fn init(a: std.mem.Allocator) !graph_pattern_mod.CountAggregateResult {
+            const values = try a.alloc(graph_node_identity.Ref, 1);
+            errdefer a.free(values);
+            const table = try a.dupe(u8, "users");
+            errdefer a.free(table);
+            const key = try a.dupe(u8, "user:1");
+            errdefer a.free(key);
+            values[0] = .{ .table = table, .key = key };
+            return .{ .value = 1, .distinct_values = values };
+        }
+    };
+    var computed = [_]graph_pattern_mod.CountAggregateResult{try Fixture.init(alloc)};
+    defer computed[0].deinit(alloc);
 
     const requested = [_]graph_query_mod.NamedCountAggregate{
         .{ .name = "authors", .of = "author", .distinct = true },
@@ -6595,8 +6513,7 @@ test "distributed graph duplicate distinct aggregates share one merge payload" {
         alloc,
         &requested,
         &indexes,
-        &accumulators,
-        &distinct_budget,
+        &computed,
     );
     defer {
         for (aggregates) |*aggregate| aggregate.deinit(alloc);
@@ -6626,60 +6543,74 @@ test "distributed graph result hydration follows the public document option" {
     try std.testing.expect(graphResultHydrationRequested(req, query));
 }
 
-test "distributed graph exact distinct merge budget spans cursor pages" {
+test "distributed graph exact distinct stream budget spans cursor pages" {
     const alloc = std.testing.allocator;
-    var accumulator = AggregatePageAccumulator{ .distinct = true };
-    defer accumulator.deinit(alloc);
-    var budget = graph_pattern_mod.DistinctBudget.init(1, 1024);
+    const Reader = struct {
+        pub fn getEdges(_: @This(), a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return try a.alloc(graph_mod.Edge, 0);
+        }
 
-    const first_values = [_]graph_node_identity.Ref{.{ .table = "users", .key = "user:1" }};
-    try accumulator.observe(alloc, .{
-        .value = 1,
-        .distinct_values = @constCast(first_values[0..]),
-    }, &budget);
-    try std.testing.expectEqual(@as(u128, 1), accumulator.value);
+        pub fn freeEdges(_: @This(), a: std.mem.Allocator, edges: []graph_mod.Edge) void {
+            a.free(edges);
+        }
+    };
+    const nodes = [_]graph_pattern_mod.MatchNode{.{ .alias = "anchor" }};
+    const pattern = graph_pattern_mod.ConjunctivePattern{
+        .anchor_alias = "anchor",
+        .nodes = &nodes,
+        .edges = &.{},
+    };
+    const specs = [_]graph_pattern_mod.CountAggregateSpec{.{ .alias = "anchor", .distinct = true }};
+    var budget = graph_pattern_mod.DistinctBudget.init(1, 1024);
+    var stream = try graph_pattern_mod.ConjunctiveCountAggregateStream.init(alloc, &specs, &budget);
+    defer stream.deinit(alloc);
+
+    try stream.consumePageWithEdgeReader(alloc, Reader{}, &.{"user:1"}, pattern, .{ .start_validation = .prevalidated });
     try std.testing.expectEqual(@as(usize, 0), budget.remaining_identities);
 
     // A duplicate on a later page neither grows the exact set nor consumes
     // another unit of request memory.
-    try accumulator.observe(alloc, .{
-        .value = 1,
-        .distinct_values = @constCast(first_values[0..]),
-    }, &budget);
-    try std.testing.expectEqual(@as(u128, 1), accumulator.value);
-
-    const next_values = [_]graph_node_identity.Ref{.{ .table = "users", .key = "user:2" }};
+    try stream.consumePageWithEdgeReader(alloc, Reader{}, &.{"user:1"}, pattern, .{ .start_validation = .prevalidated });
     try std.testing.expectError(
         error.GraphDistinctBudgetExceeded,
-        accumulator.observe(alloc, .{
-            .value = 1,
-            .distinct_values = @constCast(next_values[0..]),
-        }, &budget),
+        stream.consumePageWithEdgeReader(alloc, Reader{}, &.{"user:2"}, pattern, .{ .start_validation = .prevalidated }),
     );
-    try std.testing.expectEqual(@as(u128, 1), accumulator.value);
+    const computed = try stream.finishAlloc(alloc);
+    defer {
+        for (computed) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(computed);
+    }
+    try std.testing.expectEqual(@as(u128, 1), computed[0].value);
 }
 
 test "distributed graph exact distinct budget spans named operations" {
     const alloc = std.testing.allocator;
-    var first = AggregatePageAccumulator{ .distinct = true };
-    defer first.deinit(alloc);
-    var second = AggregatePageAccumulator{ .distinct = true };
-    defer second.deinit(alloc);
+    const Reader = struct {
+        pub fn getEdges(_: @This(), a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
+            return try a.alloc(graph_mod.Edge, 0);
+        }
+
+        pub fn freeEdges(_: @This(), a: std.mem.Allocator, edges: []graph_mod.Edge) void {
+            a.free(edges);
+        }
+    };
+    const nodes = [_]graph_pattern_mod.MatchNode{.{ .alias = "anchor" }};
+    const pattern = graph_pattern_mod.ConjunctivePattern{
+        .anchor_alias = "anchor",
+        .nodes = &nodes,
+        .edges = &.{},
+    };
+    const specs = [_]graph_pattern_mod.CountAggregateSpec{.{ .alias = "anchor", .distinct = true }};
     var request_budget = graph_pattern_mod.DistinctBudget.init(1, 1024);
+    var first = try graph_pattern_mod.ConjunctiveCountAggregateStream.init(alloc, &specs, &request_budget);
+    defer first.deinit(alloc);
+    var second = try graph_pattern_mod.ConjunctiveCountAggregateStream.init(alloc, &specs, &request_budget);
+    defer second.deinit(alloc);
 
-    const first_values = [_]graph_node_identity.Ref{.{ .table = "users", .key = "user:1" }};
-    try first.observe(alloc, .{
-        .value = 1,
-        .distinct_values = @constCast(first_values[0..]),
-    }, &request_budget);
-
-    const second_values = [_]graph_node_identity.Ref{.{ .table = "users", .key = "user:2" }};
+    try first.consumePageWithEdgeReader(alloc, Reader{}, &.{"user:1"}, pattern, .{ .start_validation = .prevalidated });
     try std.testing.expectError(
         error.GraphDistinctBudgetExceeded,
-        second.observe(alloc, .{
-            .value = 1,
-            .distinct_values = @constCast(second_values[0..]),
-        }, &request_budget),
+        second.consumePageWithEdgeReader(alloc, Reader{}, &.{"user:2"}, pattern, .{ .start_validation = .prevalidated }),
     );
 }
 
