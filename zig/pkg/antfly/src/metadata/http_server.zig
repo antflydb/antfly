@@ -55,7 +55,12 @@ fn validateRestoreProgressBodySize(body_len: usize) !void {
         return error.RestoreProgressRequestTooLarge;
 }
 
-pub const MetadataHttpServerConfig = struct {};
+pub const MetadataHttpServerConfig = struct {
+    /// Non-secret capability marker used by deployment controllers to prove
+    /// that every upgraded metadata process is actually enforcing the
+    /// configured internal-service authentication rollout mode.
+    internal_service_auth_capability: ?[]const u8 = null,
+};
 
 pub const SplitRequest = table_operations.SplitRequest;
 pub const MergeRequest = table_operations.MergeRequest;
@@ -1222,11 +1227,14 @@ pub const AdminSource = struct {
 
 pub const MetadataHttpServer = struct {
     source: AdminSource,
+    internal_service_auth_capability: ?[]const u8 = null,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MetadataHttpServerConfig, source: AdminSource) MetadataHttpServer {
         _ = alloc;
-        _ = cfg;
-        return .{ .source = source };
+        return .{
+            .source = source,
+            .internal_service_auth_capability = cfg.internal_service_auth_capability,
+        };
     }
 
     pub fn deinit(self: *MetadataHttpServer) void {
@@ -1440,11 +1448,17 @@ pub const MetadataHttpServer = struct {
 
     fn metadataRuntimeTopology(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const result = self.source.runtimeTopology() catch |err| return metadataReadError(ctx, err);
+        if (self.internal_service_auth_capability) |capability| {
+            try ctx.setHeader("X-Antfly-Internal-Service-Auth", capability);
+        }
         return self.trackedJson(ctx, result);
     }
 
     fn metadataStatus(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const result = self.readOperations().status(requestContext(ctx)) catch |err| return metadataReadError(ctx, err);
+        if (self.internal_service_auth_capability) |capability| {
+            try ctx.setHeader("X-Antfly-Internal-Service-Auth", capability);
+        }
         return self.trackedJson(ctx, result);
     }
 
@@ -3497,11 +3511,17 @@ test "metadata http server serves status and filtered admin routes" {
     };
 
     var source = FakeSource{};
-    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var server = MetadataHttpServer.init(std.testing.allocator, .{
+        .internal_service_auth_capability = "v1; mode=migration",
+    }, source.iface());
 
     var topology_resp = try server.executeTypedHandlerForTest(.GET, routes.Routes.runtime_topology, &.{}, MetadataHttpServer.metadataRuntimeTopology);
     defer topology_resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), topology_resp.status.code);
+    try std.testing.expectEqualStrings(
+        "v1; mode=migration",
+        topology_resp.headers.get("x-antfly-internal-service-auth").?,
+    );
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
         "{\"metadata_group_id\":77,\"metadata_raft_local_node_id\":2,\"metadata_raft_role\":\"follower\",\"metadata_raft_leader_id\":1,\"metadata_raft_term\":9,\"metadata_raft_local_voter\":true,\"metadata_raft_voter_count\":3,\"metadata_raft_learner_count\":2}",

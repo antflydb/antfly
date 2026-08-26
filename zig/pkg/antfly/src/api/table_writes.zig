@@ -6715,6 +6715,18 @@ pub const ProvisionedTableWriteSource = struct {
         return true;
     }
 
+    fn repairHandoffStatusPendingBestEffort(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+    ) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
+        return self.active_table_activities.items[index].repair_handoff_status_pending != 0;
+    }
+
     fn markRepairHandoffClearBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
@@ -9930,6 +9942,12 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         self.retireReadersAfterIndexRepairCompletion(table_name, result);
+        if (result.index_repair_repaired and !result.index_repair_pending and !result.terminal_degraded) {
+            // The bounded repair's post-check is the durable proof that no
+            // runnable or unavailable generation remains. Record that edge
+            // even if a visibility callback was delayed behind publication.
+            self.markRepairHandoffClearBestEffort(table_name, group_id);
+        }
         if (result.terminal_degraded) {
             // catchUpManagedDb publishes the terminal observation with startup
             // provenance. Do not relabel it as a fresh live-writer snapshot.
@@ -9952,6 +9970,13 @@ pub const ProvisionedTableWriteSource = struct {
         } else {
             try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db));
             startup_status_active = false;
+        }
+        if (self.repairHandoffStatusPendingBestEffort(table_name, group_id)) {
+            // A fenced status observation cannot be the last owner of a
+            // structural repair handoff. Retain the exact scheduler route
+            // until a later pass publishes after the clear edge and settles
+            // snapshot-only authority, even when durable repair is complete.
+            result.index_repair_pending = true;
         }
         self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &result);
         preserve_startup_cache = shouldPreserveStartupWriteCache(result);
@@ -16906,6 +16931,8 @@ pub const HostedProvisionedTableWriteSource = struct {
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     foreground_derived_progress: bool = false,
 
@@ -16951,6 +16978,22 @@ pub const HostedProvisionedTableWriteSource = struct {
             cache.write_cache.inference_api_url = inference_api_url;
         }
         return self;
+    }
+
+    pub fn withInternalServiceAuth(
+        self: *HostedProvisionedTableWriteSource,
+        secret: ?[]const u8,
+        issuer: ?[]const u8,
+    ) *HostedProvisionedTableWriteSource {
+        self.internal_service_secret = secret;
+        self.internal_service_issuer = issuer;
+        return self;
+    }
+
+    fn httpClient(self: *HostedProvisionedTableWriteSource, alloc: std.mem.Allocator) http_client.ApiHttpClient {
+        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client;
     }
 
     pub fn withDestinationAuthorization(
@@ -17020,6 +17063,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const alloc = std.heap.page_allocator;
         var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        _ = worker.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         try distributed_txn.resolveParticipant(alloc, worker.worker(), participant, txn_id, status, commit_version);
     }
 
@@ -17504,7 +17548,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
                     },
                     .remote => |remote| {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         const body = try encodeRemoteBatchRequest(alloc, .{
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
@@ -17626,6 +17670,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const participant = try distributed_txn.participantIdForGroup(alloc, coordinator_table_name, coordinator_group_id);
         defer alloc.free(participant);
         var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        _ = worker.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         try worker.worker().acknowledgeGroup(alloc, coordinator_group_id, coordinator_table_name, .{
             .txn_id = txn_id,
             .participant = participant,
@@ -17645,6 +17690,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        _ = worker_impl.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
@@ -17700,7 +17746,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 const body = try forwardedTableBackupRequestAlloc(alloc, backup_id, location_uri, connection, format);
                 defer alloc.free(body);
 
-                var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                var client = self.httpClient(alloc);
                 var response = try client.fetchBackupTableFenced(remote.base_uri, table_name, body, fence);
                 response.deinit(alloc);
 
@@ -17941,7 +17987,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             return switch (route.*) {
                 .local => try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name),
                 .remote => |remote| blk: {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var client = self.httpClient(alloc);
                     var response = client.fetchGroupDocumentArtifactReprocess(remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
                         error.NotFound, error.UnexpectedHttpStatus => break :blk null,
                         else => return err,
@@ -18011,7 +18057,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 var group_result = switch (route.*) {
                     .local => (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, group_req)) orelse continue,
                     .remote => |remote| blk: {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         var response = client.fetchGroupDocumentArtifactRangeReprocess(remote.base_uri, group_id, table_name, artifact_name, body) catch |err| switch (err) {
                             error.NotFound, error.UnexpectedHttpStatus => continue,
                             else => return err,
@@ -18095,7 +18141,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 break :blk switch (route.*) {
                     .local => (try listArtifactRepairIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue,
                     .remote => |remote| remote_blk: {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         var response = client.fetchGroupArtifactRepairIssues(remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                             else => return err,
                         };
@@ -18213,7 +18259,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         }
                         const body = try std.json.Stringify.valueAlloc(alloc, remote_req, .{ .emit_null_optional_fields = false });
                         defer alloc.free(body);
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         var response = client.fetchGroupArtifactRepairRun(remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                             else => return err,
                         };
@@ -18257,7 +18303,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .remote => |remote| blk: {
                     const body = try std.json.Stringify.valueAlloc(alloc, update, .{ .emit_null_optional_fields = false });
                     defer alloc.free(body);
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var client = self.httpClient(alloc);
                     var response = client.fetchGroupDocumentArtifactChildRangePlacementUpdate(remote.base_uri, group_id, table_name, doc_key, artifact_name, body) catch |err| switch (err) {
                         error.NotFound, error.UnexpectedHttpStatus => break :blk null,
                         else => return err,
@@ -18288,7 +18334,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .remote => |remote| blk: {
                     const body = try encodeRemoteDocumentArtifactChildRangeApplyBatch(alloc, child_batch);
                     defer alloc.free(body);
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var client = self.httpClient(alloc);
                     var response = client.fetchGroupDocumentArtifactChildRangeBatchApply(remote.base_uri, group_id, table_name, doc_key, artifact_name, body) catch |err| switch (err) {
                         error.NotFound, error.UnexpectedHttpStatus => break :blk null,
                         else => return err,
@@ -22412,8 +22458,12 @@ fn overlayRuntimeStatusReplayTargetFromDb(
     status: *runtime_status.LocalTableRuntimeStatus,
     db: *db_mod.DB,
 ) void {
-    const async_stats = db.snapshotAsyncIndexingStats();
-    status.stats.async_indexing = async_stats;
+    // Cold/query-only recovery has no producer runtime of its own. If a live
+    // writer is resident, overlay its lock-free lifecycle snapshot together
+    // with replay watermarks so a just-recovered status cannot transiently
+    // report a ready managed index with `enrichment_runtime.enabled=false`.
+    db.overlayRuntimeStatusRuntimeBestEffort(&status.stats);
+    const async_stats = status.stats.async_indexing;
     for (status.stats.indexes) |*item| {
         const prior_backfill_active = item.backfill_active;
         const prior_backfill_progress = item.backfill_progress;
@@ -34811,6 +34861,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
     var attempted_repair = false;
     var repaired = false;
     var repair_passes: usize = 0;
+    var publication_fenced = false;
     {
         // Exercise the cold-owner path that CI can reach when an idle writer
         // cache entry is retired between structural handoff and repair.
@@ -34819,6 +34870,32 @@ test "structural reconcile publishes durable index repair debt once per group" {
         const status = source.beginStatusRequest("docs");
         try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.snapshot_only, status);
         source.endStatusRequest("docs", status);
+        const PublicationFence = struct {
+            source: *ProvisionedTableWriteSource,
+            cache: *runtime_status.TableRuntimeSnapshotCache,
+            fenced: bool = false,
+            clear_publications: usize = 0,
+
+            fn run(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const io = self.source.table_activity_threaded.io();
+                self.source.table_activity_mutex.lockUncancelable(io);
+                const clear_observed = if (self.source.findTableActivityLocked("docs", 7001)) |index|
+                    self.source.active_table_activities.items[index].repair_handoff_clear_observed
+                else
+                    false;
+                self.source.table_activity_mutex.unlock(io);
+                if (!clear_observed) return;
+                self.clear_publications += 1;
+                // Fence both the clear callback's publication and the
+                // caller's final consistent publication. The next scheduler
+                // pass must own recovery of the still-pending handoff.
+                if (self.clear_publications > 2) return;
+                self.cache.invalidateTable("docs");
+                self.fenced = self.clear_publications == 2;
+            }
+        };
+        var publication_fence = PublicationFence{ .source = &source, .cache = &snapshot_cache };
         const RepairWorker = struct {
             source: *ProvisionedTableWriteSource,
             indexes_json: []const u8,
@@ -34857,15 +34934,20 @@ test "structural reconcile publishes durable index repair debt once per group" {
         // Snapshot-only status is observational and cannot delay the cold
         // repair owner. The repair's clear plus final cached publication must
         // retire shard authority without another structural pass.
+        const previous_publish_hook = test_before_runtime_status_publish_hook;
+        test_before_runtime_status_publish_hook = .{ .ptr = &publication_fence, .run = PublicationFence.run };
+        defer test_before_runtime_status_publish_hook = previous_publish_hook;
         worker.run();
         if (worker.err) |err| return err;
         attempted_repair = worker.attempted_repair;
         repaired = worker.repaired;
         repair_passes = worker.repair_passes;
+        publication_fenced = publication_fence.fenced;
     }
-    try std.testing.expect(repair_passes >= 2);
+    try std.testing.expect(repair_passes >= 3);
     try std.testing.expect(attempted_repair);
     try std.testing.expect(repaired);
+    try std.testing.expect(publication_fenced);
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
     // Repair's visibility hook may repeat the idempotent exact-debt enqueue as
     // each bounded pass discovers the durable intent. Only a subsequent

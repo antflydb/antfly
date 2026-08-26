@@ -3263,8 +3263,8 @@ fn executeTier1SegmentsWithBitplaneResolver(
     context_init_policy: codeblock.ContextInitPolicy,
     state: ?*const codestream.State,
 ) !Tier1Execution {
-    const segments = try buildTier1Segments(allocator, model);
-    errdefer freeTier1Segments(allocator, segments);
+    var plan = try Tier1ExecutionPlan.init(allocator, model);
+    defer plan.deinit();
 
     const codeblocks = try allocator.alloc(Tier1CodeblockState, model.codeblock_states.len);
     errdefer allocator.free(codeblocks);
@@ -3273,189 +3273,314 @@ fn executeTier1SegmentsWithBitplaneResolver(
         for (codeblocks[0..initialized_codeblocks]) |*codeblock_state| codeblock_state.deinit();
     }
 
-    const rects = try allocator.alloc(tile.CodeBlockRect, model.codeblock_states.len);
-    defer allocator.free(rects);
-    const subbands = try allocator.alloc(tile.SubbandType, model.codeblock_states.len);
-    defer allocator.free(subbands);
-    const seen = try allocator.alloc(bool, model.codeblock_states.len);
-    defer allocator.free(seen);
-    @memset(seen, false);
-
-    for (model.layout) |entry| {
-        if (entry.state_index >= model.codeblock_states.len) return error.InvalidPacketStateIndex;
-        if (seen[entry.state_index]) continue;
-        seen[entry.state_index] = true;
-        rects[entry.state_index] = entry.rect;
-        subbands[entry.state_index] = entry.subband;
-    }
-
-    for (model.codeblock_states, 0..) |codeblock_state, idx| {
-        if (!seen[idx]) return error.InvalidPacketStateIndex;
-        const adjusted_zero_bit_planes = adjustedZeroBitPlanesForExecution(
-            state,
-            subbands[idx],
-            codeblock_state.zero_bit_planes orelse 0,
+    for (codeblocks, 0..) |*codeblock_state, state_index| {
+        codeblock_state.* = try decodeTier1Codeblock(
+            allocator,
+            model,
+            codestream_bytes,
+            &plan,
+            state_index,
+            default_bits_per_component,
+            sign_policy,
+            refinement_policy,
+            magnitude_policy,
             zero_bit_plane_adjustment,
+            context_init_policy,
+            state,
         );
-        codeblocks[idx] = .{
-            .coordinate = codeblock_state.coordinate,
-            .subband = subbands[idx],
-            .rect = rects[idx],
-            .zero_bit_planes = adjusted_zero_bit_planes,
-            .executed_passes = 0,
-            .grid = try codeblock.CoefficientGrid.init(allocator, rects[idx].width(), rects[idx].height()),
-        };
         initialized_codeblocks += 1;
-        codeblocks[idx].grid.clear();
-    }
-
-    const segment_next = try allocator.alloc(?usize, segments.len);
-    defer allocator.free(segment_next);
-    @memset(segment_next, null);
-    const group_first = try allocator.alloc(?usize, codeblocks.len);
-    defer allocator.free(group_first);
-    @memset(group_first, null);
-    const group_last = try allocator.alloc(?usize, codeblocks.len);
-    defer allocator.free(group_last);
-    @memset(group_last, null);
-
-    for (segments, 0..) |segment, idx| {
-        if (segment.state_index >= codeblocks.len) return error.InvalidPacketStateIndex;
-        const body_end = segment.body_offset + segment.body_length;
-        if (body_end > codestream_bytes.len) return error.TruncatedPacketBody;
-        if (group_first[segment.state_index] == null) {
-            group_first[segment.state_index] = idx;
-        } else {
-            segment_next[group_last[segment.state_index].?] = idx;
-        }
-        group_last[segment.state_index] = idx;
-    }
-
-    for (codeblocks, 0..) |_, state_index| {
-        const first_segment_index = group_first[state_index] orelse continue;
-        const first_segment = segments[first_segment_index];
-        const segment_context_init_policy = contextInitPolicyForSegment(state, first_segment.subband, context_init_policy);
-        const segment_magnitude_policy = magnitudePolicyForSegment(state, first_segment.coordinate.component_index, first_segment.subband, magnitude_policy);
-        const segment_refinement_policy = refinementPolicyForSegment(state, first_segment.coordinate.component_index, first_segment.subband, refinement_policy);
-        const segment_code_block_style = codeBlockStyleForSegment(state, first_segment.coordinate.component_index);
-        var total_body_length: usize = 0;
-        var total_passes: u16 = 0;
-
-        var cursor = first_segment_index;
-        while (true) {
-            const segment = segments[cursor];
-            total_body_length += segment.body_length;
-            total_passes +%= segment.num_coding_passes;
-            if (segment_next[cursor]) |next_index| {
-                cursor = next_index;
-            } else {
-                break;
-            }
-        }
-
-        const body = try allocator.alloc(u8, total_body_length);
-        defer allocator.free(body);
-
-        var passes = std.ArrayListUnmanaged(codeblock.CodingPass).empty;
-        errdefer passes.deinit(allocator);
-        var segment_lengths = std.ArrayListUnmanaged(u32).empty;
-        defer segment_lengths.deinit(allocator);
-
-        var body_offset: usize = 0;
-        cursor = first_segment_index;
-        while (true) {
-            const segment = segments[cursor];
-            const segment_end = segment.body_offset + segment.body_length;
-            if (segment.body_length != 0) {
-                std.mem.copyForwards(u8, body[body_offset .. body_offset + segment.body_length], codestream_bytes[segment.body_offset..segment_end]);
-            }
-
-            const bits_per_component = if (state) |resolved_state|
-                try codeblockBitplanesForSegment(resolved_state, segment)
-            else
-                default_bits_per_component;
-            const adjusted_segment_zero_bit_planes = adjustedZeroBitPlanesForExecution(
-                state,
-                segment.subband,
-                segment.zero_bit_planes,
-                zero_bit_plane_adjustment,
-            );
-            var plan = try codeblock.planContributionPassRange(
-                allocator,
-                segment.coordinate.component_index,
-                segment.subband,
-                adjusted_segment_zero_bit_planes,
-                segment.start_pass_index,
-                segment.num_coding_passes,
-                bits_per_component,
-            );
-            defer plan.deinit(allocator);
-            try passes.appendSlice(allocator, plan.passes);
-            if (segment.segment_lengths.len != 0) {
-                if (segment_code_block_style.termination and segment.segment_lengths.len != segment.num_coding_passes) return error.PassLengthMismatch;
-                var segment_body_length: usize = 0;
-                for (segment.segment_lengths) |segment_length| segment_body_length += segment_length;
-                if (segment_body_length != segment.body_length) return error.PassLengthMismatch;
-                try segment_lengths.appendSlice(allocator, segment.segment_lengths);
-            } else if ((segment_code_block_style.termination or segment_code_block_style.bypass) and segment.num_coding_passes != 0) {
-                return error.PassLengthMismatch;
-            }
-
-            body_offset += segment.body_length;
-            if (segment_next[cursor]) |next_index| {
-                cursor = next_index;
-            } else {
-                break;
-            }
-        }
-
-        codeblocks[state_index].magnitude_scale = switch (segment_magnitude_policy) {
-            .openjpeg_midpoint => 2,
-            else => 1,
-        };
-        var combined_plan = codeblock.ContributionPassPlan{
-            .component_index = first_segment.coordinate.component_index,
-            .subband = first_segment.subband,
-            .zero_bit_planes = codeblocks[state_index].zero_bit_planes,
-            .start_pass_index = 0,
-            .num_passes = total_passes,
-            .passes = try passes.toOwnedSlice(allocator),
-        };
-        defer combined_plan.deinit(allocator);
-
-        if (segment_code_block_style.termination or segment_code_block_style.bypass) {
-            try codeblock.executeContributionPassPlanMqWithSegments(
-                allocator,
-                &codeblocks[state_index].grid,
-                &combined_plan,
-                body,
-                segment_lengths.items,
-                sign_policy,
-                segment_refinement_policy,
-                segment_magnitude_policy,
-                segment_context_init_policy,
-                segment_code_block_style,
-            );
-        } else {
-            try codeblock.executeContributionPassPlanMq(
-                allocator,
-                &codeblocks[state_index].grid,
-                &combined_plan,
-                body,
-                sign_policy,
-                segment_refinement_policy,
-                segment_magnitude_policy,
-                segment_context_init_policy,
-                segment_code_block_style,
-            );
-        }
-        codeblocks[state_index].executed_passes +%= total_passes;
     }
 
     return .{
-        .segments = segments,
+        .segments = plan.takeSegments(),
         .codeblocks = codeblocks,
     };
+}
+
+pub const Tier1CodeblockVisitor = struct {
+    context: *anyopaque,
+    visit: *const fn (context: *anyopaque, codeblock_state: *const Tier1CodeblockState) anyerror!void,
+};
+
+pub fn visitTier1CodeblocksForState(
+    allocator: std.mem.Allocator,
+    model: *const PacketModel,
+    codestream_bytes: []const u8,
+    state: *const codestream.State,
+    sign_policy: codeblock.SignPolicy,
+    refinement_policy: codeblock.RefinementPolicy,
+    magnitude_policy: codeblock.MagnitudePolicy,
+    zero_bit_plane_adjustment: i8,
+    context_init_policy: codeblock.ContextInitPolicy,
+    visitor: Tier1CodeblockVisitor,
+) !void {
+    var plan = try Tier1ExecutionPlan.init(allocator, model);
+    defer plan.deinit();
+
+    for (model.codeblock_states, 0..) |_, state_index| {
+        var codeblock_state = try decodeTier1Codeblock(
+            allocator,
+            model,
+            codestream_bytes,
+            &plan,
+            state_index,
+            0,
+            sign_policy,
+            refinement_policy,
+            magnitude_policy,
+            zero_bit_plane_adjustment,
+            context_init_policy,
+            state,
+        );
+        defer codeblock_state.deinit();
+        try visitor.visit(visitor.context, &codeblock_state);
+    }
+}
+
+const Tier1ExecutionPlan = struct {
+    allocator: std.mem.Allocator,
+    segments: []Tier1Segment,
+    rects: []tile.CodeBlockRect,
+    subbands: []tile.SubbandType,
+    segment_next: []?usize,
+    group_first: []?usize,
+
+    fn init(allocator: std.mem.Allocator, model: *const PacketModel) !Tier1ExecutionPlan {
+        const segments = try buildTier1Segments(allocator, model);
+        errdefer freeTier1Segments(allocator, segments);
+        const rects = try allocator.alloc(tile.CodeBlockRect, model.codeblock_states.len);
+        errdefer allocator.free(rects);
+        const subbands = try allocator.alloc(tile.SubbandType, model.codeblock_states.len);
+        errdefer allocator.free(subbands);
+        const seen = try allocator.alloc(bool, model.codeblock_states.len);
+        defer allocator.free(seen);
+        @memset(seen, false);
+
+        for (model.layout) |entry| {
+            if (entry.state_index >= model.codeblock_states.len) return error.InvalidPacketStateIndex;
+            if (seen[entry.state_index]) continue;
+            seen[entry.state_index] = true;
+            rects[entry.state_index] = entry.rect;
+            subbands[entry.state_index] = entry.subband;
+        }
+        for (seen) |present| {
+            if (!present) return error.InvalidPacketStateIndex;
+        }
+
+        const segment_next = try allocator.alloc(?usize, segments.len);
+        errdefer allocator.free(segment_next);
+        @memset(segment_next, null);
+        const group_first = try allocator.alloc(?usize, model.codeblock_states.len);
+        errdefer allocator.free(group_first);
+        @memset(group_first, null);
+        const group_last = try allocator.alloc(?usize, model.codeblock_states.len);
+        defer allocator.free(group_last);
+        @memset(group_last, null);
+
+        for (segments, 0..) |segment, idx| {
+            if (segment.state_index >= model.codeblock_states.len) return error.InvalidPacketStateIndex;
+            if (group_first[segment.state_index] == null) {
+                group_first[segment.state_index] = idx;
+            } else {
+                segment_next[group_last[segment.state_index].?] = idx;
+            }
+            group_last[segment.state_index] = idx;
+        }
+
+        return .{
+            .allocator = allocator,
+            .segments = segments,
+            .rects = rects,
+            .subbands = subbands,
+            .segment_next = segment_next,
+            .group_first = group_first,
+        };
+    }
+
+    fn takeSegments(self: *Tier1ExecutionPlan) []Tier1Segment {
+        const segments = self.segments;
+        self.segments = &.{};
+        return segments;
+    }
+
+    fn deinit(self: *Tier1ExecutionPlan) void {
+        if (self.segments.len > 0) freeTier1Segments(self.allocator, self.segments);
+        self.allocator.free(self.rects);
+        self.allocator.free(self.subbands);
+        self.allocator.free(self.segment_next);
+        self.allocator.free(self.group_first);
+        self.* = undefined;
+    }
+};
+
+fn decodeTier1Codeblock(
+    allocator: std.mem.Allocator,
+    model: *const PacketModel,
+    codestream_bytes: []const u8,
+    plan: *const Tier1ExecutionPlan,
+    state_index: usize,
+    default_bits_per_component: u8,
+    sign_policy: codeblock.SignPolicy,
+    refinement_policy: codeblock.RefinementPolicy,
+    magnitude_policy: codeblock.MagnitudePolicy,
+    zero_bit_plane_adjustment: i8,
+    context_init_policy: codeblock.ContextInitPolicy,
+    state: ?*const codestream.State,
+) !Tier1CodeblockState {
+    if (state_index >= model.codeblock_states.len) return error.InvalidPacketStateIndex;
+    const model_state = model.codeblock_states[state_index];
+    const adjusted_zero_bit_planes = adjustedZeroBitPlanesForExecution(
+        state,
+        plan.subbands[state_index],
+        model_state.zero_bit_planes orelse 0,
+        zero_bit_plane_adjustment,
+    );
+    var result = Tier1CodeblockState{
+        .coordinate = model_state.coordinate,
+        .subband = plan.subbands[state_index],
+        .rect = plan.rects[state_index],
+        .zero_bit_planes = adjusted_zero_bit_planes,
+        .executed_passes = 0,
+        .grid = try codeblock.CoefficientGrid.init(
+            allocator,
+            plan.rects[state_index].width(),
+            plan.rects[state_index].height(),
+        ),
+    };
+    errdefer result.deinit();
+    result.grid.clear();
+
+    const first_segment_index = plan.group_first[state_index] orelse return result;
+    const first_segment = plan.segments[first_segment_index];
+    const segment_context_init_policy = contextInitPolicyForSegment(state, first_segment.subband, context_init_policy);
+    const segment_magnitude_policy = magnitudePolicyForSegment(state, first_segment.coordinate.component_index, first_segment.subband, magnitude_policy);
+    const segment_refinement_policy = refinementPolicyForSegment(state, first_segment.coordinate.component_index, first_segment.subband, refinement_policy);
+    const segment_code_block_style = codeBlockStyleForSegment(state, first_segment.coordinate.component_index);
+    var total_body_length: usize = 0;
+    var total_passes: u16 = 0;
+
+    var cursor = first_segment_index;
+    while (true) {
+        const segment = plan.segments[cursor];
+        total_body_length = std.math.add(usize, total_body_length, segment.body_length) catch
+            return error.TruncatedPacketBody;
+        total_passes +%= segment.num_coding_passes;
+        if (plan.segment_next[cursor]) |next_index| {
+            cursor = next_index;
+        } else {
+            break;
+        }
+    }
+
+    const body = try allocator.alloc(u8, total_body_length);
+    defer allocator.free(body);
+    var passes = std.ArrayListUnmanaged(codeblock.CodingPass).empty;
+    errdefer passes.deinit(allocator);
+    var segment_lengths = std.ArrayListUnmanaged(u32).empty;
+    defer segment_lengths.deinit(allocator);
+
+    var body_offset: usize = 0;
+    cursor = first_segment_index;
+    while (true) {
+        const segment = plan.segments[cursor];
+        const segment_end = std.math.add(usize, segment.body_offset, segment.body_length) catch
+            return error.TruncatedPacketBody;
+        if (segment_end > codestream_bytes.len) return error.TruncatedPacketBody;
+        if (segment.body_length != 0) {
+            std.mem.copyForwards(
+                u8,
+                body[body_offset .. body_offset + segment.body_length],
+                codestream_bytes[segment.body_offset..segment_end],
+            );
+        }
+
+        const bits_per_component = if (state) |resolved_state|
+            try codeblockBitplanesForSegment(resolved_state, segment)
+        else
+            default_bits_per_component;
+        const adjusted_segment_zero_bit_planes = adjustedZeroBitPlanesForExecution(
+            state,
+            segment.subband,
+            segment.zero_bit_planes,
+            zero_bit_plane_adjustment,
+        );
+        var contribution = try codeblock.planContributionPassRange(
+            allocator,
+            segment.coordinate.component_index,
+            segment.subband,
+            adjusted_segment_zero_bit_planes,
+            segment.start_pass_index,
+            segment.num_coding_passes,
+            bits_per_component,
+        );
+        defer contribution.deinit(allocator);
+        try passes.appendSlice(allocator, contribution.passes);
+        if (segment.segment_lengths.len != 0) {
+            if (segment_code_block_style.termination and segment.segment_lengths.len != segment.num_coding_passes)
+                return error.PassLengthMismatch;
+            var segment_body_length: usize = 0;
+            for (segment.segment_lengths) |segment_length| {
+                segment_body_length = std.math.add(usize, segment_body_length, segment_length) catch
+                    return error.PassLengthMismatch;
+            }
+            if (segment_body_length != segment.body_length) return error.PassLengthMismatch;
+            try segment_lengths.appendSlice(allocator, segment.segment_lengths);
+        } else if ((segment_code_block_style.termination or segment_code_block_style.bypass) and
+            segment.num_coding_passes != 0)
+        {
+            return error.PassLengthMismatch;
+        }
+
+        body_offset += segment.body_length;
+        if (plan.segment_next[cursor]) |next_index| {
+            cursor = next_index;
+        } else {
+            break;
+        }
+    }
+
+    result.magnitude_scale = switch (segment_magnitude_policy) {
+        .openjpeg_midpoint => 2,
+        else => 1,
+    };
+    var combined_plan = codeblock.ContributionPassPlan{
+        .component_index = first_segment.coordinate.component_index,
+        .subband = first_segment.subband,
+        .zero_bit_planes = result.zero_bit_planes,
+        .start_pass_index = 0,
+        .num_passes = total_passes,
+        .passes = try passes.toOwnedSlice(allocator),
+    };
+    defer combined_plan.deinit(allocator);
+
+    if (segment_code_block_style.termination or segment_code_block_style.bypass) {
+        try codeblock.executeContributionPassPlanMqWithSegments(
+            allocator,
+            &result.grid,
+            &combined_plan,
+            body,
+            segment_lengths.items,
+            sign_policy,
+            segment_refinement_policy,
+            segment_magnitude_policy,
+            segment_context_init_policy,
+            segment_code_block_style,
+        );
+    } else {
+        try codeblock.executeContributionPassPlanMq(
+            allocator,
+            &result.grid,
+            &combined_plan,
+            body,
+            sign_policy,
+            segment_refinement_policy,
+            segment_magnitude_policy,
+            segment_context_init_policy,
+            segment_code_block_style,
+        );
+    }
+    result.executed_passes +%= total_passes;
+    return result;
 }
 
 fn magnitudePolicyForSegment(

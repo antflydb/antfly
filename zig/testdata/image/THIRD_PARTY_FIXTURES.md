@@ -97,3 +97,28 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
+
+## U.S. Treasury Bulletin JPEG 2000 Regression Fixture
+
+Files:
+
+- `jpeg2000/regression/officeqa-1985-page1-2319x3253.j2k`
+  - SHA-256:
+    `7200669239a3fc847d685f6b8e7efbcc556a7b61db9755b1e3d07e0c5c6b9359`
+- `jpeg2000/regression/officeqa-1972-page204-2612x3564.j2k`
+  - SHA-256:
+    `91f9bdd4f04ec89d7b8167c02bfa034cead2739d67509d16fec5598a437b435c`
+
+Sources:
+
+- Page 1 image XObject from the March 1985 *Treasury Bulletin*, distributed by
+  the Federal Reserve Bank of St. Louis:
+  `https://fraser.stlouisfed.org/files/docs/publications/tbulletin/1985_03_treasurybulletin.pdf`
+- Page 204 image XObject from the May 1972 *Treasury Bulletin*, distributed by
+  the Federal Reserve Bank of St. Louis:
+  `https://fraser.stlouisfed.org/files/docs/publications/tbulletin/1972_05_treasurybulletin.pdf`
+
+License:
+
+- Public-domain works of the United States federal government. The fixtures are
+  JPEG 2000 codestreams extracted without modification from the source PDFs.

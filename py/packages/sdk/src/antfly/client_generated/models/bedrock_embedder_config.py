@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="BedrockEmbedderConfig")
@@ -23,11 +24,17 @@ class BedrockEmbedderConfig:
     **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
 
         Example:
-            {'provider': 'bedrock', 'model': 'cohere.embed-v4', 'region': 'us-east-1'}
+            {'provider': 'bedrock', 'model': 'cohere.embed-v4', 'request_format': 'cohere_v4', 'region': 'us-east-1'}
 
         Attributes:
-            model (str): The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0'). Example:
-                cohere.embed-v4.
+            model (str): The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4',
+                'amazon.titan-embed-text-v2:0', or an application inference profile ARN). Example: cohere.embed-v4.
+            request_format (BedrockEmbedderConfigRequestFormat | Unset): Bedrock provider request schema. `auto` recognizes
+                direct foundation-model IDs,
+                foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
+                for application inference profiles, provisioned throughput, custom models, and
+                other aliases whose invocation target does not identify the underlying model. Default:
+                BedrockEmbedderConfigRequestFormat.AUTO.
             region (str | Unset): The AWS region for the Bedrock service (e.g., 'us-east-1'). Example: us-east-1.
             dimension (int | Unset): Output dimension for Bedrock embedding models that support configurable dimensions.
             dimensions (int | Unset): Alias for output dimension when using OpenAI-compatible configuration fields.
@@ -39,6 +46,7 @@ class BedrockEmbedderConfig:
     """
 
     model: str
+    request_format: BedrockEmbedderConfigRequestFormat | Unset = BedrockEmbedderConfigRequestFormat.AUTO
     region: str | Unset = UNSET
     dimension: int | Unset = UNSET
     dimensions: int | Unset = UNSET
@@ -50,6 +58,10 @@ class BedrockEmbedderConfig:
 
     def to_dict(self) -> dict[str, Any]:
         model = self.model
+
+        request_format: str | Unset = UNSET
+        if not isinstance(self.request_format, Unset):
+            request_format = self.request_format.value
 
         region = self.region
 
@@ -72,6 +84,8 @@ class BedrockEmbedderConfig:
                 "model": model,
             }
         )
+        if request_format is not UNSET:
+            field_dict["request_format"] = request_format
         if region is not UNSET:
             field_dict["region"] = region
         if dimension is not UNSET:
@@ -94,6 +108,13 @@ class BedrockEmbedderConfig:
         d = dict(src_dict)
         model = d.pop("model")
 
+        _request_format = d.pop("request_format", UNSET)
+        request_format: BedrockEmbedderConfigRequestFormat | Unset
+        if isinstance(_request_format, Unset):
+            request_format = UNSET
+        else:
+            request_format = BedrockEmbedderConfigRequestFormat(_request_format)
+
         region = d.pop("region", UNSET)
 
         dimension = d.pop("dimension", UNSET)
@@ -110,6 +131,7 @@ class BedrockEmbedderConfig:
 
         bedrock_embedder_config = cls(
             model=model,
+            request_format=request_format,
             region=region,
             dimension=dimension,
             dimensions=dimensions,

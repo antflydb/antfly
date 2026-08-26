@@ -16,6 +16,7 @@ const std = @import("std");
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const tables_api = @import("../api/tables.zig");
+const internal_service_auth = @import("../api/internal_service_auth.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -86,12 +87,28 @@ pub const ActiveTransitionsResponse = struct {
 pub const MetadataHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
+    internal_service: ?internal_service_auth.Config = null,
 
     pub fn init(alloc: std.mem.Allocator, executor: http_common.RequestExecutor) MetadataHttpClient {
         return .{
             .alloc = alloc,
             .executor = executor,
         };
+    }
+
+    pub fn withInternalServiceAuth(
+        self: *MetadataHttpClient,
+        secret: ?[]const u8,
+        issuer: ?[]const u8,
+    ) *MetadataHttpClient {
+        self.internal_service = if (secret) |value|
+            if (value.len > 0) .{
+                .secret = value,
+                .issuer = issuer orelse "antfly-node",
+            } else null
+        else
+            null;
+        return self;
     }
 
     pub fn fetchStatus(self: *MetadataHttpClient, base_uri: []const u8) !metadata_api.MetadataStatus {
@@ -825,7 +842,12 @@ pub const MetadataHttpClient = struct {
         var not_leader_attempt: usize = 0;
         while (true) {
             const controlled_req = try applyRequestBudget(req, budget);
-            var resp = self.executor.execute(self.alloc, controlled_req) catch |err| switch (err) {
+            var resp = internal_service_auth.executeRequest(
+                self.alloc,
+                self.executor,
+                controlled_req,
+                self.internal_service,
+            ) catch |err| switch (err) {
                 // The operating system rejected the connection before an HTTP
                 // request could reach the metadata service, so retrying cannot
                 // create a second reallocation generation.
@@ -1235,6 +1257,49 @@ test "metadata http client requests a non-cacheable linearizable head fence" {
     try std.testing.expectEqual(@as(u64, 91), head.metadata_group_id);
     try std.testing.expectEqual(@as(u64, 18), head.metadata_epoch);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
+}
+
+test "metadata http client signs internal routes without leaking authority to public routes" {
+    const CaptureExecutor = struct {
+        internal_calls: usize = 0,
+        public_calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var service_headers: usize = 0;
+            for (req.headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, internal_service_auth.header_name)) continue;
+                service_headers += 1;
+                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+            }
+            if (internal_service_auth.requestTargetsInternalApi(req.uri)) {
+                self.internal_calls += 1;
+                try std.testing.expectEqual(@as(usize, 1), service_headers);
+            } else {
+                self.public_calls += 1;
+                try std.testing.expectEqual(@as(usize, 0), service_headers);
+            }
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"metadata_group_id":91,"metadata_incarnation":"11111111111111111111111111111111","metadata_epoch":18}
+                ),
+            };
+        }
+    };
+
+    var executor = CaptureExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    _ = client.withInternalServiceAuth("metadata-client-test-service-secret", "cluster-a");
+    _ = try client.fetchHead("http://127.0.0.1:9000");
+    _ = try client.fetchLinearizableHead("http://127.0.0.1:9000");
+    try std.testing.expectEqual(@as(usize, 1), executor.public_calls);
+    try std.testing.expectEqual(@as(usize, 1), executor.internal_calls);
 }
 
 test "metadata http client fetches one bounded linearizable snapshot" {

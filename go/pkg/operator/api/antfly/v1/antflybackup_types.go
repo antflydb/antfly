@@ -27,6 +27,10 @@ const (
 	// ReasonInvalidDestination indicates the backup destination is invalid
 	ReasonInvalidDestination = "InvalidDestination"
 
+	// ReasonBackupConnectionRequired indicates a legacy schedule is waiting for
+	// a named external_io connection before it can run safely.
+	ReasonBackupConnectionRequired = "ConnectionRequired"
+
 	// ReasonBackupValidationFailed indicates the backup spec failed validation
 	ReasonBackupValidationFailed = "ValidationFailed"
 
@@ -83,11 +87,14 @@ type BackupDestination struct {
 
 	// Connection is the ID of an external_io connection configured on the
 	// AntflyCluster. It must grant backup.write and authorize this location.
+	// New resources require this field. It remains structurally optional so an
+	// operator upgrade can surface a migration condition on legacy resources.
 	// +optional
 	Connection string `json:"connection,omitempty"`
 
-	// CredentialsSecret references a Secret containing storage credentials
-	// For S3: expects keys AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optionally AWS_REGION
+	// CredentialsSecret is retained only so legacy resources can be read and
+	// migrated. New backup requests must use a named connection instead.
+	// Deprecated: configure credentials on the referenced external_io connection.
 	// +optional
 	CredentialsSecret *SecretReference `json:"credentialsSecret,omitempty"`
 }

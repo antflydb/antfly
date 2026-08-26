@@ -3082,8 +3082,23 @@ pub fn build(b: *std.Build) void {
         .root_module = image_test_mod,
     });
     const run_lib_image_tests = b.addRunArtifact(lib_image_tests);
+    const jpeg2000_decode_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/image/src/jpeg2000/decode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const jpeg2000_decode_tests = b.addTest(.{
+        .root_module = jpeg2000_decode_test_mod,
+    });
+    const run_jpeg2000_decode_tests = b.addRunArtifact(jpeg2000_decode_tests);
+    const jpeg2000_decode_test_step = b.step(
+        "lib-image-jpeg2000-test",
+        "Run direct JPEG 2000 decoder tests",
+    );
+    jpeg2000_decode_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
     lib_image_test_step.dependOn(&run_lib_image_tests.step);
+    lib_image_test_step.dependOn(&run_jpeg2000_decode_tests.step);
 
     const pdf_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/pdf_test_root.zig"),
@@ -3866,6 +3881,7 @@ pub fn build(b: *std.Build) void {
         "table read source distinguishes unavailable physical capability observation",
         "generated route policy inventory is unique and describes wire modes",
         "linked API dispatch preserves kernel-owned ingress policy",
+        "opaque host middleware protects direct internal routes across the kernel ABI",
         "linked transport projects the universal request cancellation callback",
         "linked transport admits a streaming body before the kernel pulls it",
         "linked callbacks preserve streaming and cancellation semantics",
@@ -5445,18 +5461,23 @@ pub fn build(b: *std.Build) void {
         "api http server document scan requires table read permission",
         "transaction principals bind sessions to credential identity",
         "api transaction sessions enforce principal permissions and row filters",
-        "query builder runtime preflight injects mandatory row filter",
-        "MCP document sampling pushes mandatory row filters into storage scans",
-        "usermgr api key permission intersection narrows owner and key wildcards",
         "stored destination admission requires write permission on every eventual sink",
+        "query builder runtime preflight injects mandatory row filter",
         "stored destination envelopes cannot be forged and validate on resume",
         "stored destination grants bind credential source and live permissions",
+        "api http client forwards bounded raft batch routing context without allocation",
+        "api http client authenticates only the internal API namespace",
+        "MCP document sampling pushes mandatory row filters into storage scans",
+        "internal service credentials cannot authorize public inference routes",
         "legacy restore jobs resume only when backed-up definitions are sink free",
         "failed destination authorization refresh reuses the idempotent restore job",
         "destination authorization adoption requires source table admin",
         "legacy stored destinations can be adopted idempotently",
         "api http server cluster restore",
         "cluster restore repository errors preserve operational failure semantics",
+        "internal namespace requires a service principal except HA",
+        "usermgr api key permission intersection narrows owner and key wildcards",
+        "httpx internal control routes call typed operations directly",
     };
     const authorization_sink_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6636,6 +6657,7 @@ pub fn build(b: *std.Build) void {
         "metadata linearizable snapshot fences and frees one owned response",
         "metadata linearizable snapshot detects concurrent projection changes",
         "coherent linearizable snapshot retries a torn capture and preserves request context",
+        "metadata http client signs internal routes without leaking authority to public routes",
         "metadata http client fetches one bounded linearizable snapshot",
         "metadata http client treats missing linearizable snapshot route as unsupported",
         "metadata http server accepts internal reallocate and split merge routes",
@@ -7245,6 +7267,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_mcp_tests.step);
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
+    unit_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     unit_test_step.dependOn(&run_lib_pdf_tests.step);
     unit_test_step.dependOn(&run_lib_scraping_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);

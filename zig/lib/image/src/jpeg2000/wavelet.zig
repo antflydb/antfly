@@ -315,18 +315,64 @@ pub fn inverse97LevelInPlacePhaseOpenJpeg(allocator: std.mem.Allocator, data: []
 }
 
 fn inverse97LevelInPlacePhaseWithScaling(allocator: std.mem.Allocator, data: []f32, width: usize, height: usize, phase_x: u1, phase_y: u1, openjpeg_highpass_scaling: bool) !void {
-    if (data.len != width * height or width == 0 or height == 0) return error.InvalidWaveletBufferShape;
+    return inverse97LevelInPlaceStridedPhaseWithScaling(
+        allocator,
+        data,
+        width,
+        height,
+        width,
+        phase_x,
+        phase_y,
+        openjpeg_highpass_scaling,
+    );
+}
+
+pub fn inverse97LevelInPlaceStridedPhase(
+    allocator: std.mem.Allocator,
+    data: []f32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    phase_x: u1,
+    phase_y: u1,
+) !void {
+    return inverse97LevelInPlaceStridedPhaseWithScaling(allocator, data, width, height, stride, phase_x, phase_y, false);
+}
+
+pub fn inverse97LevelInPlaceStridedPhaseOpenJpeg(
+    allocator: std.mem.Allocator,
+    data: []f32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    phase_x: u1,
+    phase_y: u1,
+) !void {
+    return inverse97LevelInPlaceStridedPhaseWithScaling(allocator, data, width, height, stride, phase_x, phase_y, true);
+}
+
+fn inverse97LevelInPlaceStridedPhaseWithScaling(
+    allocator: std.mem.Allocator,
+    data: []f32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    phase_x: u1,
+    phase_y: u1,
+    openjpeg_highpass_scaling: bool,
+) !void {
+    if (width == 0 or height == 0 or stride < width) return error.InvalidWaveletBufferShape;
+    const required_len = std.math.mul(usize, stride, height) catch return error.InvalidWaveletBufferShape;
+    if (data.len < required_len) return error.InvalidWaveletBufferShape;
 
     const low_w = if (phase_x == 0) (width + 1) / 2 else width / 2;
     const high_w = width - low_w;
     const low_h = if (phase_y == 0) (height + 1) / 2 else height / 2;
     const high_h = height - low_h;
 
-    var temp = try allocator.alloc(f32, data.len);
-    defer allocator.free(temp);
-    var low_col = try allocator.alloc(f32, low_h);
+    const low_col = try allocator.alloc(f32, low_h);
     defer allocator.free(low_col);
-    var high_col = try allocator.alloc(f32, high_h);
+    const high_col = try allocator.alloc(f32, high_h);
     defer allocator.free(high_col);
     const out_col = try allocator.alloc(f32, height);
     defer allocator.free(out_col);
@@ -343,8 +389,9 @@ fn inverse97LevelInPlacePhaseWithScaling(allocator: std.mem.Allocator, data: []f
 
     var y: usize = 0;
     while (y < height) : (y += 1) {
-        @memcpy(low_row, data[y * width .. y * width + low_w]);
-        @memcpy(high_row, data[y * width + low_w .. y * width + width]);
+        const row = data[y * stride ..][0..width];
+        @memcpy(low_row, row[0..low_w]);
+        @memcpy(high_row, row[low_w..width]);
         try inverse97LineIntoPhaseWithScalingScratch(
             out_row,
             low_row,
@@ -354,15 +401,15 @@ fn inverse97LevelInPlacePhaseWithScaling(allocator: std.mem.Allocator, data: []f
             line_even_scratch,
             line_odd_scratch,
         );
-        @memcpy(temp[y * width .. y * width + width], out_row);
+        @memcpy(row, out_row);
     }
 
     var x: usize = 0;
     while (x < width) : (x += 1) {
         y = 0;
-        while (y < low_h) : (y += 1) low_col[y] = temp[y * width + x];
+        while (y < low_h) : (y += 1) low_col[y] = data[y * stride + x];
         y = 0;
-        while (y < high_h) : (y += 1) high_col[y] = temp[(low_h + y) * width + x];
+        while (y < high_h) : (y += 1) high_col[y] = data[(low_h + y) * stride + x];
         try inverse97LineIntoPhaseWithScalingScratch(
             out_col,
             low_col,
@@ -373,7 +420,7 @@ fn inverse97LevelInPlacePhaseWithScaling(allocator: std.mem.Allocator, data: []f
             line_odd_scratch,
         );
         y = 0;
-        while (y < height) : (y += 1) data[y * width + x] = out_col[y];
+        while (y < height) : (y += 1) data[y * stride + x] = out_col[y];
     }
 }
 
