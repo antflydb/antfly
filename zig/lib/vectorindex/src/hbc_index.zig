@@ -2254,7 +2254,7 @@ fn searchProfiledRequestAttempt(
     captured_generation_out: ?*?u64,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
-) !search_types.ProfiledSearchResults {
+) anyerror!search_types.ProfiledSearchResults {
     var profile = search_types.SearchProfile{};
     const Index = comptime childType(@TypeOf(self));
     defer if (!capture_durable_snapshot and comptime @hasDecl(Index, "observeSearchCacheBenefit")) {
@@ -2294,13 +2294,27 @@ fn searchProfiledRequestAttempt(
         }
         published_snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation);
     }
-    var coverage_claim = CompleteCoverageValidationClaim{ .enabled = false, .held = false };
+    var coverage_tracker = CompleteCoverageTracker.init(
+        .{ .enabled = false, .held = false },
+        published_snapshot.active_count,
+    );
+    defer if (coverage_tracker.claim_held) {
+        // A normal early exit without a completed validation is retryable.
+        finishCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, false);
+    };
+    errdefer |failure| if (coverage_tracker.claim_held) {
+        failCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, failure);
+        coverage_tracker.claim_held = false;
+    };
     if (!capture_durable_snapshot) {
-        coverage_claim = try beginCompleteCoverageValidationIfSupported(
-            self,
-            exhaustive_coverage,
-            published_snapshot.publish_generation,
-            req.cancellation,
+        coverage_tracker = CompleteCoverageTracker.init(
+            try beginCompleteCoverageValidationIfSupported(
+                self,
+                exhaustive_coverage,
+                published_snapshot.publish_generation,
+                req.cancellation,
+            ),
+            published_snapshot.active_count,
         );
     }
     // A waiter may have spent time behind the generation validator. Do not
@@ -2326,17 +2340,16 @@ fn searchProfiledRequestAttempt(
         // Validation can wait on another query's generation flight. Hold the
         // captured MVCC transaction, but never the publication fence, while
         // waiting so publishers remain independent of the O(N) traversal.
-        coverage_claim = try beginCompleteCoverageValidationIfSupported(
-            self,
-            exhaustive_coverage,
-            published_snapshot.publish_generation,
-            req.cancellation,
+        coverage_tracker = CompleteCoverageTracker.init(
+            try beginCompleteCoverageValidationIfSupported(
+                self,
+                exhaustive_coverage,
+                published_snapshot.publish_generation,
+                req.cancellation,
+            ),
+            published_snapshot.active_count,
         );
     }
-    var coverage_tracker = CompleteCoverageTracker.init(coverage_claim, published_snapshot.active_count);
-    defer if (coverage_tracker.claim_held) {
-        finishCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, false);
-    };
     hbc_runtime.beginSearchEpoch(self);
     defer hbc_runtime.endSearchEpoch(self);
     const use_search_cache = !capture_durable_snapshot;
@@ -2538,7 +2551,7 @@ fn searchProfiledRequestAttempt(
                 .profile = profile,
             };
         },
-        else => return err,
+        else => |unhandled| return @as(anyerror!search_types.ProfiledSearchResults, unhandled),
     };
     var root_handle_active = true;
     defer if (root_handle_active) root_handle.deinit(self.alloc);
@@ -2569,7 +2582,7 @@ fn searchProfiledRequestAttempt(
                         .profile = profile,
                     };
                 },
-                else => return err,
+                else => |unhandled| return @as(anyerror!search_types.ProfiledSearchResults, unhandled),
             };
             try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
             if (should_rerank) {
@@ -2890,6 +2903,17 @@ fn finishCompleteCoverageValidationIfSupported(self: anytype, generation: u64, v
         self.finishCompleteCoverageValidation(generation, validated);
     } else if (validated and comptime @hasDecl(Index, "noteCompleteCoverageValidated")) {
         self.noteCompleteCoverageValidated(generation);
+    }
+}
+
+fn failCompleteCoverageValidationIfSupported(self: anytype, generation: u64, err: anyerror) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "failCompleteCoverageValidation")) {
+        self.failCompleteCoverageValidation(generation, err);
+    } else if (comptime @hasDecl(Index, "finishCompleteCoverageValidation")) {
+        // Legacy adapters cannot preserve a terminal failure for waiters, but
+        // must still release the elected producer claim.
+        self.finishCompleteCoverageValidation(generation, false);
     }
 }
 

@@ -2150,6 +2150,7 @@ const CompleteCoverageFlight = struct {
     ready: std.Io.Event = .unset,
     refs: usize = 1,
     validated: bool = false,
+    failure: ?anyerror = null,
     next: ?*CompleteCoverageFlight = null,
 };
 
@@ -2158,7 +2159,7 @@ const FlatCentroidBuildFlight = struct {
     io: std.Io,
     ready: std.Io.Event = .unset,
     refs: usize = 1,
-    directory: ?*vectorindex_spfresh_index.FlatCentroidDirectory = null,
+    outcome: vectorindex_spfresh_index.FlatCentroidBuildOutcome = .retry,
     next: ?*FlatCentroidBuildFlight = null,
 };
 
@@ -3357,6 +3358,7 @@ pub const HBCIndex = struct {
         if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         lockAtomic(&self.complete_coverage_state_mu);
         defer self.complete_coverage_state_mu.unlock();
+        if (flight.failure) |err| return err;
         return flight.validated;
     }
 
@@ -3419,7 +3421,12 @@ pub const HBCIndex = struct {
         }
     }
 
-    pub fn finishCompleteCoverageValidation(self: *HBCIndex, generation: u64, validated: bool) void {
+    fn publishCompleteCoverageValidationOutcome(
+        self: *HBCIndex,
+        generation: u64,
+        validated: bool,
+        failure: ?anyerror,
+    ) void {
         lockAtomic(&self.complete_coverage_state_mu);
         var link = &self.complete_coverage_flight;
         const flight = while (link.*) |candidate| {
@@ -3430,6 +3437,7 @@ pub const HBCIndex = struct {
             link = &candidate.next;
         } else unreachable;
         flight.validated = validated;
+        flight.failure = failure;
         if (validated) {
             var current = self.complete_coverage_generation.load(.acquire);
             while (current == std.math.maxInt(u64) or generation > current) {
@@ -3449,12 +3457,29 @@ pub const HBCIndex = struct {
         self.releaseCompleteCoverageFlightRef(flight);
     }
 
+    pub fn finishCompleteCoverageValidation(self: *HBCIndex, generation: u64, validated: bool) void {
+        self.publishCompleteCoverageValidationOutcome(generation, validated, null);
+    }
+
+    pub fn failCompleteCoverageValidation(self: *HBCIndex, generation: u64, err: anyerror) void {
+        const failure: ?anyerror = switch (err) {
+            // These are producer-local or publication-local outcomes. Another
+            // request may still validate the generation and should re-elect.
+            error.Cancelled, error.Canceled, error.StalePublishedSnapshot => null,
+            else => err,
+        };
+        self.publishCompleteCoverageValidationOutcome(generation, false, failure);
+    }
+
     fn releaseFlatCentroidBuildFlightRef(self: *HBCIndex, flight: *FlatCentroidBuildFlight) void {
         lockAtomic(&self.flat_centroid_build_mu);
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
         const destroy = flight.refs == 0;
-        const directory = if (destroy) flight.directory else null;
+        const directory = if (destroy) switch (flight.outcome) {
+            .ready => |retained| retained,
+            else => null,
+        } else null;
         self.flat_centroid_build_mu.unlock();
         if (destroy) {
             self.alloc.destroy(flight);
@@ -3466,7 +3491,7 @@ pub const HBCIndex = struct {
         self: *HBCIndex,
         flight: *FlatCentroidBuildFlight,
         cancellation: ?vectorindex_search_types.CancellationToken,
-    ) !?*vectorindex_spfresh_index.FlatCentroidDirectory {
+    ) !vectorindex_spfresh_index.FlatCentroidBuildClaim {
         defer self.releaseFlatCentroidBuildFlightRef(flight);
         while (!flight.ready.isSet()) {
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
@@ -3483,9 +3508,14 @@ pub const HBCIndex = struct {
         if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         lockAtomic(&self.flat_centroid_build_mu);
         defer self.flat_centroid_build_mu.unlock();
-        const directory = flight.directory;
-        if (directory) |retained| retained.retain();
-        return directory;
+        return switch (flight.outcome) {
+            .retry => .retry,
+            .failed => |err| return err,
+            .ready => |retained| blk: {
+                retained.retain();
+                break :blk .{ .ready = retained };
+            },
+        };
     }
 
     /// Elect one cold directory builder per generation. Same-generation
@@ -3503,10 +3533,7 @@ pub const HBCIndex = struct {
             if (flight.generation != generation) continue;
             flight.refs += 1;
             self.flat_centroid_build_mu.unlock();
-            return if (try self.waitForFlatCentroidBuildFlight(flight, cancellation)) |directory|
-                .{ .ready = directory }
-            else
-                .retry;
+            return try self.waitForFlatCentroidBuildFlight(flight, cancellation);
         }
         self.flat_centroid_build_mu.unlock();
 
@@ -3524,10 +3551,7 @@ pub const HBCIndex = struct {
             flight.refs += 1;
             self.flat_centroid_build_mu.unlock();
             self.alloc.destroy(candidate);
-            return if (try self.waitForFlatCentroidBuildFlight(flight, cancellation)) |directory|
-                .{ .ready = directory }
-            else
-                .retry;
+            return try self.waitForFlatCentroidBuildFlight(flight, cancellation);
         }
         candidate.next = self.flat_centroid_build_flight;
         self.flat_centroid_build_flight = candidate;
@@ -3538,7 +3562,7 @@ pub const HBCIndex = struct {
     pub fn finishFlatCentroidDirectoryBuild(
         self: *HBCIndex,
         generation: u64,
-        directory: ?*vectorindex_spfresh_index.FlatCentroidDirectory,
+        outcome: vectorindex_spfresh_index.FlatCentroidBuildOutcome,
     ) void {
         lockAtomic(&self.flat_centroid_build_mu);
         var link = &self.flat_centroid_build_flight;
@@ -3549,10 +3573,11 @@ pub const HBCIndex = struct {
             }
             link = &candidate.next;
         } else unreachable;
-        if (directory) |retained| {
-            retained.retain();
-            flight.directory = retained;
+        switch (outcome) {
+            .ready => |retained| retained.retain(),
+            else => {},
         }
+        flight.outcome = outcome;
         self.flat_centroid_build_mu.unlock();
         flight.ready.set(flight.io);
         self.releaseFlatCentroidBuildFlightRef(flight);
@@ -9441,6 +9466,20 @@ test "complete coverage validation claim caches success and retries failure" {
     try std.testing.expect(!try idx.beginCompleteCoverageValidation(next_generation, null));
 }
 
+fn waitForCompleteCoverageWaiter(index: *HBCIndex, generation: u64, io: std.Io) !void {
+    for (0..5_000) |_| {
+        lockAtomic(&index.complete_coverage_state_mu);
+        var current = index.complete_coverage_flight;
+        const joined = while (current) |flight| : (current = flight.next) {
+            if (flight.generation == generation and flight.refs > 1) break true;
+        } else false;
+        index.complete_coverage_state_mu.unlock();
+        if (joined) return;
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "complete coverage validation waiter honors cancellation without canceling owner" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -9470,7 +9509,7 @@ test "complete coverage validation waiter honors cancellation without canceling 
         }
     };
     var waiter = std.Io.async(io, Waiter.run, .{ &idx, &cancelled, generation });
-    try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    try waitForCompleteCoverageWaiter(&idx, generation, io);
     cancelled.store(true, .release);
     try std.testing.expectError(error.Cancelled, waiter.await(io));
 
@@ -9509,6 +9548,64 @@ test "complete coverage flight preserves older success after newer validation" {
     try std.testing.expect(try idx.waitForCompleteCoverageFlight(older_flight, null));
 }
 
+test "complete coverage flight shares a deterministic producer failure" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    idx.setIo(io);
+
+    const generation = idx.publishedGeneration();
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
+    var owner_active = true;
+    defer if (owner_active) idx.finishCompleteCoverageValidation(generation, false);
+
+    const Waiter = struct {
+        fn run(index: *HBCIndex, expected_generation: u64) !bool {
+            return try index.beginCompleteCoverageValidation(expected_generation, null);
+        }
+    };
+    var waiter = std.Io.async(io, Waiter.run, .{ &idx, generation });
+    try waitForCompleteCoverageWaiter(&idx, generation, io);
+    idx.failCompleteCoverageValidation(generation, error.IncompletePublishedSnapshot);
+    owner_active = false;
+    try std.testing.expectError(error.IncompletePublishedSnapshot, waiter.await(io));
+
+    // The terminal result is scoped to callers that joined this flight. A
+    // later request may retry after repair or another external state change.
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
+    idx.finishCompleteCoverageValidation(generation, false);
+}
+
+test "complete coverage flight retries an owner-local cancellation" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+    const generation = idx.publishedGeneration();
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
+
+    lockAtomic(&idx.complete_coverage_state_mu);
+    const flight = idx.complete_coverage_flight orelse return error.TestUnexpectedResult;
+    flight.refs += 1;
+    idx.complete_coverage_state_mu.unlock();
+
+    idx.failCompleteCoverageValidation(generation, error.Cancelled);
+    try std.testing.expect(!try idx.waitForCompleteCoverageFlight(flight, null));
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
+    idx.finishCompleteCoverageValidation(generation, false);
+}
+
 fn waitForFlatCentroidBuildWaiter(index: *HBCIndex, generation: u64, io: std.Io) !void {
     for (0..5_000) |_| {
         lockAtomic(&index.flat_centroid_build_mu);
@@ -9543,7 +9640,7 @@ test "flat centroid build single flight waits on backend runtime" {
         else => return error.TestUnexpectedResult,
     }
     var owner_active = true;
-    defer if (owner_active) idx.finishFlatCentroidDirectoryBuild(generation, null);
+    defer if (owner_active) idx.finishFlatCentroidDirectoryBuild(generation, .retry);
 
     const Waiter = struct {
         fn run(index: *HBCIndex, expected_generation: u64) !vectorindex_spfresh_index.FlatCentroidBuildClaim {
@@ -9552,7 +9649,7 @@ test "flat centroid build single flight waits on backend runtime" {
     };
     var waiter = std.Io.async(io, Waiter.run, .{ &idx, generation });
     try waitForFlatCentroidBuildWaiter(&idx, generation, io);
-    idx.finishFlatCentroidDirectoryBuild(generation, null);
+    idx.finishFlatCentroidDirectoryBuild(generation, .retry);
     owner_active = false;
     switch (try waiter.await(io)) {
         .retry => {},
@@ -9563,7 +9660,7 @@ test "flat centroid build single flight waits on backend runtime" {
         .owner => {},
         else => return error.TestUnexpectedResult,
     }
-    idx.finishFlatCentroidDirectoryBuild(generation, null);
+    idx.finishFlatCentroidDirectoryBuild(generation, .retry);
 }
 
 test "flat centroid build flight shares a completed stale generation result" {
@@ -9586,7 +9683,7 @@ test "flat centroid build flight shares a completed stale generation result" {
         else => return error.TestUnexpectedResult,
     }
     var owner_active = true;
-    defer if (owner_active) idx.finishFlatCentroidDirectoryBuild(generation, null);
+    defer if (owner_active) idx.finishFlatCentroidDirectoryBuild(generation, .retry);
 
     const Waiter = struct {
         fn run(index: *HBCIndex, expected_generation: u64) !vectorindex_spfresh_index.FlatCentroidBuildClaim {
@@ -9600,7 +9697,7 @@ test "flat centroid build flight shares a completed stale generation result" {
     directory.* = .{ .publish_generation_snapshot = generation };
     var directory_owned = true;
     defer if (directory_owned) directory.release(alloc);
-    idx.finishFlatCentroidDirectoryBuild(generation, directory);
+    idx.finishFlatCentroidDirectoryBuild(generation, .{ .ready = directory });
     owner_active = false;
 
     switch (try waiter.await(io)) {
@@ -9612,6 +9709,46 @@ test "flat centroid build flight shares a completed stale generation result" {
     }
     directory.release(alloc);
     directory_owned = false;
+}
+
+test "flat centroid build flight shares a deterministic producer failure" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    idx.setIo(io);
+
+    const generation = idx.publishedGeneration();
+    switch (try idx.beginFlatCentroidDirectoryBuild(generation, null)) {
+        .owner => {},
+        else => return error.TestUnexpectedResult,
+    }
+    var owner_active = true;
+    defer if (owner_active) idx.finishFlatCentroidDirectoryBuild(generation, .retry);
+
+    const Waiter = struct {
+        fn run(index: *HBCIndex, expected_generation: u64) !vectorindex_spfresh_index.FlatCentroidBuildClaim {
+            return try index.beginFlatCentroidDirectoryBuild(expected_generation, null);
+        }
+    };
+    var waiter = std.Io.async(io, Waiter.run, .{ &idx, generation });
+    try waitForFlatCentroidBuildWaiter(&idx, generation, io);
+    idx.finishFlatCentroidDirectoryBuild(generation, .{ .failed = error.ResourceBudgetExceeded });
+    owner_active = false;
+    try std.testing.expectError(error.ResourceBudgetExceeded, waiter.await(io));
+
+    switch (try idx.beginFlatCentroidDirectoryBuild(generation, null)) {
+        .owner => {},
+        else => return error.TestUnexpectedResult,
+    }
+    idx.finishFlatCentroidDirectoryBuild(generation, .retry);
 }
 
 test "stale flat directory build preserves the current generation cache" {
@@ -9713,8 +9850,8 @@ test "coverage and flat build flights do not block a newer generation" {
         .owner => {},
         else => return error.TestUnexpectedResult,
     }
-    idx.finishFlatCentroidDirectoryBuild(older, null);
-    idx.finishFlatCentroidDirectoryBuild(newer, null);
+    idx.finishFlatCentroidDirectoryBuild(older, .retry);
+    idx.finishFlatCentroidDirectoryBuild(newer, .retry);
 }
 
 test "search publication wait uses runtime wakeups and honors cancellation" {

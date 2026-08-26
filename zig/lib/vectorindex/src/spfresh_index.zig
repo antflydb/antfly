@@ -106,6 +106,15 @@ pub const FlatCentroidBuildReservation = struct {
 pub const FlatCentroidBuildClaim = union(enum) {
     owner,
     retry,
+    /// Owns one retained reference; the caller must eventually release it.
+    ready: *FlatCentroidDirectory,
+};
+
+pub const FlatCentroidBuildOutcome = union(enum) {
+    retry,
+    failed: anyerror,
+    /// The flight retains its own reference until every waiter has consumed
+    /// the outcome.
     ready: *FlatCentroidDirectory,
 };
 
@@ -501,12 +510,21 @@ fn snapshotStillPublished(self: anytype, snapshot: PublishedSnapshot) bool {
 fn finishFlatCentroidBuildIfSupported(
     self: anytype,
     generation: u64,
-    directory: ?*FlatCentroidDirectory,
+    outcome: FlatCentroidBuildOutcome,
 ) void {
     const Index = comptime @TypeOf(self.*);
     if (comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild")) {
-        self.finishFlatCentroidDirectoryBuild(generation, directory);
+        self.finishFlatCentroidDirectoryBuild(generation, outcome);
     }
+}
+
+fn flatCentroidBuildFailureOutcome(err: anyerror) FlatCentroidBuildOutcome {
+    return switch (err) {
+        // A request-local cancellation or publication race says nothing about
+        // whether another waiter can build the same generation successfully.
+        error.Cancelled, error.Canceled, error.StalePublishedSnapshot => .retry,
+        else => .{ .failed = err },
+    };
 }
 
 fn appendFlatCentroidBlock(
@@ -703,7 +721,9 @@ fn acquireFlatCentroidDirectory(
             }
         }
         var build_flight_open = comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild");
-        defer if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, null);
+        var build_outcome: FlatCentroidBuildOutcome = .retry;
+        defer if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, build_outcome);
+        errdefer |err| build_outcome = flatCentroidBuildFailureOutcome(err);
 
         var build_reservation: FlatCentroidBuildReservation = .{};
         if (comptime @hasDecl(Index, "reserveFlatCentroidDirectoryBuildBytes")) {
@@ -751,7 +771,7 @@ fn acquireFlatCentroidDirectory(
             {
                 built.deinit(self.alloc);
                 self.alloc.destroy(built);
-                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, null);
+                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, .retry);
                 build_flight_open = false;
                 continue;
             }
@@ -760,7 +780,7 @@ fn acquireFlatCentroidDirectory(
         lockAtomicMutex(&self.flat_centroid_mu);
         if (expected_snapshot != null and !snapshotStillPublished(self, snapshot)) {
             self.flat_centroid_mu.unlock();
-            if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, built);
+            if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, .{ .ready = built });
             build_flight_open = false;
             return built;
         }
@@ -770,7 +790,7 @@ fn acquireFlatCentroidDirectory(
                 self.flat_centroid_mu.unlock();
                 built.deinit(self.alloc);
                 self.alloc.destroy(built);
-                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, directory);
+                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, .{ .ready = directory });
                 build_flight_open = false;
                 return directory;
             }
@@ -783,7 +803,7 @@ fn acquireFlatCentroidDirectory(
         self.flat_centroid_directory = built;
         self.flat_centroid_mu.unlock();
         if (stale) |directory| directory.release(self.alloc);
-        if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, built);
+        if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, .{ .ready = built });
         build_flight_open = false;
         return built;
     }
@@ -1383,4 +1403,17 @@ test "flat centroid directory match includes publish generation" {
 
     try std.testing.expect(directoryMatches(&directory, 11, 42, 7));
     try std.testing.expect(!directoryMatches(&directory, 11, 42, 8));
+}
+
+test "flat centroid build failures retry only request-local outcomes" {
+    for ([_]anyerror{ error.Cancelled, error.Canceled, error.StalePublishedSnapshot }) |err| {
+        switch (flatCentroidBuildFailureOutcome(err)) {
+            .retry => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    switch (flatCentroidBuildFailureOutcome(error.ResourceBudgetExceeded)) {
+        .failed => |err| try std.testing.expectEqual(error.ResourceBudgetExceeded, err),
+        else => return error.TestUnexpectedResult,
+    }
 }
