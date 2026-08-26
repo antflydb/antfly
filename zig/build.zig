@@ -6182,6 +6182,7 @@ pub fn build(b: *std.Build) void {
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned create succeeds when post-commit runtime status is fenced",
             "provisioned create reuses a generation opened by startup reconciliation",
+            "provisioned owner clone snapshot preserves retired runtime counters",
             "provisioned create installs managed enrichment despite a matching stale fingerprint",
             "runtime status refreshes aged live writer publications",
             "provisioned table write source runtime status serves cached snapshot during active same-table work",

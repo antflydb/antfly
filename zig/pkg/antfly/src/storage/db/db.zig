@@ -4826,6 +4826,7 @@ pub const DB = struct {
         kind: LsmOwnerKind,
         name: []u8,
         maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+        retired_labels_collapsed_total: u64 = 0,
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.name);
@@ -4863,6 +4864,7 @@ pub const DB = struct {
                 },
                 .name = owner.name,
                 .maintenance = owner.maintenance,
+                .retired_labels_collapsed_total = owner.retired_labels_collapsed_total,
             });
             transferred += 1;
         }
@@ -13559,6 +13561,12 @@ pub const DB = struct {
         shadow_manager.setIo(self.backend_runtime.io());
         shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
         shadow_manager.registerReplacementIndex(self.core.store, cfg) catch |err| {
+            shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |transfer_err| {
+                std.log.warn("failed to preserve unopened shadow LSM clone attribution index={s} err={s}", .{
+                    cfg.name,
+                    @errorName(transfer_err),
+                });
+            };
             shadow_manager.deinit();
             if (resume_candidate) {
                 candidate_reopenable = false;
@@ -13568,7 +13576,15 @@ pub const DB = struct {
             return err;
         };
         var shadow_manager_open = true;
-        defer if (shadow_manager_open) shadow_manager.deinit();
+        defer if (shadow_manager_open) {
+            shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |err| {
+                std.log.warn("failed to preserve shadow LSM clone attribution index={s} err={s}", .{
+                    cfg.name,
+                    @errorName(err),
+                });
+            };
+            shadow_manager.deinit();
+        };
 
         // A scan cursor is useful only when there is a durable intent to own
         // it. Non-durable/internal one-shot rebuild callers retain the existing
@@ -14129,6 +14145,12 @@ pub const DB = struct {
             retired_generation = null;
         }
         if (shadow_manager_open) {
+            shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |err| {
+                std.log.warn("failed to preserve activated shadow LSM clone attribution index={s} err={s}", .{
+                    cfg.name,
+                    @errorName(err),
+                });
+            };
             shadow_manager.deinit();
             shadow_manager_open = false;
         }

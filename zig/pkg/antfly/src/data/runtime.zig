@@ -1668,7 +1668,7 @@ pub const HealthSource = struct {
             self.data_server.alloc.free(lsm_owner_stats);
         }
         try writeLsmOwnerCloneMetrics(writer, lsm_owner_stats);
-        try health_metrics.appendPromMetric(writer, "antfly_lsm_owner_clone_registry_dropped_total", "counter", "Retired LSM owner clone metric records dropped after the bounded runtime registry reached capacity", live_write_source.lsmOwnerCloneStatsDroppedTotal());
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_owner_clone_registry_dropped_total", "counter", "LSM owner attribution labels collapsed into bounded overflow or dropped after runtime registry capacity", live_write_source.lsmOwnerCloneStatsDroppedTotal());
         try writeLsmWriteMetrics(writer, live_write_source.lsmWriteStatsBestEffort());
         try writeTextMergeMetrics(writer, live_write_source.textMergeStatsBestEffort());
         var async_indexing_stats = live_write_source.asyncIndexingStatsBestEffort();

@@ -52,6 +52,9 @@ pub const LsmOwnerCloneStats = struct {
     bytes_total: u64 = 0,
     peak_bytes: u64 = 0,
     bulk_current_scan_peak_active_bytes: u64 = 0,
+    /// Number of distinct retired owner labels folded into this bounded
+    /// attribution record. This is a counter, not owner residency.
+    labels_collapsed_total: u64 = 0,
     by_reason: [lsm_mutable_snapshot_reason_count]LsmMutableSnapshotCloneReasonStats =
         [_]LsmMutableSnapshotCloneReasonStats{.{}} ** lsm_mutable_snapshot_reason_count,
 
@@ -63,6 +66,7 @@ pub const LsmOwnerCloneStats = struct {
             self.bulk_current_scan_peak_active_bytes,
             other.bulk_current_scan_peak_active_bytes,
         );
+        self.labels_collapsed_total +|= other.labels_collapsed_total;
         for (&self.by_reason, other.by_reason) |*dst, src| dst.accumulate(src);
     }
 };
@@ -83,6 +87,7 @@ pub const LsmOwnerCloneMetricSnapshot = struct {
 
 const LsmOwnerCloneRegistry = struct {
     const max_entries: usize = 4096;
+    const max_sources: usize = 8192;
 
     const Entry = struct {
         table_name: []u8,
@@ -96,25 +101,50 @@ const LsmOwnerCloneRegistry = struct {
             alloc.free(self.owner_name);
             self.* = undefined;
         }
+    };
 
-        fn matches(
-            self: *const Entry,
-            table_name: []const u8,
-            group_id: u64,
-            owner_kind: LsmOwnerKind,
-            owner_name: []const u8,
-        ) bool {
-            return self.group_id == group_id and
-                self.owner_kind == owner_kind and
-                std.mem.eql(u8, self.table_name, table_name) and
-                std.mem.eql(u8, self.owner_name, owner_name);
+    const EntryKey = struct {
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+    };
+
+    const EntryKeyContext = struct {
+        pub fn hash(_: @This(), key: EntryKey) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(std.mem.asBytes(&key.group_id));
+            hasher.update(std.mem.asBytes(&key.owner_kind));
+            hasher.update(key.table_name);
+            hasher.update("\x00");
+            hasher.update(key.owner_name);
+            return hasher.final();
         }
+
+        pub fn eql(_: @This(), lhs: EntryKey, rhs: EntryKey) bool {
+            return lhs.group_id == rhs.group_id and lhs.owner_kind == rhs.owner_kind and
+                std.mem.eql(u8, lhs.table_name, rhs.table_name) and
+                std.mem.eql(u8, lhs.owner_name, rhs.owner_name);
+        }
+    };
+
+    const EntryMap = std.HashMapUnmanaged(EntryKey, usize, EntryKeyContext, 80);
+
+    const SourceKey = struct { id: usize, entry_index: usize };
+
+    const Source = struct {
+        key: SourceKey,
+        observed: LsmOwnerCloneStats,
     };
 
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    entry_by_key: EntryMap = .empty,
+    sources: std.ArrayListUnmanaged(Source) = .empty,
+    source_by_key: std.AutoHashMapUnmanaged(SourceKey, usize) = .empty,
     dropped: u64 = 0,
+    collapsed_labels: u64 = 0,
 
     fn init(alloc: Allocator) LsmOwnerCloneRegistry {
         return .{ .alloc = alloc };
@@ -123,7 +153,128 @@ const LsmOwnerCloneRegistry = struct {
     fn deinit(self: *LsmOwnerCloneRegistry) void {
         for (self.entries.items) |*entry| entry.deinit(self.alloc);
         self.entries.deinit(self.alloc);
+        self.entry_by_key.deinit(self.alloc);
+        self.sources.deinit(self.alloc);
+        self.source_by_key.deinit(self.alloc);
         self.* = undefined;
+    }
+
+    fn findOrCreateEntryLocked(
+        self: *LsmOwnerCloneRegistry,
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+    ) !?usize {
+        const lookup_key: EntryKey = .{
+            .table_name = table_name,
+            .group_id = group_id,
+            .owner_kind = owner_kind,
+            .owner_name = owner_name,
+        };
+        if (self.entry_by_key.get(lookup_key)) |index| return index;
+        if (self.entries.items.len >= max_entries) {
+            self.dropped +|= 1;
+            return null;
+        }
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        errdefer self.alloc.free(owned_table_name);
+        const owned_owner_name = try self.alloc.dupe(u8, owner_name);
+        errdefer self.alloc.free(owned_owner_name);
+        try self.entries.ensureUnusedCapacity(self.alloc, 1);
+        try self.entry_by_key.ensureUnusedCapacity(self.alloc, 1);
+        self.entries.appendAssumeCapacity(.{
+            .table_name = owned_table_name,
+            .group_id = group_id,
+            .owner_kind = owner_kind,
+            .owner_name = owned_owner_name,
+            .stats = .{},
+        });
+        const index = self.entries.items.len - 1;
+        const entry = &self.entries.items[index];
+        self.entry_by_key.putAssumeCapacity(.{
+            .table_name = entry.table_name,
+            .group_id = entry.group_id,
+            .owner_kind = entry.owner_kind,
+            .owner_name = entry.owner_name,
+        }, index);
+        return index;
+    }
+
+    fn accumulateObserved(
+        total: *LsmOwnerCloneStats,
+        previous: LsmOwnerCloneStats,
+        current: LsmOwnerCloneStats,
+    ) void {
+        total.calls +|= current.calls -| previous.calls;
+        total.bytes_total +|= current.bytes_total -| previous.bytes_total;
+        total.peak_bytes = @max(total.peak_bytes, current.peak_bytes);
+        total.bulk_current_scan_peak_active_bytes = @max(
+            total.bulk_current_scan_peak_active_bytes,
+            current.bulk_current_scan_peak_active_bytes,
+        );
+        total.labels_collapsed_total +|= current.labels_collapsed_total -| previous.labels_collapsed_total;
+        for (&total.by_reason, previous.by_reason, current.by_reason) |*dst, prior, now| {
+            dst.calls +|= now.calls -| prior.calls;
+            dst.bytes_total +|= now.bytes_total -| prior.bytes_total;
+            dst.peak_bytes = @max(dst.peak_bytes, now.peak_bytes);
+        }
+    }
+
+    /// Observe absolute counters from one live DB generation. The registry
+    /// converts them to deltas under the same mutex that serves snapshots, so
+    /// a scrape can never fall back from live totals to a smaller archived
+    /// value while a cache entry is being retired.
+    fn observe(
+        self: *LsmOwnerCloneRegistry,
+        source_id: usize,
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+        stats: LsmOwnerCloneStats,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const entry_index = (try self.findOrCreateEntryLocked(table_name, group_id, owner_kind, owner_name)) orelse return;
+        const source_key: SourceKey = .{ .id = source_id, .entry_index = entry_index };
+        if (self.source_by_key.get(source_key)) |source_index| {
+            const source = &self.sources.items[source_index];
+            const collapsed_delta = stats.labels_collapsed_total -| source.observed.labels_collapsed_total;
+            accumulateObserved(&self.entries.items[entry_index].stats, source.observed, stats);
+            self.collapsed_labels +|= collapsed_delta;
+            source.observed = stats;
+            return;
+        }
+        if (self.sources.items.len >= max_sources) {
+            self.dropped +|= 1;
+            return;
+        }
+        try self.sources.ensureUnusedCapacity(self.alloc, 1);
+        try self.source_by_key.ensureUnusedCapacity(self.alloc, 1);
+        self.sources.appendAssumeCapacity(.{
+            .key = source_key,
+            .observed = stats,
+        });
+        self.source_by_key.putAssumeCapacity(source_key, self.sources.items.len - 1);
+        self.entries.items[entry_index].stats.accumulate(stats);
+        self.collapsed_labels +|= stats.labels_collapsed_total;
+    }
+
+    fn retireSource(self: *LsmOwnerCloneRegistry, source_id: usize) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        var i: usize = self.sources.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.sources.items[i].key.id != source_id) continue;
+            const removed_key = self.sources.items[i].key;
+            _ = self.source_by_key.remove(removed_key);
+            _ = self.sources.swapRemove(i);
+            if (i < self.sources.items.len) {
+                self.source_by_key.getPtr(self.sources.items[i].key).?.* = i;
+            }
+        }
     }
 
     fn accumulate(
@@ -136,26 +287,9 @@ const LsmOwnerCloneRegistry = struct {
     ) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        for (self.entries.items) |*entry| {
-            if (!entry.matches(table_name, group_id, owner_kind, owner_name)) continue;
-            entry.stats.accumulate(stats);
-            return;
-        }
-        if (self.entries.items.len >= max_entries) {
-            self.dropped +|= 1;
-            return;
-        }
-        const owned_table_name = try self.alloc.dupe(u8, table_name);
-        errdefer self.alloc.free(owned_table_name);
-        const owned_owner_name = try self.alloc.dupe(u8, owner_name);
-        errdefer self.alloc.free(owned_owner_name);
-        try self.entries.append(self.alloc, .{
-            .table_name = owned_table_name,
-            .group_id = group_id,
-            .owner_kind = owner_kind,
-            .owner_name = owned_owner_name,
-            .stats = stats,
-        });
+        const entry_index = (try self.findOrCreateEntryLocked(table_name, group_id, owner_kind, owner_name)) orelse return;
+        self.entries.items[entry_index].stats.accumulate(stats);
+        self.collapsed_labels +|= stats.labels_collapsed_total;
     }
 
     fn snapshotAlloc(self: *LsmOwnerCloneRegistry, alloc: Allocator) ![]LsmOwnerCloneMetricSnapshot {
@@ -188,7 +322,7 @@ const LsmOwnerCloneRegistry = struct {
     fn droppedTotal(self: *LsmOwnerCloneRegistry) u64 {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        return self.dropped;
+        return self.dropped +| self.collapsed_labels;
     }
 };
 
@@ -621,6 +755,29 @@ pub const BackendRuntime = struct {
             owner_name,
             stats,
         );
+    }
+
+    pub fn observeLsmOwnerCloneStats(
+        self: *BackendRuntime,
+        source_id: usize,
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+        stats: LsmOwnerCloneStats,
+    ) !void {
+        try self.lsm_owner_clone_registry.observe(
+            source_id,
+            table_name,
+            group_id,
+            owner_kind,
+            owner_name,
+            stats,
+        );
+    }
+
+    pub fn retireLsmOwnerCloneSource(self: *BackendRuntime, source_id: usize) void {
+        self.lsm_owner_clone_registry.retireSource(source_id);
     }
 
     pub fn snapshotRetiredLsmOwnerCloneStatsAlloc(
@@ -1347,6 +1504,45 @@ test "backend runtime retains LSM owner clone counters across generations" {
     try std.testing.expectEqual(@as(u64, 1280), snapshot[0].stats.bytes_total);
     try std.testing.expectEqual(@as(u64, 768), snapshot[0].stats.peak_bytes);
     try std.testing.expectEqual(@as(u64, 512), snapshot[0].stats.bulk_current_scan_peak_active_bytes);
+}
+
+test "backend runtime observes live clone counters monotonically across retirement" {
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+
+    try runtime.observeLsmOwnerCloneStats(101, "docs", 17, .dense_vector, "embedding", .{
+        .calls = 2,
+        .bytes_total = 1024,
+        .peak_bytes = 768,
+        .labels_collapsed_total = 1,
+    });
+    try runtime.observeLsmOwnerCloneStats(101, "docs", 17, .dense_vector, "embedding", .{
+        .calls = 5,
+        .bytes_total = 4096,
+        .peak_bytes = 2048,
+        .labels_collapsed_total = 3,
+    });
+    runtime.retireLsmOwnerCloneSource(101);
+
+    // A replacement generation starts its counters at zero. Its absolute
+    // values add to, rather than replace, the retired generation.
+    try runtime.observeLsmOwnerCloneStats(102, "docs", 17, .dense_vector, "embedding", .{
+        .calls = 1,
+        .bytes_total = 256,
+        .peak_bytes = 256,
+    });
+
+    const snapshot = try runtime.snapshotRetiredLsmOwnerCloneStatsAlloc(std.testing.allocator);
+    defer {
+        for (snapshot) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(snapshot);
+    }
+    try std.testing.expectEqual(@as(usize, 1), snapshot.len);
+    try std.testing.expectEqual(@as(u64, 6), snapshot[0].stats.calls);
+    try std.testing.expectEqual(@as(u64, 4352), snapshot[0].stats.bytes_total);
+    try std.testing.expectEqual(@as(u64, 2048), snapshot[0].stats.peak_bytes);
+    try std.testing.expectEqual(@as(u64, 3), runtime.retiredLsmOwnerCloneStatsDroppedTotal());
 }
 
 test "backend runtime API lane leases expose and release the interface" {

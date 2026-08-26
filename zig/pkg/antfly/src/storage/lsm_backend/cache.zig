@@ -360,12 +360,16 @@ pub const Cache = struct {
         var by_kind: [@typeInfo(Kind).@"enum".fields.len]usize = undefined;
         var peak_by_kind: [@typeInfo(Kind).@"enum".fields.len]usize = undefined;
         inline for (0..by_kind.len) |i| by_kind[i] = self.kind_bytes[i].load(.monotonic);
-        inline for (0..peak_by_kind.len) |i| peak_by_kind[i] = self.kind_peak_bytes[i].load(.monotonic);
+        inline for (0..peak_by_kind.len) |i| {
+            peak_by_kind[i] = @max(by_kind[i], self.kind_peak_bytes[i].load(.monotonic));
+        }
+        const used_bytes = self.currentBytes();
+        const data_block_used_bytes = self.data_block_used_bytes.load(.monotonic);
         return self.stats.snapshot(
-            self.currentBytes(),
-            self.peak_used_bytes.load(.monotonic),
-            self.data_block_used_bytes.load(.monotonic),
-            self.data_block_peak_used_bytes.load(.monotonic),
+            used_bytes,
+            @max(used_bytes, self.peak_used_bytes.load(.monotonic)),
+            data_block_used_bytes,
+            @max(data_block_used_bytes, self.data_block_peak_used_bytes.load(.monotonic)),
             self.entryCount(),
             by_kind,
             peak_by_kind,
@@ -1265,6 +1269,33 @@ test "cache preserves simultaneous data block residency high water after evictio
     const after_eviction = cache.snapshotStats();
     try std.testing.expectEqual(@as(usize, 0), after_eviction.data_block_used_bytes);
     try std.testing.expectEqual(simultaneous.data_block_peak_used_bytes, after_eviction.data_block_peak_used_bytes);
+}
+
+test "cache snapshot clamps concurrently sampled peaks to current residency" {
+    var cache = Cache.init(std.testing.allocator, 1024 * 1024);
+    defer cache.deinit();
+
+    // Model the small publication window between the current-byte increment
+    // and the corresponding atomic-max update.
+    cache.used_bytes.store(1024, .monotonic);
+    cache.peak_used_bytes.store(512, .monotonic);
+    cache.data_block_used_bytes.store(768, .monotonic);
+    cache.data_block_peak_used_bytes.store(256, .monotonic);
+    cache.kind_bytes[@intFromEnum(Kind.run_table_block)].store(768, .monotonic);
+    cache.kind_peak_bytes[@intFromEnum(Kind.run_table_block)].store(256, .monotonic);
+    defer {
+        cache.used_bytes.store(0, .monotonic);
+        cache.peak_used_bytes.store(0, .monotonic);
+        cache.data_block_used_bytes.store(0, .monotonic);
+        cache.data_block_peak_used_bytes.store(0, .monotonic);
+        cache.kind_bytes[@intFromEnum(Kind.run_table_block)].store(0, .monotonic);
+        cache.kind_peak_bytes[@intFromEnum(Kind.run_table_block)].store(0, .monotonic);
+    }
+
+    const stats = cache.snapshotStats();
+    try std.testing.expectEqual(stats.used_bytes, stats.peak_used_bytes);
+    try std.testing.expectEqual(stats.data_block_used_bytes, stats.data_block_peak_used_bytes);
+    try std.testing.expectEqual(stats.run_table_block.used_bytes, stats.run_table_block.peak_used_bytes);
 }
 
 test "cache pending load waiter survives finish removal" {
