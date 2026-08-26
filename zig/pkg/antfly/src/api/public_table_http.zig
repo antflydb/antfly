@@ -913,6 +913,8 @@ fn graphQueryModeUnsupportedBodyForDiagnostic(
 fn graphQueryModeUnsupportedMessage(reason: []const u8) []const u8 {
     if (std.mem.eql(u8, reason, "legacy_graph_searches_not_supported"))
         return "serverless graph queries require graph_queries; graph_searches is available only on stateful/provisioned Antfly during its compatibility window";
+    if (std.mem.eql(u8, reason, "request_control_not_supported"))
+        return "this request control cannot be combined with exact graph execution in this runtime; remove the field or run the graph query separately";
     if (std.mem.eql(u8, reason, "external_alias_document_filter_not_supported"))
         return "this runtime snapshot cannot evaluate stored-document filters on aliases outside the queried table; remove that alias filter or use coordinator-backed execution";
     if (std.mem.eql(u8, reason, "external_alias_source_not_supported"))
@@ -4033,6 +4035,37 @@ test "recorded graph mode diagnostics explain serverless legacy rejection" {
     );
     try std.testing.expectEqualStrings(
         "serverless graph queries require graph_queries; graph_searches is available only on stateful/provisioned Antfly during its compatibility window",
+        parsed.value.message,
+    );
+}
+
+test "recorded graph mode diagnostics identify unsupported request controls" {
+    graph_query_diagnostic.reset();
+    defer graph_query_diagnostic.reset();
+    graph_query_diagnostic.record(
+        "$request",
+        "order_by",
+        .request_control_not_supported,
+    );
+
+    const body = try graphQueryModeUnsupportedBody(
+        std.testing.allocator,
+        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"match\":{}}},\"order_by\":[{\"field\":\"created_at\"}]}",
+    );
+    defer std.testing.allocator.free(body);
+    var parsed = try ant_json.parseFromSlice(
+        metadata_openapi.GraphQueryModeUnsupportedError,
+        std.testing.allocator,
+        body,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("$request", parsed.value.operation);
+    try std.testing.expectEqualStrings("order_by", parsed.value.mode);
+    try std.testing.expectEqualStrings("request_control_not_supported", parsed.value.reason);
+    try std.testing.expectEqualStrings(
+        "this request control cannot be combined with exact graph execution in this runtime; remove the field or run the graph query separately",
         parsed.value.message,
     );
 }

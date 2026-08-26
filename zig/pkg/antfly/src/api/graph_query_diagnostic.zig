@@ -11,6 +11,7 @@ const graph_query = @import("../graph/query.zig");
 
 pub const Reason = enum {
     legacy_graph_searches_not_supported,
+    request_control_not_supported,
     external_alias_document_filter_not_supported,
     external_alias_source_not_supported,
     reverse_variable_path_not_supported,

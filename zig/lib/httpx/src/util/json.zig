@@ -27,6 +27,14 @@ pub const Json = struct {
         return stringifyJsonAlloc(allocator, value, .{});
     }
 
+    /// Serializes an outbound request body using OpenAPI's presence semantics:
+    /// optional fields whose value is null are absent on the wire. Generated
+    /// types with required nullable fields provide a schema-aware
+    /// `jsonStringify` implementation so those fields remain explicit.
+    pub fn stringifyRequest(allocator: Allocator, value: anytype) ![]u8 {
+        return stringifyJsonAlloc(allocator, value, .{ .emit_null_optional_fields = false });
+    }
+
     /// Serializes a value to a JSON string with pretty formatting.
     pub fn stringifyPretty(allocator: Allocator, value: anytype) ![]u8 {
         return stringifyJsonAlloc(allocator, value, .{ .whitespace = .indent_2 });
@@ -43,6 +51,48 @@ pub const Json = struct {
         }
     }
 };
+
+test "Json.stringifyRequest omits absent optional fields" {
+    const Payload = struct {
+        name: []const u8,
+        note: ?[]const u8 = null,
+    };
+
+    const encoded = try Json.stringifyRequest(std.testing.allocator, Payload{ .name = "antfly" });
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expectEqualStrings("{\"name\":\"antfly\"}", encoded);
+}
+
+test "Json.stringifyRequest preserves required nullable fields" {
+    const Payload = struct {
+        required_nullable: ?u64,
+        optional: ?u64 = null,
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            try jw.beginObject();
+            try jw.objectField("required_nullable");
+            try jw.write(self.required_nullable);
+            if (self.optional) |value| {
+                try jw.objectField("optional");
+                try jw.write(value);
+            } else if (jw.options.emit_null_optional_fields) {
+                try jw.objectField("optional");
+                try jw.write(@as(?u8, null));
+            }
+            try jw.endObject();
+        }
+    };
+
+    const payload = Payload{ .required_nullable = null };
+    const regular = try Json.stringify(std.testing.allocator, payload);
+    defer std.testing.allocator.free(regular);
+    try std.testing.expectEqualStrings("{\"required_nullable\":null,\"optional\":null}", regular);
+
+    const request = try Json.stringifyRequest(std.testing.allocator, payload);
+    defer std.testing.allocator.free(request);
+    try std.testing.expectEqualStrings("{\"required_nullable\":null}", request);
+}
 
 /// Dynamic JSON builder for constructing JSON objects.
 pub const JsonBuilder = struct {

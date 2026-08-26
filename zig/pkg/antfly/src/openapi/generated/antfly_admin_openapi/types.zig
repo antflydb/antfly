@@ -550,6 +550,19 @@ pub const PromotionAssessRequest = struct {
     fencing_confirmed: bool,
     force: bool,
     use_current_fence: bool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("required_lsn");
+        try jw.write(self.required_lsn);
+        try jw.objectField("fencing_confirmed");
+        try jw.write(self.fencing_confirmed);
+        try jw.objectField("force");
+        try jw.write(self.force);
+        try jw.objectField("use_current_fence");
+        try jw.write(self.use_current_fence);
+        try jw.endObject();
+    }
 };
 
 pub const ReadCheckRequest = struct {

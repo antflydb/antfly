@@ -8601,6 +8601,7 @@ components:
             - external_alias_source_not_supported
             - reverse_variable_path_not_supported
             - legacy_graph_searches_not_supported
+            - request_control_not_supported
             - unsupported_mode
           description: Stable machine-readable constraint that prevents exact public execution.
     GraphMatchOperationLimitExceededError:

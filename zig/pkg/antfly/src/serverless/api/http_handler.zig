@@ -2682,8 +2682,14 @@ pub const HttpHandler = struct {
                 "distance_under",
             };
             for (unsupported_controls) |field| {
-                if (public_search_request.hasNonNullField(raw_request.value.object, field))
+                if (public_search_request.hasNonNullField(raw_request.value.object, field)) {
+                    graph_query_diagnostic.record(
+                        "$request",
+                        field,
+                        .request_control_not_supported,
+                    );
                     return error.UnsupportedQueryRequest;
+                }
             }
         }
         var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
@@ -2695,24 +2701,6 @@ pub const HttpHandler = struct {
         defer parsed_request.deinit();
         const request = parsed_request.value;
         if (request.graph_queries == null and request.graph_searches == null) return null;
-
-        if (request.aggregations != null or
-            request.analyses != null or
-            request.order_by != null or
-            request.search_after != null or
-            request.search_before != null or
-            request.document_renderer != null or
-            request.join != null or
-            request.foreign_sources != null or
-            request.merge_config != null or
-            request.pruner != null or
-            request.reranker != null or
-            request.expand_strategy != null or
-            request.distance_over != null or
-            request.distance_under != null)
-        {
-            return error.UnsupportedQueryRequest;
-        }
 
         const started_ns = platform_time.monotonicNs();
         const graph_queries = public_graph_query.parseSupportedGraphQueriesAlloc(self.alloc, request) catch |err| {
@@ -10866,6 +10854,28 @@ test "http handler serves published graph query endpoints" {
         parsed_legacy_pattern.value.reason,
     );
 
+    var unsupported_control = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/query",
+        .body =
+        \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"]}]},"return":{"bindings":["a","b"]}}},"order_by":[{"field":"created_at"}]}
+        ,
+    });
+    defer unsupported_control.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), unsupported_control.status);
+    var parsed_unsupported_control = try parseJsonTestBody(
+        metadata_openapi.GraphQueryModeUnsupportedError,
+        alloc,
+        unsupported_control.body,
+    );
+    defer parsed_unsupported_control.deinit();
+    try std.testing.expectEqualStrings("$request", parsed_unsupported_control.value.operation);
+    try std.testing.expectEqualStrings("order_by", parsed_unsupported_control.value.mode);
+    try std.testing.expectEqualStrings(
+        "request_control_not_supported",
+        parsed_unsupported_control.value.reason,
+    );
+
     var invalid_version_neighbors = try handler.handle(.{
         .method = .post,
         .path = "/internal/v1/namespaces/docs/query/versions/1/graph/neighbors",
@@ -11072,18 +11082,34 @@ test "serverless public graph query rejects exact sort controls" {
         .runtime_status = undefined,
     };
 
+    graph_query_diagnostic.reset();
+    defer graph_query_diagnostic.reset();
     try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
         "{\"graph_queries\":{\"related\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"max_depth\":1}}},\"order_by\":[{\"field\":\"created_at\"}]}",
         .none,
     ));
+    const order_by_diagnostic = graph_query_diagnostic.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("$request", order_by_diagnostic.operation);
+    try std.testing.expectEqualStrings("order_by", order_by_diagnostic.mode);
+    try std.testing.expectEqual(
+        graph_query_diagnostic.Reason.request_control_not_supported,
+        order_by_diagnostic.reason,
+    );
     try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
         "{\"graph_queries\":{\"related\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"max_depth\":1}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
         .none,
     ));
+    const search_after_diagnostic = graph_query_diagnostic.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("$request", search_after_diagnostic.operation);
+    try std.testing.expectEqualStrings("search_after", search_after_diagnostic.mode);
+    try std.testing.expectEqual(
+        graph_query_diagnostic.Reason.request_control_not_supported,
+        search_after_diagnostic.reason,
+    );
     try std.testing.expectError(error.InvalidQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
@@ -11091,7 +11117,6 @@ test "serverless public graph query rejects exact sort controls" {
         .none,
     ));
 
-    graph_query_diagnostic.reset();
     try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",

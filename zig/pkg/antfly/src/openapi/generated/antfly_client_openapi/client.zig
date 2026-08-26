@@ -137,7 +137,7 @@ pub const Client = struct {
     pub fn chatCompletions(self: *@This(), body: types.InferenceGenerateRequest) !RawResponse {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/chat/completions", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         defer resp.deinit();
@@ -149,7 +149,7 @@ pub const Client = struct {
     pub fn chunkText(self: *@This(), body: types.InferenceChunkRequest) !ApiResponse(types.InferenceChunkResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/chunk", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceChunkResponse).fromResponse(self.allocator, &resp);
@@ -160,7 +160,7 @@ pub const Client = struct {
     pub fn generateEmbeddings(self: *@This(), body: types.InferenceEmbedRequest) !ApiResponse(types.InferenceEmbedResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/embed", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceEmbedResponse).fromResponse(self.allocator, &resp);
@@ -171,7 +171,7 @@ pub const Client = struct {
     pub fn createEmbedding(self: *@This(), body: types.InferenceEmbedRequest) !ApiResponse(types.InferenceEmbedResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/embeddings", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceEmbedResponse).fromResponse(self.allocator, &resp);
@@ -182,7 +182,7 @@ pub const Client = struct {
     pub fn extract(self: *@This(), body: types.ExtractionRequest) !ApiResponse(types.ExtractionResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/extract", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.ExtractionResponse).fromResponse(self.allocator, &resp);
@@ -193,7 +193,7 @@ pub const Client = struct {
     pub fn generateContent(self: *@This(), body: types.InferenceGenerateRequest) !RawResponse {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/generate", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         defer resp.deinit();
@@ -205,7 +205,7 @@ pub const Client = struct {
     pub fn generateBatchContent(self: *@This(), body: types.InferenceGenerateBatchRequest) !ApiResponse(types.InferenceGenerateBatchResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/generate/batch", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceGenerateBatchResponse).fromResponse(self.allocator, &resp);
@@ -225,7 +225,7 @@ pub const Client = struct {
     pub fn readImages(self: *@This(), body: types.InferenceReadRequest) !ApiResponse(types.InferenceReadResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/read", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceReadResponse).fromResponse(self.allocator, &resp);
@@ -236,7 +236,7 @@ pub const Client = struct {
     pub fn rerankPrompts(self: *@This(), body: types.InferenceRerankRequest) !ApiResponse(types.InferenceRerankResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/rerank", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceRerankResponse).fromResponse(self.allocator, &resp);
@@ -247,7 +247,7 @@ pub const Client = struct {
     pub fn rerankMultimodalPrompts(self: *@This(), body: types.InferenceRerankMultimodalRequest) !ApiResponse(types.InferenceRerankResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/rerank_multimodal", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceRerankResponse).fromResponse(self.allocator, &resp);
@@ -258,7 +258,7 @@ pub const Client = struct {
     pub fn rewriteText(self: *@This(), body: types.InferenceRewriteRequest) !ApiResponse(types.InferenceRewriteResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/rewrite", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceRewriteResponse).fromResponse(self.allocator, &resp);
@@ -269,7 +269,7 @@ pub const Client = struct {
     pub fn transcribeAudio(self: *@This(), body: types.InferenceTranscribeRequest) !ApiResponse(types.InferenceTranscribeResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ai/v1/transcribe", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferenceTranscribeResponse).fromResponse(self.allocator, &resp);
@@ -326,7 +326,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, encoded_subject, encoded_table });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.RowFilterEntry).fromResponse(self.allocator, &resp);
@@ -372,7 +372,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_user_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.User).fromResponse(self.allocator, &resp);
@@ -407,7 +407,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_user_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/api-keys", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.ApiKeyWithSecret).fromResponse(self.allocator, &resp);
@@ -433,7 +433,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_user_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/password", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.SuccessMessage).fromResponse(self.allocator, &resp);
@@ -457,7 +457,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_user_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/permissions", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.SuccessMessage).fromResponse(self.allocator, &resp);
@@ -512,7 +512,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_user_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/roles", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.SuccessMessage).fromResponse(self.allocator, &resp);
@@ -576,7 +576,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, encoded_user_name, encoded_table });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.RowFilterEntry).fromResponse(self.allocator, &resp);
@@ -600,7 +600,7 @@ pub const Client = struct {
     pub fn queryBuilderAgent(self: *@This(), body: types.QueryBuilderRequest) !ApiResponse(types.QueryBuilderResult) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/query-builder", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.QueryBuilderResult).fromResponse(self.allocator, &resp);
@@ -611,7 +611,7 @@ pub const Client = struct {
     pub fn retrievalAgent(self: *@This(), body: types.RetrievalAgentRequest) !RawResponse {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/agents/retrieval", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         defer resp.deinit();
@@ -623,7 +623,7 @@ pub const Client = struct {
     pub fn backup(self: *@This(), body: types.ClusterBackupRequest) !ApiResponse(types.ClusterBackupResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/backup", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.ClusterBackupResponse).fromResponse(self.allocator, &resp);
@@ -679,7 +679,7 @@ pub const Client = struct {
     pub fn multiBatchWrite(self: *@This(), body: types.MultiBatchRequest) !ApiResponse(types.MultiBatchResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/batch", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.MultiBatchResponse).fromResponse(self.allocator, &resp);
@@ -744,7 +744,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_operation);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/connections/{s}/inference/{s}", .{ self.base_url, encoded_connection_id, encoded_operation });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         defer resp.deinit();
@@ -756,7 +756,7 @@ pub const Client = struct {
     pub fn evaluate(self: *@This(), body: types.EvalRequest) !ApiResponse(types.EvalResult) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/eval", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.EvalResult).fromResponse(self.allocator, &resp);
@@ -767,7 +767,7 @@ pub const Client = struct {
     pub fn globalQuery(self: *@This(), body: types.QueryRequest) !ApiResponse(types.QueryResponses) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/query", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.QueryResponses).fromResponse(self.allocator, &resp);
@@ -778,7 +778,7 @@ pub const Client = struct {
     pub fn restore(self: *@This(), body: types.ClusterRestoreRequest, idempotency_key: ?[]const u8) !ApiResponse(types.RestoreJob) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/restore", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
         defer request_headers.deinit(self.allocator);
@@ -875,7 +875,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_key);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/secrets/{s}", .{ self.base_url, encoded_key });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.SecretEntry).fromResponse(self.allocator, &resp);
@@ -952,7 +952,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
@@ -989,7 +989,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_artifact_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/enrichment", .{ self.base_url, encoded_table_name, encoded_artifact_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -1017,7 +1017,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_artifact_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess", .{ self.base_url, encoded_table_name, encoded_artifact_name });
         defer self.allocator.free(url);
-        const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
         defer if (json_body) |value| self.allocator.free(value);
         var resp = if (json_body) |value|
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
@@ -1035,7 +1035,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_artifact_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs", .{ self.base_url, encoded_table_name, encoded_artifact_name });
         defer self.allocator.free(url);
-        const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
         defer if (json_body) |value| self.allocator.free(value);
         var resp = if (json_body) |value|
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
@@ -1096,7 +1096,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/backup", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -1109,7 +1109,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/batch", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.BatchResponse).fromResponse(self.allocator, &resp);
@@ -1133,7 +1133,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
         defer if (json_body) |value| self.allocator.free(value);
         var resp = if (json_body) |value|
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
@@ -1288,7 +1288,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_index_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}", .{ self.base_url, encoded_table_name, encoded_index_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.CreatedIndex).fromResponse(self.allocator, &resp);
@@ -1314,7 +1314,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/merge", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.LinearMergeResult).fromResponse(self.allocator, &resp);
@@ -1327,7 +1327,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/query", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.QueryResponses).fromResponse(self.allocator, &resp);
@@ -1340,7 +1340,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/issues", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
         defer if (json_body) |value| self.allocator.free(value);
         var resp = if (json_body) |value|
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
@@ -1356,7 +1356,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/jobs", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
         defer if (json_body) |value| self.allocator.free(value);
         var resp = if (json_body) |value|
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
@@ -1411,7 +1411,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/repair/run", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
         defer if (json_body) |value| self.allocator.free(value);
         var resp = if (json_body) |value|
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
@@ -1427,7 +1427,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/restore", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
         defer request_headers.deinit(self.allocator);
@@ -1444,7 +1444,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.Table).fromResponse(self.allocator, &resp);
@@ -1464,7 +1464,7 @@ pub const Client = struct {
     pub fn beginTransaction(self: *@This(), body: ?types.TransactionBeginRequest) !ApiResponse(types.TransactionBeginResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/begin", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
         defer if (json_body) |value| self.allocator.free(value);
         var resp = if (json_body) |value|
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
@@ -1503,7 +1503,7 @@ pub const Client = struct {
     pub fn commitTransaction(self: *@This(), body: types.TransactionCommitRequest) !ApiResponse(types.TransactionCommitResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/commit", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.TransactionCommitResponse).fromResponse(self.allocator, &resp);
@@ -1538,7 +1538,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_transaction_id);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/commit", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
-        const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
         defer if (json_body) |value| self.allocator.free(value);
         var resp = if (json_body) |value|
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
@@ -1554,7 +1554,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_transaction_id);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/delete", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.TransactionStatusResponse).fromResponse(self.allocator, &resp);
@@ -1567,7 +1567,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_transaction_id);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/read", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.TransactionStageReadResponse).fromResponse(self.allocator, &resp);
@@ -1604,7 +1604,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_transaction_id);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/stage", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.TransactionStatusResponse).fromResponse(self.allocator, &resp);
@@ -1617,7 +1617,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_transaction_id);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/write", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.TransactionStatusResponse).fromResponse(self.allocator, &resp);
@@ -1650,7 +1650,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
@@ -1663,7 +1663,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/config", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
@@ -1687,7 +1687,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/drop", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
-        const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
         defer if (json_body) |value| self.allocator.free(value);
         var resp = if (json_body) |value|
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
@@ -1725,7 +1725,7 @@ pub const Client = struct {
         defer self.allocator.free(encoded_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/update", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
-        const json_body = if (body) |value| try httpx.json.Json.stringify(self.allocator, value) else null;
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
         defer if (json_body) |value| self.allocator.free(value);
         var resp = if (json_body) |value|
             try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
@@ -1781,7 +1781,7 @@ pub const Client = struct {
     pub fn predict(self: *@This(), body: types.InferencePredictRequest) !ApiResponse(types.InferencePredictResponse) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/ml/v1/predict", .{self.base_url});
         defer self.allocator.free(url);
-        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
         return ApiResponse(types.InferencePredictResponse).fromResponse(self.allocator, &resp);

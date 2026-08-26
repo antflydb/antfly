@@ -3314,6 +3314,127 @@ pub const CreateCompletionRequest = struct {
     top_p: ?f64 = null,
     /// A unique identifier representing your end-user, which can help OpenAI to monitor and detect abuse. [Learn more](/docs/guides/safety-best-practices#end-user-ids).
     user: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("prompt");
+        try jw.write(self.prompt);
+        if (self.best_of) |value| {
+            try jw.objectField("best_of");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("best_of");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.echo) |value| {
+            try jw.objectField("echo");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("echo");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.frequency_penalty) |value| {
+            try jw.objectField("frequency_penalty");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("frequency_penalty");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.logit_bias) |value| {
+            try jw.objectField("logit_bias");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("logit_bias");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.logprobs) |value| {
+            try jw.objectField("logprobs");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("logprobs");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("max_tokens");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.n) |value| {
+            try jw.objectField("n");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("n");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.presence_penalty) |value| {
+            try jw.objectField("presence_penalty");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("presence_penalty");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.seed) |value| {
+            try jw.objectField("seed");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("seed");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.stop) |value| {
+            try jw.objectField("stop");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("stop");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.stream) |value| {
+            try jw.objectField("stream");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("stream");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.stream_options) |value| {
+            try jw.objectField("stream_options");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("stream_options");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.suffix) |value| {
+            try jw.objectField("suffix");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("suffix");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("temperature");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("top_p");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.user) |value| {
+            try jw.objectField("user");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("user");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 /// Represents a completion response from the API. Note: both the streamed and non-streamed response objects share the same shape (unlike the chat endpoint).
@@ -11762,6 +11883,75 @@ pub const RunObject = struct {
     tool_choice: std.json.Value,
     parallel_tool_calls: ParallelToolCalls,
     response_format: AssistantsApiResponseFormatOption,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        try jw.objectField("thread_id");
+        try jw.write(self.thread_id);
+        try jw.objectField("assistant_id");
+        try jw.write(self.assistant_id);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("required_action");
+        try jw.write(self.required_action);
+        try jw.objectField("last_error");
+        try jw.write(self.last_error);
+        try jw.objectField("expires_at");
+        try jw.write(self.expires_at);
+        try jw.objectField("started_at");
+        try jw.write(self.started_at);
+        try jw.objectField("cancelled_at");
+        try jw.write(self.cancelled_at);
+        try jw.objectField("failed_at");
+        try jw.write(self.failed_at);
+        try jw.objectField("completed_at");
+        try jw.write(self.completed_at);
+        try jw.objectField("incomplete_details");
+        try jw.write(self.incomplete_details);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("instructions");
+        try jw.write(self.instructions);
+        try jw.objectField("tools");
+        try jw.write(self.tools);
+        try jw.objectField("metadata");
+        try jw.write(self.metadata);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("temperature");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("top_p");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("max_prompt_tokens");
+        try jw.write(self.max_prompt_tokens);
+        try jw.objectField("max_completion_tokens");
+        try jw.write(self.max_completion_tokens);
+        try jw.objectField("truncation_strategy");
+        try jw.write(self.truncation_strategy);
+        try jw.objectField("tool_choice");
+        try jw.write(self.tool_choice);
+        try jw.objectField("parallel_tool_calls");
+        try jw.write(self.parallel_tool_calls);
+        try jw.objectField("response_format");
+        try jw.write(self.response_format);
+        try jw.endObject();
+    }
 };
 
 pub const RunStepCompletionUsage = std.json.Value;

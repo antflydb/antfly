@@ -253,6 +253,21 @@ pub const TypeGenerator = struct {
             try self.emitStructField(type_name, prop_name, prop_sor, required_set.contains(prop_name));
         }
 
+        // Request serialization normally omits null optional fields. A custom
+        // serializer is needed only when the schema also has a required field
+        // that permits null, because presence remains part of its contract.
+        if (self.schemaHasRequiredNullableFields(schema, &required_set, true)) {
+            try self.w.blank();
+            try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
+            self.w.indent();
+            try self.w.line("try jw.beginObject();", .{});
+            var emitted_json_props = std.StringArrayHashMapUnmanaged(void){};
+            try self.emitFlattenedSchemaJsonStringifyFields(schema, &emitted_json_props, &required_set, true, true);
+            try self.w.line("try jw.endObject();", .{});
+            self.w.dedent();
+            try self.w.line("}}", .{});
+        }
+
         self.w.dedent();
         try self.w.line("}};", .{});
     }
@@ -384,6 +399,18 @@ pub const TypeGenerator = struct {
         // Also include any direct properties on the schema itself
         try self.emitFlattenedSchemaProperties(type_name, schema, &emitted_props, &all_required, true);
 
+        if (self.schemaHasRequiredNullableFields(schema, &all_required, true)) {
+            try self.w.blank();
+            try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
+            self.w.indent();
+            try self.w.line("try jw.beginObject();", .{});
+            var emitted_json_props = std.StringArrayHashMapUnmanaged(void){};
+            try self.emitFlattenedSchemaJsonStringifyFields(schema, &emitted_json_props, &all_required, true, true);
+            try self.w.line("try jw.endObject();", .{});
+            self.w.dedent();
+            try self.w.line("}}", .{});
+        }
+
         self.w.dedent();
         try self.w.line("}};", .{});
     }
@@ -412,7 +439,7 @@ pub const TypeGenerator = struct {
         self.w.indent();
         try self.w.line("try jw.beginObject();", .{});
         var emitted_json_props = std.StringArrayHashMapUnmanaged(void){};
-        try self.emitFlattenedSchemaJsonStringifyFields(schema, &emitted_json_props, &all_required, true);
+        try self.emitFlattenedSchemaJsonStringifyFields(schema, &emitted_json_props, &all_required, true, false);
         try self.w.line("try jw.endObject();", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
@@ -457,52 +484,73 @@ pub const TypeGenerator = struct {
         emitted_props: *std.StringArrayHashMapUnmanaged(void),
         required_fields: *const std.StringArrayHashMapUnmanaged(void),
         allow_required: bool,
+        optional_nulls_follow_writer: bool,
     ) !void {
-        for (schema.properties.keys(), schema.properties.values()) |prop_name, prop_sor| {
+        for (schema.properties.keys(), schema.properties.values()) |prop_name, _| {
             if (emitted_props.contains(prop_name)) continue;
             try emitted_props.put(self.arena, prop_name, {});
 
             const field = try naming.zigFieldName(self.arena, prop_name);
             const is_required = allow_required and required_fields.contains(prop_name);
-            const schema_nullable = switch (prop_sor) {
-                .schema => |s| s.isNullable(),
-                .ref => false,
-            };
 
             if (is_required) {
                 try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
                 try self.w.line("try jw.write(self.{s});", .{field});
-            } else if (schema_nullable) {
-                try self.w.line("if (self.{s}) |value| {{", .{field});
-                self.w.indent();
-                try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
-                try self.w.line("try jw.write(value);", .{});
-                self.w.dedent();
-                try self.w.line("}}", .{});
             } else {
                 try self.w.line("if (self.{s}) |value| {{", .{field});
                 self.w.indent();
                 try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
                 try self.w.line("try jw.write(value);", .{});
                 self.w.dedent();
+                if (optional_nulls_follow_writer) {
+                    try self.w.line("}} else if (jw.options.emit_null_optional_fields) {{", .{});
+                    self.w.indent();
+                    try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
+                    try self.w.line("try jw.write(@as(?u8, null));", .{});
+                    self.w.dedent();
+                }
                 try self.w.line("}}", .{});
             }
         }
 
         for (schema.all_of) |member| {
             const resolved = self.resolver.resolveSchema(member) catch continue;
-            try self.emitFlattenedSchemaJsonStringifyFields(resolved, emitted_props, required_fields, allow_required);
+            try self.emitFlattenedSchemaJsonStringifyFields(resolved, emitted_props, required_fields, allow_required, optional_nulls_follow_writer);
         }
 
         for (schema.one_of) |member| {
             const resolved = self.resolver.resolveSchema(member) catch continue;
-            try self.emitFlattenedSchemaJsonStringifyFields(resolved, emitted_props, required_fields, false);
+            try self.emitFlattenedSchemaJsonStringifyFields(resolved, emitted_props, required_fields, false, optional_nulls_follow_writer);
         }
 
         for (schema.any_of) |member| {
             const resolved = self.resolver.resolveSchema(member) catch continue;
-            try self.emitFlattenedSchemaJsonStringifyFields(resolved, emitted_props, required_fields, false);
+            try self.emitFlattenedSchemaJsonStringifyFields(resolved, emitted_props, required_fields, false, optional_nulls_follow_writer);
         }
+    }
+
+    fn schemaHasRequiredNullableFields(
+        self: *TypeGenerator,
+        schema: types.Schema,
+        required_fields: *const std.StringArrayHashMapUnmanaged(void),
+        allow_required: bool,
+    ) bool {
+        if (allow_required) {
+            for (schema.properties.keys(), schema.properties.values()) |prop_name, prop_sor| {
+                if (!required_fields.contains(prop_name)) continue;
+                const nullable = switch (prop_sor) {
+                    .schema => |property_schema| property_schema.isNullable(),
+                    .ref => false,
+                };
+                if (nullable) return true;
+            }
+        }
+
+        for (schema.all_of) |member| {
+            const resolved = self.resolver.resolveSchema(member) catch continue;
+            if (self.schemaHasRequiredNullableFields(resolved, required_fields, allow_required)) return true;
+        }
+        return false;
     }
 
     /// Generate a union(enum) from oneOf with discriminator.
@@ -1493,6 +1541,12 @@ test "required + nullable field codegen" {
     try std.testing.expect(std.mem.indexOf(u8, output, "old_tag: ?[]const u8 = null") == null);
     // Doc comment from nullable field description
     try std.testing.expect(std.mem.indexOf(u8, output, "/// A nullable required tag") != null);
+    // Request serialization must preserve required nulls while omitting absent
+    // optional fields.
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.objectField(\"tag\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.tag);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "if (self.note) |value|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "else if (jw.options.emit_null_optional_fields)") != null);
 }
 
 test "component schema emission order is lexical" {

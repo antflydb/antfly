@@ -4137,6 +4137,19 @@ pub const TransactionStageReadSnapshot = struct {
     key: []const u8,
     version: []const u8,
     document: ?std.json.Value,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("version");
+        try jw.write(self.version);
+        try jw.objectField("document");
+        try jw.write(self.document);
+        try jw.endObject();
+    }
 };
 
 pub const TransactionStageWriteRequest = struct {

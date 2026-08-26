@@ -10,6 +10,7 @@ class GraphQueryModeUnsupportedErrorReason(str, Enum):
     K_MUST_EQUAL_ONE = "k_must_equal_one"
     LEGACY_GRAPH_SEARCHES_NOT_SUPPORTED = "legacy_graph_searches_not_supported"
     PATTERN_REQUIRED = "pattern_required"
+    REQUEST_CONTROL_NOT_SUPPORTED = "request_control_not_supported"
     REVERSE_VARIABLE_PATH_NOT_SUPPORTED = "reverse_variable_path_not_supported"
     START_SELECTOR_NOT_SUPPORTED = "start_selector_not_supported"
     TARGET_REQUIRED = "target_required"

@@ -39,3 +39,21 @@ def test_serverless_legacy_graph_rejection_decodes_as_typed_error() -> None:
     )
 
     assert error.reason is GraphQueryModeUnsupportedErrorReason.LEGACY_GRAPH_SEARCHES_NOT_SUPPORTED
+
+
+def test_serverless_request_control_rejection_decodes_as_typed_error() -> None:
+    error = GraphQueryModeUnsupportedError.from_dict(
+        {
+            "status": 422,
+            "error": "graph_query_mode_unsupported",
+            "message": "this request control cannot be combined with exact graph execution",
+            "retryable": False,
+            "operation": "$request",
+            "mode": "order_by",
+            "reason": "request_control_not_supported",
+        }
+    )
+
+    assert error.operation == "$request"
+    assert error.mode == "order_by"
+    assert error.reason is GraphQueryModeUnsupportedErrorReason.REQUEST_CONTROL_NOT_SUPPORTED

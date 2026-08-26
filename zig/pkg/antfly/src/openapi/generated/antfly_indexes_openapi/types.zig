@@ -756,6 +756,45 @@ pub const DerivedCoverageStatus = struct {
     healthy: bool,
     /// Whether all sources are settled but coverage remains unhealthy under the configured policy, including terminal failures or policy-rejected skips.
     degraded: bool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("policy");
+        try jw.write(self.policy);
+        try jw.objectField("observation_complete");
+        try jw.write(self.observation_complete);
+        try jw.objectField("observation_incomplete_reasons");
+        try jw.write(self.observation_incomplete_reasons);
+        try jw.objectField("config_fingerprint");
+        try jw.write(self.config_fingerprint);
+        try jw.objectField("summary_ready");
+        try jw.write(self.summary_ready);
+        try jw.objectField("config_mismatch_group_count");
+        try jw.write(self.config_mismatch_group_count);
+        try jw.objectField("source_total");
+        try jw.write(self.source_total);
+        try jw.objectField("produced");
+        try jw.write(self.produced);
+        try jw.objectField("skipped");
+        try jw.write(self.skipped);
+        try jw.objectField("terminal_failed");
+        try jw.write(self.terminal_failed);
+        try jw.objectField("covered");
+        try jw.write(self.covered);
+        try jw.objectField("settled");
+        try jw.write(self.settled);
+        try jw.objectField("uncovered");
+        try jw.write(self.uncovered);
+        try jw.objectField("pending");
+        try jw.write(self.pending);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        try jw.objectField("healthy");
+        try jw.write(self.healthy);
+        try jw.objectField("degraded");
+        try jw.write(self.degraded);
+        try jw.endObject();
+    }
 };
 
 pub const DerivedCoverageStatusPolicy = enum {

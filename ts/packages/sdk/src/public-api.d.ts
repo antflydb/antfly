@@ -3098,7 +3098,7 @@ export interface components {
              * @description Stable machine-readable constraint that prevents exact public execution.
              * @enum {string}
              */
-            reason: "expand_strategy_not_supported" | "direction_must_be_out" | "deduplicate_nodes_must_be_true" | "weight_mode_must_be_min_hops" | "start_selector_not_supported" | "target_selector_not_supported" | "target_required" | "k_must_equal_one" | "pattern_required" | "external_alias_document_filter_not_supported" | "external_alias_source_not_supported" | "reverse_variable_path_not_supported" | "legacy_graph_searches_not_supported" | "unsupported_mode";
+            reason: "expand_strategy_not_supported" | "direction_must_be_out" | "deduplicate_nodes_must_be_true" | "weight_mode_must_be_min_hops" | "start_selector_not_supported" | "target_selector_not_supported" | "target_required" | "k_must_equal_one" | "pattern_required" | "external_alias_document_filter_not_supported" | "external_alias_source_not_supported" | "reverse_variable_path_not_supported" | "legacy_graph_searches_not_supported" | "request_control_not_supported" | "unsupported_mode";
         };
         GraphMatchOperationLimitExceededError: {
             /**
