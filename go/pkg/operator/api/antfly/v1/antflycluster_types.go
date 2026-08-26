@@ -388,6 +388,13 @@ type AntflyClusterSpec struct {
 	// +optional
 	SecretStore *SecretStoreSpec `json:"secretStore,omitempty"`
 
+	// InternalServiceAuth references the dedicated per-cluster signing key used
+	// for metadata/data internal RPC. Kubernetes injects the selected Secret key
+	// directly into runtime pods; the operator never reads the Secret value.
+	// Required for Distributed mode and forbidden for Standalone mode.
+	// +optional
+	InternalServiceAuth *InternalServiceAuthSpec `json:"internalServiceAuth,omitempty"`
+
 	// Storage defines the storage configuration
 	Storage StorageSpec `json:"storage"`
 
@@ -411,6 +418,25 @@ type AntflyClusterSpec struct {
 	// If not specified, the default ServiceAccount for the namespace is used
 	// +optional
 	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+}
+
+// InternalServiceAuthSpec selects the Kubernetes Secret key used to authenticate
+// distributed node-to-node RPC. Issuer and rolling-upgrade mode are derived and
+// managed by the operator so every node in one cluster receives identical,
+// non-secret settings.
+type InternalServiceAuthSpec struct {
+	// SecretKeyRef selects a required key in a Secret in the AntflyCluster
+	// namespace. The value must contain at least 32 random bytes and must not be
+	// reused as an API key, trusted-principal key, or another cluster's key.
+	SecretKeyRef corev1.SecretKeySelector `json:"secretKeyRef"`
+
+	// NextSecretKeyRef starts an operator-managed zero-downtime key rotation.
+	// Every node first receives this key as an additional verifier; after all
+	// runtimes acknowledge the overlap, the operator switches signing to it while
+	// retaining SecretKeyRef as the verifier. Promote it to SecretKeyRef only
+	// after status.internalServiceAuthRotation.phase is Switched.
+	// +optional
+	NextSecretKeyRef *corev1.SecretKeySelector `json:"nextSecretKeyRef,omitempty"`
 }
 
 // SecretStoreSpec configures a mounted Antfly secrets.json file.
@@ -1722,6 +1748,11 @@ type AntflyClusterStatus struct {
 	// +optional
 	ConfigPublication *ConfigPublicationStatus `json:"configPublication,omitempty"`
 
+	// InternalServiceAuthRotation reports the operator-managed overlap rollout
+	// for spec.internalServiceAuth.nextSecretKeyRef.
+	// +optional
+	InternalServiceAuthRotation *InternalServiceAuthRotationStatus `json:"internalServiceAuthRotation,omitempty"`
+
 	// Conditions represent the current conditions of the cluster
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
@@ -1765,6 +1796,24 @@ type AntflyClusterStatus struct {
 	// ServiceMeshStatus reports service mesh operational state
 	// +optional
 	ServiceMeshStatus *ServiceMeshStatus `json:"serviceMeshStatus,omitempty"`
+}
+
+type InternalServiceAuthRotationPhase string
+
+const (
+	InternalServiceAuthRotationPreparing InternalServiceAuthRotationPhase = "Preparing"
+	InternalServiceAuthRotationSwitching InternalServiceAuthRotationPhase = "Switching"
+	InternalServiceAuthRotationSwitched  InternalServiceAuthRotationPhase = "Switched"
+)
+
+// InternalServiceAuthRotationStatus contains only Secret object identity, never
+// Secret data. It is safe for the operator to publish without Secret RBAC.
+type InternalServiceAuthRotationStatus struct {
+	Phase InternalServiceAuthRotationPhase `json:"phase"`
+
+	TargetSecretName string `json:"targetSecretName"`
+
+	TargetSecretKey string `json:"targetSecretKey"`
 }
 
 // ConfigPublicationStatus identifies an operator-generated config.json image.

@@ -49,6 +49,9 @@ const transactions_mod = @import("../storage/transactions.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const transactions_api = @import("transactions.zig");
 
+const internal_service_test_secret = "antfly-multi-node-e2e-internal-service-secret-v1";
+const internal_service_test_issuer = "antfly-multi-node-e2e";
+
 fn parsePageJson(comptime T: type, body: []const u8) !std.json.Parsed(T) {
     return ant_json.parseFromSlice(T, std.heap.page_allocator, body, .{});
 }
@@ -711,6 +714,7 @@ fn startPublicApiServersWithSharedSessionStorePath(
             routers[i].iface(),
             forward_executor.executor(),
         );
+        _ = read_sources[i].withInternalServiceAuth(internal_service_test_secret, internal_service_test_issuer);
         _ = read_sources[i].withIo(forward_executor.io_impl);
         _ = read_sources[i].withBackendRuntime(cluster.backendRuntime(i));
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
@@ -719,6 +723,7 @@ fn startPublicApiServersWithSharedSessionStorePath(
             routers[i].iface(),
             forward_executor.executor(),
         );
+        _ = write_sources[i].withInternalServiceAuth(internal_service_test_secret, internal_service_test_issuer);
         _ = write_sources[i].withBackendRuntime(cluster.backendRuntime(i));
         // These stateful API fixtures issue visibility assertions immediately
         // after writes. Opt into the hosted source's explicit foreground
@@ -727,6 +732,8 @@ fn startPublicApiServersWithSharedSessionStorePath(
         servers[i] = try api_http_server.ApiHttpServer.initWithConfig(
             std.testing.allocator,
             .{
+                .internal_service_secret = internal_service_test_secret,
+                .internal_service_issuer = internal_service_test_issuer,
                 .session_router = routers[i].iface(),
                 .session_executor = forward_executor.executor(),
                 .session_store_path = session_store_path,
@@ -782,6 +789,7 @@ fn startPublicApiServersWithOptionalSessions(
             routers[i].iface(),
             forward_executor,
         );
+        _ = read_sources[i].withInternalServiceAuth(internal_service_test_secret, internal_service_test_issuer);
         if (forward_io_impl) |io_impl| _ = read_sources[i].withIo(io_impl);
         _ = read_sources[i].withBackendRuntime(cluster.backendRuntime(i));
         write_sources[i] = api_table_writes.HostedProvisionedTableWriteSource.init(
@@ -790,11 +798,14 @@ fn startPublicApiServersWithOptionalSessions(
             routers[i].iface(),
             forward_executor,
         );
+        _ = write_sources[i].withInternalServiceAuth(internal_service_test_secret, internal_service_test_issuer);
         _ = write_sources[i].withBackendRuntime(cluster.backendRuntime(i));
         _ = write_sources[i].withForegroundDerivedProgress();
         servers[i] = api_http_server.ApiHttpServer.init(
             std.testing.allocator,
             .{
+                .internal_service_secret = internal_service_test_secret,
+                .internal_service_issuer = internal_service_test_issuer,
                 .session_router = routers[i].iface(),
                 .session_executor = forward_executor,
                 .session_store = if (session_stores) |stores| stores[i] else null,
