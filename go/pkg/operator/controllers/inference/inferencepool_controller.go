@@ -326,7 +326,7 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 
 		entry := map[string]any{
 			"kind": zigWarmModelKind(model.Tasks),
-			"name": model.Name,
+			"name": inferenceWarmModelName(model.Name),
 		}
 		if format, quantization, ok := inferenceArtifactSelection(model.Name); ok {
 			entry["format"] = format
@@ -548,19 +548,8 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 		"inference", "run",
 		"--host", "0.0.0.0",
 		"--port", strconv.Itoa(InferenceAPIPort),
-		"--models-dir", "/models",
 		"--config", "/config/config.json",
 		"--allow-insecure-public-bind",
-	}
-	for _, model := range preloadModels {
-		if effectiveInferenceLoadingStrategy(model.Strategy, pool.Spec.Models.LoadingStrategy) != antflyaiv1alpha1.LoadingStrategyEager {
-			continue
-		}
-		inferenceArgs = append(
-			inferenceArgs,
-			"--preload-model",
-			fmt.Sprintf("%s:%s", zigWarmModelKind(model.Tasks), inferenceWarmModelName(model.Name)),
-		)
 	}
 
 	inferenceVolumeMounts := []corev1.VolumeMount{

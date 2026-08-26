@@ -137,10 +137,8 @@ var _ = Describe("InferencePool Controller", func() {
 				"inference", "run",
 				"--host", "0.0.0.0",
 				"--port", "8080",
-				"--models-dir", "/models",
 				"--config", "/config/config.json",
 				"--allow-insecure-public-bind",
-				"--preload-model", "embedder:BAAI/bge-small-en-v1.5:i8",
 			}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers).To(HaveLen(2))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Name).To(Equal("pjrt-plugin"))
@@ -487,11 +485,8 @@ var _ = Describe("InferencePool Controller", func() {
 				"inference", "run",
 				"--host", "0.0.0.0",
 				"--port", "8080",
-				"--models-dir", "/models",
 				"--config", "/config/config.json",
 				"--allow-insecure-public-bind",
-				"--preload-model", "generator:model-a:i8",
-				"--preload-model", "generator:model-b",
 			}))
 
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())

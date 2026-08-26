@@ -17294,6 +17294,16 @@ fn freeLocalBootstrapStatusOwned(alloc: std.mem.Allocator, record: antfly.raft.h
     if (record.snapshot_path) |value| alloc.free(value);
 }
 
+fn freeReplicationSourceActionHintOwned(
+    alloc: std.mem.Allocator,
+    record: antfly.metadata_api.ReplicationSourceActionHint,
+) void {
+    alloc.free(record.table_name);
+    alloc.free(record.action);
+    alloc.free(record.reason);
+    alloc.free(record.reseed_exact_cutover_path);
+}
+
 fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_api.AdminSnapshot) void {
     alloc.free(snapshot.status.metadata_raft_role);
     for (snapshot.tables) |record| antfly.metadata.table_manager.freeTable(alloc, record);
@@ -17314,12 +17324,7 @@ fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_a
     if (snapshot.restore_progresses.len > 0) alloc.free(snapshot.restore_progresses);
     for (snapshot.replication_source_statuses) |record| antfly.metadata.table_manager.freeReplicationSourceStatus(alloc, record);
     if (snapshot.replication_source_statuses.len > 0) alloc.free(snapshot.replication_source_statuses);
-    for (snapshot.replication_source_action_hints) |record| {
-        alloc.free(record.table_name);
-        alloc.free(record.action);
-        alloc.free(record.reason);
-        alloc.free(record.reseed_exact_cutover_path);
-    }
+    for (snapshot.replication_source_action_hints) |record| freeReplicationSourceActionHintOwned(alloc, record);
     if (snapshot.replication_source_action_hints.len > 0) alloc.free(snapshot.replication_source_action_hints);
     for (snapshot.extension_packages) |record| {
         var owned = record;
@@ -17407,8 +17412,15 @@ fn cloneRestoreProgressesOwned(
 ) ![]antfly.metadata.table_manager.RestoreProgressRecord {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata.table_manager.RestoreProgressRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneRestoreProgress(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeRestoreProgress(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneRestoreProgress(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
@@ -17418,9 +17430,37 @@ fn cloneReplicationSourceStatusesOwned(
 ) ![]antfly.metadata.table_manager.ReplicationSourceStatusRecord {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata.table_manager.ReplicationSourceStatusRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneReplicationSourceStatus(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeReplicationSourceStatus(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneReplicationSourceStatus(alloc, record);
+        initialized += 1;
+    }
     return out;
+}
+
+fn cloneReplicationSourceActionHintOwned(
+    alloc: std.mem.Allocator,
+    record: antfly.metadata_api.ReplicationSourceActionHint,
+) !antfly.metadata_api.ReplicationSourceActionHint {
+    const table_name = try alloc.dupe(u8, record.table_name);
+    errdefer alloc.free(table_name);
+    const action = try alloc.dupe(u8, record.action);
+    errdefer alloc.free(action);
+    const reason = try alloc.dupe(u8, record.reason);
+    errdefer alloc.free(reason);
+    const reseed_exact_cutover_path = try alloc.dupe(u8, record.reseed_exact_cutover_path);
+    return .{
+        .table_id = record.table_id,
+        .table_name = table_name,
+        .source_ordinal = record.source_ordinal,
+        .action = action,
+        .reason = reason,
+        .reseed_exact_cutover_path = reseed_exact_cutover_path,
+    };
 }
 
 fn cloneReplicationSourceActionHintsOwned(
@@ -17429,31 +17469,43 @@ fn cloneReplicationSourceActionHintsOwned(
 ) ![]antfly.metadata_api.ReplicationSourceActionHint {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata_api.ReplicationSourceActionHint, records.len);
-    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| freeReplicationSourceActionHintOwned(alloc, record);
+        alloc.free(out);
+    }
     for (records, 0..) |record, i| {
-        out[i] = .{
-            .table_id = record.table_id,
-            .table_name = try alloc.dupe(u8, record.table_name),
-            .source_ordinal = record.source_ordinal,
-            .action = try alloc.dupe(u8, record.action),
-            .reason = try alloc.dupe(u8, record.reason),
-            .reseed_exact_cutover_path = try alloc.dupe(u8, record.reseed_exact_cutover_path),
-        };
+        out[i] = try cloneReplicationSourceActionHintOwned(alloc, record);
+        initialized += 1;
     }
     return out;
 }
 
 fn cloneTablesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.TableRecord) ![]antfly.metadata.table_manager.TableRecord {
     const out = try alloc.alloc(antfly.metadata.table_manager.TableRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneTable(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeTable(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneTable(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
 fn cloneRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.RangeRecord) ![]antfly.metadata.table_manager.RangeRecord {
     const out = try alloc.alloc(antfly.metadata.table_manager.RangeRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneRange(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeRange(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneRange(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
@@ -25405,18 +25457,41 @@ test "data runtime remote admin snapshot clone releases partial ownership" {
                     .snapshot_path = "backup-12/groups/12.afb",
                 },
             };
+            var tables = [_]antfly.metadata.table_manager.TableRecord{
+                .{ .table_id = 7, .name = "docs", .description = "documents", .schema_json = "{}" },
+                .{ .table_id = 8, .name = "events", .description = "events", .schema_json = "{}" },
+            };
+            var ranges = [_]antfly.metadata.table_manager.RangeRecord{
+                .{ .group_id = 11, .table_id = 7, .start_key = "a", .end_key = "m", .restore_backup_id = "backup-11" },
+                .{ .group_id = 12, .table_id = 8, .start_key = "m", .end_key = "z", .restore_backup_id = "backup-12" },
+            };
+            var restore_progresses = [_]antfly.metadata.table_manager.RestoreProgressRecord{
+                .{ .table_id = 7, .node_id = 3, .group_id = 11, .backup_id = "backup-11", .location = "s3://backups", .phase = "repairing" },
+                .{ .table_id = 8, .node_id = 4, .group_id = 12, .backup_id = "backup-12", .location = "s3://backups", .phase = "complete" },
+            };
+            var replication_source_statuses = [_]antfly.metadata.table_manager.ReplicationSourceStatusRecord{
+                .{ .table_id = 7, .source_ordinal = 0, .source_kind = "postgres", .external_table = "docs", .phase = "streaming" },
+                .{ .table_id = 8, .source_ordinal = 1, .source_kind = "postgres", .external_table = "events", .phase = "snapshot" },
+            };
+            var replication_source_action_hints = [_]antfly.metadata_api.ReplicationSourceActionHint{
+                .{ .table_id = 7, .table_name = @constCast("docs"), .source_ordinal = 0, .action = "reseed", .reason = "slot mismatch", .reseed_exact_cutover_path = @constCast("/tables/docs/reseed") },
+                .{ .table_id = 8, .table_name = @constCast("events"), .source_ordinal = 1, .action = "reseed", .reason = "publication mismatch", .reseed_exact_cutover_path = @constCast("/tables/events/reseed") },
+            };
             const snapshot: antfly.metadata_api.AdminSnapshot = .{
                 .status = .{
                     .metadata_group_id = 1,
                     .metadata_raft_role = "leader",
                     .metrics = .{},
                 },
-                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .tables = tables[0..],
+                .ranges = ranges[0..],
                 .nodes = nodes[0..],
                 .stores = stores[0..],
                 .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
                 .local_bootstrap_statuses = local_bootstrap_statuses[0..],
+                .restore_progresses = restore_progresses[0..],
+                .replication_source_statuses = replication_source_statuses[0..],
+                .replication_source_action_hints = replication_source_action_hints[0..],
                 .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
                 .merged_group_statuses = merged_group_statuses[0..],
