@@ -6713,6 +6713,28 @@ pub const ProvisionedTableWriteSource = struct {
         return true;
     }
 
+    fn settleTerminalRepairHandoffStatusBestEffort(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+    ) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
+        const entry = &self.active_table_activities.items[index];
+        if (entry.repair_handoff_status_pending == 0) return false;
+        // A terminal intent deliberately remains durable, so no aggregate
+        // repair-clear edge is guaranteed to follow it. Its authoritative
+        // terminal snapshot is the fail-closed completion proof for the status
+        // handoff and must retire that authority directly.
+        entry.repair_handoff_status_pending = 0;
+        entry.repair_handoff_clear_observed = false;
+        self.pruneTableActivityLocked(table_name, group_id);
+        self.table_activity_ready.broadcast(io);
+        return true;
+    }
+
     fn retainRepairRouteForPendingHandoffBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
@@ -21953,13 +21975,19 @@ fn publishTerminalStartupRuntimeStatusSnapshot(
     table_name: []const u8,
     group_id: u64,
     db: *db_mod.DB,
-) !void {
-    const snapshot_cache = source.runtime_status_cache orelse return;
+) !bool {
+    const snapshot_cache = source.runtime_status_cache orelse {
+        // Uncached sources serve their next status directly from the DB. The
+        // durable terminal state is already authoritative and has no cached
+        // publication plane that can fence it.
+        _ = source.settleTerminalRepairHandoffStatusBestEffort(table_name, group_id);
+        return true;
+    };
     const publication_token = try snapshot_cache.capturePublicationToken(table_name);
     const visible_root_generation = source.visibleRootGeneration(group_id);
     const opened_root_generation = db.core.index_manager.lsm_root_generation;
-    if (opened_root_generation != visible_root_generation) return;
-    try publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
+    if (opened_root_generation != visible_root_generation) return false;
+    publishRuntimeStatusSnapshotToCacheWithStartupPhaseMode(
         snapshot_cache,
         alloc,
         table_name,
@@ -21970,7 +21998,12 @@ fn publishTerminalStartupRuntimeStatusSnapshot(
         .consistent,
         .terminal_startup,
         db,
-    );
+    ) catch |err| switch (err) {
+        error.RuntimeStatusPublicationFenced => return false,
+        else => return err,
+    };
+    _ = source.settleTerminalRepairHandoffStatusBestEffort(table_name, group_id);
+    return true;
 }
 
 fn publishRuntimeStatusSnapshotToCacheConsistent(
@@ -23034,10 +23067,11 @@ fn catchUpManagedDb(
         // cannot participate in that proof, so preserve both debts and fail
         // closed until the index repair owner has recovered (or an operator
         // has replaced) the unavailable generation.
-        try finishManagedMaintenanceStatusPublication(publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db));
+        const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db);
         return .{
             .had_debt = true,
             .terminal_degraded = true,
+            .index_repair_pending = !terminal_status_published,
         };
     }
 
@@ -23279,19 +23313,21 @@ fn catchUpManagedDb(
         };
     }
     if (repair_summary.terminal != 0) {
-        try finishManagedMaintenanceStatusPublication(publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db));
+        const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db);
         return .{
             .had_debt = true,
             .terminal_degraded = true,
             .made_progress = made_progress,
+            .index_repair_pending = !terminal_status_published,
         };
     }
     if (try managedDbHasIndexLoadFailure(alloc, db)) {
-        try finishManagedMaintenanceStatusPublication(publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db));
+        const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db);
         return .{
             .had_debt = true,
             .terminal_degraded = true,
             .made_progress = made_progress,
+            .index_repair_pending = !terminal_status_published,
         };
     }
     const index_only_result = mode == .index_repair_only or mode == .index_repair_prerequisite;
@@ -34271,6 +34307,74 @@ test "repair handoff status settles after authoritative cached publication" {
     var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer published.deinit(alloc);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
+}
+
+test "terminal repair publication settles handoff or retains one fenced retry" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/terminal-repair-handoff-publication",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(path, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+    var visible_generation = db.core.index_manager.lsm_root_generation;
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&visible_generation));
+
+    // A durable terminal intent does not emit a repair-clear edge. Its
+    // authoritative fail-closed snapshot must therefore settle the handoff
+    // directly instead of leaving every future status request cache-only.
+    source.reserveStructuralReconcileStatus("docs");
+    source.ensureStructuralRepairHandoffStatus("docs", 7001);
+    source.releaseStructuralReconcileStatus("docs");
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    try std.testing.expect(try publishTerminalStartupRuntimeStatusSnapshot(&source, alloc, "docs", 7001, &db));
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
+
+    // A prior per-intent clear can exist while another intent becomes terminal.
+    // If invalidation fences that terminal snapshot, preserve exactly one route
+    // until a later authoritative publication retires the handoff.
+    source.reserveStructuralReconcileStatus("docs");
+    source.ensureStructuralRepairHandoffStatus("docs", 7002);
+    source.releaseStructuralReconcileStatus("docs");
+    source.markRepairHandoffClearBestEffort("docs", 7002);
+    const Fence = struct {
+        cache: *runtime_status.TableRuntimeSnapshotCache,
+        calls: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.cache.invalidateTable("docs");
+        }
+    };
+    var fence = Fence{ .cache = &snapshot_cache };
+    {
+        const previous_hook = test_before_runtime_status_publish_hook;
+        test_before_runtime_status_publish_hook = .{ .ptr = &fence, .run = Fence.run };
+        defer test_before_runtime_status_publish_hook = previous_hook;
+        try std.testing.expect(!try publishTerminalStartupRuntimeStatusSnapshot(&source, alloc, "docs", 7002, &db));
+    }
+    try std.testing.expectEqual(@as(usize, 1), fence.calls);
+    try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    var terminal_retry = ProvisionedTableWriteSource.StartupCatchUpResult{
+        .terminal_degraded = true,
+        .index_repair_pending = true,
+    };
+    source.retainRepairRouteForPendingHandoffBestEffort("docs", 7002, &terminal_retry);
+    try std.testing.expect(terminal_retry.index_repair_pending);
+
+    try std.testing.expect(try publishTerminalStartupRuntimeStatusSnapshot(&source, alloc, "docs", 7002, &db));
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
 }
 
 test "managed create publication handoff releases on converged owner publication" {
