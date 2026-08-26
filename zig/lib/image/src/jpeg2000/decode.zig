@@ -1891,6 +1891,23 @@ test "OfficeQA JPEG 2000 page decodes natively within bounded memory" {
     decoded.deinit();
     try std.testing.expectEqual(@as(usize, 0), peak.live_bytes);
 }
+test "larger OfficeQA JPEG 2000 page decodes within 128 MiB" {
+    const fixture = try readTestFile(
+        std.testing.allocator,
+        "testdata/image/jpeg2000/regression/officeqa-1972-page204-2612x3564.j2k",
+    );
+    defer std.testing.allocator.free(fixture);
+
+    var peak = TestPeakAllocator{ .backing = std.testing.allocator };
+    var decoded = try decodeU8Bytes(peak.allocator(), fixture);
+    try std.testing.expectEqual(@as(u32, 2612), decoded.width);
+    try std.testing.expectEqual(@as(u32, 3564), decoded.height);
+    try std.testing.expectEqual(@as(u8, 3), decoded.components);
+    try std.testing.expectEqual(@as(usize, 2612 * 3564 * 3), decoded.pixels.len);
+    try std.testing.expect(peak.peak_live_bytes <= 128 * 1024 * 1024);
+    decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), peak.live_bytes);
+}
 
 test "decode OpenJPEG lossless 8x8 grayscale J2K" {
     const allocator = std.testing.allocator;
