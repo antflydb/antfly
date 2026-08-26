@@ -14232,6 +14232,15 @@ pub const ProvisionedTableWriteSource = struct {
                 true,
             );
             defer cached.deinit(alloc);
+            // Opening/adopting the resident writer must remain exclusive with
+            // reads: until this lease exists, a reader could fall back to a
+            // second DB owner for the same path. Once the authoritative writer
+            // is leased, however, DB's apply lock provides the required local
+            // mutation/read ordering. Downgrade group admission before the
+            // batch so a remote HA durability wait cannot turn a healthy
+            // promoted primary into a read outage. Structural transitions and
+            // later writers remain serialized by operation_active.
+            self.allowGroupOperationReads(table_name, group.group_id);
             try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req, cancellation);
             cache.publishCachedLeaseGeneration(&cached, target_generation);
         } else {
@@ -32844,6 +32853,62 @@ test "provisioned table write source serializes same-table same-group operations
     defer source.endGroupOperation("docs", 7001);
 
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
+}
+
+test "resident group write releases queued reads before remote completion" {
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const ReaderWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        started: std.atomic.Value(bool) = .init(false),
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            var read = self.source.readPreparation().beginRead("docs", .general).?;
+            defer read.deinit();
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+
+    var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-resident-write-read-liveness", NoCatalog.iface());
+    source.beginGroupOperation("docs", 7001);
+    var operation_active = true;
+    defer if (operation_active) source.endGroupOperation("docs", 7001);
+
+    var worker = ReaderWorker{ .source = &source };
+    const thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&worker});
+    defer {
+        worker.release.store(true, .release);
+        thread.join();
+    }
+
+    // The writer remains exclusive until it has leased the authoritative
+    // resident DB; a fallback reader must not open the same storage path.
+    while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..10_000) |_| std.atomic.spinLoopHint();
+    try std.testing.expect(!worker.entered.load(.acquire));
+
+    // Resident DB reads are safe once DB's local apply lock owns ordering.
+    // Keep the group operation active to model a synchronous HA wait.
+    source.allowGroupOperationReads("docs", 7001);
+    while (!worker.entered.load(.acquire)) std.atomic.spinLoopHint();
+    try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
+
+    worker.release.store(true, .release);
+    source.endGroupOperation("docs", 7001);
+    operation_active = false;
 }
 
 test "provisioned table transition activity excludes writers but preserves reads" {
