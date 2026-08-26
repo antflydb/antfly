@@ -7488,7 +7488,7 @@ pub fn build(b: *std.Build) void {
         "one percent filtered route preserves exact recall with candidate-linear IO",
         "dense index manager accepts external embedding indexes without enrichments",
         "production external scorers use bounded cache-first artifact batches",
-        "progressive filtered l2 traversal preserves exact top k and stops on leaf bounds",
+        "progressive filtered l2 traversal preserves exact top k without bound stops",
         "flat rabitq filtered traversal advances past its initial probe wave safely",
         "sorted unique vector id subtraction handles sparse and dense exclusions",
     };
