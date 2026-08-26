@@ -6719,14 +6719,15 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
-        if (result.terminal_degraded or result.index_repair_paused) return;
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = self.active_table_activities.items[index];
         if (entry.repair_handoff_status_pending == 0 or !entry.repair_handoff_clear_observed) return;
         // Handoff edges are causally ordered by the visibility callbacks:
         // pending always invalidates an older clear. Only post-clear
-        // publication debt may borrow the repair route; ordinary paused or
-        // terminal handoffs are not runnable scheduler work.
+        // publication debt may borrow the repair route. This includes paused
+        // or terminal durable repair: the next pass performs no repair work,
+        // but remains the only exact owner that can retry a fenced
+        // authoritative status publication.
         result.index_repair_pending = true;
     }
 
@@ -34239,13 +34240,15 @@ test "repair handoff status settles after authoritative cached publication" {
     try std.testing.expect(publication_retry.index_repair_pending);
     var terminal = ProvisionedTableWriteSource.StartupCatchUpResult{ .terminal_degraded = true };
     source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &terminal);
-    try std.testing.expect(!terminal.index_repair_pending);
+    try std.testing.expect(terminal.index_repair_pending);
     var paused = ProvisionedTableWriteSource.StartupCatchUpResult{
         .had_debt = true,
         .index_repair_paused = true,
     };
     source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &paused);
-    try std.testing.expect(!paused.index_repair_pending);
+    // Paused durable work is not runnable, but the exact route must survive
+    // until its already-observed clear has an authoritative publication.
+    try std.testing.expect(paused.index_repair_pending);
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
     try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, &db);
