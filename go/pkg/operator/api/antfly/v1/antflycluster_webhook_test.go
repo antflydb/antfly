@@ -24,6 +24,20 @@ func TestHAStartupGateSerializationPreservesExplicitFalseRuntimeEligibility(t *t
 	}
 }
 
+func TestHAPlannedActionSerializationPreservesZeroRetryGeneration(t *testing.T) {
+	raw, err := json.Marshal(HAPlannedActionStatus{
+		Kind:                  "DemoteFormerPrimary",
+		OperationID:           "haop-v2-test",
+		ExecutionStateVersion: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"retryGeneration":0`) {
+		t.Fatalf("explicit initial retry generation was omitted from durable action status: %s", raw)
+	}
+}
+
 func TestValidateCreate_ValidBalanced(t *testing.T) {
 	cluster := &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{

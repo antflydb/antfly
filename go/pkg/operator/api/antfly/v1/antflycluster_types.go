@@ -2492,9 +2492,11 @@ type HAPlannedActionStatus struct {
 	ExecutionStateVersion int32 `json:"executionStateVersion,omitempty"`
 
 	// RetryGeneration is the explicit recovery nonce captured when this operation
-	// was planned.
+	// was planned. It is always serialized, including generation zero, so API
+	// consumers can distinguish a current bounded-retry action from legacy status
+	// that predates recovery-generation tracking.
 	// +optional
-	RetryGeneration int64 `json:"retryGeneration,omitempty"`
+	RetryGeneration int64 `json:"retryGeneration"`
 
 	// AttemptCount is the durable number of direct requests or Kubernetes Job pod
 	// attempts observed for this exact action identity.
