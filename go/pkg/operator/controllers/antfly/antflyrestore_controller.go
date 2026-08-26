@@ -24,8 +24,9 @@ import (
 // AntflyRestoreReconciler reconciles an AntflyRestore object
 type AntflyRestoreReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
+	Scheme        *runtime.Scheme
+	Recorder      events.EventRecorder
+	ClusterDomain string
 }
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyrestores,verbs=get;list;watch;create;update;patch;delete
@@ -174,8 +175,7 @@ func (r *AntflyRestoreReconciler) buildRestoreJob(restore *antflyv1.AntflyRestor
 	}
 
 	// Build the cluster API URL using the public-api service
-	clusterURL := fmt.Sprintf("http://%s-public-api.%s.svc.cluster.local",
-		cluster.Name, clusterNamespace)
+	clusterURL := "http://" + serviceDNSName(cluster.Name+"-public-api", clusterNamespace, r.ClusterDomain)
 
 	// Build CLI arguments
 	args := []string{
@@ -374,6 +374,9 @@ func (r *AntflyRestoreReconciler) setCondition(restore *antflyv1.AntflyRestore, 
 
 // SetupWithManager sets up the controller with the Manager
 func (r *AntflyRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := normalizeClusterDomainField(&r.ClusterDomain); err != nil {
+		return fmt.Errorf("configure AntflyRestore controller: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&antflyv1.AntflyRestore{}).
 		Owns(&batchv1.Job{}).
