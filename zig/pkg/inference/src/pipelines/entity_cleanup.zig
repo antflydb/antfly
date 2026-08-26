@@ -123,9 +123,13 @@ pub fn cleanupMentions(
 
     for (mentions, 0..) |mention, idx| {
         if (mention.validity_score < cfg.min_validity_score) {
+            const text = try allocator.dupe(u8, mention.entity.text);
+            errdefer allocator.free(text);
+            const label = try allocator.dupe(u8, mention.entity.label);
+            errdefer allocator.free(label);
             try dropped.append(allocator, .{
-                .text = try allocator.dupe(u8, mention.entity.text),
-                .label = try allocator.dupe(u8, mention.entity.label),
+                .text = text,
+                .label = label,
                 .start = mention.entity.start,
                 .end = mention.entity.end,
                 .detect_score = mention.entity.score,
@@ -225,14 +229,23 @@ fn buildResolvedEntity(
 
     if (cfg.track_provenance) {
         for (indices) |idx| {
-            try mention_values.append(allocator, try allocator.dupe(u8, mentions[idx].entity.text));
+            const mention_text = try allocator.dupe(u8, mentions[idx].entity.text);
+            errdefer allocator.free(mention_text);
+            try mention_values.append(allocator, mention_text);
         }
     }
 
+    const id = try std.fmt.allocPrint(allocator, "cleanup-entity-{d}", .{cluster_idx});
+    errdefer allocator.free(id);
+    const text = try allocator.dupe(u8, mentions[best_idx].entity.text);
+    errdefer allocator.free(text);
+    const label = try allocator.dupe(u8, mentions[best_idx].entity.label);
+    errdefer allocator.free(label);
+
     return .{
-        .id = try std.fmt.allocPrint(allocator, "cleanup-entity-{d}", .{cluster_idx}),
-        .text = try allocator.dupe(u8, mentions[best_idx].entity.text),
-        .label = try allocator.dupe(u8, mentions[best_idx].entity.label),
+        .id = id,
+        .text = text,
+        .label = label,
         .start = mentions[best_idx].entity.start,
         .end = mentions[best_idx].entity.end,
         .detect_score = mentions[best_idx].entity.score,

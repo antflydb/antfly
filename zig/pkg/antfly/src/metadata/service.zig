@@ -51,6 +51,7 @@ const api_table_catalog = @import("../api/table_catalog.zig");
 const api_operation = @import("../api/operation.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
+const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
 const db_mod = if (control_only_storage_sources)
     @import("../storage/db/control_root.zig")
 else
@@ -494,6 +495,9 @@ pub const MetadataServiceConfig = struct {
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
 
@@ -1771,6 +1775,9 @@ pub const MetadataService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     json_response_calls: std.atomic.Value(u64) = .init(0),
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
     json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
@@ -1825,6 +1832,9 @@ pub const MetadataService = struct {
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
+            .internal_service_secret = cfg.internal_service_secret,
+            .internal_service_issuer = cfg.internal_service_issuer,
+            .destination_authorizer = cfg.destination_authorizer,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHostService.init(alloc, host_cfg, host_deps, cfg.raft, deps.raft),
         };
@@ -3247,6 +3257,7 @@ pub const MetadataService = struct {
                 ranges,
                 .{
                     .backend_runtime = try self.ensureBackendRuntime(),
+                    .destination_authorizer = self.destination_authorizer,
                 },
             );
         try self.refreshLocalRestoreProgress(group_ids, tables, ranges);
@@ -3489,6 +3500,7 @@ pub const MetadataService = struct {
         );
         write_source.backend_runtime = runtime;
         _ = write_source.withSecretStore(self.secret_store);
+        _ = write_source.withDestinationAuthorization(self.destination_authorizer);
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
             .alloc = self.alloc,
             .runner = .{
@@ -3498,6 +3510,7 @@ pub const MetadataService = struct {
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
                 .work_permit = cdcWorkPermit(self),
+                .destination_authorizer = self.destination_authorizer,
             },
         };
         const summary = coordinator.runRound(self) catch |err| {
@@ -3526,6 +3539,7 @@ pub const MetadataService = struct {
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
                 .work_permit = cdcWorkPermit(self),
+                .destination_authorizer = self.destination_authorizer,
             },
         };
         const stream_summary = streaming.runRound(self) catch |err| {
@@ -3629,6 +3643,9 @@ pub const MetadataHttpService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
@@ -3688,6 +3705,9 @@ pub const MetadataHttpService = struct {
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
             .secret_store = cfg.secret_store,
+            .internal_service_secret = cfg.internal_service_secret,
+            .internal_service_issuer = cfg.internal_service_issuer,
+            .destination_authorizer = cfg.destination_authorizer,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
         };
@@ -6089,6 +6109,7 @@ pub const MetadataHttpService = struct {
                 inputs.ranges,
                 .{
                     .backend_runtime = try self.ensureBackendRuntime(),
+                    .destination_authorizer = self.destination_authorizer,
                 },
             );
         try self.refreshLocalRestoreProgress(group_ids, inputs.tables, inputs.ranges, inputs.restore_progresses);
@@ -6348,6 +6369,11 @@ pub const MetadataHttpService = struct {
         );
         _ = hosted_write_source.withBackendRuntime(runtime);
         _ = hosted_write_source.withSecretStore(self.secret_store);
+        _ = hosted_write_source.withInternalServiceAuth(
+            self.internal_service_secret,
+            self.internal_service_issuer,
+        );
+        _ = hosted_write_source.withDestinationAuthorization(self.destination_authorizer);
         const write_source = self.cdc_write_source_override orelse hosted_write_source.source();
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{
             .alloc = self.alloc,
@@ -6358,6 +6384,7 @@ pub const MetadataHttpService = struct {
                 .write_source = write_source,
                 .secret_store = self.secret_store,
                 .work_permit = cdcWorkPermit(self),
+                .destination_authorizer = self.destination_authorizer,
             },
         };
         const summary = coordinator.runRound(self) catch |err| {
@@ -6389,6 +6416,7 @@ pub const MetadataHttpService = struct {
                 .write_source = write_source,
                 .secret_store = self.secret_store,
                 .work_permit = cdcWorkPermit(self),
+                .destination_authorizer = self.destination_authorizer,
             },
         };
         const stream_summary = streaming.runRound(self) catch |err| {

@@ -22,6 +22,7 @@ const control_only_storage_sources = storage_source_options.control_only;
 const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
 const json_helpers = @import("../api/json_helpers.zig");
+const internal_service_auth = @import("../api/internal_service_auth.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const process_memory_budget = @import("../common/process_memory_budget.zig");
 const runtime_status = @import("../api/runtime_status.zig");
@@ -416,6 +417,10 @@ const DataRaftBatchForwardState = struct {
 };
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
+const internal_service_secret_key = "antfly.internal_service.secret";
+const internal_service_verification_secret_key = "antfly.internal_service.verification_secret";
+const internal_service_issuer_key = "antfly.internal_service.issuer";
+const internal_service_rollout_mode_key = "antfly.internal_service.rollout_mode";
 
 fn dataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     var cfg: raft_engine.runtime.RuntimeConfig = .{};
@@ -5190,6 +5195,10 @@ pub const DataServer = struct {
         _ = self.read_source.withIo(&self.query_io_impl.?);
         _ = self.read_source.withSecretStore(api_server_cfg.secret_store);
         _ = self.write_source.withSecretStore(api_server_cfg.secret_store);
+        _ = self.write_source.withDestinationAuthorization(.{
+            .manager = api_server_cfg.user_manager,
+            .auth_enabled = api_server_cfg.auth_enabled,
+        });
         const restore_io = if (self.backend_runtime) |runtime|
             if (runtime.apiIoImpl()) |io_impl| io_impl.io() else null
         else
@@ -5219,6 +5228,10 @@ pub const DataServer = struct {
                 apply_sm.attachKernelOwnerSource(self.kernel_owner_source.?);
             }
             _ = apply_sm.write_source.withSecretStore(api_server_cfg.secret_store);
+            _ = apply_sm.write_source.withDestinationAuthorization(.{
+                .manager = api_server_cfg.user_manager,
+                .auth_enabled = api_server_cfg.auth_enabled,
+            });
             _ = apply_sm.write_source.withRestoreAccess(api_server_cfg.node_config, restore_io);
             _ = apply_sm.write_source.withRemoteContent(api_server_cfg.remote_content);
             _ = try apply_sm.write_source.withHAWriteGate(ha_write_gate);
@@ -7623,6 +7636,10 @@ pub const DataServer = struct {
 
         const raft = self.data_raft orelse return 0;
         var client = antfly.public_api.ApiHttpClient.init(alloc, raft.host.http_host.request_executor);
+        _ = client.withInternalServiceAuth(
+            self.api_server_cfg.internal_service_secret,
+            self.api_server_cfg.internal_service_issuer,
+        );
         const version = client.fetchDataRaftBatchProtocolVersion(
             raft_url,
             @min(dataRaftBatchHttpTimeoutMs(deadline_ns), data_raft_protocol_capability_probe_timeout_ms),
@@ -8128,6 +8145,10 @@ pub const DataServer = struct {
                                 var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
                                 defer executor.deinit();
                                 var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+                                _ = client.withInternalServiceAuth(
+                                    self.api_server_cfg.internal_service_secret,
+                                    self.api_server_cfg.internal_service_issuer,
+                                );
                                 const body = try antfly.public_api.batch.encodeBatchRequest(alloc, proposal_req);
                                 defer alloc.free(body);
                                 const forwarding = nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse {
@@ -8319,6 +8340,10 @@ pub const DataServer = struct {
         var executor = antfly.raft.transport.StdHttpExecutor.init(alloc, .{});
         defer executor.deinit();
         var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+        _ = client.withInternalServiceAuth(
+            self.api_server_cfg.internal_service_secret,
+            self.api_server_cfg.internal_service_issuer,
+        );
         const body = try antfly.public_api.batch.encodeBatchRequest(alloc, req);
         defer alloc.free(body);
         const forwarding = nextDataRaftBatchForwarding(deadline_ns, route, request_campaign_consumed) orelse return false;
@@ -15103,6 +15128,10 @@ pub const DataServer = struct {
         const remote_metadata = try alloc.create(RemoteMetadataSource);
         errdefer alloc.destroy(remote_metadata);
         remote_metadata.* = try RemoteMetadataSource.init(alloc, metadata_api_urls, api_io_impl);
+        _ = remote_metadata.withInternalServiceAuth(
+            cfg.api_server_cfg.internal_service_secret,
+            cfg.api_server_cfg.internal_service_issuer,
+        );
         errdefer remote_metadata.deinit();
 
         var data_raft_store: ?*raft_engine.core.MemoryStorage = null;
@@ -15494,6 +15523,8 @@ const RemoteMetadataSource = struct {
     linearizable_snapshot_unsupported_until_ns: []u64,
     http_executors: []antfly.raft.transport.std_http_executor.StdHttpExecutor,
     next_http_executor: std.atomic.Value(usize) = .init(0),
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
     test_faults: TestFaults = .{},
 
     fn init(
@@ -15546,6 +15577,25 @@ const RemoteMetadataSource = struct {
         self.alloc.free(self.base_uris);
         self.cache_mutex.unlock();
         self.* = undefined;
+    }
+
+    fn withInternalServiceAuth(
+        self: *RemoteMetadataSource,
+        secret: ?[]const u8,
+        issuer: ?[]const u8,
+    ) *RemoteMetadataSource {
+        self.internal_service_secret = secret;
+        self.internal_service_issuer = issuer;
+        return self;
+    }
+
+    fn metadataClient(
+        self: *RemoteMetadataSource,
+        alloc: std.mem.Allocator,
+    ) antfly.metadata_http_client.MetadataHttpClient {
+        var client = antfly.metadata_http_client.MetadataHttpClient.init(alloc, self.httpExecutor());
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client;
     }
 
     fn httpExecutor(self: *RemoteMetadataSource) antfly.common.http.RequestExecutor {
@@ -15921,7 +15971,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -15980,10 +16030,7 @@ const RemoteMetadataSource = struct {
                 const ticket = self.beginLinearizableSnapshot();
                 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
-                var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(
-                    arena.allocator(),
-                    self.httpExecutor(),
-                );
+                var metadata_client = self.metadataClient(arena.allocator());
                 var parsed = metadata_client.fetchLinearizableSnapshot(self.base_uris[index], budget) catch |err| {
                     if (err == error.UnsupportedOperation) {
                         self.noteLinearizableSnapshotUnsupported(index, platform_time.monotonicNs());
@@ -16049,7 +16096,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             const head = metadata_client.fetchHeadWithBudget(self.base_uris[index], budget) catch |err| {
                 if (err == error.Cancelled or err == error.Timeout) return err;
                 last_err = err;
@@ -16073,7 +16120,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             const status = metadata_client.fetchStatus(self.base_uris[index]) catch |err| {
                 last_err = err;
                 continue;
@@ -16106,7 +16153,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             var parsed = metadata_client.fetchSnapshotWithBudget(self.base_uris[index], budget) catch |err| {
                 if (err == error.Cancelled or err == error.Timeout) return err;
                 last_err = err;
@@ -16160,7 +16207,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             const valid = metadata_client.validateCatalogPublication(self.base_uris[index], contract) catch |err| {
                 last_err = err;
                 continue;
@@ -16181,7 +16228,7 @@ const RemoteMetadataSource = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
-            var metadata_client = antfly.metadata_http_client.MetadataHttpClient.init(scratch, self.httpExecutor());
+            var metadata_client = self.metadataClient(scratch);
             const valid = metadata_client.validateCatalogTablePublication(self.base_uris[index], contract) catch |err| {
                 last_err = err;
                 continue;
@@ -18456,6 +18503,70 @@ pub fn runFromIterator(
         if (secret_store_initialized) &secret_store else null,
     );
     defer if (trusted_principal_secret) |value| alloc.free(value);
+    const internal_service_secret = try resolveTrustedPrincipalConfigValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_secret_key,
+    );
+    defer if (internal_service_secret) |value| alloc.free(value);
+    const internal_service_verification_secret = try resolveTrustedPrincipalConfigValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_verification_secret_key,
+    );
+    defer if (internal_service_verification_secret) |value| alloc.free(value);
+    const internal_service_issuer = try resolveTrustedPrincipalConfigValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_issuer_key,
+    );
+    defer if (internal_service_issuer) |value| alloc.free(value);
+    const internal_service_rollout_mode_raw = try resolveTrustedPrincipalConfigValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_rollout_mode_key,
+    );
+    defer if (internal_service_rollout_mode_raw) |value| alloc.free(value);
+    const internal_service_rollout_mode = internal_service_auth.parseRolloutMode(
+        internal_service_rollout_mode_raw,
+    ) catch |err| {
+        std.log.err("invalid {s}; expected enforce or migration", .{internal_service_rollout_mode_key});
+        return err;
+    };
+    internal_service_auth.validateRuntimeConfig(
+        internal_service_secret,
+        internal_service_verification_secret,
+        internal_service_issuer,
+    ) catch |err| {
+        std.log.err(
+            "data startup requires a dedicated internal service credential: configure {s} with at least {d} bytes and a printable {s}; err={s}",
+            .{ internal_service_secret_key, internal_service_auth.minimum_secret_bytes, internal_service_issuer_key, @errorName(err) },
+        );
+        return err;
+    };
+    internal_service_auth.validateCredentialIsolation(
+        internal_service_secret,
+        trusted_principal_secret,
+    ) catch |err| {
+        std.log.err(
+            "data startup rejected reused signing material: {s} must differ from {s}",
+            .{ internal_service_secret_key, trusted_principal_secret_key },
+        );
+        return err;
+    };
+    internal_service_auth.validateCredentialIsolation(
+        internal_service_verification_secret,
+        trusted_principal_secret,
+    ) catch |err| {
+        std.log.err("data startup rejected reused verification signing material; err={s}", .{@errorName(err)});
+        return err;
+    };
+    if (internal_service_rollout_mode == .migration) {
+        std.log.warn(
+            "SECURITY: internal RPC legacy migration mode is active; unsigned old-peer requests are temporarily accepted. Upgrade every peer, verify X-Antfly-Internal-Auth=legacy-migration disappears, then set {s}=enforce",
+            .{internal_service_rollout_mode_key},
+        );
+    }
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
@@ -18561,6 +18672,14 @@ pub fn runFromIterator(
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
+            .internal_service_secret = internal_service_secret,
+            .internal_service_verification_secret = internal_service_verification_secret,
+            .internal_service_issuer = internal_service_issuer,
+            .internal_service_auth_capability = internal_service_auth.capability(
+                internal_service_rollout_mode,
+                internal_service_verification_secret != null,
+            ),
+            .internal_service_accept_legacy_unauthenticated = internal_service_rollout_mode == .migration,
             .ard_base_url = cli.ard_base_url,
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",

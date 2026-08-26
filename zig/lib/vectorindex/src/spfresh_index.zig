@@ -23,10 +23,12 @@ const vec = @import("antfly_vector").vector;
 
 pub const FlatCentroidBlock = struct {
     posting_ids: []u64,
+    covering_radii: []f32,
     quantized: proto.RaBitQuantizedVectorSet,
 
     fn deinit(self: *FlatCentroidBlock, alloc: std.mem.Allocator) void {
         alloc.free(self.posting_ids);
+        alloc.free(self.covering_radii);
         self.quantized.deinit(alloc);
         self.* = undefined;
     }
@@ -61,6 +63,8 @@ pub const FlatCentroidProbe = struct {
     posting_id: u64,
     distance: f32,
     error_bound: f32,
+    member_lower_bound: f32 = -std.math.inf(f32),
+    bound_resolved: bool = false,
 };
 
 fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
@@ -100,7 +104,7 @@ fn savePackedNodeValue(self: anytype, txn: anytype, node: *const types.Node) !vo
     const packed_len = hbc.packedNodeValueSize(centroid_bytes.len, ids_bytes.len);
     const packed_value = try self.alloc.alloc(u8, packed_len);
     defer self.alloc.free(packed_value);
-    const encoded = try hbc.encodePackedNodeValue(packed_value, header, centroid_bytes, ids_bytes);
+    const encoded = try hbc.encodePackedNodeValue(packed_value, header, node.covering_radius, centroid_bytes, ids_bytes);
     var key_buf: [12]u8 = undefined;
     try self.putNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node.id, .packed_node), encoded);
 }
@@ -112,21 +116,39 @@ fn insertFlatProbe(probes: []FlatCentroidProbe, count: *usize, candidate: FlatCe
         count.* += 1;
     } else {
         var worst_index: usize = 0;
-        var worst_score = probes[0].distance - probes[0].error_bound;
+        var worst_score = flatProbeScore(probes[0]);
         for (probes[1..], 1..) |probe, i| {
-            const score = probe.distance - probe.error_bound;
+            const score = flatProbeScore(probe);
             if (score > worst_score) {
                 worst_score = score;
                 worst_index = i;
             }
         }
-        if (candidate.distance - candidate.error_bound >= worst_score) return;
+        if (flatProbeScore(candidate) >= worst_score) return;
         probes[worst_index] = candidate;
     }
 }
 
+fn flatProbeScore(probe: FlatCentroidProbe) f32 {
+    // Unknown radii must be visited before bounded postings: omitting them
+    // from a bounded directory selection would make the stopping proof false.
+    if (!probe.bound_resolved) return -std.math.inf(f32);
+    return probe.member_lower_bound;
+}
+
 fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
-    return lhs.distance - lhs.error_bound < rhs.distance - rhs.error_bound;
+    const lhs_score = flatProbeScore(lhs);
+    const rhs_score = flatProbeScore(rhs);
+    if (lhs_score != rhs_score) return lhs_score < rhs_score;
+    return lhs.posting_id < rhs.posting_id;
+}
+
+fn flatL2MemberLowerBound(distance: f32, error_bound: f32, covering_radius: f32) ?f32 {
+    if (!std.math.isFinite(covering_radius) or covering_radius < 0) return null;
+    const centroid_squared_lower = @max(@as(f32, 0), distance - error_bound);
+    if (!std.math.isFinite(centroid_squared_lower)) return null;
+    const member_distance_lower = @max(@as(f32, 0), @sqrt(centroid_squared_lower) - covering_radius);
+    return member_distance_lower * member_distance_lower;
 }
 
 fn publishedRootNodeSnapshot(self: anytype) u64 {
@@ -201,6 +223,7 @@ fn appendFlatCentroidBlock(
     self: anytype,
     blocks: *std.ArrayListUnmanaged(FlatCentroidBlock),
     posting_ids: []const u64,
+    covering_radii: []const f32,
     centroids: []const f32,
     dims: usize,
 ) !void {
@@ -211,10 +234,13 @@ fn appendFlatCentroidBlock(
 
     const ids = try self.alloc.dupe(u64, posting_ids);
     errdefer self.alloc.free(ids);
+    const radii = try self.alloc.dupe(f32, covering_radii);
+    errdefer self.alloc.free(radii);
     var quantized = try self.quantizer.quantize(zero, centroids, posting_ids.len);
     errdefer quantized.deinit(self.alloc);
     try blocks.append(self.alloc, .{
         .posting_ids = ids,
+        .covering_radii = radii,
         .quantized = quantized,
     });
 }
@@ -232,6 +258,8 @@ fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_
     defer self.alloc.free(posting_ids);
     var centroids = try self.alloc.alloc(f32, block_size * dims);
     defer self.alloc.free(centroids);
+    var covering_radii = try self.alloc.alloc(f32, block_size);
+    defer self.alloc.free(covering_radii);
     var pending = std.ArrayListUnmanaged(u64).empty;
     defer pending.deinit(self.alloc);
     try pending.append(self.alloc, root_node);
@@ -254,17 +282,18 @@ fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_
         if (node.members.len == 0 or node.centroid.len != dims) continue;
 
         posting_ids[block_count] = node.id;
+        covering_radii[block_count] = node.covering_radius;
         @memcpy(centroids[block_count * dims ..][0..dims], node.centroid);
         block_count += 1;
         posting_count += 1;
 
         if (block_count == block_size) {
-            try appendFlatCentroidBlock(self, &blocks, posting_ids[0..block_count], centroids[0 .. block_count * dims], dims);
+            try appendFlatCentroidBlock(self, &blocks, posting_ids[0..block_count], covering_radii[0..block_count], centroids[0 .. block_count * dims], dims);
             block_count = 0;
         }
     }
     if (block_count > 0) {
-        try appendFlatCentroidBlock(self, &blocks, posting_ids[0..block_count], centroids[0 .. block_count * dims], dims);
+        try appendFlatCentroidBlock(self, &blocks, posting_ids[0..block_count], covering_radii[0..block_count], centroids[0 .. block_count * dims], dims);
     }
 
     return .{
@@ -347,23 +376,31 @@ fn acquireFlatCentroidDirectory(self: anytype, txn: anytype) !*FlatCentroidDirec
     }
 }
 
-pub fn selectFlatRabitqPostings(
+/// Scores and returns the complete ordered flat frontier from one retained
+/// directory publication. Allocation capacity is derived from that same
+/// directory, so a concurrent publication cannot make the caller silently
+/// truncate newer postings with an older capacity snapshot.
+pub fn selectFlatRabitqPostingsAlloc(
     self: anytype,
     txn: anytype,
     query: []const f32,
-    limit: usize,
-    probes: []FlatCentroidProbe,
     scratch: anytype,
     profile: *search_types.SearchProfile,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
-) !usize {
-    if (limit == 0 or probes.len == 0) return 0;
-    const probe_limit = @min(limit, probes.len);
+) ![]FlatCentroidProbe {
     const start = now_fn_u64();
     const directory = try acquireFlatCentroidDirectory(self, txn);
     defer directory.release(self.alloc);
     defer profile.child_expand_ns += elapsed_fn_u64(start);
+
+    var posting_count: usize = 0;
+    for (directory.blocks) |*block| {
+        posting_count = std.math.add(usize, posting_count, block.posting_ids.len) catch return error.OutOfMemory;
+    }
+    std.debug.assert(posting_count == directory.posting_count);
+    const probes = try self.alloc.alloc(FlatCentroidProbe, posting_count);
+    errdefer self.alloc.free(probes);
     var probe_count: usize = 0;
 
     for (directory.blocks) |*block| {
@@ -373,17 +410,24 @@ pub fn selectFlatRabitqPostings(
         const error_bounds = scratch.error_bounds[0..count];
         try self.quantizer.estimateDistancesWithScratch(&block.quantized, query, distances, error_bounds, &scratch.estimate);
         for (block.posting_ids, 0..) |posting_id, i| {
-            insertFlatProbe(probes[0..probe_limit], &probe_count, .{
+            const member_lower_bound = if (self.config.metric == .l2_squared)
+                flatL2MemberLowerBound(distances[i], error_bounds[i], block.covering_radii[i])
+            else
+                null;
+            insertFlatProbe(probes, &probe_count, .{
                 .posting_id = posting_id,
                 .distance = distances[i],
                 .error_bound = error_bounds[i],
+                .member_lower_bound = member_lower_bound orelse -std.math.inf(f32),
+                .bound_resolved = member_lower_bound != null,
             });
         }
     }
 
+    std.debug.assert(probe_count == posting_count);
     std.mem.sort(FlatCentroidProbe, probes[0..probe_count], {}, flatProbeLess);
     profile.approx_nodes_expanded += @intCast(directory.blocks.len);
-    return probe_count;
+    return probes;
 }
 
 fn recomputeAncestorCentroids(
@@ -454,6 +498,50 @@ pub fn runAutoPostingMaintenanceTxn(self: anytype, txn: anytype) !void {
     _ = try repairDirtyPostingsTxnWithOptions(self, txn, .{ .max_postings = max_postings });
 }
 
+fn replaceOwnedU64Slice(alloc: std.mem.Allocator, target: *[]u64, replacement: *?[]u64) void {
+    const owned = replacement.* orelse unreachable;
+    if (target.*.len > 0) alloc.free(target.*);
+    target.* = owned;
+    replacement.* = null;
+}
+
+fn removeUniqueChildLinkAlloc(
+    alloc: std.mem.Allocator,
+    children: []const u64,
+    child_id: u64,
+) !?[]u64 {
+    var match_count: usize = 0;
+    for (children) |cid| {
+        if (cid == child_id) match_count += 1;
+    }
+    // A merge is safe only when the recorded parent owns exactly one link to
+    // the leaf. Zero links are a stale parent pointer; duplicate links are
+    // tree corruption. In either case, leave both postings untouched for the
+    // tree-link repair sweep instead of sizing a len-1 array incorrectly.
+    if (match_count != 1) return null;
+
+    const replacement = try alloc.alloc(u64, children.len - 1);
+    errdefer alloc.free(replacement);
+    var wi: usize = 0;
+    for (children) |cid| {
+        if (cid == child_id) continue;
+        replacement[wi] = cid;
+        wi += 1;
+    }
+    std.debug.assert(wi == replacement.len);
+    return replacement;
+}
+
+fn noteTreeLinkInconsistencyIfSupported(self: anytype) void {
+    const Index = comptime switch (@typeInfo(@TypeOf(self))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(self),
+    };
+    if (comptime @hasDecl(Index, "noteTreeLinkInconsistency")) {
+        self.noteTreeLinkInconsistency();
+    }
+}
+
 fn mergeUnderfullPostingWithNearestSibling(
     self: anytype,
     txn: anytype,
@@ -465,6 +553,17 @@ fn mergeUnderfullPostingWithNearestSibling(
     var parent = try self.loadNode(txn, leaf.parent);
     defer parent.deinit(self.alloc);
     try parent.ensureUnbacked(self.alloc);
+
+    var new_children: ?[]u64 = try removeUniqueChildLinkAlloc(self.alloc, parent.children, leaf.id);
+    defer if (new_children) |owned| self.alloc.free(owned);
+    if (new_children == null) {
+        std.log.warn(
+            "hbc: underfull leaf {d} is not uniquely linked by recorded parent {d}; skipping merge",
+            .{ leaf.id, leaf.parent },
+        );
+        noteTreeLinkInconsistencyIfSupported(self);
+        return false;
+    }
 
     var best_sibling_id: u64 = 0;
     var best_dist: f32 = std.math.inf(f32);
@@ -487,12 +586,11 @@ fn mergeUnderfullPostingWithNearestSibling(
     try sibling.ensureUnbacked(self.alloc);
 
     const merged_len = sibling.members.len + leaf.members.len;
-    var merged = try self.alloc.alloc(u64, merged_len);
-    errdefer self.alloc.free(merged);
-    @memcpy(merged[0..sibling.members.len], sibling.members);
-    @memcpy(merged[sibling.members.len..], leaf.members);
-    self.alloc.free(sibling.members);
-    sibling.members = merged;
+    var merged: ?[]u64 = try self.alloc.alloc(u64, merged_len);
+    errdefer if (merged) |owned| self.alloc.free(owned);
+    @memcpy(merged.?[0..sibling.members.len], sibling.members);
+    @memcpy(merged.?[sibling.members.len..], leaf.members);
+    replaceOwnedU64Slice(self.alloc, &sibling.members, &merged);
     posting.PostingStore.noteMembersChanged(&sibling);
     try posting.PostingStore.recomputeCentroid(self, txn, &sibling);
     if (self.config.use_quantization) {
@@ -505,16 +603,7 @@ fn mergeUnderfullPostingWithNearestSibling(
 
     for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
-    var new_children = try self.alloc.alloc(u64, parent.children.len - 1);
-    errdefer self.alloc.free(new_children);
-    var wi_child: usize = 0;
-    for (parent.children) |cid| {
-        if (cid == leaf.id) continue;
-        new_children[wi_child] = cid;
-        wi_child += 1;
-    }
-    self.alloc.free(parent.children);
-    parent.children = new_children;
+    replaceOwnedU64Slice(self.alloc, &parent.children, &new_children);
     try self.recomputeInternalCentroid(txn, &parent);
     try self.saveNodeWithOptionsMode(txn, &parent, save_options, false);
     try self.deleteNode(txn, leaf.id);
@@ -787,6 +876,42 @@ pub fn repairDirtyPostingsTxnWithOptions(
     self.write_profile.posting_maintenance_boundary_reassigned_vectors += result.boundary_reassigned_vectors;
 
     return result;
+}
+
+test "owned slice replacement survives later error cleanup" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var node = types.Node{
+                .id = 1,
+                .is_leaf = true,
+                .level = 0,
+                .parent = 0,
+                .centroid = &.{},
+                .children = &.{},
+                .members = try alloc.dupe(u64, &.{ 1, 2 }),
+            };
+            defer node.deinit(alloc);
+
+            var replacement: ?[]u64 = try alloc.dupe(u64, &.{ 3, 4, 5 });
+            errdefer if (replacement) |owned| alloc.free(owned);
+            replaceOwnedU64Slice(alloc, &node.members, &replacement);
+            return error.InjectedFailure;
+        }
+    };
+
+    try std.testing.expectError(error.InjectedFailure, Runner.run(std.testing.allocator));
+}
+
+test "underfull merge child unlink requires exactly one parent link" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect((try removeUniqueChildLinkAlloc(alloc, &.{ 2, 3, 4 }, 9)) == null);
+    try std.testing.expect((try removeUniqueChildLinkAlloc(alloc, &.{ 2, 3, 2 }, 2)) == null);
+
+    const replacement = (try removeUniqueChildLinkAlloc(alloc, &.{ 2, 3, 4 }, 3)) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(replacement);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 4 }, replacement);
 }
 
 test "posting backlog stats starts clean" {

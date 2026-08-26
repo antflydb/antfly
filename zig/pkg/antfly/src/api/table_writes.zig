@@ -68,6 +68,7 @@ const coverage_policy_mod = @import("coverage_policy.zig");
 const query_api = @import("query.zig");
 const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
+const stored_destination_authorization = @import("stored_destination_authorization.zig");
 
 const storage_kernel_experiment = control_only_storage_sources;
 
@@ -4820,6 +4821,7 @@ pub const ProvisionedTableWriteSource = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     restore_open_options: backups_api.OpenOptions = .{},
     remote_content: ?*const scraping.RemoteContentConfig = null,
     resolution_candidate_source: ?db_mod.CandidateSource = null,
@@ -5194,6 +5196,14 @@ pub const ProvisionedTableWriteSource = struct {
         self.restore_open_options.secret_store = secret_store;
         if (self.write_cache) |cache| cache.secret_store = secret_store;
         if (self.startup_write_cache) |cache| cache.secret_store = secret_store;
+        return self;
+    }
+
+    pub fn withDestinationAuthorization(
+        self: *ProvisionedTableWriteSource,
+        authorizer: ?stored_destination_authorization.Authorizer,
+    ) *ProvisionedTableWriteSource {
+        self.destination_authorizer = authorizer;
         return self;
     }
 
@@ -6306,6 +6316,18 @@ pub const ProvisionedTableWriteSource = struct {
         self.pruneTableActivityLocked(table_name, group_id);
         self.table_activity_ready.broadcast(io);
         return true;
+    }
+
+    fn repairHandoffStatusPendingBestEffort(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+    ) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
+        return self.active_table_activities.items[index].repair_handoff_status_pending != 0;
     }
 
     fn markRepairHandoffClearBestEffort(
@@ -7950,6 +7972,8 @@ pub const ProvisionedTableWriteSource = struct {
             const effective_ha_mirror = haMirrorForManagedDbOpenMode(mode, self.ha_async_mirror);
             var effective_open_options = managed_open_options;
             effective_open_options.drain_resolver_backfill = false;
+            effective_open_options.source_table = table_name;
+            effective_open_options.destination_authorizer = self.destination_authorizer;
             effective_open_options.inference_api_url = self.inference_api_url;
             effective_open_options.ha_write_gate = self.ha_write_gate;
             effective_open_options.ha_async_effect_mirror = effective_ha_mirror;
@@ -8645,6 +8669,7 @@ pub const ProvisionedTableWriteSource = struct {
             .{
                 .backend_runtime = backend_runtime,
                 .restore_open_options = self.restore_open_options,
+                .destination_authorizer = self.destination_authorizer,
             },
         );
 
@@ -9547,6 +9572,12 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         self.retireReadersAfterIndexRepairCompletion(table_name, result);
+        if (result.index_repair_repaired and !result.index_repair_pending and !result.terminal_degraded) {
+            // The bounded repair's post-check is the durable proof that no
+            // runnable or unavailable generation remains. Record that edge
+            // even if a visibility callback was delayed behind publication.
+            self.markRepairHandoffClearBestEffort(table_name, group_id);
+        }
         if (result.terminal_degraded) {
             // catchUpManagedDb publishes the terminal observation with startup
             // provenance. Do not relabel it as a fresh live-writer snapshot.
@@ -9569,6 +9600,13 @@ pub const ProvisionedTableWriteSource = struct {
         } else {
             try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db));
             startup_status_active = false;
+        }
+        if (self.repairHandoffStatusPendingBestEffort(table_name, group_id)) {
+            // A fenced status observation cannot be the last owner of a
+            // structural repair handoff. Retain the exact scheduler route
+            // until a later pass publishes after the clear edge and settles
+            // snapshot-only authority, even when durable repair is complete.
+            result.index_repair_pending = true;
         }
         self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &result);
         preserve_startup_cache = shouldPreserveStartupWriteCache(result);
@@ -11873,7 +11911,11 @@ pub const ProvisionedTableWriteSource = struct {
                 alloc,
                 cached.db,
                 indexes_json,
-                .{ .drain_resolver_backfill = false },
+                .{
+                    .drain_resolver_backfill = false,
+                    .source_table = table_name,
+                    .destination_authorizer = self.destination_authorizer,
+                },
             );
             try self.repairRestoredDbRuntimeStateBlocking(alloc, cached.db, group_id, 0);
 
@@ -12615,6 +12657,8 @@ pub const ProvisionedTableWriteSource = struct {
                 else
                     try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                         .drain_resolver_backfill = false,
+                        .source_table = table_name,
+                        .destination_authorizer = self.destination_authorizer,
                     });
                 if (reconcile_summary.indexes_pending != 0) {
                     _ = try cached.db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
@@ -12805,6 +12849,8 @@ pub const ProvisionedTableWriteSource = struct {
             else
                 try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
                     .drain_resolver_backfill = false,
+                    .source_table = table_name,
+                    .destination_authorizer = self.destination_authorizer,
                 });
             if (reconcile_summary.indexes_pending != 0) {
                 _ = try db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
@@ -13649,6 +13695,8 @@ pub const ProvisionedTableWriteSource = struct {
                     );
                     _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                         .drain_resolver_backfill = false,
+                        .source_table = table_name,
+                        .destination_authorizer = self.destination_authorizer,
                     });
                     cached_groups.appendAssumeCapacity(cached);
                 }
@@ -13749,6 +13797,8 @@ pub const ProvisionedTableWriteSource = struct {
             // names that already exist on reopen).
             _ = try metadata_table_provisioner.ensureResolversWithOptions(alloc, &opened.?, indexes_json, .{
                 .drain_backfill = false,
+                .source_table = table_name,
+                .destination_authorizer = self.destination_authorizer,
             });
             if (seed_create_table_writer) {
                 try self.write_cache.?.seedCreatedDbLocked(&opened, group_id, lsm_root_generation, table_name, indexes_json, schema_json);
@@ -17485,6 +17535,9 @@ pub const HostedProvisionedTableWriteSource = struct {
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     foreground_derived_progress: bool = false,
     /// Optional local physical-operation provider. Hosted routing and remote
     /// forwarding remain here while the compiled storage unit owns local DBs.
@@ -17531,6 +17584,30 @@ pub const HostedProvisionedTableWriteSource = struct {
         if (hostedManagedDbCacheForRootIfPresent(self.replica_root_dir)) |cache| {
             cache.write_cache.inference_api_url = inference_api_url;
         }
+        return self;
+    }
+
+    pub fn withInternalServiceAuth(
+        self: *HostedProvisionedTableWriteSource,
+        secret: ?[]const u8,
+        issuer: ?[]const u8,
+    ) *HostedProvisionedTableWriteSource {
+        self.internal_service_secret = secret;
+        self.internal_service_issuer = issuer;
+        return self;
+    }
+
+    fn httpClient(self: *HostedProvisionedTableWriteSource, alloc: std.mem.Allocator) http_client.ApiHttpClient {
+        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client;
+    }
+
+    pub fn withDestinationAuthorization(
+        self: *HostedProvisionedTableWriteSource,
+        authorizer: ?stored_destination_authorization.Authorizer,
+    ) *HostedProvisionedTableWriteSource {
+        self.destination_authorizer = authorizer;
         return self;
     }
 
@@ -17639,6 +17716,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const alloc = std.heap.page_allocator;
         var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        _ = worker.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         try distributed_txn.resolveParticipant(alloc, worker.worker(), participant, txn_id, status, commit_version);
     }
 
@@ -17797,6 +17875,8 @@ pub const HostedProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .drain_resolver_backfill = false,
+                    .source_table = table_name,
+                    .destination_authorizer = self.destination_authorizer,
                     .inference_api_url = cache.write_cache.inference_api_url,
                     .ha_write_gate = cache.write_cache.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
@@ -18151,7 +18231,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
                     },
                     .remote => |remote| {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         const body = try encodeRemoteBatchRequest(alloc, .{
                             .writes = group.writes.items,
                             .deletes = group.deletes.items,
@@ -18284,6 +18364,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const participant = try distributed_txn.participantIdForGroup(alloc, coordinator_table_name, coordinator_group_id);
         defer alloc.free(participant);
         var worker = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        _ = worker.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         try worker.worker().acknowledgeGroup(alloc, coordinator_group_id, coordinator_table_name, .{
             .txn_id = txn_id,
             .participant = participant,
@@ -18303,6 +18384,7 @@ pub const HostedProvisionedTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
+        _ = worker_impl.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
@@ -18358,7 +18440,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 const body = try forwardedTableBackupRequestAlloc(alloc, backup_id, location_uri, connection, format);
                 defer alloc.free(body);
 
-                var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                var client = self.httpClient(alloc);
                 var response = try client.fetchBackupTableFenced(remote.base_uri, table_name, body, fence);
                 response.deinit(alloc);
 
@@ -18631,7 +18713,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             return switch (route.*) {
                 .local => try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name),
                 .remote => |remote| blk: {
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var client = self.httpClient(alloc);
                     var response = client.fetchGroupDocumentArtifactReprocess(remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
                         error.NotFound, error.UnexpectedHttpStatus => break :blk null,
                         else => return err,
@@ -18701,7 +18783,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 var group_result = switch (route.*) {
                     .local => (try reprocessDocumentArtifactRangeGroupLocal(ptr, alloc, group_id, table_name, artifact_name, group_req)) orelse continue,
                     .remote => |remote| blk: {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         var response = client.fetchGroupDocumentArtifactRangeReprocess(remote.base_uri, group_id, table_name, artifact_name, body) catch |err| switch (err) {
                             error.NotFound, error.UnexpectedHttpStatus => continue,
                             else => return err,
@@ -18785,7 +18867,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 break :blk switch (route.*) {
                     .local => (try listArtifactRepairIssuesGroupLocal(ptr, alloc, group_id, table_name, group_req)) orelse continue,
                     .remote => |remote| remote_blk: {
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         var response = client.fetchGroupArtifactRepairIssues(remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                             else => return err,
                         };
@@ -18903,7 +18985,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                         }
                         const body = try std.json.Stringify.valueAlloc(alloc, remote_req, .{ .emit_null_optional_fields = false });
                         defer alloc.free(body);
-                        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                        var client = self.httpClient(alloc);
                         var response = client.fetchGroupArtifactRepairRun(remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                             else => return err,
                         };
@@ -18947,7 +19029,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .remote => |remote| blk: {
                     const body = try std.json.Stringify.valueAlloc(alloc, update, .{ .emit_null_optional_fields = false });
                     defer alloc.free(body);
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var client = self.httpClient(alloc);
                     var response = client.fetchGroupDocumentArtifactChildRangePlacementUpdate(remote.base_uri, group_id, table_name, doc_key, artifact_name, body) catch |err| switch (err) {
                         error.NotFound, error.UnexpectedHttpStatus => break :blk null,
                         else => return err,
@@ -18978,7 +19060,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .remote => |remote| blk: {
                     const body = try encodeRemoteDocumentArtifactChildRangeApplyBatch(alloc, child_batch);
                     defer alloc.free(body);
-                    var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                    var client = self.httpClient(alloc);
                     var response = client.fetchGroupDocumentArtifactChildRangeBatchApply(remote.base_uri, group_id, table_name, doc_key, artifact_name, body) catch |err| switch (err) {
                         error.NotFound, error.UnexpectedHttpStatus => break :blk null,
                         else => return err,
@@ -20819,6 +20901,15 @@ fn catchUpManagedIndexCreate(
 
     const requires_enrichment_replay = try db.core.indexRequiresEnrichmentReplay(index_name);
     if (requires_enrichment_replay) {
+        // A completed managed dense generation already proves source outcome
+        // coverage, durable replay convergence, physical artifact cardinality,
+        // and a quiet HBC publication boundary. Re-forcing every stored source
+        // at this point does not add recovery authority; it replays historical
+        // delete/upsert windows over the final deterministic chunk identities
+        // and can regress an otherwise ready generation.
+        if (try db.completedManagedDenseGenerationIsServiceable(alloc, index_name)) {
+            return .complete;
+        }
         if (db.enrichment_runtime != null) {
             const appended = try db.reprocessGeneratedEnrichmentFromStoredDocsWithProgress(
                 alloc,
@@ -21045,6 +21136,56 @@ test "managed structural catch-up does not delegate an empty producer handoff" {
         ManagedIndexCreateCatchUp.complete,
         try catchUpManagedIndexCreate(alloc, &db, "semantic_idx", true),
     );
+}
+
+test "managed structural catch-up does not replay a completed dense generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/managed-complete-dense-no-replay",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var deterministic = db_embedder.DeterministicDenseEmbedder{};
+    var db = try db_mod.DB.open(alloc, path, .{
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"alpha beta gamma delta epsilon zeta eta theta iota kappa\"}",
+        }},
+        .sync_level = .write,
+    });
+    const cfg = db_mod.types.IndexConfig{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","chunk_name":"semantic_chunks","chunk_size":4,"chunk_overlap":1}}
+        ,
+        .coverage_generation = 73,
+    };
+    const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+    try db.runUntilIdle();
+    const completed = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expect(completed.repaired);
+    try std.testing.expect(try db.completedManagedDenseGenerationIsServiceable(alloc, cfg.name));
+
+    const dense_target_before = try db.core.store.latestReplaySequenceForHint(.dense_vector, 0);
+    const enrichment_target_before = try db.core.store.latestReplaySequenceForHint(.enrichment, 0);
+    try std.testing.expectEqual(
+        ManagedIndexCreateCatchUp.complete,
+        try catchUpManagedIndexCreate(alloc, &db, cfg.name, true),
+    );
+    try std.testing.expectEqual(dense_target_before, try db.core.store.latestReplaySequenceForHint(.dense_vector, 0));
+    try std.testing.expectEqual(enrichment_target_before, try db.core.store.latestReplaySequenceForHint(.enrichment, 0));
 }
 
 const ManagedIndexReplayPosition = struct {
@@ -21598,6 +21739,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
 
 const ManagedDbOpenOptions = struct {
     drain_resolver_backfill: bool = true,
+    source_table: []const u8 = "",
+    destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     /// HA replay must reconcile catalog-driven indexes while the node remains a
     /// read-only standby. Perform that structural reconciliation in an isolated
     /// workerless open, then reopen with the live HA gate before publishing the
@@ -22086,6 +22229,8 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
     else
         try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
             .drain_resolver_backfill = options.drain_resolver_backfill,
+            .source_table = options.source_table,
+            .destination_authorizer = options.destination_authorizer,
         });
     if (summary.indexManagerCatalogChanged() or options.reconcile_for_replicated_apply) {
         // First-open provisioning can mutate the live index manager. Reopen so
@@ -22916,7 +23061,11 @@ fn dbHbcCacheKindStatsFromIndex(cache_stats: hbc_mod.HbcCacheKindStats) db_mod.t
     return .{
         .used_bytes = cache_stats.used_bytes,
         .peak_bytes = cache_stats.peak_bytes,
+        .hits = cache_stats.hits,
+        .misses = cache_stats.misses,
         .insertions = cache_stats.insertions,
+        .replacements = cache_stats.replacements,
+        .sampled_admissions = cache_stats.sampled_admissions,
         .admission_skips = cache_stats.admission_skips,
         .evictions = cache_stats.evictions,
     };
@@ -22926,6 +23075,7 @@ fn dbHbcCacheStatsFromIndex(cache_stats: hbc_mod.HbcCacheStats) db_mod.types.Hbc
     return .{
         .total_bytes = cache_stats.total_bytes,
         .accounted_bytes = cache_stats.accounted_bytes,
+        .pinned_bytes = cache_stats.pinned_bytes,
         .node = dbHbcCacheKindStatsFromIndex(cache_stats.node),
         .quantized = dbHbcCacheKindStatsFromIndex(cache_stats.quantized),
         .vector = dbHbcCacheKindStatsFromIndex(cache_stats.vector),
@@ -22977,8 +23127,12 @@ fn overlayRuntimeStatusReplayTargetFromDb(
     status: *runtime_status.LocalTableRuntimeStatus,
     db: *db_mod.DB,
 ) void {
-    const async_stats = db.snapshotAsyncIndexingStats();
-    status.stats.async_indexing = async_stats;
+    // Cold/query-only recovery has no producer runtime of its own. If a live
+    // writer is resident, overlay its lock-free lifecycle snapshot together
+    // with replay watermarks so a just-recovered status cannot transiently
+    // report a ready managed index with `enrichment_runtime.enabled=false`.
+    db.overlayRuntimeStatusRuntimeBestEffort(&status.stats);
+    const async_stats = status.stats.async_indexing;
     for (status.stats.indexes) |*item| {
         const prior_backfill_active = item.backfill_active;
         const prior_backfill_progress = item.backfill_progress;
@@ -35660,6 +35814,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
     var attempted_repair = false;
     var repaired = false;
     var repair_passes: usize = 0;
+    var publication_fenced = false;
     {
         // Exercise the cold-owner path that CI can reach when an idle writer
         // cache entry is retired between structural handoff and repair.
@@ -35668,6 +35823,32 @@ test "structural reconcile publishes durable index repair debt once per group" {
         const status = source.beginStatusRequest("docs");
         try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.snapshot_only, status);
         source.endStatusRequest("docs", status);
+        const PublicationFence = struct {
+            source: *ProvisionedTableWriteSource,
+            cache: *runtime_status.TableRuntimeSnapshotCache,
+            fenced: bool = false,
+            clear_publications: usize = 0,
+
+            fn run(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const io = self.source.table_activity_threaded.io();
+                self.source.table_activity_mutex.lockUncancelable(io);
+                const clear_observed = if (self.source.findTableActivityLocked("docs", 7001)) |index|
+                    self.source.active_table_activities.items[index].repair_handoff_clear_observed
+                else
+                    false;
+                self.source.table_activity_mutex.unlock(io);
+                if (!clear_observed) return;
+                self.clear_publications += 1;
+                // Fence both the clear callback's publication and the
+                // caller's final consistent publication. The next scheduler
+                // pass must own recovery of the still-pending handoff.
+                if (self.clear_publications > 2) return;
+                self.cache.invalidateTable("docs");
+                self.fenced = self.clear_publications == 2;
+            }
+        };
+        var publication_fence = PublicationFence{ .source = &source, .cache = &snapshot_cache };
         const RepairWorker = struct {
             source: *ProvisionedTableWriteSource,
             indexes_json: []const u8,
@@ -35706,15 +35887,20 @@ test "structural reconcile publishes durable index repair debt once per group" {
         // Snapshot-only status is observational and cannot delay the cold
         // repair owner. The repair's clear plus final cached publication must
         // retire shard authority without another structural pass.
+        const previous_publish_hook = test_before_runtime_status_publish_hook;
+        test_before_runtime_status_publish_hook = .{ .ptr = &publication_fence, .run = PublicationFence.run };
+        defer test_before_runtime_status_publish_hook = previous_publish_hook;
         worker.run();
         if (worker.err) |err| return err;
         attempted_repair = worker.attempted_repair;
         repaired = worker.repaired;
         repair_passes = worker.repair_passes;
+        publication_fenced = publication_fence.fenced;
     }
-    try std.testing.expect(repair_passes >= 2);
+    try std.testing.expect(repair_passes >= 3);
     try std.testing.expect(attempted_repair);
     try std.testing.expect(repaired);
+    try std.testing.expect(publication_fenced);
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
     // Repair's visibility hook may repeat the idempotent exact-debt enqueue as
     // each bounded pass discovers the durable intent. Only a subsequent

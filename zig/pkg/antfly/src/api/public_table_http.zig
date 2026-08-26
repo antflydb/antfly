@@ -25,6 +25,22 @@ const http_route_helpers = @import("http_route_helpers.zig");
 const query_contract = @import("query_contract.zig");
 const operation = @import("operation.zig");
 
+threadlocal var last_batch_failure_name: ?[]const u8 = null;
+
+pub fn resetLastBatchFailureName() void {
+    last_batch_failure_name = null;
+}
+
+pub fn setLastBatchFailureName(err: anyerror) void {
+    last_batch_failure_name = @errorName(err);
+}
+
+fn takeLastBatchFailureName() ?[]const u8 {
+    const name = last_batch_failure_name;
+    last_batch_failure_name = null;
+    return name;
+}
+
 pub const DocumentArtifactManifestDetail = enum {
     summary,
     raw,
@@ -165,6 +181,7 @@ pub const TableApi = struct {
         RestoreDurabilityPending,
         RestoreDurabilityConfirmed,
         BackupIntegrityFailure,
+        RestoreDestinationReauthorizationRequired,
         InvalidBackupRequest,
         InternalFailure,
     };
@@ -752,6 +769,7 @@ pub fn handleTableBatch(
     body: []const u8,
     api: TableApi,
 ) !OwnedResponse {
+    resetLastBatchFailureName();
     var batch_req = batch_api.parseBatchRequest(alloc, body) catch |err| {
         switch (err) {
             error.ValueTooLong => return .{ .status = 413, .body = try alloc.dupe(u8, "value too large") },
@@ -803,7 +821,17 @@ pub fn handleTableBatch(
         error.HAFencedPrimary => return .{ .status = 409, .body = try alloc.dupe(u8, "fenced primary rejects writes") },
         error.Canceled => return error.Canceled,
         error.DeadlineExceeded => return error.DeadlineExceeded,
-        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "batch failed") },
+        error.InternalFailure => {
+            const error_name = takeLastBatchFailureName() orelse @errorName(error.InternalFailure);
+            return .{
+                .status = 500,
+                .body = try std.json.Stringify.valueAlloc(alloc, .{
+                    .@"error" = error_name,
+                    .message = "batch failed",
+                }, .{}),
+                .json = true,
+            };
+        },
     };
 
     return .{
@@ -1173,6 +1201,10 @@ pub fn handleTableRestore(
         error.RestoreDurabilityPending => return .{ .status = 202, .body = try backups_api.encodeRestoreDurabilityPending(alloc), .json = true },
         error.RestoreDurabilityConfirmed => return .{ .status = 200, .body = try backups_api.encodeRestoreDurabilityConfirmed(alloc), .json = true },
         error.BackupIntegrityFailure => return .{ .status = 422, .body = try alloc.dupe(u8, backups_api.integrity_failure_message) },
+        error.RestoreDestinationReauthorizationRequired => return .{
+            .status = 409,
+            .body = try alloc.dupe(u8, "restore was queued before destination authorization was recorded; resubmit it to reauthorize CDC and graph destinations"),
+        },
         error.InvalidBackupRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
@@ -2260,6 +2292,8 @@ test "public table batch handler maps write unavailable errors" {
             _: operation.RequestContext,
         ) TableApi.ExecuteBatchError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.err == error.InternalFailure)
+                setLastBatchFailureName(error.InferenceProviderFailure);
             return self.err;
         }
     };
@@ -2268,12 +2302,19 @@ test "public table batch handler maps write unavailable errors" {
         err: TableApi.ExecuteBatchError,
         status: u16,
         body: []const u8,
+        json: bool = false,
     }{
         .{ .err = error.WriteUnavailable, .status = 503, .body = "write unavailable" },
         .{
             .err = error.OutcomeUnknown,
             .status = 500,
             .body = "transaction outcome is unknown; do not retry this stateless batch because it may already have committed; use a transaction session for retryable commits",
+        },
+        .{
+            .err = error.InternalFailure,
+            .status = 500,
+            .body = "{\"error\":\"InferenceProviderFailure\",\"message\":\"batch failed\"}",
+            .json = true,
         },
     };
     for (cases) |tc| {
@@ -2285,6 +2326,7 @@ test "public table batch handler maps write unavailable errors" {
 
         try std.testing.expectEqual(tc.status, resp.status);
         try std.testing.expectEqualStrings(tc.body, resp.body);
+        try std.testing.expectEqual(tc.json, resp.json);
     }
 }
 

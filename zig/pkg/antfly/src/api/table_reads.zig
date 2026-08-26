@@ -2318,6 +2318,13 @@ pub const BoundTableReadSource = struct {
                 .result = profiled.result,
                 .dense_profile = mapDenseSearchProfile(profiled.profile),
             };
+        } else if (snapshot_req.profile) {
+            const profiled = try self.db.searchWithDenseProfile(alloc, snapshot_req);
+            execution = .{
+                .request = snapshot_req,
+                .result = profiled.result,
+                .dense_profile = if (profiled.dense_profile) |profile| mapDenseSearchProfile(profile) else null,
+            };
         } else {
             execution = .{
                 .request = snapshot_req,
@@ -4108,6 +4115,8 @@ pub const HostedProvisionedTableReadSource = struct {
     requester: raft_mod.ReadableLeaseRequester,
     router: table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
     io_impl: ?*std.Io.Threaded = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
@@ -4139,6 +4148,31 @@ pub const HostedProvisionedTableReadSource = struct {
     pub fn withBackendRuntime(self: *HostedProvisionedTableReadSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableReadSource {
         self.backend_runtime = backend_runtime;
         return self;
+    }
+
+    pub fn withInternalServiceAuth(
+        self: *HostedProvisionedTableReadSource,
+        secret: ?[]const u8,
+        issuer: ?[]const u8,
+    ) *HostedProvisionedTableReadSource {
+        self.internal_service_secret = secret;
+        self.internal_service_issuer = issuer;
+        return self;
+    }
+
+    fn internalExecutor(self: *HostedProvisionedTableReadSource) http_common.RequestExecutor {
+        return .{ .ptr = self, .vtable = &.{ .execute = executeInternalRequest } };
+    }
+
+    fn executeInternalRequest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: http_common.HttpRequest,
+    ) anyerror!http_common.HttpResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client.executeRequest(request);
     }
 
     pub fn withGroupVisibleRootGeneration(self: *HostedProvisionedTableReadSource, generation_source: ?GroupVisibleRootGenerationSource) *HostedProvisionedTableReadSource {
@@ -4283,7 +4317,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
         return switch (route) {
             .local => try self.groupLocalSource().documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, consistency),
-            .remote => |remote| documentArtifactManifestRemote(self.executor, alloc, remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
+            .remote => |remote| documentArtifactManifestRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
                 error.UnexpectedHttpStatus, error.NotFound => null,
                 else => err,
             },
@@ -4302,7 +4336,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
         return switch (route) {
             .local => try self.groupLocalSource().documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, consistency),
-            .remote => |remote| documentArtifactManifestsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, doc_key) catch |err| switch (err) {
+            .remote => |remote| documentArtifactManifestsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, doc_key) catch |err| switch (err) {
                 error.UnexpectedHttpStatus, error.NotFound => null,
                 else => err,
             },
@@ -4321,7 +4355,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         return switch (route) {
             .local => try self.groupLocalSource().lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency),
-            .remote => |remote| lookupRemote(self.executor, alloc, remote.base_uri, group_id, table_name, key, opts, consistency) catch |err| switch (err) {
+            .remote => |remote| lookupRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, key, opts, consistency) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4364,7 +4398,7 @@ pub const HostedProvisionedTableReadSource = struct {
             }
             const base_uri = (try self.router.nodeBaseUriForGroup(alloc, group_id, node_id)) orelse continue;
             defer alloc.free(base_uri);
-            if (lookupRemote(self.executor, alloc, base_uri, group_id, table_name, key, opts, consistency)) |result| {
+            if (lookupRemote(self.internalExecutor(), alloc, base_uri, group_id, table_name, key, opts, consistency)) |result| {
                 return result;
             } else |err| switch (err) {
                 error.UnexpectedHttpStatus => continue,
@@ -4426,7 +4460,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
             var result = switch (route) {
                 .local => try self.groupLocalSource().scanGroupLocal(alloc, group_id, table_name, from_key, to_key, group_opts, consistency),
-                .remote => |remote| try scanRemote(self.executor, alloc, remote.base_uri, group_id, table_name, from_key, to_key, group_opts),
+                .remote => |remote| try scanRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, from_key, to_key, group_opts),
             } orelse return null;
             defer result.deinit(alloc);
 
@@ -4538,7 +4572,7 @@ pub const HostedProvisionedTableReadSource = struct {
                     }
                 },
                 .remote => |remote| {
-                    const summary = try preflightRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req, max_work);
+                    const summary = try preflightRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req, max_work);
                     if (first_summary == null) {
                         first_summary = summary;
                     } else {
@@ -4808,7 +4842,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinPartitionRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinPartitionRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4829,7 +4863,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinRowsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinRowsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4850,7 +4884,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinUnmatchedRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinUnmatchedRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4871,7 +4905,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinFinalizeRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinFinalizeRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4891,7 +4925,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinJobStateRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+            .remote => |remote| joinJobStateRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4933,7 +4967,7 @@ pub const HostedProvisionedTableReadSource = struct {
                         ctx.namespace.range_id,
                     );
                 }
-                break :blk try graphExpandRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req);
+                break :blk try graphExpandRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req);
             },
         };
     }
@@ -5040,7 +5074,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => try self.groupLocalSource().graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency),
-            .remote => |remote| try graphEdgesRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req),
+            .remote => |remote| try graphEdgesRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req),
         };
     }
 
@@ -5283,7 +5317,7 @@ fn collectHostedSearchRequestTextStatsParallel(
                     table_name_inner,
                     body_inner,
                 ),
-                .remote => |remote| textStatsRemote(source.executor, arena, remote.base_uri, group_id, table_name_inner, body_inner, req_inner),
+                .remote => |remote| textStatsRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, body_inner, req_inner),
             } catch |err| {
                 slot.err = err;
                 return;
@@ -5432,8 +5466,8 @@ fn queryHostedAcrossGroupsParallel(
             const arena = slot.arena.allocator();
             var group_req = shard_req_inner.*;
             if (required_identity_generation) |generation| group_req.identity_read_generation = generation;
-            slot.result = switch (route) {
-                .local => source.groupLocalSource().searchResultGroupLocal(
+            switch (route) {
+                .local => slot.result = source.groupLocalSource().searchResultGroupLocal(
                     arena,
                     group_id,
                     table_name_inner,
@@ -5443,18 +5477,11 @@ fn queryHostedAcrossGroupsParallel(
                     slot.err = err;
                     return;
                 },
-                .remote => |remote| queryRemote(
-                    source.executor,
-                    arena,
-                    remote.base_uri,
-                    group_id,
-                    table_name_inner,
-                    group_req,
-                ) catch |err| {
+                .remote => |remote| slot.result = queryRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, group_req) catch |err| {
                     slot.err = err;
                     return;
                 },
-            };
+            }
             if (slot.result == null) slot.err = error.TableNotFound;
         }
     };
@@ -6711,7 +6738,7 @@ fn preflightHostedGroupsParallel(
                     return;
                 },
                 .remote => |remote| slot.summary = preflightRemote(
-                    source.executor,
+                    source.internalExecutor(),
                     arena,
                     remote.base_uri,
                     group_id,
@@ -8283,7 +8310,7 @@ fn queryHostedAcrossGroupsPhase(
                 group_req,
                 consistency,
             )) orelse return error.TableNotFound,
-            .remote => |remote| try queryRemote(self.executor, alloc, remote.base_uri, group_id, table_name, group_req),
+            .remote => |remote| try queryRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, group_req),
         };
         initialized += 1;
         result_identity_generations[i] = shard_results[i].identity_read_generation;
@@ -8559,7 +8586,7 @@ fn executeHostedGraphHydrate(
                     ctx.namespace.range_id,
                 );
             }
-            break :blk try graphHydrateRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req);
+            break :blk try graphHydrateRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req);
         },
     };
 }
@@ -8640,7 +8667,7 @@ fn executeHostedGraphGetEdges(
 
     return switch (route) {
         .local => (try self.groupLocalSource().graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency)) orelse return error.TableNotFound,
-        .remote => |remote| try graphEdgesRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req),
+        .remote => |remote| try graphEdgesRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req),
     };
 }
 
@@ -9026,11 +9053,47 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_scratch_acquire_ns = profile.hbc_scratch_acquire_ns,
         .hbc_node_cache_lookup_ns = profile.hbc_node_cache_lookup_ns,
         .hbc_quantized_cache_lookup_ns = profile.hbc_quantized_cache_lookup_ns,
+        .hbc_filter_candidates = profile.hbc_filter_candidates,
+        .hbc_filter_rejected = profile.hbc_filter_rejected,
+        .hbc_filter_metadata_batches = profile.hbc_filter_metadata_batches,
+        .hbc_filter_metadata_batch_ns = profile.hbc_filter_metadata_batch_ns,
+        .hbc_traversal_waves = profile.hbc_traversal_waves,
+        .hbc_traversal_initial_wave_leaves = profile.hbc_traversal_initial_wave_leaves,
+        .hbc_traversal_max_wave_leaves = profile.hbc_traversal_max_wave_leaves,
+        .hbc_traversal_bound_resolutions = profile.hbc_traversal_bound_resolutions,
+        .hbc_traversal_bound_fallbacks = profile.hbc_traversal_bound_fallbacks,
+        .hbc_traversal_bound_stops = profile.hbc_traversal_bound_stops,
+        .hbc_traversal_frontier_remaining = profile.hbc_traversal_frontier_remaining,
+        .hbc_traversal_eligible_vectors = profile.hbc_traversal_eligible_vectors,
+        .hbc_traversal_stop_lower_bound = profile.hbc_traversal_stop_lower_bound,
+        .hbc_traversal_stop_result_upper_bound = profile.hbc_traversal_stop_result_upper_bound,
         .resolved_search_width = profile.resolved_search_width,
         .resolved_epsilon = profile.resolved_epsilon,
         .native_filter_candidate_count = profile.native_filter_candidate_count,
         .search_route = profile.search_route,
         .route_reason = profile.route_reason,
+        .route_estimated_exact_storage_bytes = profile.route_estimated_exact_storage_bytes,
+        .route_estimated_hbc_storage_bytes = profile.route_estimated_hbc_storage_bytes,
+        .route_estimated_exact_work_ns = profile.route_estimated_exact_work_ns,
+        .route_estimated_hbc_work_ns = profile.route_estimated_hbc_work_ns,
+        .exact_candidate_count = profile.exact_candidate_count,
+        .exact_batch_count = profile.exact_batch_count,
+        .exact_max_batch_size = profile.exact_max_batch_size,
+        .exact_workspace_bytes = profile.exact_workspace_bytes,
+        .exact_request_vector_cache_entries = profile.exact_request_vector_cache_entries,
+        .exact_raw_batch_reads = profile.exact_raw_batch_reads,
+        .exact_raw_scalar_reads = profile.exact_raw_scalar_reads,
+        .exact_missing_vectors = profile.exact_missing_vectors,
+        .exact_candidate_prepare_ns = profile.exact_candidate_prepare_ns,
+        .exact_metadata_lookup_ns = profile.exact_metadata_lookup_ns,
+        .exact_artifact_key_ns = profile.exact_artifact_key_ns,
+        .exact_artifact_read_ns = profile.exact_artifact_read_ns,
+        .exact_artifact_decode_ns = profile.exact_artifact_decode_ns,
+        .exact_distance_ns = profile.exact_distance_ns,
+        .exact_lsm_cache_hits = profile.exact_lsm_cache_hits,
+        .exact_lsm_cache_misses = profile.exact_lsm_cache_misses,
+        .exact_artifact_cache_hits = profile.exact_artifact_cache_hits,
+        .exact_artifact_vectors_loaded = profile.exact_artifact_vectors_loaded,
         .hbc_nodes_visited = profile.hbc_nodes_visited,
         .hbc_leaves_explored = profile.hbc_leaves_explored,
         .hbc_approx_vectors_scored = profile.hbc_approx_vectors_scored,
@@ -9038,6 +9101,9 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_reranked_vectors = profile.hbc_reranked_vectors,
         .hbc_approx_candidate_count = profile.hbc_approx_candidate_count,
         .hbc_rerank_candidate_count = profile.hbc_rerank_candidate_count,
+        .hbc_rerank_batches = profile.hbc_rerank_batches,
+        .hbc_rerank_max_batch_size = profile.hbc_rerank_max_batch_size,
+        .hbc_rerank_candidates_skipped_by_bound = profile.hbc_rerank_candidates_skipped_by_bound,
         .hbc_ambiguous_top_k_pairs = profile.hbc_ambiguous_top_k_pairs,
         .hbc_ambiguous_boundary_pairs = profile.hbc_ambiguous_boundary_pairs,
         .hbc_ambiguous_distance_over_hits = profile.hbc_ambiguous_distance_over_hits,
@@ -9065,12 +9131,15 @@ fn mapDenseSearchProfile(profile: db_query_search.DenseSearchProfile) query_api.
         .hbc_rerank_external_score_ns = profile.hbc_rerank_external_score_ns,
         .hbc_rerank_vector_load_ns = profile.hbc_rerank_vector_load_ns,
         .hbc_rerank_metadata_lookup_ns = profile.hbc_rerank_metadata_lookup_ns,
+        .hbc_rerank_metadata_vectors_loaded = profile.hbc_rerank_metadata_vectors_loaded,
         .hbc_rerank_artifact_key_ns = profile.hbc_rerank_artifact_key_ns,
         .hbc_rerank_artifact_read_ns = profile.hbc_rerank_artifact_read_ns,
         .hbc_rerank_artifact_decode_ns = profile.hbc_rerank_artifact_decode_ns,
         .hbc_rerank_artifact_distance_ns = profile.hbc_rerank_artifact_distance_ns,
         .hbc_rerank_lsm_cache_hits = profile.hbc_rerank_lsm_cache_hits,
         .hbc_rerank_lsm_cache_misses = profile.hbc_rerank_lsm_cache_misses,
+        .hbc_rerank_artifact_cache_hits = profile.hbc_rerank_artifact_cache_hits,
+        .hbc_rerank_artifact_vectors_loaded = profile.hbc_rerank_artifact_vectors_loaded,
         .hbc_rerank_distance_ns = profile.hbc_rerank_distance_ns,
         .doc_key_resolve_ns = profile.doc_key_resolve_ns,
         .doc_ordinal_lookup_ns = profile.doc_ordinal_lookup_ns,
@@ -9106,7 +9175,11 @@ fn mapDenseDebugPair(pair: db_query_search.DenseSearchProfile.DebugPair) query_a
 
 fn profiledDenseQuery(req: db_mod.types.SearchRequest) ?ProfiledDenseQuery {
     if (!req.profile) return null;
-    if (req.full_text != null or req.full_text_queries.len > 0) return null;
+    if (req.full_text) |full_text| switch (full_text) {
+        .match_all => {},
+        else => return null,
+    };
+    if (req.full_text_queries.len > 0) return null;
     if (req.sparse != null or req.sparse_queries.len > 0) return null;
     if (req.graph_queries.len > 0) return null;
     if (req.dense_queries.len > 1) return null;
@@ -9115,6 +9188,8 @@ fn profiledDenseQuery(req: db_mod.types.SearchRequest) ?ProfiledDenseQuery {
     if (req.dense_queries.len == 1) {
         var dense_req = req;
         dense_req.index_name = req.dense_queries[0].index_name;
+        dense_req.full_text = null;
+        dense_req.dense_queries = &.{};
         return .{
             .req = dense_req,
             .query = req.dense_queries[0].query,
@@ -9126,6 +9201,54 @@ fn profiledDenseQuery(req: db_mod.types.SearchRequest) ?ProfiledDenseQuery {
         .dense_knn => |dense| .{ .req = req, .query = dense },
         else => null,
     };
+}
+
+test "profiled composed dense query preserves exact route telemetry" {
+    const profiled = profiledDenseQuery(.{
+        .profile = true,
+        .full_text = .{ .match_all = {} },
+        .dense_queries = &.{.{
+            .name = "semantic",
+            .index_name = "semantic_idx",
+            .query = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 10 },
+        }},
+        .filter_query_json = "{\"term\":{\"tenant\":\"a\"}}",
+    }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("semantic_idx", profiled.req.index_name.?);
+    try std.testing.expect(profiled.req.full_text == null);
+    try std.testing.expectEqual(@as(usize, 0), profiled.req.dense_queries.len);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant\":\"a\"}}", profiled.req.filter_query_json);
+    try std.testing.expectEqual(@as(u32, 10), profiled.query.k);
+
+    const public = mapDenseSearchProfile(.{
+        .search_route = "exact_native_filter",
+        .route_reason = "exact_storage_work_lower",
+        .route_estimated_exact_storage_bytes = 123,
+        .route_estimated_hbc_storage_bytes = 456,
+        .exact_candidate_count = 17,
+        .exact_batch_count = 2,
+        .exact_raw_batch_reads = 2,
+        .exact_raw_scalar_reads = 0,
+        .exact_artifact_read_ns = 789,
+        .exact_artifact_cache_hits = 3,
+        .exact_artifact_vectors_loaded = 14,
+        .hbc_rerank_metadata_vectors_loaded = 9,
+        .hbc_rerank_artifact_cache_hits = 4,
+        .hbc_rerank_artifact_vectors_loaded = 9,
+    });
+    try std.testing.expectEqualStrings("exact_native_filter", public.search_route);
+    try std.testing.expectEqual(@as(u64, 123), public.route_estimated_exact_storage_bytes);
+    try std.testing.expectEqual(@as(u64, 456), public.route_estimated_hbc_storage_bytes);
+    try std.testing.expectEqual(@as(u64, 17), public.exact_candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), public.exact_batch_count);
+    try std.testing.expectEqual(@as(u64, 2), public.exact_raw_batch_reads);
+    try std.testing.expectEqual(@as(u64, 0), public.exact_raw_scalar_reads);
+    try std.testing.expectEqual(@as(u64, 789), public.exact_artifact_read_ns);
+    try std.testing.expectEqual(@as(u64, 3), public.exact_artifact_cache_hits);
+    try std.testing.expectEqual(@as(u64, 14), public.exact_artifact_vectors_loaded);
+    try std.testing.expectEqual(@as(u64, 9), public.hbc_rerank_metadata_vectors_loaded);
+    try std.testing.expectEqual(@as(u64, 4), public.hbc_rerank_artifact_cache_hits);
+    try std.testing.expectEqual(@as(u64, 9), public.hbc_rerank_artifact_vectors_loaded);
 }
 
 fn readPreparationKindForQuery(req: db_mod.types.SearchRequest) ReadPreparation.Kind {
@@ -9218,6 +9341,15 @@ fn queryDbDetailed(
             .request = snapshot_req,
             .result = profiled.result,
             .dense_profile = mapDenseSearchProfile(profiled.profile),
+            .db_owner = owner,
+        };
+    }
+    if (snapshot_req.profile) {
+        const profiled = try db.searchWithDenseProfile(alloc, snapshot_req);
+        return .{
+            .request = snapshot_req,
+            .result = profiled.result,
+            .dense_profile = if (profiled.dense_profile) |profile| mapDenseSearchProfile(profile) else null,
             .db_owner = owner,
         };
     }
@@ -14503,7 +14635,7 @@ fn collectHostedAlgebraicDistributedPartials(
                 };
             },
             .remote => |remote| blk: {
-                var response = (algebraicPartialsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, group_req) catch return null) orelse return null;
+                var response = (algebraicPartialsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req) catch return null) orelse return null;
                 defer response.deinit(alloc);
                 break :blk try parseAlgebraicPartialsResponse(alloc, response.json);
             },
@@ -16017,7 +16149,7 @@ fn collectHostedSearchRequestTextStats(
                     table_name,
                     body,
                 )) orelse return error.TableNotFound,
-                .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
+                .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
             };
             defer response.deinit(alloc);
             shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -16047,7 +16179,7 @@ fn collectHostedSearchRequestTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -16174,7 +16306,7 @@ fn collectHostedAggregationTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -16220,7 +16352,7 @@ fn collectHostedAggregationBackgroundTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseBackgroundTextStatsResponse(alloc, response.json);
@@ -18532,7 +18664,7 @@ test "parseRemoteSearchResult preserves grouped hierarchy matches" {
 test "storage-kernel search result preserves sort and hierarchy identity" {
     const alloc = std.testing.allocator;
     var result = try parseStorageKernelSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:a","_score":0.8,"_sort":[42,"doc:a"],"_source":{"title":"source"},"hierarchy":{"level":"source","parent_doc_key":"doc:a","ancestors":{"source":{"id":"doc:a","document":{"title":"source"}}},"chunks":[{"_id":"chunk:a:1","_score":0.7,"_source":{"text":"alpha"},"hierarchy":{"level":"chunk","parent_doc_key":"doc:a","parent_unit_id":"page:1","artifact":{"name":"chunks","kind":"chunk","chunk_id":1,"unit_id":"page:1","source":{"name":"pages","kind":"asset","unit_id":"page:1"}},"ancestors":{"unit":{"id":"page:1","document":{"page":1}}}}}]}}],"max_score":0.8},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"exact"},"hits":[{"_id":"doc:a","_score":0.8,"_sort":[42,"doc:a"],"_source":{"title":"source"},"hierarchy":{"level":"source","parent_doc_key":"doc:a","ancestors":{"source":{"id":"doc:a","document":{"title":"source"}}},"chunks":[{"_id":"chunk:a:1","_score":0.7,"_source":{"text":"alpha"},"hierarchy":{"level":"chunk","parent_doc_key":"doc:a","parent_unit_id":"page:1","artifact":{"name":"chunks","kind":"chunk","chunk_id":1,"unit_id":"page:1","source":{"name":"pages","kind":"asset","unit_id":"page:1"}},"ancestors":{"source":{"id":"doc:a","document":{"title":"source"}},"unit":{"id":"page:1","document":{"page":1}}}}}]}}],"max_score":0.8},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
@@ -21155,7 +21287,7 @@ test "provisioned table read source preflights every local group" {
     defer dense_summary.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 2), dense_summary.shard_count);
     try std.testing.expectEqual(@as(u32, 2), dense_summary.dense_query_count);
-    try std.testing.expectError(error.UnsupportedQueryRequest, source.source().preflightQuery(alloc, "docs", .{
+    try std.testing.expectError(error.IndexNotFound, source.source().preflightQuery(alloc, "docs", .{
         .graph_queries = &.{
             .{
                 .name = "neighbors",
@@ -26434,7 +26566,7 @@ test "hosted table read source preflights every local group" {
     defer dense_summary.deinit(test_alloc);
     try std.testing.expectEqual(@as(u32, 2), dense_summary.shard_count);
     try std.testing.expectEqual(@as(u32, 2), dense_summary.dense_query_count);
-    try std.testing.expectError(error.UnsupportedQueryRequest, hosted.source().preflightQuery(test_alloc, "docs", .{
+    try std.testing.expectError(error.IndexNotFound, hosted.source().preflightQuery(test_alloc, "docs", .{
         .graph_queries = &.{
             .{
                 .name = "neighbors",

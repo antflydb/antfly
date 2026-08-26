@@ -1035,6 +1035,105 @@ predicate must be implemented consistently by planning, execution, repair, and
 status before it becomes public. Unknown `applies_when` configuration is
 rejected rather than silently ignored.
 
+### Publication Policy And Readiness
+
+Managed embeddings indexes separate publication availability from source
+coverage. `publication_policy` controls when a generation may answer queries;
+`coverage_policy` controls which source outcomes count as complete. A partial
+coverage policy does not authorize querying an unsafe generation.
+
+The publication policies are:
+
+- `progressive` is the default. A newly admitted canonical generation becomes
+  queryable after it has at least one physical entry and a durable,
+  generation-matching projection checkpoint beyond its admission fence. It
+  remains `queryable_partial` until coverage and replay are complete.
+- `atomic` preserves fail-closed construction. A shadow generation is built,
+  validated, and activated only after the complete-generation proof succeeds.
+
+The persisted representation is migration-free. An embeddings index whose
+stored configuration predates `publication_policy` is interpreted as
+`progressive`; there is no catalog rewrite, rebuild, warning, or operator
+action. Only an explicit `atomic` value requests the old initial-admission
+behavior. Externally supplied vector fields have no managed producer or
+coverage authority and do not use the managed partial-admission exception.
+
+Public readiness is authoritative:
+
+| State | Queryable | Complete | Meaning |
+| --- | --- | --- | --- |
+| `pending` | no | no | No safely published generation exists. |
+| `queryable_partial` | yes | no | One safe generation is published, but source coverage or replay is incomplete. |
+| `ready` | yes | yes | The desired incarnation is fully covered, current, and published. |
+| `failed` | no | no | Automatic progress requires corrective action. |
+
+`IndexReadinessStatus` includes `queryable`, `complete`, an opaque incarnation,
+and target and published revisions. Physical vector or sparse-entry counts are
+reported separately from generation-scoped source coverage; clients must not
+infer completeness from physical cardinality.
+
+`antfly index wait` waits for complete readiness. `antfly index wait
+--queryable` exits for either `queryable_partial` or `ready`. Search uses the
+best safely published generation by default. Long waits belong in this waiter,
+not in a held search request.
+
+Write synchronization remains the derived-replay contract defined in
+[ENRICHMENTS.md](ENRICHMENTS.md#derived-replay-and-indexing-contract):
+`sync_level=write` may observe eventual index consistency, while
+`sync_level=full_index` waits for that write's configured derived-publication
+fences. A write fence is distinct from waiting for an initial corpus-wide
+backfill to complete.
+
+Partial visibility advances only at durable producer and index checkpoints; an
+embedding-provider batch is not a publication boundary. Index-before-load
+workloads expose successive durable load revisions as they catch up. A
+bootstrap scan of a corpus that predates index creation currently emits one
+final producer revision, so exposing its internal provider batches would first
+require splitting the scan into bounded durable producer revisions.
+
+Progressive publication obeys these invariants:
+
+1. A query reads exactly one generation. Models, dimensions, chunkers, and
+   configuration incarnations are never mixed.
+2. A mutable shadow candidate is never queried. Progressive initial admission
+   publishes only canonical-generation durable checkpoints.
+3. Partial admission applies only to the managed-admission repair that created
+   the incarnation, only under `progressive`, and only after a physical entry
+   is visible.
+4. Catalog configuration hash, coverage incarnation, projection checkpoint,
+   and replay fence must agree. Corrupt or untrusted state remains fail-closed.
+5. Replacement rebuilds keep serving the previous trustworthy generation until
+   atomic activation. With no trustworthy generation, the index stays
+   unavailable until the progressive-admission proof succeeds.
+
+The durable repair intent remains the owner of completion, restart recovery,
+and fallback shadow reconstruction after partial publication. It is retired
+only by the stronger complete-generation proof.
+
+Dense and sparse indexes share generation, coverage, and replay fences, but
+their physical proofs match their storage engines:
+
+- Dense publication requires active HBC cardinality to match the durable
+  artifact target (or produced-source count for non-chunked data) and requires
+  no deferred posting repair.
+- Sparse derived batches apply transactionally before their checkpoint
+  advances. Partial publication therefore requires a clean matching checkpoint
+  and at least one live sparse document. Completion additionally requires
+  complete source outcomes and enough live sparse documents to cover produced
+  sources; chunking may make the physical count larger.
+
+Correctness and latency use separate verification gates. The 500-document
+regression requires complete coverage, idempotent replay, a complete second
+index, and a stable first index. A deterministic partial-publication test proves
+`queryable_partial`, semantic retrieval, generation and coverage metadata,
+restart safety, and the final transition to `ready`. Release benchmarks record
+time to first queryable result separately from time to complete.
+
+This readiness contract landed before the v0.2 API and SDK surface was
+released, so the OpenAPI enum and required fields changed in place and all
+generated clients moved together. Persisted-index compatibility is provided by
+the silent `progressive` default above.
+
 ### Readiness And Repair
 
 Runtime status must use coverage accounting instead of raw `doc_count >=
@@ -1107,15 +1206,18 @@ primary document store:
 2. Commit the index catalog row and a fixed-size admission marker in one primary
    store transaction. Do not synchronously scan or rebuild the corpus.
 3. Materialize that marker idempotently into the generation repair checkpoint.
-   The owner repair scheduler performs the bounded shadow rebuild and replay.
+   Under `progressive`, the canonical worker may publish bounded durable
+   checkpoints while the repair intent remains pending. Under `atomic`, the
+   owner repair scheduler performs the bounded shadow rebuild and replay.
 4. Keep the marker while repair is pending. Every DB open captures the marker
    prefix once before catalog open. Writable open uses the O(1) name set to
    suppress in-place backfill and recreate missing checkpoint state; read-only
-   and status opens use the same snapshot to keep the generation unavailable.
-5. After clean shadow activation, delete the primary-store marker before
-   removing the checkpoint intent. A crash between those writes leaves
-   redundant, resumable repair state rather than an admitted generation
-   without debt.
+   and status opens use the same snapshot to evaluate the same fail-closed or
+   progressive serviceability proof.
+5. After the complete-generation proof succeeds (and, for `atomic`, after clean
+   shadow activation), delete the primary-store marker before removing the
+   checkpoint intent. A crash between those writes leaves redundant, resumable
+   repair state rather than an admitted generation without debt.
 
 Filesystem DBs publish the replica-local repair checkpoint beside the physical
 root with fsync and atomic rename. Externally owned roots such as `.aflite`
@@ -1169,8 +1271,9 @@ The in-memory identity summary is an optimization for status and query
 planning, not admission authority. Admission reads the durable O(1) primary
 summary under the apply lock because an HA mirror failure may occur after the
 primary commit but before the runtime cache is published. Normal query traffic
-does not read admission markers; only a query already rejected by an in-memory
-repair gate performs a point recheck to observe repair completion safely.
+does not read admission markers; only a query evaluating an in-memory repair
+gate performs a bounded point recheck to prove progressive serviceability or
+observe repair completion safely.
 
 Catalog admission and repair activation are separate safety proofs. Metadata
 cutover additionally requires a fresh target observation, complete document

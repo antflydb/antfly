@@ -2921,6 +2921,7 @@ fn antflyTypeName(value: runtime_schema_mod.AntflyType) []const u8 {
 }
 
 fn queryNeedsPrimaryTextIndex(req: db_mod.types.SearchRequest) bool {
+    if (req.hierarchy_children != null) return false;
     if (req.full_text != null) return true;
     if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return true;
     if (req.full_text_queries.len > 0) return false;
@@ -5075,6 +5076,23 @@ test "metadata.query routing selects read schema full text index" {
     try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
     try std.testing.expectEqualStrings("full_text_index_v0", req.index_name.?);
     try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+}
+
+test "metadata.query routing leaves hierarchy child traversal index free" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":2}",
+        .indexes_json = "{\"full_text_index_v2\":{\"type\":\"full_text\"}}",
+        .placement_role = "data",
+    };
+    var req: db_mod.types.SearchRequest = .{
+        .hierarchy_children = .{ .parent_id = "doc:a" },
+    };
+
+    try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
+    try std.testing.expect(req.index_name == null);
+    try std.testing.expect(req.primary_text_index_name == null);
 }
 
 test "metadata.query routing selects current versioned full text index" {

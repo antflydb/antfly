@@ -38,12 +38,11 @@ const ProvisionedWriteCache = if (storage_kernel_experiment) void else table_wri
 const MiB: u64 = 1024 * 1024;
 const GiB: u64 = 1024 * MiB;
 const MinSmartLsmCacheBytes: u64 = 64 * 1024 * 1024;
-// Decoded primary-run indexes are important for latency, but letting this
-// cache consume a full GiB leaves too little headroom for full-text mappings,
-// query work, and write-side state in one process. Cursor scans can
-// temporarily pin more than the limit; release immediately evicts back to
-// this aggregate ResourceManager-aligned ceiling.
-const MaxSmartLsmCacheBytes: u64 = 512 * 1024 * 1024;
+// Primary values and decoded run indexes are the authoritative miss path for
+// HBC. Give their reclaimable cache an elastic ceiling instead of imposing a
+// fixed corpus-size cliff; the aggregate ResourceManager ledger and synchronous
+// reclaim still preserve room for foreground work and the process reserve.
+const MaxSmartLsmCacheBytes: u64 = 8 * GiB;
 const MinSmartLsmCompactionBytes: u64 = 128 * 1024 * 1024;
 const MaxSmartLsmCompactionBytes: u64 = 1024 * 1024 * 1024;
 const MinSmartLsmTableBuilderBytes: u64 = 64 * 1024 * 1024;
@@ -55,7 +54,11 @@ const MinSmartLsmInMemoryStateBytes: u64 = 256 * 1024 * 1024;
 // fairness, while this remains the aggregate process admission ceiling.
 const MaxSmartLsmInMemoryStateBytes: u64 = 768 * 1024 * 1024;
 const MinSmartHbcCacheBytes: u64 = 128 * 1024 * 1024;
-const MaxSmartHbcCacheBytes: u64 = 2 * 1024 * 1024 * 1024;
+// HBC exact vectors are derivative, reclaimable copies of LSM-owned values.
+// A fixed 2 GiB ceiling produces a deterministic corpus-size cliff for 768-D
+// vectors, so this cache is allowed to consume an elastic share of the node
+// envelope while the aggregate ResourceManager budget remains authoritative.
+const MaxSmartHbcCacheBytes: u64 = 16 * GiB;
 const MinSmartDenseApplyBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartDenseApplyBytes: u64 = 512 * 1024 * 1024;
 const MinSmartReplayWindowBytes: u64 = 64 * 1024 * 1024;
@@ -146,6 +149,13 @@ fn resourceBudget(soft_numerator: u64, hard_limit_bytes: u64) resource_manager_m
     };
 }
 
+fn elasticCacheBudget(hard_limit_bytes: u64) resource_manager_mod.Budget {
+    return .{
+        .soft_limit_bytes = hard_limit_bytes * 7 / 8,
+        .hard_limit_bytes = hard_limit_bytes,
+    };
+}
+
 const SmartResourceBudgets = struct {
     options: resource_manager_mod.Options,
     lsm_cache_budget_bytes: usize,
@@ -201,12 +211,12 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     var options = resource_manager_mod.Options{};
     options.memory_budget = resourceBudget(3, safeManagedHostMemory(total));
 
-    const lsm_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCacheBytes, MaxSmartLsmCacheBytes);
+    const lsm_hard = adaptiveSliceHardLimit(total, 4, MinSmartLsmCacheBytes, MaxSmartLsmCacheBytes);
     const lsm_compaction_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmCompactionBytes, MaxSmartLsmCompactionBytes);
     const lsm_table_builder_hard = adaptiveSliceHardLimit(total, 32, MinSmartLsmTableBuilderBytes, MaxSmartLsmTableBuilderBytes);
     const lsm_in_memory_state_hard = adaptiveSliceHardLimit(total, 8, MinSmartLsmInMemoryStateBytes, MaxSmartLsmInMemoryStateBytes);
     const lsm_wal_write_hard = adaptiveSliceHardLimit(total, 16, MinSmartLsmInMemoryStateBytes, MaxSmartLsmInMemoryStateBytes);
-    const hbc_hard = adaptiveSliceHardLimit(total, 12, MinSmartHbcCacheBytes, MaxSmartHbcCacheBytes);
+    const hbc_hard = adaptiveSliceHardLimit(total, 3, MinSmartHbcCacheBytes, MaxSmartHbcCacheBytes);
     const dense_search_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseApplyBytes, MaxSmartDenseApplyBytes);
     const dense_apply_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseApplyBytes, MaxSmartDenseApplyBytes);
     const replay_hard = adaptiveSliceHardLimit(total, 32, MinSmartReplayWindowBytes, MaxSmartReplayWindowBytes);
@@ -219,12 +229,12 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     const dense_repair_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseRepairBytes, MaxSmartDenseRepairBytes);
     const shard_transition_hard = adaptiveSliceHardLimit(total, 24, MinSmartShardTransitionBytes, MaxSmartShardTransitionBytes);
 
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = resourceBudget(3, lsm_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = elasticCacheBudget(lsm_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = resourceBudget(3, lsm_table_builder_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = resourceBudget(3, lsm_in_memory_state_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)] = resourceBudget(3, lsm_wal_write_hard);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = resourceBudget(3, hbc_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = elasticCacheBudget(hbc_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = resourceBudget(3, dense_search_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] = resourceBudget(3, dense_apply_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_routing_working_set)] = resourceBudget(3, dense_apply_hard);
@@ -587,16 +597,16 @@ test "provisioned group storage aligns lsm cache with resource budget" {
     try std.testing.expectEqual(stats.hard_limit_bytes, @as(u64, @intCast(storage.lsm_cache.max_bytes)));
 }
 
-test "provisioned lsm cache budget scales with node memory and remains capped" {
+test "provisioned lsm cache is an elastic share of the node envelope" {
     const small = smartResourceBudgetsForTotal(2 * 1024 * MiB);
     const medium = smartResourceBudgetsForTotal(8 * 1024 * MiB);
     const large = smartResourceBudgetsForTotal(64 * 1024 * MiB);
 
-    try std.testing.expectEqual(@as(usize, 128 * 1024 * 1024), small.lsm_cache_budget_bytes);
-    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), medium.lsm_cache_budget_bytes);
+    try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), small.lsm_cache_budget_bytes);
+    try std.testing.expectEqual(@as(usize, 2 * GiB), medium.lsm_cache_budget_bytes);
     try std.testing.expectEqual(@as(usize, MaxSmartLsmCacheBytes), large.lsm_cache_budget_bytes);
     try std.testing.expect(small.lsm_cache_budget_bytes < medium.lsm_cache_budget_bytes);
-    try std.testing.expectEqual(medium.lsm_cache_budget_bytes, large.lsm_cache_budget_bytes);
+    try std.testing.expect(medium.lsm_cache_budget_bytes < large.lsm_cache_budget_bytes);
 
     inline for (.{
         .{ .budgets = small, .total = 2 * 1024 * MiB },
@@ -606,11 +616,30 @@ test "provisioned lsm cache budget scales with node memory and remains capped" {
         const budgets = fixture.budgets;
         const configured = budgets.options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
         try std.testing.expectEqual(@as(u64, @intCast(budgets.lsm_cache_budget_bytes)), configured.hard_limit_bytes);
-        try std.testing.expectEqual(configured.hard_limit_bytes * 3 / 4, configured.soft_limit_bytes);
+        try std.testing.expectEqual(configured.hard_limit_bytes * 7 / 8, configured.soft_limit_bytes);
         try std.testing.expectEqual(
             safeManagedHostMemory(fixture.total),
             budgets.options.memory_budget.hard_limit_bytes,
         );
+    }
+}
+
+test "provisioned HBC cache is an elastic share of the node envelope" {
+    const small = smartResourceBudgetsForTotal(2 * GiB);
+    const medium = smartResourceBudgetsForTotal(12 * GiB);
+    const large = smartResourceBudgetsForTotal(64 * GiB);
+
+    const small_hbc = small.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+    const medium_hbc = medium.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+    const large_hbc = large.options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+
+    try std.testing.expectEqual(@as(u64, 2 * GiB / 3), small_hbc.hard_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 4 * GiB), medium_hbc.hard_limit_bytes);
+    try std.testing.expectEqual(@as(u64, MaxSmartHbcCacheBytes), large_hbc.hard_limit_bytes);
+    try std.testing.expect(small_hbc.hard_limit_bytes < medium_hbc.hard_limit_bytes);
+    try std.testing.expect(medium_hbc.hard_limit_bytes < large_hbc.hard_limit_bytes);
+    inline for (.{ small_hbc, medium_hbc, large_hbc }) |budget| {
+        try std.testing.expectEqual(budget.hard_limit_bytes * 7 / 8, budget.soft_limit_bytes);
     }
 }
 

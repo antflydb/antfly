@@ -31,6 +31,7 @@ antfly --version
   <TabsContent value="linux">
 ```bash
 curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
 
 # Verify
 antfly --version
@@ -43,12 +44,6 @@ See the [Downloads page](/docs/downloads) for a complete Docker Compose setup wi
 </Tabs>
 
 ## Start Antfly
-
-Pull a multimodal embedding model for text and image search. [Antfly inference](/docs/guides/inference) is Antfly's built-in ML inference engine — it runs quantized models locally for fast inference, no external APIs needed.
-
-```bash
-antfly inference pull antflydb/clipclap:gguf:Q4_K
-```
 
 Start Antfly in standalone mode:
 
@@ -66,16 +61,54 @@ brew services start antfly
 Standalone mode starts metadata, data nodes, and Antfly inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
 </Callout>
 
+### Verify the basic data path
+
+Before starting the longer semantic workflow, verify that storage and full-text
+search work with one document:
+
+```bash
+curl -fsS -X POST http://localhost:8080/db/v1/tables/hello \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+curl -fsS -X POST http://localhost:8080/db/v1/tables/hello/batch \
+  -H "Content-Type: application/json" \
+  -d '{"inserts":{"first":{"title":"Hello","body":"Antfly is ready."}},"sync_level":"full_text"}'
+
+antfly query --table hello \
+  --full-text-search 'body:Antfly' \
+  --fields 'title,body'
+```
+
+The last command should return the document with key `first`. If it does not,
+stop here and use [Troubleshooting](#troubleshooting).
+
+### Install the embedding model
+
+Now pull the multimodal model used for text and image search. [Antfly
+inference](/docs/guides/inference) runs quantized models locally without an
+external API:
+
+```bash
+antfly inference pull antflydb/clipclap:gguf:Q4_K
+antfly inference list
+```
+
+If the running standalone process does not detect the newly installed model,
+restart it once before creating the embeddings index.
+
 ## Download Sample Data
 
 In a new terminal, download 10,000 Wikipedia articles enriched with thumbnail images:
 
 ```bash
-curl -L -o wiki-articles.json https://cdn.antfly.io/datasets/wiki-articles-10k-v001.json
-head -n 1 wiki-articles.json | jq '.'
+curl -L -o wiki-articles.jsonl https://cdn.antfly.io/datasets/wiki-articles-10k-v001.json
+head -n 1 wiki-articles.jsonl | jq '.'
 ```
 
-Each article has `title`, `body`, `url`, and `thumbnail_url` fields.
+The fixture is newline-delimited JSON (JSONL): one article per line. Every
+article has `title`, `body`, and `url`; 2,477 of the 10,000 articles also have
+an optional `thumbnail_url` used later for image search.
 
 ## Create a Table
 
@@ -179,7 +212,7 @@ client.create_table(
             'type': 'embeddings',
             'template': '{{title}} {{body}}',
             'embedder': {
-                'provider': 'inference',
+                'provider': 'antfly',
                 'model': 'antflydb/clipclap',
             },
             'chunker': {
@@ -196,38 +229,42 @@ client.create_table(
 ```go
 import (
 	"context"
+	"fmt"
 	"log"
+	"net/http"
+
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
+	"github.com/antflydb/antfly/go/pkg/sdk/query"
 )
 
-client, err := antfly.NewAntflyClient("http://localhost:8080")
+ctx := context.Background()
+client, err := antfly.NewAntflyClient("http://localhost:8080", http.DefaultClient)
 if err != nil {
 	log.Fatal(err)
 }
 
-_, err = client.CreateTableWithResponse(
-	context.Background(),
-	"wikipedia",
-	antfly.CreateTableJSONRequestBody{
-		Indexes: &map[string]interface{}{
-			"title_body": map[string]interface{}{
-				"type":     "embeddings",
-				"template": "{{title}} {{body}}",
-				"embedder": map[string]interface{}{
-					"provider": "antfly",
-					"model":    "antflydb/clipclap",
-				},
-				"chunker": map[string]interface{}{
-					"provider": "antfly",
-					"text": map[string]interface{}{
-						"target_tokens":  200,
-						"overlap_tokens": 25,
-					},
-				},
-			},
+embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
+	Model: "antflydb/clipclap",
+})
+if err != nil { log.Fatal(err) }
+
+titleBody, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
+	Template: "{{title}} {{body}}",
+	Embedder: *embedder,
+	Chunker: antfly.ChunkerConfig{
+		Provider: antfly.ChunkerProviderAntfly,
+		Text: antfly.TextChunkOptions{
+			TargetTokens: 200,
+			OverlapTokens: 25,
 		},
 	},
-)
+})
+if err != nil { log.Fatal(err) }
+
+err = client.CreateTable(ctx, "wikipedia", antfly.CreateTableRequest{
+	Indexes: map[string]antfly.CreateIndexRequest{"title_body": *titleBody},
+})
+if err != nil { log.Fatal(err) }
 ```
   </TabsContent>
 
@@ -268,170 +305,61 @@ antfly table list
 antfly index list --table wikipedia
 ```
 
+Antfly also provisions `full_text_index_v0` automatically. That default index
+is what makes the full-text query later in this guide work; `title_body` is the
+managed embeddings index created above.
+
 ## Load Data
 
-<Tabs defaultValue="cli">
-  <TabsList>
-    <TabsTrigger value="cli">CLI</TabsTrigger>
-    <TabsTrigger value="curl">cURL</TabsTrigger>
-    <TabsTrigger value="typescript">TypeScript</TabsTrigger>
-    <TabsTrigger value="python">Python</TabsTrigger>
-    <TabsTrigger value="go">Go</TabsTrigger>
-    <TabsTrigger value="rust">Rust</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="cli">
 ```bash
 # Load all 10,000 articles using the title as the document ID
 antfly load --table wikipedia \
-  --file wiki-articles.json \
-  --id-field title
+  --file wiki-articles.jsonl \
+  --id-field title \
+  --sync-level full_text
 ```
-  </TabsContent>
-
-  <TabsContent value="curl">
-```bash
-# The CLI 'load' command handles batching automatically.
-# With cURL, send documents via the batch endpoint:
-curl -X POST http://localhost:8080/db/v1/tables/wikipedia/batch \
-  -H "Content-Type: application/json" \
-  -d '{
-    "inserts": {
-      "Albert Einstein": {
-        "title": "Albert Einstein",
-        "body": "Albert Einstein was a German-born theoretical physicist...",
-        "url": "https://en.wikipedia.org/wiki/Albert_Einstein"
-      },
-      "Marie Curie": {
-        "title": "Marie Curie",
-        "body": "Marie Curie was a Polish-French physicist and chemist...",
-        "url": "https://en.wikipedia.org/wiki/Marie_Curie"
-      }
-    }
-  }'
-```
-  </TabsContent>
-
-  <TabsContent value="typescript">
-```typescript
-// Using client from above
-await client.tables.batch('wikipedia', {
-  inserts: {
-    'Albert Einstein': {
-      title: 'Albert Einstein',
-      body: 'Albert Einstein was a German-born theoretical physicist...',
-      url: 'https://en.wikipedia.org/wiki/Albert_Einstein',
-    },
-    'Marie Curie': {
-      title: 'Marie Curie',
-      body: 'Marie Curie was a Polish-French physicist and chemist...',
-      url: 'https://en.wikipedia.org/wiki/Marie_Curie',
-    },
-  },
-});
-```
-  </TabsContent>
-
-  <TabsContent value="python">
-```python
-# Using client from above
-client.batch(
-    table='wikipedia',
-    inserts={
-        'Albert Einstein': {
-            'title': 'Albert Einstein',
-            'body': 'Albert Einstein was a German-born theoretical physicist...',
-            'url': 'https://en.wikipedia.org/wiki/Albert_Einstein',
-        },
-        'Marie Curie': {
-            'title': 'Marie Curie',
-            'body': 'Marie Curie was a Polish-French physicist and chemist...',
-            'url': 'https://en.wikipedia.org/wiki/Marie_Curie',
-        },
-    },
-)
-```
-  </TabsContent>
-
-  <TabsContent value="go">
-```go
-// Using client from above
-_, err = client.BatchTableWithResponse(
-	context.Background(),
-	"wikipedia",
-	antfly.BatchTableJSONRequestBody{
-		Inserts: &map[string]interface{}{
-			"Albert Einstein": map[string]interface{}{
-				"title": "Albert Einstein",
-				"body":  "Albert Einstein was a German-born theoretical physicist...",
-				"url":   "https://en.wikipedia.org/wiki/Albert_Einstein",
-			},
-			"Marie Curie": map[string]interface{}{
-				"title": "Marie Curie",
-				"body":  "Marie Curie was a Polish-French physicist and chemist...",
-				"url":   "https://en.wikipedia.org/wiki/Marie_Curie",
-			},
-		},
-	},
-)
-```
-  </TabsContent>
-
-  <TabsContent value="rust">
-```rust
-// Using client from above
-use antfly_sdk::types::BatchTableBody;
-use std::collections::HashMap;
-
-let mut inserts = HashMap::new();
-inserts.insert(
-    "Albert Einstein".to_string(),
-    json!({
-        "title": "Albert Einstein",
-        "body": "Albert Einstein was a German-born theoretical physicist...",
-        "url": "https://en.wikipedia.org/wiki/Albert_Einstein"
-    }),
-);
-inserts.insert(
-    "Marie Curie".to_string(),
-    json!({
-        "title": "Marie Curie",
-        "body": "Marie Curie was a Polish-French physicist and chemist...",
-        "url": "https://en.wikipedia.org/wiki/Marie_Curie"
-    }),
-);
-
-client
-    .batch_table(
-        "wikipedia",
-        &BatchTableBody {
-            inserts: Some(inserts),
-            ..Default::default()
-        },
-    )
-    .await?;
-```
-  </TabsContent>
-</Tabs>
 
 <Callout type="info">
-The CLI `load` command reads a JSON file and batches documents automatically. For SDK usage with large files, see the [Batch Operations](/docs/api/data-operations) documentation.
+This shared load step ensures that every query tab below runs against the same
+dataset. `full_text` fences the inexpensive text index for each load batch but
+does not wait for embeddings, which continue asynchronously. The CLI reads
+JSONL and batches documents automatically. Applications
+that need to own ingestion should use the SDK [Batch Operations](/docs/api/data-operations)
+workflow with bounded batches and retries.
 </Callout>
 
-Embedding generation runs in the background. Wait for the semantic index to be
-fully queryable before running semantic, hybrid, or RAG examples:
+Embedding generation runs in the background. Managed embeddings indexes use
+progressive publication by default, so a safely checkpointed partial generation
+can serve semantic queries while source coverage continues in the background.
+To wait only for that first queryable generation, run:
 
 ```bash
 antfly index wait --table wikipedia \
   --index title_body \
+  --queryable \
   --timeout 20m
 ```
 
+Continue as soon as this command succeeds. The examples below search the safely
+published portion of the index while the remaining documents continue indexing,
+so result counts and rankings can improve as coverage grows. When an application
+requires a fixed, fully covered corpus, omit `--queryable` to wait for the
+stronger `ready` state instead.
+
 Use `antfly index list --table wikipedia` for a compact progress summary, or
 add `--output json` for the complete diagnostic payload.
-On a laptop, the initial local-model download and 10,000-document backfill can
-take several minutes; the wait command reports bounded periodic progress and
-enforces the timeout.
+Model startup and time-to-first-result depend on hardware. The wait command
+reports bounded periodic progress and enforces the timeout; do not continue if
+it times out before the index becomes queryable. Use `publication_policy:
+atomic` when a replacement generation must remain unavailable until fully built
+and validated. See [Troubleshooting](#troubleshooting) below.
+
+<Callout type="info">
+For chunked indexes, `INDEXED` and `VISIBLE` describe physical chunks or vector
+records, not source documents, so they can exceed 10,000. The JSON status also
+contains generation-scoped source coverage. `queryable_partial` means the active
+generation is safe to query but incomplete; `ready` means coverage is complete.
+</Callout>
 
 ## Search
 
@@ -506,24 +434,17 @@ for hit in results.hits:
 
   <TabsContent value="go">
 ```go
-resp, err := client.QueryWithResponse(
-	context.Background(),
-	antfly.QueryJSONRequestBody{
-		Table: strPtr("wikipedia"),
-		FullTextSearch: &antfly.FullTextSearch{
-			Query: strPtr("body:\"Korea\""),
-		},
-		Fields: &[]string{"title", "url"},
-		Limit:  intPtr(5),
-	},
-)
+fullText := query.NewQueryString(`body:"Korea"`)
+results, err := client.Query(ctx, antfly.QueryRequest{
+	Table:          "wikipedia",
+	FullTextSearch: &fullText,
+	Fields:         []string{"title", "url"},
+	Limit:          5,
+})
 if err != nil {
 	log.Fatal(err)
 }
-
-for _, hit := range resp.JSON200.Hits {
-	fmt.Printf("%s: %v\n", hit.Key, hit.Fields)
-}
+fmt.Printf("%+v\n", results)
 ```
   </TabsContent>
 
@@ -626,23 +547,17 @@ for hit in results.hits:
 
   <TabsContent value="go">
 ```go
-resp, err := client.QueryWithResponse(
-	context.Background(),
-	antfly.QueryJSONRequestBody{
-		Table:          strPtr("wikipedia"),
-		SemanticSearch: strPtr("anatomy and physiology"),
-		Indexes:        &[]string{"title_body"},
-		Fields:         &[]string{"title", "url"},
-		Limit:          intPtr(5),
-	},
-)
+results, err := client.Query(ctx, antfly.QueryRequest{
+	Table:          "wikipedia",
+	SemanticSearch: "anatomy and physiology",
+	Indexes:        []string{"title_body"},
+	Fields:         []string{"title", "url"},
+	Limit:          5,
+})
 if err != nil {
 	log.Fatal(err)
 }
-
-for _, hit := range resp.JSON200.Hits {
-	fmt.Printf("%s: %v\n", hit.Key, hit.Fields)
-}
+fmt.Printf("%+v\n", results)
 ```
   </TabsContent>
 
@@ -765,7 +680,7 @@ results = client.query(
     fields=['title', 'url'],
     limit=10,
     reranker={
-        'provider': 'inference',
+        'provider': 'antfly',
         'model': 'mixedbread-ai/mxbai-rerank-base-v1',
         'field': 'body',
     },
@@ -776,27 +691,24 @@ results = client.query(
 
   <TabsContent value="go">
 ```go
-resp, err := client.QueryWithResponse(
-	context.Background(),
-	antfly.QueryJSONRequestBody{
-		Table:          strPtr("wikipedia"),
-		FullTextSearch: &antfly.FullTextSearch{
-			Query: strPtr("body:Einstein"),
-		},
-		SemanticSearch: strPtr("theory of relativity and physics"),
-		Indexes:        &[]string{"title_body"},
-		Fields:         &[]string{"title", "url"},
-		Limit:          intPtr(10),
-		Reranker: &antfly.Reranker{
-			Provider: strPtr("antfly"),
-			Model:    strPtr("mixedbread-ai/mxbai-rerank-base-v1"),
-			Field:    strPtr("body"),
-		},
-		Pruner: &antfly.Pruner{
-			MinScoreRatio: float64Ptr(0.01),
-		},
-	},
-)
+reranker, err := antfly.NewRerankerConfig(antfly.AntflyRerankerConfig{
+	Model: "mixedbread-ai/mxbai-rerank-base-v1",
+})
+if err != nil { log.Fatal(err) }
+reranker.Field = "body"
+fullText = query.NewQueryString("body:Einstein")
+results, err := client.Query(ctx, antfly.QueryRequest{
+	Table:          "wikipedia",
+	FullTextSearch: &fullText,
+	SemanticSearch: "theory of relativity and physics",
+	Indexes:        []string{"title_body"},
+	Fields:         []string{"title", "url"},
+	Limit:          10,
+	Reranker:       reranker,
+	Pruner:         antfly.Pruner{MinScoreRatio: 0.01},
+})
+if err != nil { log.Fatal(err) }
+fmt.Printf("%+v\n", results)
 ```
   </TabsContent>
 
@@ -937,7 +849,7 @@ created_index = client.indexes.create(
 embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
 	Model: "antflydb/clipclap",
 })
-if err != nil { return err }
+if err != nil { log.Fatal(err) }
 request, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
 	CoveragePolicy: antfly.DerivedCoveragePolicyPartial,
 	Template:       "{{#if thumbnail_url}}{{remoteMedia url=thumbnail_url}}{{/if}}",
@@ -945,9 +857,10 @@ request, err := antfly.NewCreateIndexRequest(antfly.EmbeddingsIndexConfig{
 	Dimension:      512,
 	DistanceMetric: antfly.DistanceMetricCosine,
 })
-if err != nil { return err }
-createdIndex, err := client.CreateIndex(context.Background(), "wikipedia", "thumbnail", *request)
-if err != nil { return err }
+if err != nil { log.Fatal(err) }
+createdIndex, err := client.CreateIndex(ctx, "wikipedia", "thumbnail", *request)
+if err != nil { log.Fatal(err) }
+fmt.Printf("%+v\n", createdIndex)
 ```
   </TabsContent>
 
@@ -978,6 +891,7 @@ Adding an index to a table with existing data triggers background embedding gene
 ```bash
 antfly index wait --table wikipedia \
   --index thumbnail \
+  --queryable \
   --timeout 20m
 ```
 
@@ -1047,16 +961,15 @@ results = client.query(
 
   <TabsContent value="go">
 ```go
-resp, err := client.QueryWithResponse(
-	context.Background(),
-	antfly.QueryJSONRequestBody{
-		Table:          strPtr("wikipedia"),
-		SemanticSearch: strPtr("map of a country"),
-		Indexes:        &[]string{"thumbnail"},
-		Fields:         &[]string{"title", "url", "thumbnail_url"},
-		Limit:          intPtr(5),
-	},
-)
+results, err := client.Query(ctx, antfly.QueryRequest{
+	Table:          "wikipedia",
+	SemanticSearch: "map of a country",
+	Indexes:        []string{"thumbnail"},
+	Fields:         []string{"title", "url", "thumbnail_url"},
+	Limit:          5,
+})
+if err != nil { log.Fatal(err) }
+fmt.Printf("%+v\n", results)
 ```
   </TabsContent>
 
@@ -1209,7 +1122,7 @@ result = client.agents.retrieval(
         'fields': ['title', 'body'],
         'limit': 5,
         'reranker': {
-            'provider': 'inference',
+            'provider': 'antfly',
             'model': 'mixedbread-ai/mxbai-rerank-base-v1',
             'field': 'body',
         },
@@ -1231,37 +1144,35 @@ result = client.agents.retrieval(
 
   <TabsContent value="go">
 ```go
-resp, err := client.RetrievalAgentWithResponse(
-	context.Background(),
-	antfly.RetrievalAgentJSONRequestBody{
-		Queries: &[]antfly.QueryBody{{
-			Table:          strPtr("wikipedia"),
-			SemanticSearch: strPtr("What are the major events in Korean history?"),
-			Indexes:        &[]string{"title_body"},
-			Fields:         &[]string{"title", "body"},
-			Limit:          intPtr(5),
-			Reranker: &antfly.Reranker{
-				Provider: strPtr("antfly"),
-				Model:    strPtr("mixedbread-ai/mxbai-rerank-base-v1"),
-				Field:    strPtr("body"),
-			},
-			Pruner: &antfly.Pruner{
-				MinScoreRatio:      float64Ptr(0.6),
-				MaxScoreGapPercent: float64Ptr(40),
-			},
-		}},
-		Generator: &antfly.Generator{
-			Provider: strPtr("antfly"),
-			Model:    strPtr("ggml-org/gemma-4-E4B-it-GGUF"),
-			MaxTokens: 128,
+generator, err := antfly.NewGeneratorConfig(antfly.AntflyGeneratorConfig{
+	Model: "ggml-org/gemma-4-E4B-it-GGUF",
+	MaxTokens: 128,
+})
+if err != nil { log.Fatal(err) }
+fields := []string{"title", "body"}
+result, err := client.RetrievalAgent(ctx, antfly.RetrievalAgentRequest{
+	Queries: []antfly.RetrievalQueryRequest{{
+		Table:          "wikipedia",
+		SemanticSearch: "What are the major events in Korean history?",
+		Indexes:        []string{"title_body"},
+		Fields:         &fields,
+		Limit:          5,
+		Reranker:       reranker,
+		Pruner: antfly.Pruner{
+			MinScoreRatio:      0.6,
+			MaxScoreGapPercent: 40,
 		},
-		MaxContextTokens: intPtr(512),
-		Classify:         boolPtr(true),
-		Reasoning:        boolPtr(true),
-		Generate:         boolPtr(true),
-		Followup:         boolPtr(true),
+	}},
+	Generator:        *generator,
+	MaxContextTokens: 512,
+	Steps: antfly.RetrievalAgentSteps{
+		Classification: antfly.ClassificationStepConfig{Enabled: true, WithReasoning: true},
+		Generation:     antfly.GenerationStepConfig{Enabled: true},
+		Followup:       antfly.FollowupStepConfig{Enabled: true},
 	},
-)
+})
+if err != nil { log.Fatal(err) }
+fmt.Printf("%+v\n", result)
 ```
   </TabsContent>
 
@@ -1412,6 +1323,77 @@ Available evaluators:
 - **Retrieval metrics** (require `ground_truth.relevant_ids`): `recall`, `precision`, `ndcg`, `mrr`, `map`
 - **LLM-as-judge metrics** (require `judge` config): `relevance`, `faithfulness`, `completeness`, `coherence`, `safety`, `helpfulness`, `correctness`, `citation_quality`
 </Steps>
+
+## Troubleshooting
+
+### `antfly` is not found after the Linux install
+
+The user installer places the binary in `~/.local/bin`. Make it available in
+the current terminal, then retry:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+antfly --version
+```
+
+### Antfly reports a legacy data directory
+
+Antfly refuses to overwrite a legacy Go-runtime directory. Keep that directory
+intact, back it up with the old runtime, and start this quickstart with a new
+database directory:
+
+```bash
+antfly standalone --data-dir "$HOME/.antfly-zig" 2>&1 | tee antfly.log
+```
+
+Models remain in the documented `~/.antfly/inference/models` store unless you
+explicitly pass `--models-dir` or set `ANTFLY_INFERENCE_MODELS_DIR`.
+
+### `MODEL_NOT_FOUND`
+
+Confirm that the requested model is installed and inspect the resolved model
+directory printed in the standalone startup log:
+
+```bash
+antfly inference list
+grep -F 'standalone inference paths' antfly.log
+```
+
+Pull the missing model again, or pass the intended directory explicitly with
+`antfly standalone --models-dir <path>`.
+
+### An index remains pending or `index wait` times out
+
+Do not continue to semantic, image, or RAG steps until the relevant index is
+queryable. `queryable_partial` is safe to use while coverage grows; `pending` is
+not. If `index wait --queryable` times out, capture the full status and recent
+watchdog messages:
+
+```bash
+antfly index list --table wikipedia --output json | jq '.'
+grep -E 'watchdog|derived worker|NotFound|EnrichmentWaitTimeout' antfly.log | tail -n 100
+```
+
+Remember that physical chunk/vector counts can exceed source-document counts.
+Continual growth for unchanged source data, no generation-coverage progress, or
+an unexplained `ready` to `pending` transition should be reported with the JSON
+status, log excerpt, Antfly version, and startup command.
+
+### Startup reports a port conflict or memory error
+
+Stop the process already using ports 8080 or 4200, or select different public
+and health ports with `--port` and `--health-port`. For memory errors, stop
+other large local models and retry with a smaller model or a larger process
+memory envelope appropriate for the machine.
+
+### Stop the quickstart
+
+Press <kbd>Ctrl</kbd>+<kbd>C</kbd> in the standalone terminal. If you used
+Homebrew services, run:
+
+```bash
+brew services stop antfly
+```
 
 ## Next Steps
 

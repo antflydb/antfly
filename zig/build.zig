@@ -3040,6 +3040,7 @@ pub fn build(b: *std.Build) void {
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
+            "failed destination authorization refresh reuses the idempotent restore job",
             "delayed replicated restore refresh cannot regress a running job",
             "restore job store is idempotent and fenced",
             "restore idempotency keys are scoped by principal and resource",
@@ -3149,8 +3150,23 @@ pub fn build(b: *std.Build) void {
         .root_module = image_test_mod,
     });
     const run_lib_image_tests = b.addRunArtifact(lib_image_tests);
+    const jpeg2000_decode_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/image/src/jpeg2000/decode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const jpeg2000_decode_tests = b.addTest(.{
+        .root_module = jpeg2000_decode_test_mod,
+    });
+    const run_jpeg2000_decode_tests = b.addRunArtifact(jpeg2000_decode_tests);
+    const jpeg2000_decode_test_step = b.step(
+        "lib-image-jpeg2000-test",
+        "Run direct JPEG 2000 decoder tests",
+    );
+    jpeg2000_decode_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
     lib_image_test_step.dependOn(&run_lib_image_tests.step);
+    lib_image_test_step.dependOn(&run_jpeg2000_decode_tests.step);
 
     const pdf_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/pdf_test_root.zig"),
@@ -3502,6 +3518,21 @@ pub fn build(b: *std.Build) void {
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
 
+    const lib_preload_model_spec_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "preload model spec parser categorizes registry variants and backends",
+            "inference runtime preload parser preserves registry variants and explicit backends",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_preload_model_spec_tests = addFilteredTestRunArtifact(b, lib_preload_model_spec_tests);
+    const lib_preload_model_spec_test_step = b.step("lib-preload-model-spec-test", "Run preload model CLI parser tests");
+    lib_preload_model_spec_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
+
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{ "file secret store", "remote content runtime" },
@@ -3522,7 +3553,7 @@ pub fn build(b: *std.Build) void {
     antfly_imports.configure(b, api_cluster_secret_status_test_mod, true, true);
     const api_cluster_secret_status_tests = b.addTest(.{
         .root_module = api_cluster_secret_status_test_mod,
-        .filters = &.{"cluster status carries non-secret"},
+        .filters = &.{ "cluster status carries non-secret", "cluster topology owns snapshot data" },
     });
     const run_api_cluster_secret_status_tests = addFilteredTestRunArtifact(b, api_cluster_secret_status_tests);
     lib_common_secrets_test_step.dependOn(&run_api_cluster_secret_status_tests.step);
@@ -3614,6 +3645,7 @@ pub fn build(b: *std.Build) void {
     };
     const unit_progress_skip_filters = root_test_skip_filters;
     const lib_unit_default_filters = [_][]const u8{
+        "bedrock provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
         "restore runtime store persists checkpoints and requeues interrupted work",
@@ -3696,6 +3728,7 @@ pub fn build(b: *std.Build) void {
         "partial coverage embeddings readiness counts skipped source units",
         "partial coverage embeddings readiness does not mask pending enrichment",
         "complete partial embeddings coverage is ready after active generation proof",
+        "progressive embeddings readiness exposes a queryable partial generation",
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
         "table contract rejects unsupported index kinds before admission",
@@ -3890,6 +3923,18 @@ pub fn build(b: *std.Build) void {
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
+    const lib_bedrock_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"bedrock provider request helpers"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_bedrock_tests = addFilteredTestRunArtifact(b, lib_bedrock_tests);
+    const lib_bedrock_test_step = b.step("lib-bedrock-test", "Run focused Bedrock provider tests");
+    lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
+
     const api_http_runtime_default_filters = [_][]const u8{
         "api http client round-trips public status and internal capability routes",
         "api http retryable embedding failures provide retry guidance",
@@ -3906,6 +3951,7 @@ pub fn build(b: *std.Build) void {
         "table read source distinguishes unavailable physical capability observation",
         "generated route policy inventory is unique and describes wire modes",
         "linked API dispatch preserves kernel-owned ingress policy",
+        "opaque host middleware protects direct internal routes across the kernel ABI",
         "linked transport projects the universal request cancellation callback",
         "linked transport admits a streaming body before the kernel pulls it",
         "linked callbacks preserve streaming and cancellation semantics",
@@ -3915,6 +3961,7 @@ pub fn build(b: *std.Build) void {
         "native executor borrows validate before reconstructing std.Io",
         "httpx production path sheds 128 abandoned queries and preserves control recovery",
         "httpx write admission rejects saturated table mutations",
+        "httpx owned response preserves retryable JSON metadata",
         "httpx inference connection uses the configured shared admission owner",
         "local inference connection admission is owned exactly once by its target",
         "httpx inference connection requires inference write permission",
@@ -4633,8 +4680,10 @@ pub fn build(b: *std.Build) void {
             "retained document collection allocations compose with the hard working-set cap",
             "document replay payloads are admitted before persistent allocation",
             "document extraction generated OCR bypasses unsupported native batch",
+            "document-wide OCR resource failure preserves units and marks pending pages",
             "OCR pending metadata construction is allocation-failure safe",
             "generated text provider config is validated while parsing extraction config",
+            "PDF text regions use reconstructed output spans",
             "public enrichment validation rejects invalid execution and producer config",
             "enrichment runtime document extraction manifest uses v2 range and merge shape",
             "enrichment runtime document extraction state parses byte-array keys",
@@ -5427,6 +5476,52 @@ pub fn build(b: *std.Build) void {
     const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
     lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
 
+    const authorization_sink_filters = [_][]const u8{
+        "api http server document scan requires table read permission",
+        "transaction principals bind sessions to credential identity",
+        "api transaction sessions enforce principal permissions and row filters",
+        "stored destination admission requires write permission on every eventual sink",
+        "query builder runtime preflight injects mandatory row filter",
+        "stored destination envelopes cannot be forged and validate on resume",
+        "stored destination grants bind credential source and live permissions",
+        "api http client forwards bounded raft batch routing context without allocation",
+        "api http client authenticates only the internal API namespace",
+        "MCP document sampling pushes mandatory row filters into storage scans",
+        "internal service credentials cannot authorize public inference routes",
+        "legacy restore jobs resume only when backed-up definitions are sink free",
+        "failed destination authorization refresh reuses the idempotent restore job",
+        "destination authorization adoption requires source table admin",
+        "legacy stored destinations can be adopted idempotently",
+        "api http server cluster restore",
+        "cluster restore repository errors preserve operational failure semantics",
+        "internal namespace requires a service principal except HA",
+        "usermgr api key permission intersection narrows owner and key wildcards",
+        "httpx internal control routes call typed operations directly",
+    };
+    const authorization_sink_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &authorization_sink_filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_authorization_sink_tests = addFilteredTestRunArtifact(b, authorization_sink_tests);
+    run_authorization_sink_tests.step.dependOn(&openapi_root_check.step);
+    const authorization_sink_test_step = b.step(
+        "lib-api-authorization-sink-test",
+        "Run exploit regressions for API authorization sinks",
+    );
+    authorization_sink_test_step.dependOn(&run_authorization_sink_tests.step);
+    authorization_sink_test_step.dependOn(&run_lib_usermgr_tests.step);
+
+    const authorization_audit_step = b.step(
+        "authorization-audit",
+        "Run the authorization sink audit and broader API auth suite",
+    );
+    authorization_audit_step.dependOn(authorization_sink_test_step);
+    authorization_audit_step.dependOn(lib_api_auth_test_step);
+
     const algebraic_dynamic_template_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -6007,6 +6102,7 @@ pub fn build(b: *std.Build) void {
             "encode query request includes named vector embeddings for routed semantic search",
             "storage-kernel query wire round trips graph-only requests",
             "provisioned reads advertise owner-backed physical sort evidence",
+            "profiled composed dense query preserves exact route telemetry",
             "aggregation completeness requires exact total relation",
             "distributed grouped hierarchy expands only the globally merged page",
             "distributed grouped unit expansion rejects a cross-revision result",
@@ -6192,6 +6288,8 @@ pub fn build(b: *std.Build) void {
             "runtime status cache stable absence removal retires the old table epoch",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
+            "progressive embeddings readiness exposes a queryable partial generation",
+            "managed embedder preserves atomic publication policy",
             "derived coverage reasons deduplicate overlapping freshness signals",
             "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
             "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
@@ -6538,6 +6636,7 @@ pub fn build(b: *std.Build) void {
         "metadata linearizable snapshot fences and frees one owned response",
         "metadata linearizable snapshot detects concurrent projection changes",
         "coherent linearizable snapshot retries a torn capture and preserves request context",
+        "metadata http client signs internal routes without leaking authority to public routes",
         "metadata http client fetches one bounded linearizable snapshot",
         "metadata http client treats missing linearizable snapshot route as unsupported",
         "metadata http server accepts internal reallocate and split merge routes",
@@ -6649,6 +6748,9 @@ pub fn build(b: *std.Build) void {
         "resource manager records index repair activation pause separately from cleanup",
         "catchUpIndex refuses to open an apply window after its deadline",
         "cache reports shared byte usage to resource manager",
+        "cache falls back to a transient handle when retention exceeds the resource envelope",
+        "cache transfers existing usage when resource manager changes",
+        "shared LSM cache yields to foreground aggregate admission",
         "lsm backend resource manager throttles projected immutable state",
         "lsm backend resource manager rejects before wal apply",
         "derived backlog tracker accounts and releases payload bytes",
@@ -6656,10 +6758,43 @@ pub fn build(b: *std.Build) void {
         "derived backlog tracker bounds sequence-only admission drain window",
         "hbc shared cache namespaces entries",
         "hbc shared cache evicts across namespaces under one resource budget",
+        "hbc shared cache CLOCK refreshes recency on borrowed vector hits",
+        "hbc shared vector replacement cannot return an older external value",
+        "hbc vector fill captured before a committed mutation cannot repopulate stale data",
+        "hbc shared detached leases remain physically accounted until release",
+        "hbc standalone detached leases remain physically accounted until release",
+        "hbc standalone cache yields to foreground aggregate admission",
+        "hbc concurrent vector admission samples at a full steady target",
+        "hbc exact-route vector admission samples outside the search epoch",
+        "hbc decoded residency lease reserves a complete query and bypasses mid-query sampling",
+        "hbc sampled decoded residency evolves a full resident set within its byte target",
+        "hbc decoded residency fails closed when pinned entries prevent precharge",
+        "hbc route observation counts external distance timing once",
+        "dense vector load session switches to retained LSM ownership before reservation overrun",
+        "production external vector session evolves a saturated decoded resident set",
+        "hbc shared cache reclaims exact vectors before protected routing nodes",
+        "hbc shared cache reclaims an over-quota namespace for a borrowing peer",
+        "hbc shared vector cache warms during concurrent search",
+        "hbc external rerank loads metadata only for decoded vector misses",
+        "hbc shared vector publication coalesces concurrent duplicate fills",
+        "hbc retained node and quantized handles survive threaded eviction",
+        "hbc vector artifact reads avoid duplicate LSM block residency only with retained vectors",
+        "searchWithRequest applies filter prefix and distance bounds",
         "hbc cache reports byte usage to resource manager",
+        "hbc resource manager reattachment is idempotent and transfers local cache usage",
         "hbc cache shrinks to resource budget under pressure",
+        "resource manager derives elastic HBC cache-class policy from pressure",
+        "resource manager bounds adaptive HBC benefit-per-byte targets",
+        "adaptive HBC benefit retains miss cost through all-hit samples",
+        "resource manager apportions reclaim across weighted cache owners",
+        "resource manager invokes reclaimers without holding registry mutex",
+        "foreground admission reclaims cache bytes and retries atomically",
+        "classified batch chooses foreground requester when cache slice is first",
         "resource-managed mapped residency evicts cold segments and preserves hot mappings",
         "provisioned group storage derives all resource budgets",
+        "provisioned lsm cache is an elastic share of the node envelope",
+        "provisioned HBC cache is an elastic share of the node envelope",
+        "standalone resource manager derives elastic storage cache envelopes",
         "effective process memory limit preserves source and clamps explicit requests",
         "resource manager capacity source is immutable after composition",
         "capacity reservation revalidation fails closed when available space falls",
@@ -6983,6 +7118,7 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
             "parse cli accepts canonical host port and models dir flags",
+            "parse cli preserves registry variants and recognizes explicit preload backends",
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
             "parse cli accepts HA standby runtime flags",
@@ -7010,6 +7146,7 @@ pub fn build(b: *std.Build) void {
             "inference admission bridge charges combined native residency to resource manager",
             "standalone tokenizer bridge enforces growth and permits exact teardown",
             "standalone inference keep alive parses compound durations and zero",
+            "standalone data directory does not change the default models directory",
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked inference ABI rejects mismatched context and function-table prefixes",
             "standalone local inference lifetime distinguishes deadline from upstream cancellation",
@@ -7071,6 +7208,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
+    unit_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_httpx_transport_regression_tests.step);
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
@@ -7100,6 +7238,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_mcp_tests.step);
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
+    unit_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     unit_test_step.dependOn(&run_lib_pdf_tests.step);
     unit_test_step.dependOn(&run_lib_scraping_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
@@ -7517,7 +7656,13 @@ pub fn build(b: *std.Build) void {
     const release_blocker_regression_filters = [_][]const u8{
         "non-visible doc set complements visibility per generation",
         "built-in exact dense scorer filters metadata before vector reads",
+        "dense search route reports exact native filter budget decisions",
+        "dense search route uses measured per-index costs pressure and hysteresis",
         "one percent filtered route preserves exact recall with candidate-linear IO",
+        "dense index manager accepts external embedding indexes without enrichments",
+        "production external scorers use bounded cache-first artifact batches",
+        "progressive filtered l2 traversal preserves exact top k and stops on leaf bounds",
+        "flat rabitq filtered traversal advances past its initial probe wave safely",
         "sorted unique vector id subtraction handles sparse and dense exclusions",
     };
     const release_blocker_regression_tests = b.addTest(.{
@@ -9930,6 +10075,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     public_query_guardrail_mod.addImport("antfly-zig", lib_mod);
+    public_query_guardrail_mod.addImport("httpx", httpx_mod);
+    const public_query_guardrail_build_options = b.addOptions();
+    public_query_guardrail_build_options.addOption(bool, "standalone_only", false);
+    public_query_guardrail_mod.addOptions("public_query_guardrail_build_options", public_query_guardrail_build_options);
 
     const public_query_guardrail = b.addExecutable(.{
         .name = "public_query_guardrail",
@@ -9963,6 +10112,31 @@ pub fn build(b: *std.Build) void {
     build_public_query_guardrail_step.dependOn(&public_query_guardrail.step);
     const public_query_guardrail_step = b.step("public-query-guardrail", "Benchmark the public /db/v1/tables/<table>/query path against direct DB search and health responsiveness");
     public_query_guardrail_step.dependOn(&run_public_query_guardrail.step);
+
+    // The direct handler compatibility lane still intentionally exercises
+    // internal API construction. Production scale qualification needs only
+    // the standalone process boundary, so keep a build that does not compile
+    // unreachable direct-executor code into the rollout harness.
+    const public_query_standalone_guardrail_mod = b.createModule(.{
+        .root_source_file = b.path("bench/storage/public_query_guardrail.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    public_query_standalone_guardrail_mod.addImport("antfly-zig", lib_mod);
+    public_query_standalone_guardrail_mod.addImport("httpx", httpx_mod);
+    const public_query_standalone_guardrail_build_options = b.addOptions();
+    public_query_standalone_guardrail_build_options.addOption(bool, "standalone_only", true);
+    public_query_standalone_guardrail_mod.addOptions("public_query_guardrail_build_options", public_query_standalone_guardrail_build_options);
+    const public_query_standalone_guardrail = b.addExecutable(.{
+        .name = "public_query_standalone_guardrail",
+        .root_module = public_query_standalone_guardrail_mod,
+    });
+    const run_public_query_standalone_guardrail = b.addRunArtifact(public_query_standalone_guardrail);
+    if (b.args) |args| run_public_query_standalone_guardrail.addArgs(args);
+    const build_public_query_standalone_guardrail_step = b.step("public-query-standalone-guardrail-build", "Build the production standalone public-query cache qualification harness");
+    build_public_query_standalone_guardrail_step.dependOn(&public_query_standalone_guardrail.step);
+    const public_query_standalone_guardrail_step = b.step("public-query-standalone-guardrail", "Run the production standalone public-query cache qualification harness");
+    public_query_standalone_guardrail_step.dependOn(&run_public_query_standalone_guardrail.step);
     const raft_apply_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/raft_apply_bench.zig"),
         .target = target,

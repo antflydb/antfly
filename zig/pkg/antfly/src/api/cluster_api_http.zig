@@ -49,6 +49,7 @@ pub const ClusterApi = struct {
         BackupRepositoryBusy,
         BackupManifestTooLarge,
         BackupIntegrityFailure,
+        RestoreDestinationReauthorizationRequired,
         TableAlreadyExists,
         MethodNotAllowed,
         Cancelled,
@@ -81,6 +82,7 @@ pub const ClusterApi = struct {
             req: backups_api.ClusterRestoreRequest,
             location: *backups_api.BackupLocation,
             restore_mode: []const u8,
+            request: operation.RequestContext,
         ) ExecuteRestoreError!RestoreExecution,
     };
 
@@ -110,8 +112,9 @@ pub const ClusterApi = struct {
         req: backups_api.ClusterRestoreRequest,
         location: *backups_api.BackupLocation,
         restore_mode: []const u8,
+        request: operation.RequestContext,
     ) ExecuteRestoreError!RestoreExecution {
-        return try self.vtable.execute_cluster_restore(self.ptr, alloc, req, location, restore_mode);
+        return try self.vtable.execute_cluster_restore(self.ptr, alloc, req, location, restore_mode, request);
     }
 };
 
@@ -220,6 +223,7 @@ pub fn handleClusterRestore(
     secret_store: ?*common_secrets.FileStore,
     node_config: ?*const common_config.Config,
     io: ?std.Io,
+    request: operation.RequestContext,
 ) !OwnedResponse {
     var req = backups_api.parseClusterRestoreRequest(alloc, body) catch {
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
@@ -247,12 +251,13 @@ pub fn handleClusterRestore(
         return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
     };
 
-    const result = api.executeClusterRestore(alloc, req, &location, restore_mode) catch |err| switch (err) {
+    const result = api.executeClusterRestore(alloc, req, &location, restore_mode, request) catch |err| switch (err) {
         error.NotLeader => return err,
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.BackupRepositoryBusy => return .{ .status = 409, .body = try alloc.dupe(u8, "backup repository is busy; retry later") },
         error.BackupManifestTooLarge => return .{ .status = 400, .body = try alloc.dupe(u8, backups_api.manifest_too_large_message) },
         error.BackupIntegrityFailure => return .{ .status = 422, .body = try alloc.dupe(u8, backups_api.integrity_failure_message) },
+        error.RestoreDestinationReauthorizationRequired => return .{ .status = 409, .body = try alloc.dupe(u8, "restore destination authorization is missing or revoked; resubmit with a currently authorized credential") },
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "table already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Cancelled => return .{ .status = 409, .body = try alloc.dupe(u8, "restore cancelled") },
@@ -290,6 +295,7 @@ test "cluster backup APIs require named connections" {
         null,
         null,
         null,
+        .{},
     );
     defer restore.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 400), restore.status);
