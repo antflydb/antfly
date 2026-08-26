@@ -86,6 +86,36 @@ const WorkingSetAllocator = struct {
     }
 };
 
+const DecodeWorkBudget = struct {
+    remaining: u64,
+
+    fn charge(self: *DecodeWorkBudget, units: u64) !void {
+        if (units > self.remaining) return error.Jbig2WorkLimitExceeded;
+        self.remaining -= units;
+    }
+
+    fn chargePixels(self: *DecodeWorkBudget, width: u32, height: u32) !void {
+        const pixels = std.math.mul(u64, width, height) catch return error.Jbig2WorkLimitExceeded;
+        try self.charge(pixels);
+    }
+
+    fn chargeBytes(self: *DecodeWorkBudget, bytes: usize) !void {
+        try self.charge(std.math.cast(u64, bytes) orelse return error.Jbig2WorkLimitExceeded);
+    }
+
+    fn chargeItems(self: *DecodeWorkBudget, count: usize, units_per_item: u64) !void {
+        const count_u64 = std.math.cast(u64, count) orelse return error.Jbig2WorkLimitExceeded;
+        try self.charge(std.math.mul(u64, count_u64, units_per_item) catch return error.Jbig2WorkLimitExceeded);
+    }
+};
+
+fn allocZeroedBytes(alloc: Allocator, work: *DecodeWorkBudget, len: usize) ![]u8 {
+    try work.chargeBytes(len);
+    const result = try alloc.alloc(u8, len);
+    @memset(result, 0);
+    return result;
+}
+
 pub const Decoded = struct {
     width: u32,
     height: u32,
@@ -114,14 +144,18 @@ const Bitmap = struct {
         return .{ .width = width, .height = height, .stride = stride, .data = try alloc.alloc(u8, len) };
     }
 
-    fn blank(alloc: Allocator, width: u32, height: u32, max_bytes: usize) !Bitmap {
-        const result = try init(alloc, width, height, max_bytes);
+    fn blank(alloc: Allocator, work: *DecodeWorkBudget, width: u32, height: u32, max_bytes: usize) !Bitmap {
+        var result = try init(alloc, width, height, max_bytes);
+        errdefer result.deinit(alloc);
+        try work.chargeBytes(result.data.len);
         @memset(result.data, 0);
         return result;
     }
 
-    fn clone(self: Bitmap, alloc: Allocator, max_bytes: usize) !Bitmap {
-        const result = try init(alloc, self.width, self.height, max_bytes);
+    fn clone(self: Bitmap, alloc: Allocator, work: *DecodeWorkBudget, max_bytes: usize) !Bitmap {
+        var result = try init(alloc, self.width, self.height, max_bytes);
+        errdefer result.deinit(alloc);
+        try work.chargeBytes(result.data.len);
         @memcpy(result.data, self.data);
         return result;
     }
@@ -145,16 +179,19 @@ const Bitmap = struct {
         if (value == 1) self.data[index] |= mask else self.data[index] &= ~mask;
     }
 
-    fn compose(self: Bitmap, source: Bitmap, dx: i64, dy: i64, op: u3) !void {
+    fn compose(self: Bitmap, source: Bitmap, dx: i64, dy: i64, op: u3, work: *DecodeWorkBudget) !void {
         if (op > 4) return error.UnsupportedJbig2CombinationOperator;
-        var sy: u32 = 0;
-        while (sy < source.height) : (sy += 1) {
-            const ty = dy + sy;
-            if (ty < 0 or ty >= self.height) continue;
-            var sx: u32 = 0;
-            while (sx < source.width) : (sx += 1) {
-                const tx = dx + sx;
-                if (tx < 0 or tx >= self.width) continue;
+        const x_clip = clippedRange(dx, source.width, self.width) orelse return;
+        const y_clip = clippedRange(dy, source.height, self.height) orelse return;
+        try work.chargePixels(x_clip.len, y_clip.len);
+        var row: u32 = 0;
+        while (row < y_clip.len) : (row += 1) {
+            const sy = y_clip.source_start + row;
+            const ty = y_clip.target_start + row;
+            var column: u32 = 0;
+            while (column < x_clip.len) : (column += 1) {
+                const sx = x_clip.source_start + column;
+                const tx = x_clip.target_start + column;
                 const a = self.get(tx, ty);
                 const b = source.get(sx, sy);
                 const value: u1 = switch (op) {
@@ -165,11 +202,28 @@ const Bitmap = struct {
                     4 => b,
                     else => unreachable,
                 };
-                self.set(@intCast(tx), @intCast(ty), value);
+                self.set(tx, ty, value);
             }
         }
     }
 };
+
+const ClipRange = struct { source_start: u32, target_start: u32, len: u32 };
+
+fn clippedRange(offset: i64, source_len: u32, target_len: u32) ?ClipRange {
+    var source_start: u32 = 0;
+    var target_start: u32 = 0;
+    if (offset < 0) {
+        if (offset <= -@as(i64, source_len)) return null;
+        source_start = @intCast(-offset);
+    } else {
+        if (offset >= target_len) return null;
+        target_start = @intCast(offset);
+    }
+    const len = @min(source_len - source_start, target_len - target_start);
+    if (len == 0) return null;
+    return .{ .source_start = source_start, .target_start = target_start, .len = len };
+}
 
 const Cursor = struct {
     bytes: []const u8,
@@ -383,10 +437,11 @@ fn decodeIaid(arith: *ArithmeticDecoder, contexts: []u8, code_len: u6) !u32 {
     return @intCast(prev - (@as(usize, 1) << code_len));
 }
 
-fn decodeGeneric0(alloc: Allocator, arith: *ArithmeticDecoder, contexts: []u8, width: u32, height: u32, at: [4][2]i8, max_bytes: usize) !Bitmap {
+fn decodeGeneric0(alloc: Allocator, work: *DecodeWorkBudget, arith: *ArithmeticDecoder, contexts: []u8, width: u32, height: u32, at: [4][2]i8, max_bytes: usize) !Bitmap {
     const defaults = [4][2]i8{ .{ 3, -1 }, .{ -3, -1 }, .{ 2, -2 }, .{ -2, -2 } };
     if (!std.mem.eql([2]i8, &at, &defaults)) return error.UnsupportedJbig2AdaptiveTemplate;
-    var bitmap = try Bitmap.blank(alloc, width, height, max_bytes);
+    try work.chargePixels(width, height);
+    var bitmap = try Bitmap.blank(alloc, work, width, height, max_bytes);
     errdefer bitmap.deinit(alloc);
     var y: u32 = 0;
     while (y < height) : (y += 1) {
@@ -417,10 +472,11 @@ fn decodeGeneric0(alloc: Allocator, arith: *ArithmeticDecoder, contexts: []u8, w
     return bitmap;
 }
 
-fn decodeRefinement0(alloc: Allocator, arith: *ArithmeticDecoder, contexts: []u8, width: u32, height: u32, reference: Bitmap, dx: i64, dy: i64, at: [2][2]i8, max_bytes: usize) !Bitmap {
+fn decodeRefinement0(alloc: Allocator, work: *DecodeWorkBudget, arith: *ArithmeticDecoder, contexts: []u8, width: u32, height: u32, reference: Bitmap, dx: i64, dy: i64, at: [2][2]i8, max_bytes: usize) !Bitmap {
     const defaults = [2][2]i8{ .{ -1, -1 }, .{ -1, -1 } };
     if (!std.mem.eql([2]i8, &at, &defaults)) return error.UnsupportedJbig2AdaptiveTemplate;
-    var bitmap = try Bitmap.blank(alloc, width, height, max_bytes);
+    try work.chargePixels(width, height);
+    var bitmap = try Bitmap.blank(alloc, work, width, height, max_bytes);
     errdefer bitmap.deinit(alloc);
     var y: u32 = 0;
     while (y < height) : (y += 1) {
@@ -459,13 +515,12 @@ const IntContexts = struct {
     rdx: []u8,
     rdy: []u8,
 
-    fn init(alloc: Allocator) !IntContexts {
+    fn init(alloc: Allocator, work: *DecodeWorkBudget) !IntContexts {
         var all: [9][]u8 = undefined;
         var count: usize = 0;
         errdefer for (all[0..count]) |item| alloc.free(item);
         for (&all) |*item| {
-            item.* = try alloc.alloc(u8, 512);
-            @memset(item.*, 0);
+            item.* = try allocZeroedBytes(alloc, work, 512);
             count += 1;
         }
         return .{ .dt = all[0], .fs = all[1], .ds = all[2], .it = all[3], .ri = all[4], .rdw = all[5], .rdh = all[6], .rdx = all[7], .rdy = all[8] };
@@ -495,28 +550,29 @@ fn ceilLog2(value: usize) !u6 {
     return @intCast(std.math.log2_int_ceil(usize, value));
 }
 
-fn decodeTextRegion(alloc: Allocator, arith: *ArithmeticDecoder, symbols: []const Bitmap, params: TextParams, shared_generic_contexts: ?[]u8, shared_iaid: ?[]u8, max_bytes: usize) !Bitmap {
+fn decodeTextRegion(alloc: Allocator, work: *DecodeWorkBudget, arith: *ArithmeticDecoder, symbols: []const Bitmap, params: TextParams, shared_generic_contexts: ?[]u8, shared_iaid: ?[]u8, max_bytes: usize) !Bitmap {
     const pixels = std.math.mul(u64, params.width, params.height) catch return error.Jbig2ImageTooLarge;
     if (params.instances > pixels) return error.InvalidJbig2SymbolCount;
     const code_len = try ceilLog2(symbols.len);
-    var int_ctx = try IntContexts.init(alloc);
+    var int_ctx = try IntContexts.init(alloc, work);
     defer int_ctx.deinit(alloc);
     const iaid = if (shared_iaid) |value| value else blk: {
-        const value = try alloc.alloc(u8, @as(usize, 1) << code_len);
-        @memset(value, 0);
+        const value = try allocZeroedBytes(alloc, work, @as(usize, 1) << code_len);
         break :blk value;
     };
     defer if (shared_iaid == null) alloc.free(iaid);
     const generic_ctx = if (shared_generic_contexts) |value| value else blk: {
-        const value = try alloc.alloc(u8, 65536);
-        @memset(value, 0);
+        const value = try allocZeroedBytes(alloc, work, 65536);
         break :blk value;
     };
     defer if (shared_generic_contexts == null) alloc.free(generic_ctx);
 
-    var region = try Bitmap.blank(alloc, params.width, params.height, max_bytes);
+    var region = try Bitmap.blank(alloc, work, params.width, params.height, max_bytes);
     errdefer region.deinit(alloc);
-    if (params.default_pixel == 1) @memset(region.data, 0xff);
+    if (params.default_pixel == 1) {
+        try work.chargeBytes(region.data.len);
+        @memset(region.data, 0xff);
+    }
     const strips: i64 = @as(i64, 1) << params.strips_log;
     const initial_t = try decodeInteger(arith, int_ctx.dt) orelse return error.InvalidJbig2Integer;
     var strip_t = -initial_t * strips;
@@ -528,6 +584,7 @@ fn decodeTextRegion(alloc: Allocator, arith: *ArithmeticDecoder, symbols: []cons
         var first = true;
         var current_s: i64 = 0;
         while (count < params.instances) {
+            try work.charge(32);
             if (first) {
                 const dfs = try decodeInteger(arith, int_ctx.fs) orelse return error.InvalidJbig2Integer;
                 first_s += dfs;
@@ -552,7 +609,7 @@ fn decodeTextRegion(alloc: Allocator, arith: *ArithmeticDecoder, symbols: []cons
                 const new_width = @as(i64, symbols[id].width) + rdw;
                 const new_height = @as(i64, symbols[id].height) + rdh;
                 if (new_width <= 0 or new_height <= 0 or new_width > std.math.maxInt(u32) or new_height > std.math.maxInt(u32)) return error.InvalidJbig2Dimensions;
-                refined = try decodeRefinement0(alloc, arith, generic_ctx, @intCast(new_width), @intCast(new_height), symbols[id], @divFloor(rdw, 2) + rdx, @divFloor(rdh, 2) + rdy, params.refine_at, max_bytes);
+                refined = try decodeRefinement0(alloc, work, arith, generic_ctx, @intCast(new_width), @intCast(new_height), symbols[id], @divFloor(rdw, 2) + rdx, @divFloor(rdh, 2) + rdy, params.refine_at, max_bytes);
                 break :blk refined.?;
             };
             if (!params.transposed and (params.reference_corner == 2 or params.reference_corner == 3)) current_s += symbol.width - 1;
@@ -568,7 +625,7 @@ fn decodeTextRegion(alloc: Allocator, arith: *ArithmeticDecoder, symbols: []cons
                 3 => s -= symbol.width - 1,
                 else => {},
             }
-            try region.compose(symbol, s, t, params.op);
+            try region.compose(symbol, s, t, params.op, work);
             if (!params.transposed and (params.reference_corner == 0 or params.reference_corner == 1)) current_s += symbol.width - 1;
             if (params.transposed and (params.reference_corner == 1 or params.reference_corner == 3)) current_s += symbol.height - 1;
             count += 1;
@@ -590,6 +647,7 @@ const StoredSegment = struct { number: u32, dictionary: ?Dictionary = null };
 
 const Decoder = struct {
     alloc: Allocator,
+    work: *DecodeWorkBudget,
     max_bytes: usize,
     segments: std.ArrayList(StoredSegment) = .empty,
     page: ?Bitmap = null,
@@ -604,14 +662,23 @@ const Decoder = struct {
         if (self.page) |*page| page.deinit(self.alloc);
     }
 
-    fn dictionaryFor(self: *Decoder, number: u32) ?*const Dictionary {
-        for (self.segments.items) |*segment| if (segment.number == number and segment.dictionary != null) return &segment.dictionary.?;
+    fn dictionaryFor(self: *Decoder, number: u32) !?*const Dictionary {
+        // References normally point to a recent segment. Search backwards for
+        // that fast path and charge adversarial long scans to the CPU budget.
+        var index = self.segments.items.len;
+        while (index > 0) {
+            index -= 1;
+            try self.work.charge(1);
+            const segment = &self.segments.items[index];
+            if (segment.number == number and segment.dictionary != null) return &segment.dictionary.?;
+        }
         return null;
     }
 
     fn decodeStream(self: *Decoder, bytes: []const u8) !void {
         var cursor = Cursor{ .bytes = bytes };
         while (cursor.pos < bytes.len) {
+            try self.work.charge(64);
             if (self.segments.items.len >= 100_000) return error.TooManyJbig2Segments;
             const number = try cursor.u32be();
             const flags = try cursor.byte();
@@ -658,8 +725,12 @@ const Decoder = struct {
         self.page_default = @truncate((flags >> 2) & 1);
         self.page_op = @truncate((flags >> 3) & 3);
         self.page_allows_op_override = (flags & 0x40) != 0;
-        const page = try Bitmap.blank(self.alloc, width, height, self.max_bytes);
-        if (self.page_default == 1) @memset(page.data, 0xff);
+        var page = try Bitmap.blank(self.alloc, self.work, width, height, self.max_bytes);
+        errdefer page.deinit(self.alloc);
+        if (self.page_default == 1) {
+            try self.work.chargeBytes(page.data.len);
+            @memset(page.data, 0xff);
+        }
         self.page = page;
     }
 
@@ -692,10 +763,11 @@ const Decoder = struct {
         }
         var symbol_bytes: usize = 0;
         for (refs) |ref| {
-            const dict = self.dictionaryFor(ref) orelse return error.MissingJbig2SymbolDictionary;
+            const dict = (try self.dictionaryFor(ref)) orelse return error.MissingJbig2SymbolDictionary;
             for (dict.symbols) |symbol| {
+                try self.work.charge(16);
                 try symbols.ensureUnusedCapacity(self.alloc, 1);
-                var copy = try symbol.clone(self.alloc, self.max_bytes);
+                var copy = try symbol.clone(self.alloc, self.work, self.max_bytes);
                 if (copy.data.len > self.max_bytes -| symbol_bytes) {
                     copy.deinit(self.alloc);
                     return error.Jbig2ImageTooLarge;
@@ -707,31 +779,23 @@ const Decoder = struct {
         const imported_count = symbols.items.len;
         const code_len = if (refine) try ceilLog2(imported_count + new_count) else 0;
         var arith = try ArithmeticDecoder.init(payload[cursor.pos..]);
-        const generic_ctx = try self.alloc.alloc(u8, 65536);
+        const generic_ctx = try allocZeroedBytes(self.alloc, self.work, 65536);
         defer self.alloc.free(generic_ctx);
-        @memset(generic_ctx, 0);
-        const dh = try self.alloc.alloc(u8, 512);
+        const dh = try allocZeroedBytes(self.alloc, self.work, 512);
         defer self.alloc.free(dh);
-        @memset(dh, 0);
-        const dw = try self.alloc.alloc(u8, 512);
+        const dw = try allocZeroedBytes(self.alloc, self.work, 512);
         defer self.alloc.free(dw);
-        @memset(dw, 0);
-        const iaai = try self.alloc.alloc(u8, 512);
+        const iaai = try allocZeroedBytes(self.alloc, self.work, 512);
         defer self.alloc.free(iaai);
-        @memset(iaai, 0);
-        const iaex = try self.alloc.alloc(u8, 512);
+        const iaex = try allocZeroedBytes(self.alloc, self.work, 512);
         defer self.alloc.free(iaex);
-        @memset(iaex, 0);
-        const iardx = try self.alloc.alloc(u8, 512);
+        const iardx = try allocZeroedBytes(self.alloc, self.work, 512);
         defer self.alloc.free(iardx);
-        @memset(iardx, 0);
-        const iardy = try self.alloc.alloc(u8, 512);
+        const iardy = try allocZeroedBytes(self.alloc, self.work, 512);
         defer self.alloc.free(iardy);
-        @memset(iardy, 0);
         var iaid: []u8 = &.{};
         if (refine) {
-            iaid = try self.alloc.alloc(u8, @as(usize, 1) << code_len);
-            @memset(iaid, 0);
+            iaid = try allocZeroedBytes(self.alloc, self.work, @as(usize, 1) << code_len);
         }
         defer if (iaid.len > 0) self.alloc.free(iaid);
         var height: i64 = 0;
@@ -744,12 +808,13 @@ const Decoder = struct {
             while (true) {
                 const delta_width = try decodeInteger(&arith, dw) orelse break;
                 if (decoded >= new_count) break;
+                try self.work.charge(64);
                 width += delta_width;
                 if (width <= 0 or width > std.math.maxInt(u32)) return error.InvalidJbig2Dimensions;
                 try symbols.ensureUnusedCapacity(self.alloc, 1);
                 var symbol: Bitmap = undefined;
                 if (!refine) {
-                    symbol = try decodeGeneric0(self.alloc, &arith, generic_ctx, @intCast(width), @intCast(height), at, self.max_bytes);
+                    symbol = try decodeGeneric0(self.alloc, self.work, &arith, generic_ctx, @intCast(width), @intCast(height), at, self.max_bytes);
                 } else {
                     const instances = try decodeInteger(&arith, iaai) orelse return error.InvalidJbig2Integer;
                     if (instances == 1) {
@@ -757,9 +822,9 @@ const Decoder = struct {
                         if (id >= symbols.items.len) return error.InvalidJbig2SymbolId;
                         const rdx = try decodeInteger(&arith, iardx) orelse return error.InvalidJbig2Integer;
                         const rdy = try decodeInteger(&arith, iardy) orelse return error.InvalidJbig2Integer;
-                        symbol = try decodeRefinement0(self.alloc, &arith, generic_ctx, @intCast(width), @intCast(height), symbols.items[id], rdx, rdy, refine_at, self.max_bytes);
+                        symbol = try decodeRefinement0(self.alloc, self.work, &arith, generic_ctx, @intCast(width), @intCast(height), symbols.items[id], rdx, rdy, refine_at, self.max_bytes);
                     } else if (instances > 1 and instances <= std.math.maxInt(u32)) {
-                        symbol = try decodeTextRegion(self.alloc, &arith, symbols.items, .{
+                        symbol = try decodeTextRegion(self.alloc, self.work, &arith, symbols.items, .{
                             .width = @intCast(width),
                             .height = @intCast(height),
                             .instances = @intCast(instances),
@@ -798,6 +863,7 @@ const Decoder = struct {
         var run_count: usize = 0;
         var previous_run_was_zero = false;
         while (index < total) {
+            try self.work.charge(16);
             if (run_count > std.math.mul(usize, total, 2) catch return error.InvalidJbig2ExportRun) return error.InvalidJbig2ExportRun;
             run_count += 1;
             const run = try decodeInteger(&arith, iaex) orelse return error.InvalidJbig2ExportRun;
@@ -805,8 +871,9 @@ const Decoder = struct {
             if (run == 0 and previous_run_was_zero) return error.InvalidJbig2ExportRun;
             previous_run_was_zero = run == 0;
             if (flag == 1) for (symbols.items[index .. index + @as(usize, @intCast(run))]) |symbol| {
+                try self.work.charge(16);
                 try exported.ensureUnusedCapacity(self.alloc, 1);
-                var copy = try symbol.clone(self.alloc, self.max_bytes);
+                var copy = try symbol.clone(self.alloc, self.work, self.max_bytes);
                 if (copy.data.len > self.max_bytes -| symbol_bytes) {
                     copy.deinit(self.alloc);
                     return error.Jbig2ImageTooLarge;
@@ -818,6 +885,7 @@ const Decoder = struct {
             flag = 1 - flag;
         }
         if (exported.items.len != export_count or symbols.items.len != imported_count + new_count) return error.InvalidJbig2SymbolCount;
+        try self.work.chargeItems(exported.items.len, 16);
         return .{ .symbols = try exported.toOwnedSlice(self.alloc) };
     }
 
@@ -841,12 +909,13 @@ const Decoder = struct {
         var symbols = std.ArrayList(Bitmap).empty;
         defer symbols.deinit(self.alloc);
         for (refs) |ref| {
-            const dict = self.dictionaryFor(ref) orelse return error.MissingJbig2SymbolDictionary;
+            const dict = (try self.dictionaryFor(ref)) orelse return error.MissingJbig2SymbolDictionary;
+            try self.work.chargeItems(dict.symbols.len, 16);
             try symbols.appendSlice(self.alloc, dict.symbols);
         }
         if (symbols.items.len == 0) return error.MissingJbig2SymbolDictionary;
         var arith = try ArithmeticDecoder.init(payload[cursor.pos..]);
-        var region = try decodeTextRegion(self.alloc, &arith, symbols.items, .{
+        var region = try decodeTextRegion(self.alloc, self.work, &arith, symbols.items, .{
             .width = width,
             .height = height,
             .instances = instances,
@@ -860,7 +929,7 @@ const Decoder = struct {
             .refine_at = refine_at,
         }, null, null, self.max_bytes);
         defer region.deinit(self.alloc);
-        try self.page.?.compose(region, x, y, if (self.page_allows_op_override) @truncate(region_flags & 7) else self.page_op);
+        try self.page.?.compose(region, x, y, if (self.page_allows_op_override) @truncate(region_flags & 7) else self.page_op, self.work);
     }
 
     fn decodeGeneric(self: *Decoder, payload: []const u8) !void {
@@ -879,12 +948,11 @@ const Decoder = struct {
             point[1] = @bitCast(try cursor.byte());
         }
         var arith = try ArithmeticDecoder.init(payload[cursor.pos..]);
-        const contexts = try self.alloc.alloc(u8, 65536);
+        const contexts = try allocZeroedBytes(self.alloc, self.work, 65536);
         defer self.alloc.free(contexts);
-        @memset(contexts, 0);
-        var region = try decodeGeneric0(self.alloc, &arith, contexts, width, height, at, self.max_bytes);
+        var region = try decodeGeneric0(self.alloc, self.work, &arith, contexts, width, height, at, self.max_bytes);
         defer region.deinit(self.alloc);
-        try self.page.?.compose(region, x, y, if (self.page_allows_op_override) @truncate(region_flags & 7) else self.page_op);
+        try self.page.?.compose(region, x, y, if (self.page_allows_op_override) @truncate(region_flags & 7) else self.page_op, self.work);
     }
 };
 
@@ -898,14 +966,17 @@ pub fn decodeAlloc(
     bytes: []const u8,
     max_output_bytes: usize,
     max_working_set_bytes: usize,
+    max_work_units: u64,
     expected_dimensions: ?ExpectedDimensions,
 ) !Decoded {
     if (max_output_bytes == 0) return error.Jbig2ImageTooLarge;
     if (max_working_set_bytes == 0) return error.Jbig2WorkingSetTooLarge;
+    if (max_work_units == 0) return error.Jbig2WorkLimitExceeded;
     const input_bytes = std.math.add(usize, bytes.len, if (globals) |value| value.len else 0) catch return error.Jbig2WorkingSetTooLarge;
     if (input_bytes >= max_working_set_bytes) return error.Jbig2WorkingSetTooLarge;
     var budget = WorkingSetAllocator{ .backing = alloc, .live_bytes = input_bytes, .max_live_bytes = max_working_set_bytes };
-    var decoder = Decoder{ .alloc = budget.allocator(), .max_bytes = max_output_bytes, .expected_dimensions = expected_dimensions };
+    var work = DecodeWorkBudget{ .remaining = max_work_units };
+    var decoder = Decoder{ .alloc = budget.allocator(), .work = &work, .max_bytes = max_output_bytes, .expected_dimensions = expected_dimensions };
     defer decoder.deinit();
     if (globals) |global_bytes| decoder.decodeStream(global_bytes) catch |err| {
         if (err == error.OutOfMemory and budget.limit_exceeded) return error.Jbig2WorkingSetTooLarge;
@@ -935,6 +1006,30 @@ test "arithmetic decoder matches Annex E context transitions" {
     try std.testing.expect(contexts[0] != 0);
 }
 
+test "bitmap composition clips work to visible pixels" {
+    var work = DecodeWorkBudget{ .remaining = 100 };
+    var target = try Bitmap.blank(std.testing.allocator, &work, 2, 2, 1024);
+    defer target.deinit(std.testing.allocator);
+    var source = try Bitmap.blank(std.testing.allocator, &work, 4, 2, 1024);
+    defer source.deinit(std.testing.allocator);
+    @memset(source.data, 0xff);
+
+    // Only the rightmost source column intersects the target.
+    try target.compose(source, -3, 0, 4, &work);
+    try std.testing.expectEqual(@as(u64, 94), work.remaining);
+    try std.testing.expectEqual(@as(u1, 1), target.get(0, 0));
+    try std.testing.expectEqual(@as(u1, 0), target.get(1, 0));
+
+    // A fully off-page region does no pixel work.
+    try target.compose(source, 2, 0, 4, &work);
+    try std.testing.expectEqual(@as(u64, 94), work.remaining);
+
+    // Composition reserves its complete visible cost before touching output.
+    var exhausted = DecodeWorkBudget{ .remaining = 1 };
+    try std.testing.expectError(error.Jbig2WorkLimitExceeded, target.compose(source, 0, 0, 4, &exhausted));
+    try std.testing.expectEqual(@as(u64, 1), exhausted.remaining);
+}
+
 test "embedded generic region decodes through segment and page composition" {
     const page = [_]u8{
         0, 0, 0, 0, 48, 0, 1, 0, 0, 0, 19,
@@ -951,11 +1046,12 @@ test "embedded generic region decodes through segment and page composition" {
     var stream: [page.len + region.len]u8 = undefined;
     @memcpy(stream[0..page.len], &page);
     @memcpy(stream[page.len..], &region);
-    var decoded = try decodeAlloc(std.testing.allocator, null, &stream, 1024, 128 * 1024, null);
+    var decoded = try decodeAlloc(std.testing.allocator, null, &stream, 1024, 128 * 1024, 1_000_000, null);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1), decoded.width);
     try std.testing.expectEqual(@as(u32, 1), decoded.height);
     try std.testing.expectEqual(@as(u8, 0), decoded.pixels[0]);
+    try std.testing.expectError(error.Jbig2WorkLimitExceeded, decodeAlloc(std.testing.allocator, null, &stream, 1024, 128 * 1024, 130, null));
 }
 
 test "PDF 32000 JBIG2 example decodes global dictionary and text region" {
@@ -978,7 +1074,7 @@ test "PDF 32000 JBIG2 example decodes global dictionary and text region" {
     _ = try std.fmt.hexToBytes(&globals, globals_hex);
     _ = try std.fmt.hexToBytes(&page, page_hex);
 
-    var decoded = try decodeAlloc(std.testing.allocator, &globals, &page, 1024, 256 * 1024, null);
+    var decoded = try decodeAlloc(std.testing.allocator, &globals, &page, 1024, 256 * 1024, 1_000_000, null);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 52), decoded.width);
     try std.testing.expectEqual(@as(u32, 66), decoded.height);
@@ -993,8 +1089,8 @@ test "decoder enforces cumulative working set" {
         0, 0, 0, 1, 0,  0, 0, 1, 0, 0, 0,
         0, 0, 0, 0, 0,  0, 0, 0,
     };
-    try std.testing.expectError(error.Jbig2WorkingSetTooLarge, decodeAlloc(std.testing.allocator, null, &page, 1024, 1, null));
-    try std.testing.expectError(error.Jbig2DimensionMismatch, decodeAlloc(std.testing.allocator, null, &page, 1024, 128 * 1024, .{ .width = 2, .height = 1 }));
+    try std.testing.expectError(error.Jbig2WorkingSetTooLarge, decodeAlloc(std.testing.allocator, null, &page, 1024, 1, 1_000_000, null));
+    try std.testing.expectError(error.Jbig2DimensionMismatch, decodeAlloc(std.testing.allocator, null, &page, 1024, 128 * 1024, 1_000_000, .{ .width = 2, .height = 1 }));
 }
 
 test "Treasury mask decodes refinement aggregation and text region" {
@@ -1005,7 +1101,9 @@ test "Treasury mask decodes refinement aggregation and text region" {
     const stream_len = try base64_decoder.decode(stream_buffer, encoded);
     const stream = stream_buffer[0..stream_len];
 
-    var decoded = try decodeAlloc(std.testing.allocator, null, stream, 64 * 1024 * 1024, 128 * 1024 * 1024, null);
+    // Match the Reader's production budget for this 2,393 x 3,201 page.
+    const work_limit = 4_000_000 + 8 * 2_393 * 3_201;
+    var decoded = try decodeAlloc(std.testing.allocator, null, stream, 64 * 1024 * 1024, 128 * 1024 * 1024, work_limit, null);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2393), decoded.width);
     try std.testing.expectEqual(@as(u32, 3201), decoded.height);

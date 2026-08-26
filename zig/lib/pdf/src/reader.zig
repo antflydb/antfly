@@ -25,6 +25,11 @@ const DecodedRgbaImage = struct { rgba: []u8, width: u32, height: u32 };
 
 pub const default_max_decoded_stream_bytes: usize = 64 * 1024 * 1024;
 pub const default_max_decode_working_set_bytes: usize = 128 * 1024 * 1024;
+const jbig2_work_units_per_expected_pixel: u64 = 8;
+const jbig2_work_unit_floor: u64 = 4_000_000;
+// A hard ceiling keeps unusually large but valid output dimensions from
+// turning attacker-controlled symbol dictionaries into unbounded CPU work.
+const jbig2_work_unit_ceiling: u64 = 256_000_000;
 
 /// Bounds both the final output of one PDF stream and the cumulative live
 /// allocations used while applying its filter chain. The working-set limit is
@@ -3592,9 +3597,11 @@ pub const Reader = struct {
                 encoded,
                 self.decode_limits.max_decoded_stream_bytes,
                 self.decode_limits.max_working_set_bytes,
+                jbig2DecodeWorkLimit(pixel_count),
                 .{ .width = width, .height = height },
             ) catch |err| switch (err) {
                 error.Jbig2WorkingSetTooLarge => return error.PdfDecodeWorkingSetTooLarge,
+                error.Jbig2WorkLimitExceeded => return error.PdfDecodeWorkLimitExceeded,
                 else => return err,
             };
             defer decoded.deinit(self.alloc);
@@ -5220,6 +5227,19 @@ fn ensureDecodeWorkingSet(max_bytes: usize, parts: []const usize) !void {
     var total: usize = 0;
     for (parts) |part| total = std.math.add(usize, total, part) catch return error.PdfDecodeWorkingSetTooLarge;
     if (total > max_bytes) return error.PdfDecodeWorkingSetTooLarge;
+}
+
+fn jbig2DecodeWorkLimit(expected_pixels: usize) u64 {
+    const pixels = std.math.cast(u64, expected_pixels) orelse return jbig2_work_unit_ceiling;
+    const scaled = std.math.mul(u64, pixels, jbig2_work_units_per_expected_pixel) catch return jbig2_work_unit_ceiling;
+    const with_floor = std.math.add(u64, scaled, jbig2_work_unit_floor) catch return jbig2_work_unit_ceiling;
+    return @min(with_floor, jbig2_work_unit_ceiling);
+}
+
+test "JBIG2 work limit scales with expected page pixels and saturates" {
+    try std.testing.expectEqual(jbig2_work_unit_floor, jbig2DecodeWorkLimit(0));
+    try std.testing.expectEqual(@as(u64, 65_279_944), jbig2DecodeWorkLimit(2_393 * 3_201));
+    try std.testing.expectEqual(jbig2_work_unit_ceiling, jbig2DecodeWorkLimit(std.math.maxInt(usize)));
 }
 
 fn parseXrefWidths(obj: *const syntax.Object) ![3]usize {
