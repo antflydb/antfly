@@ -5272,7 +5272,7 @@ pub const GraphQueryModeUnsupportedError = struct {
     retryable: bool,
     /// Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
     operation: []const u8,
-    /// Graph operation mode, or `graph_queries` for a request-wide constraint.
+    /// Graph operation mode, or the rejected graph request field for a request-wide constraint.
     mode: []const u8,
     /// Stable machine-readable constraint that prevents exact public execution.
     reason: []const u8,

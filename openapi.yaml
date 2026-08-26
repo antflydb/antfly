@@ -8584,7 +8584,7 @@ components:
             constraint.
         mode:
           type: string
-          description: Graph operation mode, or `graph_queries` for a request-wide constraint.
+          description: Graph operation mode, or the rejected graph request field for a request-wide constraint.
         reason:
           type: string
           enum:
@@ -8600,6 +8600,7 @@ components:
             - external_alias_document_filter_not_supported
             - external_alias_source_not_supported
             - reverse_variable_path_not_supported
+            - legacy_graph_searches_not_supported
             - unsupported_mode
           description: Stable machine-readable constraint that prevents exact public execution.
     GraphMatchOperationLimitExceededError:

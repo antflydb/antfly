@@ -2652,7 +2652,7 @@ pub const HttpHandler = struct {
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch return null;
         defer raw_request.deinit();
         const has_legacy_graph_request = raw_request.value == .object and
-            if (raw_request.value.object.get("graph_searches")) |value| value != .null else false;
+            public_search_request.hasNonNullField(raw_request.value.object, "graph_searches");
         if (has_legacy_graph_request) {
             graph_query_diagnostic.record(
                 "$request",
@@ -2662,8 +2662,8 @@ pub const HttpHandler = struct {
             return error.UnsupportedQueryRequest;
         }
         const has_graph_request = raw_request.value == .object and
-            (raw_request.value.object.get("graph_queries") != null or
-                raw_request.value.object.get("graph_searches") != null);
+            (public_search_request.hasNonNullField(raw_request.value.object, "graph_queries") or
+                public_search_request.hasNonNullField(raw_request.value.object, "graph_searches"));
         if (has_graph_request) {
             const unsupported_controls = [_][]const u8{
                 "aggregations",
@@ -2682,7 +2682,8 @@ pub const HttpHandler = struct {
                 "distance_under",
             };
             for (unsupported_controls) |field| {
-                if (raw_request.value.object.get(field) != null) return error.UnsupportedQueryRequest;
+                if (public_search_request.hasNonNullField(raw_request.value.object, field))
+                    return error.UnsupportedQueryRequest;
             }
         }
         var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
@@ -10795,12 +10796,35 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqualStrings("doc-b", neighbors_from_fused.nodes[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors_from_fused.nodes[1].key);
 
+    const pattern_request_json =
+        \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{"filter":{"term":"beta","path":"/title"}},"c":{"filter":{"prefix":"ga","path":"/title"}}},"edges":[{"from":"a","to":"b","types":["cites"]},{"from":"b","to":"c","types":["cites"]}]},"return":{"bindings":["a","b","c"],"limit":10}}},"limit":10}
+    ;
+    var typed_pattern_request = try ant_json.parseFromSlice(
+        metadata_openapi.QueryRequest,
+        alloc,
+        pattern_request_json,
+        .{ .allocate = .alloc_always },
+    );
+    defer typed_pattern_request.deinit();
+    const generated_pattern_body = try std.json.Stringify.valueAlloc(
+        alloc,
+        typed_pattern_request.value,
+        .{},
+    );
+    defer alloc.free(generated_pattern_body);
+    var generated_pattern_value = try ant_json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        generated_pattern_body,
+        .{},
+    );
+    defer generated_pattern_value.deinit();
+    try std.testing.expect(generated_pattern_value.value.object.get("aggregations").? == .null);
+
     var pattern = try handler.handle(.{
         .method = .post,
         .path = "/tables/docs/query",
-        .body =
-        \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{"filter":{"term":"beta","path":"/title"}},"c":{"filter":{"prefix":"ga","path":"/title"}}},"edges":[{"from":"a","to":"b","types":["cites"]},{"from":"b","to":"c","types":["cites"]}]},"return":{"bindings":["a","b","c"],"limit":10}}},"limit":10}
-        ,
+        .body = generated_pattern_body,
     });
     defer pattern.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), pattern.status);
@@ -11088,6 +11112,26 @@ test "serverless public graph query rejects exact sort controls" {
         "docs",
         "docs",
         "{\"graph_searches\":null}",
+        .none,
+    )) == null);
+
+    var typed_plain_request = try ant_json.parseFromSlice(
+        metadata_openapi.QueryRequest,
+        alloc,
+        "{\"order_by\":[{\"field\":\"_id\"}],\"limit\":10}",
+        .{ .allocate = .alloc_always },
+    );
+    defer typed_plain_request.deinit();
+    const generated_plain_body = try std.json.Stringify.valueAlloc(
+        alloc,
+        typed_plain_request.value,
+        .{},
+    );
+    defer alloc.free(generated_plain_body);
+    try std.testing.expect((try handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        generated_plain_body,
         .none,
     )) == null);
 }

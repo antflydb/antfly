@@ -193,7 +193,9 @@ fn cloneIndexNamesAlloc(alloc: std.mem.Allocator, indexes: []const []const u8) !
     return out;
 }
 
-fn hasNonNullField(obj: std.json.ObjectMap, key: []const u8) bool {
+/// Optional public request fields use null as the wire-equivalent of omission.
+/// Keep raw admission checks on the same rule as generated optional models.
+pub fn hasNonNullField(obj: std.json.ObjectMap, key: []const u8) bool {
     const value = obj.get(key) orelse return false;
     return value != .null;
 }

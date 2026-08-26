@@ -8,6 +8,7 @@ class GraphQueryModeUnsupportedErrorReason(str, Enum):
     EXTERNAL_ALIAS_DOCUMENT_FILTER_NOT_SUPPORTED = "external_alias_document_filter_not_supported"
     EXTERNAL_ALIAS_SOURCE_NOT_SUPPORTED = "external_alias_source_not_supported"
     K_MUST_EQUAL_ONE = "k_must_equal_one"
+    LEGACY_GRAPH_SEARCHES_NOT_SUPPORTED = "legacy_graph_searches_not_supported"
     PATTERN_REQUIRED = "pattern_required"
     REVERSE_VARIABLE_PATH_NOT_SUPPORTED = "reverse_variable_path_not_supported"
     START_SELECTOR_NOT_SUPPORTED = "start_selector_not_supported"
