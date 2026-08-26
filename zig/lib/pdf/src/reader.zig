@@ -1734,14 +1734,18 @@ pub const Reader = struct {
     }
 
     pub fn readRawStreamData(self: *const Reader, obj: *const syntax.Object) ![]u8 {
+        return try self.readRawStreamDataWithLimit(obj, self.decode_limits.max_working_set_bytes);
+    }
+
+    fn readRawStreamDataWithLimit(self: *const Reader, obj: *const syntax.Object, max_bytes: usize) ![]u8 {
         if (obj.* != .stream) return error.NotAStream;
         const stream_value = obj.stream;
         if (self.decrypted_streams.get(stream_value.data_offset)) |decrypted| {
-            if (decrypted.len > self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
+            if (decrypted.len > max_bytes) return error.PdfDecodeWorkingSetTooLarge;
             return try self.alloc.dupe(u8, decrypted);
         }
         const data_length = try self.resolvedStreamDataLength(obj);
-        if (data_length > self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
+        if (data_length > max_bytes) return error.PdfDecodeWorkingSetTooLarge;
         const end = std.math.add(usize, stream_value.data_offset, data_length) catch return error.InvalidObjectOffset;
         if (end > self.bytes.len) return error.InvalidObjectOffset;
         return try self.alloc.dupe(u8, self.bytes[stream_value.data_offset..end]);
@@ -1762,9 +1766,13 @@ pub const Reader = struct {
     }
 
     pub fn readDecodedStreamData(self: *const Reader, obj: *const syntax.Object) ![]u8 {
+        return try self.readDecodedStreamDataWithLimits(obj, self.decode_limits);
+    }
+
+    fn readDecodedStreamDataWithLimits(self: *const Reader, obj: *const syntax.Object, decode_limits: DecodeLimits) ![]u8 {
         if (obj.* != .stream) return error.NotAStream;
-        const raw = try self.readRawStreamData(obj);
-        return try decodeStreamFiltersOwnedAlloc(self.alloc, raw, obj.get("Filter"), obj.get("DecodeParms"), self.decode_limits);
+        const raw = try self.readRawStreamDataWithLimit(obj, decode_limits.max_working_set_bytes);
+        return try decodeStreamFiltersOwnedAlloc(self.alloc, raw, obj.get("Filter"), obj.get("DecodeParms"), decode_limits);
     }
 
     pub fn pageCount(self: *Reader) !usize {
@@ -3510,10 +3518,6 @@ pub const Reader = struct {
     }
 
     fn decodeImageToRgbaAlloc(self: *const Reader, obj: *const syntax.Object) anyerror!DecodedRgbaImage {
-        return try self.decodeImageToRgbaWithOptionsAlloc(obj, false);
-    }
-
-    fn decodeImageToRgbaWithOptionsAlloc(self: *const Reader, obj: *const syntax.Object, jbig2_soft_mask: bool) anyerror!DecodedRgbaImage {
         const width_i = (obj.get("Width") orelse return error.UnsupportedPdfRendering).asInteger() orelse return error.UnsupportedPdfRendering;
         const height_i = (obj.get("Height") orelse return error.UnsupportedPdfRendering).asInteger() orelse return error.UnsupportedPdfRendering;
         const image_mask = if (obj.get("ImageMask")) |v| switch (v.*) {
@@ -3542,11 +3546,21 @@ pub const Reader = struct {
         const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
         if (has_jbig2) {
             const raw = try self.readRawStreamData(obj);
+            var resolved_decode_parms: ?syntax.Object = null;
+            defer if (resolved_decode_parms) |*value| value.deinit(self.alloc);
+            const decode_parms = blk: {
+                const parms = obj.get("DecodeParms") orelse break :blk null;
+                if (parms.* == .obj_ref) {
+                    resolved_decode_parms = try self.resolveValue(parms);
+                    break :blk &resolved_decode_parms.?;
+                }
+                break :blk parms;
+            };
             const encoded = try decodeStreamFiltersBeforeOwnedAlloc(
                 self.alloc,
                 raw,
                 obj.get("Filter").?,
-                obj.get("DecodeParms"),
+                decode_parms,
                 "JBIG2Decode",
                 self.decode_limits,
             );
@@ -3554,26 +3568,39 @@ pub const Reader = struct {
 
             var globals: ?[]u8 = null;
             defer if (globals) |bytes| self.alloc.free(bytes);
-            if (streamFilterParamFor(obj.get("Filter"), obj.get("DecodeParms"), "JBIG2Decode")) |param| {
+            if (encoded.len >= self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
+            if (streamFilterParamFor(obj.get("Filter"), decode_parms, "JBIG2Decode")) |param| {
                 var resolved_param = try self.resolveValue(param);
                 defer resolved_param.deinit(self.alloc);
                 if (resolved_param.get("JBIG2Globals")) |globals_obj| {
                     var resolved_globals = try self.resolveValue(globals_obj);
                     defer resolved_globals.deinit(self.alloc);
                     if (resolved_globals != .stream) return error.UnsupportedPdfRendering;
-                    globals = try self.readDecodedStreamData(&resolved_globals);
+                    globals = try self.readDecodedStreamDataWithLimits(&resolved_globals, .{
+                        .max_decoded_stream_bytes = self.decode_limits.max_decoded_stream_bytes,
+                        .max_working_set_bytes = self.decode_limits.max_working_set_bytes - encoded.len,
+                    });
                 }
             }
 
-            var decoded = try jbig2.decodeAlloc(
+            const input_live_bytes = std.math.add(usize, encoded.len, if (globals) |bytes| bytes.len else 0) catch return error.PdfDecodeWorkingSetTooLarge;
+            if (input_live_bytes >= self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
+
+            var decoded = jbig2.decodeAlloc(
                 self.alloc,
                 if (globals) |bytes| bytes else null,
                 encoded,
                 self.decode_limits.max_decoded_stream_bytes,
-            );
+                self.decode_limits.max_working_set_bytes,
+                .{ .width = width, .height = height },
+            ) catch |err| switch (err) {
+                error.Jbig2WorkingSetTooLarge => return error.PdfDecodeWorkingSetTooLarge,
+                else => return err,
+            };
             defer decoded.deinit(self.alloc);
             if (decoded.width != width or decoded.height != height) return error.UnsupportedPdfRendering;
 
+            try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ input_live_bytes, decoded.pixels.len, rgba_len });
             const rgba = try self.alloc.alloc(u8, rgba_len);
             errdefer self.alloc.free(rgba);
             if (image_mask) {
@@ -3581,26 +3608,27 @@ pub const Reader = struct {
                 return .{ .rgba = rgba, .width = width, .height = height };
             }
 
-            const samples = try unpackPackedGraySamplesAlloc(self.alloc, decoded.pixels, width, height, 1);
-            defer self.alloc.free(samples);
-            // PDF producers use JBIG2's black-pixel convention for soft-mask
-            // coverage. Treat those decoded bits as coverage directly; applying
-            // an image Decode inversion here reverses the mask in real MRC PDFs.
-            const decode_obj = if (jbig2_soft_mask) null else obj.get("Decode");
             const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
             var resolved_color_space = try self.resolveValue(color_space_obj);
             defer resolved_color_space.deinit(self.alloc);
             if (resolved_color_space.asName()) |color_space| {
-                try decodeDeviceColorSpaceToRgba(rgba, pixel_count, samples, color_space, decode_obj);
+                if (!std.mem.eql(u8, color_space, "DeviceGray")) return error.UnsupportedPdfRendering;
+                // JBIG2 bitmaps use one for black, while PDF image samples use
+                // zero for black. Normalize at the codec boundary, then apply
+                // the image's Decode array normally (including for SMask).
+                try decodeJbig2DeviceGrayToRgba(rgba, width, height, decoded.pixels, obj.get("Decode"));
             } else if (resolved_color_space == .array) {
-                if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+                try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ input_live_bytes, decoded.pixels.len, rgba_len, pixel_count });
+                const samples = try unpackPackedJbig2SamplesAlloc(self.alloc, decoded.pixels, width, height);
+                defer self.alloc.free(samples);
+                if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
-                } else if (try self.tryDecodeCalibratedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+                } else if (try self.tryDecodeCalibratedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
-                } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+                } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
                 } else {
-                    try self.decodeIndexedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj);
+                    try self.decodeIndexedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"));
                 }
             } else return error.UnsupportedPdfRendering;
             try self.applyImageTransparencyAlloc(rgba, width, height, obj);
@@ -4226,7 +4254,7 @@ pub const Reader = struct {
                 // optional decoration. Propagate unsupported codecs so the
                 // caller can use a capable page renderer instead of silently
                 // sending a corrupted image downstream.
-                const smask = try self.decodeImageToRgbaWithOptionsAlloc(&resolved, true);
+                const smask = try self.decodeImageToRgbaAlloc(&resolved);
                 defer self.alloc.free(smask.rgba);
                 if (smask.width == width and smask.height == height) {
                     applySoftMaskAlpha(rgba, smask.rgba);
@@ -5153,6 +5181,45 @@ fn unpackPackedGraySamplesAlloc(alloc: Allocator, encoded: []const u8, width: u3
         }
     }
     return out;
+}
+
+fn unpackPackedJbig2SamplesAlloc(alloc: Allocator, encoded: []const u8, width: u32, height: u32) ![]u8 {
+    const samples = try unpackPackedGraySamplesAlloc(alloc, encoded, width, height, 1);
+    for (samples) |*sample| sample.* = 0xff - sample.*;
+    return samples;
+}
+
+fn decodeJbig2DeviceGrayToRgba(
+    rgba: []u8,
+    width: u32,
+    height: u32,
+    encoded: []const u8,
+    decode_obj: ?*const syntax.Object,
+) !void {
+    const row_bytes = (@as(usize, width) + 7) / 8;
+    const required = std.math.mul(usize, row_bytes, height) catch return error.UnsupportedPdfRendering;
+    if (encoded.len < required or rgba.len != @as(usize, width) * @as(usize, height) * 4) return error.UnsupportedPdfRendering;
+    const black_gray = applyDecodeByte(0, decode_obj, 0);
+    const white_gray = applyDecodeByte(0xff, decode_obj, 0);
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const byte = encoded[y * row_bytes + x / 8];
+            const shift: u3 = @intCast(7 - (x & 7));
+            const jbig2_black = ((byte >> shift) & 1) != 0;
+            const gray = if (jbig2_black) black_gray else white_gray;
+            const dst = (y * @as(usize, width) + x) * 4;
+            rgba[dst + 0] = gray;
+            rgba[dst + 1] = gray;
+            rgba[dst + 2] = gray;
+            rgba[dst + 3] = 0xff;
+        }
+    }
+}
+
+fn ensureDecodeWorkingSet(max_bytes: usize, parts: []const usize) !void {
+    var total: usize = 0;
+    for (parts) |part| total = std.math.add(usize, total, part) catch return error.PdfDecodeWorkingSetTooLarge;
+    if (total > max_bytes) return error.PdfDecodeWorkingSetTooLarge;
 }
 
 fn parseXrefWidths(obj: *const syntax.Object) ![3]usize {
@@ -13435,6 +13502,64 @@ test "reader rejects a malformed JBIG2 soft mask instead of dropping it" {
     const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
     defer alloc.free(sample);
 
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.TruncatedJbig2Stream, reader.extractPageImageRunsAlloc(1));
+}
+
+test "JBIG2 black pixels use PDF sample polarity and honor Decode" {
+    const encoded_bits = [_]u8{0b10000000};
+    var rgba: [8]u8 = undefined;
+    try decodeJbig2DeviceGrayToRgba(&rgba, 2, 1, &encoded_bits, null);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255, 255, 255, 255, 255 }, &rgba);
+
+    var decode_items = [_]syntax.Object{ .{ .integer = 1 }, .{ .integer = 0 } };
+    const decode = syntax.Object{ .array = &decode_items };
+    try decodeJbig2DeviceGrayToRgba(&rgba, 2, 1, &encoded_bits, &decode);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255, 0, 0, 0, 255 }, &rgba);
+}
+
+test "reader resolves an indirect DecodeParms array for JBIG2Globals" {
+    const alloc = std.testing.allocator;
+    const image_data = "000000003000010000001300000001000000010000000000000000040000>";
+    const globals_data = &.{0};
+    const content = "q\n1 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter [/ASCIIHexDecode /JBIG2Decode] /DecodeParms 6 0 R /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ image_data.len, image_data },
+        ),
+        "6 0 obj\n[null << /JBIG2Globals 7 0 R >>]\nendobj\n",
+        try std.fmt.allocPrint(alloc, "7 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ globals_data.len, globals_data }),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+    defer alloc.free(objects[6]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, obj_src);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 8\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 8 /Root 1 0 R >>\n");
+
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
     var reader = try Reader.init(alloc, sample);
     defer reader.deinit();
     try std.testing.expectError(error.TruncatedJbig2Stream, reader.extractPageImageRunsAlloc(1));

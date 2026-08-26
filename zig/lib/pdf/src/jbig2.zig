@@ -21,6 +21,71 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
+/// Tracks every live allocation made while decoding. The wrapper delegates
+/// allocations directly to `backing`, so the final page allocation can be
+/// detached and returned to the caller without a copy.
+const WorkingSetAllocator = struct {
+    backing: Allocator,
+    live_bytes: usize = 0,
+    max_live_bytes: usize,
+    limit_exceeded: bool = false,
+
+    fn allocator(self: *WorkingSetAllocator) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn permitsGrowth(self: *WorkingSetAllocator, additional_bytes: usize) bool {
+        if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
+        self.limit_exceeded = true;
+        return false;
+    }
+
+    fn disown(self: *WorkingSetAllocator, bytes: usize) void {
+        std.debug.assert(bytes <= self.live_bytes);
+        self.live_bytes -= bytes;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.permitsGrowth(len)) return null;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.live_bytes += len;
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return false;
+        if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        const growth = new_len -| memory.len;
+        if (growth > 0 and !self.permitsGrowth(growth)) return null;
+        const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *WorkingSetAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+        self.live_bytes -|= memory.len;
+    }
+};
+
 pub const Decoded = struct {
     width: u32,
     height: u32,
@@ -32,6 +97,8 @@ pub const Decoded = struct {
         self.* = undefined;
     }
 };
+
+pub const ExpectedDimensions = struct { width: u32, height: u32 };
 
 const Bitmap = struct {
     width: u32,
@@ -529,6 +596,7 @@ const Decoder = struct {
     page_default: u1 = 0,
     page_op: u2 = 0,
     page_allows_op_override: bool = false,
+    expected_dimensions: ?ExpectedDimensions = null,
 
     fn deinit(self: *Decoder) void {
         for (self.segments.items) |*segment| if (segment.dictionary) |*dict| dict.deinit(self.alloc);
@@ -559,6 +627,9 @@ const Decoder = struct {
             const length = try cursor.u32be();
             if (length == 0xffffffff) return error.UnsupportedJbig2UnknownLength;
             const payload = try cursor.take(length);
+            // Reserve list capacity before a segment decoder creates owned
+            // data, so an append OOM cannot orphan a decoded dictionary.
+            try self.segments.ensureUnusedCapacity(self.alloc, 1);
             var stored = StoredSegment{ .number = number };
             switch (segment_type) {
                 0 => stored.dictionary = try self.decodeDictionary(payload, refs[0..ref_count]),
@@ -568,7 +639,7 @@ const Decoder = struct {
                 49, 50, 51, 52, 62 => {},
                 else => return error.UnsupportedJbig2Segment,
             }
-            try self.segments.append(self.alloc, stored);
+            self.segments.appendAssumeCapacity(stored);
         }
     }
 
@@ -581,6 +652,9 @@ const Decoder = struct {
         const flags = try cursor.byte();
         _ = try cursor.u16be();
         if (self.page != null) return error.InvalidJbig2Segment;
+        if (self.expected_dimensions) |expected| {
+            if (width != expected.width or height != expected.height) return error.Jbig2DimensionMismatch;
+        }
         self.page_default = @truncate((flags >> 2) & 1);
         self.page_op = @truncate((flags >> 3) & 3);
         self.page_allows_op_override = (flags & 0x40) != 0;
@@ -617,15 +691,19 @@ const Decoder = struct {
             symbols.deinit(self.alloc);
         }
         var symbol_bytes: usize = 0;
-        for (refs) |ref| if (self.dictionaryFor(ref)) |dict| for (dict.symbols) |symbol| {
-            var copy = try symbol.clone(self.alloc, self.max_bytes);
-            if (copy.data.len > self.max_bytes -| symbol_bytes) {
-                copy.deinit(self.alloc);
-                return error.Jbig2ImageTooLarge;
+        for (refs) |ref| {
+            const dict = self.dictionaryFor(ref) orelse return error.MissingJbig2SymbolDictionary;
+            for (dict.symbols) |symbol| {
+                try symbols.ensureUnusedCapacity(self.alloc, 1);
+                var copy = try symbol.clone(self.alloc, self.max_bytes);
+                if (copy.data.len > self.max_bytes -| symbol_bytes) {
+                    copy.deinit(self.alloc);
+                    return error.Jbig2ImageTooLarge;
+                }
+                symbol_bytes += copy.data.len;
+                symbols.appendAssumeCapacity(copy);
             }
-            symbol_bytes += copy.data.len;
-            try symbols.append(self.alloc, copy);
-        };
+        }
         const imported_count = symbols.items.len;
         const code_len = if (refine) try ceilLog2(imported_count + new_count) else 0;
         var arith = try ArithmeticDecoder.init(payload[cursor.pos..]);
@@ -659,6 +737,7 @@ const Decoder = struct {
         var height: i64 = 0;
         var decoded: u32 = 0;
         while (decoded < new_count) {
+            const decoded_before_height_class = decoded;
             height += try decodeInteger(&arith, dh) orelse return error.InvalidJbig2Integer;
             if (height <= 0 or height > std.math.maxInt(u32)) return error.InvalidJbig2Dimensions;
             var width: i64 = 0;
@@ -667,6 +746,7 @@ const Decoder = struct {
                 if (decoded >= new_count) break;
                 width += delta_width;
                 if (width <= 0 or width > std.math.maxInt(u32)) return error.InvalidJbig2Dimensions;
+                try symbols.ensureUnusedCapacity(self.alloc, 1);
                 var symbol: Bitmap = undefined;
                 if (!refine) {
                     symbol = try decodeGeneric0(self.alloc, &arith, generic_ctx, @intCast(width), @intCast(height), at, self.max_bytes);
@@ -699,9 +779,13 @@ const Decoder = struct {
                     return error.Jbig2ImageTooLarge;
                 }
                 symbol_bytes += symbol.data.len;
-                try symbols.append(self.alloc, symbol);
+                symbols.appendAssumeCapacity(symbol);
                 decoded += 1;
             }
+            // A height class without a symbol cannot contribute to the
+            // declared total. Reject it instead of repeatedly consuming the
+            // arithmetic marker padding forever.
+            if (decoded == decoded_before_height_class) return error.InvalidJbig2SymbolCount;
         }
         const total = symbols.items.len;
         var exported = std.ArrayList(Bitmap).empty;
@@ -711,17 +795,24 @@ const Decoder = struct {
         }
         var index: usize = 0;
         var flag: u1 = 0;
+        var run_count: usize = 0;
+        var previous_run_was_zero = false;
         while (index < total) {
+            if (run_count > std.math.mul(usize, total, 2) catch return error.InvalidJbig2ExportRun) return error.InvalidJbig2ExportRun;
+            run_count += 1;
             const run = try decodeInteger(&arith, iaex) orelse return error.InvalidJbig2ExportRun;
             if (run < 0 or run > total - index) return error.InvalidJbig2ExportRun;
+            if (run == 0 and previous_run_was_zero) return error.InvalidJbig2ExportRun;
+            previous_run_was_zero = run == 0;
             if (flag == 1) for (symbols.items[index .. index + @as(usize, @intCast(run))]) |symbol| {
+                try exported.ensureUnusedCapacity(self.alloc, 1);
                 var copy = try symbol.clone(self.alloc, self.max_bytes);
                 if (copy.data.len > self.max_bytes -| symbol_bytes) {
                     copy.deinit(self.alloc);
                     return error.Jbig2ImageTooLarge;
                 }
                 symbol_bytes += copy.data.len;
-                try exported.append(self.alloc, copy);
+                exported.appendAssumeCapacity(copy);
             };
             index += @intCast(run);
             flag = 1 - flag;
@@ -749,7 +840,10 @@ const Decoder = struct {
         const instances = try cursor.u32be();
         var symbols = std.ArrayList(Bitmap).empty;
         defer symbols.deinit(self.alloc);
-        for (refs) |ref| if (self.dictionaryFor(ref)) |dict| try symbols.appendSlice(self.alloc, dict.symbols);
+        for (refs) |ref| {
+            const dict = self.dictionaryFor(ref) orelse return error.MissingJbig2SymbolDictionary;
+            try symbols.appendSlice(self.alloc, dict.symbols);
+        }
         if (symbols.items.len == 0) return error.MissingJbig2SymbolDictionary;
         var arith = try ArithmeticDecoder.init(payload[cursor.pos..]);
         var region = try decodeTextRegion(self.alloc, &arith, symbols.items, .{
@@ -798,14 +892,34 @@ fn decodeSignedFive(value: u5) i6 {
     return if (value <= 15) @intCast(value) else @intCast(@as(i8, @intCast(value)) - 32);
 }
 
-pub fn decodeAlloc(alloc: Allocator, globals: ?[]const u8, bytes: []const u8, max_output_bytes: usize) !Decoded {
+pub fn decodeAlloc(
+    alloc: Allocator,
+    globals: ?[]const u8,
+    bytes: []const u8,
+    max_output_bytes: usize,
+    max_working_set_bytes: usize,
+    expected_dimensions: ?ExpectedDimensions,
+) !Decoded {
     if (max_output_bytes == 0) return error.Jbig2ImageTooLarge;
-    var decoder = Decoder{ .alloc = alloc, .max_bytes = max_output_bytes };
+    if (max_working_set_bytes == 0) return error.Jbig2WorkingSetTooLarge;
+    const input_bytes = std.math.add(usize, bytes.len, if (globals) |value| value.len else 0) catch return error.Jbig2WorkingSetTooLarge;
+    if (input_bytes >= max_working_set_bytes) return error.Jbig2WorkingSetTooLarge;
+    var budget = WorkingSetAllocator{ .backing = alloc, .live_bytes = input_bytes, .max_live_bytes = max_working_set_bytes };
+    var decoder = Decoder{ .alloc = budget.allocator(), .max_bytes = max_output_bytes, .expected_dimensions = expected_dimensions };
     defer decoder.deinit();
-    if (globals) |global_bytes| try decoder.decodeStream(global_bytes);
-    try decoder.decodeStream(bytes);
+    if (globals) |global_bytes| decoder.decodeStream(global_bytes) catch |err| {
+        if (err == error.OutOfMemory and budget.limit_exceeded) return error.Jbig2WorkingSetTooLarge;
+        return err;
+    };
+    decoder.decodeStream(bytes) catch |err| {
+        if (err == error.OutOfMemory and budget.limit_exceeded) return error.Jbig2WorkingSetTooLarge;
+        return err;
+    };
     const page = decoder.page orelse return error.MissingJbig2PageInformation;
     decoder.page = null;
+    // WorkingSetAllocator is a transparent wrapper over `alloc`; detach the
+    // page from its accounting so callers can release it with `alloc`.
+    budget.disown(page.data.len);
     return .{ .width = page.width, .height = page.height, .pixels = page.data };
 }
 
@@ -837,9 +951,65 @@ test "embedded generic region decodes through segment and page composition" {
     var stream: [page.len + region.len]u8 = undefined;
     @memcpy(stream[0..page.len], &page);
     @memcpy(stream[page.len..], &region);
-    var decoded = try decodeAlloc(std.testing.allocator, null, &stream, 1024);
+    var decoded = try decodeAlloc(std.testing.allocator, null, &stream, 1024, 128 * 1024, null);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1), decoded.width);
     try std.testing.expectEqual(@as(u32, 1), decoded.height);
     try std.testing.expectEqual(@as(u8, 0), decoded.pixels[0]);
+}
+
+test "PDF 32000 JBIG2 example decodes global dictionary and text region" {
+    // PDF 32000-1:2008, 7.4.7 Examples 1 and 2. Keeping this small published
+    // vector in-tree protects the segment integration paths, not just the
+    // arithmetic primitive.
+    const globals_hex =
+        "0000000000010000000032" ++
+        "000003fffdff02fefefe0000000100000001" ++
+        "2ae225aea9a5a538b4d9999c5c8e56ef0f8727f2b53d4e37ef795cc5506dffac";
+    const page_hex =
+        "0000000130000100000013" ++
+        "00000034000000420000000000000000400000" ++
+        "00000002062000010000001e" ++
+        "000000340000004200000000000000000000100000000231db51ce51ffac" ++
+        "0000000331000100000000" ++
+        "0000000433010000000000";
+    var globals: [globals_hex.len / 2]u8 = undefined;
+    var page: [page_hex.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&globals, globals_hex);
+    _ = try std.fmt.hexToBytes(&page, page_hex);
+
+    var decoded = try decodeAlloc(std.testing.allocator, &globals, &page, 1024, 256 * 1024, null);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 52), decoded.width);
+    try std.testing.expectEqual(@as(u32, 66), decoded.height);
+    var black_pixels: usize = 0;
+    for (decoded.pixels) |byte| black_pixels += @popCount(byte);
+    try std.testing.expectEqual(@as(usize, 234), black_pixels);
+}
+
+test "decoder enforces cumulative working set" {
+    const page = [_]u8{
+        0, 0, 0, 0, 48, 0, 1, 0, 0, 0, 19,
+        0, 0, 0, 1, 0,  0, 0, 1, 0, 0, 0,
+        0, 0, 0, 0, 0,  0, 0, 0,
+    };
+    try std.testing.expectError(error.Jbig2WorkingSetTooLarge, decodeAlloc(std.testing.allocator, null, &page, 1024, 1, null));
+    try std.testing.expectError(error.Jbig2DimensionMismatch, decodeAlloc(std.testing.allocator, null, &page, 1024, 128 * 1024, .{ .width = 2, .height = 1 }));
+}
+
+test "Treasury mask decodes refinement aggregation and text region" {
+    const encoded = @embedFile("testdata/treasury-page25-symbols.b64");
+    const base64_decoder = std.base64.standard.decoderWithIgnore("\r\n");
+    const stream_buffer = try std.testing.allocator.alloc(u8, base64_decoder.calcSizeUpperBound(encoded.len));
+    defer std.testing.allocator.free(stream_buffer);
+    const stream_len = try base64_decoder.decode(stream_buffer, encoded);
+    const stream = stream_buffer[0..stream_len];
+
+    var decoded = try decodeAlloc(std.testing.allocator, null, stream, 64 * 1024 * 1024, 128 * 1024 * 1024, null);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2393), decoded.width);
+    try std.testing.expectEqual(@as(u32, 3201), decoded.height);
+    var black_pixels: usize = 0;
+    for (decoded.pixels) |byte| black_pixels += @popCount(byte);
+    try std.testing.expectEqual(@as(usize, 230_542), black_pixels);
 }
