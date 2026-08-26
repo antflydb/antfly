@@ -458,7 +458,7 @@ pub fn executeGraphQueriesWithSets(
     );
     var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
         graph_pattern_mod.default_max_distinct_identities,
-        graph_pattern_mod.default_max_distinct_identity_bytes,
+        graph_pattern_mod.default_max_distinct_state_bytes,
     );
     const request_budgets = RequestGraphBudgets{
         .work = &request_work_budget,
@@ -1553,7 +1553,7 @@ pub fn executeSingleNonPatternQueryWithSets(
     );
     var distinct_budget = graph_pattern_mod.DistinctBudget.init(
         graph_pattern_mod.default_max_distinct_identities,
-        graph_pattern_mod.default_max_distinct_identity_bytes,
+        graph_pattern_mod.default_max_distinct_state_bytes,
     );
     return try executeSingleNonPatternQueryWithSetsWithBudgets(
         alloc,

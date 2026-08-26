@@ -1002,7 +1002,7 @@ fn executeCrossRangeOnce(
     );
     var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
         graph_pattern_mod.default_max_distinct_identities,
-        graph_pattern_mod.default_max_distinct_identity_bytes,
+        graph_pattern_mod.default_max_distinct_state_bytes,
     );
     var initialized: usize = 0;
     errdefer {
@@ -6518,7 +6518,7 @@ test "distributed graph paged execution trusts only source-filtered anchors acro
     );
     var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
         graph_pattern_mod.default_max_distinct_identities,
-        graph_pattern_mod.default_max_distinct_identity_bytes,
+        graph_pattern_mod.default_max_distinct_state_bytes,
     );
     var row_state = QueryState{ .name = try alloc.dupe(u8, row_query.name) };
     var rows = try executeDistributedConjunctivePattern(

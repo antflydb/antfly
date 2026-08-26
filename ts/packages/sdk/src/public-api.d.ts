@@ -3003,9 +3003,9 @@ export interface components {
             max_distinct_identities: number;
             /**
              * Format: uint64
-             * @description Maximum identity payload bytes retained by one request.
+             * @description Maximum distinct aggregation working-set bytes admitted for one request, including identity payloads, containers, and output state.
              */
-            max_distinct_identity_bytes: number;
+            max_distinct_state_bytes: number;
         };
         GraphWorkBudgetExceededError: {
             /**

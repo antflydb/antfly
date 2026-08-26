@@ -41,7 +41,7 @@ pub const default_max_scanned_anchors = work_budget_mod.default_max_scanned_anch
 pub const default_max_intermediate_states = work_budget_mod.default_max_intermediate_states;
 pub const default_max_retained_state_bytes = work_budget_mod.default_max_retained_state_bytes;
 pub const default_max_distinct_identities: usize = 100_000;
-pub const default_max_distinct_identity_bytes: usize = 16 * 1024 * 1024;
+pub const default_max_distinct_state_bytes: usize = 16 * 1024 * 1024;
 
 pub const NodeFilter = struct {
     filter_prefix: []const u8 = "",
@@ -348,12 +348,12 @@ test "graph identifiers match the versioned wire-policy conformance cases" {
 
 pub const DistinctBudget = struct {
     remaining_identities: usize,
-    remaining_identity_bytes: usize,
+    remaining_state_bytes: usize,
 
-    pub fn init(max_identities: usize, max_identity_bytes: usize) DistinctBudget {
+    pub fn init(max_identities: usize, max_state_bytes: usize) DistinctBudget {
         return .{
             .remaining_identities = max_identities,
-            .remaining_identity_bytes = max_identity_bytes,
+            .remaining_state_bytes = max_state_bytes,
         };
     }
 
@@ -363,10 +363,10 @@ pub const DistinctBudget = struct {
             if (ref.table) |table| table.len else 0,
             ref.key.len,
         ) catch return error.GraphDistinctBudgetExceeded;
-        if (self.remaining_identities == 0 or identity_bytes > self.remaining_identity_bytes)
+        if (self.remaining_identities == 0 or identity_bytes > self.remaining_state_bytes)
             return error.GraphDistinctBudgetExceeded;
         self.remaining_identities -= 1;
-        self.remaining_identity_bytes -= identity_bytes;
+        self.remaining_state_bytes -= identity_bytes;
     }
 
     /// Charge retained container storage used to index and return exact
@@ -374,9 +374,9 @@ pub const DistinctBudget = struct {
     /// request-consumptive: transient reallocations cannot be used to exceed
     /// admission by repeatedly growing and releasing distinct sets.
     pub fn consumeRetainedBytes(self: *DistinctBudget, bytes: usize) !void {
-        if (bytes > self.remaining_identity_bytes)
+        if (bytes > self.remaining_state_bytes)
             return error.GraphDistinctBudgetExceeded;
-        self.remaining_identity_bytes -= bytes;
+        self.remaining_state_bytes -= bytes;
     }
 };
 
@@ -2110,7 +2110,7 @@ pub fn aggregateConjunctivePatternWithEdgeReader(
 ) ![]CountAggregateResult {
     var local_distinct_budget = DistinctBudget.init(
         default_max_distinct_identities,
-        default_max_distinct_identity_bytes,
+        default_max_distinct_state_bytes,
     );
     var stream = try ConjunctiveCountAggregateStream.init(
         alloc,
@@ -3599,7 +3599,7 @@ test "conjunctive match supports branches anti joins inequality and optional nul
 
     var page_distinct_budget = DistinctBudget.init(
         default_max_distinct_identities,
-        default_max_distinct_identity_bytes,
+        default_max_distinct_state_bytes,
     );
     var page_stream = try ConjunctiveCountAggregateStream.init(alloc, &specs, &page_distinct_budget);
     defer page_stream.deinit(alloc);
@@ -3636,7 +3636,7 @@ test "serverless paged conjunctive aggregate preserves exact state across anchor
         .edges = &.{},
     };
     const specs = [_]CountAggregateSpec{ .{}, .{ .alias = "anchor", .distinct = true } };
-    var distinct_budget = DistinctBudget.init(default_max_distinct_identities, default_max_distinct_identity_bytes);
+    var distinct_budget = DistinctBudget.init(default_max_distinct_identities, default_max_distinct_state_bytes);
     var stream = try ConjunctiveCountAggregateStream.init(alloc, &specs, &distinct_budget);
     defer stream.deinit(alloc);
     try stream.consumePageWithEdgeReader(alloc, Reader{}, &.{ "a", "b" }, pattern, .{ .start_validation = .prevalidated });
@@ -3666,7 +3666,7 @@ test "anchor-only aggregate fails closed at the shared anchor scan ceiling" {
         .edges = &.{},
     };
     const specs = [_]CountAggregateSpec{.{}};
-    var distinct_budget = DistinctBudget.init(default_max_distinct_identities, default_max_distinct_identity_bytes);
+    var distinct_budget = DistinctBudget.init(default_max_distinct_identities, default_max_distinct_state_bytes);
     var stream = try ConjunctiveCountAggregateStream.init(alloc, &specs, &distinct_budget);
     defer stream.deinit(alloc);
     var work_budget = WorkBudget.init(default_max_explored_nodes, default_max_explored_edges);
@@ -3992,7 +3992,7 @@ test "exact distinct aggregates share a fail-closed identity and byte budget" {
     try std.testing.expectEqual(@as(u128, 1), repeated[0].value);
     try std.testing.expectEqual(@as(u128, 1), repeated[1].value);
     try std.testing.expectEqual(@as(usize, 0), shared_budget.remaining_identities);
-    try std.testing.expect(shared_budget.remaining_identity_bytes < 2048 - 8);
+    try std.testing.expect(shared_budget.remaining_state_bytes < 2048 - 8);
 
     var byte_budget = DistinctBudget.init(10, 3);
     try std.testing.expectError(

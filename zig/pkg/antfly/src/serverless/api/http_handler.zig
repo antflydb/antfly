@@ -3133,7 +3133,7 @@ pub const HttpHandler = struct {
         );
         var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
             graph_pattern_mod.default_max_distinct_identities,
-            graph_pattern_mod.default_max_distinct_identity_bytes,
+            graph_pattern_mod.default_max_distinct_state_bytes,
         );
         var request_graph_read_budget = ServerlessGraphReadBudget{
             .cancellation = session.cancellation,

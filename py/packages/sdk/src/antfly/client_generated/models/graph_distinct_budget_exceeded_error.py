@@ -20,7 +20,8 @@ class GraphDistinctBudgetExceededError:
         message (str):
         retryable (bool):
         max_distinct_identities (int): Maximum distinct table-qualified identities retained by one request.
-        max_distinct_identity_bytes (int): Maximum identity payload bytes retained by one request.
+        max_distinct_state_bytes (int): Maximum distinct aggregation working-set bytes admitted for one request,
+            including identity payloads, containers, and output state.
     """
 
     status: GraphDistinctBudgetExceededErrorStatus
@@ -28,7 +29,7 @@ class GraphDistinctBudgetExceededError:
     message: str
     retryable: bool
     max_distinct_identities: int
-    max_distinct_identity_bytes: int
+    max_distinct_state_bytes: int
 
     def to_dict(self) -> dict[str, Any]:
         status = self.status.value
@@ -41,7 +42,7 @@ class GraphDistinctBudgetExceededError:
 
         max_distinct_identities = self.max_distinct_identities
 
-        max_distinct_identity_bytes = self.max_distinct_identity_bytes
+        max_distinct_state_bytes = self.max_distinct_state_bytes
 
         field_dict: dict[str, Any] = {}
 
@@ -52,7 +53,7 @@ class GraphDistinctBudgetExceededError:
                 "message": message,
                 "retryable": retryable,
                 "max_distinct_identities": max_distinct_identities,
-                "max_distinct_identity_bytes": max_distinct_identity_bytes,
+                "max_distinct_state_bytes": max_distinct_state_bytes,
             }
         )
 
@@ -71,7 +72,7 @@ class GraphDistinctBudgetExceededError:
 
         max_distinct_identities = d.pop("max_distinct_identities")
 
-        max_distinct_identity_bytes = d.pop("max_distinct_identity_bytes")
+        max_distinct_state_bytes = d.pop("max_distinct_state_bytes")
 
         graph_distinct_budget_exceeded_error = cls(
             status=status,
@@ -79,7 +80,7 @@ class GraphDistinctBudgetExceededError:
             message=message,
             retryable=retryable,
             max_distinct_identities=max_distinct_identities,
-            max_distinct_identity_bytes=max_distinct_identity_bytes,
+            max_distinct_state_bytes=max_distinct_state_bytes,
         )
 
         return graph_distinct_budget_exceeded_error

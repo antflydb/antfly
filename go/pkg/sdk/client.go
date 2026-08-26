@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 //go:generate go tool oapi-codegen --config=cfg.yaml ../../../openapi.yaml
+//go:generate uv run --project ../../../scripts --locked python ../../../scripts/generate_go_graph_result_shapes.py
 
 package sdk
 

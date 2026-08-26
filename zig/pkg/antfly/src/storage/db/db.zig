@@ -26646,7 +26646,7 @@ pub const DB = struct {
             );
             var distinct_budget = graph_pattern_mod.DistinctBudget.init(
                 graph_pattern_mod.default_max_distinct_identities,
-                graph_pattern_mod.default_max_distinct_identity_bytes,
+                graph_pattern_mod.default_max_distinct_state_bytes,
             );
             graph_results[0] = try self.executeSinglePatternQueryWithSets(
                 alloc,

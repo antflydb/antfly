@@ -967,22 +967,55 @@ const GraphSearchResultBuilder = struct {
         self.* = undefined;
     }
 
-    fn toOwned(self: *GraphSearchResultBuilder, alloc: std.mem.Allocator) !db_mod.types.GraphSearchResult {
+    fn toOwned(
+        self: *GraphSearchResultBuilder,
+        alloc: std.mem.Allocator,
+        budget: *graph_work_budget.WorkBudget,
+        query: graph_query_mod.GraphQuery,
+    ) !db_mod.types.GraphSearchResult {
+        // `toOwnedSlice` may need an exact-sized allocation while the builder's
+        // capacity is still live. Charge that ownership-transfer allocation
+        // before asking the allocator so the request-wide cap remains hard
+        // even on allocators that cannot resize in place.
+        try retainGraphMergeBytes(
+            budget,
+            self.name,
+            query,
+            retainedBytesForSlice(graph_query_mod.GraphResultNode, self.nodes.items.len),
+        );
         const nodes = try self.nodes.toOwnedSlice(alloc);
         errdefer {
             for (nodes) |*node| node.deinit(alloc);
             if (nodes.len > 0) alloc.free(nodes);
         }
+        try retainGraphMergeBytes(
+            budget,
+            self.name,
+            query,
+            retainedBytesForSlice(db_mod.types.GraphPath, self.paths.items.len),
+        );
         const paths = try self.paths.toOwnedSlice(alloc);
         errdefer {
             for (paths) |path| graph_paths.freePath(alloc, path);
             if (paths.len > 0) alloc.free(paths);
         }
+        try retainGraphMergeBytes(
+            budget,
+            self.name,
+            query,
+            retainedBytesForSlice(db_mod.types.GraphPatternMatch, self.matches.items.len),
+        );
         const matches = try self.matches.toOwnedSlice(alloc);
         errdefer {
             for (matches) |*match| match.deinit(alloc);
             if (matches.len > 0) alloc.free(matches);
         }
+        try retainGraphMergeBytes(
+            budget,
+            self.name,
+            query,
+            retainedBytesForSlice(db_mod.types.GraphAggregateResult, self.aggregates.items.len),
+        );
         const aggregates = try alloc.alloc(db_mod.types.GraphAggregateResult, self.aggregates.items.len);
         var initialized_aggregates: usize = 0;
         errdefer {
@@ -995,6 +1028,12 @@ const GraphSearchResultBuilder = struct {
         }
         self.aggregates.deinit(alloc);
         self.aggregates = .empty;
+        try retainGraphMergeBytes(
+            budget,
+            self.name,
+            query,
+            retainedBytesForSlice(db_mod.types.SearchHit, self.hits.items.len),
+        );
         const hits = try self.hits.toOwnedSlice(alloc);
         errdefer {
             for (hits) |*hit| hit.deinit(alloc);
@@ -1041,6 +1080,32 @@ fn retainGraphMergeBytes(
     };
 }
 
+/// Grow an outer merge list explicitly so its actual retained capacity is
+/// admitted before allocation. Geometric growth preserves amortized O(1)
+/// appends, while `ensureTotalCapacityPrecise` prevents the allocator helper
+/// from choosing an unaccounted capacity of its own.
+fn ensureGraphMergeListCapacity(
+    comptime T: type,
+    alloc: std.mem.Allocator,
+    budget: *graph_work_budget.WorkBudget,
+    operation: []const u8,
+    query: graph_query_mod.GraphQuery,
+    list: *std.ArrayListUnmanaged(T),
+    next_count: usize,
+) !void {
+    if (next_count <= list.capacity) return;
+    const doubled = std.math.mul(usize, list.capacity, 2) catch
+        return retainGraphMergeBytes(budget, operation, query, std.math.maxInt(usize));
+    const target_capacity = @max(next_count, @max(@as(usize, 8), doubled));
+    const added_bytes = std.math.mul(
+        usize,
+        target_capacity - list.capacity,
+        @sizeOf(T),
+    ) catch return retainGraphMergeBytes(budget, operation, query, std.math.maxInt(usize));
+    try retainGraphMergeBytes(budget, operation, query, added_bytes);
+    try list.ensureTotalCapacityPrecise(alloc, target_capacity);
+}
+
 fn retainedBytesForSlice(comptime T: type, count: usize) usize {
     return std.math.mul(usize, @sizeOf(T), count) catch std.math.maxInt(usize);
 }
@@ -1073,7 +1138,7 @@ fn retainedPathEdgeSliceBytes(comptime Edge: type, edges: []const Edge) usize {
 }
 
 fn graphResultNodeRetainedBytes(node: graph_query_mod.GraphResultNode) usize {
-    var total: usize = @sizeOf(graph_query_mod.GraphResultNode);
+    var total: usize = 0;
     retainedAdd(&total, node.key.len);
     if (node.table) |table| retainedAdd(&total, table.len);
     if (node.path) |path| retainedAdd(&total, retainedStringSliceBytes(path));
@@ -1087,7 +1152,7 @@ fn graphResultNodeRetainedBytes(node: graph_query_mod.GraphResultNode) usize {
 }
 
 fn graphPathRetainedBytes(path: db_mod.types.GraphPath) usize {
-    var total: usize = @sizeOf(db_mod.types.GraphPath);
+    var total: usize = 0;
     retainedAdd(&total, retainedStringSliceBytes(path.nodes));
     retainedAdd(&total, retainedOptionalStringSliceBytes(path.node_tables));
     retainedAdd(&total, retainedPathEdgeSliceBytes(graph_paths.PathEdge, path.edges));
@@ -1095,7 +1160,7 @@ fn graphPathRetainedBytes(path: db_mod.types.GraphPath) usize {
 }
 
 fn graphPatternMatchRetainedBytes(match: db_mod.types.GraphPatternMatch) usize {
-    var total: usize = @sizeOf(db_mod.types.GraphPatternMatch);
+    var total: usize = 0;
     retainedAdd(&total, retainedBytesForSlice(db_mod.types.GraphPatternBinding, match.bindings.len));
     for (match.bindings) |binding| {
         retainedAdd(&total, binding.alias.len);
@@ -1145,7 +1210,7 @@ fn artifactRefRetainedBytes(artifact: db_mod.types.ArtifactRef) usize {
 }
 
 fn graphHitRetainedBytes(hit: db_mod.types.SearchHit) usize {
-    var total: usize = @sizeOf(db_mod.types.SearchHit);
+    var total: usize = 0;
     retainedAdd(&total, hit.id.len);
     if (hit.source_table) |table| retainedAdd(&total, table.len);
     retainedAdd(&total, retainedBytesForSlice(std.meta.Child(@TypeOf(hit.index_scores)), hit.index_scores.len));
@@ -1178,7 +1243,7 @@ fn mergeGraphSearchResults(
     );
     var distinct_budget = graph_pattern.DistinctBudget.init(
         graph_pattern.default_max_distinct_identities,
-        graph_pattern.default_max_distinct_identity_bytes,
+        graph_pattern.default_max_distinct_state_bytes,
     );
     var builders = std.ArrayListUnmanaged(GraphSearchResultBuilder).empty;
     defer {
@@ -1196,17 +1261,23 @@ fn mergeGraphSearchResults(
                 for (builders.items, 0..) |builder, i| {
                     if (std.mem.eql(u8, builder.name, graph_result.name)) break :blk i;
                 }
-                const name = try alloc.dupe(u8, graph_result.name);
+                try ensureGraphMergeListCapacity(
+                    GraphSearchResultBuilder,
+                    alloc,
+                    &merge_work_budget,
+                    graph_result.name,
+                    merge_query,
+                    &builders,
+                    builders.items.len + 1,
+                );
                 try retainGraphMergeBytes(
                     &merge_work_budget,
                     graph_result.name,
                     merge_query,
-                    retainedBytesForSlice(GraphSearchResultBuilder, 1) +| graph_result.name.len,
+                    graph_result.name.len,
                 );
-                builders.append(alloc, .{ .name = name }) catch |err| {
-                    alloc.free(name);
-                    return err;
-                };
+                const name = try alloc.dupe(u8, graph_result.name);
+                builders.appendAssumeCapacity(.{ .name = name });
                 break :blk builders.items.len - 1;
             };
             var builder = &builders.items[idx];
@@ -1216,21 +1287,36 @@ fn mergeGraphSearchResults(
             for (graph_result.nodes) |node| {
                 if (builder.nodes.items.len >= public_limits.max_graph_result_items)
                     return error.QueryCandidateBudgetExceeded;
+                try ensureGraphMergeListCapacity(
+                    graph_query_mod.GraphResultNode,
+                    alloc,
+                    &merge_work_budget,
+                    graph_result.name,
+                    merge_query,
+                    &builder.nodes,
+                    builder.nodes.items.len + 1,
+                );
                 try retainGraphMergeBytes(
                     &merge_work_budget,
                     graph_result.name,
                     merge_query,
                     graphResultNodeRetainedBytes(node),
                 );
-                var owned = try cloneGraphResultNode(alloc, node);
-                builder.nodes.append(alloc, owned) catch |err| {
-                    owned.deinit(alloc);
-                    return err;
-                };
+                const owned = try cloneGraphResultNode(alloc, node);
+                builder.nodes.appendAssumeCapacity(owned);
             }
             for (graph_result.paths) |path| {
                 if (builder.paths.items.len >= public_limits.max_graph_result_items)
                     return error.QueryCandidateBudgetExceeded;
+                try ensureGraphMergeListCapacity(
+                    db_mod.types.GraphPath,
+                    alloc,
+                    &merge_work_budget,
+                    graph_result.name,
+                    merge_query,
+                    &builder.paths,
+                    builder.paths.items.len + 1,
+                );
                 try retainGraphMergeBytes(
                     &merge_work_budget,
                     graph_result.name,
@@ -1238,10 +1324,7 @@ fn mergeGraphSearchResults(
                     graphPathRetainedBytes(path),
                 );
                 const owned = try cloneGraphPath(alloc, path);
-                builder.paths.append(alloc, owned) catch |err| {
-                    graph_paths.freePath(alloc, owned);
-                    return err;
-                };
+                builder.paths.appendAssumeCapacity(owned);
             }
             for (graph_result.matches) |match| {
                 const limit = graphQueryReturnLimit(queries, graph_result.name);
@@ -1253,17 +1336,23 @@ fn mergeGraphSearchResults(
                     builder.truncated = true;
                     continue;
                 }
+                try ensureGraphMergeListCapacity(
+                    db_mod.types.GraphPatternMatch,
+                    alloc,
+                    &merge_work_budget,
+                    graph_result.name,
+                    merge_query,
+                    &builder.matches,
+                    builder.matches.items.len + 1,
+                );
                 try retainGraphMergeBytes(
                     &merge_work_budget,
                     graph_result.name,
                     merge_query,
                     graphPatternMatchRetainedBytes(match),
                 );
-                var owned = try cloneGraphPatternMatch(alloc, match);
-                builder.matches.append(alloc, owned) catch |err| {
-                    owned.deinit(alloc);
-                    return err;
-                };
+                const owned = try cloneGraphPatternMatch(alloc, match);
+                builder.matches.appendAssumeCapacity(owned);
             }
             for (graph_result.aggregates) |aggregate| {
                 const distinct = graphAggregateIsDistinct(queries, graph_result.name, aggregate.name);
@@ -1281,13 +1370,22 @@ fn mergeGraphSearchResults(
                     break;
                 }
                 if (!found) {
-                    const name = try alloc.dupe(u8, aggregate.name);
+                    try ensureGraphMergeListCapacity(
+                        GraphAggregateResultBuilder,
+                        alloc,
+                        &merge_work_budget,
+                        graph_result.name,
+                        merge_query,
+                        &builder.aggregates,
+                        builder.aggregates.items.len + 1,
+                    );
                     try retainGraphMergeBytes(
                         &merge_work_budget,
                         graph_result.name,
                         merge_query,
-                        retainedBytesForSlice(GraphAggregateResultBuilder, 1) +| aggregate.name.len,
+                        aggregate.name.len,
                     );
+                    const name = try alloc.dupe(u8, aggregate.name);
                     var owned = GraphAggregateResultBuilder{
                         .name = name,
                         .value = if (distinct) 0 else aggregate.value,
@@ -1298,28 +1396,44 @@ fn mergeGraphSearchResults(
                     var owned_active = true;
                     errdefer if (owned_active) owned.deinit(alloc);
                     if (distinct) try owned.appendDistinctValues(alloc, aggregate);
-                    try builder.aggregates.append(alloc, owned);
+                    builder.aggregates.appendAssumeCapacity(owned);
                     owned_active = false;
                 }
             }
             for (graph_result.hits) |hit| {
                 if (builder.hits.items.len >= public_limits.max_graph_hydrated_bindings)
                     return error.QueryCandidateBudgetExceeded;
+                try ensureGraphMergeListCapacity(
+                    db_mod.types.SearchHit,
+                    alloc,
+                    &merge_work_budget,
+                    graph_result.name,
+                    merge_query,
+                    &builder.hits,
+                    builder.hits.items.len + 1,
+                );
                 try retainGraphMergeBytes(
                     &merge_work_budget,
                     graph_result.name,
                     merge_query,
                     graphHitRetainedBytes(hit),
                 );
-                var owned = try hit.clone(alloc);
-                builder.hits.append(alloc, owned) catch |err| {
-                    owned.deinit(alloc);
-                    return err;
-                };
+                const owned = try hit.clone(alloc);
+                builder.hits.appendAssumeCapacity(owned);
             }
         }
     }
 
+    for (builders.items) |builder| {
+        const query = graphQueryByName(queries, builder.name) orelse
+            return error.InvalidRemoteResponse;
+        try retainGraphMergeBytes(
+            &merge_work_budget,
+            builder.name,
+            query,
+            @sizeOf(db_mod.types.GraphSearchResult),
+        );
+    }
     const merged = try alloc.alloc(db_mod.types.GraphSearchResult, builders.items.len);
     var initialized: usize = 0;
     errdefer {
@@ -1327,7 +1441,9 @@ fn mergeGraphSearchResults(
         alloc.free(merged);
     }
     for (builders.items, 0..) |*builder, i| {
-        merged[i] = try builder.toOwned(alloc);
+        const query = graphQueryByName(queries, builder.name) orelse
+            return error.InvalidRemoteResponse;
+        merged[i] = try builder.toOwned(alloc, &merge_work_budget, query);
         initialized += 1;
     }
     return merged;
@@ -3704,6 +3820,52 @@ test "graph coordinator distinct merge shares one fail-closed request budget" {
         }),
     );
     try std.testing.expectEqual(@as(usize, 1), builder.distinct_values.items.len);
+}
+
+test "graph coordinator admits list capacity and ownership transfer before allocation" {
+    const alloc = std.testing.allocator;
+    const query: graph_query_mod.GraphQuery = .{
+        .query_type = .traverse,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{} },
+    };
+    var budget = graph_work_budget.WorkBudget.init(1, 1);
+    var builder = GraphSearchResultBuilder{ .name = try alloc.dupe(u8, "walk") };
+    defer builder.deinit(alloc);
+
+    try ensureGraphMergeListCapacity(
+        graph_query_mod.GraphResultNode,
+        alloc,
+        &budget,
+        builder.name,
+        query,
+        &builder.nodes,
+        1,
+    );
+    try std.testing.expectEqual(@as(usize, 8), builder.nodes.capacity);
+    try std.testing.expectEqual(
+        8 * @sizeOf(graph_query_mod.GraphResultNode),
+        budget.retained_state_bytes,
+    );
+
+    try retainGraphMergeBytes(&budget, builder.name, query, 1);
+    builder.nodes.appendAssumeCapacity(.{
+        .key = try alloc.dupe(u8, "n"),
+        .depth = 0,
+        .distance = 0,
+    });
+    budget.max_retained_state_bytes = budget.retained_state_bytes +
+        @sizeOf(graph_query_mod.GraphResultNode) - 1;
+    defer graph_work_budget_diagnostic.reset();
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        builder.toOwned(alloc, &budget, query),
+    );
+    const diagnostic = graph_work_budget_diagnostic.take().?;
+    try std.testing.expectEqual(
+        graph_work_budget.Dimension.retained_state_bytes,
+        diagnostic.dimension,
+    );
 }
 
 test "graph coordinator rejects merged node collections above the public cap" {

@@ -5481,9 +5481,17 @@ fn toOpenApiGraphResultWithFormat(
     const nodes = try toOpenApiGraphNodes(alloc, graph_result, &document_lookup);
     const paths = try toOpenApiGraphPaths(alloc, graph_result.paths, query.params.weight_mode);
     // A path operation exposes one terminal node per returned path. Enforce
-    // that relationship at the producer boundary so result references cannot
-    // observe nodes that are absent from the public path cardinality.
-    if (paths.len > 0 and nodes.len != paths.len) return error.InvalidRemoteResponse;
+    // both cardinality and ordered table-qualified identity at the producer
+    // boundary so result references and the public path payload cannot
+    // disagree about which nodes were returned.
+    if (paths.len > 0) {
+        if (nodes.len != paths.len) return error.InvalidRemoteResponse;
+        for (nodes, paths) |node, path| {
+            const terminal = path.nodes[path.nodes.len - 1];
+            if (!GraphNodeIdentityContext.eql(.{}, .{ .key = node.key, .table = node.table }, .{ .key = terminal.key, .table = terminal.table }))
+                return error.InvalidRemoteResponse;
+        }
+    }
     const response = try alloc.create(indexes_openapi.GraphNodesResult);
     errdefer alloc.destroy(response);
     response.* = .{
@@ -5814,6 +5822,28 @@ test "canonical path responses require one terminal node per path" {
         .{
             .name = @constCast("path"),
             .nodes = &nodes,
+            .paths = &paths,
+            .hits = &.{},
+            .total_hits = 1,
+        },
+    ));
+
+    nodes = .{
+        .{ .key = "a", .table = "entities", .depth = 0, .distance = 0 },
+        .{ .key = "unused", .depth = 0, .distance = 0 },
+    };
+    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+        alloc,
+        .{
+            .query_type = .shortest_path,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"a"} },
+            .target_nodes = .{ .keys = &.{"a"} },
+        },
+        .{},
+        .{
+            .name = @constCast("path"),
+            .nodes = nodes[0..1],
             .paths = &paths,
             .hits = &.{},
             .total_hits = 1,

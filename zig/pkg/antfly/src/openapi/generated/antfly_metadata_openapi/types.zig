@@ -1536,8 +1536,8 @@ pub const GraphDistinctBudgetExceededError = struct {
     retryable: bool,
     /// Maximum distinct table-qualified identities retained by one request.
     max_distinct_identities: i64,
-    /// Maximum identity payload bytes retained by one request.
-    max_distinct_identity_bytes: i64,
+    /// Maximum distinct aggregation working-set bytes admitted for one request, including identity payloads, containers, and output state.
+    max_distinct_state_bytes: i64,
 };
 
 pub const GraphMatchOperationLimitExceededError = struct {

@@ -19,6 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"reflect"
+	"strings"
+	"sync"
 )
 
 // DecodeInto decodes the retained GraphResult JSON directly into value.
@@ -48,16 +52,31 @@ func (t GraphQueryResult) DecodeStrictInto(value any) error {
 }
 
 func decodeStrict(encoded []byte, value any) error {
-	if shape := canonicalGraphResultShape(value); shape != nil {
-		if err := validateRequiredJSONShape(encoded, shape); err != nil {
-			return err
-		}
+	shape := canonicalGraphResultShape(value)
+	if shape == nil {
+		return decodeStrictStandard(encoded, value)
 	}
+	destination := reflect.ValueOf(value)
+	if destination.Kind() != reflect.Pointer || destination.IsNil() {
+		return errors.New("strict JSON decode destination must be a non-nil pointer")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	if err := decodeJSONShapeValue(decoder, shape, destination.Elem()); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
+}
+
+func decodeStrictStandard(encoded []byte, value any) error {
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(value); err != nil {
 		return err
 	}
+	return requireJSONEOF(decoder)
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		if err == nil {
@@ -68,258 +87,268 @@ func decodeStrict(encoded []byte, value any) error {
 	return nil
 }
 
-// requiredJSONShape is a compact, streaming presence schema for canonical
-// graph results. Generated Go structs intentionally expose required scalar
-// fields as values rather than pointers, so encoding/json alone cannot tell an
-// omitted zero-valued field from a present zero. Keeping this validator beside
-// the generated union extensions preserves the ergonomic public structs while
-// avoiding a RawMessage copy of large rows, paths, and hydrated documents.
+// requiredJSONShape is generated from the canonical OpenAPI graph-result
+// closure. Generated Go structs intentionally expose required scalar fields as
+// values rather than pointers, so encoding/json alone cannot distinguish an
+// omitted zero-valued field from a present zero. The shaped decoder validates
+// presence and unknown fields while populating the generated model in one pass.
 type requiredJSONShape struct {
-	name                 string
-	object               bool
-	array                bool
-	nullable             bool
-	nonEmptyString       bool
-	required             []string
-	properties           map[string]*requiredJSONShape
-	additionalProperties *requiredJSONShape
-	items                *requiredJSONShape
+	name                      string
+	object                    bool
+	array                     bool
+	nullable                  bool
+	nonEmptyString            bool
+	required                  []string
+	properties                map[string]*requiredJSONShape
+	allowAdditionalProperties bool
+	additionalProperties      *requiredJSONShape
+	items                     *requiredJSONShape
+	reference                 *requiredJSONShape
 }
 
-var (
-	nonEmptyGraphStringShape = &requiredJSONShape{name: "non-empty string", nonEmptyString: true}
-	graphPathEndpointShape   = &requiredJSONShape{
-		name:     "GraphPathEndpoint",
-		object:   true,
-		required: []string{"key"},
-		properties: map[string]*requiredJSONShape{
-			"key":   nonEmptyGraphStringShape,
-			"table": nonEmptyGraphStringShape,
-		},
-	}
-	graphPathEdgeShape = &requiredJSONShape{
-		name:     "GraphPathEdge",
-		object:   true,
-		required: []string{"from", "to", "type", "weight"},
-		properties: map[string]*requiredJSONShape{
-			"from": graphPathEndpointShape,
-			"to":   graphPathEndpointShape,
-			"type": nonEmptyGraphStringShape,
-		},
-	}
-	graphResultNodeShape = &requiredJSONShape{
-		name:     "GraphResultNode",
-		object:   true,
-		required: []string{"key", "depth"},
-		properties: map[string]*requiredJSONShape{
-			"key":        nonEmptyGraphStringShape,
-			"table":      nonEmptyGraphStringShape,
-			"path":       {name: "GraphResultNode.path", array: true, items: graphPathEndpointShape},
-			"path_edges": {name: "GraphResultNode.path_edges", array: true, items: graphPathEdgeShape},
-		},
-	}
-	graphPathShape = &requiredJSONShape{
-		name:     "GraphPath",
-		object:   true,
-		required: []string{"nodes", "edges", "length", "weight_mode", "weight_sum", "objective_value"},
-		properties: map[string]*requiredJSONShape{
-			"nodes": {name: "GraphPath.nodes", array: true, items: graphPathEndpointShape},
-			"edges": {name: "GraphPath.edges", array: true, items: graphPathEdgeShape},
-		},
-	}
-	graphQueryStatsShape = &requiredJSONShape{
-		name:     "GraphQueryStats",
-		object:   true,
-		required: []string{"returned_items", "truncated"},
-	}
-	graphBindingNodeShape = &requiredJSONShape{
-		name:     "GraphBindingNode",
-		object:   true,
-		nullable: true,
-		required: []string{"key"},
-		properties: map[string]*requiredJSONShape{
-			"key":   nonEmptyGraphStringShape,
-			"table": nonEmptyGraphStringShape,
-		},
-	}
-	graphResultRowShape = &requiredJSONShape{
-		name:                 "GraphResultRow",
-		object:               true,
-		additionalProperties: graphBindingNodeShape,
-	}
-	graphAggregateValueShape = &requiredJSONShape{
-		name:     "GraphAggregateValue",
-		object:   true,
-		required: []string{"value", "exact"},
-	}
-	graphBindingsResultShape = &requiredJSONShape{
-		name:     "GraphBindingsResult",
-		object:   true,
-		required: []string{"kind", "rows", "stats"},
-		properties: map[string]*requiredJSONShape{
-			"rows":  {name: "GraphBindingsResult.rows", array: true, items: graphResultRowShape},
-			"stats": graphQueryStatsShape,
-		},
-	}
-	graphAggregatesResultShape = &requiredJSONShape{
-		name:     "GraphAggregatesResult",
-		object:   true,
-		required: []string{"kind", "aggregates", "stats"},
-		properties: map[string]*requiredJSONShape{
-			"aggregates": {name: "GraphAggregatesResult.aggregates", object: true, additionalProperties: graphAggregateValueShape},
-			"stats":      graphQueryStatsShape,
-		},
-	}
-	graphNodesResultShape = &requiredJSONShape{
-		name:     "GraphNodesResult",
-		object:   true,
-		required: []string{"kind", "nodes", "paths", "stats"},
-		properties: map[string]*requiredJSONShape{
-			"nodes": {name: "GraphNodesResult.nodes", array: true, items: graphResultNodeShape},
-			"paths": {name: "GraphNodesResult.paths", array: true, items: graphPathShape},
-			"stats": graphQueryStatsShape,
-		},
-	}
-)
+var jsonStructFieldCache sync.Map // map[reflect.Type]map[string]int
 
-func canonicalGraphResultShape(value any) *requiredJSONShape {
-	switch value.(type) {
-	case *GraphBindingsResult:
-		return graphBindingsResultShape
-	case *GraphAggregatesResult:
-		return graphAggregatesResultShape
-	case *GraphNodesResult:
-		return graphNodesResultShape
-	default:
-		return nil
+func decodeJSONShapeValue(decoder *json.Decoder, shape *requiredJSONShape, destination reflect.Value) error {
+	if shape == nil {
+		return decoder.Decode(destination.Addr().Interface())
 	}
-}
-
-func validateRequiredJSONShape(encoded []byte, shape *requiredJSONShape) error {
-	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	if err := validateJSONShapeValue(decoder, shape); err != nil {
-		return err
+	if shape.reference != nil && !shape.nullable {
+		return decodeJSONShapeValue(decoder, shape.reference, destination)
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return errors.New("multiple JSON values")
+	if shape.object || shape.array || shape.nullable {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
 		}
-		return err
+		if token == nil {
+			if !shape.nullable {
+				return fmt.Errorf("%s must not be null", shape.name)
+			}
+			destination.SetZero()
+			return nil
+		}
+		if shape.reference != nil {
+			return decodeJSONShapeToken(decoder, shape.reference, destination, token)
+		}
+		return decodeJSONShapeToken(decoder, shape, destination, token)
 	}
-	return nil
+	return decodeJSONScalar(decoder, shape, destination)
 }
 
-func validateJSONShapeValue(decoder *json.Decoder, shape *requiredJSONShape) error {
+func decodeJSONScalar(decoder *json.Decoder, shape *requiredJSONShape, destination reflect.Value) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
 	}
 	if token == nil {
-		if shape == nil || shape.nullable {
-			return nil
-		}
 		return fmt.Errorf("%s must not be null", shape.name)
 	}
-	if shape == nil {
-		return skipJSONTokenValue(decoder, token)
+	destination = indirectJSONDestination(destination)
+	switch destination.Kind() {
+	case reflect.String:
+		value, ok := token.(string)
+		if !ok {
+			return fmt.Errorf("%s must be a string", shape.name)
+		}
+		destination.SetString(value)
+	case reflect.Bool:
+		value, ok := token.(bool)
+		if !ok {
+			return fmt.Errorf("%s must be a boolean", shape.name)
+		}
+		destination.SetBool(value)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		value, ok := token.(float64)
+		if !ok || math.Trunc(value) != value || value < math.MinInt64 || value >= -float64(math.MinInt64) {
+			return fmt.Errorf("%s must be an integer", shape.name)
+		}
+		parsed := int64(value)
+		if destination.OverflowInt(parsed) {
+			return fmt.Errorf("%s integer is out of range", shape.name)
+		}
+		destination.SetInt(parsed)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		value, ok := token.(float64)
+		if !ok || math.Trunc(value) != value || value < 0 || value >= math.Exp2(64) {
+			return fmt.Errorf("%s must be an unsigned integer", shape.name)
+		}
+		parsed := uint64(value)
+		if destination.OverflowUint(parsed) {
+			return fmt.Errorf("%s unsigned integer is out of range", shape.name)
+		}
+		destination.SetUint(parsed)
+	case reflect.Float32, reflect.Float64:
+		value, ok := token.(float64)
+		if !ok {
+			return fmt.Errorf("%s must be a number", shape.name)
+		}
+		if destination.OverflowFloat(value) {
+			return fmt.Errorf("%s must be a representable number", shape.name)
+		}
+		destination.SetFloat(value)
+	default:
+		return fmt.Errorf("%s cannot decode scalar into %s", shape.name, destination.Type())
 	}
 	if shape.nonEmptyString {
-		value, ok := token.(string)
-		if !ok || value == "" {
+		if destination.Kind() != reflect.String || destination.Len() == 0 {
 			return fmt.Errorf("%s must be a non-empty string", shape.name)
 		}
-		return nil
 	}
-
-	delim, isDelim := token.(json.Delim)
-	if shape.object {
-		if !isDelim || delim != '{' {
-			return fmt.Errorf("%s must be an object", shape.name)
-		}
-		var seen uint64
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return fmt.Errorf("%s contains a non-string property name", shape.name)
-			}
-			for i, required := range shape.required {
-				if key == required {
-					seen |= uint64(1) << i
-					break
-				}
-			}
-			child := shape.properties[key]
-			if child == nil {
-				child = shape.additionalProperties
-			}
-			if err := validateJSONShapeValue(decoder, child); err != nil {
-				return err
-			}
-		}
-		if _, err := decoder.Token(); err != nil {
-			return err
-		}
-		for i, required := range shape.required {
-			if seen&(uint64(1)<<i) == 0 {
-				return fmt.Errorf("%s requires field %q", shape.name, required)
-			}
-		}
-		return nil
-	}
-	if shape.array {
-		if !isDelim || delim != '[' {
-			return fmt.Errorf("%s must be an array", shape.name)
-		}
-		for decoder.More() {
-			if err := validateJSONShapeValue(decoder, shape.items); err != nil {
-				return err
-			}
-		}
-		_, err := decoder.Token()
-		return err
-	}
-	return skipJSONTokenValue(decoder, token)
+	return nil
 }
 
-func skipJSONTokenValue(decoder *json.Decoder, token json.Token) error {
-	delim, ok := token.(json.Delim)
-	if !ok {
-		return nil
+func decodeJSONShapeToken(
+	decoder *json.Decoder,
+	shape *requiredJSONShape,
+	destination reflect.Value,
+	token json.Token,
+) error {
+	if shape.reference != nil {
+		return decodeJSONShapeToken(decoder, shape.reference, destination, token)
 	}
-	switch delim {
-	case '{':
-		for decoder.More() {
-			if _, err := decoder.Token(); err != nil {
-				return err
-			}
-			value, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			if err := skipJSONTokenValue(decoder, value); err != nil {
-				return err
-			}
+	if shape.object {
+		delim, ok := token.(json.Delim)
+		if !ok || delim != '{' {
+			return fmt.Errorf("%s must be an object", shape.name)
 		}
-		_, err := decoder.Token()
-		return err
-	case '[':
-		for decoder.More() {
-			value, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			if err := skipJSONTokenValue(decoder, value); err != nil {
-				return err
-			}
-		}
-		_, err := decoder.Token()
-		return err
-	default:
-		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+		return decodeJSONObject(decoder, shape, indirectJSONDestination(destination))
 	}
+	if shape.array {
+		delim, ok := token.(json.Delim)
+		if !ok || delim != '[' {
+			return fmt.Errorf("%s must be an array", shape.name)
+		}
+		return decodeJSONArray(decoder, shape, indirectJSONDestination(destination))
+	}
+	return fmt.Errorf("%s has an invalid generated decoding shape", shape.name)
+}
+
+func indirectJSONDestination(destination reflect.Value) reflect.Value {
+	for destination.Kind() == reflect.Pointer {
+		if destination.IsNil() {
+			destination.Set(reflect.New(destination.Type().Elem()))
+		}
+		destination = destination.Elem()
+	}
+	return destination
+}
+
+func decodeJSONObject(decoder *json.Decoder, shape *requiredJSONShape, destination reflect.Value) error {
+	if destination.Kind() != reflect.Struct && destination.Kind() != reflect.Map {
+		return fmt.Errorf("%s cannot decode into %s", shape.name, destination.Type())
+	}
+	if destination.Kind() == reflect.Map && destination.IsNil() {
+		destination.Set(reflect.MakeMap(destination.Type()))
+	}
+	seen := make(map[string]struct{}, len(shape.required))
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return fmt.Errorf("%s contains a non-string property name", shape.name)
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("%s contains duplicate field %q", shape.name, key)
+		}
+		seen[key] = struct{}{}
+
+		child, declared := shape.properties[key]
+		if !declared {
+			if !shape.allowAdditionalProperties {
+				return fmt.Errorf("%s contains unknown field %q", shape.name, key)
+			}
+			child = shape.additionalProperties
+		}
+		if destination.Kind() == reflect.Map {
+			if destination.Type().Key().Kind() != reflect.String {
+				return fmt.Errorf("%s cannot decode into non-string-keyed map", shape.name)
+			}
+			value := reflect.New(destination.Type().Elem()).Elem()
+			if err := decodeJSONShapeValue(decoder, child, value); err != nil {
+				return err
+			}
+			destination.SetMapIndex(reflect.ValueOf(key).Convert(destination.Type().Key()), value)
+			continue
+		}
+
+		fieldIndex, found := jsonStructFields(destination.Type())[key]
+		if !found {
+			if declared {
+				return fmt.Errorf("%s generated Go model is missing field %q", shape.name, key)
+			}
+			var discarded any
+			if err := decodeJSONShapeValue(decoder, child, reflect.ValueOf(&discarded).Elem()); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := decodeJSONShapeValue(decoder, child, destination.Field(fieldIndex)); err != nil {
+			return err
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if closing != json.Delim('}') {
+		return fmt.Errorf("%s has an invalid object terminator", shape.name)
+	}
+	for _, required := range shape.required {
+		if _, ok := seen[required]; !ok {
+			return fmt.Errorf("%s requires field %q", shape.name, required)
+		}
+	}
+	return nil
+}
+
+func decodeJSONArray(decoder *json.Decoder, shape *requiredJSONShape, destination reflect.Value) error {
+	if destination.Kind() != reflect.Slice {
+		return fmt.Errorf("%s cannot decode into %s", shape.name, destination.Type())
+	}
+	if destination.IsNil() {
+		destination.Set(reflect.MakeSlice(destination.Type(), 0, 0))
+	} else {
+		destination.SetLen(0)
+	}
+	for decoder.More() {
+		value := reflect.New(destination.Type().Elem()).Elem()
+		if err := decodeJSONShapeValue(decoder, shape.items, value); err != nil {
+			return err
+		}
+		destination.Set(reflect.Append(destination, value))
+	}
+	closing, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if closing != json.Delim(']') {
+		return fmt.Errorf("%s has an invalid array terminator", shape.name)
+	}
+	return nil
+}
+
+func jsonStructFields(structType reflect.Type) map[string]int {
+	if cached, ok := jsonStructFieldCache.Load(structType); ok {
+		return cached.(map[string]int)
+	}
+	fields := make(map[string]int, structType.NumField())
+	for i := range structType.NumField() {
+		field := structType.Field(i)
+		name := field.Tag.Get("json")
+		if comma := strings.IndexByte(name, ','); comma >= 0 {
+			name = name[:comma]
+		}
+		if name == "-" {
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		fields[name] = i
+	}
+	actual, _ := jsonStructFieldCache.LoadOrStore(structType, fields)
+	return actual.(map[string]int)
 }

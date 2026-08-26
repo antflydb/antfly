@@ -254,6 +254,18 @@ func decodeCanonicalGraphResult(
 				return nil, fmt.Errorf("antfly: nodes graph result path %d: %w", i, err)
 			}
 		}
+		if len(value.Paths) > 0 {
+			if len(value.Nodes) != len(value.Paths) {
+				return nil, fmt.Errorf("antfly: path graph result requires one terminal node per path")
+			}
+			for i, path := range value.Paths {
+				terminal := path.Nodes[len(path.Nodes)-1]
+				node := value.Nodes[i]
+				if !sameDecodedGraphEndpoint(terminal, GraphPathEndpoint{Key: node.Key, Table: node.Table}) {
+					return nil, fmt.Errorf("antfly: path graph result node %d does not match its path terminal", i)
+				}
+			}
+		}
 		primaryItems := len(value.Nodes)
 		if len(value.Paths) > 0 {
 			primaryItems = len(value.Paths)

@@ -836,7 +836,7 @@ pub fn graphDistinctBudgetExceededBody(alloc: std.mem.Allocator) ![]u8 {
         .message = "exact graph distinct aggregation exceeded its memory budget; narrow match.anchor or remove distinct",
         .retryable = false,
         .max_distinct_identities = graph_pattern_mod.default_max_distinct_identities,
-        .max_distinct_identity_bytes = graph_pattern_mod.default_max_distinct_identity_bytes,
+        .max_distinct_state_bytes = graph_pattern_mod.default_max_distinct_state_bytes,
     }, .{});
 }
 
@@ -3727,7 +3727,7 @@ test "public table query handler maps exact graph execution failures" {
     };
     try std.testing.expect(!distinct_error.retryable);
     try std.testing.expectEqual(@as(i64, @intCast(graph_pattern_mod.default_max_distinct_identities)), distinct_error.max_distinct_identities);
-    try std.testing.expectEqual(@as(i64, @intCast(graph_pattern_mod.default_max_distinct_identity_bytes)), distinct_error.max_distinct_identity_bytes);
+    try std.testing.expectEqual(@as(i64, @intCast(graph_pattern_mod.default_max_distinct_state_bytes)), distinct_error.max_distinct_state_bytes);
 
     kind = .anchor_filter;
     var anchor_resp = try handleTableQueryRequest(

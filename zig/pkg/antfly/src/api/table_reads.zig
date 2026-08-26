@@ -18225,8 +18225,18 @@ fn parseRemoteGraphResults(
                 if (result.nodes.len > public_limits.max_graph_result_items or
                     result.paths.len > public_limits.max_graph_result_items)
                     return error.InvalidRemoteResponse;
-                if (result.paths.len > 0 and result.nodes.len != result.paths.len)
-                    return error.InvalidRemoteResponse;
+                if (result.paths.len > 0) {
+                    if (result.nodes.len != result.paths.len)
+                        return error.InvalidRemoteResponse;
+                    for (result.nodes, result.paths) |node, path| {
+                        if (path.nodes.len == 0) return error.InvalidRemoteResponse;
+                        const terminal = path.nodes[path.nodes.len - 1];
+                        if (!graphPathEndpointEql(
+                            .{ .key = node.key, .table = node.table },
+                            terminal,
+                        )) return error.InvalidRemoteResponse;
+                    }
+                }
                 const returned_items = if (result.paths.len > 0) result.paths.len else result.nodes.len;
                 if (!remoteGraphReturnedItemsMatch(result.stats.returned_items, returned_items))
                     return error.InvalidRemoteResponse;
@@ -19116,6 +19126,9 @@ test "remote canonical graph result stats and aggregate exactness fail closed" {
     ));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
         \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a","depth":0},{"key":"extra","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
+    ));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a","table":"entities","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
     ));
 }
 
