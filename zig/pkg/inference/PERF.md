@@ -37,14 +37,18 @@ memory while the native loader uploads CUDA residency. For the pinned artifact
 the peak combined envelope is about 30,154 MiB; after load the lease settles
 back to the 16,384 MiB CUDA resident envelope.
 
-The release gate remains the paired deterministic contract used above: the
+The release benchmark is a manual/local qualification, not a CI job. It keeps
+the paired deterministic contract used above: the
 128-token SHA-256 must be
 `d4ee583f092062e7177069de1f35a9cefbaac24848d11d09b64237bc9209b68e`,
 every request must report positive CUDA A4B route/decode counters and zero
-fallbacks, and warmed decode throughput on the pinned L4 must be at least 80%
-of the pinned llama.cpp CUDA comparator. The benchmark requires the expected
-llama.cpp executable SHA-256 and a clean tracked checkout, then records both
-executables, the model, runner, revision, GPU UUID, and driver in its receipt.
+fallbacks. It also requires positive compact-down and exact-LM-head hits,
+successful device-KV attempts, persistent graph replays, and zero graph skips,
+runtime-slot misses, or cross-backend copies. Warmed decode throughput on the
+pinned L4 must be at least 80% of the pinned llama.cpp CUDA comparator. The
+benchmark requires the expected llama.cpp executable SHA-256 and a clean
+tracked checkout, then records both executables, the model, runner, revision,
+GPU UUID, and driver in its receipt.
 The forced KV capacity covers the 29 prompt tokens, 128 output tokens, and one
 32-token replay headroom block, rounded up to the 32-token paged-KV block size.
 
@@ -80,6 +84,45 @@ the 127 timed decode transitions gives 43.70 and 62.47 tok/s respectively. A
 route-grouped MoE prototype was also measured but not retained: despite
 reducing CTA and combine-launch counts, it was 1.3% slower because it reduced
 the memory-level parallelism of the resident expert projections.
+
+A node-level CUDA trace then identified the repeated A4B parallel-FFN norm
+chains as the next avoidable launch cost. CUDA now fuses the three pre-FFN RMS
+norms that share one input, and fuses the post-FFN shared/routed RMS norms,
+scaled add, final RMS norm, and residual add. The exact A4B decode shape is
+qualified in the backend; other shapes retain the generic operations.
+`ANTFLY_INFERENCE_CUDA_DISABLE_A4B_NORM_FUSION=1` restores the unfused path.
+
+On the same pinned L4/GGUF 128-token workload, a same-binary A/B produced
+identical token arrays and unchanged graph behavior. Fusion reduced recorded
+CUDA launches from 42.02 to 34.98 per generated token and improved reported
+decode throughput from 61.42 to 63.18 tok/s, a **2.86%** gain. Relative to the
+original 60.35 tok/s baseline, the retained router and norm work reaches about
+63.2 tok/s. Wider decode-only expert tiles were also tested and removed after
+they regressed throughput by 0.6%; the original expert tiles remain selected.
+
+The next node-level trace showed that A4B expert down projection and the
+2816-wide Q6_K LM head still used unnecessarily expensive generic launch
+shapes. The exact top-8, `704 -> 2816` decode down projection now uses 64
+threads instead of 128, reducing ptxas register use from 56 to 40 and shared
+memory from 128 to 64 bytes per CTA. Its traced median fell from 43.17 to
+40.61 us (**5.9%**). `ANTFLY_INFERENCE_CUDA_DISABLE_A4B_COMPACT_DOWN=1`
+restores the generic route.
+
+The A4B greedy LM head now has an exact `2816 -> 262144` Q6_K/Q8_1 stage that
+hoists fixed Q6_K address arithmetic and removes dynamic shape/suppression
+branches. Register use fell from 96 to 40 per thread and traced median kernel
+time fell from 2.575 to 2.496 ms (**3.0%**). Suppressed-token and non-A4B
+requests retain the generic kernel;
+`ANTFLY_INFERENCE_CUDA_DISABLE_A4B_EXACT_LM_HEAD=1` is the rollback.
+
+A final same-binary 128-token A/B produced identical token IDs and unchanged
+graph behavior. Disabling both paths reported 61.93 tok/s; enabling both
+reported 63.18 tok/s, a **2.02%** gain. Relative to the original 60.35 tok/s
+baseline, the retained CUDA work now reaches 63.18 tok/s, about 91.0% of the
+69.41 tok/s local llama.cpp CUDA comparator. A smaller dense-Q4 block and an
+eight-column dense-Q4 route were measured and rejected at 62.08 and 61.60
+tok/s respectively. A compact gate/up expert CTA was also removed after its
+traced median was unchanged.
 
 ---
 

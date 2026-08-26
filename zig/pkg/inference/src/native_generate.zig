@@ -2911,6 +2911,10 @@ fn cudaStatsCompactJson(
         \\"a4b_route_calls":{d},
         \\"a4b_decode_calls":{d},
         \\"a4b_prefill_calls":{d},
+        \\"a4b_compact_down_hits":{d},
+        \\"a4b_compact_down_fallbacks":{d},
+        \\"a4b_exact_lm_head_hits":{d},
+        \\"a4b_exact_lm_head_fallbacks":{d},
         \\
     ,
         .{
@@ -2919,6 +2923,10 @@ fn cudaStatsCompactJson(
             stats.a4b_route_calls,
             stats.a4b_decode_calls,
             stats.a4b_prefill_calls,
+            stats.a4b_compact_down_hits,
+            stats.a4b_compact_down_fallbacks,
+            stats.a4b_exact_lm_head_hits,
+            stats.a4b_exact_lm_head_fallbacks,
         },
     );
     try appendFmt(
@@ -3224,6 +3232,11 @@ fn cudaStatsCompactJson(
         \\"device_kv_paged_block_table_uploads":{d},
         \\"device_kv_paged_block_table_bytes":{d},
         \\"device_kv_paged_identity_attention_reads":{d},
+        \\"device_kv_fail_batch":{d},
+        \\"device_kv_fail_no_cache":{d},
+        \\"device_kv_fail_no_storage":{d},
+        \\"device_kv_fail_no_hook":{d},
+        \\"device_kv_fail_write":{d},
         \\"device_kv_fail_read":{d},
         \\"device_kv_fail_shape":{d}
         \\}}
@@ -3239,6 +3252,11 @@ fn cudaStatsCompactJson(
             stats.device_kv_paged_block_table_uploads,
             stats.device_kv_paged_block_table_bytes,
             stats.device_kv_paged_identity_attention_reads,
+            stats.device_kv_fail_batch,
+            stats.device_kv_fail_no_cache,
+            stats.device_kv_fail_no_storage,
+            stats.device_kv_fail_no_hook,
+            stats.device_kv_fail_write,
             stats.device_kv_fail_read,
             stats.device_kv_fail_shape,
         },
@@ -3280,6 +3298,19 @@ test "compact CUDA stats serialize generated catalog and legacy FFN counters" {
         stats.ple_gate_prefill_bf16_mirror_first_hits = 39;
         stats.ple_gate_prefill_bf16_mirror_first_ineligible = 40;
         stats.ple_gate_decode_q4_fused_preserved = 41;
+        stats.a4b_compact_down_hits = 42;
+        stats.a4b_compact_down_fallbacks = 43;
+        stats.a4b_exact_lm_head_hits = 44;
+        stats.a4b_exact_lm_head_fallbacks = 45;
+        stats.device_kv_attempts = 46;
+        stats.device_kv_successes = 47;
+        stats.device_kv_fail_batch = 48;
+        stats.device_kv_fail_no_cache = 49;
+        stats.device_kv_fail_no_storage = 50;
+        stats.device_kv_fail_no_hook = 51;
+        stats.device_kv_fail_write = 52;
+        stats.device_kv_fail_read = 53;
+        stats.device_kv_fail_shape = 54;
         const json = try cudaStatsCompactJson(std.testing.allocator, stats, 1);
         defer std.testing.allocator.free(json);
         try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"q4_0_generated_e2b_pair_q8_hits\":11"));
@@ -3313,6 +3344,19 @@ test "compact CUDA stats serialize generated catalog and legacy FFN counters" {
         try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"ple_gate_prefill_bf16_mirror_first_hits\":39"));
         try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"ple_gate_prefill_bf16_mirror_first_ineligible\":40"));
         try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"ple_gate_decode_q4_fused_preserved\":41"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"a4b_compact_down_hits\":42"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"a4b_compact_down_fallbacks\":43"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"a4b_exact_lm_head_hits\":44"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"a4b_exact_lm_head_fallbacks\":45"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_attempts\":46"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_successes\":47"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_batch\":48"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_no_cache\":49"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_no_storage\":50"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_no_hook\":51"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_write\":52"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_read\":53"));
+        try std.testing.expect(std.mem.containsAtLeast(u8, json, 1, "\"device_kv_fail_shape\":54"));
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value == .object);
@@ -5148,12 +5192,56 @@ fn writeJsonTiming(
                 \\"a4b_route_calls":{d},
                 \\"a4b_decode_calls":{d},
                 \\"a4b_prefill_calls":{d},
+                \\"a4b_compact_down_hits":{d},
+                \\"a4b_compact_down_fallbacks":{d},
+                \\"a4b_exact_lm_head_hits":{d},
+                \\"a4b_exact_lm_head_fallbacks":{d},
                 \\
             ,
                 .{
                     cuda_stats.a4b_route_calls,
                     cuda_stats.a4b_decode_calls,
                     cuda_stats.a4b_prefill_calls,
+                    cuda_stats.a4b_compact_down_hits,
+                    cuda_stats.a4b_compact_down_fallbacks,
+                    cuda_stats.a4b_exact_lm_head_hits,
+                    cuda_stats.a4b_exact_lm_head_fallbacks,
+                },
+            );
+            try appendFmt(
+                allocator,
+                &cuda_generate_out,
+                \\"device_kv_attempts":{d},
+                \\"device_kv_successes":{d},
+                \\"device_kv_reads":{d},
+                \\"device_kv_writes":{d},
+                \\"device_kv_paged_block_table_uploads":{d},
+                \\"device_kv_paged_block_table_bytes":{d},
+                \\"device_kv_paged_identity_attention_reads":{d},
+                \\"device_kv_fail_batch":{d},
+                \\"device_kv_fail_no_cache":{d},
+                \\"device_kv_fail_no_storage":{d},
+                \\"device_kv_fail_no_hook":{d},
+                \\"device_kv_fail_write":{d},
+                \\"device_kv_fail_read":{d},
+                \\"device_kv_fail_shape":{d},
+                \\
+            ,
+                .{
+                    cuda_stats.device_kv_attempts,
+                    cuda_stats.device_kv_successes,
+                    cuda_stats.device_kv_reads,
+                    cuda_stats.device_kv_writes,
+                    cuda_stats.device_kv_paged_block_table_uploads,
+                    cuda_stats.device_kv_paged_block_table_bytes,
+                    cuda_stats.device_kv_paged_identity_attention_reads,
+                    cuda_stats.device_kv_fail_batch,
+                    cuda_stats.device_kv_fail_no_cache,
+                    cuda_stats.device_kv_fail_no_storage,
+                    cuda_stats.device_kv_fail_no_hook,
+                    cuda_stats.device_kv_fail_write,
+                    cuda_stats.device_kv_fail_read,
+                    cuda_stats.device_kv_fail_shape,
                 },
             );
             try appendFmt(

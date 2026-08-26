@@ -12392,12 +12392,14 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     defer std.testing.allocator.free(host_source);
 
     // Stage 1 maps query rows x KV heads x context splits and shares each KV
-    // tile across the four E4B or eight E2B query heads in the group.
+    // tile across every query head in the qualified E2B/E4B or A4B group.
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_paged_attention_kv_decode_gqa_split_stage("));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_paged_attention_kv_decode_gqa_split_reduce("));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint qi = tg.x; const uint kv_h = tg.y; const uint split = tg.z;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint query_pos = p.query_position_offset + qi;"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "(p.num_kv_heads != 1u && p.num_kv_heads != 2u)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const bool legacy_geometry = p.num_heads == 8u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const bool a4b_geometry = p.num_heads == 16u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "(!legacy_geometry && !a4b_geometry)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const uint heads_per_group = p.num_heads / p.num_kv_heads;"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "for (uint kc = split * schedule.key_chunk; kc < p.kv_tokens; kc += split_count * schedule.key_chunk)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "sS[j] = sS[j] * corr + row_sum"));
@@ -12446,17 +12448,19 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "maxTotalThreadsPerThreadgroup >= TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_THREADS"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "decode_gqa_split unavailable; using paged attention fallback"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "(runtime->decode_gqa_split_explicitly_requested &&"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_SCRATCH_MAX_BYTES 1052672u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_SCRATCH_MAX_BYTES 2105344u"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "newBufferWithLength:split_scratch_capacity"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "options:MTLResourceStorageModePrivate"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "scratch_runtime->submitted_frame_cb != nil"));
 
-    // Gemma4 E2B/E4B's measured routes are exact 8Q with 1KV or 2KV f16 KV,
-    // q_len 1-2, and HD256 SWA-512 or HD512 global attention.
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "num_heads != 8u || (num_kv_heads != 1u && num_kv_heads != 2u)"));
+    // Gemma4 E2B/E4B routes are exact 8Q with 1KV or 2KV; A4B routes are
+    // exact 16Q with 8KV local or 2KV global f16 KV. All remain q_len 1-2.
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const bool legacy_geometry = num_heads == 8u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "const bool a4b_geometry = num_heads == 16u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "q_len > 2u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "output_offset % (4u * sizeof(float)) != 0u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "head_dim == 256u && sliding_window == 512u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "num_kv_heads == 8u && head_dim == 256u && sliding_window == 1024u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "head_dim == 512u && sliding_window == 0u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS 512u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kv_tokens < TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS"));

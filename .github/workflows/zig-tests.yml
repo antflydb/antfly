@@ -263,7 +263,8 @@ jobs:
         (
           needs.changes.outputs.zig_tests == 'true' ||
           needs.changes.outputs.model_check == 'true' ||
-          needs.changes.outputs.trace_validate == 'true'
+          needs.changes.outputs.trace_validate == 'true' ||
+          needs.changes.outputs.a4b_cuda == 'true'
         )
       ) ||
       github.event_name == 'merge_group' ||
@@ -314,7 +315,12 @@ jobs:
   zig-base-tests:
     name: zig-base / x86_64
     needs: changes
-    if: (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') && (needs.changes.outputs.zig_tests == 'true' || needs.changes.outputs.model_check == 'true' || needs.changes.outputs.trace_validate == 'true')
+    if: >-
+      (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') &&
+      (needs.changes.outputs.zig_tests == 'true' ||
+       needs.changes.outputs.model_check == 'true' ||
+       needs.changes.outputs.trace_validate == 'true' ||
+       needs.changes.outputs.a4b_cuda == 'true')
     runs-on: arc-antfly-heavy
     # Keep the outer job timeout above the in-step hard watchdog so true hangs
     # produce the watchdog stack dump instead of an opaque GitHub cancellation.
@@ -730,10 +736,28 @@ jobs:
           --build-runner ${{ steps.cpus.outputs.build_runner }}
           --maxrss ${{ steps.cpus.outputs.max_rss }}
 
+  gemma4-a4b-cuda-config:
+    name: Gemma4 26B-A4B CUDA qualification config
+    needs: changes
+    if: needs.changes.outputs.a4b_cuda == 'true'
+    runs-on: arc-antfly-standard
+    steps:
+      - name: Require the CUDA runner configuration
+        env:
+          CUDA_RUNNER: ${{ vars.ANTFLY_CUDA_RUNNER }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CUDA_RUNNER" ]]; then
+            echo "Required Gemma4 A4B CUDA runner variable is unset: ANTFLY_CUDA_RUNNER" >&2
+            exit 1
+          fi
+
   gemma4-a4b-cuda:
     name: Gemma4 26B-A4B CUDA / SM89
-    needs: changes
-    if: needs.changes.outputs.a4b_cuda == 'true' && vars.ANTFLY_CUDA_RUNNER != ''
+    needs: [changes, gemma4-a4b-cuda-config]
+    if: >-
+      needs.changes.outputs.a4b_cuda == 'true' &&
+      needs.gemma4-a4b-cuda-config.result == 'success'
     runs-on: ${{ vars.ANTFLY_CUDA_RUNNER }}
     timeout-minutes: 120
     env:
@@ -772,10 +796,19 @@ jobs:
         run: >-
           zig build test -Dcuda=true -Dmetal=false -Donnx=false -Dpjrt=false -j2 --
           --test-filter 'explicit A4B requests'
+          --test-filter 'A4B inference contract'
+          --test-filter 'A4B artifact qualification'
+          --test-filter 'A4B geometry does not opt'
           --test-filter 'server A4B telemetry'
           --test-filter 'warm model A4B'
+          --test-filter 'parseArgs builds the explicit A4B'
+          --test-filter 'A4B model cache keys'
+          --test-filter 'explicit A4B loads ignore'
           --test-filter 'A4B GPU admission'
+          --test-filter 'CUDA resident uploads'
+          --test-filter 'CUDA A4B source upload order'
           --test-filter 'cuda A4B resident workspace'
+          --test-filter 'cuda A4B router tiled decode shape'
           --test-filter 'cuda A4B packed projection'
 
       - name: Build CUDA inference release lane
@@ -788,36 +821,9 @@ jobs:
         working-directory: zig/pkg/inference
         run: zig-out/bin/antfly-inference cuda-info --smoke
 
-      - name: Run exact-model paired CUDA qualification
-        if: >-
-          vars.GEMMA4_A4B_Q4_0_GGUF != '' &&
-          vars.LLAMA_CPP_CUDA_BIN != '' &&
-          vars.LLAMA_CPP_CUDA_SHA256 != '' &&
-          vars.GEMMA4_A4B_PROMPT != '' &&
-          vars.GEMMA4_A4B_PROMPT_TOKENS != '' &&
-          vars.GEMMA4_A4B_PROMPT_SHA256 != ''
-        working-directory: zig/pkg/inference
-        env:
-          A4B_MODEL: ${{ vars.GEMMA4_A4B_Q4_0_GGUF }}
-          LLAMA_BIN: ${{ vars.LLAMA_CPP_CUDA_BIN }}
-          LLAMA_SHA256: ${{ vars.LLAMA_CPP_CUDA_SHA256 }}
-          A4B_PROMPT: ${{ vars.GEMMA4_A4B_PROMPT }}
-          A4B_PROMPT_TOKENS: ${{ vars.GEMMA4_A4B_PROMPT_TOKENS }}
-          A4B_PROMPT_SHA256: ${{ vars.GEMMA4_A4B_PROMPT_SHA256 }}
-        run: |
-          python3 scripts/benchmark_cuda_gemma4_a4b.py \
-            --model "$A4B_MODEL" \
-            --antfly-bin zig-out/bin/antfly-inference \
-            --llama-bin "$LLAMA_BIN" \
-            --expected-llama-sha256 "$LLAMA_SHA256" \
-            --out-dir "$RUNNER_TEMP/gemma4-a4b-cuda" \
-            --prompt "$A4B_PROMPT" \
-            --expected-prompt-tokens "$A4B_PROMPT_TOKENS" \
-            --expected-prompt-sha256 "$A4B_PROMPT_SHA256"
-
   zig-base:
     name: zig-base
-    needs: [changes, zig-base-tests, arm64-codec]
+    needs: [changes, zig-base-tests, arm64-codec, gemma4-a4b-cuda-config, gemma4-a4b-cuda]
     if: |
       always() &&
       (github.event_name == 'pull_request' || github.event.schedule == '0 3 * * 0') &&
@@ -825,7 +831,8 @@ jobs:
         needs.changes.result != 'success' ||
         needs.changes.outputs.zig_tests == 'true' ||
         needs.changes.outputs.model_check == 'true' ||
-        needs.changes.outputs.trace_validate == 'true'
+        needs.changes.outputs.trace_validate == 'true' ||
+        needs.changes.outputs.a4b_cuda == 'true'
       )
     runs-on: arc-antfly-standard
     steps:
@@ -834,15 +841,22 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-base-tests.result }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
+          A4B_CUDA_CHANGE: ${{ needs.changes.outputs.a4b_cuda }}
+          A4B_CUDA_CONFIG_RESULT: ${{ needs.gemma4-a4b-cuda-config.result }}
+          A4B_CUDA_RESULT: ${{ needs.gemma4-a4b-cuda.result }}
         run: |
           set -euo pipefail
           test "$CHANGES_RESULT" = "success"
           test "$X86_64_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
+          if [[ "$A4B_CUDA_CHANGE" == "true" ]]; then
+            test "$A4B_CUDA_CONFIG_RESULT" = "success"
+            test "$A4B_CUDA_RESULT" = "success"
+          fi
 
   zig-full:
     name: zig-full
-    needs: [changes, zig-full-tests, arm64-codec]
+    needs: [changes, zig-full-tests, arm64-codec, gemma4-a4b-cuda-config, gemma4-a4b-cuda]
     if: |
       always() &&
       (
@@ -858,11 +872,18 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           X86_64_RESULT: ${{ needs.zig-full-tests.result }}
           ARM64_CODEC_RESULT: ${{ needs.arm64-codec.result }}
+          A4B_CUDA_CHANGE: ${{ needs.changes.outputs.a4b_cuda }}
+          A4B_CUDA_CONFIG_RESULT: ${{ needs.gemma4-a4b-cuda-config.result }}
+          A4B_CUDA_RESULT: ${{ needs.gemma4-a4b-cuda.result }}
         run: |
           set -euo pipefail
           test "$CHANGES_RESULT" = "success"
           test "$X86_64_RESULT" = "success"
           test "$ARM64_CODEC_RESULT" = "success"
+          if [[ "$A4B_CUDA_CHANGE" == "true" ]]; then
+            test "$A4B_CUDA_CONFIG_RESULT" = "success"
+            test "$A4B_CUDA_RESULT" = "success"
+          fi
 
   e2e-base-build:
     name: e2e-base / build

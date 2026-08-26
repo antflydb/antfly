@@ -50,6 +50,23 @@ LLAMA_DECODE = re.compile(
     r"(?:eval time|eval\s+time).*?([0-9]+(?:\.[0-9]+)?)\s+tokens per second",
     re.IGNORECASE,
 )
+LLAMA_CUDA_DEVICE_COUNT = re.compile(
+    r"ggml_cuda_init:\s*found\s+(\d+)\s+CUDA devices?",
+    re.IGNORECASE,
+)
+LLAMA_CUDA_DEVICE_INVENTORY = re.compile(
+    r"common_param:\s+-\s+CUDA(\d+)\s*:\s*([^\r\n(]+?)\s*\(",
+    re.IGNORECASE,
+)
+LLAMA_CUDA_DEVICE = re.compile(
+    r"(?:llama_prepare_model_devices|llama_model_load_from_file_impl):[^\r\n]*"
+    r"using device\s+CUDA\d+\s+\(([^)\r\n]+)\)",
+    re.IGNORECASE,
+)
+LLAMA_GPU_OFFLOAD = re.compile(
+    r"load_tensors:\s*offloaded\s+(\d+)/(\d+)\s+layers to GPU(?:\s|$)",
+    re.IGNORECASE | re.MULTILINE,
+)
 CUDA_REPLAY_KV_BLOCK_TOKENS = 32
 CUDA_REPLAY_KV_HEADROOM_TOKENS = 32
 
@@ -165,6 +182,21 @@ def parse_antfly_sample(
         "graph_capture_replays": exact_int(
             cuda_generate, "graph_capture_replays", json_path
         ),
+        "graph_capture_persistent_replays": exact_int(
+            cuda_generate, "graph_capture_persistent_replays", json_path
+        ),
+        "a4b_compact_down_hits": exact_int(
+            cuda_generate, "a4b_compact_down_hits", json_path
+        ),
+        "a4b_exact_lm_head_hits": exact_int(
+            cuda_generate, "a4b_exact_lm_head_hits", json_path
+        ),
+        "device_kv_attempts": exact_int(
+            cuda_generate, "device_kv_attempts", json_path
+        ),
+        "device_kv_successes": exact_int(
+            cuda_generate, "device_kv_successes", json_path
+        ),
     }
     if (
         counters["a4b_resident_source_bytes"] <= 0
@@ -173,8 +205,44 @@ def parse_antfly_sample(
         or counters["a4b_decode_calls"] <= 0
         or counters["a4b_prefill_calls"] <= 0
         or counters["graph_capture_replays"] <= 0
+        or counters["graph_capture_persistent_replays"] <= 0
+        or counters["a4b_compact_down_hits"] <= 0
+        or counters["a4b_exact_lm_head_hits"] <= 0
+        or counters["device_kv_attempts"] <= 0
+        or counters["device_kv_successes"] != counters["device_kv_attempts"]
     ):
         raise BenchmarkContractError(f"CUDA A4B execution counters are incomplete: {json_path}")
+
+    zero_counters = (
+        "a4b_compact_down_fallbacks",
+        "a4b_exact_lm_head_fallbacks",
+        "cross_backend_copies",
+        "cross_backend_sync_fallbacks",
+        "graph_capture_capacity_skips",
+        "graph_capture_discards",
+        "graph_capture_update_failures",
+        "decoder_runtime_linear_slot_prepare_misses",
+        "decoder_runtime_rms_norm_slot_prepare_misses",
+        "decoder_runtime_linear_apply_misses",
+        "decoder_runtime_rms_norm_apply_misses",
+        "lm_head_argmax_fallbacks",
+        "device_kv_fail_batch",
+        "device_kv_fail_no_cache",
+        "device_kv_fail_no_hook",
+        "device_kv_fail_no_storage",
+        "device_kv_fail_read",
+        "device_kv_fail_shape",
+        "device_kv_fail_write",
+    )
+    nonzero_fallbacks: dict[str, int] = {}
+    for key in zero_counters:
+        value = exact_int(cuda_generate, key, json_path)
+        if value != 0:
+            nonzero_fallbacks[key] = value
+    if nonzero_fallbacks:
+        raise BenchmarkContractError(
+            f"CUDA A4B fallback/skip counters are nonzero: {nonzero_fallbacks}: {json_path}"
+        )
 
     timing = payload.get("timing_ms")
     if not isinstance(timing, dict):
@@ -190,14 +258,68 @@ def parse_antfly_sample(
     }
 
 
-def parse_llama_sample(log_path: Path) -> dict[str, float]:
-    matches = LLAMA_DECODE.findall(log_path.read_text(errors="replace"))
-    if not matches:
+def parse_llama_sample(log_path: Path, *, expected_device: str) -> dict[str, Any]:
+    text = log_path.read_text(errors="replace")
+    decode_matches = LLAMA_DECODE.findall(text)
+    if not decode_matches:
         raise BenchmarkContractError(f"llama.cpp decode throughput missing: {log_path}")
-    tok_s = float(matches[-1])
+    tok_s = float(decode_matches[-1])
     if not math.isfinite(tok_s) or tok_s <= 0:
         raise BenchmarkContractError(f"invalid llama.cpp throughput: {log_path}")
-    return {"decode_tok_s": tok_s}
+
+    legacy_device_counts = {
+        int(value) for value in LLAMA_CUDA_DEVICE_COUNT.findall(text)
+    }
+    inventory = {
+        (int(index), name.strip())
+        for index, name in LLAMA_CUDA_DEVICE_INVENTORY.findall(text)
+    }
+    inventory_indices = {index for index, _ in inventory}
+    inventory_names = {name for _, name in inventory}
+    if legacy_device_counts:
+        has_exact_device_count = legacy_device_counts == {1}
+    else:
+        has_exact_device_count = inventory_indices == {0}
+    if not has_exact_device_count:
+        raise BenchmarkContractError(
+            f"llama.cpp did not report exactly one CUDA device: {log_path}"
+        )
+    if inventory_names and inventory_names != {expected_device}:
+        raise BenchmarkContractError(
+            f"llama.cpp CUDA inventory is {sorted(inventory_names)!r}, "
+            f"expected {expected_device!r}: {log_path}"
+        )
+    devices = {value.strip() for value in LLAMA_CUDA_DEVICE.findall(text)}
+    if devices != {expected_device}:
+        raise BenchmarkContractError(
+            f"llama.cpp CUDA device is {sorted(devices)!r}, expected {expected_device!r}: "
+            f"{log_path}"
+        )
+    offloads = LLAMA_GPU_OFFLOAD.findall(text)
+    if not offloads:
+        raise BenchmarkContractError(
+            f"llama.cpp full GPU layer-offload marker is missing: {log_path}"
+        )
+    offload_pairs = {
+        (int(offloaded), int(total)) for offloaded, total in offloads
+    }
+    if len(offload_pairs) != 1:
+        raise BenchmarkContractError(
+            f"llama.cpp GPU layer-offload markers disagree: {log_path}"
+        )
+    offloaded_layers, total_layers = next(iter(offload_pairs))
+    if offloaded_layers <= 0 or offloaded_layers != total_layers:
+        raise BenchmarkContractError(
+            f"llama.cpp GPU layer offload is {offloaded_layers}/{total_layers}, "
+            f"expected complete offload: {log_path}"
+        )
+    return {
+        "decode_tok_s": tok_s,
+        "cuda_device": expected_device,
+        "cuda_device_count": 1,
+        "offloaded_layers": offloaded_layers,
+        "total_layers": total_layers,
+    }
 
 
 def cuda_identity(expected_device: str) -> dict[str, str]:
@@ -296,10 +418,13 @@ def llama_command(binary: Path, model: Path, prompt: str, output_tokens: int) ->
         prompt,
         "-n",
         str(output_tokens),
+        "-ngl",
+        "999",
         "--temp",
         "0",
         "--ignore-eos",
         "--no-display-prompt",
+        "--single-turn",
     ]
 
 
@@ -340,6 +465,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     environment["ANTFLY_INFERENCE_JSON_TOKEN_IDS"] = "1"
     environment["ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY"] = "required"
+    # Current llama.cpp emits its device inventory and complete-offload
+    # markers at trace verbosity. Use the environment form so that evidence
+    # is enabled from process startup.
+    environment["LLAMA_ARG_LOG_VERBOSITY"] = "4"
     replay_kv_capacity = cuda_replay_kv_capacity(
         args.expected_prompt_tokens, args.output_tokens
     )
@@ -374,7 +503,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     log_path,
                     environment,
                 )
-                parsed = parse_llama_sample(log_path)
+                parsed = parse_llama_sample(
+                    log_path, expected_device=args.expected_device
+                )
             samples.append({"pair": pair, "warmup": warmup, "runtime": runtime, **parsed})
 
     measured = [sample for sample in samples if not sample["warmup"]]

@@ -945,6 +945,10 @@ pub const RuntimeStats = struct {
     a4b_route_calls: u64 = 0,
     a4b_decode_calls: u64 = 0,
     a4b_prefill_calls: u64 = 0,
+    a4b_compact_down_hits: u64 = 0,
+    a4b_compact_down_fallbacks: u64 = 0,
+    a4b_exact_lm_head_hits: u64 = 0,
+    a4b_exact_lm_head_fallbacks: u64 = 0,
     bf16_mirror_weight_count: usize = 0,
     bf16_mirror_weight_bytes: usize = 0,
     device_allocated_bytes: usize = 0,
@@ -5826,6 +5830,18 @@ fn cudaF32LinearTiledEnabled() bool {
 
 fn cudaA4bRouterTiledEnabled() bool {
     return !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_ROUTER_TILED", false);
+}
+
+fn cudaA4bNormFusionEnabled() bool {
+    return !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_NORM_FUSION", false);
+}
+
+fn cudaA4bCompactDownEnabled() bool {
+    return !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_COMPACT_DOWN", false);
+}
+
+fn cudaA4bExactLmHeadEnabled() bool {
+    return !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_EXACT_LM_HEAD", false);
 }
 
 fn isA4bRouterDecodeShape(rows: usize, in_dim: usize, out_dim: usize) bool {
@@ -13775,6 +13791,11 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         // handwritten dispatch, including suppressed-token requests.
         const generated_q8_1_candidate = cudaGeneratedQ6KQ8_1LmHeadArgmaxEnabled() and
             generatedQ6KQ8_1LmHeadArgmaxEligible(rows, in_dim, out_dim, suppress_token_ids.len);
+        const a4b_exact_candidate = cudaA4bExactLmHeadEnabled() and
+            self.a4b_runtime != null and rows == 1 and in_dim == 2816 and
+            out_dim % 8 == 0 and suppress_token_ids.len == 0;
+        const prefer_a4b_exact = a4b_exact_candidate and
+            self.kernels.hasGemma4A4BExactLmHeadPrimitive();
         const launched_q8_1 = if (cudaQ6KLmHeadQ8_1Enabled(self) or generated_q8_1_candidate) blk: {
             if (rows != 1 or in_dim % 256 != 0) break :blk false;
             const q8_row_blocks = in_dim / 32;
@@ -13831,6 +13852,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
                     in_dim,
                     out_dim,
                     suppress_token_ids.len,
+                    prefer_a4b_exact,
                 ) catch |err| switch (err) {
                     error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
                     else => return err,
@@ -13838,6 +13860,12 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
             }
             break :blk true;
         } else false;
+        if (a4b_exact_candidate) {
+            if (launched_q8_1 and prefer_a4b_exact)
+                self.stats.a4b_exact_lm_head_hits +|= 1
+            else
+                self.stats.a4b_exact_lm_head_fallbacks +|= 1;
+        }
         const launched_tile16 = blk: {
             if (launched_q8_1) break :blk true;
             if (!cudaQ6KLmHeadTile16Enabled()) break :blk false;
@@ -15958,6 +15986,133 @@ fn rmsNormBare(ctx: *anyopaque, input: CT, dim: usize, eps: f32) anyerror!?CT {
     self.stats.launch_norm += 1;
     self.stats.launch_norm_rms_bare += 1;
     return createTensor(self, device, shape, input_tensor.elem_count);
+}
+
+fn rmsNormTripleOp(
+    ctx: *anyopaque,
+    input: CT,
+    first_weight: CT,
+    second_weight: CT,
+    third_weight: CT,
+    dim: usize,
+    eps: f32,
+) anyerror!?ops.RmsNormTripleResult {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const runtime = if (self.a4b_runtime) |*value| value else return null;
+    if (!cudaA4bNormFusionEnabled() or
+        !self.kernels.hasGemma4A4BNormFusionPrimitives() or
+        dim != runtime.config.geometry.hidden_size) return null;
+    const input_tensor = tensorFromCt(input);
+    const first_weight_tensor = tensorFromCt(first_weight);
+    const second_weight_tensor = tensorFromCt(second_weight);
+    const third_weight_tensor = tensorFromCt(third_weight);
+    try ensureF32(input_tensor);
+    try ensureF32(first_weight_tensor);
+    try ensureF32(second_weight_tensor);
+    try ensureF32(third_weight_tensor);
+    if (dim == 0 or input_tensor.elem_count % dim != 0) return null;
+    try ensureCount(first_weight_tensor, dim);
+    try ensureCount(second_weight_tensor, dim);
+    try ensureCount(third_weight_tensor, dim);
+    const rows = input_tensor.elem_count / dim;
+    if (rows == 0 or rows > max_a4b_prefill_rows) return null;
+
+    const first_shape = try dupeShape(self.allocator, input_tensor.shape);
+    var first_shape_owned = false;
+    errdefer if (!first_shape_owned) self.allocator.free(first_shape);
+    const second_shape = try dupeShape(self.allocator, input_tensor.shape);
+    var second_shape_owned = false;
+    errdefer if (!second_shape_owned) self.allocator.free(second_shape);
+    const third_shape = try dupeShape(self.allocator, input_tensor.shape);
+    var third_shape_owned = false;
+    errdefer if (!third_shape_owned) self.allocator.free(third_shape);
+    var first_device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    var first_device_owned = false;
+    errdefer if (!first_device_owned) first_device.free(&self.ctx);
+    var second_device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    var second_device_owned = false;
+    errdefer if (!second_device_owned) second_device.free(&self.ctx);
+    var third_device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
+    var third_device_owned = false;
+    errdefer if (!third_device_owned) third_device.free(&self.ctx);
+    try self.kernels.launchGemma4A4BRmsNormTripleF32(
+        &self.ctx,
+        first_device,
+        second_device,
+        third_device,
+        input_tensor.buffer,
+        first_weight_tensor.buffer,
+        second_weight_tensor.buffer,
+        third_weight_tensor.buffer,
+        rows,
+        dim,
+        eps,
+    );
+    self.stats.launch_norm += 1;
+
+    const first = try createTensor(self, first_device, first_shape, input_tensor.elem_count);
+    first_device_owned = true;
+    first_shape_owned = true;
+    errdefer freeTensor(ctx, first);
+    const second = try createTensor(self, second_device, second_shape, input_tensor.elem_count);
+    second_device_owned = true;
+    second_shape_owned = true;
+    errdefer freeTensor(ctx, second);
+    const third = try createTensor(self, third_device, third_shape, input_tensor.elem_count);
+    third_device_owned = true;
+    third_shape_owned = true;
+    return .{ .first = first, .second = second, .third = third };
+}
+
+fn parallelFfnPostResidualOp(
+    ctx: *anyopaque,
+    request: *const ops.ParallelFfnPostResidualRequest,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const runtime = if (self.a4b_runtime) |*value| value else return null;
+    if (!cudaA4bNormFusionEnabled() or
+        !self.kernels.hasGemma4A4BNormFusionPrimitives() or
+        request.dim != runtime.config.geometry.hidden_size) return null;
+    const shared = tensorFromCt(request.shared);
+    const shared_weight = tensorFromCt(request.shared_weight);
+    const routed = tensorFromCt(request.routed);
+    const routed_weight = tensorFromCt(request.routed_weight);
+    const combined_weight = tensorFromCt(request.combined_weight);
+    const residual = tensorFromCt(request.residual);
+    try ensureF32(shared);
+    try ensureF32(shared_weight);
+    try ensureF32(routed);
+    try ensureF32(routed_weight);
+    try ensureF32(combined_weight);
+    try ensureF32(residual);
+    if (request.dim == 0 or shared.elem_count % request.dim != 0 or
+        routed.elem_count != shared.elem_count or residual.elem_count != shared.elem_count or
+        !sameShape(shared.shape, routed.shape) or !sameShape(shared.shape, residual.shape)) return null;
+    try ensureCount(shared_weight, request.dim);
+    try ensureCount(routed_weight, request.dim);
+    try ensureCount(combined_weight, request.dim);
+    const rows = shared.elem_count / request.dim;
+    if (rows == 0 or rows > max_a4b_prefill_rows) return null;
+
+    const shape = try dupeShape(self.allocator, shared.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, shared.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchGemma4A4BParallelFfnPostResidualF32(
+        &self.ctx,
+        device,
+        shared.buffer,
+        shared_weight.buffer,
+        routed.buffer,
+        routed_weight.buffer,
+        combined_weight.buffer,
+        residual.buffer,
+        rows,
+        request.dim,
+        request.eps,
+    );
+    self.stats.launch_norm += 1;
+    return createTensor(self, device, shape, shared.elem_count);
 }
 const UnaryOp = enum { gelu, relu, quick_gelu, sigmoid, tanh };
 
@@ -21183,12 +21338,14 @@ fn runA4bMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) any
         request.router_logit_scale,
     );
     try self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, input_q8, input.buffer, request.total, request.hidden_size);
+    const gate = try layer.gate.view();
+    const up = try layer.up.view();
     try self.kernels.launchGemma4A4BGateUpRowsQ4_0Q8_1F32(
         &self.ctx,
         activated,
         input_q8,
-        try layer.gate.view(),
-        try layer.up.view(),
+        gate,
+        up,
         route_ids,
         layer.gate.expert_stride,
         layer.up.expert_stride,
@@ -21199,18 +21356,57 @@ fn runA4bMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) any
         @intFromEnum(request.activation),
     );
     try self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, activated_q8, activated, routes, request.inter_size);
-    try self.kernels.launchGemma4A4BDownRowsQ4_0Q8_1F32(
-        &self.ctx,
-        expert_output,
-        activated_q8,
-        try layer.down.view(),
-        route_ids,
-        layer.down.expert_stride,
-        request.total,
-        request.top_k,
-        request.inter_size,
-        request.hidden_size,
-    );
+    const down = try layer.down.view();
+    if (request.total == 1 and cudaA4bCompactDownEnabled()) {
+        const launched_compact = blk: {
+            self.kernels.launchGemma4A4BDownRowsQ4_0Q8_1F32Compact(
+                &self.ctx,
+                expert_output,
+                activated_q8,
+                down,
+                route_ids,
+                layer.down.expert_stride,
+                request.total,
+                request.top_k,
+                request.inter_size,
+                request.hidden_size,
+            ) catch |err| switch (err) {
+                error.CudaKernelUnavailable, error.InvalidCudaState => break :blk false,
+                else => return err,
+            };
+            break :blk true;
+        };
+        if (launched_compact) {
+            self.stats.a4b_compact_down_hits +|= 1;
+        } else {
+            self.stats.a4b_compact_down_fallbacks +|= 1;
+            try self.kernels.launchGemma4A4BDownRowsQ4_0Q8_1F32(
+                &self.ctx,
+                expert_output,
+                activated_q8,
+                down,
+                route_ids,
+                layer.down.expert_stride,
+                request.total,
+                request.top_k,
+                request.inter_size,
+                request.hidden_size,
+            );
+        }
+    } else {
+        try self.kernels.launchGemma4A4BDownRowsQ4_0Q8_1F32(
+            &self.ctx,
+            expert_output,
+            activated_q8,
+            down,
+            route_ids,
+            layer.down.expert_stride,
+            request.total,
+            request.top_k,
+            request.inter_size,
+            request.hidden_size,
+        );
+    }
 
     const shape = try allocShape2(self.allocator, request.total, request.hidden_size);
     errdefer self.allocator.free(shape);
@@ -21541,6 +21737,8 @@ const vtable = ops.ComputeBackend.VTable{
     .rmsNormAddOutputScaleTensor = &rmsNormAddOutputScaleTensor,
     .rmsNormHeadsRope = &rmsNormHeadsRope,
     .rmsNormBare = &rmsNormBare,
+    .rmsNormTriple = &rmsNormTripleOp,
+    .parallelFfnPostResidual = &parallelFfnPostResidualOp,
     .gelu = &gelu,
     .geluExact = &geluExact,
     .relu = &relu,

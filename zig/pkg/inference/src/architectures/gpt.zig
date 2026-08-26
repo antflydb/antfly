@@ -6477,6 +6477,18 @@ fn a4bHighMemoryFeatureEnabled(
         !getenvBool(disable_name);
 }
 
+fn a4bParallelFfnFusionEnabled(
+    cb: *const ComputeBackend,
+    comptime metal_enable_name: [*:0]const u8,
+    comptime metal_disable_name: [*:0]const u8,
+) bool {
+    return switch (cb.kind()) {
+        .metal => a4bHighMemoryFeatureEnabled(metal_enable_name, metal_disable_name),
+        .cuda => !getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_NORM_FUSION"),
+        else => false,
+    };
+}
+
 fn getenvUsize(comptime name: [*:0]const u8) ?usize {
     if (comptime is_freestanding) return null;
     return platform.env.getenvUsize(name);
@@ -9534,11 +9546,11 @@ fn applyGemmaParallelFfnPreNorms(
     hidden: CT,
     layer: usize,
 ) !?ops.RmsNormTripleResult {
-    if (cb.kind() != .metal or
-        !a4bHighMemoryFeatureEnabled(
-            "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_NORMS",
-            "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_NORMS",
-        )) return null;
+    if (!a4bParallelFfnFusionEnabled(
+        cb,
+        "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_NORMS",
+        "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_NORMS",
+    )) return null;
 
     var shared_primary_buf: [256]u8 = undefined;
     var shared_fallback_buf: [256]u8 = undefined;
@@ -9621,11 +9633,11 @@ fn applyGemmaParallelFfnPostResidual(
     residual: CT,
     layer: usize,
 ) !?CT {
-    if (cb.kind() != .metal or
-        !a4bHighMemoryFeatureEnabled(
-            "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_POST_FUSION",
-            "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_POST_FUSION",
-        )) return null;
+    if (!a4bParallelFfnFusionEnabled(
+        cb,
+        "TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_POST_FUSION",
+        "TERMITE_METAL_DISABLE_A4B_PARALLEL_FFN_POST_FUSION",
+    )) return null;
 
     var shared_primary_buf: [256]u8 = undefined;
     var shared_fallback_buf: [256]u8 = undefined;

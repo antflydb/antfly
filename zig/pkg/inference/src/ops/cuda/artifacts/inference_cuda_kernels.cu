@@ -1695,6 +1695,112 @@ extern "C" __global__ void termite_rms_norm_bare_f32(
     }
 }
 
+// Gemma 4 A4B branches three RMSNorms from the same attention residual. Share
+// the denominator reduction while preserving the ordinary RMSNorm reduction
+// order, then materialize the three independently weighted outputs.
+extern "C" __global__ void termite_gemma4_a4b_rms_norm_triple_f32(
+    float* first,
+    float* second,
+    float* third,
+    const float* input,
+    const float* first_weight,
+    const float* second_weight,
+    const float* third_weight,
+    unsigned int rows,
+    unsigned int dim,
+    float eps
+) {
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int base = row * dim;
+    __shared__ float partial[256];
+    float sumsq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        const float x = input[base + i];
+        sumsq += x * x;
+    }
+    partial[tid] = sumsq;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)dim + eps);
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        const unsigned int idx = base + i;
+        const float normalized = input[idx] * scale;
+        first[idx] = normalized * first_weight[i];
+        second[idx] = normalized * second_weight[i];
+        third[idx] = normalized * third_weight[i];
+    }
+}
+
+// Fused Gemma 4 A4B parallel-FFN epilogue:
+//   rms(shared) + rms(routed) -> rms(combined) + attention residual.
+// The output buffer temporarily holds the rounded combined value so the final
+// denominator and result match the materialized unfused chain.
+extern "C" __global__ void termite_gemma4_a4b_parallel_ffn_post_residual_f32(
+    float* dst,
+    const float* shared,
+    const float* shared_weight,
+    const float* routed,
+    const float* routed_weight,
+    const float* combined_weight,
+    const float* residual,
+    unsigned int rows,
+    unsigned int dim,
+    float eps
+) {
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int base = row * dim;
+    __shared__ float shared_partial[256];
+    __shared__ float routed_partial[256];
+    float shared_sumsq = 0.0f;
+    float routed_sumsq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        const float shared_value = shared[base + i];
+        const float routed_value = routed[base + i];
+        shared_sumsq += shared_value * shared_value;
+        routed_sumsq += routed_value * routed_value;
+    }
+    shared_partial[tid] = shared_sumsq;
+    routed_partial[tid] = routed_sumsq;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            shared_partial[tid] += shared_partial[tid + stride];
+            routed_partial[tid] += routed_partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float shared_scale = rsqrtf(shared_partial[0] / (float)dim + eps);
+    const float routed_scale = rsqrtf(routed_partial[0] / (float)dim + eps);
+
+    float combined_sumsq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        const unsigned int idx = base + i;
+        const float combined =
+            shared[idx] * shared_scale * shared_weight[i] +
+            routed[idx] * routed_scale * routed_weight[i];
+        dst[idx] = combined;
+        combined_sumsq += combined * combined;
+    }
+    shared_partial[tid] = combined_sumsq;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) shared_partial[tid] += shared_partial[tid + stride];
+        __syncthreads();
+    }
+    const float combined_scale = rsqrtf(shared_partial[0] / (float)dim + eps);
+    for (unsigned int i = tid; i < dim; i += blockDim.x) {
+        const unsigned int idx = base + i;
+        dst[idx] = dst[idx] * combined_scale * combined_weight[i] + residual[idx];
+    }
+}
+
 extern "C" __global__ void termite_layer_norm_f32(
     float* dst,
     const float* input,
@@ -16286,6 +16392,64 @@ extern "C" __global__ void termite_gemma4_a4b_q4_0_down_rows_q8_1_f32(
     termite_store_q4_0_cols_warp_sum_warps<8u, 4u>(expert_output, route, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
 }
 
+// Decode-only A4B down projection. Its 704-wide input has 22 Q4_0 blocks, so
+// only 44 threads contribute. Two warps retain the original thread/block
+// mapping and arithmetic while avoiding two idle warps per CTA.
+extern "C" __global__ void termite_gemma4_a4b_q4_0_down_rows_q8_1_f32_compact(
+    float* expert_output,
+    const unsigned char* q8_activated,
+    const unsigned char* down_base,
+    const unsigned int* route_ids,
+    unsigned long long down_expert_stride,
+    unsigned int rows,
+    unsigned int top_k,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    if (rows != 1u || top_k != 8u || in_dim != 704u || out_dim != 2816u || blockDim.x != 64u) return;
+    const unsigned int cols = 8u;
+    const unsigned int col_tile = blockIdx.x * cols;
+    const unsigned int route = blockIdx.y;
+    if (route >= 8u) return;
+    const unsigned int expert = route_ids[route];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned char* weight = down_base + (size_t)expert * down_expert_stride;
+    __shared__ float warp_partial[8][2];
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    const unsigned int iqs = (tid & 1u) * 2u;
+    const unsigned int block = tid >> 1u;
+    if (block < 22u) {
+        const unsigned char* q8_bp = q8_activated + ((size_t)route * 22u + block) * 36u;
+        const unsigned short q8_d_h = (unsigned short)q8_bp[0] | ((unsigned short)q8_bp[1] << 8);
+        const float q8_d = termite_half_to_float(q8_d_h);
+        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+        const unsigned int q8_base0 = iqs * 4u;
+        const unsigned int q8_base1 = q8_base0 + 4u;
+        const int q8_low0 = termite_load_i8x4_aligned(q8_values + q8_base0);
+        const int q8_high0 = termite_load_i8x4_aligned(q8_values + q8_base0 + 16u);
+        const int q8_low1 = termite_load_i8x4_aligned(q8_values + q8_base1);
+        const int q8_high1 = termite_load_i8x4_aligned(q8_values + q8_base1 + 16u);
+#pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned char* bp = weight + ((size_t)(col_tile + c) * 22u + block) * 18u;
+            acc[c] = termite_q4_0_q8_1_partial_mmvq2(bp, q8_d, iqs, q8_low0, q8_high0, q8_low1, q8_high1);
+        }
+    }
+    termite_store_q4_0_cols_warp_sum_warps<8u, 2u>(
+        expert_output,
+        route,
+        2816u,
+        col_tile,
+        acc,
+        &warp_partial[0][0],
+        tid,
+        lane,
+        warp
+    );
+}
+
 extern "C" __global__ void termite_gemma4_a4b_combine_rows_f32(
     float* dst,
     const float* expert_output,
@@ -18106,6 +18270,134 @@ extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8(
         partial_values[global_tile] = best_value;
         partial_indices[global_tile] = best_index;
     }
+}
+
+__device__ __forceinline__ int termite_q6k_pack_i8x4_exact_2816(
+    const unsigned char* block,
+    unsigned int sub,
+    unsigned int offset
+) {
+    const unsigned int half = sub >> 3u;
+    const unsigned int group = (sub & 7u) >> 1u;
+    const unsigned int l_base = (sub & 1u) * 16u;
+    const unsigned int ql_off = half * 64u + (group & 1u) * 32u;
+    const unsigned int qh_off = half * 32u;
+    const unsigned int qh_shift = group << 1u;
+    const unsigned int nibble_shift = (group >> 1u) << 2u;
+    const unsigned char* ql = block + ql_off + l_base;
+    const unsigned char* qh = block + 128u + qh_off + l_base;
+    const unsigned int q0 = ((unsigned int)(ql[offset + 0u] >> nibble_shift) & 0x0fu) |
+        (((unsigned int)(qh[offset + 0u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int q1 = ((unsigned int)(ql[offset + 1u] >> nibble_shift) & 0x0fu) |
+        (((unsigned int)(qh[offset + 1u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int q2 = ((unsigned int)(ql[offset + 2u] >> nibble_shift) & 0x0fu) |
+        (((unsigned int)(qh[offset + 2u] >> qh_shift) & 0x03u) << 4u);
+    const unsigned int q3 = ((unsigned int)(ql[offset + 3u] >> nibble_shift) & 0x0fu) |
+        (((unsigned int)(qh[offset + 3u] >> qh_shift) & 0x03u) << 4u);
+    return (int)(
+        ((q0 - 32u) & 0xffu) |
+        (((q1 - 32u) & 0xffu) << 8u) |
+        (((q2 - 32u) & 0xffu) << 16u) |
+        (((q3 - 32u) & 0xffu) << 24u)
+    );
+}
+
+__device__ __forceinline__ int termite_q6k_q8_1_dot16_exact_2816(
+    const unsigned char* block,
+    unsigned int sub,
+    int q8_pack0,
+    int q8_pack1,
+    int q8_pack2,
+    int q8_pack3
+) {
+    int sumi = 0;
+    sumi = __dp4a(termite_q6k_pack_i8x4_exact_2816(block, sub, 0u), q8_pack0, sumi);
+    sumi = __dp4a(termite_q6k_pack_i8x4_exact_2816(block, sub, 4u), q8_pack1, sumi);
+    sumi = __dp4a(termite_q6k_pack_i8x4_exact_2816(block, sub, 8u), q8_pack2, sumi);
+    sumi = __dp4a(termite_q6k_pack_i8x4_exact_2816(block, sub, 12u), q8_pack3, sumi);
+    return sumi;
+}
+
+// Exact Gemma 4 26B-A4B greedy LM-head stage. Constant 2816-wide geometry
+// lets ptxas hoist Q6_K address arithmetic and avoids the generic kernel's
+// dynamic shape/suppression branches. Six warps cover the 176 useful
+// block/sub-block tasks without an inactive tail warp.
+extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b(
+    float* partial_values,
+    unsigned int* partial_indices,
+    const unsigned char* input_q8_1,
+    const unsigned char* weight,
+    const int* suppress_token_ids,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int suppress_count
+) {
+    (void)suppress_token_ids;
+    if (rows != 1u || in_dim != 2816u || out_dim == 0u || (out_dim & 7u) != 0u ||
+        suppress_count != 0u || blockDim.x != 192u) return;
+    const unsigned int cols = 8u;
+    const unsigned int row_blocks = 11u;
+    const unsigned int global_tile = blockIdx.x;
+    const unsigned int col_tile = global_tile * cols;
+    if (col_tile >= out_dim) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    __shared__ float warp_partial[8][6];
+    float acc[8];
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) acc[c] = 0.0f;
+
+    if (tid < 176u) {
+        const unsigned int block = tid >> 4u;
+        const unsigned int sub = tid & 15u;
+        const unsigned int q8_sub_block = sub >> 1u;
+        const unsigned int q8_lane_base = (sub & 1u) * 16u;
+        const unsigned char* q8_bp = input_q8_1 + (block * 8u + q8_sub_block) * 36u;
+        const float q8_d = termite_half_to_float(((const unsigned short*)q8_bp)[0]);
+        const signed char* q8_values = (const signed char*)(q8_bp + 4u);
+        const int q8_pack0 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 0u);
+        const int q8_pack1 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 4u);
+        const int q8_pack2 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 8u);
+        const int q8_pack3 = termite_load_i8x4_aligned(q8_values + q8_lane_base + 12u);
+#pragma unroll
+        for (unsigned int c = 0u; c < cols; ++c) {
+            const unsigned char* bp = weight + ((size_t)(col_tile + c) * row_blocks + block) * 210u;
+            const int sumi = termite_q6k_q8_1_dot16_exact_2816(
+                bp,
+                sub,
+                q8_pack0,
+                q8_pack1,
+                q8_pack2,
+                q8_pack3
+            );
+            acc[c] = (q8_d * termite_q6k_sub_scale_f32(bp, sub)) * (float)sumi;
+        }
+    }
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        const float sum = termite_warp_reduce_sum(acc[c]);
+        if (lane == 0u) warp_partial[c][warp] = sum;
+    }
+    __syncthreads();
+    if (tid != 0u) return;
+
+    float best_value = -3.402823466e+38f;
+    unsigned int best_index = 0xffffffffu;
+#pragma unroll
+    for (unsigned int c = 0u; c < cols; ++c) {
+        float value = 0.0f;
+#pragma unroll
+        for (unsigned int w = 0u; w < 6u; ++w) value += warp_partial[c][w];
+        const unsigned int col = col_tile + c;
+        if (value > best_value || (value == best_value && col < best_index)) {
+            best_value = value;
+            best_index = col;
+        }
+    }
+    partial_values[global_tile] = best_value;
+    partial_indices[global_tile] = best_index;
 }
 
 extern "C" __global__ void termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b(
