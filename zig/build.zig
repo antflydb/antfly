@@ -3432,6 +3432,21 @@ pub fn build(b: *std.Build) void {
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
 
+    const lib_preload_model_spec_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "preload model spec parser categorizes registry variants and backends",
+            "inference runtime preload parser preserves registry variants and explicit backends",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_preload_model_spec_tests = addFilteredTestRunArtifact(b, lib_preload_model_spec_tests);
+    const lib_preload_model_spec_test_step = b.step("lib-preload-model-spec-test", "Run preload model CLI parser tests");
+    lib_preload_model_spec_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
+
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{ "file secret store", "remote content runtime" },
@@ -6992,6 +7007,7 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
             "parse cli accepts canonical host port and models dir flags",
+            "parse cli preserves registry variants and recognizes explicit preload backends",
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
             "parse cli accepts HA standby runtime flags",
@@ -7080,6 +7096,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
+    unit_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_httpx_transport_regression_tests.step);
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
