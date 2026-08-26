@@ -21,7 +21,7 @@ const font_lib = @import("antfly_font");
 const Allocator = std.mem.Allocator;
 
 pub const default_max_decoded_stream_bytes: usize = 64 * 1024 * 1024;
-pub const default_max_decode_working_set_bytes: usize = 128 * 1024 * 1024;
+pub const default_max_decode_working_set_bytes: usize = 96 * 1024 * 1024;
 
 /// Bounds both the final output of one PDF stream and the cumulative live
 /// allocations used while applying its filter chain. The working-set limit is

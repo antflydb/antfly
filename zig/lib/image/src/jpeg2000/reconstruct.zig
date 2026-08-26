@@ -1277,7 +1277,7 @@ pub const IrreversiblePlaneAssembler = struct {
     }
 };
 
-pub fn interleaveComponentPlanesU8(
+fn interleaveComponentPlanesU8WithUpsampling(
     allocator: std.mem.Allocator,
     state: *const codestream.State,
     raw_planes: [][]i32,
@@ -1331,6 +1331,71 @@ pub fn interleaveComponentPlanesU8(
         first_component.is_signed,
     );
 }
+
+/// Interleave full-resolution component planes without allocating the output
+/// on top of every four-byte coefficient plane. The first plane is converted
+/// to bytes in place and shrunk before the output allocation, keeping the
+/// three-component production path below the PDF decoder's 96 MiB reservation.
+pub fn interleaveComponentPlanesU8(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: [][]i32,
+) ![]u8 {
+    if (raw_planes.len != state.header.components.len) return error.InvalidPlaneLength;
+    if (raw_planes.len != 1 and raw_planes.len != 3 and raw_planes.len != 4)
+        return error.UnsupportedPlaneCount;
+
+    const image_width: usize = @intCast(state.header.width);
+    const image_height: usize = @intCast(state.header.height);
+    const pixel_count = std.math.mul(usize, image_width, image_height) catch
+        return error.InvalidPlaneLength;
+    for (state.header.components, raw_planes) |component, plane| {
+        const dims = tile.componentDimensions(
+            state.header.width,
+            state.header.height,
+            component.xrsiz,
+            component.yrsiz,
+        );
+        if (dims.width != state.header.width or dims.height != state.header.height)
+            return interleaveComponentPlanesU8WithUpsampling(allocator, state, raw_planes);
+        if (plane.len != pixel_count) return error.InvalidPlaneLength;
+    }
+
+    const first_component = state.header.components[0];
+    var first_bytes = std.mem.sliceAsBytes(raw_planes[0]);
+    for (raw_planes[0], 0..) |sample, pixel_index| {
+        first_bytes[pixel_index] = try reconstructU8Sample(
+            sample,
+            first_component.bits_per_component,
+            first_component.is_signed,
+        );
+    }
+
+    const compact_word_count = std.math.divCeil(
+        usize,
+        pixel_count,
+        @sizeOf(i32),
+    ) catch return error.InvalidPlaneLength;
+    raw_planes[0] = try allocator.realloc(raw_planes[0], compact_word_count);
+    first_bytes = std.mem.sliceAsBytes(raw_planes[0])[0..pixel_count];
+
+    const output_len = std.math.mul(usize, pixel_count, raw_planes.len) catch
+        return error.InvalidPlaneLength;
+    const output = try allocator.alloc(u8, output_len);
+    errdefer allocator.free(output);
+    for (0..pixel_count) |pixel_index| {
+        output[pixel_index * raw_planes.len] = first_bytes[pixel_index];
+        for (1..raw_planes.len) |component_index| {
+            output[pixel_index * raw_planes.len + component_index] = try reconstructU8Sample(
+                raw_planes[component_index][pixel_index],
+                first_component.bits_per_component,
+                first_component.is_signed,
+            );
+        }
+    }
+    return output;
+}
+
 /// Apply N-level inverse 9/7 wavelet transform iteratively on f32 data.
 fn inverseWavelet97MultiLevel(
     allocator: std.mem.Allocator,

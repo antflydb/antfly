@@ -1887,7 +1887,7 @@ test "OfficeQA JPEG 2000 page decodes natively within bounded memory" {
         "bd592833fd9c09b0501d9eb6855c50e557d4df9afaca7d34963edb5af5c1363f",
         &std.fmt.bytesToHex(digest, .lower),
     );
-    try std.testing.expect(peak.peak_live_bytes <= 128 * 1024 * 1024);
+    try std.testing.expect(peak.peak_live_bytes <= 96 * 1024 * 1024);
     decoded.deinit();
     try std.testing.expectEqual(@as(usize, 0), peak.live_bytes);
 }
