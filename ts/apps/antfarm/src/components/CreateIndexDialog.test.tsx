@@ -6,9 +6,8 @@ import CreateIndexDialog, {
   buildGraphEdgeTypeConfig,
   buildGraphSourceConfig,
   getSchemaFieldNames,
-  parseAdvancedIndexConfig,
-  usesArtifactBackedIndexSource,
 } from "./CreateIndexDialog";
+import { parseAdvancedIndexConfig, usesArtifactBackedIndexSource } from "./create-index-config";
 
 const mocks = vi.hoisted(() => ({
   createIndex: vi.fn(),

@@ -103,7 +103,7 @@ export function artifactFullTextIndexConfig(
   name: string,
   options: ArtifactFullTextIndexOptions
 ): IndexConfig;
-/** Backward-compatible convenience overload for whole-artifact projection. */
+/** Convenience overload for whole-artifact projection. */
 export function artifactFullTextIndexConfig(name: string, ...artifacts: string[]): IndexConfig;
 export function artifactFullTextIndexConfig(
   name: string,

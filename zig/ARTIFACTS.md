@@ -420,7 +420,10 @@ selects the upstream artifact consumed by that single embedding producer, while
 `embedding_name`/`sources` select the producer output consumed by the vector
 index. Multi-source configurations put `source_artifact_name` on each matching
 embedding enrichment because producer inputs can differ. Normalized responses
-represent consumed embedding outputs through `sources`.
+represent canonical consumed-output identity through `sources`. When a v0.2
+single-source request uses `embedding_name` and `source_artifact_name`, those
+released fields remain alongside `sources` so v0.2 clients can inspect and
+round-trip the effective configuration.
 
 For example, one full-text index can search both extracted units and derived
 chunks:
