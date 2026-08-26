@@ -21383,6 +21383,14 @@ pub const DB = struct {
         else
             fallback;
         const desired = self.async_context.enrichment_desired_running.load(.acquire);
+        // `desired` is the lock-free source of truth for whether this DB owns
+        // an enrichment producer. A retained query-only snapshot may have
+        // `enabled=false`, and lifecycle contention prevents us from replacing
+        // it with runtime.stats(). Never let that observation gap turn a live
+        // or restarting producer into a disabled one: public readiness treats
+        // enabled + retrying as transient debt and remains fail-closed until a
+        // later poll can observe the worker directly.
+        if (desired) enrichment_status.enabled = true;
         const started = if (lifecycle_locked)
             if (self.async_context.enrichment_runtime) |runtime| runtime.isStarted() else false
         else
@@ -46641,7 +46649,6 @@ test "db enrichment status does not wait for lifecycle mutation" {
 
     lockAtomicWithBackoff(&db.async_context.enrichment_lifecycle_mutex);
     const fallback = types.EnrichmentStats{
-        .enabled = true,
         .target_sequence = 41,
         .applied_sequence = 37,
     };
