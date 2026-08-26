@@ -5108,6 +5108,7 @@ pub const DataServer = struct {
         );
         _ = owner_source.withGroupVisibleRootGeneration(self.provisioned_storage.groupVisibleRootGenerationSource());
         _ = owner_source.withTransactionRecoverySource(self.write_source.transactionRecoverySource());
+        _ = owner_source.withRemoteContent(self.api_server_cfg.remote_content);
         if (comptime storage_kernel_experiment) {
             if (self.storageKernelContextHandle()) |handle|
                 _ = owner_source.withStorageContextHandle(handle);

@@ -430,7 +430,9 @@ comptime {
             exportInternal(&storage_kernel_exports.storageOwnerContextCreate, "antfly_storage_context_create");
             exportInternal(&storage_kernel_exports.storageOwnerContextDestroy, "antfly_storage_context_destroy");
             exportInternal(&storage_kernel_exports.storageContextAttachInferenceProvider, "antfly_storage_context_attach_inference_provider");
+            exportInternal(&storage_kernel_exports.storageOwnerContextConfigureRemoteContentSecurity, "antfly_storage_context_configure_remote_content_security");
             exportInternal(&storage_kernel_exports.storageOwnerContextMetrics, "antfly_storage_context_metrics");
+            exportInternal(&storage_kernel_exports.storageOwnerContextInvalidateCaches, "antfly_storage_context_invalidate_caches");
             exportInternal(&storage_kernel_exports.storageContextSystemStoreOpen, "antfly_storage_context_system_store_open");
             exportInternal(&storage_kernel_exports.storageSystemStoreClose, "antfly_storage_system_store_close");
             exportInternal(&storage_kernel_exports.storageSystemStoreSync, "antfly_storage_system_store_sync");

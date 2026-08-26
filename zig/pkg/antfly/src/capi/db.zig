@@ -70,6 +70,7 @@ const backups_api = antfly.public_api.backups;
 const backup_restore = antfly.raft.storage.backup_restore;
 const common_config = antfly.common_config;
 const common_secrets = antfly.common_secrets;
+const scraping = @import("antfly_scraping");
 const inference_provider_client = @import("../storage/inference_provider_client.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const raft_catalog = antfly.raft_catalog;
@@ -82,6 +83,8 @@ const StorageOwnerContext = struct {
     resources: antfly.public_api.provisioned_storage.PhysicalStorageResources,
     backend_runtime: db_mod.background_runtime.BackendRuntimeHandle,
     inference_handle: ?*anyopaque = null,
+    remote_content_security: ?std.json.Parsed(scraping.ContentSecurityConfig) = null,
+    remote_content: scraping.RemoteContentConfig = .{},
     lite_backend: ?lite_backend.Handle = null,
     auth_backend: ?antfly.lsm_backend.BackendHandle = null,
     auth_users_store: ?antfly.storage_backend_erased.Store = null,
@@ -120,6 +123,10 @@ const StorageOwnerContext = struct {
         return inference_provider_client.provider(self.inference_handle orelse return null);
     }
 
+    fn remoteContent(self: *const StorageOwnerContext) ?*const scraping.RemoteContentConfig {
+        return if (self.remote_content_security != null) &self.remote_content else null;
+    }
+
     fn deinitIfIdle(self: *StorageOwnerContext) bool {
         self.lock();
         if (self.active_owners != 0) {
@@ -131,6 +138,7 @@ const StorageOwnerContext = struct {
         if (self.auth_users_store) |*store| store.deinit();
         if (self.auth_backend) |*backend| backend.close();
         if (self.lite_backend) |*backend| backend.deinit();
+        if (self.remote_content_security) |*parsed| parsed.deinit();
         self.backend_runtime.deinit();
         self.resources.deinit();
         const alloc = self.alloc;
@@ -2071,6 +2079,34 @@ pub fn storageContextAttachInferenceProvider(
     return .ok;
 }
 
+pub fn storageOwnerContextConfigureRemoteContentSecurity(
+    context: ?*anyopaque,
+    security_json: kernel_owner_abi.BorrowedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    const encoded = security_json.slice();
+    var parsed: ?std.json.Parsed(scraping.ContentSecurityConfig) = if (encoded.len == 0)
+        null
+    else
+        std.json.parseFromSlice(scraping.ContentSecurityConfig, owner_context.alloc, encoded, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = false,
+        }) catch return .invalid_argument;
+
+    owner_context.lock();
+    if (owner_context.active_owners != 0) {
+        owner_context.mutex.unlock();
+        if (parsed) |*value| value.deinit();
+        return .busy;
+    }
+    var previous = owner_context.remote_content_security;
+    owner_context.remote_content_security = parsed;
+    owner_context.remote_content.security = if (owner_context.remote_content_security) |*value| value.value else null;
+    owner_context.mutex.unlock();
+    if (previous) |*value| value.deinit();
+    return .ok;
+}
+
 fn storageOwnerContextCacheKindStats(stats: anytype) kernel_owner_abi.ContextCacheKindStats {
     return .{
         .hits = stats.hits,
@@ -2099,6 +2135,17 @@ pub fn storageOwnerContextMetrics(
         .lsm_run_table_block = storageOwnerContextCacheKindStats(stats.run_table_block),
         .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
     };
+    return .ok;
+}
+
+pub fn storageOwnerContextInvalidateCaches(context: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {
+    const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    // Generation publication is rare and can replace every inode below one
+    // table root. Cache implementations retain active borrowers safely while
+    // making all subsequent lookups miss, so invalidating the process-wide
+    // context does not disturb owners of unrelated groups.
+    owner_context.resources.lsm_cache.invalidatePrefix("");
+    owner_context.resources.hbc_cache.clear();
     return .ok;
 }
 
@@ -3753,6 +3800,7 @@ pub fn storageOwnerOpen(
         .identity_namespace = identity_namespace,
         .prefer_existing_identity_namespace = identity_namespace != null,
         .transaction_recovery = if (recovery) |value| value.dbConfig() else .{},
+        .remote_content = if (owner_context) |context| context.remoteContent() else null,
     };
     if (owner_context) |context| if (context.lite_backend) |*backend|
         backend.configureDbOpenOptionsForNamespace(&open_options, path) catch |err|
@@ -3766,6 +3814,7 @@ pub fn storageOwnerOpen(
         request.indexes_json.slice(),
         if (owner_context) |context| context.backend_runtime.ptr() else null,
         if (owner_context) |context| context.antflyProvider() else null,
+        if (owner_context) |context| context.remoteContent() else null,
     ) catch |err| return storageOwnerStatusFromError(err);
     const owned_path = alloc.dupe(u8, path) catch return .out_of_memory;
     errdefer alloc.free(owned_path);
@@ -3804,6 +3853,7 @@ pub fn storageOwnerConfigure(
         request.indexes_json.slice(),
         if (handle.storage_owner_context) |context| context.backend_runtime.ptr() else null,
         if (handle.storage_owner_context) |context| context.antflyProvider() else null,
+        if (handle.storage_owner_context) |context| context.remoteContent() else null,
     ) catch |err| {
         std.log.err("storage owner configure failed table={s} err={s}", .{
             handle.storage_owner_table_name orelse "",
@@ -4424,6 +4474,41 @@ fn prepareStorageRestore(
     );
     db.close();
     db_open = false;
+
+    // The first owner proves the generation it has in memory. Reopen the
+    // isolated candidate before sealing so publication is authorized by the
+    // files a new process actually observes. A fresh owner can also repair
+    // reopen-only dense debt (for example an incomplete HBC publication), but
+    // its result must itself survive one more reopen.
+    var durability_verified = false;
+    for (0..3) |verification_attempt| {
+        var verify_db = try antfly.public_api.table_writes.openStorageKernelRestoreDb(
+            alloc,
+            staged.path(),
+            scope.manifest.value.indexes_json,
+            request.lsm_root_generation,
+            backend_runtime.ptr(),
+            identity_namespace,
+            &staged,
+        );
+        defer verify_db.close();
+        if (!try verify_db.prepareRestoreDurabilityRetryIfNeeded(alloc)) {
+            durability_verified = true;
+            break;
+        }
+        std.log.info("storage-kernel restore durability retry group_id={} attempt={}", .{
+            request.group_id,
+            verification_attempt + 1,
+        });
+        try antfly.public_api.table_writes.repairStorageKernelRestoreDb(
+            alloc,
+            &verify_db,
+            request.group_id,
+            scope.manifest.value.schema_json,
+            scope.manifest.value.indexes_json,
+        );
+    }
+    if (!durability_verified) return error.RestoreDenseArtifactRebuildIncomplete;
     try staged.seal();
 
     const restore_live_path = try alloc.dupe(u8, path);
@@ -4583,6 +4668,7 @@ fn prepareStorageSnapshot(request: *const kernel_owner_abi.SnapshotPrepareReques
         &db,
         request.schema_json.slice(),
         request.indexes_json.slice(),
+        null,
         null,
         null,
     );

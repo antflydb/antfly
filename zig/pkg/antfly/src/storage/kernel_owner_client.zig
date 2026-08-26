@@ -58,12 +58,25 @@ pub const Context = struct {
         ));
     }
 
+    pub fn configureRemoteContentSecurity(self: *Context, security_json: []const u8) !void {
+        try self.ensure();
+        try statusToError(abi.antfly_storage_context_configure_remote_content_security(
+            self.handle,
+            .fromSlice(security_json),
+        ));
+    }
+
     pub fn metrics(self: *Context) !abi.ContextMetricsResult {
         try self.ensure();
         var result: abi.ContextMetricsResult = .{};
         try statusToError(abi.antfly_storage_context_metrics(self.handle, &result));
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
         return result;
+    }
+
+    pub fn invalidateCaches(self: *Context) !void {
+        try self.ensure();
+        try statusToError(abi.antfly_storage_context_invalidate_caches(self.handle));
     }
 
     pub fn systemStore(

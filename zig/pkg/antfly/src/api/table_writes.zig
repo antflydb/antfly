@@ -24553,6 +24553,7 @@ pub fn configureStorageKernelOwnerDb(
     indexes_json: []const u8,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
     if (schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
     if (indexes_json.len > 0) {
@@ -24564,7 +24565,7 @@ pub fn configureStorageKernelOwnerDb(
             antfly_provider,
             null,
             null,
-            null,
+            remote_content,
         );
         _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, db, indexes_json, .{
             .drain_resolver_backfill = false,
@@ -24615,7 +24616,7 @@ pub fn repairStorageKernelRestoreDb(
     schema_json: []const u8,
     indexes_json: []const u8,
 ) !void {
-    try configureStorageKernelOwnerDb(alloc, db, schema_json, indexes_json, null, null);
+    try configureStorageKernelOwnerDb(alloc, db, schema_json, indexes_json, null, null, null);
     const timeout_ns = 30 * std.time.ns_per_s;
     const start_ns = platform_time.monotonicNs();
     var attempts: usize = 0;

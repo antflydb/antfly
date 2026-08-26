@@ -47,6 +47,8 @@ const storage_maintenance_source = @import("storage_maintenance_source.zig");
 const table_write_source = @import("table_write_source.zig");
 const table_writes = @import("table_writes.zig");
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
+const common_config = @import("../common/config.zig");
+const scraping = @import("antfly_scraping");
 
 pub const ProvisionedKernelOwnerSource = struct {
     alloc: std.mem.Allocator,
@@ -56,6 +58,8 @@ pub const ProvisionedKernelOwnerSource = struct {
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
     transaction_recovery_source: ?transaction_recovery_source.Source = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
+    remote_content_configured: bool = false,
     context: client.Context = .{},
     owns_context: bool = true,
     mutex: std.atomic.Mutex = .unlocked,
@@ -174,6 +178,25 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) *ProvisionedKernelOwnerSource {
         self.document_child_range_dispatch_source = source;
         return self;
+    }
+
+    pub fn withRemoteContent(
+        self: *ProvisionedKernelOwnerSource,
+        remote_content: ?*const scraping.RemoteContentConfig,
+    ) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.entries.items.len == 0);
+        self.remote_content = remote_content;
+        self.remote_content_configured = false;
+        return self;
+    }
+
+    fn ensureContextConfigured(self: *ProvisionedKernelOwnerSource) !void {
+        try self.context.ensure();
+        if (self.remote_content_configured) return;
+        const security_json = try common_config.remoteContentSecurityJsonAlloc(self.alloc, self.remote_content);
+        defer self.alloc.free(security_json);
+        try self.context.configureRemoteContentSecurity(security_json);
+        self.remote_content_configured = true;
     }
 
     pub fn withStorageContextHandle(
@@ -308,7 +331,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     pub fn storageContextHandle(self: *ProvisionedKernelOwnerSource) !?*anyopaque {
-        try self.context.ensure();
+        try self.ensureContextConfigured();
         return self.context.handle;
     }
 
@@ -624,9 +647,15 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn publishPreparedSnapshot(ptr: *anyopaque, snapshot_handle: *anyopaque) !bool {
-        _ = ptr;
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var snapshot = client.Snapshot{ .handle = snapshot_handle };
-        return try snapshot.publishPrepared();
+        const durability_uncertain = try snapshot.publishPrepared();
+        // The compiled storage context owns the caches used by every resident
+        // table owner. The control-only caller cannot invalidate them through
+        // its legacy DB-cache path, so make the physical publication boundary
+        // explicit before a new owner can open the replacement generation.
+        try self.context.invalidateCaches();
+        return durability_uncertain;
     }
 
     fn commitSnapshot(ptr: *anyopaque, snapshot_handle: *anyopaque) !void {
@@ -1384,7 +1413,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         errdefer self.alloc.free(owned_indexes_json);
         const entry = try self.alloc.create(Entry);
         errdefer self.alloc.destroy(entry);
-        try self.context.ensure();
+        try self.ensureContextConfigured();
         var owner = try client.Owner.open(.{
             .context = self.context.handle,
             .path = abi.BorrowedBytes.fromSlice(path),

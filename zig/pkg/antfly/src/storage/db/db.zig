@@ -15035,6 +15035,26 @@ pub const DB = struct {
         return try restoreRuntimeRepairNeededForPath(self.alloc, self.core.path);
     }
 
+    /// Restore's first repair owner can prove a generation only while its
+    /// index objects remain open. Publication needs the stronger proof that a
+    /// fresh owner can load the files it left behind. When that reopen
+    /// rediscovers dense generation or watermark debt, reset the durable
+    /// restore state so the fresh owner reconstructs the candidate before it
+    /// can be sealed.
+    pub fn prepareRestoreDurabilityRetryIfNeeded(self: *DB, alloc: Allocator) !bool {
+        if (self.core.index_manager.hasLoadFailures()) return error.RestoreIndexLoadIncomplete;
+        const retry_needed = try self.hasPendingDenseArtifactRebuild(alloc) or
+            try self.denseArtifactWatermarkRepairNeeded(alloc) or
+            self.core.index_manager.hasRepairUnavailableIndexes();
+        if (!retry_needed) return false;
+        if (self.backend_runtime.io()) |io| {
+            try markRestoreRuntimeRepairNeededWithIo(alloc, io, self.core.path);
+        } else {
+            try markRestoreRuntimeRepairNeeded(alloc, self.core.path);
+        }
+        return true;
+    }
+
     fn updateRestoreRuntimeRepairPhaseWithIo(
         self: *DB,
         alloc: Allocator,
@@ -19461,7 +19481,15 @@ pub const DB = struct {
                 try self.core.store.put(counter_key, &raw);
                 result.made_progress = true;
             }
-            if (entry.index.stats().active_count == expected) continue;
+            // A private restore has no readers and owns this unpublished
+            // generation. Rebuild it once from the final logical artifacts
+            // even when the in-memory cardinality already matches: an earlier
+            // in-place replay can have the right live count while its HBC bulk
+            // publication is still incomplete on disk. Cardinality alone is
+            // therefore insufficient proof across the close/promote/reopen
+            // boundary. Resident writers retain the ordinary mismatch-only
+            // behavior and let their background owner converge safely.
+            if (self.start_index_workers and entry.index.stats().active_count == expected) continue;
             try names.append(alloc, try alloc.dupe(u8, entry.config.name));
         }
         if (names.items.len > 0 and self.start_index_workers) {
@@ -19474,6 +19502,12 @@ pub const DB = struct {
             result.rebuilt += try rebuildDenseIndexForTargetCoverageContext(self.async_context, name, 2048);
         }
         if (names.items.len > 0) {
+            // Seal the matching replay watermark in the same restore quantum.
+            // Otherwise the following `sync_indexes` pass can rediscover the
+            // old rebuilding checkpoint and enter the in-place bulk path after
+            // this complete rebuild, leaving a fresh incomplete publication
+            // for the promoted process to encounter.
+            _ = try self.repairDenseArtifactAppliedSequencesIfCovered(alloc);
             self.clearDenseHbcCaches();
             result.made_progress = true;
         }
@@ -19493,6 +19527,12 @@ pub const DB = struct {
         completed_with_progress,
     };
 
+    fn restoreOwnsDenseArtifactIntent(trigger: index_repair_state.Trigger) bool {
+        return trigger == .artifact_counter_missing or
+            trigger == .artifact_coverage_mismatch or
+            trigger == .projection_generation_invalid;
+    }
+
     fn completeRestoreDenseArtifactRepairs(self: *DB, alloc: Allocator) !RestoreDenseArtifactCompletion {
         var state = self.loadIndexRepairState(alloc) catch |err| switch (err) {
             error.FileNotFound, error.DurableIndexRepairStateUnavailable => return .complete,
@@ -19500,14 +19540,17 @@ pub const DB = struct {
         };
         defer state.deinit(alloc);
 
+        // `rebuild_replayed_artifacts` reconstructed the private restore root
+        // from its final logical artifacts. Recount them here so a restored
+        // repair-required checkpoint can be retired only from exact source
+        // and active-generation coverage, never from a stale counter alone.
+        var exact_target_counts = try self.collectDenseArtifactTargetCounts(alloc, null);
+        defer exact_target_counts.deinit(alloc);
+
         // Validate every durable intent before changing counters or removing
         // any intent. A pending proof error must be observably mutation-free.
         for (state.entries.items) |entry| {
-            if (entry.intent.trigger != .artifact_counter_missing and
-                entry.intent.trigger != .artifact_coverage_mismatch)
-            {
-                continue;
-            }
+            if (!restoreOwnsDenseArtifactIntent(entry.intent.trigger)) continue;
             const cfg = self.core.index_manager.get(entry.intent.index_name) orelse
                 return error.RestoreDenseIndexProofIncomplete;
             if (cfg.kind != .dense_vector or
@@ -19539,11 +19582,7 @@ pub const DB = struct {
         // all pending exits side-effect free and avoids partially publishing a
         // multi-index restore proof.
         for (state.entries.items) |entry| {
-            if (entry.intent.trigger != .artifact_counter_missing and
-                entry.intent.trigger != .artifact_coverage_mismatch)
-            {
-                continue;
-            }
+            if (!restoreOwnsDenseArtifactIntent(entry.intent.trigger)) continue;
             const cfg = self.core.index_manager.get(entry.intent.index_name) orelse unreachable;
             const expected = (try loadDenseArtifactTargetCounter(alloc, self.core.store, cfg.name)) orelse
                 return error.RestoreDenseCounterProofIncomplete;
@@ -19562,20 +19601,62 @@ pub const DB = struct {
             );
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
             if (applied < target or
-                checkpoint.status != .clean or
+                (entry.intent.trigger != .projection_generation_invalid and checkpoint.status != .clean) or
                 checkpoint.applied_sequence < target or
                 checkpoint.config_hash != entry.intent.config_hash)
             {
                 return error.RestoreDenseCheckpointIncomplete;
             }
+
+            if (entry.intent.trigger == .projection_generation_invalid) {
+                var exact_expected: ?u64 = null;
+                for (self.core.index_manager.dense_indexes.items, 0..) |*dense_entry, dense_index_idx| {
+                    if (!std.mem.eql(u8, dense_entry.config.name, cfg.name)) continue;
+                    exact_expected = exact_target_counts.per_target_index.get(dense_index_idx) orelse 0;
+                    break;
+                }
+                if (exact_expected == null or exact_expected.? != expected) {
+                    return error.RestoreDenseCounterProofIncomplete;
+                }
+                if (@hasDecl(@TypeOf(dense.index), "validateStoredStructure")) {
+                    dense.index.validateStoredStructure(alloc) catch
+                        return error.RestoreDenseIndexProofIncomplete;
+                }
+                if (checkpoint.status == .degraded) return error.RestoreDenseCheckpointIncomplete;
+                if (entry.intent.candidate_relative_path) |candidate| {
+                    if (try self.core.index_manager.isRepairCandidateActive(cfg.name, candidate)) {
+                        return error.RestoreDenseIndexProofIncomplete;
+                    }
+                }
+            }
         }
 
         var removed_any = false;
         for (state.entries.items) |entry| {
-            if (entry.intent.trigger != .artifact_counter_missing and
-                entry.intent.trigger != .artifact_coverage_mismatch)
-            {
-                continue;
+            if (!restoreOwnsDenseArtifactIntent(entry.intent.trigger)) continue;
+            if (entry.intent.trigger == .projection_generation_invalid) {
+                const cfg = self.core.index_manager.get(entry.intent.index_name) orelse unreachable;
+                const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
+                const applied = try self.core.loadAppliedSequence(alloc, cfg.name);
+                if (checkpoint.status != .clean or checkpoint.applied_sequence != applied) {
+                    try self.core.saveProjectionCheckpoint(cfg.name, .{
+                        .applied_sequence = applied,
+                        .status = .clean,
+                        .generation = checkpoint.generation +| @intFromBool(checkpoint.status != .clean),
+                        .config_hash = entry.intent.config_hash,
+                    });
+                }
+                if (entry.intent.candidate_relative_path != null) {
+                    if (entry.intent.phase == .terminal) {
+                        try self.updateIndexRepairIntent(alloc, entry.intent.repair_id, .{
+                            .phase = .detected,
+                            .failure_streak = 0,
+                            .next_retry_at_ms = 0,
+                            .replace_last_error = true,
+                        });
+                    }
+                    try self.discardInactiveIndexRepairCandidate(alloc, entry.intent.repair_id);
+                }
             }
             // This is restore-owned metadata debt, not a shadow-generation
             // attempt, so there is no candidate phase chain to advance. All
@@ -90621,6 +90702,268 @@ test "db restore dense artifact completion keeps every intent when one proof is 
         repair_b,
         (try db.indexRepairIdForIndex(alloc, "dense_b")) orelse return error.TestUnexpectedResult,
     );
+}
+
+test "db restore dense artifact completion retires an obsolete invalid-generation shadow" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+    const repair_id = try db.ensureAutomaticDenseGenerationRepairIntent(
+        alloc,
+        cfg.*,
+        .projection_generation_invalid,
+        "dense_projection_checkpoint_repair_required",
+    );
+    const checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try db.core.saveProjectionCheckpoint(cfg.name, .{
+        .applied_sequence = checkpoint.applied_sequence,
+        .status = .repair_required,
+        .generation = checkpoint.generation,
+        .config_hash = types.indexConfigHash(cfg.*),
+    });
+
+    const shadow_base = try createUniqueRepairShadowBase(alloc, std.mem.span(path));
+    defer alloc.free(shadow_base);
+    const candidate_relative_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/indexes/{s}",
+        .{ std.fs.path.basename(shadow_base), cfg.name },
+    );
+    defer alloc.free(candidate_relative_path);
+    try db.updateIndexRepairIntent(alloc, repair_id, .{ .phase = .preflight });
+    try db.updateIndexRepairIntent(alloc, repair_id, .{
+        .phase = .building,
+        .candidate_relative_path = candidate_relative_path,
+        .replace_candidate_path = true,
+    });
+    try db.recordIndexRepairAttemptFailure(
+        alloc,
+        repair_id,
+        @errorName(error.RepairSourceCoverageIncomplete),
+        true,
+    );
+
+    try std.testing.expectEqual(
+        DB.RestoreDenseArtifactCompletion.completed_with_progress,
+        try db.completeRestoreDenseArtifactRepairs(alloc),
+    );
+    try std.testing.expect((try db.indexRepairIdForIndex(alloc, cfg.name)) == null);
+    const completed_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try std.testing.expectEqual(apply_state.ProjectionStatus.clean, completed_checkpoint.status);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, shadow_base, .{}));
+}
+
+test "db restore final artifact rebuild seals an exact in-memory bulk generation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    var lsm_cache = lsm_backend_mod.Cache.init(alloc, 8 * 1024 * 1024);
+    defer lsm_cache.deinit();
+    var hbc_cache = hbc_mod.Cache.init(alloc);
+    defer hbc_cache.deinit();
+    var resident_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer resident_runtime.deinit();
+    {
+        var old_live = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+            .lsm_cache = &lsm_cache,
+            .hbc_cache = &hbc_cache,
+            .backend_runtime = resident_runtime.ptr(),
+            .lsm_root_generation = 41,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer old_live.close();
+        try old_live.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+        });
+    }
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(path));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var db = try DB.open(alloc, staged.path(), .{
+            .primary_backend = primary_backend,
+            .lsm_root_generation = 41,
+            .staged_generation = &staged,
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+        });
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value = "{\"body\":\"abcdefghijklmno\"}",
+            }},
+            .sync_level = .full_index,
+        });
+    }
+
+    var expected_active: u64 = 0;
+    {
+        var db = try DB.open(alloc, staged.path(), .{
+            .primary_backend = primary_backend,
+            .lsm_root_generation = 41,
+            .staged_generation = &staged,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+        const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, cfg.name);
+        defer alloc.free(counter_key);
+        try db.core.store.delete(counter_key);
+        _ = try db.ensureAutomaticDenseGenerationRepairIntent(
+            alloc,
+            cfg.*,
+            .artifact_counter_missing,
+            "dense_artifact_counter_missing",
+        );
+        const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+        expected_active = dense.index.stats().active_count;
+        try std.testing.expect(expected_active > 0);
+        try dense.index.beginBulkIngestSession();
+        const checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
+        try db.core.saveProjectionCheckpoint("dense_idx", .{
+            .applied_sequence = checkpoint.applied_sequence,
+            .status = .rebuilding,
+            .generation = checkpoint.generation,
+            .config_hash = checkpoint.config_hash,
+        });
+
+        const repaired = try db.repairRestoreDenseArtifactCoverageFromFinalArtifacts(alloc);
+        try std.testing.expectEqual(@as(usize, expected_active), repaired.rebuilt);
+        try std.testing.expect(repaired.made_progress);
+        const completed_checkpoint = try db.core.loadProjectionCheckpoint(alloc, "dense_idx");
+        try std.testing.expectEqual(apply_state.ProjectionStatus.clean, completed_checkpoint.status);
+        try std.testing.expectEqual(
+            DB.RestoreDenseArtifactCompletion.completed_with_progress,
+            try db.completeRestoreDenseArtifactRepairs(alloc),
+        );
+        _ = try db.rebuildDenseIndexesFromStoredEmbeddingArtifactsOutcomeWithProgress(alloc, null, null);
+        try db.sync(true);
+        try db.syncIndexes(true);
+    }
+    try staged.seal();
+    _ = try staged.publish();
+    staged.deinit();
+    transition.deinit();
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = primary_backend,
+        .lsm_root_generation = 41,
+        .lsm_cache = &lsm_cache,
+        .hbc_cache = &hbc_cache,
+        .backend_runtime = resident_runtime.ptr(),
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    const dense = reopened.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(expected_active, dense.index.stats().active_count);
+}
+
+test "db restore durability proof retries reopen-only dense debt" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+        });
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}",
+            }},
+            .sync_level = .full_index,
+        });
+        try DB.markRestorePrimaryRestoredForPathWithArtifact(
+            alloc,
+            std.mem.span(path),
+            "snap1",
+            "file:///tmp/backups",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "snapshots/snap1",
+            7001,
+        );
+        try DB.markRestoreRuntimeRepairCompleteWithIo(alloc, std.testing.io, std.mem.span(path));
+        try db.core.index_manager.resetDenseIndexForArtifactRebuild("dense_idx");
+        try db.sync(true);
+        try db.syncIndexes(true);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try std.testing.expect(try db.prepareRestoreDurabilityRetryIfNeeded(alloc));
+        var attempts: usize = 0;
+        while (try db.restoreRuntimeRepairNeeded()) : (attempts += 1) {
+            try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
+            try std.testing.expect(attempts < 16);
+        }
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    const dense = reopened.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), dense.index.stats().active_count);
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
 }
 
 test "db restore dense rebuild rediscovery is pending rather than progress" {

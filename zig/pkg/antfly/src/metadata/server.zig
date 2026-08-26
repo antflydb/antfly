@@ -200,6 +200,7 @@ pub const MetadataServer = struct {
                     catalog,
                     raft.read_gate.noopReadableLeaseRequester(),
                 );
+                _ = owner_source.withRemoteContent(cfg.api_server_cfg.remote_content);
                 owned_kernel_owner_source = owner_source;
                 _ = public_read_source.withLocalReadSource(owner_source.readSource());
                 _ = public_write_source.withLocalWriteSource(owner_source.writeSource());

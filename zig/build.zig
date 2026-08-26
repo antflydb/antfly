@@ -7594,7 +7594,12 @@ pub fn build(b: *std.Build) void {
 
     const db_restore_managed_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{"db restore snapshot replays managed chunked dense embeddings"},
+        .filters = &.{
+            "db restore snapshot replays managed chunked dense embeddings",
+            "db restore dense artifact completion retires an obsolete invalid-generation shadow",
+            "db restore final artifact rebuild seals an exact in-memory bulk generation",
+            "db restore durability proof retries reopen-only dense debt",
+        },
     });
     const run_db_restore_managed_tests = addFilteredTestRunArtifact(b, db_restore_managed_tests);
     const db_restore_managed_step = b.step("db-restore-managed-test", "Run the focused managed chunked dense restore DB test");

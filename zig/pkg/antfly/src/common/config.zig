@@ -1425,6 +1425,20 @@ fn parseRemoteContentConfig(alloc: std.mem.Allocator, value: std.json.Value) !Co
     return cfg;
 }
 
+/// Encode the effective remote-content security snapshot for the separately
+/// compiled storage owner. The facade can represent a hot-reload publisher, so
+/// acquire it before reading the current policy.
+pub fn remoteContentSecurityJsonAlloc(
+    alloc: std.mem.Allocator,
+    remote_content: ?*const scraping.RemoteContentConfig,
+) ![]u8 {
+    const configured = remote_content orelse return try alloc.dupe(u8, "");
+    var snapshot = configured.acquire();
+    defer snapshot.deinit();
+    const security = snapshot.config.security orelse scraping.ContentSecurityConfig{};
+    return try std.json.Stringify.valueAlloc(alloc, security, .{});
+}
+
 fn parseRemoteContentS3Credential(alloc: std.mem.Allocator, value: std.json.Value) !Config.S3CredentialConfig {
     const scraping_cfg = try std.json.parseFromValue(scraping_openapi.S3CredentialConfig, alloc, value, .{
         .allocate = .alloc_always,

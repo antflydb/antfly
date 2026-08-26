@@ -1235,10 +1235,22 @@ pub extern fn antfly_storage_context_attach_inference_provider(
     inference_handle: ?*anyopaque,
 ) callconv(.c) Status;
 
+/// Replaces the context-owned remote-content security snapshot before any
+/// table owner opens. The payload is a ContentSecurityConfig JSON object.
+pub extern fn antfly_storage_context_configure_remote_content_security(
+    context: ?*anyopaque,
+    security_json: BorrowedBytes,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_context_metrics(
     context: ?*anyopaque,
     out_result: *ContextMetricsResult,
 ) callconv(.c) Status;
+
+/// Retires process-wide decoded storage state after an atomic generation
+/// replacement. Existing borrowers remain valid; subsequent owners must load
+/// the newly published filesystem generation.
+pub extern fn antfly_storage_context_invalidate_caches(context: ?*anyopaque) callconv(.c) Status;
 
 pub extern fn antfly_storage_context_system_store_open(
     context: ?*anyopaque,
