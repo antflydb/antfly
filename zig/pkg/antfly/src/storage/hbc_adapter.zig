@@ -2144,13 +2144,19 @@ fn claimLocalClockSlot(clock_keys: []u64, start_slot: usize, key: u64) ?usize {
 // HBC Index
 // ============================================================================
 
+const CompleteCoverageOutcome = enum {
+    retry,
+    validated,
+    incomplete,
+    runtime_canceled,
+};
+
 const CompleteCoverageFlight = struct {
     generation: u64,
     io: std.Io,
     ready: std.Io.Event = .unset,
     refs: usize = 1,
-    validated: bool = false,
-    failure: ?anyerror = null,
+    outcome: CompleteCoverageOutcome = .retry,
     next: ?*CompleteCoverageFlight = null,
 };
 
@@ -3177,7 +3183,7 @@ pub const HBCIndex = struct {
                 // rather than falling back to an OS-thread spin.
                 self.published_flight_mu.unlock();
                 self.runtimeIo().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch |err| switch (err) {
-                    error.Canceled => return error.Cancelled,
+                    error.Canceled => return error.Canceled,
                 };
                 continue;
             };
@@ -3195,7 +3201,7 @@ pub const HBCIndex = struct {
                     },
                 }) catch |err| switch (err) {
                     error.Timeout => continue,
-                    error.Canceled => return error.Cancelled,
+                    error.Canceled => return error.Canceled,
                 };
             }
             return;
@@ -3352,20 +3358,24 @@ pub const HBCIndex = struct {
                 },
             }) catch |err| switch (err) {
                 error.Timeout => continue,
-                error.Canceled => return error.Cancelled,
+                error.Canceled => return error.Canceled,
             };
         }
         if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         lockAtomic(&self.complete_coverage_state_mu);
         defer self.complete_coverage_state_mu.unlock();
-        if (flight.failure) |err| return err;
-        return flight.validated;
+        return switch (flight.outcome) {
+            .retry => false,
+            .validated => true,
+            .incomplete => return error.IncompletePublishedSnapshot,
+            .runtime_canceled => return error.Canceled,
+        };
     }
 
     /// Elects one validator per publication generation. Contending callers
-    /// sleep on a runtime event, consume its successful result, or re-elect
-    /// after failure; cancellation only removes that waiter and never cancels
-    /// the producer.
+    /// sleep on a runtime event, consume its generation-wide result, or
+    /// re-elect after a request-local failure; cancellation only removes that
+    /// waiter and never cancels the producer.
     pub fn beginCompleteCoverageValidation(
         self: *HBCIndex,
         generation: u64,
@@ -3424,8 +3434,7 @@ pub const HBCIndex = struct {
     fn publishCompleteCoverageValidationOutcome(
         self: *HBCIndex,
         generation: u64,
-        validated: bool,
-        failure: ?anyerror,
+        outcome: CompleteCoverageOutcome,
     ) void {
         lockAtomic(&self.complete_coverage_state_mu);
         var link = &self.complete_coverage_flight;
@@ -3436,9 +3445,8 @@ pub const HBCIndex = struct {
             }
             link = &candidate.next;
         } else unreachable;
-        flight.validated = validated;
-        flight.failure = failure;
-        if (validated) {
+        flight.outcome = outcome;
+        if (outcome == .validated) {
             var current = self.complete_coverage_generation.load(.acquire);
             while (current == std.math.maxInt(u64) or generation > current) {
                 current = self.complete_coverage_generation.cmpxchgWeak(
@@ -3458,17 +3466,23 @@ pub const HBCIndex = struct {
     }
 
     pub fn finishCompleteCoverageValidation(self: *HBCIndex, generation: u64, validated: bool) void {
-        self.publishCompleteCoverageValidationOutcome(generation, validated, null);
+        self.publishCompleteCoverageValidationOutcome(generation, if (validated) .validated else .retry);
     }
 
     pub fn failCompleteCoverageValidation(self: *HBCIndex, generation: u64, err: anyerror) void {
-        const failure: ?anyerror = switch (err) {
-            // These are producer-local or publication-local outcomes. Another
-            // request may still validate the generation and should re-elect.
-            error.Cancelled, error.Canceled, error.StalePublishedSnapshot => null,
-            else => err,
+        const outcome: CompleteCoverageOutcome = switch (err) {
+            // Only errors that are themselves generation-wide coverage
+            // results may escape the flight. The elected validator also does
+            // request-specific scoring, so allocator, loader, and filter
+            // errors must never be broadcast to unrelated callers.
+            error.IncompletePublishedSnapshot => .incomplete,
+            // std.Io cancellation means the bound backend runtime is no
+            // longer servicing work. Re-election on the same runtime would
+            // only serialize the same shutdown failure across all waiters.
+            error.Canceled => .runtime_canceled,
+            else => .retry,
         };
-        self.publishCompleteCoverageValidationOutcome(generation, false, failure);
+        self.publishCompleteCoverageValidationOutcome(generation, outcome);
     }
 
     fn releaseFlatCentroidBuildFlightRef(self: *HBCIndex, flight: *FlatCentroidBuildFlight) void {
@@ -3502,7 +3516,7 @@ pub const HBCIndex = struct {
                 },
             }) catch |err| switch (err) {
                 error.Timeout => continue,
-                error.Canceled => return error.Cancelled,
+                error.Canceled => return error.Canceled,
             };
         }
         if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
@@ -9602,6 +9616,50 @@ test "complete coverage flight retries an owner-local cancellation" {
 
     idx.failCompleteCoverageValidation(generation, error.Cancelled);
     try std.testing.expect(!try idx.waitForCompleteCoverageFlight(flight, null));
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
+    idx.finishCompleteCoverageValidation(generation, false);
+}
+
+test "complete coverage flight does not broadcast a query-scoped failure" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+    const generation = idx.publishedGeneration();
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
+
+    lockAtomic(&idx.complete_coverage_state_mu);
+    const flight = idx.complete_coverage_flight orelse return error.TestUnexpectedResult;
+    flight.refs += 1;
+    idx.complete_coverage_state_mu.unlock();
+
+    idx.failCompleteCoverageValidation(generation, error.ExternalVectorUnavailable);
+    try std.testing.expect(!try idx.waitForCompleteCoverageFlight(flight, null));
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
+    idx.finishCompleteCoverageValidation(generation, false);
+}
+
+test "complete coverage flight propagates backend runtime cancellation" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+    const generation = idx.publishedGeneration();
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
+
+    lockAtomic(&idx.complete_coverage_state_mu);
+    const flight = idx.complete_coverage_flight orelse return error.TestUnexpectedResult;
+    flight.refs += 1;
+    idx.complete_coverage_state_mu.unlock();
+
+    idx.failCompleteCoverageValidation(generation, error.Canceled);
+    try std.testing.expectError(error.Canceled, idx.waitForCompleteCoverageFlight(flight, null));
     try std.testing.expect(try idx.beginCompleteCoverageValidation(generation, null));
     idx.finishCompleteCoverageValidation(generation, false);
 }

@@ -522,7 +522,7 @@ fn flatCentroidBuildFailureOutcome(err: anyerror) FlatCentroidBuildOutcome {
     return switch (err) {
         // A request-local cancellation or publication race says nothing about
         // whether another waiter can build the same generation successfully.
-        error.Cancelled, error.Canceled, error.StalePublishedSnapshot => .retry,
+        error.Cancelled, error.StalePublishedSnapshot => .retry,
         else => .{ .failed = err },
     };
 }
@@ -1406,14 +1406,16 @@ test "flat centroid directory match includes publish generation" {
 }
 
 test "flat centroid build failures retry only request-local outcomes" {
-    for ([_]anyerror{ error.Cancelled, error.Canceled, error.StalePublishedSnapshot }) |err| {
+    for ([_]anyerror{ error.Cancelled, error.StalePublishedSnapshot }) |err| {
         switch (flatCentroidBuildFailureOutcome(err)) {
             .retry => {},
             else => return error.TestUnexpectedResult,
         }
     }
-    switch (flatCentroidBuildFailureOutcome(error.ResourceBudgetExceeded)) {
-        .failed => |err| try std.testing.expectEqual(error.ResourceBudgetExceeded, err),
-        else => return error.TestUnexpectedResult,
+    for ([_]anyerror{ error.Canceled, error.ResourceBudgetExceeded }) |expected| {
+        switch (flatCentroidBuildFailureOutcome(expected)) {
+            .failed => |err| try std.testing.expectEqual(expected, err),
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
