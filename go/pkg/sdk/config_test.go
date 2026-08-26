@@ -338,6 +338,36 @@ func TestNewArtifactEmbeddingIndexConfigSupportsDocumentAndChunkSources(t *testi
 	}
 }
 
+func TestNewArtifactEmbeddingIndexConfigTemplateOmitsNoopField(t *testing.T) {
+	embedder, err := NewEmbedderConfig(AntflyEmbedderConfig{Model: "antflydb/clipclap"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := NewArtifactEmbeddingIndexConfig("templated_vectors", ArtifactEmbeddingIndexConfig{
+		Sources: []ArtifactEmbeddingSource{{
+			ArtifactName:   "templated_v1",
+			SourceField:    "text",
+			SourceTemplate: "{{ title }}: {{ body }}",
+		}},
+		Embedder: *embedder,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatal(err)
+	}
+	enrichment := body["enrichments"].([]any)[0].(map[string]any)
+	if _, exists := enrichment["field"]; exists {
+		t.Fatalf("template-only enrichment must omit no-op field: %s", data)
+	}
+}
+
 func TestNewGraphIndexSourcesValidatesAndCopies(t *testing.T) {
 	typeValue, err := NewGraphTemplateValue("{{ _item.type }}")
 	if err != nil {

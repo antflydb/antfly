@@ -362,11 +362,7 @@ pub fn artifact_embedding_index_config(
     }
     let mut enrichments = Vec::with_capacity(options.sources.len());
     for (index, source) in options.sources.iter().enumerate() {
-        if source.field.is_empty() && source.template.as_deref().unwrap_or_default().is_empty() {
-            return Err(IndexConfigError(format!(
-                "sources[{index}] requires field or template"
-            )));
-        }
+        let has_template = !source.template.as_deref().unwrap_or_default().is_empty();
         if source.source_artifact.as_deref() == Some("") {
             return Err(IndexConfigError(format!(
                 "sources[{index}].source_artifact cannot be empty"
@@ -375,7 +371,13 @@ pub fn artifact_embedding_index_config(
         enrichments.push(ArtifactEmbeddingEnrichmentSpec {
             name: source.artifact.clone(),
             kind: ArtifactEmbeddingEnrichmentKind::Embedding,
-            field: (!source.field.is_empty()).then(|| source.field.clone()),
+            field: if has_template {
+                None
+            } else if source.field.is_empty() {
+                Some(default_embedding_source_field())
+            } else {
+                Some(source.field.clone())
+            },
             template: source.template.clone(),
             source_artifact: source.source_artifact.clone(),
             expected_dims: options.dimension,
@@ -579,6 +581,32 @@ mod tests {
         assert_eq!(value["sources"].as_array().map(Vec::len), Some(2));
         assert_eq!(value["enrichments"].as_array().map(Vec::len), Some(2));
         assert!(value.get("embedding_name").is_none());
+    }
+
+    #[test]
+    fn template_only_embedding_source_omits_noop_field() {
+        let config = artifact_embedding_index_config(
+            "templated_vectors",
+            ArtifactEmbeddingIndexOptions {
+                sources: vec![ArtifactEmbeddingSourceSpec {
+                    artifact: "templated_v1".into(),
+                    source_artifact: None,
+                    field: "text".into(),
+                    template: Some("{{ title }}: {{ body }}".into()),
+                }],
+                embedder: antfly_embedder("antflydb/clipclap"),
+                dimension: None,
+                sparse: false,
+                distance_metric: None,
+            },
+        )
+        .expect("valid template-only index");
+        let value = serde_json::to_value(config).expect("serialize template-only index");
+        assert_eq!(
+            value["enrichments"][0]["template"],
+            "{{ title }}: {{ body }}"
+        );
+        assert!(value["enrichments"][0].get("field").is_none());
     }
 
     #[test]

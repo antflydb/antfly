@@ -231,16 +231,15 @@ def artifact_embedding_index_config(
 
     enrichments: list[dict[str, Any]] = []
     for index, source in enumerate(sources):
-        if not source.field and not source.template:
-            raise ValueError(f"sources[{index}] requires field or template")
+        field = "" if source.template else (source.field or "text")
         if source.source_artifact == "":
             raise ValueError(f"sources[{index}].source_artifact cannot be empty")
         enrichment: dict[str, Any] = {
             "name": source.artifact,
             "kind": "embedding",
         }
-        if source.field:
-            enrichment["field"] = source.field
+        if field:
+            enrichment["field"] = field
         if source.template is not None:
             enrichment["template"] = source.template
         if source.source_artifact is not None:

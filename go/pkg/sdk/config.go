@@ -509,7 +509,9 @@ func NewArtifactEmbeddingIndexConfig(name string, config ArtifactEmbeddingIndexC
 			return nil, fmt.Errorf("sources[%d].artifact name is required", i)
 		}
 		sourceField := source.SourceField
-		if sourceField == "" && source.SourceTemplate == "" {
+		if source.SourceTemplate != "" {
+			sourceField = ""
+		} else if sourceField == "" {
 			sourceField = "text"
 		}
 		artifactNames = append(artifactNames, source.ArtifactName)

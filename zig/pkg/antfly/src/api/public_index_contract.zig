@@ -293,7 +293,7 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
         else
             isString(value),
         .graph => if (std.mem.eql(u8, field, "max_edges_per_document"))
-            isInteger(value)
+            value == .integer and value.integer >= 0 and value.integer <= 1_000_000
         else if (std.mem.eql(u8, field, "edge_types") or std.mem.eql(u8, field, "resolvers"))
             value == .array
         else if (std.mem.eql(u8, field, "summarizer") or

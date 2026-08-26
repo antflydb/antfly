@@ -735,6 +735,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
     embedder: { provider: "ollama", model: "" },
   });
   const [jsonSource, setJsonSource] = useState("");
+  const [jsonFormBaseline, setJsonFormBaseline] = useState("");
   const [jsonValidationError, setJsonValidationError] = useState<string | null>(null);
   const form = useForm<IndexFormData>({
     resolver: zodResolver(indexFormSchema),
@@ -960,9 +961,25 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
     if (checked) {
       const source = JSON.stringify(jsonPayload, null, 2);
       setJsonSource(source);
+      setJsonFormBaseline(source);
       setJsonValidationError(null);
       setViewMode("json");
       return;
+    }
+    if (jsonSource !== jsonFormBaseline) {
+      const discard = window.confirm(
+        "Switching back to the form will discard Raw JSON edits that the form cannot represent. Continue?"
+      );
+      if (!discard) return;
+      try {
+        setJsonPayload(parseAdvancedIndexConfig(jsonFormBaseline));
+      } catch {
+        // The baseline is produced by the typed form and should always parse.
+        // Preserve the current payload if an invariant is violated rather than
+        // turning a view transition into an unhandled UI exception.
+      }
+      setJsonSource(jsonFormBaseline);
+      setJsonValidationError(null);
     }
     setViewMode("form");
   };

@@ -54,6 +54,15 @@ describe("artifact embedding index configuration", () => {
     expect(config).not.toHaveProperty("embedding_name");
   });
 
+  it("canonicalizes template-only embedding sources without a no-op field", () => {
+    const config = artifactEmbeddingIndexConfig("templated_vectors", {
+      sources: [{ artifact: "templated_v1", template: "{{ title }}: {{ body }}" }],
+      embedder: { provider: "antfly", model: "antflydb/clipclap" },
+    });
+    expect(config.enrichments?.[0]).toMatchObject({ template: "{{ title }}: {{ body }}" });
+    expect(config.enrichments?.[0]).not.toHaveProperty("field");
+  });
+
   it("rejects duplicate sources and invalid sparse options", () => {
     expect(() => artifactIndexSources("same", "same")).toThrow(/duplicate/);
     expect(() =>

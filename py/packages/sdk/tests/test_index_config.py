@@ -54,6 +54,16 @@ def test_builds_document_and_chunk_embedding_sources() -> None:
     assert "embedding_name" not in config
 
 
+def test_template_only_embedding_source_omits_noop_field() -> None:
+    config = artifact_embedding_index_config(
+        "templated_vectors",
+        sources=[ArtifactEmbeddingSource("templated_v1", template="{{ title }}: {{ body }}")],
+        embedder={"provider": "antfly", "model": "antflydb/clipclap"},
+    )
+    assert config["enrichments"][0]["template"] == "{{ title }}: {{ body }}"
+    assert "field" not in config["enrichments"][0]
+
+
 def test_rejects_duplicates_and_sparse_dimensions() -> None:
     with pytest.raises(ValueError, match="duplicate"):
         artifact_index_sources("same", "same")

@@ -346,7 +346,7 @@ export function artifactEmbeddingIndexConfig(
 
   const sources = artifactIndexSources(...runtimeOptions.sources.map((source) => source.artifact));
   const enrichments: EnrichmentConfig[] = runtimeOptions.sources.map((source, index) => {
-    const field = source.field ?? "text";
+    const field = (source.template?.length ?? 0) > 0 ? "" : (source.field ?? "text");
     if (field.length === 0 && (source.template?.length ?? 0) === 0) {
       throw new TypeError(`sources[${index}] requires field or template`);
     }

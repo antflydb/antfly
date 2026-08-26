@@ -32,6 +32,7 @@ const backend_erased_mod = @import("../backend_erased.zig");
 const db_config = @import("config.zig");
 const generation_lifecycle = @import("generation_lifecycle.zig");
 const graph_asset_state = @import("graph_asset_state.zig");
+const graph_state_name = @import("graph_state_name.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
@@ -16710,52 +16711,50 @@ pub const DB = struct {
 
                 const state_name = try mentionGraphStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
                 defer self.alloc.free(state_name);
-                const state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, state_name);
-                var state_key_owned = true;
-                errdefer if (state_key_owned) self.alloc.free(state_key);
-
-                if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key, graph_entry.config.coverage_generation)) |previous_keys| {
-                    defer freeOwnedConstKeySlice(self.alloc, previous_keys);
-                    for (previous_keys) |previous_key| {
-                        if (containsDeleteKey(deletes.items, previous_key)) continue;
-                        const owned_key = try self.alloc.dupe(u8, previous_key);
-                        try deletes.append(self.alloc, owned_key);
-                        try appendUniqueOwnedKey(self.alloc, changed, previous_key);
-                    }
-                }
-
-                if (!containsDeleteKey(deletes.items, state_key)) {
-                    try deletes.append(self.alloc, state_key);
-                    state_key_owned = false;
-                } else {
-                    self.alloc.free(state_key);
-                    state_key_owned = false;
-                }
+                const legacy_state_name = try graph_state_name.legacyMentionAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
+                defer self.alloc.free(legacy_state_name);
+                try self.collectGraphStateForDeleteLocked(doc_key, graph_entry.config.name, state_name, graph_entry.config.coverage_generation, deletes, changed);
+                try self.collectGraphStateForDeleteLocked(doc_key, graph_entry.config.name, legacy_state_name, graph_entry.config.coverage_generation, deletes, changed);
 
                 const mention_state_name = try mentionArtifactStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
                 defer self.alloc.free(mention_state_name);
-                const mention_state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, mention_state_name);
-                var mention_state_key_owned = true;
-                errdefer if (mention_state_key_owned) self.alloc.free(mention_state_key);
-
-                if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, mention_state_key, graph_entry.config.coverage_generation)) |previous_keys| {
-                    defer freeOwnedConstKeySlice(self.alloc, previous_keys);
-                    for (previous_keys) |previous_key| {
-                        if (containsDeleteKey(deletes.items, previous_key)) continue;
-                        const owned_key = try self.alloc.dupe(u8, previous_key);
-                        try deletes.append(self.alloc, owned_key);
-                        try appendUniqueOwnedKey(self.alloc, changed, previous_key);
-                    }
-                }
-
-                if (!containsDeleteKey(deletes.items, mention_state_key)) {
-                    try deletes.append(self.alloc, mention_state_key);
-                    mention_state_key_owned = false;
-                } else {
-                    self.alloc.free(mention_state_key);
-                    mention_state_key_owned = false;
-                }
+                const legacy_mention_state_name = try graph_state_name.legacyMentionArtifactAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
+                defer self.alloc.free(legacy_mention_state_name);
+                try self.collectGraphStateForDeleteLocked(doc_key, graph_entry.config.name, mention_state_name, graph_entry.config.coverage_generation, deletes, changed);
+                try self.collectGraphStateForDeleteLocked(doc_key, graph_entry.config.name, legacy_mention_state_name, graph_entry.config.coverage_generation, deletes, changed);
             }
+        }
+    }
+
+    fn collectGraphStateForDeleteLocked(
+        self: *DB,
+        doc_key: []const u8,
+        index_name: []const u8,
+        state_name: []const u8,
+        expected_generation: u64,
+        deletes: *std.ArrayListUnmanaged([]const u8),
+        changed: *std.ArrayListUnmanaged([]u8),
+    ) !void {
+        const state_key = try graphAssetStateKeyAlloc(self.alloc, doc_key, index_name, state_name);
+        var state_key_owned = true;
+        errdefer if (state_key_owned) self.alloc.free(state_key);
+
+        if (try loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key, expected_generation)) |previous_keys| {
+            defer freeOwnedConstKeySlice(self.alloc, previous_keys);
+            for (previous_keys) |previous_key| {
+                if (containsDeleteKey(deletes.items, previous_key)) continue;
+                const owned_key = try self.alloc.dupe(u8, previous_key);
+                try deletes.append(self.alloc, owned_key);
+                try appendUniqueOwnedKey(self.alloc, changed, previous_key);
+            }
+        }
+
+        if (!containsDeleteKey(deletes.items, state_key)) {
+            try deletes.append(self.alloc, state_key);
+            state_key_owned = false;
+        } else {
+            self.alloc.free(state_key);
+            state_key_owned = false;
         }
     }
 
@@ -30642,34 +30641,6 @@ fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []
     return try list.toOwnedSlice(alloc);
 }
 
-const graph_state_name_magic = "GSN1";
-
-fn appendGraphStateNameComponent(list: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: []const u8) !void {
-    if (value.len > std.math.maxInt(u32)) return error.GraphStateNameComponentTooLarge;
-    var len_bytes: [@sizeOf(u32)]u8 = undefined;
-    std.mem.writeInt(u32, &len_bytes, @intCast(value.len), .big);
-    try list.appendSlice(alloc, &len_bytes);
-    try list.appendSlice(alloc, value);
-}
-
-fn initGraphStateName(alloc: Allocator, source_artifact: []const u8) !std.ArrayListUnmanaged(u8) {
-    var list = std.ArrayListUnmanaged(u8).empty;
-    errdefer list.deinit(alloc);
-    try list.appendSlice(alloc, graph_state_name_magic);
-    try appendGraphStateNameComponent(&list, alloc, source_artifact);
-    return list;
-}
-
-fn graphStateNameSourceArtifact(state_name: []const u8) !?[]const u8 {
-    if (!std.mem.startsWith(u8, state_name, graph_state_name_magic)) return null;
-    var pos: usize = graph_state_name_magic.len;
-    if (state_name.len - pos < @sizeOf(u32)) return error.InvalidGraphStateName;
-    const name_len = std.mem.readInt(u32, state_name[pos..][0..@sizeOf(u32)], .big);
-    pos += @sizeOf(u32);
-    if (name_len > state_name.len - pos) return error.InvalidGraphStateName;
-    return state_name[pos..][0..name_len];
-}
-
 fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []const docstore_mod.KVPair) ![]u8 {
     return try graph_asset_state.encodeAlloc(alloc, generation, writes);
 }
@@ -30810,7 +30781,7 @@ fn graphStateSourcePriorityAlloc(
     const state_name = try internal_keys.decodeBodyAlloc(alloc, state_key[state_prefix.len..terminator]);
     defer alloc.free(state_name);
 
-    if (try graphStateNameSourceArtifact(state_name)) |artifact_name| {
+    if (try graph_state_name.sourceArtifact(state_name)) |artifact_name| {
         for (sources, 0..) |source, i| {
             if (std.mem.eql(u8, source.artifact_name, artifact_name)) return i;
         }
@@ -30842,6 +30813,7 @@ fn loadGraphEdgeWinners(
     current_state_key: []const u8,
     current_state_value: []const u8,
     pending_writes: []const docstore_mod.KVPair,
+    retired_alias_keys: []const []const u8,
     sources: []const index_manager_mod.GraphArtifactSource,
     expected_generation: u64,
 ) !GraphEdgeWinners {
@@ -30849,7 +30821,7 @@ fn loadGraphEdgeWinners(
     defer overrides.deinit(alloc);
     try overrides.append(alloc, .{ .key = current_state_key, .value = current_state_value });
     try overrides.appendSlice(alloc, pending_writes);
-    return try loadGraphEdgeWinnersWithOverrides(alloc, store, doc_key, index_name, overrides.items, sources, expected_generation);
+    return try loadGraphEdgeWinnersWithOverrides(alloc, store, doc_key, index_name, overrides.items, retired_alias_keys, sources, expected_generation);
 }
 
 fn loadGraphEdgeWinnersWithOverrides(
@@ -30858,6 +30830,7 @@ fn loadGraphEdgeWinnersWithOverrides(
     doc_key: []const u8,
     index_name: []const u8,
     state_overrides: []const docstore_mod.KVPair,
+    retired_alias_keys: []const []const u8,
     sources: []const index_manager_mod.GraphArtifactSource,
     expected_generation: u64,
 ) !GraphEdgeWinners {
@@ -30871,6 +30844,7 @@ fn loadGraphEdgeWinnersWithOverrides(
     defer override_values.deinit(alloc);
     for (state_overrides) |override| try override_values.put(alloc, override.key, override.value);
     for (existing) |entry| {
+        if (containsDeleteKey(retired_alias_keys, entry.key)) continue;
         var raw: []const u8 = entry.value;
         if (override_values.get(entry.key)) |override| {
             raw = override;
@@ -30882,6 +30856,7 @@ fn loadGraphEdgeWinnersWithOverrides(
     var override_it = override_values.iterator();
     while (override_it.next()) |override| {
         if (!std.mem.startsWith(u8, override.key_ptr.*, prefix)) continue;
+        if (containsDeleteKey(retired_alias_keys, override.key_ptr.*)) continue;
         const source_priority = try graphStateSourcePriorityAlloc(alloc, override.key_ptr.*, prefix, sources) orelse continue;
         try addGraphStateManifest(alloc, store, &winners, override.key_ptr.*, source_priority, override.value_ptr.*, expected_generation);
     }
@@ -32889,6 +32864,7 @@ const PrecomputedGraphArtifactMutation = struct {
 
 const PrecomputedGraphStateUpdate = struct {
     state_key: []const u8,
+    retired_alias_key: []const u8,
     state_value: []const u8,
     previous_keys: []const []const u8,
     graph_writes: []const docstore_mod.KVPair,
@@ -32899,6 +32875,8 @@ const PrecomputedGraphReconcileGroup = struct {
     index_name: []const u8,
     sources: []const index_manager_mod.GraphArtifactSource,
     generation: u64,
+    edge_limit: usize,
+    enforce_edge_limit: bool = false,
     updates: std.ArrayListUnmanaged(PrecomputedGraphStateUpdate) = .empty,
 };
 
@@ -32997,7 +32975,7 @@ fn preparePrecomputedGraphSourceArtifactMutation(
         if (mutation.value) |value| {
             const raw_doc = try batchDocumentValueForGraphSource(scratch, self.core.store, store_writes.items, artifact_ref.document_id);
             defer if (raw_doc) |doc_value| scratch.free(doc_value);
-            const graph_writes = try graphWritesFromArtifactValueAlloc(scratch, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc);
+            const graph_writes = try graphWritesFromArtifactValueAlloc(scratch, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc, graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document));
             defer freeGraphWrites(scratch, graph_writes);
             for (graph_writes) |write| {
                 const key = try internal_keys.graphEdgeArtifactKeyAlloc(scratch, write.source, write.index_name, write.edge_type, write.target);
@@ -33010,7 +32988,27 @@ fn preparePrecomputedGraphSourceArtifactMutation(
         const state_name = try graphArtifactStateNameAlloc(scratch, artifact_ref);
         const state_key = try graphAssetStateKeyAlloc(scratch, artifact_ref.document_id, graph_entry.config.name, state_name);
         const previous_keys = try loadGraphAssetStateKeysAlloc(scratch, self.core.store, state_key, graph_entry.config.coverage_generation);
-        if (previous_keys == null and self.core.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
+        const legacy_state_name = try graph_state_name.legacyArtifactAlloc(scratch, artifact_ref);
+        const legacy_state_key = try graphAssetStateKeyAlloc(scratch, artifact_ref.document_id, graph_entry.config.name, legacy_state_name);
+        const legacy_previous_keys = try loadGraphAssetStateKeysAlloc(scratch, self.core.store, legacy_state_key, graph_entry.config.coverage_generation);
+        var all_previous_keys = std.ArrayListUnmanaged([]const u8).empty;
+        if (previous_keys) |keys| try all_previous_keys.appendSlice(scratch, keys);
+        if (legacy_previous_keys) |keys| for (keys) |key| {
+            var duplicate = false;
+            for (all_previous_keys.items) |existing| {
+                if (std.mem.eql(u8, existing, key)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) try all_previous_keys.append(scratch, key);
+        };
+        if (!containsDeleteKey(delete_keys.items, legacy_state_key)) {
+            const owned_alias_key = try self.alloc.dupe(u8, legacy_state_key);
+            try owned_delete_keys.append(self.alloc, owned_alias_key);
+            try delete_keys.append(self.alloc, owned_alias_key);
+        }
+        if (previous_keys == null and legacy_previous_keys == null and self.core.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(scratch, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(scratch, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(scratch, self.core.store, artifact_ref.document_id, graph_entry.config.name);
@@ -33033,15 +33031,18 @@ fn preparePrecomputedGraphSourceArtifactMutation(
                 .index_name = graph_entry.config.name,
                 .sources = self.core.index_manager.graphArtifactSources(graph_entry.config.name),
                 .generation = graph_entry.config.coverage_generation,
+                .edge_limit = graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document),
             });
             try group_positions.put(scratch, group_key, position);
             break :blk position;
         };
         const state_value = try encodeGraphAssetStateKeysAlloc(scratch, graph_entry.config.coverage_generation, graph_store_writes.items);
+        groups.items[group_position].enforce_edge_limit = groups.items[group_position].enforce_edge_limit or mutation.value != null;
         try groups.items[group_position].updates.append(scratch, .{
             .state_key = state_key,
+            .retired_alias_key = legacy_state_key,
             .state_value = state_value,
-            .previous_keys = previous_keys orelse &.{},
+            .previous_keys = all_previous_keys.items,
             .graph_writes = try graph_store_writes.toOwnedSlice(scratch),
         });
     }
@@ -33059,10 +33060,12 @@ fn reconcilePrecomputedGraphGroup(
     changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
 ) !void {
     const overrides = try scratch.alloc(docstore_mod.KVPair, group.updates.items.len);
+    const retired_alias_keys = try scratch.alloc([]const u8, group.updates.items.len);
     var affected = std.ArrayListUnmanaged([]const u8).empty;
     var affected_set = std.StringHashMapUnmanaged(void).empty;
     for (group.updates.items, 0..) |update, i| {
         overrides[i] = .{ .key = update.state_key, .value = update.state_value };
+        retired_alias_keys[i] = update.retired_alias_key;
         for (update.previous_keys) |key| {
             if (try affected_set.fetchPut(scratch, key, {}) == null) try affected.append(scratch, key);
         }
@@ -33071,8 +33074,9 @@ fn reconcilePrecomputedGraphGroup(
         }
     }
 
-    var winners = try loadGraphEdgeWinnersWithOverrides(scratch, self.core.store, group.doc_key, group.index_name, overrides, group.sources, group.generation);
+    var winners = try loadGraphEdgeWinnersWithOverrides(scratch, self.core.store, group.doc_key, group.index_name, overrides, retired_alias_keys, group.sources, group.generation);
     defer winners.deinit(scratch);
+    if (group.enforce_edge_limit and winners.map.count() > group.edge_limit) return error.ResourceLimitExceeded;
     for (affected.items) |edge_key| {
         try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, edge_key);
         if (winners.map.get(edge_key)) |winner| {
@@ -33262,33 +33266,7 @@ fn graphArtifactRefUsesDocumentWideFallback(artifact_ref: types.ArtifactRef) boo
 }
 
 fn graphArtifactStateNameAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) ![]u8 {
-    var list = try initGraphStateName(alloc, artifact_ref.name);
-    errdefer list.deinit(alloc);
-    try appendGraphStateNameComponent(&list, alloc, "artifact");
-    try appendGraphStateNameComponent(&list, alloc, @tagName(artifact_ref.kind));
-    if (artifact_ref.unit_id) |unit_id| {
-        try appendGraphStateNameComponent(&list, alloc, "unit");
-        try appendGraphStateNameComponent(&list, alloc, unit_id);
-    }
-    if (artifact_ref.chunk_id) |chunk_id| {
-        var chunk_bytes: [@sizeOf(u32)]u8 = undefined;
-        std.mem.writeInt(u32, &chunk_bytes, chunk_id, .big);
-        try appendGraphStateNameComponent(&list, alloc, "chunk");
-        try appendGraphStateNameComponent(&list, alloc, &chunk_bytes);
-    }
-    if (artifact_ref.source) |source| {
-        const source_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, .{
-            .document_id = artifact_ref.document_id,
-            .name = source.name,
-            .kind = source.kind,
-            .chunk_id = source.chunk_id,
-            .unit_id = source.unit_id,
-        });
-        defer alloc.free(source_key);
-        try appendGraphStateNameComponent(&list, alloc, "source");
-        try appendGraphStateNameComponent(&list, alloc, source_key);
-    }
-    return try list.toOwnedSlice(alloc);
+    return try graph_state_name.artifactAlloc(alloc, artifact_ref);
 }
 
 fn shouldPrecomputeGeneratedRequest(
@@ -40586,7 +40564,7 @@ fn materializeGraphSourceArtifactsForIndex(
         if (raw) |value| {
             const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id);
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
-            const graph_writes = graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc) catch |err| switch (err) {
+            const graph_writes = graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc, graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
                     if (options.repair_ctx) |repair_ctx| {
@@ -40617,7 +40595,13 @@ fn materializeGraphSourceArtifactsForIndex(
         defer alloc.free(state_key);
         const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key, generation);
         defer if (previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
-        if (previous_keys == null and sources.len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
+        const legacy_state_name = try graph_state_name.legacyArtifactAlloc(alloc, artifact_ref);
+        defer alloc.free(legacy_state_name);
+        const legacy_state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, legacy_state_name);
+        defer alloc.free(legacy_state_key);
+        const legacy_previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, legacy_state_key, generation);
+        defer if (legacy_previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
+        if (previous_keys == null and legacy_previous_keys == null and sources.len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
             defer freeOwnedConstKeySlice(alloc, protected_keys);
             const existing = try collectGraphArtifactsForDocIndex(alloc, store, artifact_ref.document_id, index_name);
@@ -40634,14 +40618,16 @@ fn materializeGraphSourceArtifactsForIndex(
         const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
         var state_value_owned = true;
         defer if (state_value_owned) alloc.free(state_value);
-        var winners = try loadGraphEdgeWinners(alloc, store, artifact_ref.document_id, index_name, state_key, state_value, &.{}, sources, generation);
+        var winners = try loadGraphEdgeWinners(alloc, store, artifact_ref.document_id, index_name, state_key, state_value, &.{}, &.{legacy_state_key}, sources, generation);
         defer winners.deinit(alloc);
+        if (raw != null and winners.map.count() > graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) return error.ResourceLimitExceeded;
         var affected = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (affected.items) |key| alloc.free(key);
             affected.deinit(alloc);
         }
         if (previous_keys) |keys| for (keys) |key| try appendUniqueOwnedKey(alloc, &affected, key);
+        if (legacy_previous_keys) |keys| for (keys) |key| try appendUniqueOwnedKey(alloc, &affected, key);
         for (writes.items[0..graph_write_count]) |write| try appendUniqueOwnedKey(alloc, &affected, write.key);
         for (affected.items) |edge_key| {
             if (winners.map.get(edge_key)) |winner| {
@@ -40657,6 +40643,9 @@ fn materializeGraphSourceArtifactsForIndex(
         }
         try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, state_key, state_value);
         state_value_owned = false;
+        if (!containsDeleteKey(deletes.items, legacy_state_key)) {
+            try deletes.append(alloc, try alloc.dupe(u8, legacy_state_key));
+        }
 
         if (writes.items.len > 0 or deletes.items.len > 0) {
             var changed_batch = try filterChangedGraphMaterializationBatch(alloc, store, writes.items, deletes.items);
@@ -40700,6 +40689,10 @@ fn materializeMentionEdgesForResolutionKey(
     defer alloc.free(state_name);
     const state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, state_name);
     defer alloc.free(state_key);
+    const legacy_state_name = try graph_state_name.legacyMentionAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
+    defer alloc.free(legacy_state_name);
+    const legacy_state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, legacy_state_name);
+    defer alloc.free(legacy_state_key);
 
     var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     defer {
@@ -40764,18 +40757,22 @@ fn materializeMentionEdgesForResolutionKey(
 
     const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key, generation);
     defer if (previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
+    const legacy_previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, legacy_state_key, generation);
+    defer if (legacy_previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
     const graph_write_count = writes.items.len;
     const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
     var state_value_owned = true;
     defer if (state_value_owned) alloc.free(state_value);
-    var winners = try loadGraphEdgeWinners(alloc, store, parsed_key.doc_key, index_name, state_key, state_value, &.{}, index_manager.graphArtifactSources(index_name), generation);
+    var winners = try loadGraphEdgeWinners(alloc, store, parsed_key.doc_key, index_name, state_key, state_value, &.{}, &.{legacy_state_key}, index_manager.graphArtifactSources(index_name), generation);
     defer winners.deinit(alloc);
+    if (raw_resolution != null and winners.map.count() > graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) return error.ResourceLimitExceeded;
     var affected = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (affected.items) |key| alloc.free(key);
         affected.deinit(alloc);
     }
     if (previous_keys) |keys| for (keys) |key| try appendUniqueOwnedKey(alloc, &affected, key);
+    if (legacy_previous_keys) |keys| for (keys) |key| try appendUniqueOwnedKey(alloc, &affected, key);
     for (writes.items[0..graph_write_count]) |write| try appendUniqueOwnedKey(alloc, &affected, write.key);
     for (affected.items) |edge_key| {
         if (winners.map.get(edge_key)) |winner| {
@@ -40791,11 +40788,16 @@ fn materializeMentionEdgesForResolutionKey(
     }
     try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, state_key, state_value);
     state_value_owned = false;
+    if (!containsDeleteKey(deletes.items, legacy_state_key)) try deletes.append(alloc, try alloc.dupe(u8, legacy_state_key));
 
     const mention_state_name = try mentionArtifactStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
     defer alloc.free(mention_state_name);
     const mention_state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, mention_state_name);
     defer alloc.free(mention_state_key);
+    const legacy_mention_state_name = try graph_state_name.legacyMentionArtifactAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
+    defer alloc.free(legacy_mention_state_name);
+    const legacy_mention_state_key = try graphAssetStateKeyAlloc(alloc, parsed_key.doc_key, index_name, legacy_mention_state_name);
+    defer alloc.free(legacy_mention_state_key);
     if (try loadGraphAssetStateKeysAlloc(alloc, store, mention_state_key, generation)) |previous_mention_keys| {
         defer freeOwnedConstKeySlice(alloc, previous_mention_keys);
         for (previous_mention_keys) |previous_key| {
@@ -40804,6 +40806,15 @@ fn materializeMentionEdgesForResolutionKey(
             try appendUniqueOwnedKey(alloc, changed, previous_key);
         }
     }
+    if (try loadGraphAssetStateKeysAlloc(alloc, store, legacy_mention_state_key, generation)) |previous_mention_keys| {
+        defer freeOwnedConstKeySlice(alloc, previous_mention_keys);
+        for (previous_mention_keys) |previous_key| {
+            if (containsStoreWriteKey(mention_writes.items, previous_key)) continue;
+            if (!containsDeleteKey(deletes.items, previous_key)) try deletes.append(alloc, try alloc.dupe(u8, previous_key));
+            try appendUniqueOwnedKey(alloc, changed, previous_key);
+        }
+    }
+    if (!containsDeleteKey(deletes.items, legacy_mention_state_key)) try deletes.append(alloc, try alloc.dupe(u8, legacy_mention_state_key));
 
     const mention_state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, mention_writes.items);
     var mention_state_value_owned = true;
@@ -40826,14 +40837,16 @@ fn materializeMentionEdgesForResolutionKey(
 }
 
 fn freeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
-    for (writes) |write| {
-        alloc.free(@constCast(write.index_name));
-        alloc.free(@constCast(write.source));
-        alloc.free(@constCast(write.target));
-        alloc.free(@constCast(write.edge_type));
-        if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-    }
+    for (writes) |write| freeGraphWriteFields(alloc, write);
     if (writes.len > 0) alloc.free(writes);
+}
+
+fn freeGraphWriteFields(alloc: Allocator, write: types.GraphEdgeWrite) void {
+    alloc.free(@constCast(write.index_name));
+    alloc.free(@constCast(write.source));
+    alloc.free(@constCast(write.target));
+    alloc.free(@constCast(write.edge_type));
+    if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
 }
 
 fn resolverConfigForResolution(
@@ -40862,19 +40875,11 @@ fn resolverConfigForResolutionArtifact(
 }
 
 fn mentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
-    var list = try initGraphStateName(alloc, source_artifact);
-    errdefer list.deinit(alloc);
-    try appendGraphStateNameComponent(&list, alloc, "resolution_mentions");
-    try appendGraphStateNameComponent(&list, alloc, resolution_artifact);
-    return try list.toOwnedSlice(alloc);
+    return try graph_state_name.mentionAlloc(alloc, source_artifact, resolution_artifact);
 }
 
 fn mentionArtifactStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
-    var list = try initGraphStateName(alloc, source_artifact);
-    errdefer list.deinit(alloc);
-    try appendGraphStateNameComponent(&list, alloc, "resolution_mention_artifacts");
-    try appendGraphStateNameComponent(&list, alloc, resolution_artifact);
-    return try list.toOwnedSlice(alloc);
+    return try graph_state_name.mentionArtifactAlloc(alloc, source_artifact, resolution_artifact);
 }
 
 fn resolutionMentionArtifactNameAlloc(
@@ -41203,6 +41208,7 @@ fn graphWritesFromArtifactValueAlloc(
     source: index_manager_mod.GraphArtifactSource,
     artifact_content_type: []const u8,
     raw_doc: ?[]const u8,
+    edge_limit: usize,
 ) ![]types.GraphEdgeWrite {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -41211,16 +41217,19 @@ fn graphWritesFromArtifactValueAlloc(
     const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;
 
     var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
-    errdefer freeGraphWrites(alloc, writes.items);
+    errdefer {
+        for (writes.items) |write| freeGraphWriteFields(alloc, write);
+        writes.deinit(alloc);
+    }
 
     switch (source.format) {
-        .extraction_relation => try appendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value),
+        .extraction_relation => try appendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value, edge_limit),
         .extraction_graph => {
             if (source.path.len > 0) {
-                try appendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+                try appendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value, edge_limit);
             } else if (parsed.value == .object) {
-                if (parsed.value.object.get("relations")) |relations| try appendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, relations, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
-                if (parsed.value.object.get("edges")) |edges| try appendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, edges, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+                if (parsed.value.object.get("relations")) |relations| try appendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, relations, source.mapping, source.artifact_name, artifact_content_type, parsed.value, edge_limit);
+                if (parsed.value.object.get("edges")) |edges| try appendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, edges, source.mapping, source.artifact_name, artifact_content_type, parsed.value, edge_limit);
             }
         },
     }
@@ -41240,10 +41249,11 @@ fn appendRelationItemsFromPath(
     artifact_name: []const u8,
     artifact_content_type: []const u8,
     artifact_value: std.json.Value,
+    edge_limit: usize,
 ) !void {
-    if (path.len == 0 or std.mem.eql(u8, path, "$")) return appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, root, mapping, artifact_name, artifact_content_type, artifact_value);
+    if (path.len == 0 or std.mem.eql(u8, path, "$")) return appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, root, mapping, artifact_name, artifact_content_type, artifact_value, edge_limit);
     const selected = selectGraphArtifactPath(root, path) orelse return;
-    try appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping, artifact_name, artifact_content_type, artifact_value);
+    try appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping, artifact_name, artifact_content_type, artifact_value, edge_limit);
 }
 
 fn selectGraphArtifactPath(root: std.json.Value, path: []const u8) ?std.json.Value {
@@ -41273,11 +41283,12 @@ fn appendRelationValueItems(
     artifact_name: []const u8,
     artifact_content_type: []const u8,
     artifact_value: std.json.Value,
+    edge_limit: usize,
 ) !void {
     if (value == .array) {
-        for (value.array.items, 0..) |item, i| try appendRelationItem(alloc, writes, index_name, doc_key, doc_value, item, i, mapping, artifact_name, artifact_content_type, artifact_value);
+        for (value.array.items, 0..) |item, i| try appendRelationItem(alloc, writes, index_name, doc_key, doc_value, item, i, mapping, artifact_name, artifact_content_type, artifact_value, edge_limit);
     } else {
-        try appendRelationItem(alloc, writes, index_name, doc_key, doc_value, value, 0, mapping, artifact_name, artifact_content_type, artifact_value);
+        try appendRelationItem(alloc, writes, index_name, doc_key, doc_value, value, 0, mapping, artifact_name, artifact_content_type, artifact_value, edge_limit);
     }
 }
 
@@ -41293,6 +41304,7 @@ fn appendRelationItem(
     artifact_name: []const u8,
     artifact_content_type: []const u8,
     artifact_value: std.json.Value,
+    edge_limit: usize,
 ) !void {
     if (item != .object) return;
     const mapped_edge_type = if (mapping.edge_type_template.len > 0)
@@ -41332,6 +41344,7 @@ fn appendRelationItem(
         const target_value = item.object.get("target") orelse return;
         break :blk jsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
     };
+    if (writes.items.len >= edge_limit) return error.ResourceLimitExceeded;
 
     const weight = if (mapping.weight_template.len > 0) blk: {
         const rendered = try renderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
@@ -41345,11 +41358,19 @@ fn appendRelationItem(
         try std.json.Stringify.valueAlloc(alloc, item, .{});
     errdefer alloc.free(metadata_json);
 
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    const owned_source = try alloc.dupe(u8, source_doc);
+    errdefer alloc.free(owned_source);
+    const owned_target = try alloc.dupe(u8, target_doc);
+    errdefer alloc.free(owned_target);
+    const owned_edge_type = try alloc.dupe(u8, edge_type);
+    errdefer alloc.free(owned_edge_type);
     try writes.append(alloc, .{
-        .index_name = try alloc.dupe(u8, index_name),
-        .source = try alloc.dupe(u8, source_doc),
-        .target = try alloc.dupe(u8, target_doc),
-        .edge_type = try alloc.dupe(u8, edge_type),
+        .index_name = owned_index_name,
+        .source = owned_source,
+        .target = owned_target,
+        .edge_type = owned_edge_type,
         .weight = weight,
         .created_at = 0,
         .updated_at = 0,
@@ -53486,6 +53507,24 @@ test "db graph relation artifact materializer uses mapping templates" {
     try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"tenant\":\"tenant-a\"") != null);
 }
 
+test "graph artifact parser enforces the configured edge limit before persistence" {
+    const alloc = std.testing.allocator;
+    const source = index_manager_mod.GraphArtifactSource{
+        .artifact_name = @constCast("relations_v1"),
+    };
+    const raw = "[{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:b\"}},{\"type\":\"mentions\",\"target\":{\"document_id\":\"doc:c\"}}]";
+    try std.testing.expectError(error.ResourceLimitExceeded, graphWritesFromArtifactValueAlloc(
+        alloc,
+        "relations_graph",
+        "doc:a",
+        raw,
+        source,
+        "application/json",
+        null,
+        1,
+    ));
+}
+
 test "db graph relation artifact materializer resolves entity refs and artifact template values" {
     const alloc = std.testing.allocator;
 
@@ -54141,14 +54180,35 @@ test "db async asset producer mention edges come from resolution artifacts" {
     defer graph_mod.GraphIndex.freeEdges(alloc, deterministic_edges);
     try std.testing.expectEqual(@as(usize, 0), deterministic_edges.len);
 
-    const relation_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", "relations_v1");
-    defer alloc.free(relation_state_key);
-    try db.core.store.delete(relation_state_key);
+    // Recreate v0.2.0's raw artifact-name state layout. The canonical
+    // materializer must consume and retire it atomically rather than allowing
+    // the alias to compete with the canonical state indefinitely.
+    const legacy_relation_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", "relations_v1");
+    defer alloc.free(legacy_relation_state_key);
+
+    const artifact_ref = types.ArtifactRef{
+        .document_id = @constCast("doc:a"),
+        .name = @constCast("relations_v1"),
+        .kind = .asset,
+    };
+    const canonical_state_name = try graph_state_name.artifactAlloc(alloc, artifact_ref);
+    defer alloc.free(canonical_state_name);
+    const canonical_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", canonical_state_name);
+    defer alloc.free(canonical_state_key);
+    const pre_migration_state = try db.core.store.get(alloc, canonical_state_key);
+    defer alloc.free(pre_migration_state);
+    try db.core.store.put(legacy_relation_state_key, pre_migration_state);
+    try db.core.store.delete(canonical_state_key);
 
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
     defer alloc.free(asset_key);
     const changed = try materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph", .{});
     defer freeOwnedKeySlice(alloc, changed);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, legacy_relation_state_key));
+
+    const canonical_state = try db.core.store.get(alloc, canonical_state_key);
+    defer alloc.free(canonical_state);
+    try std.testing.expectEqual(graph_asset_state.Format.v3, try graph_asset_state.format(canonical_state));
 
     const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
     defer alloc.free(graph_edge_key);

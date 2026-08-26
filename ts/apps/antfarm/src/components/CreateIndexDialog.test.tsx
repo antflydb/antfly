@@ -1,4 +1,4 @@
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TableSchema } from "../api";
 import CreateIndexDialog, {
@@ -16,6 +16,8 @@ vi.mock("./IndexForm", () => ({
 describe("CreateIndexDialog", () => {
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("derives schema fields from valid document schema properties", () => {
@@ -149,5 +151,41 @@ describe("CreateIndexDialog", () => {
         />
       )
     ).not.toThrow();
+  });
+
+  it("does not silently discard Raw JSON edits when returning to the form", () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      }
+    );
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(
+      <CreateIndexDialog
+        open
+        onClose={() => undefined}
+        tableName="docs"
+        onIndexCreated={() => undefined}
+        schema={null}
+      />
+    );
+
+    const modeSwitch = screen.getByRole("switch");
+    fireEvent.click(modeSwitch);
+    const editor = screen.getByLabelText("Advanced index JSON");
+    fireEvent.change(editor, {
+      target: { value: '{"name":"advanced","type":"graph","sources":[{"artifact":"relations"}]}' },
+    });
+    fireEvent.click(modeSwitch);
+
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(screen.getByLabelText("Advanced index JSON")).toBeTruthy();
+
+    confirm.mockReturnValue(true);
+    fireEvent.click(modeSwitch);
+    expect(screen.getByTestId("index-form")).toBeTruthy();
   });
 });

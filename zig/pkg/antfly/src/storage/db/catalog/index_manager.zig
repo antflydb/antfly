@@ -26,6 +26,7 @@ const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const types = @import("../types.zig");
 const doc_identity = @import("../doc_identity.zig");
+const graph_asset_state = @import("../graph_asset_state.zig");
 const dynamic_field_capability = @import("../dynamic_field_capability.zig");
 const apply_state = @import("../derived/apply_state.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
@@ -2144,6 +2145,7 @@ pub const IndexManager = struct {
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
         artifact_sources: []GraphArtifactSource = &.{},
+        max_edges_per_document: u32 = 0,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
     };
@@ -11574,6 +11576,7 @@ pub const IndexManager = struct {
                     .config = cloned_cfg,
                     .edge_type_configs = graph_cfg.edge_type_configs,
                     .artifact_sources = graph_cfg.artifact_sources,
+                    .max_edges_per_document = graph_cfg.max_edges_per_document,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
                 };
@@ -11924,8 +11927,9 @@ pub const IndexManager = struct {
 
     fn ensureEmbeddingEnrichment(self: *IndexManager, cfg: enrichment_catalog.EnrichmentConfig) !bool {
         if (self.getEnrichment(.embedding, cfg.name)) |existing| {
-            if (!std.mem.eql(u8, existing.source_field, cfg.source_field) or
-                !std.mem.eql(u8, existing.source_template, cfg.source_template) or
+            const source_selector_matches = std.mem.eql(u8, existing.source_template, cfg.source_template) and
+                (cfg.source_template.len > 0 or std.mem.eql(u8, existing.source_field, cfg.source_field));
+            if (!source_selector_matches or
                 !std.mem.eql(u8, existing.source_artifact_name, cfg.source_artifact_name) or
                 existing.expected_dims != cfg.expected_dims or
                 !std.mem.eql(u8, existing.vector_space, cfg.vector_space) or
@@ -18652,6 +18656,7 @@ const GraphConfig = struct {
     edge_type_configs: []graph_mod.EdgeTypeConfig,
     artifact_sources: []GraphArtifactSource = &.{},
     shorthand_asset: ?enrichment_catalog.EnrichmentConfig = null,
+    max_edges_per_document: u32 = 0,
     algebraic_semiring_traversal: bool = false,
 
     fn deinit(self: *GraphConfig, alloc: Allocator) void {
@@ -18685,7 +18690,7 @@ fn enrichmentFromPublic(alloc: Allocator, cfg: types.EnrichmentConfig) !enrichme
     return .{
         .name = try alloc.dupe(u8, cfg.name),
         .kind = publicEnrichmentKindToInternal(cfg.kind),
-        .source_field = if (cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
+        .source_field = if (cfg.template.len == 0 and cfg.field.len > 0) try alloc.dupe(u8, cfg.field) else "",
         .source_template = if (cfg.template.len > 0) try alloc.dupe(u8, cfg.template) else "",
         .source_artifact_name = if (cfg.source_artifact_name.len > 0) try alloc.dupe(u8, cfg.source_artifact_name) else "",
         .expected_dims = cfg.expected_dims,
@@ -19643,6 +19648,12 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         return error.InvalidIndexConfig;
     if (root.object.get("sources") != null and root.object.get("source") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
+    const max_edges_per_document: u32 = if (root.object.get("max_edges_per_document")) |value| blk: {
+        if (value != .integer or value.integer < 0 or value.integer > @as(i64, graph_asset_state.hard_max_edges_per_document)) {
+            return error.InvalidIndexConfig;
+        }
+        break :blk @intCast(value.integer);
+    } else 0;
     const artifact_sources: []GraphArtifactSource = if (root.object.get("sources") != null)
         try parseGraphArtifactSources(alloc, root)
     else if (try parseGraphArtifactSource(alloc, root)) |source|
@@ -19670,6 +19681,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
             .edge_type_configs = try alloc.alloc(graph_mod.EdgeTypeConfig, 0),
             .artifact_sources = artifact_sources,
             .shorthand_asset = shorthand_asset,
+            .max_edges_per_document = max_edges_per_document,
             .algebraic_semiring_traversal = algebraic_semiring_traversal,
         };
     };
@@ -19715,6 +19727,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         .edge_type_configs = configs,
         .artifact_sources = artifact_sources,
         .shorthand_asset = shorthand_asset,
+        .max_edges_per_document = max_edges_per_document,
         .algebraic_semiring_traversal = algebraic_semiring_traversal,
     };
 }
@@ -20026,6 +20039,21 @@ test "graph config declares algebraic provenance semiring traversal law" {
 
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"algebraic_planning":{"bounded_traversal":{"law":"min_plus_semiring"}}}
+    ));
+}
+
+test "graph config validates and retains edge materialization limits" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{"max_edges_per_document":25}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 25), cfg.max_edges_per_document);
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"max_edges_per_document":-1}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"max_edges_per_document":1000001}
     ));
 }
 
@@ -22599,7 +22627,7 @@ test "shorthand chunk and embedding enrichment compatibility includes source_tem
     try std.testing.expect(!try manager.ensureEmbeddingEnrichment(.{
         .name = "body_embedding",
         .kind = .embedding,
-        .source_field = "body",
+        .source_field = "",
         .source_template = "{{title}} {{body}}",
         .source_artifact_name = "body_chunks",
         .expected_dims = 384,
