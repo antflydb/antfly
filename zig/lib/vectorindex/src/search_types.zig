@@ -338,3 +338,40 @@ test "candidateLessThan gives NaN scores deterministic lowest priority" {
     try std.testing.expectEqual(std.math.Order.gt, candidateLessThan({}, nan_distance, finite));
     try std.testing.expectEqual(std.math.Order.lt, candidateLessThan({}, nan_distance, nan_bound));
 }
+
+test "candidateLessThan does not promote unresolved children over nearer siblings" {
+    const nearer_resolved = types.PriorityItem{
+        .id = 10,
+        .distance = 1,
+        .error_bound = 0.1,
+        .lower_bound = 0.9,
+        .bound_resolved = true,
+    };
+    const farther_unresolved = types.PriorityItem{
+        .id = 20,
+        .distance = 10,
+        .error_bound = 0.1,
+        .bound_resolved = false,
+    };
+
+    try std.testing.expectEqual(std.math.Order.lt, candidateLessThan({}, nearer_resolved, farther_unresolved));
+    try std.testing.expectEqual(std.math.Order.gt, candidateLessThan({}, farther_unresolved, nearer_resolved));
+}
+
+test "candidateLessThan does not substitute covering lower bounds for ANN priority" {
+    const nearer = types.PriorityItem{
+        .id = 10,
+        .distance = 1,
+        .error_bound = 0.1,
+        .lower_bound = 0.9,
+    };
+    const farther_broad = types.PriorityItem{
+        .id = 20,
+        .distance = 10,
+        .error_bound = 0.1,
+        .lower_bound = 0,
+    };
+
+    try std.testing.expectEqual(std.math.Order.lt, candidateLessThan({}, nearer, farther_broad));
+    try std.testing.expectEqual(std.math.Order.gt, candidateLessThan({}, farther_broad, nearer));
+}

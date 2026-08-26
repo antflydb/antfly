@@ -9377,7 +9377,7 @@ pub fn build(b: *std.Build) void {
     hbc_isolate_build_options.addOption(bool, "with_tla", with_tla);
     hbc_isolate_build_options.addOption(bool, "link_libc", true);
     hbc_isolate_build_options.addOption(bool, "standalone_runtime_focused_test", false);
-    hbc_isolate_build_options.addOption(bool, "lmdb_enabled", true);
+    hbc_isolate_build_options.addOption(bool, "lmdb_enabled", false);
     hbc_isolate_build_options.addOption(bool, "bench_minimal_deps", true);
     hbc_isolate_root_mod.addOptions("build_options", hbc_isolate_build_options);
     hbc_isolate_root_mod.addImport("lmdb_engine", lmdb_engine_mod);
