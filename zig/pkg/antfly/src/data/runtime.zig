@@ -12228,13 +12228,19 @@ pub const DataServer = struct {
         return true;
     }
 
-    fn consumeProvisionedIndexRepairImmediateWake(self: *DataServer, group_id: u64) void {
+    fn consumeProvisionedIndexRepairImmediateWakeIfUnchanged(
+        self: *DataServer,
+        group_id: u64,
+        expected_wake_generation: u64,
+    ) bool {
         lockAtomic(&self.provisioned_index_repair_queue_mutex);
         defer self.provisioned_index_repair_queue_mutex.unlock();
-        const entry = self.provisioned_index_repair_group_ages.getPtr(group_id) orelse return;
-        if (!entry.immediate_wake_pending) return;
+        const entry = self.provisioned_index_repair_group_ages.getPtr(group_id) orelse return true;
+        if (entry.wake_generation != expected_wake_generation) return false;
+        if (!entry.immediate_wake_pending) return true;
         entry.immediate_wake_pending = false;
         _ = self.provisioned_index_repair_immediate_wake_count.fetchSub(1, .release);
+        return true;
     }
 
     fn requestProvisionedIndexRepairCancellation(self: *DataServer, group_id: u64) !void {
@@ -12737,7 +12743,9 @@ pub const DataServer = struct {
                 // local Raft view converge. Keep durable debt queued while the
                 // independent fallback cursor continues discovering other debt.
                 .retain => {
-                    if (queued.immediate_wake_pending) self.consumeProvisionedIndexRepairImmediateWake(group_id);
+                    if (queued.immediate_wake_pending) {
+                        _ = self.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(group_id, queued.wake_generation);
+                    }
                     found_pending = true;
                     continue;
                 },
@@ -12776,7 +12784,9 @@ pub const DataServer = struct {
                 std.log.warn("provisioned index repair candidate allocation failed err={s}", .{@errorName(err)});
                 return;
             };
-            if (queued.immediate_wake_pending) self.consumeProvisionedIndexRepairImmediateWake(group_id);
+            if (queued.immediate_wake_pending) {
+                _ = self.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(group_id, queued.wake_generation);
+            }
             // One runnable queued group is sufficient: the executor admits at
             // most one repair, and the linked cursor provides round-robin
             // fairness across subsequent passes.
@@ -23923,6 +23933,10 @@ test "data runtime repair debt hook targets the affected group queue" {
 
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
+    // A visibility clear is an aggregate audit enqueue, not a destructive
+    // lifecycle remove, and cannot consume another owner's cancellation.
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue);
+    try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .clear_cancel);
     try std.testing.expect(!server.provisionedIndexRepairCancellationRequested(7001));
 
@@ -24023,6 +24037,12 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     const newer_entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
     const newer_generation = newer_entry.wake_generation;
     try std.testing.expect(newer_generation != selected_generation);
+    try std.testing.expect(!server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(7001, selected_generation));
+    try std.testing.expect(newer_entry.immediate_wake_pending);
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
+    try std.testing.expect(server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(7001, newer_generation));
+    try std.testing.expect(!newer_entry.immediate_wake_pending);
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), newer_entry.next_retry_at_ms);
     try std.testing.expectEqual(@as(u32, 0), newer_entry.transient_failure_count);
     try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
@@ -24104,7 +24124,8 @@ test "data runtime repair queue links and removes debt in constant time" {
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_not_before_ms.load(.monotonic));
 
     server.provisioned_index_repair_queue_cursor = 20;
-    server.consumeProvisionedIndexRepairImmediateWake(20);
+    const selected_generation = server.provisioned_index_repair_group_ages.get(20).?.wake_generation;
+    try std.testing.expect(server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(20, selected_generation));
     try std.testing.expectEqual(@as(u64, 40), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     server.removeProvisionedIndexRepair(1);
     server.removeProvisionedIndexRepair(20);

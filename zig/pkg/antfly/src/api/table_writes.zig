@@ -5264,6 +5264,9 @@ pub const ProvisionedTableWriteSource = struct {
         /// conflict with repair, so the runtime may admit the queued work
         /// immediately instead of waiting for its control-loop poll.
         enqueue_runnable,
+        /// Destructive lifecycle removal after the group path and its durable
+        /// repair state are no longer authoritative. Ordinary repair clear
+        /// edges enqueue an aggregate audit instead.
         remove,
         cancel,
         clear_cancel,
@@ -8746,7 +8749,12 @@ pub const ProvisionedTableWriteSource = struct {
                 self.invalidateReadCache(table_name);
                 self.invalidateRuntimeStatusCache(table_name);
                 self.markRepairHandoffClearBestEffort(table_name, group_id);
-                self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
+                // Visibility callbacks can overlap after copying their hook.
+                // Never let an older clear delete a causally newer pending
+                // wake. Keep the group queued for one aggregate audit; only
+                // that generation-fenced owner may retire ordinary repair
+                // debt. Explicit drop remains the destructive remove path.
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
                 self.notifyLocalChange(table_name, .data);
                 return;
             },
@@ -34136,8 +34144,11 @@ test "structural repair handoff keeps status fenced through final shard visibili
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
     request.handoffDeferredRepairDebt(&source);
-    try std.testing.expectEqual(@as(usize, 4), debt_capture.enqueue_calls);
-    try std.testing.expectEqual(@as(usize, 2), debt_capture.regular_enqueue_calls);
+    // The clear contributes one regular aggregate-audit wake. It cannot
+    // destructively remove either a newer pending edge or the two runnable
+    // structural handoffs published below.
+    try std.testing.expectEqual(@as(usize, 5), debt_capture.enqueue_calls);
+    try std.testing.expectEqual(@as(usize, 3), debt_capture.regular_enqueue_calls);
     try std.testing.expectEqual(@as(usize, 2), debt_capture.runnable_enqueue_calls);
     try std.testing.expectEqual(@as(usize, 1), debt_capture.unrelated_enqueue_calls);
 
@@ -35919,7 +35930,7 @@ test "managed repair visibility edges retire cached readers and runtime status" 
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(&source, "docs", 7001, null, .index_repair_cleared);
     try std.testing.expectEqual(@as(u64, 9), read_cache.table_epochs.get("docs").?);
     try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
-    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalIndexRepairDebtAction.remove, hooks.debt.?);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalIndexRepairDebtAction.enqueue, hooks.debt.?);
     try std.testing.expectEqual(@as(usize, 2), hooks.changes);
 
     source.retireReadersAfterIndexRepairCompletion("docs", .{ .cleared_debt = true });
