@@ -4773,6 +4773,11 @@ pub const ModelManager = struct {
         component_paths: []const []const u8,
         contract: ComponentContract,
     ) !ComponentLoader {
+        var required_backend_scratch: [1]backends.BackendType = undefined;
+        const effective_backends = try self.session_manager.requiredBackendCandidates(
+            preferred_backends,
+            &required_backend_scratch,
+        );
         var loader = ComponentLoader{ .manager = self };
         for (component_paths) |path| try loader.addComponentPath(path);
         if (loader.component_path_count == 0) return error.IncompleteModelBundle;
@@ -4782,7 +4787,7 @@ pub const ModelManager = struct {
             const key = componentPlanKey(
                 model_dir,
                 &man,
-                preferred_backends,
+                effective_backends,
                 component_paths,
                 policy,
                 contract,
@@ -4804,13 +4809,13 @@ pub const ModelManager = struct {
             try validateComponentNativeArtifacts(
                 self.allocator,
                 component_paths,
-                preferred_backends,
+                effective_backends,
                 &inspection,
             );
             try validateComponentImportedGraphs(
                 self.allocator,
                 component_paths,
-                preferred_backends,
+                effective_backends,
                 &inspection,
             );
             const signature_after = try componentDependencySignature(
@@ -4824,7 +4829,7 @@ pub const ModelManager = struct {
             )) return error.ModelArtifactsChanging;
             const validated = try policyAllowedComponentBackendsFromInspection(
                 &loader.allowed_backends,
-                preferred_backends,
+                effective_backends,
                 policy,
                 &inspection,
             );
@@ -4835,7 +4840,7 @@ pub const ModelManager = struct {
                 inspection.dependencies.items,
             ) catch {};
             break :blk validated;
-        } else preferred_backends;
+        } else effective_backends;
         for (allowed) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             if (loader.allowed_backend_count == loader.allowed_backends.len) break;
@@ -4883,6 +4888,11 @@ pub const ModelManager = struct {
         shared_backend_ctx: ?*backends.imported_onnx_session.SharedBackendContext,
         source_session_manager: *const backends.SessionManager,
     ) !ManagedSession {
+        var required_backend_scratch: [1]backends.BackendType = undefined;
+        const effective_backends = try source_session_manager.requiredBackendCandidates(
+            preferred_backends,
+            &required_backend_scratch,
+        );
         var first_err: ?anyerror = null;
         var artifact_estimate = if (self.admission_enabled)
             try ComponentArtifactEstimate.init(self.allocator, model_path)
@@ -4890,7 +4900,7 @@ pub const ModelManager = struct {
             ComponentArtifactEstimate.disabled;
         defer artifact_estimate.deinit();
 
-        for (preferred_backends) |backend| {
+        for (effective_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             if (shared_backend_ctx) |shared| {
                 if (shared.backendType() != backend) continue;
@@ -5819,9 +5829,14 @@ pub const ModelManager = struct {
         cache_default_alias: bool,
         policy: ModelLoadCachePolicy,
     ) !ModelHandle {
+        var required_backend_scratch: [1]backends.BackendType = undefined;
+        const effective_backends = try self.session_manager.requiredBackendCandidates(
+            preferred_backends,
+            &required_backend_scratch,
+        );
         const flight_key = try self.loadFlightKey(
             model_dir,
-            preferred_backends,
+            effective_backends,
             cache_default_alias,
             policy,
         );
@@ -5830,7 +5845,7 @@ pub const ModelManager = struct {
         self.lockLoadedModels();
         const cached = self.lookupLoadedModelLocked(
             model_dir,
-            preferred_backends,
+            effective_backends,
             cache_default_alias,
             policy,
         ) catch |err| {
@@ -5878,7 +5893,7 @@ pub const ModelManager = struct {
         // runtime for its complete construction.
         var session_manager = sessionManagerForPreferredBackends(
             self.allocator,
-            preferred_backends,
+            effective_backends,
             &self.session_manager,
         );
         session_manager.a4b_inference_request = policy.a4b_request;
@@ -6767,6 +6782,8 @@ fn sessionManagerForPreferredBackends(
     return .{
         .allocator = allocator,
         .preferred_backends = preferred_backends,
+        .required_backend = source.required_backend,
+        .required_backend_invalid = source.required_backend_invalid,
         .graph_runtime_strategy = source.graph_runtime_strategy,
         .kernel_jit = source.kernel_jit,
         .kernel_jit_load_context = source.kernel_jit_load_context,
@@ -7306,8 +7323,13 @@ fn loadSessionForPreferredBackends(
     man: manifest_mod.ModelManifest,
     source_session_manager: *const backends.SessionManager,
 ) !LoadedSessionPlan {
+    var required_backend_scratch: [1]backends.BackendType = undefined;
+    const policy_backends = try source_session_manager.requiredBackendCandidates(
+        preferred_backends,
+        &required_backend_scratch,
+    );
     var effective_scratch: [7]backends.BackendType = undefined;
-    const effective_backends = effectiveLoadBackends(&effective_scratch, preferred_backends, man);
+    const effective_backends = effectiveLoadBackends(&effective_scratch, policy_backends, man);
     // Keep the first real failure. Reporting a blanket NoModelFileFound hides the
     // actionable cause: a GGUF whose tensors could not be resolved fails with
     // MissingRequiredWeights, and callers were being told the file did not exist.
@@ -8072,6 +8094,50 @@ test "effectiveLoadBackends preserves explicit onnx-only classifier preference" 
     try std.testing.expectEqualSlices(backends.BackendType, &preferred, effective);
 }
 
+test "required backend is applied before model manager backend planning" {
+    const allocator = std.testing.allocator;
+    var source = backends.SessionManager.init(allocator);
+    source.preferred_backends = &.{ .native, .onnx };
+    source.required_backend = .cuda;
+    source.required_backend_invalid = false;
+
+    var required_scratch: [1]backends.BackendType = undefined;
+    const policy_backends = try source.requiredBackendCandidates(
+        source.preferred_backends,
+        &required_scratch,
+    );
+
+    var load_scratch: [7]backends.BackendType = undefined;
+    var classifier = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .classifier };
+    defer classifier.deinit();
+    classifier.safetensors_path = try allocator.dupe(u8, "model.safetensors");
+
+    const effective = effectiveLoadBackends(&load_scratch, policy_backends, classifier);
+    try std.testing.expectEqualSlices(backends.BackendType, &.{.cuda}, effective);
+}
+
+test "model manager rejects an unavailable required backend before artifact selection" {
+    const allocator = std.testing.allocator;
+    var session_manager = backends.SessionManager.init(allocator);
+    session_manager.required_backend = .pjrt;
+    session_manager.required_backend_invalid = false;
+    var manager = ModelManager.init(allocator, session_manager);
+    defer manager.deinit();
+
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        manager.acquireFromDir("/nonexistent/required-backend-model"),
+    );
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        manager.componentLoaderForPaths(
+            "/nonexistent/required-backend-model",
+            &.{.native},
+            &.{"/nonexistent/component"},
+        ),
+    );
+}
+
 test "isManifestPotentiallyLoadableInCurrentBuild accepts onnx-only models when onnx model support is enabled" {
     const allocator = std.testing.allocator;
 
@@ -8661,6 +8727,20 @@ test "component compatibility validates explicit split ONNX graphs" {
         .multistage_ocr,
     );
     try std.testing.expectEqual(@as(usize, 1), manager.component_plan_cache.count());
+
+    var required_session_manager = backends.SessionManager.init(allocator);
+    required_session_manager.required_backend = .cuda;
+    required_session_manager.required_backend_invalid = false;
+    var required_manager = ModelManager.init(allocator, required_session_manager);
+    defer required_manager.deinit();
+    const required_loader = try required_manager.componentLoaderForPathsWithContract(
+        root,
+        &.{.native},
+        &.{ encoder, decoder },
+        .multistage_ocr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), required_loader.allowed_backend_count);
+    try std.testing.expectEqual(backends.BackendType.cuda, required_loader.allowed_backends[0]);
 
     try dir.dir.writeFile(std.testing.io, .{
         .sub_path = "encoder_model.onnx",

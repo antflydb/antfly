@@ -409,7 +409,22 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     defer if (resolved_artifact_dir) |path| allocator.free(path);
     const route_onnx_whole_model_graph = opts.backend == .onnx and opts.compiled_target == .whole_model;
 
-    const allow_direct_onnx = opts.backend == .auto or opts.backend == .onnx;
+    var session_manager = backends.SessionManager.initWithIo(allocator, io);
+    configureBackendPreference(&session_manager, if (route_onnx_whole_model_graph) .native else opts.backend);
+    session_manager.a4b_inference_request = a4bInferenceRequest(opts);
+    session_manager.kernel_jit = jit_config;
+    session_manager.kernel_jit_load_context = .startup_preload;
+
+    try native_backend_choice.validateRequiredCompiledBackend(
+        &session_manager,
+        if (artifact_backend) |backend|
+            if (std.mem.eql(u8, backend, "onnx")) .onnx else .pjrt
+        else
+            null,
+    );
+
+    const allow_direct_onnx = (opts.backend == .auto or opts.backend == .onnx) and
+        try session_manager.allowsDirectBackend(.onnx);
     if (allow_direct_onnx and !jit_config.mode.compiles() and opts.kernel_jit_profile_out == null and effective_draft_model == null and build_options.enable_onnx and
         !route_onnx_whole_model_graph and
         !c_file.fileExistsInDir(allocator, opts.model_dir, "genai_config.json") and
@@ -505,12 +520,6 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
         return;
     }
-
-    var session_manager = backends.SessionManager.initWithIo(allocator, io);
-    configureBackendPreference(&session_manager, if (route_onnx_whole_model_graph) .native else opts.backend);
-    session_manager.a4b_inference_request = a4bInferenceRequest(opts);
-    session_manager.kernel_jit = jit_config;
-    session_manager.kernel_jit_load_context = .startup_preload;
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
@@ -684,6 +693,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         }
         break :blk @as(?ops.BackendKind, null);
     };
+    try native_backend_choice.validateRequiredCompiledBackend(&session_manager, explicit_partition_backend);
     const compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = opts.compiled_target orelse blk: {
         if (compiled_mode_requested and explicit_partition_backend == .metal) break :blk .whole_model;
         break :blk .partitioned;

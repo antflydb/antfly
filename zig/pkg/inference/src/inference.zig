@@ -56,6 +56,7 @@ pub const quantize = @import("quantize/root.zig");
 pub const client = if (build_options.skip_openapi) struct {} else @import("inference_client");
 pub const linalg = @import("inference_linalg");
 pub const native_generate = @import("native_generate.zig");
+pub const native_backend_choice = @import("native_backend_choice.zig");
 pub const native_chat = @import("native_chat.zig");
 pub const native_compile = @import("native_compile.zig");
 pub const native_export = @import("native_export.zig");
@@ -126,6 +127,7 @@ test {
     _ = client;
     _ = scraping;
     _ = native_generate;
+    _ = native_backend_choice;
     _ = native_chat;
     _ = native_compile;
     _ = native_export;
