@@ -5724,6 +5724,98 @@ func TestHADemoteDependencySurvivesPromotionActionCompaction(t *testing.T) {
 	g.Expect(haPlannedActionDependenciesSucceededForStatus(status, []antflyv1.HAPlannedActionStatus{nonDemote}, 0)).To(BeFalse())
 }
 
+func TestHACompletedDemoteIsRestoredBeforeDispositionPlanning(t *testing.T) {
+	g := NewWithT(t)
+	cluster := haCluster()
+	cluster.Spec.HighAvailability.Identity = &antflyv1.HAReplicationIdentitySpec{
+		ClusterID: 100, ShardID: 10, TableID: 20,
+		CurrentPrimaryID: "standby-a", TimelineID: 2, Epoch: 2,
+	}
+	cluster.Spec.HighAvailability.Standbys = []antflyv1.HAStandbySpec{{Name: "primary-a"}}
+	cluster.Status.HAStatus = &antflyv1.HAStatus{
+		PrimaryLSN: 20,
+		Retention:  antflyv1.HARetentionStatus{OldestRestartLSN: 8},
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "primary-a",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  1,
+			ParentEpoch:       1,
+			NewTimelineID:     2,
+			NewEpoch:          2,
+			SwitchLSN:         13,
+			RequiredLSN:       12,
+			ObservedLSN:       12,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   2,
+			FenceToken:        "ha-fence-token",
+		},
+		// This is the promoted runtime's honest observation. It does not know
+		// the operator-owned assessment result recorded below.
+		FormerPrimary: &antflyv1.HAFormerPrimaryStatus{
+			NodeID:           "primary-a",
+			Fenced:           true,
+			FenceAuthority:   antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:      "standby-a",
+			FenceGeneration:  2,
+			ParentTimelineID: 1,
+			NewTimelineID:    2,
+			RejoinRequired:   true,
+			Action:           string(haActionDemoteFormerPrimary),
+			Reason:           "FormerPrimaryNotObserved",
+		},
+		PlannedActions: []antflyv1.HAPlannedActionStatus{{
+			Kind:                  string(haActionDemoteFormerPrimary),
+			Phase:                 string(haActionPhaseRejoin),
+			Executor:              string(haActionExecutorAdminAPI),
+			DependsOn:             string(haActionPromoteStandby),
+			StandbyName:           "primary-a",
+			AdminNodeID:           "primary-a",
+			AdminMethod:           "POST",
+			AdminPath:             haAdminRejoinAssessPath,
+			TargetLSN:             12,
+			RetainedFromLSN:       8,
+			RouteFrom:             "primary-a",
+			FenceAuthority:        antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:           "standby-a",
+			FenceGeneration:       2,
+			AdminJobName:          haAdminDirectAPIName,
+			AdminJobPhase:         haAdminJobPhaseSucceeded,
+			ExecutionStateVersion: 1,
+			AttemptCount:          1,
+			AdminResult: &antflyv1.HAAdminActionResultStatus{
+				SchemaVersion:    1,
+				ActionID:         "rejoin_assess:primary-a",
+				ActionKind:       "rejoin_assess",
+				ActionTarget:     "primary-a",
+				ActionState:      "assessed",
+				ActionNodeID:     "primary-a",
+				RejoinAction:     "rewind",
+				RejoinReason:     "parent_timeline_retained",
+				FormerNodeID:     "primary-a",
+				TargetTimelineID: 2,
+				TargetEpoch:      2,
+				ForkLSN:          12,
+				FormerLastLSN:    12,
+				RetainedFromLSN:  8,
+			},
+		}},
+	}
+	reconciler := &AntflyClusterReconciler{}
+
+	g.Expect(haAdminActionSucceededWithEvidence(cluster.Status.HAStatus.PlannedActions[0])).To(BeTrue())
+	reconciler.updateHAFormerPrimaryFromAdminJobs(context.Background(), cluster)
+	g.Expect(cluster.Status.HAStatus.FormerPrimary.AssessedAction).To(Equal("rewind"))
+	reconciler.updateHAStatusAndConditions(cluster)
+
+	assessment, found := haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionDemoteFormerPrimary)
+	g.Expect(found).To(BeTrue())
+	g.Expect(assessment.AdminJobPhase).To(Equal(haAdminJobPhaseSucceeded))
+	rewind, found := haPlannedActionByKind(cluster.Status.HAStatus.PlannedActions, haActionRewindFormerPrimary)
+	g.Expect(found).To(BeTrue())
+	g.Expect(rewind.DependsOn).To(Equal(string(haActionFenceFormerPrimary)))
+	g.Expect(rewind.TargetLSN).To(Equal(uint64(12)))
+}
+
 func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g := NewWithT(t)
 

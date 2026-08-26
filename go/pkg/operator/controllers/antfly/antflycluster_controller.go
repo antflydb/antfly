@@ -5227,6 +5227,11 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 			return err
 		}
 		r.observeHAFormerPrimaryFenceStatus(ctx, cluster)
+		// Runtime observation cannot carry operator-owned typed action results.
+		// Restore a completed assessment before planning so a promoted runtime's
+		// honest FormerPrimaryNotObserved view cannot repeatedly replan Demote
+		// and strand the subsequent rewind/reseed disposition.
+		r.updateHAFormerPrimaryFromAdminJobs(ctx, cluster)
 		r.updateHAStatusAndConditions(cluster)
 		if haAdminStatusErr != nil {
 			setHACondition(
@@ -5376,6 +5381,9 @@ func (r *AntflyClusterReconciler) updateStatusFrom(
 		return err
 	}
 	r.observeHAFormerPrimaryFenceStatus(ctx, cluster)
+	// Preserve operator-owned rejoin assessment authority across the primary
+	// runtime observation merge before deriving the next action plan.
+	r.updateHAFormerPrimaryFromAdminJobs(ctx, cluster)
 	r.updateHAStatusAndConditions(cluster)
 	if haAdminStatusErr != nil {
 		setHACondition(
