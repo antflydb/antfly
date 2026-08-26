@@ -7016,8 +7016,11 @@ func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {
 	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
 		Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1"),
 	}}
+	portableTarget := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "primary-a-data", Namespace: "default", UID: types.UID("primary-pvc-uid-1"),
+	}}
 	reconciler := &AntflyClusterReconciler{
-		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc).Build(),
+		Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc, portableTarget).Build(),
 		Scheme: s,
 	}
 	action := antflyv1.HAPlannedActionStatus{
@@ -7038,6 +7041,17 @@ func TestActivationJobBindsReceiptToObservedTargetPVCInstance(t *testing.T) {
 	g.Expect(ready).To(BeTrue())
 	g.Expect(bound.AdminCommand).To(Equal(action.AdminCommand), "PVC preflight must validate, never mutate, the frozen activation request")
 	g.Expect(haAdminActionHash(bound)).To(Equal(haAdminActionHash(action)))
+
+	portableAction := action
+	portableAction.SlotName = "primary-a"
+	portableAction.SeedArtifactGeneration = "reseed-primary-a-11"
+	portableAction.TopologyGeneration = 4
+	portableAction.TopologyNodeID = "primary-a"
+	portableAction.TargetPVCName = portableTarget.Name
+	portableAction.TargetPVCUID = string(portableTarget.UID)
+	_, ready, err = reconciler.haActivationJobAction(context.Background(), cluster, portableAction)
+	g.Expect(err).NotTo(HaveOccurred(), "the source runtime's own boot gate must not constrain a different portable target PVC")
+	g.Expect(ready).To(BeTrue())
 
 	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = "replacement-pvc"
 	_, ready, err = reconciler.haActivationJobAction(context.Background(), cluster, action)
@@ -7062,6 +7076,8 @@ func TestActivationReceiptCurrentTargetRejectsReplacementPVCAndTopologyGeneratio
 	action := antflyv1.HAPlannedActionStatus{
 		Kind: string(haActionActivateSeedArtifact), SlotName: "standby-a",
 		SeedArtifactGeneration: "prod-standby-a-10", AdminJobPhase: haAdminJobPhaseSucceeded,
+		TopologyID: "test-standalone", TopologyGeneration: 3, TopologyNodeID: "standby-a",
+		TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-2",
 		SeedCaptureReceiptSHA256: strings.Repeat("d", 64), TargetLocalNodeID: 1, TargetReplicaID: 1,
 		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
 			FormatVersion: 2,
@@ -7084,6 +7100,44 @@ func TestActivationReceiptCurrentTargetRejectsReplacementPVCAndTopologyGeneratio
 	g.Expect(current).To(BeFalse())
 	action.SeedArtifactReceipt.TargetPVCUID = "pvc-uid-2"
 	action.SeedArtifactReceipt.TopologyGeneration = 2
+	current, err = reconciler.haActivationReceiptMatchesCurrentTarget(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(current).To(BeFalse())
+}
+
+func TestActivationReceiptCurrentTargetUsesPortableActionBindingOutsideLocalStartupGate(t *testing.T) {
+	g := NewWithT(t)
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+	cluster := startupGatedStandaloneControllerCluster(true)
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "primary-a-data", Namespace: "default", UID: types.UID("primary-pvc-uid-1"),
+	}}
+	reconciler := &AntflyClusterReconciler{Client: fake.NewClientBuilder().WithScheme(s).WithObjects(cluster, pvc).Build()}
+	digest := strings.Repeat("a", 64)
+	action := antflyv1.HAPlannedActionStatus{
+		Kind: string(haActionActivateSeedArtifact), SlotName: "primary-a",
+		SeedArtifactGeneration: "reseed-primary-a-11", AdminJobPhase: haAdminJobPhaseSucceeded,
+		TopologyID: "test-standalone", TopologyGeneration: 4, TopologyNodeID: "primary-a",
+		TargetPVCName: pvc.Name, TargetPVCUID: string(pvc.UID), TargetLocalNodeID: 1, TargetReplicaID: 1,
+		SeedCaptureReceiptSHA256: strings.Repeat("d", 64),
+		SeedArtifactReceipt: &antflyv1.HASeedArtifactReceiptStatus{
+			FormatVersion: 4, TopologyID: "test-standalone", TopologyGeneration: 4,
+			NodeID: "primary-a", SlotName: "primary-a", Generation: "reseed-primary-a-11",
+			TargetPVCName: pvc.Name, TargetPVCUID: string(pvc.UID),
+			ManifestSHA256: digest, CaptureReceiptSHA256: strings.Repeat("d", 64),
+			MaterializedReceiptSHA256: strings.Repeat("e", 64), MaterializedAggregateSHA256: strings.Repeat("f", 64),
+			TargetLocalNodeID: 1, TargetReplicaID: 1,
+			GenerationPath: "live-generations/reseed-primary-a-11", RawGenerationPath: "generations/reseed-primary-a-11",
+		},
+	}
+
+	current, err := reconciler.haActivationReceiptMatchesCurrentTarget(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(current).To(BeTrue(), "portable evidence must be checked against its action target, not the source runtime's local boot gate")
+
+	action.SeedArtifactReceipt.TargetPVCUID = "replacement-pvc"
 	current, err = reconciler.haActivationReceiptMatchesCurrentTarget(context.Background(), cluster, action)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(current).To(BeFalse())

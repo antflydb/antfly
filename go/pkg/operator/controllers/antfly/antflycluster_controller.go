@@ -6701,12 +6701,22 @@ func (r *AntflyClusterReconciler) haActivationJobAction(ctx context.Context, clu
 			return action, false, fmt.Errorf("HA target activation conflicts with the configured startup gate")
 		}
 		required := gate.RequiredReceipt
-		if action.TopologyID != strings.TrimSpace(required.TopologyID) || action.TopologyGeneration != required.TopologyGeneration ||
-			action.TopologyNodeID != strings.TrimSpace(required.NodeID) || action.TargetPVCName != strings.TrimSpace(required.TargetPVCName) ||
-			action.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) ||
-			strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
-			strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
-			return action, false, fmt.Errorf("HA target activation topology binding is stale relative to the startup gate")
+		gateTargetPVC := strings.TrimSpace(required.TargetPVCName)
+		if gateTargetPVC == "" {
+			return action, false, fmt.Errorf("HA target activation startup gate omits its target PVC identity")
+		}
+		// The runtime gate protects the PVC from which this cluster boots. A
+		// promoted primary can also activate a portable seed on a different,
+		// physically isolated PVC. Only compare that action to the boot contract
+		// when both contracts address the same PVC instance.
+		if action.TargetPVCName == gateTargetPVC {
+			if action.TopologyID != strings.TrimSpace(required.TopologyID) || action.TopologyGeneration != required.TopologyGeneration ||
+				action.TopologyNodeID != strings.TrimSpace(required.NodeID) ||
+				action.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) ||
+				strings.TrimSpace(action.SlotName) != strings.TrimSpace(required.SlotName) ||
+				strings.TrimSpace(action.SeedArtifactGeneration) != strings.TrimSpace(required.Generation) {
+				return action, false, fmt.Errorf("HA target activation topology binding is stale relative to the startup gate")
+			}
 		}
 	}
 	pvc := &corev1.PersistentVolumeClaim{}
@@ -6725,49 +6735,88 @@ func (r *AntflyClusterReconciler) haActivationJobAction(ctx context.Context, clu
 }
 
 func (r *AntflyClusterReconciler) haActivationReceiptMatchesCurrentTarget(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (bool, error) {
+	receipt := action.SeedArtifactReceipt
 	gate := haRuntimeStartupGate(cluster)
-	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed {
-		return true, nil
+	if gate != nil && gate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && gate.RequiredReceipt != nil {
+		required := *gate.RequiredReceipt
+		gateTargetPVC := strings.TrimSpace(required.TargetPVCName)
+		actionTargetPVC := strings.TrimSpace(action.TargetPVCName)
+		// Completed actions written before target identity became a required
+		// action field can still authorize their exact local startup gate because
+		// the immutable receipt carries that identity. New portable actions always
+		// carry the target on both the action and receipt.
+		gateApplies := gateTargetPVC != "" &&
+			(actionTargetPVC == gateTargetPVC ||
+				(actionTargetPVC == "" && receipt != nil && strings.TrimSpace(receipt.TargetPVCName) == gateTargetPVC))
+		if gateApplies {
+			pvc := &corev1.PersistentVolumeClaim{}
+			err := r.Get(ctx, types.NamespacedName{Name: gateTargetPVC, Namespace: cluster.Namespace}, pvc)
+			if errors.IsNotFound(err) {
+				return false, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			if receipt == nil || strings.TrimSpace(string(pvc.UID)) == "" ||
+				receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
+				receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
+				receipt.TargetPVCName != required.TargetPVCName || receipt.TargetPVCUID != string(pvc.UID) ||
+				receipt.GenerationPath != path.Join("live-generations", required.Generation) ||
+				receipt.RawGenerationPath != path.Join("generations", required.Generation) ||
+				receipt.TargetLocalNodeID == 0 || receipt.TargetReplicaID == 0 ||
+				!isLowerHexDigest(receipt.CaptureReceiptSHA256) ||
+				!isLowerHexDigest(receipt.MaterializedReceiptSHA256) ||
+				!isLowerHexDigest(receipt.MaterializedAggregateSHA256) {
+				return false, nil
+			}
+			if required.TopologyGeneration != 0 && receipt.TopologyGeneration != required.TopologyGeneration {
+				return false, nil
+			}
+			if required.TargetPVCUID != "" && receipt.TargetPVCUID != required.TargetPVCUID {
+				return false, nil
+			}
+			if (required.ManifestSHA256 != "" && receipt.ManifestSHA256 != required.ManifestSHA256) ||
+				(required.AggregateSHA256 != "" && receipt.AggregateSHA256 != required.AggregateSHA256) ||
+				(required.SeedReceiptSHA256 != "" && receipt.SeedReceiptSHA256 != required.SeedReceiptSHA256) ||
+				(required.CaptureReceiptSHA256 != "" && receipt.CaptureReceiptSHA256 != required.CaptureReceiptSHA256) ||
+				(required.MaterializedReceiptSHA256 != "" && receipt.MaterializedReceiptSHA256 != required.MaterializedReceiptSHA256) ||
+				(required.MaterializedAggregateSHA256 != "" && receipt.MaterializedAggregateSHA256 != required.MaterializedAggregateSHA256) ||
+				(required.TargetLocalNodeID != 0 && receipt.TargetLocalNodeID != required.TargetLocalNodeID) ||
+				(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
+				return false, nil
+			}
+			return true, nil
+		}
 	}
-	if gate.RequiredReceipt == nil {
+
+	if strings.TrimSpace(action.TopologyID) == "" || action.TopologyGeneration <= 0 ||
+		strings.TrimSpace(action.TopologyNodeID) == "" || strings.TrimSpace(action.SlotName) == "" ||
+		strings.TrimSpace(action.SeedArtifactGeneration) == "" || strings.TrimSpace(action.TargetPVCName) == "" ||
+		strings.TrimSpace(action.TargetPVCUID) == "" || action.TargetLocalNodeID == 0 || action.TargetReplicaID == 0 {
 		return false, nil
 	}
-	required := *gate.RequiredReceipt
 	pvc := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Name: required.TargetPVCName, Namespace: cluster.Namespace}, pvc)
+	err := r.Get(ctx, types.NamespacedName{Name: action.TargetPVCName, Namespace: cluster.Namespace}, pvc)
 	if errors.IsNotFound(err) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	receipt := action.SeedArtifactReceipt
 	if receipt == nil || strings.TrimSpace(string(pvc.UID)) == "" ||
-		receipt.TopologyID != required.TopologyID || receipt.NodeID != required.NodeID ||
-		receipt.SlotName != required.SlotName || receipt.Generation != required.Generation ||
-		receipt.TargetPVCName != required.TargetPVCName || receipt.TargetPVCUID != string(pvc.UID) ||
-		receipt.GenerationPath != path.Join("live-generations", required.Generation) ||
-		receipt.RawGenerationPath != path.Join("generations", required.Generation) ||
-		receipt.TargetLocalNodeID == 0 || receipt.TargetReplicaID == 0 ||
+		receipt.TopologyID != action.TopologyID || receipt.TopologyGeneration != action.TopologyGeneration ||
+		receipt.NodeID != action.TopologyNodeID || receipt.SlotName != action.SlotName ||
+		receipt.Generation != action.SeedArtifactGeneration || receipt.TargetPVCName != action.TargetPVCName ||
+		receipt.TargetPVCUID != action.TargetPVCUID || receipt.TargetPVCUID != string(pvc.UID) ||
+		receipt.GenerationPath != path.Join("live-generations", action.SeedArtifactGeneration) ||
+		receipt.RawGenerationPath != path.Join("generations", action.SeedArtifactGeneration) ||
+		receipt.TargetLocalNodeID != action.TargetLocalNodeID || receipt.TargetReplicaID != action.TargetReplicaID ||
 		!isLowerHexDigest(receipt.CaptureReceiptSHA256) ||
 		!isLowerHexDigest(receipt.MaterializedReceiptSHA256) ||
 		!isLowerHexDigest(receipt.MaterializedAggregateSHA256) {
 		return false, nil
 	}
-	if required.TopologyGeneration != 0 && receipt.TopologyGeneration != required.TopologyGeneration {
-		return false, nil
-	}
-	if required.TargetPVCUID != "" && receipt.TargetPVCUID != required.TargetPVCUID {
-		return false, nil
-	}
-	if (required.ManifestSHA256 != "" && receipt.ManifestSHA256 != required.ManifestSHA256) ||
-		(required.AggregateSHA256 != "" && receipt.AggregateSHA256 != required.AggregateSHA256) ||
-		(required.SeedReceiptSHA256 != "" && receipt.SeedReceiptSHA256 != required.SeedReceiptSHA256) ||
-		(required.CaptureReceiptSHA256 != "" && receipt.CaptureReceiptSHA256 != required.CaptureReceiptSHA256) ||
-		(required.MaterializedReceiptSHA256 != "" && receipt.MaterializedReceiptSHA256 != required.MaterializedReceiptSHA256) ||
-		(required.MaterializedAggregateSHA256 != "" && receipt.MaterializedAggregateSHA256 != required.MaterializedAggregateSHA256) ||
-		(required.TargetLocalNodeID != 0 && receipt.TargetLocalNodeID != required.TargetLocalNodeID) ||
-		(required.TargetReplicaID != 0 && receipt.TargetReplicaID != required.TargetReplicaID) {
+	if expected := strings.TrimSpace(action.SeedCaptureReceiptSHA256); expected != "" && receipt.CaptureReceiptSHA256 != expected {
 		return false, nil
 	}
 	return true, nil
