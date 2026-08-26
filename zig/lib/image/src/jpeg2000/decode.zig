@@ -57,6 +57,19 @@ fn policiesForState(state: *const codestream.State) Tier1Policy {
     if (state.header.components.len == 0) return exact;
     return .{ .refinement = .openjpeg_midpoint_signed, .magnitude = .openjpeg_midpoint };
 }
+const SingleTileU8DecodePath = enum {
+    streaming_irreversible,
+    retained_mixed_or_reversible,
+};
+
+fn singleTileU8DecodePath(state: *const codestream.State) !SingleTileU8DecodePath {
+    if (state.header.components.len == 0) return .retained_mixed_or_reversible;
+    for (0..state.header.components.len) |component_index| {
+        const coding_style = try tile.effectiveCodingStyle(state, component_index);
+        if (coding_style.wavelet_transform != 0) return .retained_mixed_or_reversible;
+    }
+    return .streaming_irreversible;
+}
 
 fn quantizationStyleForTile(state: *const codestream.State, tile_index: u16) ?codestream.QuantizationStyle {
     for (state.tile_parts) |tile_part| {
@@ -369,8 +382,8 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
     defer packet_model.deinit(allocator);
 
     const policy = policiesForState(&decode_state);
-    const coding_style = decode_state.coding_style orelse return error.MissingCodingStyle;
-    const pixels = if (coding_style.wavelet_transform == 0) blk: {
+    const decode_path = try singleTileU8DecodePath(&decode_state);
+    const pixels = if (decode_path == .streaming_irreversible) blk: {
         var assembler = try reconstruct.IrreversiblePlaneAssembler.init(allocator, &decode_state);
         defer assembler.deinit();
         const Visitor = struct {
@@ -1867,6 +1880,63 @@ const TestPeakAllocator = struct {
         self.live_bytes -= memory.len;
     }
 };
+test "COD 9/7 with COC 5/3 override uses retained mixed reconstruction" {
+    var components = [_]codestream.Component{
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+    };
+    const default_style = codestream.CodingStyle{
+        .progression_order = 0,
+        .num_layers = 1,
+        .multiple_component_transform = true,
+        .decomposition_levels = 1,
+        .code_block_width_exponent = 4,
+        .code_block_height_exponent = 4,
+        .code_block_style = 0,
+        .wavelet_transform = 0,
+        .precincts_present = false,
+    };
+    var component_styles = [_]?codestream.CodingStyle{
+        null,
+        .{
+            .progression_order = 0,
+            .num_layers = 1,
+            .multiple_component_transform = false,
+            .decomposition_levels = 1,
+            .code_block_width_exponent = 4,
+            .code_block_height_exponent = 4,
+            .code_block_style = 0,
+            .wavelet_transform = 1,
+            .precincts_present = false,
+        },
+        null,
+    };
+    var state = codestream.State{
+        .header = .{
+            .width = 16,
+            .height = 16,
+            .components = &components,
+            .tile_width = 16,
+            .tile_height = 16,
+            .uses_multiple_tiles = false,
+        },
+        .coding_style = default_style,
+        .component_coding_styles = &component_styles,
+        .comments = &.{},
+        .tile_parts = &.{},
+    };
+
+    try std.testing.expectEqual(
+        SingleTileU8DecodePath.retained_mixed_or_reversible,
+        try singleTileU8DecodePath(&state),
+    );
+    component_styles[1] = null;
+    try std.testing.expectEqual(
+        SingleTileU8DecodePath.streaming_irreversible,
+        try singleTileU8DecodePath(&state),
+    );
+}
 
 test "OfficeQA JPEG 2000 page decodes natively within bounded memory" {
     const fixture = try readTestFile(
