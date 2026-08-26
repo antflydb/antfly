@@ -566,6 +566,9 @@ pub fn build(b: *std.Build) void {
         const metal_unavailable_step = quant_kernel_metal_unavailable_step orelse unreachable;
         a4b_metal_id_replay_step.dependOn(metal_unavailable_step);
         a4b_metal_common_q4_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_route_select_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_router_projection_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_lm_head_replay_step.dependOn(metal_unavailable_step);
         quant_kernel_metal_runtime_check_step.dependOn(metal_unavailable_step);
         metal_decode_gqa_split_routes_step.dependOn(metal_unavailable_step);
         quant_kernel_metal_v2_conformance_step.dependOn(metal_unavailable_step);

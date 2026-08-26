@@ -2862,10 +2862,18 @@ static bool termite_metal_env_flag_enabled(const char *value) {
         strcasecmp(value, "off") != 0;
 }
 
+static bool termite_metal_env_flag_truthy(const char *value) {
+    return value != NULL &&
+        (strcmp(value, "1") == 0 ||
+         strcasecmp(value, "true") == 0 ||
+         strcasecmp(value, "yes") == 0 ||
+         strcasecmp(value, "on") == 0);
+}
+
 static bool termite_metal_a4b_high_memory_fast_path_enabled(void) {
-    return termite_metal_env_flag_enabled(
+    return termite_metal_env_flag_truthy(
                getenv("TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH")) &&
-        !termite_metal_env_flag_enabled(
+        !termite_metal_env_flag_truthy(
                getenv("TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH"));
 }
 
@@ -2874,8 +2882,8 @@ static bool termite_metal_a4b_high_memory_feature_enabled(
     const char *disable_name
 ) {
     return (termite_metal_a4b_high_memory_fast_path_enabled() ||
-            termite_metal_env_flag_enabled(getenv(enable_name))) &&
-        !termite_metal_env_flag_enabled(getenv(disable_name));
+            termite_metal_env_flag_truthy(getenv(enable_name))) &&
+        !termite_metal_env_flag_truthy(getenv(disable_name));
 }
 
 static const char *termite_metal_q4_0_mmv_variant_name(termite_metal_q4_0_mmv_variant variant) {

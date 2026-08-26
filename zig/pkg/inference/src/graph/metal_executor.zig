@@ -15,6 +15,7 @@
 const build_options = @import("build_options");
 const std = @import("std");
 const platform = @import("antfly_platform");
+const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 const backends = @import("../backends/backends.zig");
 const decoder_bitnet_runtime = @import("../backends/decoder_bitnet_runtime.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
@@ -2054,8 +2055,7 @@ fn pipelinedDecodeFrameEnabled(gpt_config: gpt_mod.Config) bool {
     return pipelinedDecodeFrameEnabledForFlags(
         platform.env.getenvBool("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
         platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
-        platform.env.getenvBool("TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH") and
-            !platform.env.getenvBool("TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH"),
+        a4b_feature_flags.highMemoryFastPathEnabled(),
         qualified_a4b,
         qualified_a4b and gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config),
     );
@@ -2227,6 +2227,11 @@ fn runtimePrepare(
     const started_at = monotonicNowNs();
     defer timing_stats.runtime_prepare_nanos += @intCast(monotonicNowNs() - started_at);
 
+    // Operational rollback must dominate every prepared-runtime branch,
+    // including A4B's mapped-layer warmup, because that warmup dispatches GPU
+    // work of its own.
+    if (!runtime_ctx.decoderRuntimeExecutorEnabled()) return false;
+
     // Qualified A4B currently executes through the graph fallback, not the
     // prepared dense-family decoder. Treat its explicitly requested bounded
     // page warmup as a complete prepare operation before probing that family.
@@ -2234,7 +2239,6 @@ fn runtimePrepare(
         try prewarmA4bMappedLayer0(&runtime_ctx.cb, runtime_ctx.gpt_config);
         return true;
     }
-    if (!runtime_ctx.decoderRuntimeExecutorEnabled()) return false;
     if (gemma4_runtime.supportsPreparedA4bRuntimeConfig(runtime_ctx.gpt_config)) return false;
 
     const configured_layer_count = runtime_ctx.decoderRuntimeConfiguredLayerCount();

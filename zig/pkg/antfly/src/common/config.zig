@@ -236,11 +236,19 @@ pub const Config = struct {
             ttl_ms: u64 = 300_000,
         };
         pub const WarmModelConfig = struct {
+            pub const ResidencyMode = enum {
+                auto,
+                resident,
+                streamed,
+            };
+
             kind: []u8,
             name: []u8,
             backend: ?[]u8 = null,
             format: ?[]u8 = null,
             quantization: ?[]u8 = null,
+            residency_mode: ?ResidencyMode = null,
+            memory_budget_mb: ?u32 = null,
 
             fn deinit(self: *WarmModelConfig, alloc: std.mem.Allocator) void {
                 alloc.free(self.kind);
@@ -2053,6 +2061,12 @@ fn parseInferencePreloadModels(
             .backend = try optionalStringFieldDup(alloc, model_object, "backend"),
             .format = try optionalStringFieldDup(alloc, model_object, "format"),
             .quantization = try optionalStringFieldDup(alloc, model_object, "quantization"),
+            .residency_mode = try optionalEnumField(
+                Config.InferenceConfig.WarmModelConfig.ResidencyMode,
+                model_object,
+                "residency_mode",
+            ),
+            .memory_budget_mb = try optionalU32Field(model_object, "memory_budget_mb"),
         };
         filled = i + 1;
     }
@@ -2393,7 +2407,7 @@ test "common config parses inference preload" {
         \\  "inference": {
         \\    "api_url": "http://127.0.0.1:8090",
         \\    "preload": [
-        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "format": "gguf", "quantization": "q8" },
+        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "format": "gguf", "quantization": "q8", "residency_mode": "streamed", "memory_budget_mb": 4096 },
         \\      { "kind": "reranker", "name": "BAAI/bge-reranker", "backend": "native", "format": "onnx" }
         \\    ]
         \\  }
@@ -2407,6 +2421,11 @@ test "common config parses inference preload" {
     try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
     try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
     try std.testing.expectEqualStrings("q8", cfg.inference.preload[0].quantization.?);
+    try std.testing.expectEqual(
+        Config.InferenceConfig.WarmModelConfig.ResidencyMode.streamed,
+        cfg.inference.preload[0].residency_mode.?,
+    );
+    try std.testing.expectEqual(@as(?u32, 4096), cfg.inference.preload[0].memory_budget_mb);
     try std.testing.expectEqualStrings("reranker", cfg.inference.preload[1].kind);
     try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
     try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);

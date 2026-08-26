@@ -1789,6 +1789,12 @@ pub fn runFromIterator(
                 .backend = inference_bridge.OptionalString.init(model.backend),
                 .format = inference_bridge.OptionalString.init(model.format),
                 .quantization = inference_bridge.OptionalString.init(model.quantization),
+                .residency_mode = switch (model.residency_mode orelse .auto) {
+                    .auto => .auto,
+                    .resident => .resident,
+                    .streamed => .streamed,
+                },
+                .memory_budget_mb = model.memory_budget_mb orelse 0,
             };
         }
         break :blk out;

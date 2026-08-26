@@ -199,6 +199,16 @@ pub const SessionManager = struct {
                 first_err = first_err orelse error.A4bRequiresMetal;
                 continue;
             }
+            // The imported-ONNX graph runtime has no A4B residency contract.
+            // Reject the artifact at the route boundary instead of silently
+            // dropping the caller's memory envelope. Metal uses model_path
+            // directly, so this check does not depend on manifest fallback.
+            if (self.a4b_inference_request != null and
+                backend == .metal and
+                self.shouldUseImportedOnnxGraphRuntime(model_path))
+            {
+                return error.A4bUnsupportedArtifact;
+            }
             if (!backend.available()) continue;
             if (!backend.supportsDirectSessionLoad()) {
                 std.log.err(
@@ -468,6 +478,13 @@ test "explicit graph runtime is independent from onnx runtime backend availabili
     try std.testing.expectEqual(build_options.enable_onnx, manager.shouldUseExternalOnnxRuntime("model.onnx"));
     try std.testing.expect(!manager.shouldUseImportedOnnxGraphRuntime("model.gguf"));
     try std.testing.expect(!manager.shouldUseExternalOnnxRuntime("model.gguf"));
+}
+
+test "A4B request rejects imported ONNX Metal artifact before session creation" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.preferred_backends = &.{.metal};
+    manager.a4b_inference_request = .{ .residency_mode = .streamed, .memory_budget_mb = 2048 };
+    try std.testing.expectError(error.A4bUnsupportedArtifact, manager.loadModel("model.onnx"));
 }
 
 test "session manager defaults runtime kernel JIT off" {

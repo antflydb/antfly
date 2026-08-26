@@ -210,6 +210,12 @@ fn convertWarmModels(
                         return error.InvalidArguments,
                     .format = model.format.slice(),
                     .quantization = model.quantization.slice(),
+                    .residency_mode = switch (model.residency_mode) {
+                        .auto => .auto,
+                        .resident => .resident,
+                        .streamed => .streamed,
+                    },
+                    .memory_budget_mb = model.memory_budget_mb,
                 };
             }
             return .{ .items = out };
@@ -217,6 +223,25 @@ fn convertWarmModels(
     }
 
     return .{ .items = &.{} };
+}
+
+test "standalone preload bridge preserves A4B residency controls" {
+    const wire_model = inference_bridge.WarmModel{
+        .kind = inference_bridge.String.init("generator"),
+        .name = inference_bridge.String.init("gemma4-a4b"),
+        .backend = inference_bridge.OptionalString.init("metal"),
+        .residency_mode = .streamed,
+        .memory_budget_mb = 4096,
+    };
+    var context: inference_bridge.CreateContext = undefined;
+    context.preload_ptr = @ptrCast(&wire_model);
+    context.preload_len = 1;
+
+    var resolved = try convertWarmModels(std.testing.allocator, &context);
+    defer resolved.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), resolved.items.len);
+    try std.testing.expectEqual(inference.ops.A4bResidencyMode.streamed, resolved.items[0].residency_mode.?);
+    try std.testing.expectEqual(@as(?u32, 4096), resolved.items[0].memory_budget_mb);
 }
 
 pub fn parseKeepAliveMs(raw: []const u8) !u64 {

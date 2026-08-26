@@ -40,6 +40,7 @@ const kernel_jit = @import("../graph/kernel_jit.zig");
 const graph_quant_matmul = @import("../graph/quant_matmul.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const linalg = @import("inference_linalg");
+const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 
 const WeightStore = gpu_hosted_store_mod.WeightStore;
 const NativeWeightStore = native_compute_mod.WeightStore;
@@ -356,16 +357,14 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
 }
 
 fn a4bHighMemoryFastPathEnabled() bool {
-    return getenvBool("TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH") and
-        !getenvBool("TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH");
+    return a4b_feature_flags.highMemoryFastPathEnabled();
 }
 
 fn a4bHighMemoryFeatureEnabled(
     comptime enable_name: [*:0]const u8,
     comptime disable_name: [*:0]const u8,
 ) bool {
-    return (a4bHighMemoryFastPathEnabled() or getenvBool(enable_name)) and
-        !getenvBool(disable_name);
+    return a4b_feature_flags.highMemoryFeatureEnabled(enable_name, disable_name);
 }
 
 fn a4bExplicitCandidateEnabled(

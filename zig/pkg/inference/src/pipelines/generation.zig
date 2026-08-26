@@ -61,12 +61,23 @@ fn setWorkloadProfileRegime(cb: *const ComputeBackend, regime: ops.WorkloadRegim
 fn ordinaryMetalGemmaDraftNeedsContiguousState(
     backend: ops.BackendKind,
     config: gpt_mod.Config,
-    has_kv_storage: bool,
+    has_paged_kv_state: bool,
 ) bool {
     return backend == .metal and
         config.family == .gemma and
         !config.gemma4_mtp_assistant and
-        !has_kv_storage;
+        !has_paged_kv_state;
+}
+
+fn supportsSpeculativeTargetVerification(
+    backend: ops.BackendKind,
+    target_config: gpt_mod.Config,
+) bool {
+    // Qualified A4B Metal decode is qLen=1-only. Keep speculative decoding out
+    // of the request before either target or draft state is mutated; the
+    // reserve-time check remains as a fail-closed backstop.
+    return backend != .metal or
+        !gemma4_runtime.isQualifiedA4bArchitecture(target_config);
 }
 
 pub var gemma4_mtp_debug_override: bool = false;
@@ -929,12 +940,22 @@ fn reasoningResponseTokenSlice(
         reasoning_end = boundary;
     }
 
-    // A model may explicitly reopen a private channel before transitioning to
-    // final. Keep only that channel's content, not its name/header tokens.
+    // A model may explicitly open or reopen a private channel before
+    // transitioning to final. Keep only that channel's content, not its
+    // name/header tokens. A bare close or turn end is the first public
+    // boundary even if an explicit final header appears later: otherwise the
+    // marker and tentative public text would be decoded as reasoning.
     var reasoning_start: usize = 0;
     var idx: usize = 0;
-    while (idx < reasoning_end) : (idx += 1) {
-        if (token_ids[idx] != channel_start) continue;
+    while (idx < reasoning_end) {
+        if (token_ids[idx] == marker or token_ids[idx] == turn_end) {
+            reasoning_end = idx;
+            break;
+        }
+        if (token_ids[idx] != channel_start) {
+            idx += 1;
+            continue;
+        }
         var close = idx + 1;
         while (close < reasoning_end and token_ids[close] != marker) : (close += 1) {}
         if (close >= reasoning_end) {
@@ -942,7 +963,7 @@ fn reasoningResponseTokenSlice(
             break;
         }
         reasoning_start = close + 1;
-        idx = close;
+        idx = close + 1;
     }
     while (reasoning_end > reasoning_start and
         (token_ids[reasoning_end - 1] == marker or
@@ -3288,10 +3309,13 @@ pub const NativeGenerationPipeline = struct {
             draft_is_gemma4_mtp and
             self.cb.kind() == .metal and
             !gemma4MtpMetalAutoEnabled();
+        const target_speculative_verification_unavailable =
+            !supportsSpeculativeTargetVerification(self.cb.kind(), self.gpt_config);
         const use_speculative = speculation_policy != .off and
             !mtp_auto_uncalibrated and
             !mtp_auto_too_short and
             !mtp_metal_auto_disabled and
+            !target_speculative_verification_unavailable and
             loaded_draft_requested and
             !disable_unshared_gemma4_mtp;
         if ((has_images or has_audio) and use_speculative) return error.MultimodalSpeculativeDecodingNotSupported;
@@ -3676,6 +3700,8 @@ pub const NativeGenerationPipeline = struct {
                 speculative_stats.mtp_disabled_reason = "mtp_auto_min_tokens";
             } else if (mtp_metal_auto_disabled) {
                 speculative_stats.mtp_disabled_reason = "metal_mtp_auto_disabled";
+            } else if (target_speculative_verification_unavailable) {
+                speculative_stats.mtp_disabled_reason = "a4b_metal_speculative_verify_unqualified";
             }
         }
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
@@ -3805,7 +3831,7 @@ pub const NativeGenerationPipeline = struct {
             const use_contiguous_draft_state = ordinaryMetalGemmaDraftNeedsContiguousState(
                 draft_cb.kind(),
                 draft_gpt_config,
-                if (attached_draft_state) |state| state.kv_storage != null else false,
+                if (attached_draft_state) |state| state.isPaged() else false,
             );
             const draft_ds = if (use_contiguous_draft_state)
                 &draft_fallback_state
@@ -10891,6 +10917,20 @@ test "reasoning channel projection separates private thought from public content
         &.{ 7, 8 },
         reasoningResponseTokenSlice(&.{ 7, 8, 102, 103, 104, 101, 20, 106 }, true, false, 101, &header, 102, 106),
     );
+    // A late explicit final header must not retroactively classify the prior
+    // bare-close marker or tentative public text as private reasoning.
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        reasoningResponseTokenSlice(&.{ 7, 8, 101, 20, 102, 103, 104, 101, 21, 106 }, true, false, 101, &header, 102, 106),
+    );
+    // The same malformed transition remains bounded when reasoning begins
+    // with an explicit private-channel header.
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        reasoningResponseTokenSlice(&.{ 102, 103, 105, 101, 7, 8, 101, 20, 102, 103, 104, 101, 21, 106 }, true, false, 101, &header, 102, 106),
+    );
     // An explicitly emitted private header is protocol, not reasoning text.
     try std.testing.expectEqualSlices(
         i64,
@@ -12441,6 +12481,25 @@ test "speculative draft Metal Gemma uses contiguous state until KV storage is at
     try std.testing.expect(!ordinaryMetalGemmaDraftNeedsContiguousState(.metal, config, false));
     config = .{ .family = .llama };
     try std.testing.expect(!ordinaryMetalGemmaDraftNeedsContiguousState(.metal, config, false));
+}
+
+test "qualified A4B Metal target disables speculative verification upfront" {
+    const a4b_config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+    try std.testing.expect(!supportsSpeculativeTargetVerification(.metal, a4b_config));
+    try std.testing.expect(supportsSpeculativeTargetVerification(.cuda, a4b_config));
+    try std.testing.expect(supportsSpeculativeTargetVerification(.metal, .{
+        .family = .gemma,
+        .hidden_size = 2048,
+        .num_hidden_layers = 26,
+    }));
 }
 
 test "contiguous speculative draft state keeps full-recompute query shape in sync" {

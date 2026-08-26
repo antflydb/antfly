@@ -36,6 +36,7 @@ const turboquant = @import("../runtime/kv/turboquant.zig");
 const io_compat = @import("../io/compat.zig");
 const kernel_jit_profile_output = @import("../kernel_jit_profile_output.zig");
 const workload_profile_policy = @import("../workload_profile_policy.zig");
+const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 
 // Qualification evidence is valid only for the exact generated candidate,
 // handwritten baseline, and backend-specific qualification implementation.
@@ -1098,22 +1099,14 @@ fn getenvFlagEnabled(comptime name: [*:0]const u8) bool {
 }
 
 fn a4bHighMemoryFastPathEnabled() bool {
-    const S = struct {
-        var cached: ?bool = null;
-    };
-    if (S.cached) |cached| return cached;
-    const enabled = getenvBool("TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH") and
-        !getenvBool("TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH");
-    S.cached = enabled;
-    return enabled;
+    return a4b_feature_flags.highMemoryFastPathEnabled();
 }
 
 fn a4bHighMemoryFeatureEnabled(
     comptime enable_name: [*:0]const u8,
     comptime disable_name: [*:0]const u8,
 ) bool {
-    return (a4bHighMemoryFastPathEnabled() or getenvFlagEnabled(enable_name)) and
-        !getenvFlagEnabled(disable_name);
+    return a4b_feature_flags.highMemoryFeatureEnabled(enable_name, disable_name);
 }
 
 fn q4_0LinearRmsAddF16ProjectEnabled() bool {

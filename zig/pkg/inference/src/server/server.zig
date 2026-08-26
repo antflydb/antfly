@@ -105,6 +105,42 @@ fn generationPipelineSession(pipeline: anytype) ?backends_mod.Session {
     return null;
 }
 
+fn generationPipelineUsesReasoningChannels(pipeline: anytype) bool {
+    const Pipeline = switch (@typeInfo(@TypeOf(pipeline))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(pipeline),
+    };
+    if (comptime @hasField(Pipeline, "gpt_config")) {
+        return requiresNativeChannelProjection(pipeline.gpt_config);
+    }
+    return false;
+}
+
+fn shouldDeferStreamContentForReasoning(
+    pipeline: anytype,
+    config: generation.GenerationConfig,
+) bool {
+    return generationPipelineUsesReasoningChannels(pipeline) and
+        config.enable_thinking != false and
+        // Grammar-constrained Gemma4 generation rewrites the prompt to open
+        // the public final channel directly, so no private reasoning can
+        // precede its incrementally streamed content.
+        config.grammar == null;
+}
+
+test "channel streaming defers content only when reasoning can precede it" {
+    const Probe = struct { gpt_config: gpt_model_mod.Config };
+    const pipeline = Probe{ .gpt_config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+    } };
+    try std.testing.expect(shouldDeferStreamContentForReasoning(&pipeline, .{}));
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&pipeline, .{ .enable_thinking = false }));
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&pipeline, .{ .grammar = "json" }));
+    const ordinary = Probe{ .gpt_config = .{ .family = .llama } };
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&ordinary, .{}));
+}
+
 fn serverA4bTelemetryEnabled() bool {
     return platform.env.getenvBool("TERMITE_SERVER_A4B_TELEMETRY");
 }
@@ -1081,11 +1117,13 @@ pub const WarmModel = struct {
     memory_budget_mb: ?u32 = null,
 
     pub fn a4bRequest(self: WarmModel) ?ops.A4bInferenceRequest {
-        if (self.residency_mode == null and self.memory_budget_mb == null) return null;
-        return .{
-            .residency_mode = self.residency_mode orelse .auto,
-            .memory_budget_mb = self.memory_budget_mb orelse 0,
-        };
+        const residency_mode = self.residency_mode orelse .auto;
+        const memory_budget_mb = self.memory_budget_mb orelse 0;
+        // The documented wire defaults are policy-neutral. Treating explicit
+        // `auto`/`0` as an A4B request makes an otherwise ordinary generator
+        // fail geometry qualification merely because defaults were serialized.
+        if (residency_mode == .auto and memory_budget_mb == 0) return null;
+        return .{ .residency_mode = residency_mode, .memory_budget_mb = memory_budget_mb };
     }
 };
 
@@ -1098,6 +1136,11 @@ fn validatedWarmModelA4bRequest(model: WarmModel) !?ops.A4bInferenceRequest {
 }
 
 test "warm model A4B controls are Metal generator only" {
+    try std.testing.expect((WarmModel{
+        .name = "ordinary-generator",
+        .residency_mode = .auto,
+        .memory_budget_mb = 0,
+    }).a4bRequest() == null);
     const request = (try validatedWarmModelA4bRequest(.{
         .name = "gemma4-a4b",
         .backend = .metal,
@@ -8703,6 +8746,7 @@ pub const Node = struct {
             allocator: std.mem.Allocator,
             parser: ?*tool_parser_mod.Parser,
             request_context: *const httpx.Context,
+            defer_content: bool,
             errored: bool = false,
 
             fn shouldContinue(raw_ctx: *anyopaque) bool {
@@ -8712,6 +8756,11 @@ pub const Node = struct {
 
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
+                // Reasoning is projected only once generation completes. For
+                // channel-aware thinking requests, retain protocol order by
+                // emitting the buffered reasoning before the completed public
+                // content below.
+                if (stream.defer_content) return true;
                 if (stream.parser) |parser| {
                     const update = parser.feed(token_text) catch {
                         stream.errored = true;
@@ -8756,6 +8805,7 @@ pub const Node = struct {
             .allocator = ctx.allocator,
             .parser = tool_parser,
             .request_context = ctx,
+            .defer_content = shouldDeferStreamContentForReasoning(pipeline, config),
         };
 
         if (comptime @hasField(@TypeOf(pipeline.*), "continue_ctx") and
@@ -8833,33 +8883,51 @@ pub const Node = struct {
         );
         recordSpeculationOutcome(&self.metrics, speculative);
 
-        if (result.reasoning_text) |reasoning| {
-            if (reasoning.len > 0) emitReasoningDelta(
-                &writer,
+        if (stream_ctx.defer_content) {
+            writeStreamCompletion(
                 ctx.allocator,
+                &writer,
                 stream_id,
                 stream_created,
                 model_name,
-                reasoning,
+                result.text,
+                result.reasoning_text,
+                result.finish_reason,
+                tool_parser,
+                speculative,
             ) catch |err| {
                 writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
-        }
-
-        if (tool_parser != null) {
-            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
-                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
-                writer.close() catch {};
-                return ctx.response.build();
-            };
         } else {
-            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
-                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
-                writer.close() catch {};
-                return ctx.response.build();
-            };
+            if (result.reasoning_text) |reasoning| {
+                if (reasoning.len > 0) emitReasoningDelta(
+                    &writer,
+                    ctx.allocator,
+                    stream_id,
+                    stream_created,
+                    model_name,
+                    reasoning,
+                ) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            }
+            if (tool_parser != null) {
+                flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            } else {
+                emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            }
         }
 
         emitTerminalUsageOrDone(

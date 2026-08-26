@@ -5584,7 +5584,7 @@ pub const ModelManager = struct {
             model_dir,
             self.session_manager.preferred_backends,
             true,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request),
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
         );
     }
 
@@ -5598,7 +5598,7 @@ pub const ModelManager = struct {
             model_dir,
             preferred_backends,
             cache_default_alias,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request),
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
         );
     }
 
@@ -5685,9 +5685,11 @@ pub const ModelManager = struct {
         }
         if (policy.accept_default_alias) {
             if (self.loaded.get(model_dir)) |model|
-                if (loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
+                if (!policy.require_default_alias_backend_match or
+                    loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
             if (self.loaded_aliases.get(model_dir)) |model|
-                if (loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
+                if (!policy.require_default_alias_backend_match or
+                    loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
         }
         return null;
     }
@@ -5702,12 +5704,13 @@ pub const ModelManager = struct {
         const prefix = if (policy.a4b_request) |request|
             try std.fmt.allocPrint(
                 self.allocator,
-                "{d}:{s}:{d}:{d}:a4b={s}:{d}:",
+                "{d}:{s}:{d}:{d}:{d}:a4b={s}:{d}:",
                 .{
                     model_dir.len,
                     model_dir,
                     @intFromBool(cache_default_alias),
                     @intFromBool(policy.accept_default_alias),
+                    @intFromBool(policy.require_default_alias_backend_match),
                     @tagName(request.residency_mode),
                     request.memory_budget_mb,
                 },
@@ -5715,12 +5718,13 @@ pub const ModelManager = struct {
         else
             try std.fmt.allocPrint(
                 self.allocator,
-                "{d}:{s}:{d}:{d}:a4b=none:",
+                "{d}:{s}:{d}:{d}:{d}:a4b=none:",
                 .{
                     model_dir.len,
                     model_dir,
                     @intFromBool(cache_default_alias),
                     @intFromBool(policy.accept_default_alias),
+                    @intFromBool(policy.require_default_alias_backend_match),
                 },
             );
         defer self.allocator.free(prefix);
@@ -6255,10 +6259,15 @@ pub const ModelManager = struct {
 const ModelLoadCachePolicy = struct {
     a4b_request: ?backend_contracts.A4bInferenceRequest = null,
     accept_default_alias: bool = true,
+    /// Policy-free acquisition consumes the model's explicitly published
+    /// default alias regardless of current node preference. A caller that
+    /// supplied an explicit backend order still requires an exact match.
+    require_default_alias_backend_match: bool = true,
 };
 
 fn inheritedA4bCachePolicy(
     request: ?backend_contracts.A4bInferenceRequest,
+    require_default_alias_backend_match: bool,
 ) ModelLoadCachePolicy {
     return .{
         .a4b_request = request,
@@ -6267,6 +6276,7 @@ fn inheritedA4bCachePolicy(
         // qualified preload even when their call site does not publish new
         // aliases. Explicit A4B policies still require their exact variant key.
         .accept_default_alias = request == null,
+        .require_default_alias_backend_match = require_default_alias_backend_match,
     };
 }
 
@@ -6331,10 +6341,10 @@ test "inherited A4B policy isolates explicit loads but reuses policy-free aliase
         .residency_mode = .streamed,
         .memory_budget_mb = 4096,
     };
-    const isolated = inheritedA4bCachePolicy(request);
+    const isolated = inheritedA4bCachePolicy(request, false);
     try std.testing.expectEqual(request, isolated.a4b_request.?);
     try std.testing.expect(!isolated.accept_default_alias);
-    try std.testing.expect(inheritedA4bCachePolicy(null).accept_default_alias);
+    try std.testing.expect(inheritedA4bCachePolicy(null, false).accept_default_alias);
 }
 
 test "explicit backend lookup reuses only a matching default alias" {
@@ -6392,18 +6402,25 @@ test "explicit backend lookup reuses only a matching default alias" {
         "model",
         &.{.metal},
         false,
-        inheritedA4bCachePolicy(null),
+        inheritedA4bCachePolicy(null, true),
     );
     const mismatching = try manager.lookupLoadedModelLocked(
         "model",
         &.{.native},
         false,
-        inheritedA4bCachePolicy(null),
+        inheritedA4bCachePolicy(null, true),
+    );
+    const policy_free = try manager.lookupLoadedModelLocked(
+        "model",
+        &.{.native},
+        true,
+        inheritedA4bCachePolicy(null, false),
     );
     manager.unlockLoadedModels();
 
     try std.testing.expect(matching == &model);
     try std.testing.expect(mismatching == null);
+    try std.testing.expect(policy_free == &model);
 }
 
 test "explicit A4B loads ignore unqualified model aliases" {

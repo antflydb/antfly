@@ -322,6 +322,14 @@ fn expectedDenseCacheBytes(
     return entry.tensor_ref.byte_len;
 }
 
+fn rawPackedMmapBytesAreBorrowed(
+    has_packed_expert_view: bool,
+    raw_mmap_backed: bool,
+    raw_owned: bool,
+) bool {
+    return has_packed_expert_view and raw_mmap_backed and !raw_owned;
+}
+
 pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEntry) !void {
     if (entry.expert_coord) |coord| {
         if (data.residency) |*residency| {
@@ -336,15 +344,17 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
         if (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) |storage_value| {
             var loaded_storage = storage_value;
             errdefer loaded_storage.deinit();
-            // The qualified A4B route borrows packed tensors from the model
-            // mmap. Charge its bounded physical working set through the
-            // session admission contract, not the full virtual file span for
-            // every projection alias.
-            const a4b_mapped_packed = data.a4b_inference != null and
-                loaded_storage.packed_expert != null and
-                loaded_storage.raw_mmap_backed and
-                !loaded_storage.raw_owned;
-            entry.loaded_bytes = if (a4b_mapped_packed)
+            // Packed expert entries borrow the same model mmap span. Charge
+            // owned preparation buffers here, not the full virtual tensor once
+            // per expert/projection alias. This is a storage property, not an
+            // A4B policy property; model/session admission accounts for the
+            // mmap-backed working set separately.
+            const mmap_borrowed_packed = rawPackedMmapBytesAreBorrowed(
+                loaded_storage.packed_expert != null,
+                loaded_storage.raw_mmap_backed,
+                loaded_storage.raw_owned,
+            );
+            entry.loaded_bytes = if (mmap_borrowed_packed)
                 loaded_storage.prepared.ownedBytes()
             else
                 loaded_storage.raw_bytes.len + loaded_storage.prepared.ownedBytes();
@@ -425,6 +435,13 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
             cache_reserved_bytes = entry.loaded_bytes;
         }
     }
+}
+
+test "packed mmap admission is keyed to storage ownership rather than A4B policy" {
+    try std.testing.expect(rawPackedMmapBytesAreBorrowed(true, true, false));
+    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(false, true, false));
+    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(true, false, false));
+    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(true, true, true));
 }
 
 test "jina adapter names map base weight to PEFT LoRA tensors" {
