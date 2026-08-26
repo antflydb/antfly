@@ -5231,6 +5231,9 @@ pub const ProvisionedTableWriteSource = struct {
         quarantine_retry_scheduled: bool = false,
         retry_at_ms: u64 = 0,
         index_repair_pending: bool = false,
+        // Durable repair debt exists, but operator-controlled automation is
+        // paused. This is parked status debt, never runnable scheduler work.
+        index_repair_paused: bool = false,
         index_repair_attempted: bool = false,
         index_repair_repaired: bool = false,
         index_repair_degraded: bool = false,
@@ -6716,7 +6719,7 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
-        if (result.terminal_degraded) return;
+        if (result.terminal_degraded or result.index_repair_paused) return;
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = self.active_table_activities.items[index];
         if (entry.repair_handoff_status_pending == 0 or !entry.repair_handoff_clear_observed) return;
@@ -9824,7 +9827,7 @@ pub const ProvisionedTableWriteSource = struct {
                     metadata.index_repair_options,
                 );
                 mergeLiveIndexRepairResult(&result, repair_result);
-                if (!result.terminal_degraded) {
+                if (!result.terminal_degraded and !result.index_repair_paused) {
                     result.busy = true;
                     result.index_repair_pending = true;
                 }
@@ -9943,7 +9946,7 @@ pub const ProvisionedTableWriteSource = struct {
         // policy. Once catch-up has handed that debt off, retaining a startup
         // backoff would make two schedulers compete for the same DB and can
         // falsely quarantine healthy, progressing repair work.
-        if (!result.had_debt or result.cleared_debt or result.made_progress or result.index_repair_pending) {
+        if (!result.had_debt or result.cleared_debt or result.made_progress or result.index_repair_pending or result.index_repair_paused) {
             _ = self.startup_catch_up_backoffs.remove(group_id);
             return;
         }
@@ -22880,6 +22883,7 @@ fn mergeLiveIndexRepairResult(
     result.made_progress = result.made_progress or repair.made_progress;
     result.busy = repair.busy;
     result.index_repair_pending = repair.index_repair_pending;
+    result.index_repair_paused = repair.index_repair_paused;
     result.index_repair_attempted = repair.index_repair_attempted;
     result.index_repair_repaired = repair.index_repair_repaired;
     result.index_repair_degraded = repair.index_repair_degraded;
@@ -23258,6 +23262,7 @@ fn catchUpManagedDb(
         return .{
             .had_debt = true,
             .made_progress = made_progress,
+            .index_repair_paused = true,
         };
     }
     if (repair_summary.terminal != 0) {
@@ -34235,6 +34240,12 @@ test "repair handoff status settles after authoritative cached publication" {
     var terminal = ProvisionedTableWriteSource.StartupCatchUpResult{ .terminal_degraded = true };
     source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &terminal);
     try std.testing.expect(!terminal.index_repair_pending);
+    var paused = ProvisionedTableWriteSource.StartupCatchUpResult{
+        .had_debt = true,
+        .index_repair_paused = true,
+    };
+    source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &paused);
+    try std.testing.expect(!paused.index_repair_pending);
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
     try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, &db);
@@ -39219,6 +39230,15 @@ test "managed startup catch-up quarantines repeated zero progress with bounded b
     };
     source.updateStartupCatchUpBackoff(7004, 45_001, epoch, &delegated);
     try std.testing.expectEqual(@as(?u64, null), source.startupCatchUpRetryAt(7004, 45_001));
+
+    var paused_pending = ProvisionedTableWriteSource.StartupCatchUpResult{ .had_debt = true };
+    source.updateStartupCatchUpBackoff(7005, 46_000, epoch, &paused_pending);
+    var paused = ProvisionedTableWriteSource.StartupCatchUpResult{
+        .had_debt = true,
+        .index_repair_paused = true,
+    };
+    source.updateStartupCatchUpBackoff(7005, 46_001, epoch, &paused);
+    try std.testing.expectEqual(@as(?u64, null), source.startupCatchUpRetryAt(7005, 46_001));
 
     var terminal_attempt: usize = 0;
     while (terminal_attempt < startup_catch_up_no_progress_threshold) : (terminal_attempt += 1) {

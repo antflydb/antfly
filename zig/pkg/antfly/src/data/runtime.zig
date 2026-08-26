@@ -4658,13 +4658,14 @@ pub const DataServer = struct {
         return stats.earliest_retry_at_ms;
     }
 
-    fn accountDelegatedIndexRepair(
+    fn accountParkedIndexRepair(
         stats: *ProvisionedStartupCatchUpStats,
         result: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult,
     ) bool {
-        if (!result.index_repair_pending) return false;
-        // This is observed startup debt, but it is parked on the durable index
-        // repair queue and must not keep the startup scheduler runnable.
+        if (!result.index_repair_pending and !result.index_repair_paused) return false;
+        // Runnable repair is parked on the durable queue; operator-paused
+        // repair is parked solely in its durable intent. Neither should keep
+        // startup catch-up runnable or feed its zero-progress quarantine.
         stats.groups_with_debt += 1;
         return true;
     }
@@ -12493,13 +12494,11 @@ pub const DataServer = struct {
                         antfly.metadata.table_manager.rangeDocIdentityShardId(range),
                         antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
                     );
-                    // The durable repair queue now owns progress, retries, and
-                    // crash recovery for this debt. Do not keep startup
-                    // catch-up dirty or feed its zero-progress quarantine;
-                    // doing so competes for the same group operation and can
-                    // starve the bounded owner-side repair pass.
-                    if (accountDelegatedIndexRepair(&stats, result)) continue;
                 }
+                // Runnable repair is delegated to its durable queue, while an
+                // operator-paused intent is deliberately parked without one.
+                // Neither belongs in startup catch-up's retry/quarantine loop.
+                if (accountParkedIndexRepair(&stats, result)) continue;
                 if (result.busy) {
                     stats.busy_groups += 1;
                     if (self.runtime_status_dirty.load(.acquire) or self.runtime_status_refresh_active.load(.acquire)) {
@@ -22758,11 +22757,16 @@ test "data runtime startup catch-up parks scheduler when only quarantined debt r
     try std.testing.expectEqual(@as(u64, 0), stale.not_before_ms);
 
     var delegated_stats = DataServer.ProvisionedStartupCatchUpStats{};
-    try std.testing.expect(DataServer.accountDelegatedIndexRepair(&delegated_stats, .{
+    try std.testing.expect(DataServer.accountParkedIndexRepair(&delegated_stats, .{
         .had_debt = true,
         .index_repair_pending = true,
     }));
     try std.testing.expectEqual(@as(u64, 1), delegated_stats.groups_with_debt);
+    try std.testing.expect(DataServer.accountParkedIndexRepair(&delegated_stats, .{
+        .had_debt = true,
+        .index_repair_paused = true,
+    }));
+    try std.testing.expectEqual(@as(u64, 2), delegated_stats.groups_with_debt);
     const delegated = DataServer.startupCatchUpCompletion(delegated_stats, true, 7, 7);
     try std.testing.expect(!delegated.dirty);
     try std.testing.expectEqual(@as(u64, 0), delegated.not_before_ms);
