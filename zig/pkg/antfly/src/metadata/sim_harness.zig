@@ -66,8 +66,10 @@ const casbin = @import("antfly_casbin");
 
 const LeanSimAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 // Public API simulations can open DBs and hosted indexes from the listener
-// request thread; keep enough stack for that Linux CI path.
-const lean_sim_thread_stack_size = 4 * 1024 * 1024;
+// request thread. Debug x86_64 index construction exceeds the partitioned
+// runtime's 4 MiB floor, so match the production HTTP request stack instead
+// of intermittently entering the guard page while opening query-only DBs.
+const lean_sim_thread_stack_size = 8 * 1024 * 1024;
 fn leanSimHttpAllocator() std.mem.Allocator {
     return std.heap.smp_allocator;
 }
