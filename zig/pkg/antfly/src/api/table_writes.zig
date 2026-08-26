@@ -6834,6 +6834,25 @@ pub const ProvisionedTableWriteSource = struct {
         entry.repair_handoff_generation = self.nextRepairHandoffGenerationLocked();
     }
 
+    fn invalidateRepairHandoffOwnerAuditBestEffort(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+    ) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return;
+        const entry = &self.active_table_activities.items[index];
+        if (entry.repair_handoff_status_pending == 0 or !entry.repair_handoff_clear_observed) return;
+        // Every admitted aggregate pass must earn publication authority from
+        // a fresh durable audit. In particular, a prior fenced publication
+        // may have left a clear-eligible handoff behind while this pass drops
+        // its operation lease for a corpus-sized repair scan.
+        entry.repair_handoff_clear_observed = false;
+        entry.repair_handoff_generation = self.nextRepairHandoffGenerationLocked();
+    }
+
     fn markRepairHandoffPendingBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
@@ -9675,6 +9694,11 @@ pub const ProvisionedTableWriteSource = struct {
             };
             if (group_operation_active) self.endGroupOperation(table_name, group_id);
         }
+        // Revoke any publication retry inherited from an older audit while
+        // mutation admission is excluded. Intermediate progress snapshots
+        // remain useful, but only this pass's final durable re-audit may
+        // settle the structural repair handoff.
+        self.invalidateRepairHandoffOwnerAuditBestEffort(table_name, group_id);
         self.startup_catch_up_active.store(true, .monotonic);
         defer self.startup_catch_up_active.store(false, .monotonic);
 
@@ -9971,10 +9995,61 @@ pub const ProvisionedTableWriteSource = struct {
                 mergeLiveIndexRepairResult(&result, repair_result);
             }
         }
+        // The live repair quantum deliberately releases mutation ownership
+        // while scanning its candidate corpus. Reacquire exact group
+        // ownership before trusting durable repair state, and retain it until
+        // that state has been published and its handoff settled. This orders
+        // the audit by durable commits rather than by visibility-hook callback
+        // arrival, since a concurrent operator repair cannot enter this
+        // boundary.
+        if (!group_operation_active) {
+            if (!self.tryBeginReadCompatibleGroupOperation(table_name, group_id)) {
+                result.had_debt = true;
+                result.busy = true;
+                result.index_repair_pending = true;
+                self.retainRepairRouteForPendingHandoffBestEffort(table_name, group_id, &result);
+                self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &result);
+                preserve_startup_cache = shouldPreserveStartupWriteCache(result);
+                return result;
+            }
+            group_operation_active = true;
+        }
+
+        const final_repair_summary = try db.indexRepairIntentSummary(alloc);
+        const final_index_load_failure = try managedDbHasIndexLoadFailure(alloc, db);
+        const final_restore_repair_needed = try db.restoreRuntimeRepairNeeded();
+        const final_broad_debt = metadata.advance_index_repairs and try managedDbHasBroadCatchUpDebt(alloc, db);
+        result.index_repair_paused = false;
+        result.terminal_degraded = false;
+        if (final_restore_repair_needed and final_index_load_failure) {
+            // Restore cannot prove projection availability while any required
+            // generation is unavailable. Preserve the original fail-closed
+            // precedence even if that generation also has a runnable intent.
+            result.had_debt = true;
+            result.terminal_degraded = true;
+            result.index_repair_pending = !try publishTerminalStartupRuntimeStatusSnapshot(self, alloc, table_name, group_id, db);
+            startup_status_active = false;
+        } else if (final_repair_summary.runnable != 0) {
+            result.had_debt = true;
+            result.index_repair_pending = true;
+        } else if (final_repair_summary.terminal != 0 or final_index_load_failure) {
+            result.had_debt = true;
+            result.terminal_degraded = true;
+            result.index_repair_pending = !try publishTerminalStartupRuntimeStatusSnapshot(self, alloc, table_name, group_id, db);
+            startup_status_active = false;
+        } else if (final_broad_debt) {
+            result.had_debt = true;
+            result.index_repair_pending = true;
+        } else {
+            result.index_repair_pending = false;
+            result.index_repair_paused = final_repair_summary.paused != 0;
+            if (result.index_repair_paused) result.had_debt = true;
+            self.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
+        }
         self.retireReadersAfterIndexRepairCompletion(table_name, result);
         if (result.terminal_degraded) {
-            // catchUpManagedDb publishes the terminal observation with startup
-            // provenance. Do not relabel it as a fresh live-writer snapshot.
+            // The terminal observation was published from the final durable
+            // audit above. Do not relabel it as a fresh live-writer snapshot.
             startup_status_active = false;
         } else if (result.index_repair_attempted or result.index_repair_repaired) {
             // Repair completion changes durable lifecycle fields that the
@@ -23193,7 +23268,6 @@ fn catchUpManagedDb(
 
     if (mode == .index_repair_only) {
         if (!initial_index_repair_debt) {
-            source.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
             return .{};
         }
         if (had_debt or restore_repair_needed or needs_dense_artifact_maintenance) {
@@ -23216,11 +23290,9 @@ fn catchUpManagedDb(
         // cannot participate in that proof, so preserve both debts and fail
         // closed until the index repair owner has recovered (or an operator
         // has replaced) the unavailable generation.
-        const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db);
         return .{
             .had_debt = true,
             .terminal_degraded = true,
-            .index_repair_pending = !terminal_status_published,
         };
     }
 
@@ -23327,7 +23399,6 @@ fn catchUpManagedDb(
     }
 
     if (mode == .all_debt and !initial_repair_debt) {
-        source.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .idle, db));
         return .{};
     }
@@ -23351,7 +23422,6 @@ fn catchUpManagedDb(
     }
 
     if (mode == .all_debt and !initial_repair_debt and !repaired_restore_runtime and !repaired_dense_artifacts) {
-        source.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
         return .{};
     }
 
@@ -23451,25 +23521,20 @@ fn catchUpManagedDb(
     }
     repair_summary = try db.indexRepairIntentSummary(alloc);
     if (repair_summary.terminal != 0) {
-        const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db);
         return .{
             .had_debt = true,
             .terminal_degraded = true,
             .made_progress = made_progress,
-            .index_repair_pending = !terminal_status_published,
         };
     }
     if (try managedDbHasIndexLoadFailure(alloc, db)) {
-        const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db);
         return .{
             .had_debt = true,
             .terminal_degraded = true,
             .made_progress = made_progress,
-            .index_repair_pending = !terminal_status_published,
         };
     }
     if (repair_summary.paused != 0) {
-        source.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
         return .{
             .had_debt = true,
             .made_progress = made_progress,
@@ -23479,13 +23544,9 @@ fn catchUpManagedDb(
             .index_repair_degraded = degraded_indexes != 0,
         };
     }
-    // Runnable, terminal, and load-failure states have all been ruled out by
-    // this aggregate owner while it retains its operation lease. Paused work
-    // is durably parked and clean work is complete; either can release the
-    // structural snapshot-only fence after the corresponding authoritative
-    // status publication. A later pending callback advances the generation
-    // and fences that publication before it can settle the handoff.
-    source.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
+    // The caller performs one final durable audit after reacquiring exact
+    // group mutation ownership, then publishes and settles under that same
+    // lease. The long scan above is intentionally read-compatible.
     const index_only_result = mode == .index_repair_only or mode == .index_repair_prerequisite;
     const result_had_debt = if (index_only_result) initial_index_repair_debt else initial_repair_debt;
     return .{
@@ -34479,6 +34540,90 @@ test "repair handoff status settles after authoritative cached publication" {
     var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer published.deinit(alloc);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
+}
+
+test "live repair final audit excludes concurrent group mutation through publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/repair-final-audit-operation",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    var cached = try source.getOrOpenCachedDbModeWithMetadata(
+        alloc,
+        &write_cache,
+        path,
+        7001,
+        "docs",
+        .writer_no_replay,
+        null,
+        null,
+        .{ .indexes_json = "{}", .schema_json = "" },
+    );
+    cached.deinit(alloc);
+
+    source.reserveStructuralReconcileStatus("docs");
+    source.ensureStructuralRepairHandoffStatus("docs", 7001);
+    source.releaseStructuralReconcileStatus("docs");
+    // Model a previous clear audit whose publication was fenced. Admission of
+    // this pass must revoke it before the long, unlocked scan begins.
+    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7001);
+
+    const PublicationProbe = struct {
+        source: *ProvisionedTableWriteSource,
+        final_publications: usize = 0,
+        competing_admissions: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const io = self.source.table_activity_threaded.io();
+            self.source.table_activity_mutex.lockUncancelable(io);
+            const clear_observed = if (self.source.findTableActivityLocked("docs", 7001)) |index|
+                self.source.active_table_activities.items[index].repair_handoff_clear_observed
+            else
+                false;
+            self.source.table_activity_mutex.unlock(io);
+            if (!clear_observed) return;
+
+            self.final_publications += 1;
+            if (self.source.tryBeginGroupOperation("docs", 7001)) {
+                self.competing_admissions += 1;
+                self.source.endGroupOperation("docs", 7001);
+            }
+        }
+    };
+    var probe = PublicationProbe{ .source = &source };
+    const result = result: {
+        const previous_hook = test_before_runtime_status_publish_hook;
+        test_before_runtime_status_publish_hook = .{ .ptr = &probe, .run = PublicationProbe.run };
+        defer test_before_runtime_status_publish_hook = previous_hook;
+        break :result try source.catchUpTableGroupBestEffortWithMetadata(alloc, 7001, "docs", .{
+            .indexes_json = "{}",
+            .schema_json = "",
+            .advance_index_repairs = true,
+        });
+    };
+
+    try std.testing.expect(!result.busy);
+    try std.testing.expect(!result.index_repair_pending);
+    try std.testing.expectEqual(@as(usize, 1), probe.final_publications);
+    try std.testing.expectEqual(@as(usize, 0), probe.competing_admissions);
+    try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
 }
 
 test "terminal repair publication settles handoff or retains one fenced retry" {

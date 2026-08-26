@@ -6261,6 +6261,7 @@ pub fn build(b: *std.Build) void {
             "structural reconcile publishes durable index repair debt once per group",
             "structural repair handoff keeps status fenced through final shard visibility",
             "repair handoff status settles after authoritative cached publication",
+            "live repair final audit excludes concurrent group mutation through publication",
             "terminal repair publication settles handoff or retains one fenced retry",
             "managed create publication handoff releases on converged owner publication",
             "managed dense publication handoff releases when its incarnation is superseded",
