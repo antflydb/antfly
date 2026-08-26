@@ -35,6 +35,7 @@ from conftest import (
     REPO_ROOT,
     _read_log_tail,
     antfly_public_api_url,
+    internal_service_headers,
     lookup_key_path,
     maybe_preserve_tempdir,
     wait_for_server,
@@ -96,6 +97,7 @@ def _metadata_mutation_once(
         response = requests.request(
             method,
             f"{url}{path}",
+            headers=internal_service_headers(),
             json=json_body,
             timeout=5,
         )
@@ -478,6 +480,7 @@ def test_node_shutdown_preserves_drain_intent_across_healthy_status(stateful_api
 
     node_resp = requests.post(
         f"{admin_url}/internal/v1/nodes",
+        headers=internal_service_headers(),
         json={"node_id": node_id, "role": "data"},
         timeout=10,
     )
@@ -485,6 +488,7 @@ def test_node_shutdown_preserves_drain_intent_across_healthy_status(stateful_api
 
     store_resp = requests.post(
         f"{admin_url}/internal/v1/nodes",
+        headers=internal_service_headers(),
         json={
             "store_id": store_id,
             "node_id": node_id,
@@ -511,6 +515,7 @@ def test_node_shutdown_preserves_drain_intent_across_healthy_status(stateful_api
 
     shutdown_resp = requests.put(
         f"{admin_url}/internal/v1/nodes/{node_id}/shutdown",
+        headers=internal_service_headers(),
         json={"type": "remove", "reason": "e2e"},
         timeout=10,
     )
@@ -529,7 +534,11 @@ def test_node_shutdown_preserves_drain_intent_across_healthy_status(stateful_api
         is not None
     )
 
-    status_resp = requests.get(f"{admin_url}/internal/v1/nodes/{node_id}/shutdown", timeout=10)
+    status_resp = requests.get(
+        f"{admin_url}/internal/v1/nodes/{node_id}/shutdown",
+        headers=internal_service_headers(),
+        timeout=10,
+    )
     assert status_resp.status_code == 200, status_resp.text
     status = status_resp.json()
     assert status["phase"] == "complete"
@@ -538,6 +547,7 @@ def test_node_shutdown_preserves_drain_intent_across_healthy_status(stateful_api
 
     reregister_resp = requests.post(
         f"{admin_url}/internal/v1/nodes",
+        headers=internal_service_headers(),
         json={
             "store_id": store_id,
             "node_id": node_id,
@@ -566,6 +576,7 @@ def test_node_shutdown_preserves_drain_intent_across_healthy_status(stateful_api
 
     healthy_resp = requests.post(
         f"{admin_url}/internal/v1/nodes/{node_id}/status",
+        headers=internal_service_headers(),
         json={
             "store_id": store_id,
             "live": True,
@@ -588,6 +599,7 @@ def test_node_shutdown_before_store_registration_is_durable(stateful_api):
 
     shutdown_resp = requests.put(
         f"{admin_url}/internal/v1/nodes/{node_id}/shutdown",
+        headers=internal_service_headers(),
         json={"type": "remove", "reason": "e2e-no-store"},
         timeout=10,
     )
@@ -608,6 +620,7 @@ def test_node_shutdown_before_store_registration_is_durable(stateful_api):
 
     store_resp = requests.post(
         f"{admin_url}/internal/v1/nodes",
+        headers=internal_service_headers(),
         json={
             "store_id": store_id,
             "node_id": node_id,
@@ -634,7 +647,11 @@ def test_node_shutdown_before_store_registration_is_durable(stateful_api):
         is not None
     )
 
-    status_resp = requests.get(f"{admin_url}/internal/v1/nodes/{node_id}/shutdown", timeout=10)
+    status_resp = requests.get(
+        f"{admin_url}/internal/v1/nodes/{node_id}/shutdown",
+        headers=internal_service_headers(),
+        timeout=10,
+    )
     assert status_resp.status_code == 200, status_resp.text
     status = status_resp.json()
     assert status["phase"] == "complete"
@@ -648,6 +665,7 @@ def test_node_shutdown_cancellation_clears_node_and_store_drain_intent(stateful_
 
     node_resp = requests.post(
         f"{admin_url}/internal/v1/nodes",
+        headers=internal_service_headers(),
         json={"node_id": node_id, "role": "data"},
         timeout=10,
     )
@@ -664,6 +682,7 @@ def test_node_shutdown_cancellation_clears_node_and_store_drain_intent(stateful_
     }
     store_resp = requests.post(
         f"{admin_url}/internal/v1/nodes",
+        headers=internal_service_headers(),
         json=store_body,
         timeout=10,
     )
@@ -682,6 +701,7 @@ def test_node_shutdown_cancellation_clears_node_and_store_drain_intent(stateful_
 
     shutdown_resp = requests.put(
         f"{admin_url}/internal/v1/nodes/{node_id}/shutdown",
+        headers=internal_service_headers(),
         json={"type": "remove", "reason": "e2e-cancel"},
         timeout=10,
     )
@@ -700,7 +720,11 @@ def test_node_shutdown_cancellation_clears_node_and_store_drain_intent(stateful_
         is not None
     )
 
-    cancel_resp = requests.delete(f"{admin_url}/internal/v1/nodes/{node_id}/shutdown", timeout=10)
+    cancel_resp = requests.delete(
+        f"{admin_url}/internal/v1/nodes/{node_id}/shutdown",
+        headers=internal_service_headers(),
+        timeout=10,
+    )
     assert cancel_resp.status_code == 202, cancel_resp.text
     assert (
         wait_until(
@@ -721,7 +745,11 @@ def test_node_shutdown_cancellation_clears_node_and_store_drain_intent(stateful_
         is not None
     )
 
-    status_resp = requests.get(f"{admin_url}/internal/v1/nodes/{node_id}/shutdown", timeout=10)
+    status_resp = requests.get(
+        f"{admin_url}/internal/v1/nodes/{node_id}/shutdown",
+        headers=internal_service_headers(),
+        timeout=10,
+    )
     assert status_resp.status_code == 200, status_resp.text
     status = status_resp.json()
     assert status["phase"] == "active"
@@ -729,6 +757,7 @@ def test_node_shutdown_cancellation_clears_node_and_store_drain_intent(stateful_
 
     reregister_resp = requests.post(
         f"{admin_url}/internal/v1/nodes",
+        headers=internal_service_headers(),
         json=store_body,
         timeout=10,
     )
@@ -736,7 +765,11 @@ def test_node_shutdown_cancellation_clears_node_and_store_drain_intent(stateful_
     store = _find_store(_admin_snapshot(admin_url), store_id)
     assert store["drain_requested"] is False
 
-    retry_cancel_resp = requests.delete(f"{admin_url}/internal/v1/nodes/{node_id}/shutdown", timeout=10)
+    retry_cancel_resp = requests.delete(
+        f"{admin_url}/internal/v1/nodes/{node_id}/shutdown",
+        headers=internal_service_headers(),
+        timeout=10,
+    )
     assert retry_cancel_resp.status_code == 202, retry_cancel_resp.text
 
 
@@ -1145,7 +1178,12 @@ class MultiNodeScalingCluster:
         last_error: Exception | None = None
         for url in self.metadata_urls:
             try:
-                response = requests.post(f"{url}{path}", json=json_body, timeout=5)
+                response = requests.post(
+                    f"{url}{path}",
+                    headers=internal_service_headers(),
+                    json=json_body,
+                    timeout=5,
+                )
                 if response.ok:
                     return response
                 last_error = AssertionError(f"{response.status_code}: {response.text}")
@@ -1159,7 +1197,12 @@ class MultiNodeScalingCluster:
         last_error: Exception | None = None
         for url in self.metadata_urls:
             try:
-                response = requests.put(f"{url}{path}", json=json_body, timeout=5)
+                response = requests.put(
+                    f"{url}{path}",
+                    headers=internal_service_headers(),
+                    json=json_body,
+                    timeout=5,
+                )
                 if response.ok:
                     return response
                 last_error = AssertionError(f"{response.status_code}: {response.text}")
@@ -1173,7 +1216,11 @@ class MultiNodeScalingCluster:
         last_error: Exception | None = None
         for url in self.metadata_urls:
             try:
-                response = requests.delete(f"{url}{path}", timeout=5)
+                response = requests.delete(
+                    f"{url}{path}",
+                    headers=internal_service_headers(),
+                    timeout=5,
+                )
                 if response.ok:
                     return response
                 last_error = AssertionError(f"{response.status_code}: {response.text}")
@@ -1457,6 +1504,7 @@ class MultiNodeScalingCluster:
             try:
                 response = requests.get(
                     f"{self.metadata_urls[0]}/internal/v1/nodes/{node_id}/shutdown",
+                    headers=internal_service_headers(),
                     timeout=5,
                 )
                 diagnostics["node_shutdown_statuses"].append(
@@ -2104,7 +2152,11 @@ def _wait_node_shutdown_phase(
     def status_matches() -> dict[str, Any] | None:
         nonlocal last_status
         try:
-            response = requests.get(f"{cluster.metadata_urls[0]}/internal/v1/nodes/{node_id}/shutdown", timeout=10)
+            response = requests.get(
+                f"{cluster.metadata_urls[0]}/internal/v1/nodes/{node_id}/shutdown",
+                headers=internal_service_headers(),
+                timeout=10,
+            )
             response.raise_for_status()
             payload = response.json()
         except (AssertionError, requests.RequestException, ValueError):

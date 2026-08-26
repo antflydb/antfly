@@ -33,9 +33,10 @@ const public_table_http = @import("public_table_http.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
-const stored_destination_authorization = @import("stored_destination_authorization.zig");
 const coverage_policy = @import("coverage_policy.zig");
 const table_contract = @import("table_contract.zig");
+const stored_destination_authorization = @import("stored_destination_authorization.zig");
+const internal_service_auth = @import("internal_service_auth.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_authority = @import("../metadata/authority.zig");
@@ -790,6 +791,20 @@ pub const ApiHttpServerConfig = struct {
     ard_public_catalog_enabled: bool = false,
     trusted_principal_secret: ?[]const u8 = null,
     trusted_principal_issuer: ?[]const u8 = null,
+    /// Dedicated node-to-node signing identity. Distributed runtimes validate
+    /// both values before opening a listener; they must never share the public
+    /// trusted-principal signing domain.
+    internal_service_secret: ?[]const u8 = null,
+    /// Optional overlap key used only while rotating the node-to-node signing
+    /// credential. Outbound requests are always signed by
+    /// internal_service_secret; inbound requests accept either key.
+    internal_service_verification_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
+    internal_service_auth_capability: ?[]const u8 = null,
+    /// Explicit first-phase rolling-upgrade mode. Upgraded clients always sign;
+    /// servers may temporarily accept old unsigned peers until enforcement is
+    /// enabled cluster-wide. Defaults to fail closed.
+    internal_service_accept_legacy_unauthenticated: bool = false,
     deployment_mode: common_config.DeploymentMode = .distributed,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     storage_maintenance: ?*@import("../storage/maintenance.zig").Coordinator = null,
@@ -933,6 +948,9 @@ pub const AuthenticatedIdentity = struct {
     /// Multiple API keys owned by one user must not become interchangeable
     /// transaction-session capabilities.
     credential_principal: []u8 = &.{},
+    /// True only for an audience-bound node/service credential. A generic
+    /// trusted upstream user is deliberately not an internal service.
+    is_internal_service: bool = false,
     permissions: []usermgr.Permission = &.{},
     row_filter: []usermgr.RowFilterEntry = &.{},
     metadata_json: []u8 = &.{},
@@ -4122,6 +4140,10 @@ pub const ApiHttpServer = struct {
             else => return .unauthorized,
         };
         defer identity.deinit(self.alloc);
+        // Node credentials are audience-bound capabilities, not portable admin
+        // bearer tokens. Enforce that boundary here because inference routes are
+        // hosted by a separate manifest and do not traverse httpx API RBAC.
+        if (identity.is_internal_service) return .forbidden;
         const required: usermgr.PermissionType = switch (permission) {
             .read => .read,
             .write => .write,
@@ -4133,6 +4155,39 @@ pub const ApiHttpServer = struct {
     }
 
     fn authenticateTrustedPrincipal(self: *ApiHttpServer, token: []const u8, secret: []const u8) !AuthenticatedIdentity {
+        return try self.authenticateTrustedPrincipalWithIssuer(
+            token,
+            secret,
+            self.cfg.trusted_principal_issuer,
+        );
+    }
+
+    pub fn authenticateInternalServiceRequest(self: *ApiHttpServer, token: []const u8) !AuthenticatedIdentity {
+        const secret = self.cfg.internal_service_secret orelse return error.Unauthorized;
+        if (self.cfg.trusted_principal_secret) |trusted_secret| {
+            if (std.mem.eql(u8, secret, trusted_secret)) return error.Unauthorized;
+        }
+        return self.authenticateTrustedPrincipalWithIssuer(
+            token,
+            secret,
+            self.cfg.internal_service_issuer,
+        ) catch |primary_err| {
+            if (primary_err != error.Unauthorized) return primary_err;
+            const verification_secret = self.cfg.internal_service_verification_secret orelse return primary_err;
+            return try self.authenticateTrustedPrincipalWithIssuer(
+                token,
+                verification_secret,
+                self.cfg.internal_service_issuer,
+            );
+        };
+    }
+
+    fn authenticateTrustedPrincipalWithIssuer(
+        self: *ApiHttpServer,
+        token: []const u8,
+        secret: []const u8,
+        expected_issuer: ?[]const u8,
+    ) !AuthenticatedIdentity {
         var parts = std.mem.splitScalar(u8, token, '.');
         const header_b64 = parts.next() orelse return error.Unauthorized;
         const payload_b64 = parts.next() orelse return error.Unauthorized;
@@ -4166,16 +4221,31 @@ pub const ApiHttpServer = struct {
             .object => |object| object,
             else => return error.Unauthorized,
         };
-        if (self.cfg.trusted_principal_issuer) |expected_issuer| {
-            if (!std.mem.eql(u8, jsonStringField(payload.get("iss")) orelse "", expected_issuer)) return error.Unauthorized;
+        if (expected_issuer) |issuer| {
+            if (!std.mem.eql(u8, jsonStringField(payload.get("iss")) orelse "", issuer)) return error.Unauthorized;
         }
         const subject = jsonStringField(payload.get("sub")) orelse return error.Unauthorized;
         const exp = jsonIntegerField(payload.get("exp")) orelse return error.Unauthorized;
         const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
         if (exp < now) return error.Unauthorized;
-        if (jsonIntegerField(payload.get("iat"))) |iat| {
+        const issued_at = jsonIntegerField(payload.get("iat"));
+        if (issued_at) |iat| {
             if (iat > now + 60) return error.Unauthorized;
         }
+        const bounded_service_lifetime = if (issued_at) |iat| blk: {
+            if (exp < iat) break :blk false;
+            const lifetime = std.math.sub(i64, exp, iat) catch break :blk false;
+            break :blk lifetime <= internal_service_auth.token_ttl_seconds;
+        } else false;
+        const is_internal_service = std.mem.eql(
+            u8,
+            jsonStringField(payload.get("aud")) orelse "",
+            internal_service_auth.audience,
+        ) and std.mem.eql(
+            u8,
+            jsonStringField(payload.get("principal_kind")) orelse "",
+            internal_service_auth.principal_kind,
+        ) and bounded_service_lifetime;
 
         const permissions = try trustedPrincipalPermissionsFromPayload(self.alloc, payload);
         errdefer {
@@ -4199,6 +4269,7 @@ pub const ApiHttpServer = struct {
                 "trusted:{s}:{s}",
                 .{ jsonStringField(payload.get("iss")) orelse "", subject },
             ),
+            .is_internal_service = is_internal_service,
             .permissions = permissions,
             .row_filter = row_filters,
             .metadata_json = metadata_json,
@@ -7878,15 +7949,30 @@ pub const ApiHttpServer = struct {
         method: contextual_operations.Method,
         target: []const u8,
         authorization: ?[]const u8,
+        trusted_principal: ?[]const u8 = null,
         content_type: ?[]const u8,
         body: []const u8,
     };
+
+    fn sessionTrustedPrincipalHeaders(
+        token: ?[]const u8,
+        storage: *[1]http_common.RequestHeader,
+    ) []const http_common.RequestHeader {
+        const value = token orelse return storage[0..0];
+        storage[0] = .{ .name = trusted_principal_header, .value = value };
+        return storage[0..1];
+    }
 
     pub fn forwardSessionOperation(
         self: *ApiHttpServer,
         txn_id: db_mod.types.TxnId,
         request: SessionForwardRequest,
     ) !?contextual_operations.OwnedResponse {
+        var trusted_header_storage: [1]http_common.RequestHeader = undefined;
+        const trusted_headers = sessionTrustedPrincipalHeaders(
+            request.trusted_principal,
+            &trusted_header_storage,
+        );
         var response = (try self.forwardSessionRequest(txn_id, .{
             .method = switch (request.method) {
                 .get => .GET,
@@ -7895,6 +7981,7 @@ pub const ApiHttpServer = struct {
                 .delete => .DELETE,
             },
             .uri = request.target,
+            .headers = trusted_headers,
             .authorization = request.authorization,
             .content_type = request.content_type,
             .body = request.body,
@@ -15670,6 +15757,100 @@ test "inference connection invocation requires inference write permission" {
     )) == null);
 }
 
+test "internal service credentials cannot authorize public inference routes" {
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const secret = "inference-audience-test-secret";
+    var server = ApiHttpServer.init(alloc, .{
+        .trusted_principal_secret = secret,
+        .trusted_principal_issuer = "cluster-a",
+    }, FakeSource.iface(), null, null);
+    defer server.deinit();
+    const now_seconds: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = secret,
+        .issuer = "cluster-a",
+        .subject = "node:7",
+    }, now_seconds);
+    defer alloc.free(token);
+    try std.testing.expectEqual(
+        kernel_abi.AuthorizationDecision.forbidden,
+        try server.authorizeInferenceRequest(.{ .trusted_principal = token }, .write),
+    );
+}
+
+test "api http server validates dedicated internal service runtime credentials" {
+    try std.testing.expectError(
+        error.InternalServiceSecretMissing,
+        internal_service_auth.validateRuntimeConfig(null, null, "cluster-a"),
+    );
+    try std.testing.expectError(
+        error.InternalServiceSecretTooShort,
+        internal_service_auth.validateRuntimeConfig("short", null, "cluster-a"),
+    );
+    try std.testing.expectError(
+        error.InternalServiceIssuerMissing,
+        internal_service_auth.validateRuntimeConfig("0123456789abcdef0123456789abcdef", null, null),
+    );
+    try internal_service_auth.validateRuntimeConfig(
+        "0123456789abcdef0123456789abcdef",
+        null,
+        "cluster-a",
+    );
+    try std.testing.expectError(
+        error.InternalServiceSecretReused,
+        internal_service_auth.validateCredentialIsolation(
+            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef",
+        ),
+    );
+    try std.testing.expectEqual(
+        internal_service_auth.RolloutMode.enforce,
+        try internal_service_auth.parseRolloutMode(null),
+    );
+    try std.testing.expectEqual(
+        internal_service_auth.RolloutMode.migration,
+        try internal_service_auth.parseRolloutMode("migration"),
+    );
+}
+
+test "api http server accepts the bounded rotation verification key" {
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{ .ptr = undefined, .vtable = &.{ .status = status } };
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const primary = "primary-internal-service-secret-v1";
+    const verification = "verification-service-secret-v2-xx";
+    var server = ApiHttpServer.init(alloc, .{
+        .internal_service_secret = primary,
+        .internal_service_verification_secret = verification,
+        .internal_service_issuer = "cluster-a",
+    }, FakeSource.iface(), null, null);
+    defer server.deinit();
+    const now_seconds: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = verification,
+        .issuer = "cluster-a",
+        .subject = "node:7",
+    }, now_seconds);
+    defer alloc.free(token);
+    var identity = try server.authenticateInternalServiceRequest(token);
+    defer identity.deinit(alloc);
+    try std.testing.expect(identity.is_internal_service);
+}
+
 fn tablePermission(alloc: std.mem.Allocator, encoded_table_name: []const u8, permission_type: usermgr.PermissionType) !RequiredPermission {
     return .{
         .resource_type = .table,
@@ -15720,6 +15901,8 @@ pub fn transactionPrincipal(authenticated_identity: ?AuthenticatedIdentity) ?[]c
 pub fn storedDestinationPrincipal(authenticated_identity: ?AuthenticatedIdentity) []const u8 {
     const identity = authenticated_identity orelse
         return stored_destination_authorization.auth_disabled_principal;
+    if (identity.is_internal_service)
+        return stored_destination_authorization.catalog_service_principal;
     return if (identity.credential_principal.len > 0)
         identity.credential_principal
     else
@@ -23009,9 +23192,15 @@ test "api http server document scan requires table read permission" {
 
     var read_source = table_reads.BoundTableReadSource.init("secrets", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
     var source = FakeSource{};
+    const trusted_principal_secret = "gateway-trusted-principal-secret";
+    const internal_secret = "dedicated-internal-service-secret";
     var server = ApiHttpServer.init(alloc, .{
         .auth_enabled = true,
         .user_manager = &auth.manager,
+        .trusted_principal_secret = trusted_principal_secret,
+        .trusted_principal_issuer = "gateway",
+        .internal_service_secret = internal_secret,
+        .internal_service_issuer = "antfly-node",
     }, source.iface(), read_source.source(), null);
     defer server.deinit();
 
@@ -23048,6 +23237,108 @@ test "api http server document scan requires table read permission" {
     defer forbidden_multi.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), forbidden_multi.status);
 
+    var forbidden_internal_batch = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/1/tables/secrets/batch",
+        .authorization = other_reader_auth,
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer forbidden_internal_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), forbidden_internal_batch.status);
+
+    var forbidden_internal_transaction = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/1/tables/secrets/txn-begin",
+        .authorization = other_reader_auth,
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer forbidden_internal_transaction.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), forbidden_internal_transaction.status);
+
+    var forbidden_internal_capabilities = try executeHttpxTestRequest(&server, .{
+        .method = .GET,
+        .uri = "/internal/v1/capabilities",
+        .authorization = other_reader_auth,
+    });
+    defer forbidden_internal_capabilities.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), forbidden_internal_capabilities.status);
+
+    server.cfg.internal_service_accept_legacy_unauthenticated = true;
+    var legacy_migration_batch = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/1/tables/secrets/batch",
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer legacy_migration_batch.deinit(alloc);
+    // The request reached the unavailable test adapter instead of being
+    // rejected at authentication, proving the migration switch is explicit.
+    try std.testing.expectEqual(@as(u16, 404), legacy_migration_batch.status);
+    server.cfg.internal_service_accept_legacy_unauthenticated = false;
+
+    const now_seconds: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+    const user_payload = try std.fmt.allocPrint(
+        alloc,
+        \\{{"iss":"gateway","sub":"operator","tables":["secrets"],"operations":["write"],"iat":{d},"exp":{d}}}
+    ,
+        .{ now_seconds, now_seconds + 60 },
+    );
+    defer alloc.free(user_payload);
+    const user_token = try encodeTrustedPrincipalToken(alloc, trusted_principal_secret, user_payload);
+    defer alloc.free(user_token);
+    const user_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = user_token },
+    };
+    var trusted_user_internal_batch = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/1/tables/secrets/batch",
+        .headers = &user_headers,
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer trusted_user_internal_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), trusted_user_internal_batch.status);
+
+    const forged_service_token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = trusted_principal_secret,
+        .issuer = "gateway",
+        .subject = "node:forged",
+    }, now_seconds);
+    defer alloc.free(forged_service_token);
+    const forged_service_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = forged_service_token },
+    };
+    var forged_internal_batch = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/1/tables/secrets/batch",
+        .headers = &forged_service_headers,
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer forged_internal_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), forged_internal_batch.status);
+
+    const service_token = try internal_service_auth.tokenAlloc(alloc, .{
+        .secret = internal_secret,
+        .issuer = "antfly-node",
+        .subject = "node:1",
+    }, now_seconds);
+    defer alloc.free(service_token);
+    const service_headers = [_]http_common.RequestHeader{
+        .{ .name = trusted_principal_header, .value = service_token },
+    };
+    var trusted_internal_batch = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/internal/v1/groups/1/tables/secrets/batch",
+        .headers = &service_headers,
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer trusted_internal_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 404), trusted_internal_batch.status);
+
     const secrets_reader_auth = try encodeBasicAuthorization(alloc, "secrets-reader", "reader");
     defer alloc.free(secrets_reader_auth);
     var allowed = try executeHttpxTestRequest(&server, .{
@@ -23083,6 +23374,14 @@ test "transaction principals bind sessions to credential identity" {
         transactionPrincipal(basic).?,
         transactionPrincipal(api_key).?,
     ));
+    var forwarded_header: [1]http_common.RequestHeader = undefined;
+    const forwarded = ApiHttpServer.sessionTrustedPrincipalHeaders(
+        "trusted-token",
+        &forwarded_header,
+    );
+    try std.testing.expectEqual(@as(usize, 1), forwarded.len);
+    try std.testing.expectEqualStrings(trusted_principal_header, forwarded[0].name);
+    try std.testing.expectEqualStrings("trusted-token", forwarded[0].value);
 }
 
 fn executeHaRouteForTest(

@@ -74,6 +74,14 @@ func (r *AntflyBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		r.updateStatusWithError(ctx, backup, antflyv1.BackupPhaseFailed, antflyv1.TypeBackupScheduleReady, antflyv1.ReasonBackupValidationFailed, err.Error())
 		return ctrl.Result{}, nil
 	}
+	if strings.TrimSpace(backup.Spec.Destination.Connection) == "" {
+		if err := r.suspendCronJobForConnectionMigration(ctx, backup); err != nil {
+			return ctrl.Result{}, err
+		}
+		message := "A named external_io connection with backup.write is required. The existing schedule is suspended until spec.destination.connection is configured."
+		r.updateStatusWithError(ctx, backup, antflyv1.BackupPhasePending, antflyv1.TypeBackupScheduleReady, antflyv1.ReasonBackupConnectionRequired, message)
+		return ctrl.Result{}, nil
+	}
 
 	// Fetch the referenced AntflyCluster.
 	// Use BackupPhasePending (not Failed) for cluster-not-found since this is a
@@ -101,6 +109,29 @@ func (r *AntflyBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// suspendCronJobForConnectionMigration preserves the CronJob and its history
+// while preventing an upgraded CLI from repeatedly starting a request that it
+// must reject. A later normal reconcile restores the user's desired suspend
+// value after the connection is configured.
+func (r *AntflyBackupReconciler) suspendCronJobForConnectionMigration(ctx context.Context, backup *antflyv1.AntflyBackup) error {
+	cronJob := &batchv1.CronJob{}
+	key := types.NamespacedName{Name: backup.Name + "-backup", Namespace: backup.Namespace}
+	if err := r.Get(ctx, key, cronJob); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("read legacy backup CronJob: %w", err)
+	}
+	if cronJob.Spec.Suspend != nil && *cronJob.Spec.Suspend {
+		return nil
+	}
+	cronJob.Spec.Suspend = new(true)
+	if err := r.Update(ctx, cronJob); err != nil {
+		return fmt.Errorf("suspend legacy backup CronJob: %w", err)
+	}
+	return nil
 }
 
 // getReferencedCluster fetches the AntflyCluster referenced by the backup

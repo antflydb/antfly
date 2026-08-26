@@ -18,8 +18,9 @@ func TestAntflyRestoreValidator_ValidateCreate_Valid(t *testing.T) {
 		Spec: antflyv1.AntflyRestoreSpec{
 			ClusterRef: antflyv1.ClusterReference{Name: "my-cluster"},
 			Source: antflyv1.RestoreSource{
-				BackupID: "backup-001",
-				Location: "s3://my-bucket/backups",
+				BackupID:   "backup-001",
+				Location:   "s3://my-bucket/backups",
+				Connection: "archive-reader",
 			},
 		},
 	}
@@ -57,8 +58,9 @@ func TestAntflyRestoreValidator_ValidateUpdate_RejectsRunning(t *testing.T) {
 	spec := antflyv1.AntflyRestoreSpec{
 		ClusterRef: antflyv1.ClusterReference{Name: "my-cluster"},
 		Source: antflyv1.RestoreSource{
-			BackupID: "backup-001",
-			Location: "s3://my-bucket/backups",
+			BackupID:   "backup-001",
+			Location:   "s3://my-bucket/backups",
+			Connection: "archive-reader",
 		},
 	}
 
@@ -99,8 +101,9 @@ func TestAntflyRestoreValidator_ValidateUpdate_AllowsPending(t *testing.T) {
 		Spec: antflyv1.AntflyRestoreSpec{
 			ClusterRef: antflyv1.ClusterReference{Name: "my-cluster"},
 			Source: antflyv1.RestoreSource{
-				BackupID: "backup-001",
-				Location: "s3://my-bucket/backups",
+				BackupID:   "backup-001",
+				Location:   "s3://my-bucket/backups",
+				Connection: "archive-reader",
 			},
 		},
 		Status: antflyv1.AntflyRestoreStatus{Phase: antflyv1.RestorePhasePending},
@@ -121,8 +124,9 @@ func TestAntflyRestoreValidator_ValidateUpdate_AllowsEmptyPhase(t *testing.T) {
 		Spec: antflyv1.AntflyRestoreSpec{
 			ClusterRef: antflyv1.ClusterReference{Name: "my-cluster"},
 			Source: antflyv1.RestoreSource{
-				BackupID: "backup-001",
-				Location: "s3://my-bucket/backups",
+				BackupID:   "backup-001",
+				Location:   "s3://my-bucket/backups",
+				Connection: "archive-reader",
 			},
 		},
 		// Status.Phase is empty (zero value)
@@ -143,8 +147,9 @@ func TestAntflyRestoreValidator_ValidateUpdate_PendingRejectsInvalidSpec(t *test
 		Spec: antflyv1.AntflyRestoreSpec{
 			ClusterRef: antflyv1.ClusterReference{Name: "my-cluster"},
 			Source: antflyv1.RestoreSource{
-				BackupID: "backup-001",
-				Location: "s3://my-bucket/backups",
+				BackupID:   "backup-001",
+				Location:   "s3://my-bucket/backups",
+				Connection: "archive-reader",
 			},
 		},
 		Status: antflyv1.AntflyRestoreStatus{Phase: antflyv1.RestorePhasePending},
@@ -168,7 +173,7 @@ func TestAntflyBackupValidator_ValidateCreate_Valid(t *testing.T) {
 		Spec: antflyv1.AntflyBackupSpec{
 			ClusterRef:  antflyv1.ClusterReference{Name: "my-cluster"},
 			Schedule:    "0 2 * * *",
-			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups"},
+			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups", Connection: "archive-writer"},
 		},
 	}
 
@@ -188,7 +193,7 @@ func TestAntflyBackupValidator_ValidateCreate_Invalid(t *testing.T) {
 		Spec: antflyv1.AntflyBackupSpec{
 			// Missing clusterRef.name
 			Schedule:    "0 2 * * *",
-			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups"},
+			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups", Connection: "archive-writer"},
 		},
 	}
 
@@ -205,7 +210,7 @@ func TestAntflyBackupValidator_ValidateUpdate_ImmutableClusterRef(t *testing.T) 
 		Spec: antflyv1.AntflyBackupSpec{
 			ClusterRef:  antflyv1.ClusterReference{Name: "cluster-a"},
 			Schedule:    "0 2 * * *",
-			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups"},
+			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups", Connection: "archive-writer"},
 		},
 	}
 	newObj := oldObj.DeepCopy()
@@ -227,7 +232,7 @@ func TestAntflyBackupValidator_ValidateUpdate_AllowsScheduleChange(t *testing.T)
 		Spec: antflyv1.AntflyBackupSpec{
 			ClusterRef:  antflyv1.ClusterReference{Name: "my-cluster"},
 			Schedule:    "0 2 * * *",
-			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups"},
+			Destination: antflyv1.BackupDestination{Location: "s3://my-bucket/backups", Connection: "archive-writer"},
 		},
 	}
 	newObj := oldObj.DeepCopy()
