@@ -5828,22 +5828,6 @@ fn cudaF32LinearTiledEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_F32_LINEAR_TILED", true);
 }
 
-fn cudaA4bRouterTiledEnabled() bool {
-    return !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_ROUTER_TILED", false);
-}
-
-fn cudaA4bNormFusionEnabled() bool {
-    return !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_NORM_FUSION", false);
-}
-
-fn cudaA4bCompactDownEnabled() bool {
-    return !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_COMPACT_DOWN", false);
-}
-
-fn cudaA4bExactLmHeadEnabled() bool {
-    return !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_EXACT_LM_HEAD", false);
-}
-
 fn isA4bRouterDecodeShape(rows: usize, in_dim: usize, out_dim: usize) bool {
     return rows == 1 and in_dim == 2816 and out_dim == 128;
 }
@@ -13134,7 +13118,7 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
         } else if (cudaF32LinearTiledEnabled() and rows <= 16 and in_dim >= 512 and
             (out_dim >= 512 or
-                (self.a4b_runtime != null and isA4bRouterDecodeShape(rows, in_dim, out_dim) and cudaA4bRouterTiledEnabled())))
+                (self.a4b_runtime != null and isA4bRouterDecodeShape(rows, in_dim, out_dim))))
         {
             self.kernels.launchLinearF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tiled_err| switch (tiled_err) {
                 error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
@@ -13791,8 +13775,7 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         // handwritten dispatch, including suppressed-token requests.
         const generated_q8_1_candidate = cudaGeneratedQ6KQ8_1LmHeadArgmaxEnabled() and
             generatedQ6KQ8_1LmHeadArgmaxEligible(rows, in_dim, out_dim, suppress_token_ids.len);
-        const a4b_exact_candidate = cudaA4bExactLmHeadEnabled() and
-            self.a4b_runtime != null and rows == 1 and in_dim == 2816 and
+        const a4b_exact_candidate = self.a4b_runtime != null and rows == 1 and in_dim == 2816 and
             out_dim % 8 == 0 and suppress_token_ids.len == 0;
         const prefer_a4b_exact = a4b_exact_candidate and
             self.kernels.hasGemma4A4BExactLmHeadPrimitive();
@@ -15999,8 +15982,7 @@ fn rmsNormTripleOp(
 ) anyerror!?ops.RmsNormTripleResult {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const runtime = if (self.a4b_runtime) |*value| value else return null;
-    if (!cudaA4bNormFusionEnabled() or
-        !self.kernels.hasGemma4A4BNormFusionPrimitives() or
+    if (!self.kernels.hasGemma4A4BNormFusionPrimitives() or
         dim != runtime.config.geometry.hidden_size) return null;
     const input_tensor = tensorFromCt(input);
     const first_weight_tensor = tensorFromCt(first_weight);
@@ -16070,8 +16052,7 @@ fn parallelFfnPostResidualOp(
 ) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const runtime = if (self.a4b_runtime) |*value| value else return null;
-    if (!cudaA4bNormFusionEnabled() or
-        !self.kernels.hasGemma4A4BNormFusionPrimitives() or
+    if (!self.kernels.hasGemma4A4BNormFusionPrimitives() or
         request.dim != runtime.config.geometry.hidden_size) return null;
     const shared = tensorFromCt(request.shared);
     const shared_weight = tensorFromCt(request.shared_weight);
@@ -21357,7 +21338,7 @@ fn runA4bMoeBlockOp(ctx: *anyopaque, request: *const ops.RunMoeBlockRequest) any
     );
     try self.kernels.launchQuantizeF32Q8_1Rows(&self.ctx, activated_q8, activated, routes, request.inter_size);
     const down = try layer.down.view();
-    if (request.total == 1 and cudaA4bCompactDownEnabled()) {
+    if (request.total == 1) {
         const launched_compact = blk: {
             self.kernels.launchGemma4A4BDownRowsQ4_0Q8_1F32Compact(
                 &self.ctx,

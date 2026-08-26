@@ -1302,8 +1302,6 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
         a4b_request,
     );
     if (a4b_inference) |a4b| {
-        if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_FAST_PATH"))
-            return error.A4bCudaFastPathDisabled;
         if (a4b.residency_mode != .resident)
             return error.A4bCudaStreamingUnsupported;
     }

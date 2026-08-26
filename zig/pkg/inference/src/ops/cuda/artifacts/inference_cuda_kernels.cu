@@ -12783,7 +12783,7 @@ extern "C" __global__ void termite_linear_q4_0_q8_1_f32_tile4_e4b_attn_2048(
     const unsigned char* q8_input,
     const unsigned char* weight
 ) {
-    const unsigned int cols = 8u;
+    const unsigned int cols = 4u;
     const unsigned int row_blocks = 64u;
     unsigned int col_tile = blockIdx.x * cols;
     unsigned int tid = threadIdx.x;

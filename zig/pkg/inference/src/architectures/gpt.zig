@@ -6484,7 +6484,7 @@ fn a4bParallelFfnFusionEnabled(
 ) bool {
     return switch (cb.kind()) {
         .metal => a4bHighMemoryFeatureEnabled(metal_enable_name, metal_disable_name),
-        .cuda => !getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_NORM_FUSION"),
+        .cuda => true,
         else => false,
     };
 }

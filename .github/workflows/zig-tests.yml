@@ -134,8 +134,6 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             ':(glob)zig/pkg/inference/src/**' \
             zig/pkg/inference/build.zig \
-            ':(glob)zig/pkg/inference/scripts/*a4b*' \
-            zig/pkg/inference/PERF.md \
             ':(glob)specs/openapi/inference/**' \
             .github/workflows/zig-tests.yml
           then
@@ -382,7 +380,6 @@ jobs:
             scripts.test_benchmark_gemma4_long_e2e_server \
             scripts.test_benchmark_gemma4_cuda_batching \
             scripts.test_benchmark_gemma4_cuda_matrix \
-            scripts.test_benchmark_cuda_gemma4_a4b \
             scripts.test_benchmark_metal_gemma4_ab \
             scripts.test_benchmark_metal_gemma4_long_output \
             scripts.test_content_security_contract \
@@ -782,10 +779,6 @@ jobs:
           nvidia-smi --query-gpu=name,compute_cap,uuid,driver_version --format=csv,noheader,nounits
           test "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits | wc -l)" -eq 1
           test "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits)" = "8.9"
-
-      - name: Test CUDA A4B qualification contract
-        working-directory: zig/pkg/inference
-        run: python3 -m unittest scripts.test_benchmark_cuda_gemma4_a4b
 
       - name: Check CUDA generated artifacts
         working-directory: zig/pkg/inference

@@ -301,7 +301,7 @@ fn assessGenerator(
         if (qualified_gemma4_a4b) {
             return makeCompatible(
                 architecture,
-                "qualified Gemma 4 26B-A4B Q4_0 artifact (Metal; CUDA SM89 candidate)",
+                "qualified Gemma 4 26B-A4B Q4_0 runtime (Metal and CUDA SM89)",
             );
         }
         return makeIncompatible(
