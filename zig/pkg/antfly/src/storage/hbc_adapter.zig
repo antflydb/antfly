@@ -874,7 +874,10 @@ pub const Cache = struct {
             .hbc_node_metadata_cache,
             self,
             reclaimForResourceManager,
-        ) catch return;
+        ) catch |err| {
+            std.log.err("failed to register shared HBC cache reclaimer: {s}", .{@errorName(err)});
+            return;
+        };
         self.mutex.lockExclusive();
         if (self.resource_manager == resource_manager and self.reclaimer_identity == 0) {
             self.reclaimer_identity = identity;
@@ -2149,6 +2152,13 @@ const CompleteCoverageFlight = struct {
     refs: usize = 1,
 };
 
+const FlatCentroidBuildFlight = struct {
+    generation: u64,
+    io: std.Io,
+    ready: std.Io.Event = .unset,
+    refs: usize = 1,
+};
+
 const PublishedSearchStateFlight = struct {
     generation: u64 = 0,
     io: std.Io = undefined,
@@ -2228,6 +2238,7 @@ pub const HBCIndex = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     local_reclaimer_identity: u64 = 0,
     search_workspace_reclaimer_identity: u64 = 0,
+    flat_centroid_reclaimer_identity: u64 = 0,
     bind_shared_cache_resource_manager: bool = true,
     shared_cache: ?*Cache = null,
     shared_cache_registered: bool = false,
@@ -2247,6 +2258,9 @@ pub const HBCIndex = struct {
     hbc_cache_bytes_accounted: u64 = 0,
     detached_hbc_accounting: HbcPhysicalAccounting = .{},
     search_workspace_bytes_accounted: u64 = 0,
+    flat_centroid_directory_bytes_accounted: u64 = 0,
+    flat_centroid_build_bytes_accounted: u64 = 0,
+    flat_centroid_retained_reservation_bytes_accounted: u64 = 0,
     routing_scratch_bytes_accounted: u64 = 0,
     apply_workspace_bytes_accounted: u64 = 0,
     apply_workspace_split_bytes: u64 = 0,
@@ -2267,6 +2281,9 @@ pub const HBCIndex = struct {
     cached_routing_scratch: ?RoutingScratch,
     flat_centroid_mu: std.atomic.Mutex,
     flat_centroid_directory: ?*vectorindex_spfresh_index.FlatCentroidDirectory,
+    flat_centroid_build_mu: std.atomic.Mutex = .unlocked,
+    flat_centroid_build_flight: ?*FlatCentroidBuildFlight = null,
+    flat_centroid_accounting_mu: std.atomic.Mutex = .unlocked,
     dense_route_cost_mu: std.atomic.Mutex = .unlocked,
     dense_route_cost: DenseRouteCostSnapshot = .{},
     write_profile: WriteProfile = .{},
@@ -3403,6 +3420,165 @@ pub const HBCIndex = struct {
         self.releaseCompleteCoverageFlightRef(flight);
     }
 
+    fn releaseFlatCentroidBuildFlightRef(self: *HBCIndex, flight: *FlatCentroidBuildFlight) void {
+        lockAtomic(&self.flat_centroid_build_mu);
+        std.debug.assert(flight.refs > 0);
+        flight.refs -= 1;
+        const destroy = flight.refs == 0;
+        self.flat_centroid_build_mu.unlock();
+        if (destroy) self.alloc.destroy(flight);
+    }
+
+    fn waitForFlatCentroidBuildFlight(
+        self: *HBCIndex,
+        flight: *FlatCentroidBuildFlight,
+        cancellation: ?vectorindex_search_types.CancellationToken,
+    ) !void {
+        defer self.releaseFlatCentroidBuildFlightRef(flight);
+        while (!flight.ready.isSet()) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+            flight.ready.waitTimeout(flight.io, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromMilliseconds(5),
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => continue,
+                error.Canceled => return error.Cancelled,
+            };
+        }
+        if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+    }
+
+    /// Elect one cold directory builder at a time. Waiters sleep through the
+    /// backend runtime and recheck the generation-keyed cache after the owner
+    /// succeeds or fails.
+    pub fn beginFlatCentroidDirectoryBuild(
+        self: *HBCIndex,
+        generation: u64,
+        cancellation: ?vectorindex_search_types.CancellationToken,
+    ) !bool {
+        if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        lockAtomic(&self.flat_centroid_build_mu);
+        if (self.flat_centroid_build_flight) |flight| {
+            flight.refs += 1;
+            self.flat_centroid_build_mu.unlock();
+            try self.waitForFlatCentroidBuildFlight(flight, cancellation);
+            return false;
+        }
+        self.flat_centroid_build_mu.unlock();
+
+        const candidate = try self.alloc.create(FlatCentroidBuildFlight);
+        candidate.* = .{ .generation = generation, .io = self.runtimeIo() };
+        if (cancellation) |token| if (token.isCancelled()) {
+            self.alloc.destroy(candidate);
+            return error.Cancelled;
+        };
+
+        lockAtomic(&self.flat_centroid_build_mu);
+        if (self.flat_centroid_build_flight) |flight| {
+            flight.refs += 1;
+            self.flat_centroid_build_mu.unlock();
+            self.alloc.destroy(candidate);
+            try self.waitForFlatCentroidBuildFlight(flight, cancellation);
+            return false;
+        }
+        self.flat_centroid_build_flight = candidate;
+        self.flat_centroid_build_mu.unlock();
+        return true;
+    }
+
+    pub fn finishFlatCentroidDirectoryBuild(self: *HBCIndex, generation: u64) void {
+        lockAtomic(&self.flat_centroid_build_mu);
+        const flight = self.flat_centroid_build_flight orelse unreachable;
+        std.debug.assert(flight.generation == generation);
+        self.flat_centroid_build_flight = null;
+        self.flat_centroid_build_mu.unlock();
+        flight.ready.set(flight.io);
+        self.releaseFlatCentroidBuildFlightRef(flight);
+    }
+
+    pub fn reserveFlatCentroidDirectoryBuildBytes(
+        self: *HBCIndex,
+        reservation: vectorindex_spfresh_index.FlatCentroidBuildReservation,
+    ) !vectorindex_spfresh_index.FlatCentroidBuildReservation {
+        const transient_next = std.math.add(
+            u64,
+            self.flat_centroid_build_bytes_accounted,
+            reservation.transient_bytes,
+        ) catch return error.ResourceBudgetExceeded;
+        if (self.resource_manager) |manager| {
+            try manager.adjustUsage(.dense_search_working_set, &self.flat_centroid_build_bytes_accounted, transient_next);
+        } else {
+            self.flat_centroid_build_bytes_accounted = transient_next;
+        }
+        errdefer self.releaseFlatCentroidDirectoryBuildBytes(.{
+            .transient_bytes = reservation.transient_bytes,
+        });
+
+        const retained_next = std.math.add(
+            u64,
+            self.flat_centroid_retained_reservation_bytes_accounted,
+            reservation.retained_bytes,
+        ) catch return error.ResourceBudgetExceeded;
+        if (self.resource_manager) |manager| {
+            try manager.adjustUsage(.hbc_node_metadata_cache, &self.flat_centroid_retained_reservation_bytes_accounted, retained_next);
+        } else {
+            self.flat_centroid_retained_reservation_bytes_accounted = retained_next;
+        }
+        return reservation;
+    }
+
+    pub fn releaseFlatCentroidDirectoryBuildBytes(
+        self: *HBCIndex,
+        reservation: vectorindex_spfresh_index.FlatCentroidBuildReservation,
+    ) void {
+        const transient_next = self.flat_centroid_build_bytes_accounted -| reservation.transient_bytes;
+        const retained_next = self.flat_centroid_retained_reservation_bytes_accounted -| reservation.retained_bytes;
+        if (self.resource_manager) |manager| {
+            manager.observeUsage(.dense_search_working_set, &self.flat_centroid_build_bytes_accounted, transient_next);
+            manager.observeUsage(.hbc_node_metadata_cache, &self.flat_centroid_retained_reservation_bytes_accounted, retained_next);
+        } else {
+            self.flat_centroid_build_bytes_accounted = transient_next;
+            self.flat_centroid_retained_reservation_bytes_accounted = retained_next;
+        }
+    }
+
+    fn releaseFlatCentroidDirectoryAccounting(context: *anyopaque, bytes: u64) void {
+        const self: *HBCIndex = @ptrCast(@alignCast(context));
+        lockAtomic(&self.flat_centroid_accounting_mu);
+        defer self.flat_centroid_accounting_mu.unlock();
+        const next = self.flat_centroid_directory_bytes_accounted -| bytes;
+        if (self.resource_manager) |manager| {
+            manager.observeUsage(.hbc_node_metadata_cache, &self.flat_centroid_directory_bytes_accounted, next);
+        } else {
+            self.flat_centroid_directory_bytes_accounted = next;
+        }
+    }
+
+    pub fn accountFlatCentroidDirectory(
+        self: *HBCIndex,
+        directory: *vectorindex_spfresh_index.FlatCentroidDirectory,
+        build_reservation: vectorindex_spfresh_index.FlatCentroidBuildReservation,
+    ) void {
+        const bytes = directory.bytes();
+        std.debug.assert(bytes <= build_reservation.retained_bytes);
+        lockAtomic(&self.flat_centroid_accounting_mu);
+        const next = self.flat_centroid_directory_bytes_accounted +| bytes;
+        if (self.resource_manager) |manager| {
+            manager.observeUsage(.hbc_node_metadata_cache, &self.flat_centroid_directory_bytes_accounted, next);
+        } else {
+            self.flat_centroid_directory_bytes_accounted = next;
+        }
+        directory.accounting_context = self;
+        directory.release_accounting = releaseFlatCentroidDirectoryAccounting;
+        directory.accounted_bytes = bytes;
+        self.flat_centroid_accounting_mu.unlock();
+        // Publish retained ownership before releasing the transient build
+        // reservation, so the same allocation is never invisible to admission.
+        self.releaseFlatCentroidDirectoryBuildBytes(build_reservation);
+    }
+
     pub fn noteCompleteCoverageValidated(self: *HBCIndex, generation: u64) void {
         self.complete_coverage_generation.store(generation, .release);
     }
@@ -3422,6 +3598,7 @@ pub const HBCIndex = struct {
         if (self.resource_manager == resource_manager) {
             self.bind_shared_cache_resource_manager = bind_shared_cache_resource_manager;
             self.ensureSearchWorkspaceReclaimer(resource_manager);
+            self.ensureFlatCentroidReclaimer(resource_manager);
             if (self.shared_cache) |cache| {
                 if (bind_shared_cache_resource_manager) cache.attachResourceManager(resource_manager);
                 return;
@@ -3431,13 +3608,19 @@ pub const HBCIndex = struct {
                     .hbc_node_metadata_cache,
                     self,
                     reclaimLocalForResourceManager,
-                ) catch 0;
+                ) catch |err| blk: {
+                    std.log.err("failed to register local HBC cache reclaimer: {s}", .{@errorName(err)});
+                    break :blk 0;
+                };
             }
             self.refreshAndEnforceHbcCacheUsage(.none());
             return;
         }
 
         const current_search_bytes = self.search_workspace_bytes_accounted;
+        const current_flat_directory_bytes = self.flat_centroid_directory_bytes_accounted;
+        const current_flat_build_bytes = self.flat_centroid_build_bytes_accounted;
+        const current_flat_retained_reservation_bytes = self.flat_centroid_retained_reservation_bytes_accounted;
         const current_routing_bytes = self.routing_scratch_bytes_accounted;
         const current_apply_bytes = self.currentApplyWorkspaceBytes();
         const current_hbc_bytes = if (self.shared_cache == null) self.hbcCacheBytes() else 0;
@@ -3446,12 +3629,20 @@ pub const HBCIndex = struct {
             self.local_reclaimer_identity = 0;
             old_manager.unregisterReclaimer(self.search_workspace_reclaimer_identity);
             self.search_workspace_reclaimer_identity = 0;
+            old_manager.unregisterReclaimer(self.flat_centroid_reclaimer_identity);
+            self.flat_centroid_reclaimer_identity = 0;
             old_manager.observeUsage(.dense_search_working_set, &self.search_workspace_bytes_accounted, 0);
+            old_manager.observeUsage(.dense_search_working_set, &self.flat_centroid_build_bytes_accounted, 0);
+            old_manager.observeUsage(.hbc_node_metadata_cache, &self.flat_centroid_directory_bytes_accounted, 0);
+            old_manager.observeUsage(.hbc_node_metadata_cache, &self.flat_centroid_retained_reservation_bytes_accounted, 0);
             old_manager.observeUsage(.dense_routing_working_set, &self.routing_scratch_bytes_accounted, 0);
             old_manager.observeUsage(.dense_apply_working_set, &self.apply_workspace_bytes_accounted, 0);
             old_manager.observeUsage(.hbc_node_metadata_cache, &self.hbc_cache_bytes_accounted, 0);
         } else {
             self.search_workspace_bytes_accounted = 0;
+            self.flat_centroid_build_bytes_accounted = 0;
+            self.flat_centroid_directory_bytes_accounted = 0;
+            self.flat_centroid_retained_reservation_bytes_accounted = 0;
             self.routing_scratch_bytes_accounted = 0;
             self.apply_workspace_bytes_accounted = 0;
             self.hbc_cache_bytes_accounted = 0;
@@ -3459,10 +3650,14 @@ pub const HBCIndex = struct {
         self.resource_manager = resource_manager;
         self.bind_shared_cache_resource_manager = bind_shared_cache_resource_manager;
         resource_manager.observeUsage(.dense_search_working_set, &self.search_workspace_bytes_accounted, current_search_bytes);
+        resource_manager.observeUsage(.dense_search_working_set, &self.flat_centroid_build_bytes_accounted, current_flat_build_bytes);
+        resource_manager.observeUsage(.hbc_node_metadata_cache, &self.flat_centroid_directory_bytes_accounted, current_flat_directory_bytes);
+        resource_manager.observeUsage(.hbc_node_metadata_cache, &self.flat_centroid_retained_reservation_bytes_accounted, current_flat_retained_reservation_bytes);
         resource_manager.observeUsage(.dense_routing_working_set, &self.routing_scratch_bytes_accounted, current_routing_bytes);
         resource_manager.observeUsage(.dense_apply_working_set, &self.apply_workspace_bytes_accounted, current_apply_bytes);
         self.detached_hbc_accounting.attach(resource_manager);
         self.ensureSearchWorkspaceReclaimer(resource_manager);
+        self.ensureFlatCentroidReclaimer(resource_manager);
         if (self.shared_cache) |cache| {
             if (bind_shared_cache_resource_manager) cache.attachResourceManager(resource_manager);
             return;
@@ -3472,7 +3667,10 @@ pub const HBCIndex = struct {
             .hbc_node_metadata_cache,
             self,
             reclaimLocalForResourceManager,
-        ) catch 0;
+        ) catch |err| blk: {
+            std.log.err("failed to register local HBC cache reclaimer: {s}", .{@errorName(err)});
+            break :blk 0;
+        };
         self.enforceHbcCacheBudget(.none());
     }
 
@@ -3498,7 +3696,39 @@ pub const HBCIndex = struct {
             .dense_search_working_set,
             self,
             reclaimSearchWorkspaceForResourceManager,
-        ) catch 0;
+        ) catch |err| {
+            std.log.err("failed to register HBC search workspace reclaimer: {s}", .{@errorName(err)});
+            return;
+        };
+    }
+
+    fn ensureFlatCentroidReclaimer(
+        self: *HBCIndex,
+        manager: *resource_manager_mod.ResourceManager,
+    ) void {
+        if (self.flat_centroid_reclaimer_identity != 0) return;
+        self.flat_centroid_reclaimer_identity = manager.registerReclaimer(
+            .hbc_node_metadata_cache,
+            self,
+            reclaimFlatCentroidDirectoryForResourceManager,
+        ) catch |err| {
+            std.log.err("failed to register HBC flat centroid directory reclaimer: {s}", .{@errorName(err)});
+            return;
+        };
+    }
+
+    fn flatCentroidDirectoryAccountedBytes(self: *HBCIndex) u64 {
+        lockAtomic(&self.flat_centroid_accounting_mu);
+        defer self.flat_centroid_accounting_mu.unlock();
+        return self.flat_centroid_directory_bytes_accounted;
+    }
+
+    fn reclaimFlatCentroidDirectoryForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
+        const self: *HBCIndex = @ptrCast(@alignCast(context));
+        if (target_bytes == 0) return 0;
+        const before = self.flatCentroidDirectoryAccountedBytes();
+        vectorindex_spfresh_index.clearFlatCentroidDirectory(self);
+        return before -| self.flatCentroidDirectoryAccountedBytes();
     }
 
     fn reclaimSearchWorkspaceForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
@@ -3628,16 +3858,26 @@ pub const HBCIndex = struct {
         handle.accounted_bytes = target_bytes;
     }
 
-    /// Undo a successful pre-admission when the corresponding allocation
-    /// fails. Shrink is always permitted by ResourceManager.
+    /// Reconcile a failed pre-admitted growth to the memory the allocator
+    /// actually retained. A realloc or a sequence of allocations may have
+    /// succeeded partially before the failure, so rolling all the way back to
+    /// the old value would temporarily make live memory invisible.
     pub fn rollbackSearchScratchBytes(self: *HBCIndex, handle: *ScratchHandle, previous_bytes: u64) void {
-        if (previous_bytes >= handle.accounted_bytes) return;
         lockAtomic(&self.scratch_mu);
         defer self.scratch_mu.unlock();
 
-        const delta = handle.accounted_bytes - previous_bytes;
-        self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| delta);
-        handle.accounted_bytes = previous_bytes;
+        const live_bytes = handle.scratch.bytes();
+        const reconciled_bytes = @max(previous_bytes, live_bytes);
+        if (reconciled_bytes > handle.accounted_bytes) {
+            self.observeSearchWorkspaceBytes(
+                self.search_workspace_bytes_accounted +| (reconciled_bytes - handle.accounted_bytes),
+            );
+        } else if (reconciled_bytes < handle.accounted_bytes) {
+            self.observeSearchWorkspaceBytes(
+                self.search_workspace_bytes_accounted -| (handle.accounted_bytes - reconciled_bytes),
+            );
+        }
+        handle.accounted_bytes = reconciled_bytes;
     }
 
     /// Reconcile post-request shrink under the same serialization used for
@@ -4087,6 +4327,8 @@ pub const HBCIndex = struct {
             self.local_reclaimer_identity = 0;
             manager.unregisterReclaimer(self.search_workspace_reclaimer_identity);
             self.search_workspace_reclaimer_identity = 0;
+            manager.unregisterReclaimer(self.flat_centroid_reclaimer_identity);
+            self.flat_centroid_reclaimer_identity = 0;
         }
         if (self.shared_cache == null) {
             self.clearNodeCache();
@@ -4122,6 +4364,12 @@ pub const HBCIndex = struct {
             scratch.deinit(self.alloc);
         }
         vectorindex_spfresh_index.clearFlatCentroidDirectory(self);
+        std.debug.assert(self.flat_centroid_directory_bytes_accounted == 0);
+        std.debug.assert(self.flat_centroid_build_bytes_accounted == 0);
+        std.debug.assert(self.flat_centroid_retained_reservation_bytes_accounted == 0);
+        lockAtomic(&self.flat_centroid_build_mu);
+        std.debug.assert(self.flat_centroid_build_flight == null);
+        self.flat_centroid_build_mu.unlock();
         lockAtomic(&self.published_flight_mu);
         std.debug.assert(self.published_flight == null);
         const published_spare_flight = self.published_spare_flight;
@@ -8922,6 +9170,40 @@ test "complete coverage validation waiter honors cancellation without canceling 
     try std.testing.expect(!try idx.beginCompleteCoverageValidation(generation, null));
 }
 
+test "flat centroid build single flight waits on backend runtime" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    idx.setIo(io);
+
+    const generation = idx.publishedGeneration();
+    try std.testing.expect(try idx.beginFlatCentroidDirectoryBuild(generation, null));
+    var owner_active = true;
+    defer if (owner_active) idx.finishFlatCentroidDirectoryBuild(generation);
+
+    const Waiter = struct {
+        fn run(index: *HBCIndex, expected_generation: u64) !bool {
+            return try index.beginFlatCentroidDirectoryBuild(expected_generation, null);
+        }
+    };
+    var waiter = std.Io.async(io, Waiter.run, .{ &idx, generation });
+    try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    idx.finishFlatCentroidDirectoryBuild(generation);
+    owner_active = false;
+    try std.testing.expect(!try waiter.await(io));
+
+    try std.testing.expect(try idx.beginFlatCentroidDirectoryBuild(generation, null));
+    idx.finishFlatCentroidDirectoryBuild(generation);
+}
+
 test "search publication wait uses runtime wakeups and honors cancellation" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -10936,6 +11218,143 @@ test "hbc search scratch reports bytes to resource manager" {
 
     idx.close();
     try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.dense_search_working_set).used_bytes);
+}
+
+test "failed search scratch reservation keeps partially grown buffers accounted" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 4 });
+    var idx_open = true;
+    defer if (idx_open) idx.close();
+    idx.attachResourceManager(&resource_manager);
+
+    var handle = try idx.acquireSearchScratch();
+    const previous = handle.accounted_bytes;
+    try idx.reserveSearchScratchBytes(&handle, previous + 1024 * 1024);
+    try handle.scratch.ensureFlatProbeCapacity(alloc, 32, true);
+    const live = handle.scratch.bytes();
+    try std.testing.expect(live > previous);
+
+    idx.rollbackSearchScratchBytes(&handle, previous);
+    try std.testing.expectEqual(live, handle.accounted_bytes);
+    try std.testing.expectEqual(live, resource_manager.sliceStats(.dense_search_working_set).used_bytes);
+
+    idx.releaseSearchScratch(&handle);
+    idx.close();
+    idx_open = false;
+    try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.dense_search_working_set).used_bytes);
+}
+
+test "cold flat centroid build preadmits transient and retained memory" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const dims: usize = 8;
+    const block_size: usize = 16;
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = dims,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 16,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .flat_centroid_block_size = block_size,
+    });
+    var idx_open = true;
+    defer if (idx_open) idx.close();
+    var vector: [dims]f32 = undefined;
+    for (0..48) |i| {
+        for (&vector, 0..) |*value, dim| value.* = @floatFromInt(i + dim);
+        try idx.insert(@intCast(i + 1), &vector);
+    }
+    idx.clearNodeCache();
+    idx.clearQuantizedCache();
+    idx.clearVectorCache();
+    idx.clearMetadataCache();
+
+    const projection = try vectorindex_spfresh_index.projectedFlatCentroidDirectoryBuildBytes(
+        idx.publishedNodeCount(),
+        dims,
+        block_size,
+        @max(idx.config.leaf_size, idx.config.branching_factor),
+    );
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .hard_limit_bytes = projection.retained_bytes - 1,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer {
+        idx.close();
+        idx_open = false;
+        resource_manager.deinit(alloc);
+    }
+    idx.attachResourceManager(&resource_manager);
+    @memset(&vector, 0);
+
+    try std.testing.expectError(error.ResourceBudgetExceeded, idx.searchWithRequest(.{
+        .query = &vector,
+        .k = 3,
+        .load_metadata = false,
+    }));
+    try std.testing.expect(idx.flat_centroid_directory == null);
+    try std.testing.expectEqual(@as(u64, 0), idx.flat_centroid_build_bytes_accounted);
+    try std.testing.expectEqual(@as(u64, 0), idx.flat_centroid_retained_reservation_bytes_accounted);
+    try std.testing.expect(resource_manager.sliceStats(.hbc_node_metadata_cache).hard_limit_rejections > 0);
+}
+
+test "flat centroid directory stays accounted until its final reference" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 4,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .flat_centroid_block_size = 8,
+    });
+    var idx_open = true;
+    defer if (idx_open) idx.close();
+    for (0..32) |i| {
+        const value: f32 = @floatFromInt(i);
+        try idx.insert(@intCast(i + 1), &.{ value, value, value, value });
+    }
+    idx.attachResourceManager(&resource_manager);
+    var results = try idx.searchWithRequest(.{
+        .query = &.{ 0, 0, 0, 0 },
+        .k = 3,
+        .load_metadata = false,
+    });
+    results.deinit();
+
+    const directory_bytes = idx.flat_centroid_directory_bytes_accounted;
+    try std.testing.expect(directory_bytes > 0);
+    const retained_directory = idx.flat_centroid_directory orelse return error.TestUnexpectedResult;
+    retained_directory.retain();
+    const before = resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes;
+    vectorindex_spfresh_index.clearFlatCentroidDirectory(&idx);
+    try std.testing.expectEqual(directory_bytes, idx.flat_centroid_directory_bytes_accounted);
+    retained_directory.release(alloc);
+    try std.testing.expectEqual(@as(u64, 0), idx.flat_centroid_directory_bytes_accounted);
+    try std.testing.expectEqual(
+        directory_bytes,
+        before - resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes,
+    );
+
+    idx.close();
+    idx_open = false;
 }
 
 test "exhaustive search workspace is admitted before growth and released after rejection" {

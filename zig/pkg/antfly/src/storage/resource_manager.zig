@@ -323,10 +323,10 @@ pub const Options = struct {
     query_embedding_cache_bytes: usize = 64 * 1024 * 1024,
     query_embedding_cache_ttl_ns: u64 = 5 * std.time.ns_per_min,
     query_embedding_max_inflight: usize = 16,
-    /// Allocates identity tables only as concurrent reservations/observers
-    /// exceed their previous high-water mark. Production owners should pass
-    /// their lifetime allocator; the page allocator keeps lightweight tests
-    /// source-compatible.
+    /// Allocates identity tables and the reclaimer registry only as concurrent
+    /// owners exceed their previous high-water mark. Production owners should
+    /// pass their lifetime allocator; the page allocator keeps lightweight
+    /// tests source-compatible.
     identity_allocator: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn defaultBudgets() [slice_count]Budget {
@@ -625,7 +625,7 @@ const ObserverKey = struct {
 
 /// A cache-owned, synchronous shrink callback. ResourceManager never invokes
 /// it while holding either the accounting or reclaimer mutex. Unregistration
-/// retires the fixed slot and waits for its callback leases to drain, so an
+/// retires the stable slot and waits for its callback leases to drain, so an
 /// owner can destroy its callback context immediately after unregister returns.
 pub const ReclaimerFn = *const fn (context: *anyopaque, target_bytes: u64) u64;
 
@@ -651,12 +651,14 @@ pub const ReclaimerOptions = struct {
     weight: u32 = 1,
 };
 
-const max_reclaimers: usize = 128;
-
 pub const ResourceManager = struct {
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
-    reclaimers: [max_reclaimers]ReclaimerSlot = .{ReclaimerSlot{}} ** max_reclaimers,
+    // Slots are never compacted while the manager is live: an invocation can
+    // safely retain its index while its callback runs without holding the
+    // registry mutex. Empty slots are reused, and the list grows on the
+    // registration path instead of imposing a process-wide index-count cap.
+    reclaimers: std.ArrayListUnmanaged(ReclaimerSlot) = .empty,
     next_reclaimer_identity: u64 = 1,
     reclaimer_cursor: usize = 0,
     reclaim_requests: std.atomic.Value(u64) = .init(0),
@@ -739,7 +741,7 @@ pub const ResourceManager = struct {
     ) !u64 {
         lockAtomic(&self.reclaimer_mutex);
         defer self.reclaimer_mutex.unlock();
-        for (&self.reclaimers) |*slot| {
+        for (self.reclaimers.items) |*slot| {
             if (slot.identity != 0) continue;
             const identity = self.next_reclaimer_identity;
             self.next_reclaimer_identity +%= 1;
@@ -753,7 +755,17 @@ pub const ResourceManager = struct {
             };
             return identity;
         }
-        return error.TooManyResourceReclaimers;
+        const identity = self.next_reclaimer_identity;
+        self.next_reclaimer_identity +%= 1;
+        if (self.next_reclaimer_identity == 0) self.next_reclaimer_identity = 1;
+        try self.reclaimers.append(self.identity_allocator, .{
+            .identity = identity,
+            .slice = slice,
+            .context = context,
+            .reclaim = reclaim,
+            .weight = @max(@as(u32, 1), options.weight),
+        });
+        return identity;
     }
 
     pub fn unregisterReclaimer(self: *ResourceManager, identity: u64) void {
@@ -761,7 +773,7 @@ pub const ResourceManager = struct {
         while (true) {
             lockAtomic(&self.reclaimer_mutex);
             var found = false;
-            for (&self.reclaimers) |*slot| {
+            for (self.reclaimers.items) |*slot| {
                 if (slot.identity != identity) continue;
                 found = true;
                 slot.retiring = true;
@@ -781,7 +793,8 @@ pub const ResourceManager = struct {
     fn releaseReclaimerInvocation(self: *ResourceManager, invocation: ReclaimerInvocation) void {
         lockAtomic(&self.reclaimer_mutex);
         defer self.reclaimer_mutex.unlock();
-        const slot = &self.reclaimers[invocation.slot_index];
+        if (invocation.slot_index >= self.reclaimers.items.len) return;
+        const slot = &self.reclaimers.items[invocation.slot_index];
         if (slot.identity != invocation.identity) return;
         std.debug.assert(slot.in_flight > 0);
         slot.in_flight -= 1;
@@ -803,10 +816,12 @@ pub const ResourceManager = struct {
                 (self.memory.used_bytes +| additional_bytes) -| memory_hard;
             const requester_state = &self.slices[sliceIndex(requester)];
             const slice_hard = requester_state.budget.hard_limit_bytes;
-            // Only dense search currently has reclaimable retained capacity in
-            // the requester's own slice. Do not evict unrelated caches for a
-            // hard-limit violation they cannot resolve.
-            const slice_target = if (requester != .dense_search_working_set or slice_hard == 0)
+            // Dense scratch and HBC metadata both have reclaimers in their own
+            // slices. Do not evict unrelated caches for a hard-limit violation
+            // they cannot resolve.
+            const requester_slice_reclaimable = requester == .dense_search_working_set or
+                requester == .hbc_node_metadata_cache;
+            const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
                 0
             else
                 (requester_state.used_bytes +| additional_bytes) -| slice_hard;
@@ -817,35 +832,48 @@ pub const ResourceManager = struct {
 
         _ = self.reclaim_requests.fetchAdd(1, .monotonic);
         var reclaimed: u64 = 0;
-        var visited_identities: [max_reclaimers]u64 = undefined;
-        var visited_count: usize = 0;
         lockAtomic(&self.reclaimer_mutex);
-        const start_cursor = self.reclaimer_cursor;
-        self.reclaimer_cursor = (self.reclaimer_cursor + 1) % self.reclaimers.len;
+        const scan_len = self.reclaimers.items.len;
+        if (scan_len == 0) {
+            self.reclaimer_mutex.unlock();
+            return 0;
+        }
+        const start_cursor = self.reclaimer_cursor % scan_len;
+        self.reclaimer_cursor = (start_cursor + 1) % scan_len;
+        // A registration can reuse an empty slot while callbacks execute.
+        // Restrict this bounded pass to identities that existed at its start,
+        // so the pressure path neither revisits a slot nor allocates memory.
+        const identity_cutoff = self.next_reclaimer_identity -% 1;
         self.reclaimer_mutex.unlock();
         // Idle search scratch is cheaper to reconstruct than cached index or
         // table content. Include the requester's own search slice so one index
         // can reuse capacity retained by another; callbacks use non-blocking
         // owner locks and therefore skip an in-flight scratch handle safely.
         for ([_]Slice{ .dense_search_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache }) |candidate_slice| {
-            if (candidate_slice == requester and candidate_slice != .dense_search_working_set) continue;
-            while (visited_count < max_reclaimers) {
+            if (candidate_slice == requester and
+                candidate_slice != .dense_search_working_set and
+                candidate_slice != .hbc_node_metadata_cache) continue;
+            var remaining_weight: u64 = 0;
+            lockAtomic(&self.reclaimer_mutex);
+            for (0..scan_len) |offset| {
+                const index = (start_cursor + offset) % scan_len;
+                const slot = &self.reclaimers.items[index];
+                if (slot.identity == 0 or slot.identity > identity_cutoff or
+                    slot.retiring or slot.slice != candidate_slice) continue;
+                remaining_weight +|= slot.weight;
+            }
+            self.reclaimer_mutex.unlock();
+
+            for (0..scan_len) |offset| {
                 lockAtomic(&self.reclaimer_mutex);
-                var remaining_weight: u64 = 0;
-                var selected_index: ?usize = null;
-                for (0..self.reclaimers.len) |offset| {
-                    const index = (start_cursor + offset) % self.reclaimers.len;
-                    const slot = &self.reclaimers[index];
-                    if (slot.identity == 0 or slot.retiring or slot.slice != candidate_slice) continue;
-                    if (std.mem.indexOfScalar(u64, visited_identities[0..visited_count], slot.identity) != null) continue;
-                    remaining_weight +|= slot.weight;
-                    if (selected_index == null) selected_index = index;
-                }
-                const index = selected_index orelse {
+                const index = (start_cursor + offset) % scan_len;
+                const slot = &self.reclaimers.items[index];
+                if (slot.identity == 0 or slot.identity > identity_cutoff or
+                    slot.retiring or slot.slice != candidate_slice)
+                {
                     self.reclaimer_mutex.unlock();
-                    break;
-                };
-                const slot = &self.reclaimers[index];
+                    continue;
+                }
                 const invocation = ReclaimerInvocation{
                     .slot_index = index,
                     .identity = slot.identity,
@@ -854,13 +882,12 @@ pub const ResourceManager = struct {
                     .weight = slot.weight,
                 };
                 slot.in_flight += 1;
-                visited_identities[visited_count] = slot.identity;
-                visited_count += 1;
                 const remaining_target = target_bytes -| reclaimed;
                 const fair_target = if (remaining_weight <= invocation.weight)
                     remaining_target
                 else
                     @max(@as(u64, 1), mulDivSaturating(remaining_target, invocation.weight, remaining_weight));
+                remaining_weight -|= invocation.weight;
                 self.reclaimer_mutex.unlock();
 
                 reclaimed +|= invocation.reclaim(invocation.context, fair_target);
@@ -975,6 +1002,15 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        lockAtomic(&self.reclaimer_mutex);
+        for (self.reclaimers.items) |slot| {
+            if (slot.identity != 0 or slot.in_flight != 0)
+                @panic("resource manager deinitialized with live reclaimers");
+        }
+        self.reclaimers.deinit(self.identity_allocator);
+        self.reclaimers = .empty;
+        self.reclaimer_mutex.unlock();
+
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         var it = self.capacity_domains.valueIterator();
@@ -3271,6 +3307,35 @@ test "dense search admission reclaims retained scratch from its own slice" {
     try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.dense_search_working_set).used_bytes);
 }
 
+test "HBC admission reclaims retained metadata from its own slice" {
+    const ReclaimContext = struct {
+        manager: *ResourceManager,
+        accounted: u64,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.hbc_node_metadata_cache, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var retained = ReclaimContext{ .manager = &manager, .accounted = 0 };
+    manager.observeUsage(.hbc_node_metadata_cache, &retained.accounted, 80);
+    const identity = try manager.registerReclaimer(.hbc_node_metadata_cache, &retained, ReclaimContext.reclaim);
+    defer manager.unregisterReclaimer(identity);
+
+    var active: u64 = 0;
+    try manager.adjustUsage(.hbc_node_metadata_cache, &active, 30);
+    try std.testing.expectEqual(@as(u64, 70), retained.accounted);
+    try std.testing.expectEqual(@as(u64, 30), active);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+}
+
 test "resource manager apportions reclaim across weighted cache owners" {
     const ReclaimContext = struct {
         manager: *ResourceManager,
@@ -3338,6 +3403,39 @@ test "resource manager invokes reclaimers without holding registry mutex" {
     try std.testing.expectEqual(@as(u64, 5), manager.reclaimForAllocation(.dense_apply_working_set, 10));
     try std.testing.expectEqual(@as(u64, 1), retiring.calls);
     try std.testing.expectEqual(@as(u64, 0), passive.calls);
+}
+
+test "resource manager grows reclaimer registry beyond 128 owners" {
+    const owner_count = 257;
+    const PassiveContext = struct {
+        calls: u64 = 0,
+
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 0;
+        }
+    };
+
+    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var contexts = [_]PassiveContext{.{}} ** owner_count;
+    var identities: [owner_count]u64 = undefined;
+    for (&contexts, 0..) |*context, index| {
+        identities[index] = try manager.registerReclaimer(
+            .hbc_node_metadata_cache,
+            context,
+            PassiveContext.reclaim,
+        );
+    }
+    defer for (identities) |identity| manager.unregisterReclaimer(identity);
+
+    var accounted: u64 = 0;
+    manager.observeUsage(.hbc_node_metadata_cache, &accounted, 100);
+    try std.testing.expectEqual(@as(u64, 0), manager.reclaimForAllocation(.dense_apply_working_set, 1));
+    var calls: u64 = 0;
+    for (contexts) |context| calls += context.calls;
+    try std.testing.expectEqual(@as(u64, owner_count), calls);
 }
 
 test "classified batch chooses foreground requester when cache slice is first" {

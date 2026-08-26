@@ -2376,8 +2376,8 @@ fn searchProfiledRequestAttempt(
     const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
     const root_node_id = published_snapshot.root_node;
 
+    const previous_accounted_bytes = scratch_handle.accounted_bytes;
     if (exhaustive_coverage) {
-        const previous_accounted_bytes = scratch_handle.accounted_bytes;
         if (comptime @hasDecl(Index, "reserveSearchScratchBytes")) {
             const assignment_capacity = if (coverage_tracker.enabled)
                 CompleteCoverageTracker.assignment_batch_size
@@ -2389,10 +2389,12 @@ fn searchProfiledRequestAttempt(
             );
             try self.reserveSearchScratchBytes(&scratch_handle, target_bytes);
         }
-        errdefer if (comptime @hasDecl(Index, "rollbackSearchScratchBytes")) {
-            self.rollbackSearchScratchBytes(&scratch_handle, previous_accounted_bytes);
-        };
     }
+    errdefer if (exhaustive_coverage) {
+        if (comptime @hasDecl(Index, "rollbackSearchScratchBytes")) {
+            self.rollbackSearchScratchBytes(&scratch_handle, previous_accounted_bytes);
+        }
+    };
     try coverage_tracker.prepare(self, scratch);
     if (exhaustive_coverage) try scratch.resetCoverageVisited(self.alloc, published_snapshot.node_count);
 

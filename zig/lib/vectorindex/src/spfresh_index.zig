@@ -44,6 +44,9 @@ pub const FlatCentroidDirectory = struct {
     posting_count: usize = 0,
     missing_node_count: usize = 0,
     invalid_posting_count: usize = 0,
+    accounting_context: ?*anyopaque = null,
+    release_accounting: ?*const fn (*anyopaque, u64) void = null,
+    accounted_bytes: u64 = 0,
 
     pub fn retain(self: *FlatCentroidDirectory) void {
         _ = self.ref_count.fetchAdd(1, .acq_rel);
@@ -56,15 +59,87 @@ pub const FlatCentroidDirectory = struct {
     }
 
     fn deinit(self: *FlatCentroidDirectory, alloc: std.mem.Allocator) void {
+        const accounting_context = self.accounting_context;
+        const release_accounting = self.release_accounting;
+        const accounted_bytes = self.accounted_bytes;
         for (self.blocks) |*block| block.deinit(alloc);
         alloc.free(self.blocks);
         self.* = .{};
+        if (release_accounting) |release_fn| release_fn(accounting_context.?, accounted_bytes);
     }
 
     fn complete(self: *const FlatCentroidDirectory) bool {
         return self.missing_node_count == 0 and self.invalid_posting_count == 0;
     }
+
+    pub fn bytes(self: *const FlatCentroidDirectory) u64 {
+        var total: u64 = @sizeOf(FlatCentroidDirectory) +|
+            @as(u64, @intCast(self.blocks.len * @sizeOf(FlatCentroidBlock)));
+        for (self.blocks) |*block| {
+            total +|= @as(u64, @intCast(block.posting_ids.len * @sizeOf(u64)));
+            total +|= @as(u64, @intCast(block.covering_radii.len * @sizeOf(f32)));
+            total +|= @as(u64, @intCast(block.quantized.centroid.len * @sizeOf(f32)));
+            total +|= @as(u64, @intCast(block.quantized.codes.data.len * @sizeOf(u64)));
+            total +|= @as(u64, @intCast(block.quantized.code_counts.len * @sizeOf(u32)));
+            total +|= @as(u64, @intCast(block.quantized.centroid_distances.len * @sizeOf(f32)));
+            total +|= @as(u64, @intCast(block.quantized.quantized_dot_products.len * @sizeOf(f32)));
+            total +|= @as(u64, @intCast(block.quantized.centroid_dot_products.len * @sizeOf(f32)));
+        }
+        return total;
+    }
 };
+
+fn checkedAddMul(total: *u64, count: u64, element_size: u64) !void {
+    const bytes = std.math.mul(u64, count, element_size) catch return error.OutOfMemory;
+    total.* = std.math.add(u64, total.*, bytes) catch return error.OutOfMemory;
+}
+
+pub const FlatCentroidBuildReservation = struct {
+    transient_bytes: u64 = 0,
+    retained_bytes: u64 = 0,
+
+    fn empty(self: @This()) bool {
+        return self.transient_bytes == 0 and self.retained_bytes == 0;
+    }
+};
+
+/// Conservative peak allocation for a cold flat-directory build. It covers
+/// the retained RaBitQ output for the worst case (every published node is a
+/// leaf), traversal arrays, raw centroid blocks, and RaBitQ's normalization
+/// workspace. ArrayList growth is budgeted at twice its logical capacity.
+pub fn projectedFlatCentroidDirectoryBuildBytes(
+    node_count: u64,
+    dims: usize,
+    block_size_raw: usize,
+    max_node_entries: usize,
+) !FlatCentroidBuildReservation {
+    const block_size = @max(block_size_raw, @as(usize, 1));
+    const block_count = std.math.divCeil(u64, node_count, @as(u64, @intCast(block_size))) catch return error.OutOfMemory;
+    const code_width = std.math.divCeil(u64, @as(u64, @intCast(dims)), 64) catch return error.OutOfMemory;
+    const visited_words = std.math.divCeil(u64, node_count, @bitSizeOf(usize)) catch return error.OutOfMemory;
+
+    var retained: u64 = @sizeOf(FlatCentroidDirectory);
+    // Retained directory and its worst-case block-array capacity.
+    try checkedAddMul(&retained, @max(block_count *| 2, 16), @sizeOf(FlatCentroidBlock));
+    try checkedAddMul(&retained, node_count, @sizeOf(u64) + @sizeOf(f32));
+    try checkedAddMul(&retained, node_count, code_width *| @sizeOf(u64));
+    try checkedAddMul(&retained, node_count, 4 * @sizeOf(f32) + @sizeOf(u32));
+    try checkedAddMul(&retained, block_count, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    // Traversal and block construction workspace. Quantization temporarily
+    // holds a normalized copy alongside the raw centroid block.
+    var transient: u64 = 0;
+    try checkedAddMul(&transient, @max(node_count *| 2, 16), @sizeOf(u64));
+    try checkedAddMul(&transient, visited_words, @sizeOf(usize));
+    try checkedAddMul(&transient, @intCast(block_size), @sizeOf(u64) + @sizeOf(f32));
+    try checkedAddMul(&transient, @intCast(block_size), @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    try checkedAddMul(&transient, @min(node_count, @as(u64, @intCast(block_size))), @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    try checkedAddMul(&transient, 1, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    // One decoded node is live at a time while traversing the directory.
+    try checkedAddMul(&transient, 1, @sizeOf(types.Node));
+    try checkedAddMul(&transient, 1, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    try checkedAddMul(&transient, @intCast(max_node_entries), @sizeOf(u64));
+    return .{ .transient_bytes = transient, .retained_bytes = retained };
+}
 
 pub const FlatCentroidProbe = search_types.FlatCentroidProbe;
 const cancellable_flat_sort_chunk_size: usize = 4_096;
@@ -414,6 +489,13 @@ fn snapshotStillPublished(self: anytype, snapshot: PublishedSnapshot) bool {
         publishedNodeCountSnapshot(self) == snapshot.node_count;
 }
 
+fn finishFlatCentroidBuildIfSupported(self: anytype, generation: u64) void {
+    const Index = comptime @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild")) {
+        self.finishFlatCentroidDirectoryBuild(generation);
+    }
+}
+
 fn appendFlatCentroidBlock(
     self: anytype,
     blocks: *std.ArrayListUnmanaged(FlatCentroidBlock),
@@ -561,62 +643,12 @@ fn acquireFlatCentroidDirectory(
     expected_snapshot: ?PublishedSnapshot,
     cancellation: ?search_types.CancellationToken,
 ) !*FlatCentroidDirectory {
-    // Complete-snapshot callers already hold a generation-bound read txn. A
-    // matching shared directory is safe to reuse; otherwise build through that
-    // txn so a concurrent publication cannot mix topology from two generations,
-    // then publish it only if the captured generation is still current.
-    if (expected_snapshot) |snapshot| {
-        lockAtomicMutex(&self.flat_centroid_mu);
-        if (self.flat_centroid_directory) |directory| {
-            if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
-                directory.retain();
-                self.flat_centroid_mu.unlock();
-                return directory;
-            }
-        }
-        self.flat_centroid_mu.unlock();
-
-        const built = try self.alloc.create(FlatCentroidDirectory);
-        errdefer self.alloc.destroy(built);
-        built.* = try buildFlatCentroidDirectory(
-            self,
-            txn,
-            snapshot.root_node,
-            snapshot.node_count,
-            snapshot.publish_generation,
-            cancellation,
-        );
-        errdefer built.deinit(self.alloc);
-
-        // Install a stable complete-search build into the same generation-keyed
-        // cache used by best-effort search. The publication path clears this
-        // cache while holding the same mutex after making generation odd, so a
-        // stale directory cannot be installed behind an invalidation.
-        var stale: ?*FlatCentroidDirectory = null;
-        lockAtomicMutex(&self.flat_centroid_mu);
-        if (!snapshotStillPublished(self, snapshot)) {
-            self.flat_centroid_mu.unlock();
-            return built;
-        }
-        if (self.flat_centroid_directory) |directory| {
-            if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
-                directory.retain();
-                self.flat_centroid_mu.unlock();
-                built.deinit(self.alloc);
-                self.alloc.destroy(built);
-                return directory;
-            }
-            stale = directory;
-        }
-        built.retain();
-        self.flat_centroid_directory = built;
-        self.flat_centroid_mu.unlock();
-        if (stale) |directory| directory.release(self.alloc);
-        return built;
-    }
-
+    const Index = comptime @TypeOf(self.*);
     while (true) {
-        const snapshot = try loadStablePublishedSnapshot(self, cancellation);
+        // Complete callers retain the generation-bound transaction supplied by
+        // their snapshot. Best-effort callers open a fresh runtime transaction
+        // for the elected build owner below.
+        const snapshot = expected_snapshot orelse try loadStablePublishedSnapshot(self, cancellation);
 
         var stale: ?*FlatCentroidDirectory = null;
         lockAtomicMutex(&self.flat_centroid_mu);
@@ -632,10 +664,33 @@ fn acquireFlatCentroidDirectory(
         self.flat_centroid_mu.unlock();
         if (stale) |directory| directory.release(self.alloc);
 
+        if (comptime @hasDecl(Index, "beginFlatCentroidDirectoryBuild")) {
+            if (!try self.beginFlatCentroidDirectoryBuild(snapshot.publish_generation, cancellation)) continue;
+        }
+        var build_flight_open = comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild");
+        defer if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation);
+
+        var build_reservation: FlatCentroidBuildReservation = .{};
+        if (comptime @hasDecl(Index, "reserveFlatCentroidDirectoryBuildBytes")) {
+            build_reservation = try self.reserveFlatCentroidDirectoryBuildBytes(
+                try projectedFlatCentroidDirectoryBuildBytes(
+                    snapshot.node_count,
+                    @intCast(self.config.dims),
+                    self.config.flat_centroid_block_size,
+                    @max(self.config.leaf_size, self.config.branching_factor),
+                ),
+            );
+        }
+        var build_reservation_open = !build_reservation.empty();
+        errdefer if (comptime @hasDecl(Index, "releaseFlatCentroidDirectoryBuildBytes")) {
+            if (build_reservation_open) self.releaseFlatCentroidDirectoryBuildBytes(build_reservation);
+        };
+
         const built = try self.alloc.create(FlatCentroidDirectory);
         errdefer self.alloc.destroy(built);
-        const Index = comptime @TypeOf(self.*);
-        if (comptime @hasDecl(Index, "beginRuntimeSearchTxn")) {
+        if (expected_snapshot != null) {
+            built.* = try buildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
+        } else if (comptime @hasDecl(Index, "beginRuntimeSearchTxn")) {
             var build_txn = try self.beginRuntimeSearchTxn();
             defer build_txn.abort();
             built.* = try buildFlatCentroidDirectory(self, &build_txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
@@ -643,24 +698,45 @@ fn acquireFlatCentroidDirectory(
             built.* = try buildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
         }
         errdefer built.deinit(self.alloc);
+        if (comptime @hasDecl(Index, "accountFlatCentroidDirectory")) {
+            self.accountFlatCentroidDirectory(built, build_reservation);
+            build_reservation_open = false;
+        } else if (comptime @hasDecl(Index, "releaseFlatCentroidDirectoryBuildBytes")) {
+            if (build_reservation_open) {
+                self.releaseFlatCentroidDirectoryBuildBytes(build_reservation);
+                build_reservation_open = false;
+            }
+        }
 
-        const current = try loadStablePublishedSnapshot(self, cancellation);
-        if (current.root_node != snapshot.root_node or
-            current.node_count != snapshot.node_count or
-            current.publish_generation != snapshot.publish_generation)
-        {
-            built.deinit(self.alloc);
-            self.alloc.destroy(built);
-            continue;
+        if (expected_snapshot == null) {
+            const current = try loadStablePublishedSnapshot(self, cancellation);
+            if (current.root_node != snapshot.root_node or
+                current.node_count != snapshot.node_count or
+                current.publish_generation != snapshot.publish_generation)
+            {
+                built.deinit(self.alloc);
+                self.alloc.destroy(built);
+                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation);
+                build_flight_open = false;
+                continue;
+            }
         }
 
         lockAtomicMutex(&self.flat_centroid_mu);
+        if (expected_snapshot != null and !snapshotStillPublished(self, snapshot)) {
+            self.flat_centroid_mu.unlock();
+            if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation);
+            build_flight_open = false;
+            return built;
+        }
         if (self.flat_centroid_directory) |directory| {
             if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
                 directory.retain();
                 self.flat_centroid_mu.unlock();
                 built.deinit(self.alloc);
                 self.alloc.destroy(built);
+                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation);
+                build_flight_open = false;
                 return directory;
             }
             stale = directory;
@@ -672,6 +748,8 @@ fn acquireFlatCentroidDirectory(
         self.flat_centroid_directory = built;
         self.flat_centroid_mu.unlock();
         if (stale) |directory| directory.release(self.alloc);
+        if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation);
+        build_flight_open = false;
         return built;
     }
 }
