@@ -7688,9 +7688,11 @@ func haRejoinFenceReceipt(status *antflyv1.HAStatus, identity *antflyv1.HAReplic
 	if identity == nil {
 		return adminsdk.HAFenceReceipt{}, false
 	}
-	if promotion.OldPrimaryID != identity.CurrentPrimaryID ||
-		promotion.ParentTimelineID != identity.TimelineID ||
-		promotion.ParentEpoch != identity.Epoch {
+	// Colony adopts the promoted topology before former-primary repair. Accept
+	// either exact side of this one promotion receipt so the already-completed
+	// fence remains usable after that declarative identity advance. Unrelated,
+	// stale, and cross-topology identities still fail closed.
+	if !haIdentityMatchesPromotionParentOrChild(identity, promotion) {
 		return adminsdk.HAFenceReceipt{}, false
 	}
 	receiptIdentity := haAdminIdentityRequestFromSpec(identity)

@@ -5281,6 +5281,59 @@ func TestReconcileHAAdminJobsExecutesRejoinWorkflowViaAdminAPI(t *testing.T) {
 	g.Expect(jobs.Items).To(BeEmpty())
 }
 
+func TestHARejoinFenceReceiptSurvivesPromotionIdentityAdoption(t *testing.T) {
+	g := NewWithT(t)
+	promotion := &antflyv1.HAPromotionStatus{
+		ClusterID:         100,
+		ShardID:           10,
+		TableID:           20,
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  4,
+		ParentEpoch:       6,
+		NewTimelineID:     5,
+		NewEpoch:          7,
+		RequiredLSN:       12,
+		ObservedLSN:       13,
+		FenceGeneration:   3,
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceToken:        "ha-fence-token",
+		FenceReason:       "LeaseAcquired",
+	}
+	status := &antflyv1.HAStatus{LastPromotion: promotion}
+	identities := map[string]*antflyv1.HAReplicationIdentitySpec{
+		"parent": {
+			ClusterID: 100, ShardID: 10, TableID: 20,
+			TimelineID: 4, Epoch: 6, CurrentPrimaryID: "primary-a",
+		},
+		"adopted-child": {
+			ClusterID: 100, ShardID: 10, TableID: 20,
+			TimelineID: 5, Epoch: 7, CurrentPrimaryID: "standby-a",
+		},
+	}
+	for name, identity := range identities {
+		t.Run(name, func(t *testing.T) {
+			receipt, ok := haRejoinFenceReceipt(status, identity)
+			NewWithT(t).Expect(ok).To(BeTrue())
+			NewWithT(t).Expect(receipt.Identity.TimelineId).To(Equal(uint64(5)))
+			NewWithT(t).Expect(receipt.Identity.Epoch).To(Equal(uint64(7)))
+			NewWithT(t).Expect(receipt.OldPrimaryId).To(Equal("primary-a"))
+			NewWithT(t).Expect(receipt.PromotedNodeId).To(Equal("standby-a"))
+			NewWithT(t).Expect(receipt.Token).To(Equal("ha-fence-token"))
+		})
+	}
+
+	wrongTopology := identities["adopted-child"].DeepCopy()
+	wrongTopology.TableID++
+	_, ok := haRejoinFenceReceipt(status, wrongTopology)
+	g.Expect(ok).To(BeFalse())
+
+	staleChild := identities["adopted-child"].DeepCopy()
+	staleChild.TimelineID++
+	_, ok = haRejoinFenceReceipt(status, staleChild)
+	g.Expect(ok).To(BeFalse())
+}
+
 func TestReconcileHAAdminJobsRejectsDirectRejoinWorkflowMismatchedAssessment(t *testing.T) {
 	g := NewWithT(t)
 
