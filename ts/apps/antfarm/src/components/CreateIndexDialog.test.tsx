@@ -1,12 +1,22 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import type { IndexConfig } from "@antfly/sdk";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TableSchema } from "../api";
 import CreateIndexDialog, {
   buildGraphEdgeTypeConfig,
   buildGraphSourceConfig,
   getSchemaFieldNames,
   parseAdvancedIndexConfig,
+  usesArtifactBackedIndexSource,
 } from "./CreateIndexDialog";
+
+const mocks = vi.hoisted(() => ({
+  createIndex: vi.fn(),
+}));
+
+vi.mock("../hooks/use-api-config", () => ({
+  useApi: () => ({ indexes: { create: mocks.createIndex } }),
+}));
 
 vi.mock("./IndexForm", () => ({
   default: ({
@@ -23,6 +33,18 @@ vi.mock("./IndexForm", () => ({
 }));
 
 describe("CreateIndexDialog", () => {
+  beforeEach(() => {
+    mocks.createIndex.mockReset();
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      }
+    );
+  });
+
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
@@ -83,6 +105,59 @@ describe("CreateIndexDialog", () => {
         metadata: { evidence: "{{ _item.evidence }}" },
       },
       context: { doc_fields: ["title", "body"] },
+    });
+  });
+
+  it("recognizes every supported artifact-backed request form", () => {
+    const artifactBacked = [
+      { name: "text", type: "full_text", sources: [{ artifact: "chunks" }] },
+      { name: "text", type: "full_text", artifact_name: "chunks" },
+      { name: "dense", type: "embeddings", dimension: 3, embedding_name: "dense_v1" },
+      {
+        name: "dense",
+        type: "embeddings",
+        dimension: 3,
+        source_artifact_name: "chunks_v1",
+      },
+      { name: "graph", type: "graph", source: { artifact: "relations" } },
+    ] satisfies IndexConfig[];
+    for (const config of artifactBacked) {
+      expect(usesArtifactBackedIndexSource(config)).toBe(true);
+    }
+
+    expect(usesArtifactBackedIndexSource({ name: "text", type: "full_text", field: "body" })).toBe(
+      false
+    );
+    expect(
+      usesArtifactBackedIndexSource({
+        name: "graph",
+        type: "graph",
+        edge_types: [{ name: "related", field: "related_ids" }],
+      })
+    ).toBe(false);
+  });
+
+  it("uses the runtime-configured client for index creation", async () => {
+    render(
+      <CreateIndexDialog
+        open
+        onClose={() => undefined}
+        tableName="docs"
+        onIndexCreated={() => undefined}
+        schema={null}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("switch"));
+    fireEvent.change(screen.getByLabelText("Advanced index JSON"), {
+      target: { value: '{"name":"text","type":"full_text","field":"body"}' },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(mocks.createIndex).toHaveBeenCalledOnce());
+    expect(mocks.createIndex).toHaveBeenCalledWith("docs", "text", {
+      type: "full_text",
+      field: "body",
     });
   });
 

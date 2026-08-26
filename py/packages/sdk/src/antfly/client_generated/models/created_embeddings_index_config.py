@@ -23,36 +23,41 @@ T = TypeVar("T", bound="CreatedEmbeddingsIndexConfig")
 
 @_attrs_define
 class CreatedEmbeddingsIndexConfig:
-    """Credential-free normalized embeddings configuration returned after creation.
+    """Credential-free normalized embeddings configuration returned after creation. Single-source v0.2 fields are preserved
+    alongside canonical sources for read compatibility.
 
-    Attributes:
-        publication_policy (IndexPublicationPolicy | Unset): Publication behavior for a managed embeddings index.
-            `progressive` makes a safely checkpointed active generation queryable before initial source coverage is
-            complete. `atomic` keeps a new generation unavailable until complete validation and activation.
-        coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
-            completeness.
-        external (bool | Unset):  Default: False.
-        sparse (bool | Unset):  Default: False.
-        dimension (int | Unset):
-        field (str | Unset):
-        sources (list[ArtifactIndexSource] | Unset): Embedding artifact streams indexed together as independent vector
-            members.
-        template (str | Unset):
-        distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
-            models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
-            product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
-        mem_only (bool | Unset):
-        embedder (CreatedProviderConfig | Unset): Credential-free provider configuration returned after index creation.
-            Only non-secret provider settings are represented.
-        summarizer (CreatedProviderConfig | Unset): Credential-free provider configuration returned after index
-            creation. Only non-secret provider settings are represented.
-        chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
-            'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
-        top_k (int | Unset):  Default: 10.
-        min_weight (float | Unset):  Default: 0.0.
-        chunk_size (int | Unset):  Default: 1024.
-        execution (IndexExecutionConfig | Unset): Namespaced execution policy for managed index shorthand. Only
-            namespaces with runtime effects are accepted.
+        Attributes:
+            publication_policy (IndexPublicationPolicy | Unset): Publication behavior for a managed embeddings index.
+                `progressive` makes a safely checkpointed active generation queryable before initial source coverage is
+                complete. `atomic` keeps a new generation unavailable until complete validation and activation.
+            coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
+                completeness.
+            external (bool | Unset):  Default: False.
+            sparse (bool | Unset):  Default: False.
+            dimension (int | Unset):
+            field (str | Unset):
+            sources (list[ArtifactIndexSource] | Unset): Embedding artifact streams indexed together as independent vector
+                members.
+            embedding_name (str | Unset): Released v0.2 single-source read field, preserved when that request form created
+                the index. Canonical source identity is also returned through sources.
+            source_artifact_name (str | Unset): Released v0.2 descriptive source read field, preserved when supplied with
+                embedding_name.
+            template (str | Unset):
+            distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
+                models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot
+                product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
+            mem_only (bool | Unset):
+            embedder (CreatedProviderConfig | Unset): Credential-free provider configuration returned after index creation.
+                Only non-secret provider settings are represented.
+            summarizer (CreatedProviderConfig | Unset): Credential-free provider configuration returned after index
+                creation. Only non-secret provider settings are represented.
+            chunker (ChunkerConfig | Unset): A unified configuration for a chunking provider. Example: {'provider':
+                'antfly', 'model': 'fixed', 'text': {'target_tokens': 500, 'overlap_tokens': 50}}.
+            top_k (int | Unset):  Default: 10.
+            min_weight (float | Unset):  Default: 0.0.
+            chunk_size (int | Unset):  Default: 1024.
+            execution (IndexExecutionConfig | Unset): Namespaced execution policy for managed index shorthand. Only
+                namespaces with runtime effects are accepted.
     """
 
     publication_policy: IndexPublicationPolicy | Unset = UNSET
@@ -62,6 +67,8 @@ class CreatedEmbeddingsIndexConfig:
     dimension: int | Unset = UNSET
     field: str | Unset = UNSET
     sources: list[ArtifactIndexSource] | Unset = UNSET
+    embedding_name: str | Unset = UNSET
+    source_artifact_name: str | Unset = UNSET
     template: str | Unset = UNSET
     distance_metric: DistanceMetric | Unset = UNSET
     mem_only: bool | Unset = UNSET
@@ -97,6 +104,10 @@ class CreatedEmbeddingsIndexConfig:
             for sources_item_data in self.sources:
                 sources_item = sources_item_data.to_dict()
                 sources.append(sources_item)
+
+        embedding_name = self.embedding_name
+
+        source_artifact_name = self.source_artifact_name
 
         template = self.template
 
@@ -145,6 +156,10 @@ class CreatedEmbeddingsIndexConfig:
             field_dict["field"] = field
         if sources is not UNSET:
             field_dict["sources"] = sources
+        if embedding_name is not UNSET:
+            field_dict["embedding_name"] = embedding_name
+        if source_artifact_name is not UNSET:
+            field_dict["source_artifact_name"] = source_artifact_name
         if template is not UNSET:
             field_dict["template"] = template
         if distance_metric is not UNSET:
@@ -207,6 +222,10 @@ class CreatedEmbeddingsIndexConfig:
 
                 sources.append(sources_item)
 
+        embedding_name = d.pop("embedding_name", UNSET)
+
+        source_artifact_name = d.pop("source_artifact_name", UNSET)
+
         template = d.pop("template", UNSET)
 
         _distance_metric = d.pop("distance_metric", UNSET)
@@ -260,6 +279,8 @@ class CreatedEmbeddingsIndexConfig:
             dimension=dimension,
             field=field,
             sources=sources,
+            embedding_name=embedding_name,
+            source_artifact_name=source_artifact_name,
             template=template,
             distance_metric=distance_metric,
             mem_only=mem_only,

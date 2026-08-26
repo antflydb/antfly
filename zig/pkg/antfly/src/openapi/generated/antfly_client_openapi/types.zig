@@ -723,7 +723,7 @@ pub const ApiKeyWithSecret = struct {
 
 /// Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment.
 pub const ArtifactIndexSource = struct {
-    /// Stable name of a generated chunk or asset artifact stream.
+    /// Stable name of a generated artifact stream.
     artifact: []const u8,
 };
 
@@ -926,8 +926,10 @@ pub const BatchResponse = struct {
 
 /// Configuration for the AWS Bedrock embedding provider. Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles. **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0 **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
 pub const BedrockEmbedderConfig = struct {
-    /// The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
+    /// The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
     model: []const u8,
+    /// Bedrock provider request schema. `auto` recognizes direct foundation-model IDs, foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly for application inference profiles, provisioned throughput, custom models, and other aliases whose invocation target does not identify the underlying model.
+    request_format: ?[]const u8 = null,
     /// The AWS region for the Bedrock service (e.g., 'us-east-1').
     region: ?[]const u8 = null,
     /// Output dimension for Bedrock embedding models that support configurable dimensions.
@@ -1862,7 +1864,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    /// Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
@@ -2044,6 +2046,10 @@ pub const CreatedEmbeddingsIndex = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
     sources: ?[]const ArtifactIndexSource = null,
+    /// Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources.
+    embedding_name: ?[]const u8 = null,
+    /// Released v0.2 descriptive source read field, preserved when supplied with embedding_name.
+    source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
@@ -2057,7 +2063,7 @@ pub const CreatedEmbeddingsIndex = struct {
     type: []const u8,
 };
 
-/// Credential-free normalized embeddings configuration returned after creation.
+/// Credential-free normalized embeddings configuration returned after creation. Single-source v0.2 fields are preserved alongside canonical sources for read compatibility.
 pub const CreatedEmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
@@ -2067,6 +2073,10 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
     sources: ?[]const ArtifactIndexSource = null,
+    /// Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources.
+    embedding_name: ?[]const u8 = null,
+    /// Released v0.2 descriptive source read field, preserved when supplied with embedding_name.
+    source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
@@ -2946,6 +2956,8 @@ pub const EmbedderConfig = struct {
     credentials_path: ?[]const u8 = null,
     /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
     dimensions: ?i64 = null,
+    /// Bedrock provider request schema. `auto` recognizes direct foundation-model IDs, foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly for application inference profiles, provisioned throughput, custom models, and other aliases whose invocation target does not identify the underlying model.
+    request_format: ?[]const u8 = null,
     /// The AWS region for the Bedrock service (e.g., 'us-east-1').
     region: ?[]const u8 = null,
     /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
@@ -3027,7 +3039,7 @@ pub const EmbeddingsIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    /// Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
@@ -4829,7 +4841,7 @@ pub const IndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    /// Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,

@@ -2,7 +2,7 @@
  * Unit tests for the Antfly SDK client using Vitest
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { CreateTableRequest, QueryRequest, TableStatus } from "../src/types.js";
+import type { ClusterStatus, CreateTableRequest, QueryRequest, TableStatus } from "../src/types.js";
 
 // Mock openapi-fetch at the top level
 const mockGet = vi.fn();
@@ -112,6 +112,26 @@ describe("AntflyClient", () => {
           }),
         })
       );
+    });
+  });
+
+  describe("status", () => {
+    it("returns the typed deployment capability contract", async () => {
+      const status: ClusterStatus = {
+        health: "healthy",
+        deployment_mode: "standalone",
+        index_capabilities: { artifact_sources: true },
+      };
+      mockGet.mockResolvedValueOnce({ data: status, error: undefined });
+
+      await expect(client.getStatus()).resolves.toEqual(status);
+      expect(mockGet).toHaveBeenCalledWith("/db/v1/status");
+    });
+
+    it("rejects an empty successful status response", async () => {
+      mockGet.mockResolvedValueOnce({ data: undefined, error: undefined });
+
+      await expect(client.getStatus()).rejects.toThrow("response body was empty");
     });
   });
 
@@ -838,13 +858,10 @@ describe("AntflyClient", () => {
       });
 
       expect(result).toEqual(created);
-      expect(mockPost).toHaveBeenCalledWith(
-        "/db/v1/tables/{tableName}/indexes/{indexName}",
-        {
-          params: { path: { tableName: "wikipedia", indexName: "thumbnail" } },
-          body: { type: "embeddings", dimension: 512 },
-        }
-      );
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/tables/{tableName}/indexes/{indexName}", {
+        params: { path: { tableName: "wikipedia", indexName: "thumbnail" } },
+        body: { type: "embeddings", dimension: 512 },
+      });
     });
 
     it("rejects an empty create response", async () => {

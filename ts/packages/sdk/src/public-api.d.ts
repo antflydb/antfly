@@ -8353,7 +8353,7 @@ export interface components {
         };
         /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
         ArtifactIndexSource: {
-            /** @description Stable name of a generated chunk or asset artifact stream. */
+            /** @description Stable name of a generated artifact stream. */
             artifact: string;
         };
         FullTextIndexConfig: {
@@ -8573,15 +8573,25 @@ export interface components {
          * @example {
          *       "provider": "bedrock",
          *       "model": "cohere.embed-v4",
+         *       "request_format": "cohere_v4",
          *       "region": "us-east-1"
          *     }
          */
         BedrockEmbedderConfig: {
             /**
-             * @description The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
+             * @description The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
              * @example cohere.embed-v4
              */
             model: string;
+            /**
+             * @description Bedrock provider request schema. `auto` recognizes direct foundation-model IDs,
+             *     foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
+             *     for application inference profiles, provisioned throughput, custom models, and
+             *     other aliases whose invocation target does not identify the underlying model.
+             * @default auto
+             * @enum {string}
+             */
+            request_format?: "auto" | "titan_text" | "titan_multimodal" | "cohere_v3" | "cohere_v4";
             /**
              * @description The AWS region for the Bedrock service (e.g., 'us-east-1').
              * @example us-east-1
@@ -9332,7 +9342,7 @@ export interface components {
             field?: string;
             /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["ArtifactIndexSource"][];
-            /** @description Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            /** @description Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             embedding_name?: string;
             /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
             source_artifact_name?: string;
@@ -12156,7 +12166,7 @@ export interface components {
             presence_penalty?: number;
             timeout?: number;
         };
-        /** @description Credential-free normalized embeddings configuration returned after creation. */
+        /** @description Credential-free normalized embeddings configuration returned after creation. Single-source v0.2 fields are preserved alongside canonical sources for read compatibility. */
         CreatedEmbeddingsIndexConfig: {
             publication_policy?: components["schemas"]["IndexPublicationPolicy"];
             coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
@@ -12168,6 +12178,10 @@ export interface components {
             field?: string;
             /** @description Embedding artifact streams indexed together as independent vector members. */
             sources?: components["schemas"]["ArtifactIndexSource"][];
+            /** @description Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources. */
+            readonly embedding_name?: string;
+            /** @description Released v0.2 descriptive source read field, preserved when supplied with embedding_name. */
+            readonly source_artifact_name?: string;
             template?: string;
             distance_metric?: components["schemas"]["DistanceMetric"];
             mem_only?: boolean;

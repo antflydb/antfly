@@ -22,10 +22,12 @@ const group_ids = @import("../common/group_ids.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const process_memory_budget = @import("../common/process_memory_budget.zig");
+const preload_model_spec = @import("../common/preload_model_spec.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
 const inference_connection_abi = @import("../inference_connection_abi.zig");
+const internal_service_auth = @import("../api/internal_service_auth.zig");
 const runtime_http_abi = @import("../runtime_http_abi.zig");
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("inference_host.zig") else struct {};
@@ -81,6 +83,8 @@ const ha_lease_min_grace_ms: u64 = 10_000;
 const ha_lease_api_host_env = "ANTFLY_HA_LEASE_API_HOST";
 const ha_lease_default_api_host = "kubernetes.default.svc";
 const ha_lease_max_response_bytes: usize = 256 * 1024;
+const internal_service_secret_key = "antfly.internal_service.secret";
+const internal_service_issuer_key = "antfly.internal_service.issuer";
 
 const StandaloneHttpContext = struct {
     api_server: ?*ApiHttpServer,
@@ -1914,6 +1918,24 @@ pub fn runFromIterator(
         secret_store_initialized = true;
     }
 
+    const internal_service_secret = try secret_store.getOwned(alloc, internal_service_secret_key);
+    defer if (internal_service_secret) |value| alloc.free(value);
+    const internal_service_issuer = try secret_store.getOwned(alloc, internal_service_issuer_key);
+    defer if (internal_service_issuer) |value| alloc.free(value);
+    if (internal_service_secret != null or internal_service_issuer != null) {
+        internal_service_auth.validateRuntimeConfig(
+            internal_service_secret,
+            null,
+            internal_service_issuer,
+        ) catch |err| {
+            std.log.err(
+                "standalone internal service credential is incomplete or invalid: configure {s} with at least {d} bytes and a printable {s}; err={s}",
+                .{ internal_service_secret_key, internal_service_auth.minimum_secret_bytes, internal_service_issuer_key, @errorName(err) },
+            );
+            return err;
+        };
+    }
+
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
     var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
     var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
@@ -2125,6 +2147,8 @@ pub fn runFromIterator(
             .ard_publisher_domain = cli.ard_publisher_domain orelse "antfly.local",
             .ard_display_name = cli.ard_display_name orelse "Antfly",
             .ard_public_catalog_enabled = cli.ard_public_catalog_enabled,
+            .internal_service_secret = internal_service_secret,
+            .internal_service_issuer = internal_service_issuer,
             .deployment_mode = .standalone,
             .storage_maintenance = &storage_maintenance,
             .admin_bearer_token = admin_bearer_token,
@@ -3425,33 +3449,12 @@ fn validPreloadModelKind(value: []const u8) bool {
         std.mem.eql(u8, value, "extractor");
 }
 
-fn validInferenceBackend(value: []const u8) bool {
-    return std.mem.eql(u8, value, "native") or
-        std.mem.eql(u8, value, "onnx") or
-        std.mem.eql(u8, value, "metal") or
-        std.mem.eql(u8, value, "cuda") or
-        std.mem.eql(u8, value, "xla") or
-        std.mem.eql(u8, value, "pjrt") or
-        std.mem.eql(u8, value, "wasm") or
-        std.mem.eql(u8, value, "webgpu");
-}
-
 fn parsePreloadModelFlag(value: []const u8) !inference_bridge.WarmModel {
-    const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
-    const kind_name = value[0..separator];
-    var model_name = value[separator + 1 ..];
-    var backend: ?[]const u8 = null;
-    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
-        const backend_name = model_name[0..backend_separator];
-        if (!validInferenceBackend(backend_name)) return error.InvalidArguments;
-        backend = backend_name;
-        model_name = model_name[backend_separator + 1 ..];
-    }
-    if (model_name.len == 0) return error.InvalidArguments;
+    const spec = try preload_model_spec.parse(value);
     return .{
-        .kind = inference_bridge.String.init(if (validPreloadModelKind(kind_name)) kind_name else return error.InvalidArguments),
-        .name = inference_bridge.String.init(model_name),
-        .backend = inference_bridge.OptionalString.init(backend),
+        .kind = inference_bridge.String.init(if (validPreloadModelKind(spec.kind)) spec.kind else return error.InvalidArguments),
+        .name = inference_bridge.String.init(spec.name),
+        .backend = inference_bridge.OptionalString.init(spec.backend),
     };
 }
 
@@ -6089,6 +6092,24 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_preload_models.items[0].name.slice());
     try std.testing.expectEqualStrings("metal", cfg.inference_preload_models.items[0].backend.slice().?);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
+}
+
+test "parse cli preserves registry variants and recognizes explicit preload backends" {
+    var argv = [_][*:0]const u8{
+        "--preload-model",
+        "embedder:owner/model:i8",
+        "--preload-model",
+        "generator:metal:owner/model:Q4_K_M",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.inference_preload_models.items.len);
+    try std.testing.expectEqualStrings("owner/model:i8", cfg.inference_preload_models.items[0].name.slice());
+    try std.testing.expect(cfg.inference_preload_models.items[0].backend.slice() == null);
+    try std.testing.expectEqualStrings("owner/model:Q4_K_M", cfg.inference_preload_models.items[1].name.slice());
+    try std.testing.expectEqualStrings("metal", cfg.inference_preload_models.items[1].backend.slice().?);
 }
 
 test "parse cli accepts HA primary runtime flags" {

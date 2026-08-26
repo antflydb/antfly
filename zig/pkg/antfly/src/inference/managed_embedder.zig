@@ -405,6 +405,7 @@ pub const ManagedEmbeddingEntry = struct {
     model: []u8,
     base_url: []u8,
     region: []u8 = "",
+    bedrock_request_format: bedrock_provider.RequestFormat = .auto,
     input_type: []u8 = "",
     truncate: []u8 = "",
     bedrock_credentials: bedrock_provider.CredentialCache = .{},
@@ -517,6 +518,7 @@ fn managedEmbeddingEntriesEquivalentForLookup(
         std.mem.eql(u8, lhs.model, rhs.model) and
         std.mem.eql(u8, lhs.base_url, rhs.base_url) and
         std.mem.eql(u8, lhs.region, rhs.region) and
+        lhs.bedrock_request_format == rhs.bedrock_request_format and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
         std.mem.eql(u8, lhs.truncate, rhs.truncate);
 }
@@ -1762,6 +1764,13 @@ fn buildManagedEmbeddingEntry(
 
     const provider = try parseEmbedderProvider(embedder_cfg);
     if (embedder_cfg.model.len == 0 and provider != .antfly) return error.InvalidManagedEmbeddingIndex;
+    const bedrock_request_format = if (provider == .bedrock)
+        try bedrock_provider.resolveRequestFormat(
+            embedder_cfg.model,
+            try bedrock_provider.parseRequestFormat(embedder_cfg.request_format),
+        )
+    else
+        bedrock_provider.RequestFormat.auto;
     const requests_per_minute = try resolveEmbedderRequestsPerMinute(embedder, provider);
     const burst = try resolveEmbedderBurst(embedder, provider);
     const antfly_provider = if (isAntflyProvider(provider) and shouldUseAntflyProvider(embedder_cfg, options))
@@ -1826,6 +1835,7 @@ fn buildManagedEmbeddingEntry(
         .model = owned_model,
         .base_url = base_url,
         .region = bedrock_region,
+        .bedrock_request_format = bedrock_request_format,
         .input_type = input_type,
         .truncate = truncate,
         .api_key = api_key,
@@ -2382,6 +2392,7 @@ fn embedWithEntryParts(
         var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
             .region = entry.region,
             .endpoint = entry.base_url,
+            .request_format = entry.bedrock_request_format,
             .input_type = entry.input_type,
             .truncate = entry.truncate,
             .dimension = dims,
@@ -2722,7 +2733,7 @@ fn embedBatchWithBedrock(
     texts: []const []const u8,
     dims: u32,
 ) ![]const []const f32 {
-    const max_batch = bedrock_provider.maxBatchSize(entry.model);
+    const max_batch = bedrock_provider.maxBatchSizeForFormat(entry.bedrock_request_format);
     var out = std.ArrayListUnmanaged([]const f32).empty;
     errdefer {
         for (out.items) |vector| alloc.free(vector);
@@ -2754,6 +2765,7 @@ fn embedBatchWithBedrockRequest(
     var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
         .region = entry.region,
         .endpoint = entry.base_url,
+        .request_format = entry.bedrock_request_format,
         .input_type = entry.input_type,
         .truncate = entry.truncate,
         .dimension = dims,
@@ -4562,6 +4574,29 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     try std.testing.expectError(error.InvalidEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3));
 
     try std.testing.expectError(error.EmptyEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &.{}, 3));
+}
+
+pub fn testBedrockRequestFormatConfiguration() !void {
+    const alloc = std.testing.allocator;
+
+    var system_profile = try ManagedEmbedder.initFromIndexesJson(alloc,
+        \\{"bedrock_idx":{"type":"embeddings","field":"body","dimension":1024,"embedder":{"provider":"bedrock","model":"us.amazon.titan-embed-image-v1:0","region":"us-east-1"}}}
+    );
+    defer system_profile.deinit();
+    try std.testing.expectEqual(bedrock_provider.RequestFormat.titan_multimodal, system_profile.entries[0].bedrock_request_format);
+
+    var application_profile = try ManagedEmbedder.initFromIndexesJson(alloc,
+        \\{"bedrock_idx":{"type":"embeddings","field":"body","dimension":1024,"embedder":{"provider":"bedrock","model":"arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings","request_format":"titan_multimodal","region":"us-east-1"}}}
+    );
+    defer application_profile.deinit();
+    try std.testing.expectEqual(bedrock_provider.RequestFormat.titan_multimodal, application_profile.entries[0].bedrock_request_format);
+
+    try std.testing.expectError(
+        error.BedrockRequestFormatRequired,
+        ManagedEmbedder.initFromIndexesJson(alloc,
+            \\{"bedrock_idx":{"type":"embeddings","field":"body","dimension":1024,"embedder":{"provider":"bedrock","model":"arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings","region":"us-east-1"}}}
+        ),
+    );
 }
 
 test "managed embedder preserves antfly api_url path for shared antfly endpoint" {

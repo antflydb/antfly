@@ -63,6 +63,7 @@ from .batch_request_inserts_additional_property import BatchRequestInsertsAdditi
 from .batch_response import BatchResponse
 from .batch_response_status import BatchResponseStatus
 from .bedrock_embedder_config import BedrockEmbedderConfig
+from .bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
 from .bedrock_generator_config import BedrockGeneratorConfig
 from .bool_field_query import BoolFieldQuery
 from .boolean_query import BooleanQuery
@@ -917,6 +918,7 @@ __all__ = (
     "BatchResponse",
     "BatchResponseStatus",
     "BedrockEmbedderConfig",
+    "BedrockEmbedderConfigRequestFormat",
     "BedrockGeneratorConfig",
     "BooleanQuery",
     "BoolFieldQuery",

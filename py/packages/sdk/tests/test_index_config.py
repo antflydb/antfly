@@ -11,6 +11,10 @@ from antfly import (
     artifact_index_sources,
     graph_index_sources,
 )
+from antfly.client_generated.models.artifact_index_source import ArtifactIndexSource
+from antfly.client_generated.models.created_embeddings_index_config import (
+    CreatedEmbeddingsIndexConfig,
+)
 
 
 def test_builds_multi_source_full_text_index() -> None:
@@ -52,6 +56,19 @@ def test_builds_document_and_chunk_embedding_sources() -> None:
     assert config["enrichments"][1]["source_artifact_name"] == "document_chunks_v1"
     assert all("vector_space" not in item for item in config["enrichments"])
     assert "embedding_name" not in config
+
+
+def test_created_embedding_config_preserves_v0_2_single_source_fields() -> None:
+    config = CreatedEmbeddingsIndexConfig(
+        sources=[ArtifactIndexSource(artifact="document_dense_v1")],
+        embedding_name="document_dense_v1",
+        source_artifact_name="document_chunks_v1",
+    )
+
+    encoded = config.to_dict()
+    assert encoded["sources"] == [{"artifact": "document_dense_v1"}]
+    assert encoded["embedding_name"] == "document_dense_v1"
+    assert encoded["source_artifact_name"] == "document_chunks_v1"
 
 
 def test_template_only_embedding_source_omits_noop_field() -> None:

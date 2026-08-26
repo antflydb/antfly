@@ -16938,7 +16938,7 @@ components:
         artifact:
           type: string
           minLength: 1
-          description: Stable name of a generated chunk or asset artifact stream.
+          description: Stable name of a generated artifact stream.
     FullTextIndexConfig:
       type: object
       x-antfly-mutually-exclusive:
@@ -17233,8 +17233,26 @@ components:
       properties:
         model:
           type: string
-          description: The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
+          description: The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4',
+            'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
           example: cohere.embed-v4
+        request_format:
+          type: string
+          enum:
+            - auto
+            - titan_text
+            - titan_multimodal
+            - cohere_v3
+            - cohere_v4
+          description: >-
+            Bedrock provider request schema. `auto` recognizes direct foundation-model IDs,
+
+            foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
+
+            for application inference profiles, provisioned throughput, custom models, and
+
+            other aliases whose invocation target does not identify the underlying model.
+          default: auto
         region:
           type: string
           description: The AWS region for the Bedrock service (e.g., 'us-east-1').
@@ -17265,6 +17283,7 @@ components:
       example:
         provider: bedrock
         model: cohere.embed-v4
+        request_format: cohere_v4
         region: us-east-1
     CohereEmbedderConfig:
       type: object
@@ -18298,9 +18317,9 @@ components:
         embedding_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Single-source convenience form. Mutually exclusive with sources; accepted requests
-            are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected
-            by serverless deployments.
+          description: Single-source alternative request form. Mutually exclusive with sources. Responses
+            also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true
+            and is rejected by serverless deployments.
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -22954,7 +22973,8 @@ components:
           minimum: 1
     CreatedEmbeddingsIndexConfig:
       type: object
-      description: Credential-free normalized embeddings configuration returned after creation.
+      description: Credential-free normalized embeddings configuration returned after creation. Single-source
+        v0.2 fields are preserved alongside canonical sources for read compatibility.
       properties:
         publication_policy:
           $ref: '#/components/schemas/IndexPublicationPolicy'
@@ -22979,6 +22999,15 @@ components:
           items:
             $ref: '#/components/schemas/ArtifactIndexSource'
           description: Embedding artifact streams indexed together as independent vector members.
+        embedding_name:
+          type: string
+          readOnly: true
+          description: Released v0.2 single-source read field, preserved when that request form created
+            the index. Canonical source identity is also returned through sources.
+        source_artifact_name:
+          type: string
+          readOnly: true
+          description: Released v0.2 descriptive source read field, preserved when supplied with embedding_name.
         template:
           type: string
         distance_metric:

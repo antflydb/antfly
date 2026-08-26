@@ -16,9 +16,10 @@ import type {
   ChatMessage,
   ChatStreamCallbacks,
   ClusterRestoreRequest,
+  ClusterStatus,
   ConnectionsResponse,
-  CreateIndexRequest,
   CreatedIndex,
+  CreateIndexRequest,
   CreateTableRequest,
   CreateUserRequest,
   DocumentArtifactManifest,
@@ -77,11 +78,7 @@ export interface RestoreJobPage {
 export interface IndexOperations {
   list(tableName: string): Promise<IndexStatus[]>;
   get(tableName: string, indexName: string): Promise<IndexStatus>;
-  create(
-    tableName: string,
-    indexName: string,
-    config: CreateIndexRequest
-  ): Promise<CreatedIndex>;
+  create(tableName: string, indexName: string, config: CreateIndexRequest): Promise<CreatedIndex>;
   drop(tableName: string, indexName: string): Promise<true>;
 }
 
@@ -484,9 +481,10 @@ export class AntflyClient {
   /**
    * Get cluster status
    */
-  async getStatus() {
+  async getStatus(): Promise<ClusterStatus> {
     const { data, error } = await this.client.GET("/db/v1/status");
     if (error) throw new Error(`Failed to get status: ${errorMessage(error)}`);
+    if (!data) throw new Error("Failed to get status: response body was empty");
     return data;
   }
 
@@ -1555,20 +1553,24 @@ export class AntflyClient {
           detail.retryable === true
         ) {
           const retryAfterHeader = response.headers.get("Retry-After");
-          const parsedRetryAfter = retryAfterHeader && /^[1-9]\d*$/.test(retryAfterHeader)
-            ? Number(retryAfterHeader)
-            : NaN;
-          const retryAfterSeconds = Number.isFinite(parsedRetryAfter) && parsedRetryAfter > 0
-            ? parsedRetryAfter
-            : undefined;
-          const retryAfterMs = typeof detail.retry_after_ms === "number" &&
+          const parsedRetryAfter =
+            retryAfterHeader && /^[1-9]\d*$/.test(retryAfterHeader)
+              ? Number(retryAfterHeader)
+              : NaN;
+          const retryAfterSeconds =
+            Number.isFinite(parsedRetryAfter) && parsedRetryAfter > 0
+              ? parsedRetryAfter
+              : undefined;
+          const retryAfterMs =
+            typeof detail.retry_after_ms === "number" &&
             Number.isFinite(detail.retry_after_ms) &&
             detail.retry_after_ms > 0
-            ? detail.retry_after_ms
-            : (retryAfterSeconds ?? 0) * 1000;
-          const message = typeof detail.message === "string" && detail.message
-            ? detail.message
-            : "storage capacity is temporarily exhausted";
+              ? detail.retry_after_ms
+              : (retryAfterSeconds ?? 0) * 1000;
+          const message =
+            typeof detail.message === "string" && detail.message
+              ? detail.message
+              : "storage capacity is temporarily exhausted";
           throw new StorageResourceExhaustedError(message, retryAfterMs, retryAfterSeconds);
         }
         throw new Error(`Failed to create index: ${detail.error}`);

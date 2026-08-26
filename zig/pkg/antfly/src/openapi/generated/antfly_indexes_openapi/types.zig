@@ -190,7 +190,7 @@ pub const AntflyType = enum {
 
 /// Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment.
 pub const ArtifactIndexSource = struct {
-    /// Stable name of a generated chunk or asset artifact stream.
+    /// Stable name of a generated artifact stream.
     artifact: []const u8,
 };
 
@@ -228,7 +228,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    /// Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
@@ -387,6 +387,10 @@ pub const CreatedEmbeddingsIndex = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
     sources: ?[]const ArtifactIndexSource = null,
+    /// Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources.
+    embedding_name: ?[]const u8 = null,
+    /// Released v0.2 descriptive source read field, preserved when supplied with embedding_name.
+    source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
@@ -400,7 +404,7 @@ pub const CreatedEmbeddingsIndex = struct {
     type: []const u8,
 };
 
-/// Credential-free normalized embeddings configuration returned after creation.
+/// Credential-free normalized embeddings configuration returned after creation. Single-source v0.2 fields are preserved alongside canonical sources for read compatibility.
 pub const CreatedEmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
@@ -410,6 +414,10 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together as independent vector members.
     sources: ?[]const ArtifactIndexSource = null,
+    /// Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources.
+    embedding_name: ?[]const u8 = null,
+    /// Released v0.2 descriptive source read field, preserved when supplied with embedding_name.
+    source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
     mem_only: ?bool = null,
@@ -850,7 +858,7 @@ pub const EmbeddingsIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    /// Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
@@ -1589,7 +1597,7 @@ pub const IndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    /// Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,

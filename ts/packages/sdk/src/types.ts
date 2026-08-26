@@ -178,6 +178,8 @@ export type CreateAlgebraicIndexRequest = components["schemas"]["CreateAlgebraic
 export type CreatedIndex = components["schemas"]["CreatedIndex"];
 export type IndexType = components["schemas"]["IndexType"];
 export type IndexStatus = components["schemas"]["IndexStatus"];
+export type IndexRuntimeCapabilities = components["schemas"]["IndexRuntimeCapabilities"];
+export type ClusterStatus = components["schemas"]["ClusterStatus"];
 
 // Graph index types
 export type GraphIndexConfig = components["schemas"]["GraphIndexConfig"];

@@ -50,9 +50,9 @@ class CreateEmbeddingsIndexRequest:
             vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or
             source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless
             deployments.
-        embedding_name (str | Unset): Single-source convenience form. Mutually exclusive with sources; accepted requests
-            are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless
-            deployments.
+        embedding_name (str | Unset): Single-source alternative request form. Mutually exclusive with sources. Responses
+            also expose canonical sources while preserving this released v0.2 field. Requires
+            index_capabilities.artifact_sources=true and is rejected by serverless deployments.
         source_artifact_name (str | Unset): Artifact stream consumed by the embedding enrichment backing this vector
             index. This is descriptive public configuration; the matching enrichment defines the materialized source.
         template (str | Unset): Handlebars template for generating prompts (managed indexes only; not allowed when

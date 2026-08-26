@@ -798,6 +798,9 @@ mod tests {
             "type": "embeddings",
             "dimension": 512,
             "distance_metric": "cosine",
+            "sources": [{"artifact": "thumbnail_dense_v1"}],
+            "embedding_name": "thumbnail_dense_v1",
+            "source_artifact_name": "thumbnail_chunks_v1",
             "chunker": {
                 "provider": "antfly",
                 "model": "fixed",
@@ -809,6 +812,12 @@ mod tests {
             types::CreatedIndex::EmbeddingsIndex(index) => {
                 assert_eq!(index.name, "thumbnail");
                 assert_eq!(index.dimension.map(std::num::NonZeroU64::get), Some(512));
+                assert_eq!(index.embedding_name.as_deref(), Some("thumbnail_dense_v1"));
+                assert_eq!(
+                    index.source_artifact_name.as_deref(),
+                    Some("thumbnail_chunks_v1"),
+                );
+                assert_eq!(index.sources.as_ref().map(Vec::len), Some(1));
                 assert_eq!(
                     index.chunker.and_then(|chunker| chunker.model),
                     Some("fixed".to_string()),

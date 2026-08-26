@@ -91,7 +91,7 @@ components:
         artifact:
           type: string
           minLength: 1
-          description: "Stable name of a generated chunk or asset artifact stream."
+          description: "Stable name of a generated artifact stream."
     CreateFullTextIndexRequest:
       description: "Create a full-text index."
       allOf:
@@ -412,7 +412,7 @@ components:
         execution: { $ref: "#/components/schemas/ExecutionPolicy" }
     CreatedEmbeddingsIndexConfig:
       type: object
-      description: "Credential-free normalized embeddings configuration returned after creation."
+      description: "Credential-free normalized embeddings configuration returned after creation. Single-source v0.2 fields are preserved alongside canonical sources for read compatibility."
       properties:
         publication_policy: { $ref: "#/components/schemas/IndexPublicationPolicy" }
         coverage_policy: { $ref: "#/components/schemas/DerivedCoveragePolicy" }
@@ -427,6 +427,14 @@ components:
           uniqueItems: true
           items: { $ref: "#/components/schemas/ArtifactIndexSource" }
           description: "Embedding artifact streams indexed together as independent vector members."
+        embedding_name:
+          type: string
+          readOnly: true
+          description: "Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources."
+        source_artifact_name:
+          type: string
+          readOnly: true
+          description: "Released v0.2 descriptive source read field, preserved when supplied with embedding_name."
         template: { type: string }
         distance_metric: { $ref: "#/components/schemas/DistanceMetric" }
         mem_only: { type: boolean }
@@ -993,7 +1001,7 @@ components:
         embedding_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
+          description: "Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string

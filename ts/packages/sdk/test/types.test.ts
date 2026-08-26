@@ -13,9 +13,11 @@ import type {
   BatchRequest,
   BooleanQuery,
   BoolFieldQuery,
+  ClusterStatus,
   ConjunctionQuery,
   CreateIndexRequest,
   DisjunctionQuery,
+  IndexRuntimeCapabilities,
   MatchQuery,
   NumericRangeQuery,
   QueryRequest,
@@ -43,6 +45,26 @@ function generatedSortProfileDeclaration(): string {
 }
 
 describe("Antfly Query Type Integration", () => {
+  describe("cluster status capabilities", () => {
+    it("exports the typed artifact-source capability contract", () => {
+      const capabilities: IndexRuntimeCapabilities = { artifact_sources: true };
+      const status: ClusterStatus = {
+        health: "healthy",
+        deployment_mode: "standalone",
+        index_capabilities: capabilities,
+      };
+      type CreatedEmbeddings = components["schemas"]["CreatedEmbeddingsIndexConfig"];
+      const created: CreatedEmbeddings = {
+        sources: [{ artifact: "document_dense_v1" }],
+        embedding_name: "document_dense_v1",
+        source_artifact_name: "document_chunks_v1",
+      };
+
+      expect(status.index_capabilities?.artifact_sources).toBe(true);
+      expect(created.embedding_name).toBe("document_dense_v1");
+    });
+  });
+
   describe("Backup metadata availability responses", () => {
     it("types both retryable 503 variants", () => {
       type BackupUnavailable = components["schemas"]["BackupMetadataUnavailableError"];

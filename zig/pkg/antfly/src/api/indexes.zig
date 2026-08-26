@@ -986,15 +986,15 @@ fn appendPublicIndexConfig(
         try out.appendSlice(alloc, "}]");
     }
 
+    // `embedding_name` and `source_artifact_name` shipped in v0.2. Keep
+    // those single-source read fields alongside canonical `sources` so a
+    // v0.2 client can still inspect and round-trip the effective config.
     var it = config.object.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "name") or
             std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.incarnation_field)) continue;
         if (single_full_text_artifact != null and std.mem.eql(u8, entry.key_ptr.*, "artifact_name")) continue;
         if (single_graph_source != null and std.mem.eql(u8, entry.key_ptr.*, "source")) continue;
-        if (single_embedding_artifact != null and
-            (std.mem.eql(u8, entry.key_ptr.*, "embedding_name") or
-                std.mem.eql(u8, entry.key_ptr.*, "source_artifact_name"))) continue;
         if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "artifact") and
             isV0_2_0GraphShorthandArtifact(entry.value_ptr.*))
         {
@@ -4743,7 +4743,7 @@ test "created index configs normalize single-source input forms" {
     defer std.testing.allocator.free(embeddings);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"vectors\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"sources\":[{\"artifact\":\"body_dense_v1\"}],\"dimension\":3}",
+        "{\"name\":\"vectors\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"sources\":[{\"artifact\":\"body_dense_v1\"}],\"dimension\":3,\"embedding_name\":\"body_dense_v1\",\"source_artifact_name\":\"body_chunks_v1\"}",
         embeddings,
     );
 }

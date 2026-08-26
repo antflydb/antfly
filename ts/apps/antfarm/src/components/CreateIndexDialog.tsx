@@ -38,7 +38,8 @@ import type React from "react";
 import { useEffect, useState } from "react";
 import { useFieldArray, useForm, useFormContext } from "react-hook-form";
 import { z } from "zod";
-import { api, type TableSchema } from "../api";
+import type { TableSchema } from "../api";
+import { useApi } from "../hooks/use-api-config";
 import { createIndexArguments } from "../lib/create-index";
 import { Combobox } from "./Combobox";
 import IndexForm from "./IndexForm";
@@ -130,9 +131,23 @@ export function parseAdvancedIndexConfig(source: string): IndexConfig {
   return value as IndexConfig;
 }
 
-function usesArtifactSources(config: IndexConfig): boolean {
-  const sources = (config as unknown as Record<string, unknown>).sources;
-  return Array.isArray(sources) && sources.length > 0;
+export function usesArtifactBackedIndexSource(config: IndexConfig): boolean {
+  const raw = config as unknown as Record<string, unknown>;
+  if (Array.isArray(raw.sources) && raw.sources.length > 0) return true;
+
+  switch (config.type) {
+    case "full_text":
+      return typeof raw.artifact_name === "string" && raw.artifact_name.trim().length > 0;
+    case "embeddings":
+      return (
+        (typeof raw.embedding_name === "string" && raw.embedding_name.trim().length > 0) ||
+        (typeof raw.source_artifact_name === "string" && raw.source_artifact_name.trim().length > 0)
+      );
+    case "graph":
+      return raw.source !== null && typeof raw.source === "object" && !Array.isArray(raw.source);
+    default:
+      return false;
+  }
 }
 
 const indexFormSchema = z
@@ -1020,6 +1035,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
   schema,
   artifactSourcesSupported = false,
 }) => {
+  const client = useApi();
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"form" | "json">("form");
   const [jsonPayload, setJsonPayload] = useState<IndexConfig>({
@@ -1181,7 +1197,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
       let indexConfig: IndexConfig;
       if (viewMode === "json") {
         indexConfig = parseAdvancedIndexConfig(jsonSource);
-        if (!artifactSourcesSupported && usesArtifactSources(indexConfig)) {
+        if (!artifactSourcesSupported && usesArtifactBackedIndexSource(indexConfig)) {
           throw new Error("Artifact-backed index sources are unavailable on this deployment.");
         }
       } else if (data.indexType === "full_text") {
@@ -1277,7 +1293,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
               } as IndexConfig);
       }
       const { indexName, request } = createIndexArguments(indexConfig);
-      await api.indexes.create(tableName, indexName, request);
+      await client.indexes.create(tableName, indexName, request);
       onIndexCreated();
       onClose();
     } catch (e) {

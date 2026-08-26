@@ -13,7 +13,7 @@ class ArtifactIndexSource:
     """Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment.
 
     Attributes:
-        artifact (str): Stable name of a generated chunk or asset artifact stream.
+        artifact (str): Stable name of a generated artifact stream.
     """
 
     artifact: str

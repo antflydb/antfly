@@ -60,7 +60,7 @@ import { ReloadIcon } from "@radix-ui/react-icons";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, type TableSchema } from "../api";
+import type { TableSchema } from "../api";
 import AggregationResults from "../components/AggregationResults";
 import AIQueryAssistant from "../components/AIQueryAssistant";
 import CreateIndexDialog from "../components/CreateIndexDialog";
@@ -279,10 +279,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       .getStatus()
       .then((status) => {
         if (active) {
-          const capabilities = status.index_capabilities as
-            | { artifact_sources?: unknown }
-            | undefined;
-          setArtifactSourcesSupported(capabilities?.artifact_sources === true);
+          setArtifactSourcesSupported(status.index_capabilities?.artifact_sources === true);
         }
       })
       .catch(() => {
@@ -432,7 +429,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     const requestSequence = ++indexesRequestSequence.current;
     setIndexesMetadataState("loading");
     try {
-      const response = await api.indexes.list(tableName);
+      const response = await client.indexes.list(tableName);
       if (
         activeTableName.current !== tableName ||
         requestSequence !== indexesRequestSequence.current
@@ -458,7 +455,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       setError(`Failed to fetch indexes for table ${tableName}.`);
       console.error(e);
     }
-  }, [tableName]);
+  }, [client, tableName]);
 
   const fetchTableSchema = useCallback(async () => {
     if (!tableName) return;
@@ -466,7 +463,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     const requestSequence = ++tableMetadataRequestSequence.current;
     setTableMetadataState("loading");
     try {
-      const response = await api.tables.get(tableName);
+      const response = await client.tables.get(tableName);
       if (
         activeTableName.current !== tableName ||
         requestSequence !== tableMetadataRequestSequence.current
@@ -494,7 +491,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       setError(tableQueryErrorMessage(e, `Failed to fetch table metadata for ${tableName}.`));
       console.error(e);
     }
-  }, [tableName]);
+  }, [client, tableName]);
 
   const fetchDocumentCount = useCallback(async () => {
     if (!tableName) return;
@@ -503,7 +500,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       return;
     }
     try {
-      const response = await api.tables.query(tableName, {
+      const response = await client.tables.query(tableName, {
         filter_query: { match_all: {} },
         count: true,
         limit: 0,
@@ -514,7 +511,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       if (activeTableName.current !== tableName) return;
       setDocumentCount(null);
     }
-  }, [storageStatus?.empty, tableName]);
+  }, [client, storageStatus?.empty, tableName]);
 
   useEffect(() => {
     fetchIndexes();
@@ -577,7 +574,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     if (!tableName || !selectedIndex) return;
     try {
       const droppedIndexName = selectedIndex.config.name;
-      await api.indexes.drop(tableName, droppedIndexName);
+      await client.indexes.drop(tableName, droppedIndexName);
       setQueryIndexes((current) => current.filter((name) => name !== droppedIndexName));
       await refreshQueryMetadata();
       handleCloseDropDialog();
@@ -619,7 +616,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         setError("The query editor must contain one JSON object.");
         return;
       }
-      const response = await api.tables.query(tableName, queryRequest, {
+      const response = await client.tables.query(tableName, queryRequest, {
         signal: controller.signal,
       });
       if (
@@ -644,6 +641,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       }
     }
   }, [
+    client,
     tableName,
     queryMode,
     parsedJsonQuery,
@@ -734,7 +732,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         version: 0, // Default version to 0 if not specified
         ...schema,
       };
-      await api.tables.updateSchema(tableName, schemaWithVersion);
+      await client.tables.updateSchema(tableName, schemaWithVersion);
       fetchTableSchema();
       setIsEditingSchema(false);
     } catch (error) {

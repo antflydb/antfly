@@ -417,12 +417,18 @@ pub const AntflyClient = struct {
     }
 
     pub fn getRestoreJob(self: *AntflyClient, job_id: []const u8) !openapi.ApiResponse(openapi.types.RestoreJob) {
-        var resp = try self.inner.getRestoreJob(job_id);
+        var resp = try self.getRestoreJobResponse(job_id);
         if (resp.status_code >= 300) {
             defer resp.deinit();
             return self.apiErrorFromResponse(&resp);
         }
         return resp;
+    }
+
+    /// Returns the restore status response without converting non-success
+    /// statuses so callers can honor the endpoint's retry contract.
+    pub fn getRestoreJobResponse(self: *AntflyClient, job_id: []const u8) !openapi.ApiResponse(openapi.types.RestoreJob) {
+        return self.inner.getRestoreJob(job_id);
     }
 
     pub fn cancelRestoreJob(self: *AntflyClient, job_id: []const u8) !openapi.ApiResponse(openapi.types.RestoreJob) {

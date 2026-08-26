@@ -168,6 +168,7 @@ export type {
   // Retrieval Agent result types
   ClassificationTransformationResult,
   ClusterRestoreRequest,
+  ClusterStatus,
   // Connection types
   ConnectedModel,
   ConnectedModelType,
@@ -236,6 +237,7 @@ export type {
   GraphQueryType,
   GraphResultNode,
   IndexConfig,
+  IndexRuntimeCapabilities,
   IndexStatus,
   IndexType,
   InferenceConnection,

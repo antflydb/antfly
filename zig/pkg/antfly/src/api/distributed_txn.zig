@@ -183,6 +183,8 @@ pub const HostedParticipantWorker = struct {
     router: table_router.HostedGroupRouter,
     writes: table_writes.TableWriteSource,
     executor: http_common.RequestExecutor,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
 
     pub fn init(
         catalog: table_catalog.CatalogSource,
@@ -196,6 +198,18 @@ pub const HostedParticipantWorker = struct {
             .writes = writes,
             .executor = executor,
         };
+    }
+
+    pub fn withInternalServiceAuth(self: *HostedParticipantWorker, secret: ?[]const u8, issuer: ?[]const u8) *HostedParticipantWorker {
+        self.internal_service_secret = secret;
+        self.internal_service_issuer = issuer;
+        return self;
+    }
+
+    fn httpClient(self: *HostedParticipantWorker, alloc: std.mem.Allocator) http_client_mod.ApiHttpClient {
+        var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client;
     }
 
     pub fn worker(self: *HostedParticipantWorker) ParticipantWorker {
@@ -219,7 +233,7 @@ pub const HostedParticipantWorker = struct {
         switch (route) {
             .local => _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants)) orelse return error.UnknownGroup,
             .remote => |remote| {
-                var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
+                var client = self.httpClient(alloc);
                 const body = try encodeTxnBeginRequest(alloc, req);
                 defer alloc.free(body);
                 var response = try client.fetchGroupTxnBegin(remote.base_uri, group_id, table_name, body);
@@ -235,7 +249,7 @@ pub const HostedParticipantWorker = struct {
         switch (route) {
             .local => _ = (try self.writes.txnPrepareGroupLocal(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req)) orelse return error.UnknownGroup,
             .remote => |remote| {
-                var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
+                var client = self.httpClient(alloc);
                 const body = try encodeTxnPrepareRequest(alloc, req);
                 defer alloc.free(body);
                 var response = try client.fetchGroupTxnPrepare(remote.base_uri, group_id, table_name, body);
@@ -255,7 +269,7 @@ pub const HostedParticipantWorker = struct {
         switch (route) {
             .local => _ = (try self.writes.txnResolveGroupLocalWithCancellation(alloc, group_id, table_name, req.txn_id, req.status, req.commit_version, req.topology_epoch, req.sync_level, cancellation)) orelse return error.UnknownGroup,
             .remote => |remote| {
-                var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
+                var client = self.httpClient(alloc);
                 const body = try encodeTxnResolveRequest(alloc, req);
                 defer alloc.free(body);
                 // The semantic callback remains process-local. Adapt it to the
@@ -283,7 +297,7 @@ pub const HostedParticipantWorker = struct {
         return switch (route) {
             .local => (try self.writes.txnStatusGroupLocal(alloc, group_id, table_name, txn_id)) orelse error.UnknownGroup,
             .remote => |remote| blk: {
-                var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
+                var client = self.httpClient(alloc);
                 const body = try encodeTxnStatusRequest(alloc, txn_id);
                 defer alloc.free(body);
                 var response = try client.fetchGroupTxnStatus(remote.base_uri, group_id, table_name, body);
@@ -301,7 +315,7 @@ pub const HostedParticipantWorker = struct {
         switch (route) {
             .local => _ = (try self.writes.txnAcknowledgeGroupLocal(alloc, group_id, table_name, req.txn_id, req.participant)) orelse return error.UnknownGroup,
             .remote => |remote| {
-                var client = http_client_mod.ApiHttpClient.init(alloc, self.executor);
+                var client = self.httpClient(alloc);
                 const body = try encodeTxnAcknowledgeRequest(alloc, req);
                 defer alloc.free(body);
                 var response = try client.fetchGroupTxnAcknowledge(remote.base_uri, group_id, table_name, body);
