@@ -708,6 +708,7 @@ pub const HttpHandler = struct {
             else => return err,
         };
         validateServerlessIndexCatalog(self.alloc, indexes_json) catch |err| switch (err) {
+            error.UnsupportedServerlessArtifactIndexSources => return try unsupportedArtifactIndexSourcesResponse(self.alloc),
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
         };
@@ -806,6 +807,7 @@ pub const HttpHandler = struct {
         const next_indexes_json = try indexes_api.addIndexToTableIndexesJson(self.alloc, table.indexes_json, index_name, expanded_index_json);
         defer self.alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(self.alloc, next_indexes_json) catch |err| switch (err) {
+            error.UnsupportedServerlessArtifactIndexSources => return try unsupportedArtifactIndexSourcesResponse(self.alloc),
             error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
             error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
             else => return err,
@@ -831,6 +833,7 @@ pub const HttpHandler = struct {
         };
         defer self.alloc.free(next_indexes_json);
         validateServerlessIndexCatalog(self.alloc, next_indexes_json) catch |err| switch (err) {
+            error.UnsupportedServerlessArtifactIndexSources => return try unsupportedArtifactIndexSourcesResponse(self.alloc),
             error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
             error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
             else => return err,
@@ -4743,6 +4746,7 @@ pub const HttpHandler = struct {
         const response_body = indexes_api.encodeCreatedIndexConfig(alloc, index_name, normalized_index_json) catch return error.InternalFailure;
         errdefer alloc.free(response_body);
         validateServerlessIndexCatalog(alloc, next_indexes_json) catch |err| switch (err) {
+            error.UnsupportedServerlessArtifactIndexSources => return error.UnsupportedArtifactIndexSources,
             error.UnsupportedCreateTableRequest, error.InvalidTableIndexMetadata => return error.InvalidIndexRequest,
             else => return error.InternalFailure,
         };
@@ -6129,6 +6133,10 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
         else
             "full_text";
 
+        if (try serverlessIndexUsesArtifactSources(kind, entry.value_ptr.*)) {
+            return error.UnsupportedServerlessArtifactIndexSources;
+        }
+
         if (std.mem.eql(u8, kind, "full_text")) {
             full_text_count += 1;
             if (std.mem.startsWith(u8, entry.key_ptr.*, "full_text_index_v")) {
@@ -6158,6 +6166,24 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
     if ((full_text_count > 1 and versioned_full_text_count != full_text_count) or graph_count > 1) {
         return error.UnsupportedCreateTableRequest;
     }
+}
+
+fn serverlessIndexUsesArtifactSources(kind: []const u8, config: std.json.Value) !bool {
+    if (config != .object) return error.InvalidTableIndexMetadata;
+    if (config.object.get("sources")) |sources| {
+        if (sources != .array or sources.array.items.len == 0) return error.InvalidTableIndexMetadata;
+        return true;
+    }
+    if (std.mem.eql(u8, kind, "full_text")) {
+        return config.object.get("artifact_name") != null or config.object.get("chunk_name") != null;
+    }
+    if (std.mem.eql(u8, kind, "embeddings")) {
+        return config.object.get("embedding_name") != null or config.object.get("source_artifact_name") != null;
+    }
+    if (std.mem.eql(u8, kind, "graph")) {
+        return config.object.get("source") != null;
+    }
+    return false;
 }
 
 fn validateServerlessAlgebraicIndexConfig(alloc: Allocator, value: std.json.Value) !void {
@@ -6691,6 +6717,30 @@ fn textResponse(alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
 
 fn unsupportedMixedSourceReturnModeResponse(alloc: Allocator) !HttpResponse {
     return jsonResponse(alloc, 422, public_table_http.UnsupportedHierarchyGroupingError{});
+}
+
+const UnsupportedArtifactIndexSourcesError = struct {
+    @"error": []const u8 = "unsupported_index_capability",
+    message: []const u8 = "artifact-backed index sources are not supported by this deployment",
+    retryable: bool = false,
+};
+
+fn unsupportedArtifactIndexSourcesResponse(alloc: Allocator) !HttpResponse {
+    return jsonResponse(alloc, 400, UnsupportedArtifactIndexSourcesError{});
+}
+
+test "serverless artifact index capability response is structured and actionable" {
+    const alloc = std.testing.allocator;
+    var response = try unsupportedArtifactIndexSourcesResponse(alloc);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 400), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type);
+    var parsed = try std.json.parseFromSlice(UnsupportedArtifactIndexSourcesError, alloc, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_index_capability", parsed.value.@"error");
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "artifact-backed index sources") != null);
+    try std.testing.expect(!parsed.value.retryable);
 }
 
 test "serverless mixed hierarchy grouping response uses the public contract" {
@@ -8681,6 +8731,28 @@ test "serverless index catalog validation rejects malformed configs" {
     try std.testing.expectError(error.InvalidTableIndexMetadata, validateServerlessIndexCatalog(alloc,
         \\{"relations":{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[0]"}}}
     ));
+}
+
+test "serverless index catalog rejects artifact-backed sources before publication" {
+    const alloc = std.testing.allocator;
+    const unsupported = [_][]const u8{
+        "{\"chunks\":{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"document_chunks_v1\"}]}}",
+        "{\"chunks\":{\"type\":\"full_text\",\"artifact_name\":\"document_chunks_v1\"}}",
+        "{\"vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"}]}}",
+        "{\"vectors\":{\"type\":\"embeddings\",\"dimension\":3,\"embedding_name\":\"document_dense_v1\",\"source_artifact_name\":\"document_chunks_v1\"}}",
+        "{\"relations\":{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\"}]}}",
+        "{\"relations\":{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"}}}",
+    };
+    for (unsupported) |indexes_json| {
+        try std.testing.expectError(
+            error.UnsupportedServerlessArtifactIndexSources,
+            validateServerlessIndexCatalog(alloc, indexes_json),
+        );
+    }
+
+    try validateServerlessIndexCatalog(alloc,
+        \\{"text":{"type":"full_text","field":"body"},"vectors":{"type":"embeddings","field":"body","dimension":3},"relations":{"type":"graph","edge_types":[{"name":"related","field":"related_ids"}]}}
+    );
 }
 
 test "http handler serves the table public lifecycle and consistency routes" {

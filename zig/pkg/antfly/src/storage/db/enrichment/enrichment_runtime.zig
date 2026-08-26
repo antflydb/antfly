@@ -7654,15 +7654,7 @@ fn runtimeGraphStateSourcePriorityAlloc(
     const terminator = internal_keys.findComponentTerminator(state_key, state_prefix.len) orelse return null;
     const state_name = try internal_keys.decodeBodyAlloc(runtime.alloc, state_key[state_prefix.len..terminator]);
     defer runtime.alloc.free(state_name);
-    if (try graph_state_name.identity(state_name)) |identity| {
-        if (identity.role == .resolution_mention_artifacts) return null;
-        for (sources, 0..) |source, i| {
-            if (std.mem.eql(u8, source.artifact_name, identity.source_artifact)) return i;
-        }
-        return null;
-    }
-
-    return graph_state_name.legacySourcePriority(state_name, sources);
+    return graph_state_name.materializedSourcePriority(state_name, sources);
 }
 
 fn runtimeLoadGraphEdgeWinners(

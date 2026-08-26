@@ -79,6 +79,24 @@ pub fn legacySourcePriority(state_name: []const u8, sources: anytype) ?usize {
     return best;
 }
 
+/// Resolves a persisted graph state name to its configured source precedence.
+///
+/// Released state names are checked before the canonical envelope because
+/// artifact names were unrestricted and may legally begin with `magic`. This
+/// ordering keeps names such as "GSN1" readable without turning malformed
+/// canonical envelopes into silently accepted state: names that do not match a
+/// configured legacy source are still decoded strictly by `identity`.
+pub fn materializedSourcePriority(state_name: []const u8, sources: anytype) !?usize {
+    if (legacySourcePriority(state_name, sources)) |priority| return priority;
+
+    const parsed = try identity(state_name) orelse return null;
+    if (parsed.role == .resolution_mention_artifacts) return null;
+    for (sources, 0..) |source, i| {
+        if (std.mem.eql(u8, source.artifact_name, parsed.source_artifact)) return i;
+    }
+    return null;
+}
+
 pub fn artifactAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) ![]u8 {
     var list = try init(alloc, artifact_ref.name);
     errdefer list.deinit(alloc);
@@ -174,4 +192,28 @@ test "v0.2.0 graph state names prefer the longest source boundary" {
     };
     try std.testing.expectEqual(@as(?usize, 1), legacySourcePriority("relations\x1fwest\x1fresolution_mentions", &sources));
     try std.testing.expectEqual(@as(?usize, null), legacySourcePriority("relations-west", &sources));
+}
+
+test "released graph state names may begin with canonical magic" {
+    const Source = struct { artifact_name: []const u8 };
+    const sources = [_]Source{
+        .{ .artifact_name = "GSN1" },
+        .{ .artifact_name = "GSN1\x1fwest" },
+    };
+
+    try std.testing.expectEqual(@as(?usize, 0), try materializedSourcePriority("GSN1", &sources));
+    try std.testing.expectEqual(@as(?usize, 1), try materializedSourcePriority("GSN1\x1fwest\x1fasset", &sources));
+}
+
+test "canonical graph state names resolve after legacy collision check" {
+    const alloc = std.testing.allocator;
+    const Source = struct { artifact_name: []const u8 };
+    const sources = [_]Source{
+        .{ .artifact_name = "GSN1" },
+        .{ .artifact_name = "relations" },
+    };
+    const name = try mentionAlloc(alloc, "relations", "resolution:v1");
+    defer alloc.free(name);
+
+    try std.testing.expectEqual(@as(?usize, 1), try materializedSourcePriority(name, &sources));
 }

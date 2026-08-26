@@ -209,6 +209,7 @@ pub const TableApi = struct {
         Conflict,
         MethodNotAllowed,
         InvalidIndexRequest,
+        UnsupportedArtifactIndexSources,
         ProbeUnavailable,
         ModelNotFound,
         Backpressured,
@@ -1336,6 +1337,7 @@ pub fn handleTableCreateIndex(
         error.Conflict => return .{ .status = 409, .body = try alloc.dupe(u8, "{\"error\":\"table_mutation_conflict\",\"message\":\"table mutation conflict; retry request\",\"retryable\":true}"), .json = true },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"unsupported index configuration\",\"retryable\":false}"), .json = true },
+        error.UnsupportedArtifactIndexSources => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"unsupported_index_capability\",\"message\":\"artifact-backed index sources are not supported by this deployment\",\"retryable\":false}"), .json = true },
         error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"index validation probe unavailable\",\"retryable\":true}"), .json = true },
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"model_not_found\",\"message\":\"model not found\",\"retryable\":false}"), .json = true },
         error.Backpressured => return .{
@@ -2072,6 +2074,57 @@ test "public create index exposes retryable storage descriptor exhaustion" {
     try std.testing.expect(resp.json);
     try std.testing.expectEqual(@as(?u32, 1), resp.retry_after_seconds);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "storage_resource_exhausted") != null);
+}
+
+test "public create index exposes unsupported deployment capability" {
+    const Backend = struct {
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .request = .{},
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = executeCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteBatchError!void {}
+
+        fn executeCreateIndex(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: operation.RequestContext,
+        ) TableApi.ExecuteCreateIndexError![]u8 {
+            return error.UnsupportedArtifactIndexSources;
+        }
+    };
+
+    var backend = Backend{};
+    var resp = try handleTableCreateIndex(std.testing.allocator, "docs", "search", "{}", backend.iface());
+    defer resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    try std.testing.expect(resp.json);
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"unsupported_index_capability\",\"message\":\"artifact-backed index sources are not supported by this deployment\",\"retryable\":false}",
+        resp.body,
+    );
 }
 
 test "public create index returns normalized created resource" {
