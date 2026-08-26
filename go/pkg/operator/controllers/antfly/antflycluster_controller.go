@@ -7660,13 +7660,24 @@ func haRejoinAssessBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlann
 	if identity == nil || strings.TrimSpace(action.StandbyName) == "" {
 		return adminsdk.RejoinAssessRequest{}, false
 	}
+	requestIdentity := haAdminIdentityRequestFromSpec(identity)
+	promotion := haPromotionReceipt(cluster.Status.HAStatus)
+	if promotion != nil {
+		if !haIdentityMatchesPromotionParentOrChild(identity, promotion) {
+			return adminsdk.RejoinAssessRequest{}, false
+		}
+		// The former-primary assessment must describe the immutable parent
+		// branch. The cluster spec may already describe the promoted child.
+		requestIdentity.TimelineId = promotion.ParentTimelineID
+		requestIdentity.Epoch = promotion.ParentEpoch
+	}
 	lastLSN := action.ObservedLSN
 	if lastLSN == 0 {
 		lastLSN = action.TargetLSN
 	}
 	body := adminsdk.RejoinAssessRequest{
 		NodeId:                          action.StandbyName,
-		Identity:                        haAdminIdentityRequestFromSpec(identity),
+		Identity:                        requestIdentity,
 		LastLsn:                         lastLSN,
 		RetainedFromLsn:                 action.RetainedFromLSN,
 		AllowRewindAfterForcedPromotion: false,

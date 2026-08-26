@@ -1691,7 +1691,10 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		plan.Actions = append(plan.Actions, action)
 	}
 	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary, status); action.Kind != "" {
-		action.DependsOn = formerPrimaryFenceDependency
+		// Assessment is meaningful only after the promotion receipt exists. The
+		// subsequent mutating rewind/reseed remains ordered behind the concrete
+		// former-primary fence so no old-timeline writer can race repair.
+		action.DependsOn = haFormerPrimaryActionDependency(action.Kind, formerPrimaryFenceDependency)
 		plan.Actions = append(plan.Actions, action)
 		if action.Kind == haActionReseedFormerPrimary {
 			if standby, ok := haStandbySpecByName(ha, action.StandbyName); ok {
@@ -1725,6 +1728,13 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 	}
 
 	return plan
+}
+
+func haFormerPrimaryActionDependency(kind, fenceDependency haActionKind) haActionKind {
+	if kind == haActionDemoteFormerPrimary {
+		return haActionPromoteStandby
+	}
+	return fenceDependency
 }
 
 func haFormerPrimaryFencePlannedAction(cluster *antflyv1.AntflyCluster, status *antflyv1.HAStatus) haPlannedAction {
@@ -2433,7 +2443,12 @@ func haPlannedActionExecutionStarted(action antflyv1.HAPlannedActionStatus) bool
 // only while its declarative claim name remains unchanged and is revalidated at
 // the execution boundary.
 func haPlannedActionOperationID(action antflyv1.HAPlannedActionStatus) string {
-	if strings.TrimSpace(action.SeedArtifactCaptureRoot) == "" && strings.TrimSpace(action.TopologyID) == "" &&
+	generationBoundAssessment := haActionKind(action.Kind) == haActionDemoteFormerPrimary &&
+		action.FenceGeneration > 0 &&
+		action.FenceAuthority != "" &&
+		strings.TrimSpace(action.FenceHolder) != ""
+	if !generationBoundAssessment &&
+		strings.TrimSpace(action.SeedArtifactCaptureRoot) == "" && strings.TrimSpace(action.TopologyID) == "" &&
 		action.TopologyGeneration == 0 && strings.TrimSpace(action.TopologyNodeID) == "" &&
 		strings.TrimSpace(action.TargetPVCName) == "" && strings.TrimSpace(action.TargetPVCUID) == "" &&
 		strings.TrimSpace(action.SeedCaptureReceiptPath) == "" && strings.TrimSpace(action.SeedCaptureReceiptSHA256) == "" &&
@@ -3154,6 +3169,20 @@ func haFormerPrimaryAdminCommand(action haPlannedAction, identity *antflyv1.HARe
 	if identity == nil || action.StandbyName == "" {
 		return nil
 	}
+	requestTimelineID := identity.TimelineID
+	requestEpoch := identity.Epoch
+	promotion := haPromotionReceipt(status)
+	if promotion != nil {
+		if !haIdentityMatchesPromotionParentOrChild(identity, promotion) {
+			return nil
+		}
+		// The request describes the former primary, not the newly adopted
+		// primary. After Colony advances the declarative spec to the child
+		// timeline, the immutable promotion receipt is the only authoritative
+		// source for the former node's parent identity.
+		requestTimelineID = promotion.ParentTimelineID
+		requestEpoch = promotion.ParentEpoch
+	}
 	lastLSN := action.ObservedLSN
 	if lastLSN == 0 {
 		lastLSN = action.TargetLSN
@@ -3164,8 +3193,8 @@ func haFormerPrimaryAdminCommand(action haPlannedAction, identity *antflyv1.HARe
 		"--cluster-id", strconv.FormatUint(identity.ClusterID, 10),
 		"--shard-id", strconv.FormatUint(identity.ShardID, 10),
 		"--table-id", strconv.FormatUint(identity.TableID, 10),
-		"--timeline-id", strconv.FormatUint(identity.TimelineID, 10),
-		"--epoch", strconv.FormatUint(identity.Epoch, 10),
+		"--timeline-id", strconv.FormatUint(requestTimelineID, 10),
+		"--epoch", strconv.FormatUint(requestEpoch, 10),
 		"--last-lsn", strconv.FormatUint(lastLSN, 10),
 		"--retained-from-lsn", strconv.FormatUint(action.RetainedFromLSN, 10),
 	}
@@ -3173,7 +3202,6 @@ func haFormerPrimaryAdminCommand(action haPlannedAction, identity *antflyv1.HARe
 		return args
 	}
 
-	promotion := haPromotionReceipt(status)
 	if promotion == nil {
 		return nil
 	}

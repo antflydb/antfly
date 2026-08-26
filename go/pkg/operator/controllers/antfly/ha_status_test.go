@@ -518,6 +518,31 @@ func TestHAPlannedActionOperationIDVersionsTopologyBindingWithoutRekeyingLegacyA
 	if !strings.HasPrefix(boundID, "haop-v2-") || boundID == legacyID {
 		t.Fatalf("topology-bound seed action must use a distinct versioned identity, legacy=%q bound=%q", legacyID, boundID)
 	}
+
+	assessment := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		Executor:        string(haActionExecutorAdminAPI),
+		StandbyName:     "primary-a",
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 7,
+	}
+	assessmentID := haPlannedActionOperationID(assessment)
+	if !strings.HasPrefix(assessmentID, "haop-v2-") {
+		t.Fatalf("promotion-generation-bound former-primary assessment must not use a legacy retry identity, got %q", assessmentID)
+	}
+}
+
+func TestHAFormerPrimaryActionDependencySeparatesAssessmentFromMutation(t *testing.T) {
+	fenceDependency := haActionIsolateFormerPrimary
+	if got := haFormerPrimaryActionDependency(haActionDemoteFormerPrimary, fenceDependency); got != haActionPromoteStandby {
+		t.Fatalf("former-primary assessment must follow the promotion receipt, got %q", got)
+	}
+	for _, kind := range []haActionKind{haActionRewindFormerPrimary, haActionReseedFormerPrimary} {
+		if got := haFormerPrimaryActionDependency(kind, fenceDependency); got != fenceDependency {
+			t.Fatalf("mutating former-primary action %q must follow physical fencing, got %q", kind, got)
+		}
+	}
 }
 
 func TestHARewindFormerPrimaryBindsImmutableTopologyAndPVCExecutionIdentity(t *testing.T) {
@@ -2903,6 +2928,10 @@ func TestHADirectAdminRequestBodiesMarshalOpenAPIFields(t *testing.T) {
 		rejoinJSON["allow_rewind_after_forced_promotion"] != false {
 		t.Fatalf("unexpected rejoin request JSON: %#v", rejoinJSON)
 	}
+	rejoinIdentity := rejoinJSON["identity"].(map[string]any)
+	if rejoinIdentity["timeline_id"] != float64(4) || rejoinIdentity["epoch"] != float64(6) {
+		t.Fatalf("expected rejoin assessment to describe the former-primary parent identity, got %#v", rejoinIdentity)
+	}
 	receipt := rejoinJSON["receipt"].(map[string]any)
 	if receipt["old_primary_id"] != "primary-a" ||
 		receipt["promoted_node_id"] != "standby-a" ||
@@ -2914,6 +2943,23 @@ func TestHADirectAdminRequestBodiesMarshalOpenAPIFields(t *testing.T) {
 	receiptIdentity := receipt["identity"].(map[string]any)
 	if receiptIdentity["timeline_id"] != float64(5) || receiptIdentity["epoch"] != float64(7) {
 		t.Fatalf("expected rejoin receipt identity to use promoted timeline, got %#v", receiptIdentity)
+	}
+
+	// Colony adopts the child identity before it asks the former-primary
+	// controller to repair. That declarative advance must not cause assessment
+	// to describe the winner as the former primary.
+	cluster.Spec.HighAvailability.Identity.TimelineID = 5
+	cluster.Spec.HighAvailability.Identity.Epoch = 7
+	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
+	adoptedRejoin, ok := haRejoinAssessBody(cluster, antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		StandbyName:     "primary-a",
+		TargetLSN:       12,
+		ObservedLSN:     13,
+		RetainedFromLSN: 8,
+	})
+	if !ok || adoptedRejoin.Identity.TimelineId != 4 || adoptedRejoin.Identity.Epoch != 6 {
+		t.Fatalf("adopted topology lost former-primary parent identity: %#v", adoptedRejoin)
 	}
 
 	cluster.Status.HAStatus.LastPromotion.FenceAuthority = ""
