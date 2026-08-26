@@ -445,6 +445,12 @@ pub const OwnedStack = struct {
             .compaction_enabled = cfg.compaction_enabled,
             .prune_enabled = cfg.prune_enabled,
             .enrichment_enabled = cfg.enrichment_enabled,
+            .embedder_options = .{
+                .io = io,
+                .bounded_http_request = true,
+                .secret_store = cfg.secret_store,
+                .remote_content = cfg.remote_content,
+            },
         }, &self.catalog, build_mod.Pruner.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal));
         const generated_lease_owner = if (cfg.work_lease_owner_id == null)
             try workLeaseOwnerIdAlloc(alloc, io)
@@ -462,6 +468,8 @@ pub const OwnedStack = struct {
         if (cfg.embedding_indexes_json) |indexes_json| {
             const embedder_options = managed_embedder.InitOptions{
                 .io = io,
+                .bounded_http_request = true,
+                .secret_store = cfg.secret_store,
                 .remote_content = cfg.remote_content,
             };
             var query_embedder = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, embedder_options);

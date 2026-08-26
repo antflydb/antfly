@@ -14,6 +14,10 @@ pub const Transition = struct {
     actor_id: ?ids.StableId = null,
     resource_id: ?ids.StableId = null,
     parameter: i64 = 0,
+    /// Optional semantic content digest for transitions whose identity and
+    /// scalar parameter do not fully describe the operation (for example,
+    /// equal-length network packets with different bytes).
+    semantic_digest: u64 = 0,
     /// Required for explicit lifecycle transitions. Legacy fault transitions
     /// default to a pulse when this is null.
     fault_phase: ?FaultPhase = null,
@@ -34,6 +38,7 @@ pub const Transition = struct {
             lhs.actor_id == rhs.actor_id and
             lhs.resource_id == rhs.resource_id and
             lhs.parameter == rhs.parameter and
+            lhs.semantic_digest == rhs.semantic_digest and
             lhs.fault_phase == rhs.fault_phase and
             lhs.weight == rhs.weight;
     }
@@ -41,10 +46,14 @@ pub const Transition = struct {
     pub fn payloadDigest(self: Transition) u64 {
         const actors = ids.derive("transition.payload.actors", self.actor_id orelse 0, self.resource_id orelse 0);
         const legacy = ids.derive("transition.payload", actors, @bitCast(self.parameter));
-        return if (self.fault_phase) |phase|
+        const phased = if (self.fault_phase) |phase|
             ids.derive("transition.payload.fault-phase", legacy, @as(u64, @intFromEnum(phase)) + 1)
         else
             legacy;
+        return if (self.semantic_digest == 0)
+            phased
+        else
+            ids.derive("transition.payload.semantic", phased, self.semantic_digest);
     }
 };
 
@@ -98,4 +107,19 @@ test "zero transition weight is rejected" {
     defer list.deinit(std.testing.allocator);
     try list.append(std.testing.allocator, .{ .id = 2, .name = "never", .kind = .workload, .weight = 0 });
     try std.testing.expectError(error.InvalidTransitionWeight, list.canonicalize());
+}
+
+test "semantic payload distinguishes equal-length transition contents" {
+    const left = Transition{
+        .id = 7,
+        .name = "packet",
+        .kind = .scheduler,
+        .actor_id = 8,
+        .resource_id = 9,
+        .parameter = 3,
+        .semantic_digest = ids.digest("abc"),
+    };
+    var right = left;
+    right.semantic_digest = ids.digest("xyz");
+    try std.testing.expect(left.payloadDigest() != right.payloadDigest());
 }

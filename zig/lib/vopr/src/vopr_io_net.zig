@@ -87,6 +87,7 @@ const SocketState = struct {
     /// when pipelined bytes remain unread.
     peer_hard_disconnected: bool = false,
     closed: bool = false,
+    next_packet_sequence: u64 = 1,
 
     fn readResource(self: *const SocketState) ids.StableId {
         return ids.derive("sim-io.socket-read", self.id, 0);
@@ -113,15 +114,21 @@ const Packet = struct {
     datagram: bool = false,
 };
 
+const IdentitySequence = struct {
+    parent: ids.StableId,
+    next_sequence: u64 = 1,
+};
+
 pub const Network = struct {
     allocator: std.mem.Allocator,
     config: Config,
     wait_port: ?WaitPort = null,
     next_handle: std.Io.net.Socket.Handle = 0x5000_0000,
-    next_sequence: u64 = 1,
+    next_pair_sequence: u64 = 1,
     next_ephemeral_port: u16 = 20_000,
     sockets: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, *SocketState) = .empty,
     socket_order: std.ArrayListUnmanaged(*SocketState) = .empty,
+    identity_sequences: std.ArrayListUnmanaged(IdentitySequence) = .empty,
     open_sockets: usize = 0,
     packets: std.ArrayListUnmanaged(Packet) = .empty,
     queued_bytes: usize = 0,
@@ -153,6 +160,7 @@ pub const Network = struct {
             self.allocator.destroy(socket_state);
         }
         self.socket_order.deinit(self.allocator);
+        self.identity_sequences.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -164,7 +172,7 @@ pub const Network = struct {
             address.setPort(self.allocateEphemeralPort() catch return error.AddressInUse);
         }
         if (self.findIpListener(address) != null) return error.AddressInUse;
-        const listener = self.createSocket(.listener, address) catch |err| return mapListenResourceError(err);
+        const listener = self.createSocket(.listener, address, ipEndpointIdentity("sim-io.ip-listener", address)) catch |err| return mapListenResourceError(err);
         listener.listener_address = .{ .ip = address };
         listener.backlog = options.kernel_backlog;
         return .{ .handle = listener.handle, .address = address };
@@ -173,7 +181,7 @@ pub const Network = struct {
     pub fn listenUnix(self: *Network, requested: *const std.Io.net.UnixAddress, options: std.Io.net.UnixAddress.ListenOptions) std.Io.net.UnixAddress.ListenError!std.Io.net.Socket.Handle {
         if (self.faults.network_down) return error.NetworkDown;
         if (self.findUnixListener(requested.path) != null) return error.AddressInUse;
-        const listener = self.createSocket(.listener, .{ .ip4 = .loopback(0) }) catch |err|
+        const listener = self.createSocket(.listener, .{ .ip4 = .loopback(0) }, ids.stable("sim-io.unix-listener", requested.path)) catch |err|
             return mapUnixListenResourceError(err);
         errdefer self.destroyLastSocket(listener);
         listener.listener_address = .{ .unix = self.allocator.dupe(u8, requested.path) catch return error.SystemResources };
@@ -197,7 +205,7 @@ pub const Network = struct {
         if (address.getPort() == 0)
             address.setPort(self.allocateEphemeralPort() catch return error.AddressInUse);
         if (self.findDatagram(address) != null) return error.AddressInUse;
-        const socket_state = self.createSocket(.datagram, address) catch |err| return mapBindResourceError(err);
+        const socket_state = self.createSocket(.datagram, address, ipEndpointIdentity("sim-io.datagram-endpoint", address)) catch |err| return mapBindResourceError(err);
         return .{ .handle = socket_state.handle, .address = address };
     }
 
@@ -215,9 +223,12 @@ pub const Network = struct {
             .ip4 => .{ .ip4 = .loopback(0) },
             .ip6 => .{ .ip6 = .loopback(0) },
         };
-        const left = self.createSocket(.stream, address) catch |err| return mapPairResourceError(err);
+        if (self.next_pair_sequence == std.math.maxInt(u64)) return error.SystemResources;
+        const pair_parent = ids.derive("sim-io.socket-pair", network_id, self.next_pair_sequence);
+        self.next_pair_sequence += 1;
+        const left = self.createSocket(.stream, address, pair_parent) catch |err| return mapPairResourceError(err);
         errdefer self.destroyLastSocket(left);
-        const right = self.createSocket(.stream, address) catch |err| return mapPairResourceError(err);
+        const right = self.createSocket(.stream, address, pair_parent) catch |err| return mapPairResourceError(err);
         left.peer = right.handle;
         right.peer = left.handle;
         return .{
@@ -299,7 +310,7 @@ pub const Network = struct {
             written += copyLimited(bytes, buffer, written);
             if (written == bytes.len) break :outer;
         };
-        const sequence = self.allocateSequence();
+        const sequence = self.allocatePacketSequence(source) catch return error.SystemResources;
         self.packets.append(self.allocator, .{
             .id = ids.derive("sim-io.packet", source.id, sequence),
             .sequence = sequence,
@@ -323,7 +334,8 @@ pub const Network = struct {
                 return .{ error.SystemResources, index };
             const bytes = self.allocator.dupe(u8, message.data_ptr[0..message.data_len]) catch
                 return .{ error.SystemResources, index };
-            const sequence = self.allocateSequence();
+            const sequence = self.allocatePacketSequence(source) catch
+                return .{ error.SystemResources, index };
             self.packets.append(self.allocator, .{
                 .id = ids.derive("sim-io.datagram", source.id, sequence),
                 .sequence = sequence,
@@ -468,6 +480,7 @@ pub const Network = struct {
                 .actor_id = self.getSocket(packet.source).?.id,
                 .resource_id = self.getSocket(packet.destination).?.id,
                 .parameter = @intCast(packet.bytes.len),
+                .semantic_digest = if (packet.close_write) 0 else ids.digest(packet.bytes),
             });
         }
     }
@@ -540,8 +553,8 @@ pub const Network = struct {
 
     fn connectToListener(self: *Network, listener: *SocketState, address: std.Io.net.IpAddress) !*SocketState {
         if (listener.pending_accept.items.len >= listener.backlog) return error.ConnectionRefused;
-        const client = try self.createSocket(.stream, address);
-        const server = self.createSocket(.stream, address) catch |err| {
+        const client = try self.createSocket(.stream, address, listener.id);
+        const server = self.createSocket(.stream, address, listener.id) catch |err| {
             self.destroyLastSocket(client);
             return err;
         };
@@ -556,17 +569,17 @@ pub const Network = struct {
         return client;
     }
 
-    fn createSocket(self: *Network, kind: SocketKind, address: std.Io.net.IpAddress) !*SocketState {
+    fn createSocket(self: *Network, kind: SocketKind, address: std.Io.net.IpAddress, identity_parent: ids.StableId) !*SocketState {
         if (self.open_sockets >= self.config.max_sockets) return error.ProcessFdQuotaExceeded;
         if (self.next_handle == std.math.maxInt(std.Io.net.Socket.Handle)) return error.ProcessFdQuotaExceeded;
         const socket_state = try self.allocator.create(SocketState);
         errdefer self.allocator.destroy(socket_state);
         const handle = self.next_handle;
         self.next_handle += 1;
-        const sequence = self.allocateSequence();
+        const sequence = try self.allocateIdentitySequence(identity_parent);
         socket_state.* = .{
             .handle = handle,
-            .id = ids.derive("sim-io.socket", network_id, sequence),
+            .id = ids.derive("sim-io.socket", identity_parent, sequence),
             .kind = kind,
             .address = address,
         };
@@ -596,7 +609,7 @@ pub const Network = struct {
         socket_state.write_open = false;
         if (socket_state.peer) |peer_handle| if (self.getSocket(peer_handle)) |peer| {
             if (peer.closed) return;
-            const sequence = self.allocateSequence();
+            const sequence = try self.allocatePacketSequence(socket_state);
             try self.packets.append(self.allocator, .{
                 .id = ids.derive("sim-io.stream-fin", socket_state.id, sequence),
                 .sequence = sequence,
@@ -665,9 +678,22 @@ pub const Network = struct {
         return self.sockets.get(handle);
     }
 
-    fn allocateSequence(self: *Network) u64 {
-        const result = self.next_sequence;
-        self.next_sequence +|= 1;
+    fn allocateIdentitySequence(self: *Network, parent: ids.StableId) !u64 {
+        for (self.identity_sequences.items) |*identity| {
+            if (identity.parent != parent) continue;
+            if (identity.next_sequence == std.math.maxInt(u64)) return error.VoprIoSequenceExhausted;
+            const result = identity.next_sequence;
+            identity.next_sequence += 1;
+            return result;
+        }
+        try self.identity_sequences.append(self.allocator, .{ .parent = parent, .next_sequence = 2 });
+        return 1;
+    }
+
+    fn allocatePacketSequence(_: *Network, socket_state: *SocketState) !u64 {
+        if (socket_state.next_packet_sequence == std.math.maxInt(u64)) return error.VoprIoSequenceExhausted;
+        const result = socket_state.next_packet_sequence;
+        socket_state.next_packet_sequence += 1;
         return result;
     }
 
@@ -717,6 +743,21 @@ fn ipAddressMatches(listener: std.Io.net.IpAddress, requested: std.Io.net.IpAddr
             .ip6 => |right| std.mem.allEqual(u8, &left.bytes, 0) or std.mem.eql(u8, &left.bytes, &right.bytes),
         },
     };
+}
+
+fn ipEndpointIdentity(namespace: []const u8, address: std.Io.net.IpAddress) ids.StableId {
+    const address_id = switch (address) {
+        .ip4 => |ip4| ids.derive("sim-io.ip4-address", ids.digest(&ip4.bytes), ip4.port),
+        .ip6 => |ip6| blk: {
+            const scoped = ids.derive(
+                "sim-io.ip6-scope",
+                ids.digest(&ip6.bytes),
+                (@as(u64, ip6.flow) << 32) | ip6.interface.index,
+            );
+            break :blk ids.derive("sim-io.ip6-address", scoped, ip6.port);
+        },
+    };
+    return ids.derive(namespace, Network.network_id, address_id);
 }
 
 fn mapListenResourceError(err: anyerror) std.Io.net.IpAddress.ListenError {
@@ -782,6 +823,43 @@ fn mapWaitWriteError(err: anyerror) std.Io.net.Stream.Writer.Error {
         error.Canceled => error.Canceled,
         else => error.Unexpected,
     };
+}
+
+test "listener and connection identities are scoped to their logical endpoint" {
+    const NoopWaitPort = struct {
+        fn wait(_: *anyopaque, _: ids.StableId) anyerror!void {
+            return error.UnexpectedWait;
+        }
+
+        fn wake(_: *anyopaque, _: ids.StableId, _: u32) anyerror!void {}
+
+        const vtable = WaitPort.VTable{ .wait = wait, .wake = wake };
+    };
+    const address_a: std.Io.net.IpAddress = .{ .ip4 = .loopback(21_001) };
+    const address_b: std.Io.net.IpAddress = .{ .ip4 = .loopback(21_002) };
+
+    var first = try Network.init(std.testing.allocator, .{});
+    defer first.deinit();
+    var first_context: u8 = 0;
+    first.bindWaitPort(.{ .ptr = &first_context, .vtable = &NoopWaitPort.vtable });
+    const first_listener_a = try first.listenIp(&address_a, .{});
+    const first_listener_b = try first.listenIp(&address_b, .{});
+    const first_client_a = try first.connectIp(&address_a, .{ .mode = .stream });
+    const first_client_b = try first.connectIp(&address_b, .{ .mode = .stream });
+
+    var second = try Network.init(std.testing.allocator, .{});
+    defer second.deinit();
+    var second_context: u8 = 0;
+    second.bindWaitPort(.{ .ptr = &second_context, .vtable = &NoopWaitPort.vtable });
+    const second_listener_b = try second.listenIp(&address_b, .{});
+    const second_listener_a = try second.listenIp(&address_a, .{});
+    const second_client_b = try second.connectIp(&address_b, .{ .mode = .stream });
+    const second_client_a = try second.connectIp(&address_a, .{ .mode = .stream });
+
+    try std.testing.expectEqual(first.getSocket(first_listener_a.handle).?.id, second.getSocket(second_listener_a.handle).?.id);
+    try std.testing.expectEqual(first.getSocket(first_listener_b.handle).?.id, second.getSocket(second_listener_b.handle).?.id);
+    try std.testing.expectEqual(first.getSocket(first_client_a.handle).?.id, second.getSocket(second_client_a.handle).?.id);
+    try std.testing.expectEqual(first.getSocket(first_client_b.handle).?.id, second.getSocket(second_client_b.handle).?.id);
 }
 
 test "stream FIN never overtakes earlier payload when reordering is enabled" {

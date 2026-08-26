@@ -28,7 +28,10 @@ pub fn exactWithContext(
     if (!std.mem.eql(u8, recorded.header.scenario, Scenario.name)) return error.IncompatibleScenario;
     if (recorded.header.scenario_version != Scenario.version) return error.IncompatibleScenarioVersion;
 
-    var source = choice.Replay{ .records = recorded.choices.items };
+    var source = choice.Replay{
+        .records = recorded.choices.items,
+        .expected_transitions = recorded.transitions.items,
+    };
     var replayed = try runner.run(Scenario, allocator, source.source(), .{
         .system = recorded.header.system,
         .seed = recorded.config.seed,

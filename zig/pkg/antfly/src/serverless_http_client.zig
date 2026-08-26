@@ -1748,7 +1748,14 @@ test "serverless http client round-trips semantic search with embedding_template
         \\{{"serverless_chunk":{{"type":"embeddings","field":"text","dimension":3,"embedder":{{"provider":"openai","model":"text-embedding-3-small","url":"{s}"}}}}}}
     , .{embed_base_uri});
     defer alloc.free(indexes_json);
-    var query_embedder = try managed_embedder.ManagedEmbedder.initFromIndexesJson(alloc, indexes_json);
+    var query_embedder = try managed_embedder.ManagedEmbedder.initFromIndexesJsonWithOptions(
+        alloc,
+        indexes_json,
+        .{
+            .io = std.testing.io,
+            .bounded_http_request = true,
+        },
+    );
     defer query_embedder.deinit();
 
     var fs_artifacts = try @import("serverless/artifacts/mod.zig").FsStore.init(alloc, std.mem.span(artifact_root));

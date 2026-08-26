@@ -948,7 +948,16 @@ pub fn loadFromPathWithSecrets(
     path: []const u8,
     secret_store: ?*secrets.FileStore,
 ) !Config {
-    const raw = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, alloc, .limited(16 * 1024 * 1024));
+    return loadFromPathWithSecretsWithIo(alloc, std.Options.debug_io, path, secret_store);
+}
+
+pub fn loadFromPathWithSecretsWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    secret_store: ?*secrets.FileStore,
+) !Config {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(raw);
     return try Config.parseFromSliceWithSecrets(alloc, raw, secret_store);
 }
@@ -959,7 +968,17 @@ pub fn loadFromPathWithSecretsForDeployment(
     secret_store: ?*secrets.FileStore,
     deployment_mode: DeploymentMode,
 ) !Config {
-    const raw = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, alloc, .limited(16 * 1024 * 1024));
+    return loadFromPathWithSecretsForDeploymentWithIo(alloc, std.Options.debug_io, path, secret_store, deployment_mode);
+}
+
+pub fn loadFromPathWithSecretsForDeploymentWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    secret_store: ?*secrets.FileStore,
+    deployment_mode: DeploymentMode,
+) !Config {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(raw);
     return try Config.parseFromSliceWithSecretsForDeployment(alloc, raw, secret_store, deployment_mode);
 }

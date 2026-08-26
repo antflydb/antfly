@@ -84,13 +84,20 @@ pub fn runFromIterator(
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
 
+    // ProcessInit's compatibility executor may not run detached concurrent
+    // work eagerly. Serverless maintenance and request handling must share a
+    // process-owned executor so full-index waits can make forward progress.
+    var runtime_io_impl = std.Io.Threaded.init(alloc, .{});
+    defer runtime_io_impl.deinit();
+    const runtime_io = runtime_io_impl.io();
+
     var secret_store: ?antfly.common.secrets.FileStore = if (cli.secret_store_path orelse init.environ_map.get("ANTFLY_SECRET_STORE_PATH")) |path|
-        try antfly.common.secrets.FileStore.init(alloc, path)
+        try antfly.common.secrets.FileStore.initWithIo(alloc, runtime_io, path)
     else
         null;
     defer if (secret_store) |*store| store.deinit();
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |path|
-        try antfly.common.config.loadFromPathWithSecretsForDeployment(alloc, path, if (secret_store) |*store| store else null, .serverless)
+        try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(alloc, runtime_io, path, if (secret_store) |*store| store else null, .serverless)
     else
         null;
     defer if (loaded_config) |*cfg| cfg.deinit();
@@ -143,7 +150,7 @@ pub fn runFromIterator(
     const listener_enabled = forced_listener orelse listenerEnabledForRole(bootstrap.role);
     const listener = if (listener_enabled) try serverless_serverConfigFromEnv(init.environ_map, cli) else null;
 
-    var srv = serverless.ServerlessServer.init(alloc, init.io, .{
+    var srv = serverless.ServerlessServer.init(alloc, runtime_io, .{
         .bootstrap = bootstrap,
         .listener = listener,
     }) catch |err| {
@@ -171,7 +178,7 @@ pub fn runFromIterator(
     const health_bind_host = cli.bind_host orelse init.environ_map.get("ANTFLY_SERVERLESS_BIND_HOST") orelse "127.0.0.1";
     const health_server = try antfly.common.health_server.HealthServer.startIfConfiguredOnHostWithRuntime(
         alloc,
-        init.io,
+        runtime_io,
         "serverless",
         health_bind_host,
         health_port,
@@ -188,7 +195,7 @@ pub fn runFromIterator(
         if (health_server) |hs| if (hs.runtimeFailure()) |err| return supervisor.fail("health", "http", err);
         // A short interruptible wait bounds graceful termination latency even
         // on platforms whose clock sleep is automatically restarted.
-        sleepMs(init.io, 250);
+        sleepMs(runtime_io, 250);
     }
 }
 

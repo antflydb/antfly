@@ -25,7 +25,7 @@ const process_mod = @import("vopr_io_process.zig");
 const task_mod = @import("vopr_io_task.zig");
 const transition = @import("transition.zig");
 
-pub const model_version: u32 = 2;
+pub const model_version: u32 = 3;
 
 pub const Capability = enum(u6) {
     eager_async,
@@ -454,6 +454,13 @@ pub const VoprIo = struct {
             .storage_bytes = self.files.totalBytes(),
             .storage_capacity_bytes = self.files.capacityBytes(),
         };
+    }
+
+    /// Node/storage-domain accounting for composed VOPR deployments sharing
+    /// one virtual filesystem. This is intentionally path-scoped instead of
+    /// exposing filesystem internals to application fixtures.
+    pub fn storageBytesUnderPrefix(self: *const VoprIo, prefix: []const u8) !u64 {
+        return self.files.bytesUnderPrefix(prefix);
     }
 
     /// Stable task evidence for debuggers and harness-health reports. The

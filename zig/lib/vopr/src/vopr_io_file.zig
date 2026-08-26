@@ -775,6 +775,22 @@ pub const FileSystem = struct {
         return total;
     }
 
+    /// Current volatile file bytes rooted at one logical storage prefix.
+    /// The prefix is resolved in the same virtual namespace as ordinary file
+    /// operations, so callers never need to inspect the host filesystem.
+    pub fn bytesUnderPrefix(self: *const FileSystem, prefix: []const u8) !u64 {
+        const resolved = std.fs.path.resolve(self.allocator, &.{ "/", prefix }) catch
+            return error.SystemResources;
+        defer self.allocator.free(resolved);
+
+        var total: u64 = 0;
+        for (self.nodes.items) |node| {
+            if (node.exists and node.kind == .file and pathWithin(resolved, node.path))
+                total +|= node.data.items.len;
+        }
+        return total;
+    }
+
     pub fn openHandleCount(self: *const FileSystem) usize {
         return self.handles.count();
     }
@@ -1062,6 +1078,22 @@ test "virtual filesystem separates file and namespace durability" {
     var bytes: [3]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 3), try fs.readPositional(file, &.{&bytes}, 0));
     try std.testing.expectEqualStrings("one", &bytes);
+}
+
+test "virtual filesystem accounts bytes by logical storage prefix" {
+    var fs = try FileSystem.init(std.testing.allocator, .{});
+    defer fs.deinit();
+    _ = try fs.createDirPath(.cwd(), "nodes/one", .default_dir, 1);
+    _ = try fs.createDirPath(.cwd(), "nodes/two", .default_dir, 1);
+    const first = try fs.createFile(.cwd(), "nodes/one/wal", .{ .read = true }, 2);
+    const second = try fs.createFile(.cwd(), "nodes/two/wal", .{ .read = true }, 2);
+    _ = try fs.writePositional(first, &.{}, &.{"one"}, 1, 0, 3);
+    _ = try fs.writePositional(second, &.{}, &.{"second"}, 1, 0, 3);
+
+    try std.testing.expectEqual(@as(u64, 3), try fs.bytesUnderPrefix("nodes/one"));
+    try std.testing.expectEqual(@as(u64, 6), try fs.bytesUnderPrefix("/nodes/two"));
+    try std.testing.expectEqual(@as(u64, 9), try fs.bytesUnderPrefix("nodes"));
+    try std.testing.expectEqual(@as(u64, 0), try fs.bytesUnderPrefix("node"));
 }
 
 test "virtual filesystem enforces descriptor capacity partial writes and crash publication" {

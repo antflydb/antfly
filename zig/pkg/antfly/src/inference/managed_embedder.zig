@@ -776,9 +776,7 @@ pub const ManagedEmbedder = struct {
     ) ![32]u8 {
         const entry = self.findEntry(index_name) orelse return error.EmbeddingIndexNotFound;
         if (entry.sparse or entry.multimodal) return error.QueryEmbeddingNotCacheable;
-        if (entry.secret_store) |store| {
-            _ = try store.refreshIfChangedThrottled(query_cache_secret_refresh_interval_ns);
-        }
+        const secret_store_generation = try queryCacheSecretStoreGeneration(entry);
 
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hashQueryCacheField(&hasher, "antfly-query-embedding-v1");
@@ -792,7 +790,7 @@ pub const ManagedEmbedder = struct {
         hashQueryCacheField(&hasher, entry.truncate);
         hashQueryCacheU64(&hasher, entry.dimensions);
         hashQueryCacheSecretIdentity(&hasher, entry.api_key);
-        hashQueryCacheU64(&hasher, if (entry.secret_store) |store| store.generationFast() else 0);
+        hashQueryCacheU64(&hasher, secret_store_generation);
         hashQueryCacheField(&hasher, text);
         var digest: [32]u8 = undefined;
         hasher.final(&digest);
@@ -960,6 +958,17 @@ fn hashQueryCacheSecretIdentity(hasher: *std.crypto.hash.sha2.Sha256, maybe_secr
             hashQueryCacheField(hasher, value);
         },
     }
+}
+
+fn queryCacheSecretStoreGeneration(entry: *const ManagedEmbeddingEntry) !u64 {
+    const api_key = entry.api_key orelse return 0;
+    switch (api_key) {
+        .secret_ref => {},
+        .literal, .env_var => return 0,
+    }
+    const store = entry.secret_store orelse return 0;
+    _ = try store.refreshIfChangedThrottled(query_cache_secret_refresh_interval_ns);
+    return store.generationFast();
 }
 
 fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) !void {
@@ -3371,7 +3380,7 @@ pub fn testFileBackedApiKeyRotation() !void {
         .data = "{\"secrets\":[{\"key\":\"openai.api_key\",\"value\":\"first-key\",\"created_at_ns\":1,\"updated_at_ns\":1}]}",
     });
 
-    var secret_store = try common_secrets.FileStore.init(alloc, store_path);
+    var secret_store = try common_secrets.FileStore.initWithIo(alloc, io_impl.io(), store_path);
     defer secret_store.deinit();
 
     var app = AuthCaptureApp{ .alloc = alloc };
@@ -3395,6 +3404,16 @@ pub fn testFileBackedApiKeyRotation() !void {
     defer managed.deinit();
     const first_cache_key = try managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
 
+    const env_indexes_json = try std.fmt.allocPrint(alloc,
+        \\{{"semantic_idx":{{"type":"embeddings","field":"body","dimension":3,"embedder":{{"provider":"openai","model":"text-embedding-3-small","url":"{s}","api_key":"${{env:OPENAI_API_KEY}}"}}}}}}
+    , .{base_uri});
+    defer alloc.free(env_indexes_json);
+    var env_managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, env_indexes_json, .{
+        .secret_store = &secret_store,
+    });
+    defer env_managed.deinit();
+    const env_cache_key = try env_managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
+
     const first = try managed.embedQuery(alloc, "semantic_idx", "alpha concept");
     defer alloc.free(first);
     try app.expectHeader(0, "Bearer first-key");
@@ -3407,6 +3426,8 @@ pub fn testFileBackedApiKeyRotation() !void {
     _ = try secret_store.refreshIfChanged();
     const rotated_cache_key = try managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
     try std.testing.expect(!std.mem.eql(u8, &first_cache_key, &rotated_cache_key));
+    const rotated_env_cache_key = try env_managed.queryCacheKey("semantic_idx", .principal, "alice", "same query");
+    try std.testing.expectEqualSlices(u8, &env_cache_key, &rotated_env_cache_key);
 
     const second = try managed.embedQuery(alloc, "semantic_idx", "beta concept");
     defer alloc.free(second);

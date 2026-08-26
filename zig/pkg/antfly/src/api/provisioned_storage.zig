@@ -329,6 +329,17 @@ pub const ProvisionedGroupStorage = struct {
         self.write_cache.table_eviction_hook = null;
     }
 
+    /// Install an operator/runtime-owned capacity domain before sources are
+    /// attached. Deterministic runtimes use this to keep admission and status
+    /// reporting on modeled storage instead of probing the host filesystem.
+    pub fn installCapacitySource(
+        self: *ProvisionedGroupStorage,
+        source: resource_manager_mod.CapacitySource,
+    ) !void {
+        if (self.filesystem_capacity_probe != null) return error.CapacitySourceAlreadyInstalled;
+        try self.resource_manager.installCapacitySource(source);
+    }
+
     pub fn attachSources(
         self: *ProvisionedGroupStorage,
         read_source: *table_reads.ProvisionedTableReadSource,
@@ -338,7 +349,7 @@ pub const ProvisionedGroupStorage = struct {
         // and therefore one physical capacity domain. BackendRuntime remains
         // the execution abstraction; filesystem policy and accounting stay in
         // the ResourceManager.
-        if (filesystem_capacity.supported) {
+        if (filesystem_capacity.supported and self.resource_manager.capacitySource() == null) {
             if (self.filesystem_capacity_probe) |probe| {
                 if (!std.mem.eql(u8, probe.path, write_source.replica_root_dir)) {
                     return error.CapacitySourceAlreadyInstalled;

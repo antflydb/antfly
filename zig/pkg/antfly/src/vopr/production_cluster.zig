@@ -21,6 +21,34 @@ const api_table_router = @import("../api/table_router.zig");
 const hosted_shard_ops = @import("../raft/hosted_shard_ops.zig");
 const shard_ops = @import("../raft/shard_ops.zig");
 const transition_state = @import("../metadata/transition_state.zig");
+const resource_manager = @import("../storage/resource_manager.zig");
+
+const ModeledCapacitySource = struct {
+    sim: *vopr.vopr_io.VoprIo,
+    root: []const u8,
+    catalog: []const u8,
+    capacity_bytes: u64,
+    domain_id: resource_manager.CapacityDomainId,
+
+    fn source(self: *@This()) resource_manager.CapacitySource {
+        return .{
+            .ptr = self,
+            .domain_id = self.domain_id,
+            .observe = observe,
+        };
+    }
+
+    fn observe(raw: *anyopaque) anyerror!resource_manager.CapacityObservation {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const root_bytes = try self.sim.storageBytesUnderPrefix(self.root);
+        const catalog_bytes = try self.sim.storageBytesUnderPrefix(self.catalog);
+        const used_bytes = root_bytes +| catalog_bytes;
+        return .{
+            .capacity_bytes = self.capacity_bytes,
+            .available_bytes = self.capacity_bytes -| used_bytes,
+        };
+    }
+};
 
 pub const Fixture = struct {
     pub const Phase = enum(u8) {
@@ -87,6 +115,7 @@ pub const Fixture = struct {
     backend_runtime_owners_started: usize = 0,
     data_roots: [node_count][]u8 = undefined,
     data_root_count: usize = 0,
+    capacity_sources: [node_count]ModeledCapacitySource = undefined,
     data_catalogs: [node_count][]u8 = undefined,
     data_catalog_count: usize = 0,
     data_servers: [node_count]DataServer = undefined,
@@ -252,6 +281,17 @@ pub const Fixture = struct {
                 .{ self.metadata.?.tmp.sub_path, index + 1 },
             );
             self.data_catalog_count += 1;
+            self.capacity_sources[index] = .{
+                .sim = self.sim,
+                .root = self.data_roots[index],
+                .catalog = self.data_catalogs[index],
+                .capacity_bytes = 64 * 1024 * 1024,
+                .domain_id = @as(u128, vopr.id.derive(
+                    "full-cluster.production-capacity-domain",
+                    vopr.id.stable("full-cluster", "production-data"),
+                    index + 1,
+                )),
+            };
             self.data_servers[index] = try DataServer.initFromMetadataApiUrls(alloc, .{
                 .replica_root_dir = self.data_roots[index],
                 .replica_catalog_path = self.data_catalogs[index],
@@ -264,6 +304,7 @@ pub const Fixture = struct {
                     .failure_domain = if (index == 0) "rack-a" else if (index == 1) "rack-b" else "rack-c",
                 },
                 .process_memory_limit_bytes = 512 * 1024 * 1024,
+                .capacity_source = self.capacity_sources[index].source(),
                 .backend_runtime = self.backend_runtimes[index].ptr(),
                 .metadata_request_executors = &request_executors,
                 .data_raft_request_executor = self.raft_executor.executor(),
@@ -1023,7 +1064,11 @@ pub const Fixture = struct {
         raft_wire_requests: u64,
     } {
         return .{
-            .requests_ok = self.write_sound and self.read_sound and self.tenant_sound and self.split_sound and self.failure == null,
+            .requests_ok = self.write_sound and
+                self.read_sound and
+                self.tenant_sound and
+                (!self.active_split_enabled or self.split_sound) and
+                self.failure == null,
             .topology_ok = self.topology_sound,
             .cleanup_ok = self.cleanup_sound,
             // `backend_runtime_count` is live ownership and intentionally

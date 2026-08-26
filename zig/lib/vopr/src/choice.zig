@@ -448,8 +448,11 @@ pub const Enumerating = struct {
 
 pub const Replay = struct {
     records: []const trace.ChoiceRecord,
+    expected_transitions: []const trace.TransitionRecord = &.{},
     cursor: usize = 0,
     diagnostics: bool = true,
+    recent_actual: [8]transition.Transition = undefined,
+    recent_actual_count: usize = 0,
 
     pub fn source(self: *Replay) Source {
         return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
@@ -461,23 +464,70 @@ pub const Replay = struct {
         const record = self.records[self.cursor];
         if (record.site_id != request.site_id or !std.mem.eql(u8, record.site_name, request.site_name) or record.occurrence != request.occurrence) return error.ReplayChoiceSiteDiverged;
         if (record.enabled_ids.len != request.enabled.len) {
-            if (self.diagnostics) logEnabledSetDivergence(self.cursor, record, request);
+            if (self.diagnostics) self.logEnabledSetDivergence(self.cursor, record, request);
             return error.ReplayEnabledSetDiverged;
         }
         for (request.enabled, record.enabled_ids) |enabled, recorded_id| {
             if (enabled.id != recorded_id) {
-                if (self.diagnostics) logEnabledSetDivergence(self.cursor, record, request);
+                if (self.diagnostics) self.logEnabledSetDivergence(self.cursor, record, request);
                 return error.ReplayEnabledSetDiverged;
+            }
+        }
+        var selected: ?transition.Transition = null;
+        for (request.enabled) |enabled| {
+            if (enabled.id != record.selected_id) continue;
+            selected = enabled;
+            self.recent_actual[self.recent_actual_count % self.recent_actual.len] = enabled;
+            self.recent_actual_count += 1;
+            break;
+        }
+        if (selected) |actual| {
+            if (self.cursor < self.expected_transitions.len) {
+                const expected = self.expected_transitions[self.cursor];
+                if (actual.id != expected.id or
+                    !std.mem.eql(u8, actual.name, expected.name) or
+                    actual.kind != expected.kind or
+                    actual.actor_id != expected.actor_id or
+                    actual.resource_id != expected.resource_id or
+                    actual.parameter != expected.parameter or
+                    actual.payloadDigest() != expected.payload_digest)
+                {
+                    if (self.diagnostics) self.logSelectedTransitionDivergence(self.cursor, expected, actual);
+                    return error.ReplaySelectedTransitionDiverged;
+                }
             }
         }
         self.cursor += 1;
         return record.selected_id;
     }
 
-    fn logEnabledSetDivergence(index: usize, record: trace.ChoiceRecord, request: Request) void {
+    fn logSelectedTransitionDivergence(_: *const Replay, index: usize, expected: trace.TransitionRecord, actual: transition.Transition) void {
         std.debug.print(
-            "exact replay enabled set diverged choice={d} site={s} occurrence={d} expected_count={d} actual_count={d}",
-            .{ index, request.site_name, request.occurrence, record.enabled_ids.len, request.enabled.len },
+            "exact replay selected transition diverged choice={d}\nexpected id={d} name={s} kind={s} actor={?d} resource={?d} parameter={d} payload={d}\nactual id={d} name={s} kind={s} actor={?d} resource={?d} parameter={d} payload={d}\n",
+            .{
+                index,
+                expected.id,
+                expected.name,
+                @tagName(expected.kind),
+                expected.actor_id,
+                expected.resource_id,
+                expected.parameter,
+                expected.payload_digest,
+                actual.id,
+                actual.name,
+                @tagName(actual.kind),
+                actual.actor_id,
+                actual.resource_id,
+                actual.parameter,
+                actual.payloadDigest(),
+            },
+        );
+    }
+
+    fn logEnabledSetDivergence(self: *const Replay, index: usize, record: trace.ChoiceRecord, request: Request) void {
+        std.debug.print(
+            "exact replay enabled set diverged choice={d} site={s} occurrence={d} expected_count={d} actual_count={d} recorded_selected={d}",
+            .{ index, request.site_name, request.occurrence, record.enabled_ids.len, request.enabled.len, record.selected_id },
         );
         const diagnostic_limit = 32;
         for (record.enabled_ids[0..@min(record.enabled_ids.len, diagnostic_limit)], 0..) |id, ordinal|
@@ -487,6 +537,30 @@ pub const Replay = struct {
                 "\nactual enabled[{d}]={d} name={s} actor={?d} resource={?d} parameter={d}",
                 .{ ordinal, enabled.id, enabled.name, enabled.actor_id, enabled.resource_id, enabled.parameter },
             );
+        if (index < self.expected_transitions.len) {
+            const expected = self.expected_transitions[index];
+            std.debug.print(
+                "\nrecorded selected transition id={d} name={s} actor={?d} resource={?d} parameter={d}",
+                .{ expected.id, expected.name, expected.actor_id, expected.resource_id, expected.parameter },
+            );
+        }
+        const recent_count = @min(self.recent_actual_count, self.recent_actual.len);
+        const recent_start = self.recent_actual_count - recent_count;
+        for (0..recent_count) |offset| {
+            const choice_index = index - recent_count + offset;
+            const actual = self.recent_actual[(recent_start + offset) % self.recent_actual.len];
+            std.debug.print(
+                "\nprior actual[{d}] id={d} name={s} actor={?d} resource={?d} parameter={d}",
+                .{ choice_index, actual.id, actual.name, actual.actor_id, actual.resource_id, actual.parameter },
+            );
+            if (choice_index < self.expected_transitions.len) {
+                const expected = self.expected_transitions[choice_index];
+                std.debug.print(
+                    "\nprior expected[{d}] id={d} name={s} actor={?d} resource={?d} parameter={d}",
+                    .{ choice_index, expected.id, expected.name, expected.actor_id, expected.resource_id, expected.parameter },
+                );
+            }
+        }
         std.debug.print("\n", .{});
     }
 
@@ -643,6 +717,81 @@ test "replay diagnoses enabled-set divergence" {
     };
     var replay = Replay{ .records = &records, .diagnostics = false };
     try std.testing.expectError(error.ReplayEnabledSetDiverged, replay.source().choose(.{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled = &enabled }));
+}
+
+test "replay rejects selected transition metadata hidden behind the same stable id" {
+    const records = [_]trace.ChoiceRecord{.{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled_ids = &.{1}, .selected_id = 1 }};
+    const expected_transition = transition.Transition{
+        .id = 1,
+        .name = "packet",
+        .kind = .scheduler,
+        .actor_id = 2,
+        .resource_id = 3,
+        .parameter = 315,
+    };
+    const expected = [_]trace.TransitionRecord{.{
+        .index = 0,
+        .id = 1,
+        .name = "packet",
+        .kind = .scheduler,
+        .actor_id = 2,
+        .resource_id = 3,
+        .parameter = 315,
+        .payload_digest = expected_transition.payloadDigest(),
+    }};
+    const enabled = [_]transition.Transition{.{
+        .id = 1,
+        .name = "packet",
+        .kind = .scheduler,
+        .actor_id = 2,
+        .resource_id = 3,
+        .parameter = 641,
+    }};
+    var replay = Replay{
+        .records = &records,
+        .expected_transitions = &expected,
+        .diagnostics = false,
+    };
+    try std.testing.expectError(error.ReplaySelectedTransitionDiverged, replay.source().choose(.{
+        .site_id = 7,
+        .site_name = "site",
+        .occurrence = 0,
+        .enabled = &enabled,
+    }));
+}
+
+test "replay retains the most recent selected transitions in logical order" {
+    var records: [10]trace.ChoiceRecord = undefined;
+    for (&records, 0..) |*record, occurrence| record.* = .{
+        .site_id = 7,
+        .site_name = "site",
+        .occurrence = occurrence,
+        .enabled_ids = &.{1},
+        .selected_id = 1,
+    };
+    var replay = Replay{ .records = &records, .diagnostics = false };
+    const source = replay.source();
+    for (0..records.len) |occurrence| {
+        const enabled = [_]transition.Transition{.{
+            .id = 1,
+            .name = "selected",
+            .kind = .scheduler,
+            .parameter = @intCast(occurrence),
+        }};
+        try std.testing.expectEqual(@as(u64, 1), try source.choose(.{
+            .site_id = 7,
+            .site_name = "site",
+            .occurrence = occurrence,
+            .enabled = &enabled,
+        }));
+    }
+    try source.finish();
+    try std.testing.expectEqual(@as(usize, records.len), replay.recent_actual_count);
+    const oldest = replay.recent_actual_count - replay.recent_actual.len;
+    for (0..replay.recent_actual.len) |offset| {
+        const actual = replay.recent_actual[(oldest + offset) % replay.recent_actual.len];
+        try std.testing.expectEqual(@as(i64, @intCast(offset + 2)), actual.parameter);
+    }
 }
 
 test "mutating choice source replays a prefix and branches" {

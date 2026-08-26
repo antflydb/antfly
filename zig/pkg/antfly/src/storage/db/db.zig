@@ -264,7 +264,7 @@ fn validateDocumentExtractionInlineSources(db: *DB, doc_value: []const u8) !void
         if (producer_cfg.type != .document_extraction) continue;
 
         if (entry.source_template.len > 0) {
-            const rendered = renderSourceTemplateText(db.alloc, db.secret_store, db.remote_content, entry.source_template, doc_value) catch |err| switch (err) {
+            const rendered = renderSourceTemplateText(db.alloc, dbRemoteIo(db), db.secret_store, db.remote_content, entry.source_template, doc_value) catch |err| switch (err) {
                 error.PermanentPromptFailure, error.TransientPromptFailure => return err,
                 else => continue,
             };
@@ -27679,12 +27679,20 @@ fn generatedEmbedBatchBytes() usize {
     return @max(@as(usize, 1), parsed);
 }
 
+fn dbRemoteIo(db: *DB) ?std.Io {
+    return db.backend_runtime.inferenceIo() orelse db.backend_runtime.io();
+}
+
 fn remoteRenderConfig(
+    io: ?std.Io,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     max_media_parts: ?usize,
 ) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
+    if (comptime @hasField(template_remote.RenderConfig, "io")) {
+        config.io = io;
+    }
     if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
         config.secret_store = secret_store;
     }
@@ -27699,6 +27707,7 @@ fn remoteRenderConfig(
 
 fn renderSourceTemplateText(
     alloc: Allocator,
+    io: ?std.Io,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     template_source: []const u8,
@@ -27709,19 +27718,20 @@ fn renderSourceTemplateText(
             alloc,
             template_source,
             doc_value,
-            remoteRenderConfig(secret_store, remote_content, null),
+            remoteRenderConfig(io, secret_store, remote_content, null),
         );
     }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         template_source,
         doc_value,
-        remoteRenderConfig(secret_store, remote_content, null),
+        remoteRenderConfig(io, secret_store, remote_content, null),
     );
 }
 
 fn renderSourceTemplateParts(
     alloc: Allocator,
+    io: ?std.Io,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     template_source: []const u8,
@@ -27733,7 +27743,7 @@ fn renderSourceTemplateParts(
             alloc,
             template_source,
             doc_value,
-            remoteRenderConfig(secret_store, remote_content, max_media_parts),
+            remoteRenderConfig(io, secret_store, remote_content, max_media_parts),
         );
     }
     return try template_remote.renderJsonToParts(alloc, template_source, doc_value);
@@ -27817,7 +27827,7 @@ fn getOrCreateChunks(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        renderSourceTemplateText(alloc, dbRemoteIo(db), db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => null,
         }
@@ -31058,7 +31068,7 @@ fn extractAssetSourceValue(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]u8 {
     if (request.source_template.len > 0) {
-        const rendered = renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        const rendered = renderSourceTemplateText(alloc, dbRemoteIo(db), db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         };
@@ -32083,7 +32093,7 @@ fn computeDenseRequestImpl(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        renderSourceTemplateText(alloc, dbRemoteIo(db), db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => null,
         }
@@ -32239,7 +32249,7 @@ fn computeSparseRequestDerived(
     }
 
     const source_text = if (request.source_template.len > 0)
-        renderSourceTemplateText(alloc, db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
+        renderSourceTemplateText(alloc, dbRemoteIo(db), db.secret_store, db.remote_content, request.source_template, doc_value) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => null,
         }
@@ -32495,7 +32505,7 @@ fn renderSourceParts(
     max_media_parts: ?usize,
 ) !?[]template_mod.ContentPart {
     if (request.source_template.len == 0) return null;
-    const parts = renderSourceTemplateParts(alloc, db.secret_store, db.remote_content, request.source_template, doc_value, max_media_parts) catch |err| switch (err) {
+    const parts = renderSourceTemplateParts(alloc, dbRemoteIo(db), db.secret_store, db.remote_content, request.source_template, doc_value, max_media_parts) catch |err| switch (err) {
         error.PermanentPromptFailure, error.TransientPromptFailure => return err,
         else => return null,
     };
@@ -48070,6 +48080,7 @@ test "remote template host-rendered parts preserve prompt failures" {
         error.PermanentPromptFailure,
         renderSourceTemplateParts(
             alloc,
+            null,
             null,
             null,
             "{{remoteMedia url=this}}",

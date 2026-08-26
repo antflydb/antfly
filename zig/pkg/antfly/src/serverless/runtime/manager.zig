@@ -31,6 +31,7 @@ pub const RuntimeConfig = struct {
     compaction_enabled: bool = true,
     prune_enabled: bool = true,
     enrichment_enabled: bool = true,
+    embedder_options: managed_embedder.InitOptions = .{},
 };
 
 pub const RuntimeRunStats = struct {
@@ -93,10 +94,12 @@ pub const ManagedRuntime = struct {
         catalog: *catalog_mod.CatalogService,
         pruner: build_mod.Pruner,
     ) ManagedRuntime {
+        var resolved_cfg = cfg;
+        resolved_cfg.embedder_options.io = io;
         return .{
             .alloc = alloc,
             .io = io,
-            .cfg = cfg,
+            .cfg = resolved_cfg,
             .catalog = catalog,
             .publisher = build_mod.BackgroundPublisher.initWithIo(
                 alloc,
@@ -210,7 +213,7 @@ pub const ManagedRuntime = struct {
                     var table = table_record;
                     defer table.deinit(self.alloc);
 
-                    if (try managed_embedder.ManagedEmbedder.createSparseEmbedder(self.alloc, table.indexes_json)) |sparse_embedder| {
+                    if (try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(self.alloc, table.indexes_json, self.cfg.embedder_options)) |sparse_embedder| {
                         var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
                         defer parsed.deinit();
                         const sparse_name = firstSparseIndexNameFromIndexesJson(parsed.value) orelse "serverless_sparse";
@@ -219,7 +222,7 @@ pub const ManagedRuntime = struct {
                         enricher.clearSparseEmbedder();
                     }
 
-                    if (try managed_embedder.ManagedEmbedder.createDenseEmbedder(self.alloc, table.indexes_json)) |dense_embedder| {
+                    if (try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(self.alloc, table.indexes_json, self.cfg.embedder_options)) |dense_embedder| {
                         var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, table.indexes_json, .{});
                         defer parsed.deinit();
                         const dims = denseDimsFromIndexesJson(parsed.value) orelse 8;

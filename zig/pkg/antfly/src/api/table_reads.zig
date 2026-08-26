@@ -2315,7 +2315,7 @@ pub const BoundTableReadSource = struct {
         const agg_ns = if (phase_profile) platform_time.monotonicNs() - agg_start_ns else 0;
         try checkQueryDeadline(response_req);
         const post_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
-        try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
+        try applyQueryPostProcessing(alloc, postProcessingIo(null), response_req, &result, &meta, null, null);
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
         const encode_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         const response = try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
@@ -3175,7 +3175,7 @@ pub const ProvisionedTableReadSource = struct {
             try applyProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), .stale);
             execution.releaseDb();
             try checkQueryDeadline(response_req);
-            try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
+            try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), response_req, &result, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
         }
 
@@ -3229,7 +3229,7 @@ pub const ProvisionedTableReadSource = struct {
                 else => return err,
             };
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, self.antfly_provider, self.secret_store);
+            try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), graph_req, &merged, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = queryProvisionedAcrossGroups(self, alloc, group_ids, req, table_name, .stale) catch |err| switch (err) {
@@ -3257,7 +3257,7 @@ pub const ProvisionedTableReadSource = struct {
             else => return err,
         };
         try checkQueryDeadline(req);
-        try applyQueryPostProcessing(alloc, req, &merged, &meta, self.antfly_provider, self.secret_store);
+        try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), req, &merged, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
@@ -3497,7 +3497,7 @@ pub const ProvisionedTableReadSource = struct {
             defer meta.deinit(alloc);
             try applyProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), .stale);
             execution.releaseDb();
-            try applyQueryPostProcessing(alloc, response_req, &result, &meta, self.antfly_provider, self.secret_store);
+            try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), response_req, &result, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
         }
         unreachable;
@@ -4222,7 +4222,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
                 execution.releaseDb();
                 try checkQueryDeadline(response_req);
-                try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
+                try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), response_req, &result, &meta, null, null);
                 return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
             }
         }
@@ -4249,7 +4249,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer meta.deinit(alloc);
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, consistency);
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(alloc, graph_req, &merged, &meta, null, null);
+            try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), graph_req, &merged, &meta, null, null);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
@@ -4263,7 +4263,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, null, consistency);
         try checkQueryDeadline(req);
-        try applyQueryPostProcessing(alloc, req, &merged, &meta, null, null);
+        try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), req, &merged, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
@@ -4409,7 +4409,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
         execution.releaseDb();
-        try applyQueryPostProcessing(alloc, response_req, &result, &meta, null, null);
+        try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), response_req, &result, &meta, null, null);
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
     }
 
@@ -15749,6 +15749,7 @@ fn collectHostedAggregationBackgroundTextStats(
 
 fn applyQueryPostProcessing(
     alloc: std.mem.Allocator,
+    io: std.Io,
     req: db_mod.types.SearchRequest,
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
@@ -15756,11 +15757,17 @@ fn applyQueryPostProcessing(
     secret_store: ?*common_secrets.FileStore,
 ) !void {
     if (req.reranker == null or result.hits.len == 0) return;
-    try applyReranker(alloc, req, result, meta, antfly_provider, secret_store);
+    try applyReranker(alloc, io, req, result, meta, antfly_provider, secret_store);
+}
+
+fn postProcessingIo(backend_runtime: ?*db_mod.background_runtime.BackendRuntime) std.Io {
+    const runtime = backend_runtime orelse return std.Options.debug_io;
+    return runtime.inferenceIo() orelse runtime.apiIo() orelse runtime.io() orelse std.Options.debug_io;
 }
 
 fn applyReranker(
     alloc: std.mem.Allocator,
+    io: std.Io,
     req: db_mod.types.SearchRequest,
     result: *db_mod.types.SearchResult,
     meta: *query_api.QueryResponseMeta,
@@ -15793,9 +15800,7 @@ fn applyReranker(
         initialized_docs += 1;
     }
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    var http = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+    var http = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
     defer http.deinit();
 
     const rerank_start_ns = platform_time.monotonicNs();

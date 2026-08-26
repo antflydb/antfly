@@ -838,7 +838,7 @@ fn runExactMode(
     replayed.deinit();
 }
 
-test "full cluster VOPR exact replays metadata data serverless HTTP clients and recovery" {
+test "full cluster VOPR exact replays the composed deployment and recovery" {
     // Stackful fibers make host unwinding both expensive and unsafe. Preserve
     // leak and ownership checking while keeping stack capture disabled, as the
     // production-sized fixtures below already do.

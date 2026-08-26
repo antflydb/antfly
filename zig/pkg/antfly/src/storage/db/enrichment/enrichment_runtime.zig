@@ -79,6 +79,8 @@ pub const Config = struct {
     enable_without_producers: bool = false,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    /// Borrowed executor for request-scoped remote template and artifact I/O.
+    io: ?std.Io = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     inline_retry_max_attempts: u32 = transient_embed_retry_max_attempts,
@@ -2242,6 +2244,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
+                .io = config.io,
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
                 .inline_retry_max_attempts = config.inline_retry_max_attempts,
@@ -2655,6 +2658,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
                 .enable_without_producers = config.enable_without_producers,
                 .secret_store = config.secret_store,
                 .remote_content = config.remote_content,
+                .io = borrowed_io orelse config.io,
                 .resource_manager = config.resource_manager,
                 .clock = config.clock,
                 .inline_retry_max_attempts = config.inline_retry_max_attempts,
@@ -12845,11 +12849,15 @@ fn storePutBatch(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: [
 }
 
 fn remoteRenderConfig(
+    io: ?std.Io,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     max_media_parts: ?usize,
 ) template_remote.RenderConfig {
     var config: template_remote.RenderConfig = .{};
+    if (comptime @hasField(template_remote.RenderConfig, "io")) {
+        config.io = io;
+    }
     if (comptime @hasField(template_remote.RenderConfig, "secret_store")) {
         config.secret_store = secret_store;
     }
@@ -12904,14 +12912,14 @@ fn renderSourceTemplateText(
             alloc,
             source_template,
             raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content, null),
+            remoteRenderConfig(config.io, config.secret_store, config.remote_content, null),
         );
     }
     return try template_remote.renderJsonToTextWithConfig(
         alloc,
         source_template,
         raw_doc,
-        remoteRenderConfig(config.secret_store, config.remote_content, null),
+        remoteRenderConfig(config.io, config.secret_store, config.remote_content, null),
     );
 }
 
@@ -12962,7 +12970,7 @@ fn renderSourceParts(
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content, max_media_parts)) catch |err| switch (err) {
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.io, config.secret_store, config.remote_content, max_media_parts)) catch |err| switch (err) {
             error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => return null,
         }

@@ -3077,6 +3077,10 @@ pub const DataServerConfig = struct {
     /// This prevents independently composed managers from probing different
     /// cgroup views or sizing from different host values.
     process_memory_limit_source: ?antfly.public_api.MemoryLimitSource = null,
+    /// Optional caller-owned storage-capacity domain. Deterministic runtimes
+    /// provide modeled capacity here so status and admission never observe the
+    /// host filesystem containing their backing image.
+    capacity_source: ?resource_manager_mod.CapacitySource = null,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     /// Optional transport-neutral metadata executors. Supplying these lets a
     /// deterministic runtime drive the real DataServer without constructing a
@@ -15576,6 +15580,14 @@ pub const DataServer = struct {
             }
         }
 
+        var provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
+            alloc,
+            cfg.process_memory_limit_bytes,
+            cfg.process_memory_limit_source,
+        );
+        errdefer provisioned_storage.deinit();
+        if (cfg.capacity_source) |source| try provisioned_storage.installCapacitySource(source);
+
         const server = DataServer{
             .alloc = alloc,
             .remote_metadata = remote_metadata,
@@ -15587,11 +15599,7 @@ pub const DataServer = struct {
             .group_leadership_source = cfg.group_leadership_source orelse if (data_raft) |raft| GroupLeadershipSource.fromManagedHttpHostService(raft) else null,
             .group_membership_source = cfg.group_membership_source orelse if (data_raft) |raft| GroupMembershipSource.fromManagedHttpHostService(raft) else null,
             .local_transition_runtime = if (data_raft) |raft| raft.local_transition_runtime else null,
-            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.initWithProcessMemoryPolicy(
-                alloc,
-                cfg.process_memory_limit_bytes,
-                cfg.process_memory_limit_source,
-            ),
+            .provisioned_storage = provisioned_storage,
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 remote_metadata.catalogSource(),
@@ -18855,6 +18863,8 @@ pub fn runFromIterator(
     }
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
+    var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
+    defer setup_io.deinit();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
         cli.control_tick_ms,
@@ -18874,13 +18884,14 @@ pub fn runFromIterator(
     defer if (secret_store_initialized) secret_store.deinit();
 
     if (cli.secret_store_paths.items.len > 0) {
-        secret_store = try initLayeredSecretStore(alloc, cli.secret_store_paths.items);
+        secret_store = try initLayeredSecretStore(alloc, setup_io.io(), cli.secret_store_paths.items);
         secret_store_initialized = true;
     }
 
     var loaded_config: ?antfly.common.config.Config = if (cli.config_path) |config_path|
-        try antfly.common.config.loadFromPathWithSecrets(
+        try antfly.common.config.loadFromPathWithSecretsWithIo(
             alloc,
+            setup_io.io(),
             config_path,
             if (secret_store_initialized) &secret_store else null,
         )
@@ -18897,8 +18908,9 @@ pub fn runFromIterator(
     defer if (remote_content_runtime_initialized) remote_content_runtime.deinit();
     var remote_content_facade = antfly.common.config.Config.RemoteContentConfig{};
     const remote_content = if (cli.config_path) |config_path| blk: {
-        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.init(
+        remote_content_runtime = try antfly.common.remote_content_runtime.Runtime.initWithIo(
             alloc,
+            setup_io.io(),
             config_path,
             if (secret_store_initialized) &secret_store else null,
             null,
@@ -18913,8 +18925,6 @@ pub fn runFromIterator(
 
     const data_dir = try resolveLocalBaseDir(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer alloc.free(data_dir);
-    var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
-    defer setup_io.deinit();
     try antfly.common.data_format.ensureCompatible(alloc, setup_io.io(), data_dir);
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
@@ -18937,7 +18947,7 @@ pub fn runFromIterator(
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
-        init.io,
+        setup_io.io(),
         if (loaded_config) |*cfg| cfg else null,
     );
     defer active_audio_runtime.deinit();
@@ -18956,7 +18966,7 @@ pub fn runFromIterator(
         auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
         user_manager = try antfly.usermgr.UserManager.initWithIo(
             alloc,
-            init.io,
+            setup_io.io(),
             auth_user_store.?.iface(),
             try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
         );
@@ -19035,7 +19045,7 @@ pub fn runFromIterator(
     std.debug.print("\n", .{});
 
     var raft_progress = antfly.raft.ManagedProgressDriver.init(
-        init.io,
+        setup_io.io(),
         data_server.raftProgressSource(),
         runtime_cadence.raft_tick_ns,
     );
@@ -19085,7 +19095,7 @@ pub fn runFromIterator(
                 return supervisor.fail("data", "raft-progress", err);
             };
         } else {
-            init.io.sleep(
+            setup_io.io().sleep(
                 std.Io.Duration.fromNanoseconds(runtime_cadence.control_tick_ns),
                 .awake,
             ) catch |err| return supervisor.fail("data", "control-wait", err);
@@ -19231,6 +19241,7 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
 
 fn initLayeredSecretStore(
     alloc: std.mem.Allocator,
+    io: std.Io,
     raw_paths: []const []const u8,
 ) !antfly.common.secrets.FileStore {
     var normalized_paths: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -19243,7 +19254,7 @@ fn initLayeredSecretStore(
         errdefer alloc.free(normalized_path);
         try normalized_paths.append(alloc, normalized_path);
     }
-    return try antfly.common.secrets.FileStore.initLayered(alloc, normalized_paths.items);
+    return try antfly.common.secrets.FileStore.initLayeredWithIo(alloc, io, normalized_paths.items);
 }
 
 fn resolveLocalBaseDir(
