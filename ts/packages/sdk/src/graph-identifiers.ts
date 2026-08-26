@@ -10,6 +10,8 @@ import { isValidGraphIdentifier } from "./graph-identifier-policy.generated.js";
 import type { GraphCountAggregate, GraphDocumentFilter } from "./types.js";
 
 type JSONObject = Record<string, unknown>;
+const MAX_ANTFLY_UNIX_NS = (1n << 64n) - 1n;
+const NS_PER_SECOND = 1_000_000_000n;
 
 function object(value: unknown): JSONObject | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -37,7 +39,7 @@ function requireRfc3339DateTime(value: unknown, path: string): asserts value is 
     throw new TypeError(`${path} must be an RFC 3339 date-time with a UTC offset`);
   }
   const match =
-    /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:[Zz]|[+-](\d{2}):(\d{2}))$/.exec(
+    /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/.exec(
       value
     );
   if (!match) {
@@ -52,6 +54,8 @@ function requireRfc3339DateTime(value: unknown, path: string): asserts value is 
     hourText,
     minuteText,
     secondText,
+    fractionText,
+    offsetSign,
     offsetHourText,
     offsetMinuteText,
   ] = match;
@@ -74,11 +78,46 @@ function requireRfc3339DateTime(value: unknown, path: string): asserts value is 
   if (!valid) {
     throw new TypeError(`${path} must be a valid RFC 3339 date-time`);
   }
+
+  const localSeconds =
+    daysFromCivil(year, month, day) * 86_400n +
+    BigInt(Number(hourText) * 3_600 + Number(minuteText) * 60 + Number(secondText));
+  const offsetMagnitude = BigInt(
+    Number(offsetHourText ?? 0) * 3_600 + Number(offsetMinuteText ?? 0) * 60
+  );
+  const offsetSeconds = offsetSign === "-" ? -offsetMagnitude : offsetMagnitude;
+  const fractionNs = BigInt((fractionText ?? "").padEnd(9, "0") || "0");
+  const unixNs = (localSeconds - offsetSeconds) * NS_PER_SECOND + fractionNs;
+  if (unixNs < 0n || unixNs > MAX_ANTFLY_UNIX_NS) {
+    throw new TypeError(
+      `${path} must fall within Antfly's supported Unix-nanosecond range ` +
+        "(1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z)"
+    );
+  }
 }
 
-function requireRangeOptions(value: unknown, name: string): void {
+function daysFromCivil(year: number, month: number, day: number): bigint {
+  const adjustedYear = BigInt(year - (month <= 2 ? 1 : 0));
+  const era = adjustedYear / 400n;
+  const yearOfEra = adjustedYear - era * 400n;
+  const adjustedMonth = BigInt(month + (month > 2 ? -3 : 9));
+  const dayOfYear = (153n * adjustedMonth + 2n) / 5n + BigInt(day - 1);
+  const dayOfEra = yearOfEra * 365n + yearOfEra / 4n - yearOfEra / 100n + dayOfYear;
+  return era * 146_097n + dayOfEra - 719_468n;
+}
+
+function requireRangeOptions(
+  value: unknown,
+  name: string,
+  allowedKeys: readonly string[]
+): void {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new TypeError(`${name} options must be an object`);
+  }
+  for (const key of Object.keys(value)) {
+    if (!allowedKeys.includes(key)) {
+      throw new TypeError(`${name} options contain unsupported property ${JSON.stringify(key)}`);
+    }
   }
 }
 
@@ -116,7 +155,12 @@ export function graphNumericRangeFilter(
   options: GraphNumericRangeOptions
 ): GraphDocumentFilter {
   requireGraphDocumentPath(path);
-  requireRangeOptions(options, "graph numeric range");
+  requireRangeOptions(options, "graph numeric range", [
+    "min",
+    "max",
+    "inclusiveMin",
+    "inclusiveMax",
+  ]);
   if (options.min === undefined && options.max === undefined) {
     throw new TypeError("graph numeric range requires min or max");
   }
@@ -145,7 +189,7 @@ export function graphTermRangeFilter(
   options: GraphTermRangeOptions
 ): GraphDocumentFilter {
   requireGraphDocumentPath(path);
-  requireRangeOptions(options, "graph term range");
+  requireRangeOptions(options, "graph term range", ["min", "max", "inclusiveMin", "inclusiveMax"]);
   if (options.min === undefined && options.max === undefined) {
     throw new TypeError("graph term range requires min or max");
   }
@@ -174,7 +218,12 @@ export function graphDateRangeFilter(
   options: GraphDateRangeOptions
 ): GraphDocumentFilter {
   requireGraphDocumentPath(path);
-  requireRangeOptions(options, "graph date range");
+  requireRangeOptions(options, "graph date range", [
+    "start",
+    "end",
+    "inclusiveStart",
+    "inclusiveEnd",
+  ]);
   if (options.start === undefined && options.end === undefined) {
     throw new TypeError("graph date range requires start or end");
   }

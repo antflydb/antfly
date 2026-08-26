@@ -14,6 +14,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
@@ -40,6 +41,8 @@ const (
 	maxGraphHydratedBindings    = 10_000
 	maxNamedGraphQueries        = 64
 	defaultGraphBindingsLimit   = 100
+	maxAntflyUnixSeconds        = int64(18_446_744_073)
+	maxAntflyUnixNanoseconds    = 709_551_615
 )
 
 func validateNamedGraphQueries(queries map[string]GraphQuery) error {
@@ -571,10 +574,18 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 		if err != nil {
 			return GraphDocumentFilter{}, err
 		}
+		start, err := normalizeGraphDateBound(value.Start, "start")
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		end, err := normalizeGraphDateBound(value.End, "end")
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentDateRangeFilter(oapi.GraphDocumentDateRangeFilter{
 			DateRange: oapi.GraphDocumentDateRangeBody{
-				Start: value.Start, End: value.End, InclusiveStart: value.InclusiveStart,
+				Start: start, End: end, InclusiveStart: value.InclusiveStart,
 				InclusiveEnd: value.InclusiveEnd, Path: path,
 			},
 		})
@@ -702,6 +713,22 @@ func graphDocumentFuzziness(value querydsl.Fuzziness) (oapi.Fuzziness, error) {
 		return oapi.Fuzziness{}, err
 	}
 	return out, nil
+}
+
+func normalizeGraphDateBound(value *time.Time, name string) (*time.Time, error) {
+	if value == nil {
+		return nil, nil
+	}
+	normalized := value.UTC()
+	seconds := normalized.Unix()
+	if seconds < 0 || seconds > maxAntflyUnixSeconds ||
+		(seconds == maxAntflyUnixSeconds && normalized.Nanosecond() > maxAntflyUnixNanoseconds) {
+		return nil, fmt.Errorf(
+			"antfly: graph date range %s must fall within the supported Unix-nanosecond range (1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z)",
+			name,
+		)
+	}
+	return &normalized, nil
 }
 
 func convertGraphRangeFilter(filter querydsl.Query, members map[string]json.RawMessage) (GraphDocumentFilter, error) {

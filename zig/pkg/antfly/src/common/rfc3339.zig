@@ -6,9 +6,10 @@
 
 //! Allocation-free RFC 3339 parsing for public query contracts.
 //!
-//! Parsed values are normalized to UTC nanoseconds. Numeric offsets are
-//! accepted as required by OpenAPI `date-time`; calendar and clock fields are
-//! validated before conversion instead of being normalized implicitly.
+//! Parsed values are normalized to Antfly's canonical unsigned Unix-nanosecond
+//! domain. Numeric offsets are accepted as required by OpenAPI `date-time`;
+//! calendar, clock, and representable-instant bounds are validated before
+//! conversion instead of being normalized implicitly.
 
 const std = @import("std");
 
@@ -116,8 +117,12 @@ test "RFC3339 offsets normalize to the same instant" {
 }
 
 test "RFC3339 parser validates calendar clock and offset fields" {
+    try std.testing.expect(parseToUnixNs("1969-12-31T23:59:59.999999999Z") == null);
+    try std.testing.expect(parseToUnixNs("1970-01-01T00:00:00+00:01") == null);
     try std.testing.expect(parseToUnixNs("2026-02-29T00:00:00Z") == null);
     try std.testing.expect(parseToUnixNs("2024-02-29T23:59:59.123456789Z") != null);
+    try std.testing.expectEqual(std.math.maxInt(u64), parseToUnixNs("2554-07-21T23:34:33.709551615Z").?);
+    try std.testing.expect(parseToUnixNs("2554-07-21T23:34:33.709551616Z") == null);
     try std.testing.expect(parseToUnixNs("2026-01-01T24:00:00Z") == null);
     try std.testing.expect(parseToUnixNs("2026-01-01T00:00:00+24:00") == null);
     try std.testing.expect(parseDateToUnixNs("2026-04-31") == null);

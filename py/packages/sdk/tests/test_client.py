@@ -2,7 +2,7 @@
 
 import json
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from unittest.mock import MagicMock, Mock, patch
 
 import httpx
@@ -485,6 +485,35 @@ class TestAntflyClient:
             graph_numeric_range_filter("/score")
         with pytest.raises(AntflyException, match="RFC 6901"):
             graph_term_range_filter("score", min_value="a")
+        with pytest.raises(AntflyException, match="finite number"):
+            graph_numeric_range_filter("/score", min_value=True)
+        with pytest.raises(AntflyException, match="must be a boolean"):
+            graph_numeric_range_filter("/score", min_value=1, inclusive_min="false")  # type: ignore[arg-type]
+        with pytest.raises(AntflyException, match="must be a string"):
+            graph_term_range_filter("/status", min_value=1)  # type: ignore[arg-type]
+        with pytest.raises(AntflyException, match="timezone-aware"):
+            graph_date_range_filter("/created_at", start=datetime(2026, 1, 1))
+        with pytest.raises(AntflyException, match="supported Unix-nanosecond range"):
+            graph_date_range_filter("/created_at", start=datetime(1969, 12, 31, tzinfo=UTC))
+        with pytest.raises(AntflyException, match="supported Unix-nanosecond range"):
+            graph_date_range_filter(
+                "/created_at",
+                start=datetime(1, 1, 1, tzinfo=timezone(timedelta(hours=14))),
+            )
+        assert (
+            graph_date_range_filter(
+                "/created_at",
+                end=datetime(2554, 7, 21, 23, 34, 33, 709551, tzinfo=UTC),
+            ).to_dict()["date_range"]["end"]
+            == "2554-07-21T23:34:33.709551+00:00"
+        )
+        with pytest.raises(AntflyException, match="supported Unix-nanosecond range"):
+            graph_date_range_filter("/created_at", end=datetime(2554, 7, 21, 23, 34, 34, tzinfo=UTC))
+        normalized = graph_date_range_filter(
+            "/created_at",
+            start=datetime(2300, 1, 1, tzinfo=timezone(timedelta(seconds=30))),
+        ).to_dict()
+        assert normalized["date_range"]["start"] == "2299-12-31T23:59:30+00:00"
 
     @pytest.mark.parametrize("distinct", [False, True])
     def test_query_rejects_distinct_presence_on_row_count(self, distinct: bool) -> None:

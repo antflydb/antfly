@@ -1,6 +1,6 @@
 """Ergonomic, validated constructors for canonical graph queries."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from math import isfinite
 from typing import TypeAlias
 
@@ -18,6 +18,8 @@ from .exceptions import AntflyException
 from .graph_identifier_policy_generated import is_valid_graph_identifier
 
 GraphCountAggregate: TypeAlias = GraphRowCountAggregate | GraphAliasCountAggregate
+_MIN_ANTFLY_DATETIME = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_MAX_ANTFLY_DATETIME = datetime(2554, 7, 21, 23, 34, 33, 709551, tzinfo=timezone.utc)
 
 
 def require_graph_identifier(value: object, path: str) -> None:
@@ -41,8 +43,8 @@ def count_graph_alias(alias: str, distinct: bool = False) -> GraphAliasCountAggr
     return GraphAliasCountAggregate(count=alias, distinct=distinct)
 
 
-def _require_graph_document_path(path: str) -> None:
-    if not path.startswith("/"):
+def _require_graph_document_path(path: object) -> None:
+    if not isinstance(path, str) or not path.startswith("/"):
         raise AntflyException("graph document filter path must be a valid RFC 6901 JSON Pointer")
     index = 0
     while index < len(path):
@@ -51,6 +53,42 @@ def _require_graph_document_path(path: str) -> None:
                 raise AntflyException("graph document filter path must be a valid RFC 6901 JSON Pointer")
             index += 1
         index += 1
+
+
+def _require_optional_bool(value: object, path: str) -> None:
+    if value is not None and not isinstance(value, bool):
+        raise AntflyException(f"{path} must be a boolean")
+
+
+def _require_finite_number(value: object, path: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AntflyException(f"{path} must be a finite number")
+    try:
+        finite = isfinite(value)
+    except OverflowError:
+        finite = False
+    if not finite:
+        raise AntflyException(f"{path} must be a finite number")
+
+
+def _normalize_graph_datetime(value: object, path: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise AntflyException(f"{path} must be a timezone-aware datetime")
+    try:
+        if value.utcoffset() is None:
+            raise AntflyException(f"{path} must be a timezone-aware datetime")
+        normalized = value.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as exc:
+        raise AntflyException(
+            f"{path} must fall within Antfly's supported Unix-nanosecond range "
+            "(1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z)"
+        ) from exc
+    if normalized < _MIN_ANTFLY_DATETIME or normalized > _MAX_ANTFLY_DATETIME:
+        raise AntflyException(
+            f"{path} must fall within Antfly's supported Unix-nanosecond range "
+            "(1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z)"
+        )
+    return normalized
 
 
 def graph_numeric_range_filter(
@@ -65,8 +103,12 @@ def graph_numeric_range_filter(
     _require_graph_document_path(path)
     if min_value is None and max_value is None:
         raise AntflyException("graph numeric range requires min_value or max_value")
-    if (min_value is not None and not isfinite(min_value)) or (max_value is not None and not isfinite(max_value)):
-        raise AntflyException("graph numeric range bounds must be finite numbers")
+    if min_value is not None:
+        _require_finite_number(min_value, "graph numeric range min_value")
+    if max_value is not None:
+        _require_finite_number(max_value, "graph numeric range max_value")
+    _require_optional_bool(inclusive_min, "graph numeric range inclusive_min")
+    _require_optional_bool(inclusive_max, "graph numeric range inclusive_max")
     return GraphDocumentNumericRangeFilter(
         numeric_range=GraphDocumentNumericRangeBody(
             path=path,
@@ -90,6 +132,12 @@ def graph_term_range_filter(
     _require_graph_document_path(path)
     if min_value is None and max_value is None:
         raise AntflyException("graph term range requires min_value or max_value")
+    if min_value is not None and not isinstance(min_value, str):
+        raise AntflyException("graph term range min_value must be a string")
+    if max_value is not None and not isinstance(max_value, str):
+        raise AntflyException("graph term range max_value must be a string")
+    _require_optional_bool(inclusive_min, "graph term range inclusive_min")
+    _require_optional_bool(inclusive_max, "graph term range inclusive_max")
     return GraphDocumentTermRangeFilter(
         term_range=GraphDocumentTermRangeBody(
             path=path,
@@ -113,13 +161,15 @@ def graph_date_range_filter(
     _require_graph_document_path(path)
     if start is None and end is None:
         raise AntflyException("graph date range requires start or end")
-    if (start is not None and start.utcoffset() is None) or (end is not None and end.utcoffset() is None):
-        raise AntflyException("graph date range bounds must include a UTC offset")
+    normalized_start = _normalize_graph_datetime(start, "graph date range start") if start is not None else None
+    normalized_end = _normalize_graph_datetime(end, "graph date range end") if end is not None else None
+    _require_optional_bool(inclusive_start, "graph date range inclusive_start")
+    _require_optional_bool(inclusive_end, "graph date range inclusive_end")
     return GraphDocumentDateRangeFilter(
         date_range=GraphDocumentDateRangeBody(
             path=path,
-            start=start if start is not None else UNSET,
-            end=end if end is not None else UNSET,
+            start=normalized_start if normalized_start is not None else UNSET,
+            end=normalized_end if normalized_end is not None else UNSET,
             inclusive_start=inclusive_start if inclusive_start is not None else UNSET,
             inclusive_end=inclusive_end if inclusive_end is not None else UNSET,
         )

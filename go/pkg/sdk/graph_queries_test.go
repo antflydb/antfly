@@ -362,6 +362,41 @@ func TestGraphDocumentFilterUsesDiscriminatedDateRangeWireShape(t *testing.T) {
 	}
 }
 
+func TestGraphDocumentFilterNormalizesAndBoundsDateRangeInstants(t *testing.T) {
+	start := time.Date(2300, time.January, 1, 0, 0, 0, 0, time.FixedZone("test", -7*60*60))
+	filter, err := NewGraphDocumentFilter(querydsl.DateRangeStringQuery{
+		Field: "created_at",
+		Start: &start,
+	}.ToQuery())
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		t.Fatal(err)
+	}
+	body, ok := value["date_range"].(map[string]any)
+	if !ok || body["start"] != "2300-01-01T07:00:00Z" {
+		t.Fatalf("graph date range did not normalize to UTC: %#v", value)
+	}
+
+	for _, invalid := range []time.Time{
+		time.Date(1969, time.December, 31, 23, 59, 59, 999_999_999, time.UTC),
+		time.Date(2554, time.July, 21, 23, 34, 33, 709_551_616, time.UTC),
+	} {
+		if _, err := NewGraphDocumentFilter(querydsl.DateRangeStringQuery{
+			Field: "created_at",
+			Start: &invalid,
+		}.ToQuery()); err == nil || !strings.Contains(err.Error(), "supported Unix-nanosecond range") {
+			t.Fatalf("expected unsupported graph date %s to fail, got %v", invalid, err)
+		}
+	}
+}
+
 func TestGraphDocumentFilterRejectsFullTextDateParser(t *testing.T) {
 	start := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 	if _, err := NewGraphDocumentFilter(querydsl.DateRangeStringQuery{

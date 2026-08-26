@@ -3889,11 +3889,11 @@ fn jsonPatternBoolOrDefault(value: ?std.json.Value, default_value: bool) !bool {
 fn jsonValuesContainDateRange(values: []const std.json.Value, range_query: std.json.Value) !bool {
     if (range_query != .object) return error.InvalidArgument;
     const start_ns = if (range_query.object.get("start_ns")) |value|
-        try jsonI64FromValue(value)
+        try jsonU64FromValue(value)
     else
         null;
     const end_ns = if (range_query.object.get("end_ns")) |value|
-        try jsonI64FromValue(value)
+        try jsonU64FromValue(value)
     else
         null;
     if (start_ns == null and end_ns == null) return error.InvalidArgument;
@@ -4122,13 +4122,24 @@ fn jsonI64FromValue(value: std.json.Value) !i64 {
     };
 }
 
-fn jsonDateNsFromValue(value: std.json.Value) !i64 {
+fn jsonU64FromValue(value: std.json.Value) !u64 {
+    const u64_exclusive_upper_f64: f64 = 18_446_744_073_709_551_616.0;
     return switch (value) {
-        .string => |text| blk: {
-            const ts = (try parsePatternRfc3339ToNs(text)) orelse return error.InvalidArgument;
-            break :blk @as(i64, @intCast(ts));
+        .integer => |number| std.math.cast(u64, number) orelse error.InvalidArgument,
+        .float => |number| blk: {
+            if (!std.math.isFinite(number) or @round(number) != number or
+                number < 0 or number >= u64_exclusive_upper_f64) return error.InvalidArgument;
+            break :blk @intFromFloat(number);
         },
-        .integer, .float => try jsonI64FromValue(value),
+        .number_string => |text| std.fmt.parseInt(u64, text, 10) catch error.InvalidArgument,
+        else => error.InvalidArgument,
+    };
+}
+
+fn jsonDateNsFromValue(value: std.json.Value) !u64 {
+    return switch (value) {
+        .string => |text| (try parsePatternRfc3339ToNs(text)) orelse error.InvalidArgument,
+        .integer, .float, .number_string => try jsonU64FromValue(value),
         else => error.InvalidArgument,
     };
 }
@@ -4637,6 +4648,31 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     try std.testing.expect(compiled == .bool_query);
     try std.testing.expectEqual(@as(usize, 2), compiled.bool_query.must.len);
     try std.testing.expect(try compiled.matches(alloc, "doc:b", parsed_geo_doc.value));
+}
+
+test "stored date filters preserve the full unsigned Unix-nanosecond domain" {
+    const alloc = std.testing.allocator;
+    var doc = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"created_at":"2300-01-01T00:00:00Z"}
+    ,
+        .{},
+    );
+    defer doc.deinit();
+    var filter = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"date_range":{"path":"/created_at","start_ns":10413792000000000000}}
+    ,
+        .{},
+    );
+    defer filter.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const compiled = try compilePatternFilter(arena.allocator(), filter.value);
+    try std.testing.expect(try compiled.matches(alloc, "doc:future", doc.value));
 }
 
 test "compiled stored filters preserve bool thresholds and reject unsafe leaves" {

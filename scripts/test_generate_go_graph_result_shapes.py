@@ -61,6 +61,19 @@ class GoGraphResultShapesTest(unittest.TestCase):
             {"oneOf": [{"type": "string"}, {"type": "integer"}]},
             {"anyOf": [{"type": "string"}, {"type": "integer"}]},
             {"allOf": [{"type": "object"}, {"type": "object"}]},
+            {
+                "$ref": "#/components/schemas/GraphBindingNode",
+                "maxLength": 1,
+            },
+            {
+                "oneOf": [{"type": "string"}, {"enum": [None]}],
+                "maxLength": 1,
+            },
+            {"allOf": [{"type": "string"}], "pattern": "^[0-9]+$"},
+            {"oneOf": ["not-a-schema", {"enum": [None]}]},
+            {"$ref": None},
+            {"allOf": ["not-a-schema"]},
+            {"allOf": None},
         ):
             with self.subTest(schema=schema), self.assertRaises(ValueError):
                 generator.render_shape(schema, "Unsupported")

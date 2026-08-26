@@ -229,7 +229,9 @@ edge keys during the compatibility window.
 `match` expresses branched conjunctive patterns and can return rows or exact
 named counts. Node filters are non-scoring stored-document predicates; they do
 not run full-text analyzers. Range predicates use explicit `numeric_range` or
-`term_range` wrappers so their types remain unambiguous in every SDK.
+`term_range` wrappers, or `date_range` with RFC 3339 bounds, so their types
+remain unambiguous in every SDK. Date bounds are normalized into Antfly's
+unsigned Unix-nanosecond domain (1970-01-01 through 2554-07-21 UTC).
 
 ```jsonc
 {

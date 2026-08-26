@@ -38,6 +38,7 @@ ANNOTATION_KEYS = {
     "title",
     "writeOnly",
 }
+COMPOSITION_ANNOTATION_KEYS = ANNOTATION_KEYS - {"format"}
 SUPPORTED_SHAPE_KEYS = {
     "$ref",
     "additionalProperties",
@@ -216,6 +217,23 @@ def reject_constraints(
         raise ValueError(f"invalid constraints for result schema {name!r}: {present!r}")
 
 
+def reject_composition_siblings(
+    schema: dict[str, Any], name: str, composition_key: str
+) -> None:
+    siblings = sorted(
+        key
+        for key in schema
+        if key != composition_key
+        and key not in COMPOSITION_ANNOTATION_KEYS
+        and not key.startswith("x-")
+    )
+    if siblings:
+        raise ValueError(
+            f"unsupported validation siblings beside {composition_key} "
+            f"in result schema {name!r}: {siblings!r}"
+        )
+
+
 def nullable_branch(schema: dict[str, Any]) -> dict[str, Any] | None:
     alternatives = schema.get("oneOf")
     if not isinstance(alternatives, list):
@@ -223,6 +241,8 @@ def nullable_branch(schema: dict[str, Any]) -> dict[str, Any] | None:
     concrete: list[dict[str, Any]] = []
     has_null = False
     for alternative in alternatives:
+        if not isinstance(alternative, dict):
+            raise ValueError("oneOf alternatives must be schema objects")
         if alternative.get("enum") == [None] or alternative.get("type") == "null":
             has_null = True
         else:
@@ -236,6 +256,7 @@ def render_shape(schema: dict[str, Any], name: str, indent: str = "") -> str:
     validate_shape_keywords(schema, name)
     nullable = nullable_branch(schema)
     if nullable is not None:
+        reject_composition_siblings(schema, name, "oneOf")
         return (
             f"&requiredJSONShape{{name: {go_string(name)}, nullable: true, "
             f"reference: {render_shape(nullable, name, indent)}}}"
@@ -245,15 +266,23 @@ def render_shape(schema: dict[str, Any], name: str, indent: str = "") -> str:
     if "anyOf" in schema:
         raise ValueError(f"unsupported anyOf in result schema {name!r}")
 
-    ref = schema.get("$ref")
-    if isinstance(ref, str):
+    if "$ref" in schema:
+        ref = schema["$ref"]
+        if not isinstance(ref, str):
+            raise ValueError(f"schema reference for {name!r} must be a string")
         if not ref.startswith(REF_PREFIX):
             raise ValueError(f"unsupported external schema reference {ref!r}")
+        reject_composition_siblings(schema, name, "$ref")
         return go_identifier(ref[len(REF_PREFIX) :])
 
-    all_of = schema.get("allOf")
-    if all_of is not None:
-        if isinstance(all_of, list) and len(all_of) == 1:
+    if "allOf" in schema:
+        all_of = schema["allOf"]
+        if (
+            isinstance(all_of, list)
+            and len(all_of) == 1
+            and isinstance(all_of[0], dict)
+        ):
+            reject_composition_siblings(schema, name, "allOf")
             return render_shape(all_of[0], name, indent)
         raise ValueError(f"unsupported allOf in result schema {name!r}")
 

@@ -134,13 +134,22 @@ describe("graph identifier policy", () => {
     );
     expect(() =>
       graphNumericRangeFilter("/score", { min: 1, path: "not-a-pointer" } as never)
-    ).not.toThrow();
-    expect(graphNumericRangeFilter("/score", { min: 1, path: "not-a-pointer" } as never)).toEqual({
-      numeric_range: { path: "/score", min: 1 },
-    });
+    ).toThrow("unsupported property");
+    expect(() =>
+      graphNumericRangeFilter("/score", { min: 1, inclusive_min: false } as never)
+    ).toThrow("unsupported property");
     expect(() => graphTermRangeFilter("/status", { min: 1 } as never)).toThrow(
       "bounds must be strings"
     );
     expect(() => graphDateRangeFilter("/created_at", { start: 1 } as never)).toThrow("RFC 3339");
+    expect(() =>
+      graphDateRangeFilter("/created_at", { start: "1969-12-31T23:59:59.999999999Z" })
+    ).toThrow("supported Unix-nanosecond range");
+    expect(() =>
+      graphDateRangeFilter("/created_at", { start: "2554-07-21T23:34:33.709551615Z" })
+    ).not.toThrow();
+    expect(() =>
+      graphDateRangeFilter("/created_at", { start: "2554-07-21T23:34:33.709551616Z" })
+    ).toThrow("supported Unix-nanosecond range");
   });
 });
