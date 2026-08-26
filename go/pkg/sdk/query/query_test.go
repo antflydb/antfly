@@ -1,6 +1,7 @@
 package query
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -19,25 +20,64 @@ func TestNewDisjunctionDistinguishesOmittedAndExplicitZero(t *testing.T) {
 	}
 }
 
-func TestDateRangeStringQueryNormalizesBeforeUnionSerialization(t *testing.T) {
+func TestDateRangeStringQueryNormalizesEverySerializationPath(t *testing.T) {
 	start := time.Date(2300, time.January, 1, 0, 0, 0, 0, time.FixedZone("east-seconds", 30))
 	end := time.Date(2300, time.January, 2, 0, 0, 0, 0, time.FixedZone("west-seconds", -45))
+	input := DateRangeStringQuery{Field: "created_at", Start: &start, End: &end}
 
-	decoded, err := (DateRangeStringQuery{
-		Field: "created_at",
-		Start: &start,
-		End:   &end,
-	}.ToQuery()).AsDateRangeStringQuery()
+	decode := func(encoded []byte) DateRangeStringQuery {
+		t.Helper()
+		var decoded DateRangeStringQuery
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		return decoded
+	}
+	assertNormalized := func(name string, decoded DateRangeStringQuery) {
+		t.Helper()
+		wantStart := time.Date(2299, time.December, 31, 23, 59, 30, 0, time.UTC)
+		wantEnd := time.Date(2300, time.January, 2, 0, 0, 45, 0, time.UTC)
+		if decoded.Start == nil || !decoded.Start.Equal(wantStart) || decoded.Start.Location() != time.UTC {
+			t.Fatalf("%s start = %v, want %v in UTC", name, decoded.Start, wantStart)
+		}
+		if decoded.End == nil || !decoded.End.Equal(wantEnd) || decoded.End.Location() != time.UTC {
+			t.Fatalf("%s end = %v, want %v in UTC", name, decoded.End, wantEnd)
+		}
+	}
+
+	direct, err := json.Marshal(input)
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertNormalized("json.Marshal", decode(direct))
 
-	wantStart := time.Date(2299, time.December, 31, 23, 59, 30, 0, time.UTC)
-	wantEnd := time.Date(2300, time.January, 2, 0, 0, 45, 0, time.UTC)
-	if decoded.Start == nil || !decoded.Start.Equal(wantStart) || decoded.Start.Location() != time.UTC {
-		t.Fatalf("start = %v, want %v in UTC", decoded.Start, wantStart)
+	var from Query
+	if err := from.FromDateRangeStringQuery(input); err != nil {
+		t.Fatal(err)
 	}
-	if decoded.End == nil || !decoded.End.Equal(wantEnd) || decoded.End.Location() != time.UTC {
-		t.Fatalf("end = %v, want %v in UTC", decoded.End, wantEnd)
+	fromDecoded, err := from.AsDateRangeStringQuery()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNormalized("FromDateRangeStringQuery", fromDecoded)
+
+	var merged Query
+	if err := merged.MergeDateRangeStringQuery(input); err != nil {
+		t.Fatal(err)
+	}
+	mergedDecoded, err := merged.AsDateRangeStringQuery()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNormalized("MergeDateRangeStringQuery", mergedDecoded)
+
+	toQueryDecoded, err := input.ToQuery().AsDateRangeStringQuery()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNormalized("ToQuery", toQueryDecoded)
+
+	if start.Location() == time.UTC || end.Location() == time.UTC {
+		t.Fatal("serialization mutated caller-owned date bounds")
 	}
 }

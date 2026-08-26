@@ -1,7 +1,10 @@
 //go:generate go tool oapi-codegen --config=cfg.yaml ../../../../specs/openapi/antfly/query.yaml
 package query
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Builder helpers for creating Antfly queries with convenience functions
 
@@ -131,12 +134,15 @@ func (v TermRangeQuery) ToQuery() Query {
 	return q
 }
 
-// ToQuery creates a Query from a DateRangeStringQuery. Panics on error.
-func (v DateRangeStringQuery) ToQuery() Query {
+// MarshalJSON normalizes date bounds to UTC before time.Time's RFC 3339
+// encoder sees them. RFC 3339 cannot represent sub-minute UTC offsets, so
+// normalization preserves the instant for historical and fixed-offset zones
+// through every public serialization path (including generated union helpers).
+func (v DateRangeStringQuery) MarshalJSON() ([]byte, error) {
+	type dateRangeStringQuery DateRangeStringQuery
+
 	// time.Time's RFC 3339 encoding can only represent whole-minute UTC
-	// offsets. Normalize before the generated union serializer sees the value so
-	// historical and fixed zones with sub-minute offsets preserve the instant
-	// instead of silently truncating offset seconds.
+	// offsets. Work on the value copy so serialization never mutates caller data.
 	if v.Start != nil {
 		start := v.Start.UTC()
 		v.Start = &start
@@ -145,6 +151,11 @@ func (v DateRangeStringQuery) ToQuery() Query {
 		end := v.End.UTC()
 		v.End = &end
 	}
+	return json.Marshal(dateRangeStringQuery(v))
+}
+
+// ToQuery creates a Query from a DateRangeStringQuery. Panics on error.
+func (v DateRangeStringQuery) ToQuery() Query {
 	var q Query
 	if err := q.FromDateRangeStringQuery(v); err != nil {
 		panic(err)

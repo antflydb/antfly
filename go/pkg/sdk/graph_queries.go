@@ -69,16 +69,6 @@ func validateGraphQuery(query GraphQuery) error {
 	if err := json.Unmarshal(encoded, &members); err != nil {
 		return fmt.Errorf("invalid graph query: %w", err)
 	}
-	if err := rejectUnknownGraphFields(
-		"graph query",
-		members,
-		"match",
-		"traverse",
-		"shortest_path",
-		"k_shortest_paths",
-	); err != nil {
-		return err
-	}
 	match, hasMatch := members["match"]
 	traverse, hasTraverse := members["traverse"]
 	shortestPath, hasShortestPath := members["shortest_path"]
@@ -97,41 +87,41 @@ func validateGraphQuery(query GraphQuery) error {
 		if isNullGraphJSON(match) {
 			return fmt.Errorf("graph query match must not be null")
 		}
-		value, err := query.AsGraphMatchQuery()
-		if err != nil {
-			return err
+		var value GraphMatchQuery
+		if err := query.DecodeStrictInto(&value); err != nil {
+			return fmt.Errorf("antfly: invalid graph match query: %w", err)
 		}
 		return validateGraphMatchQuery(value)
 	case hasTraverse:
 		if isNullGraphJSON(traverse) {
 			return fmt.Errorf("graph query traverse must not be null")
 		}
-		value, err := query.AsGraphTraverseQuery()
-		if err != nil {
-			return err
+		var value GraphTraverseQuery
+		if err := query.DecodeStrictInto(&value); err != nil {
+			return fmt.Errorf("antfly: invalid graph traverse query: %w", err)
 		}
 		return validateGraphTraverseQuery(value)
 	case hasShortestPath:
 		if isNullGraphJSON(shortestPath) {
 			return fmt.Errorf("graph query shortest_path must not be null")
 		}
-		value, err := query.AsGraphShortestPathQuery()
-		if err != nil {
-			return err
+		var value GraphShortestPathQuery
+		if err := query.DecodeStrictInto(&value); err != nil {
+			return fmt.Errorf("antfly: invalid graph shortest-path query: %w", err)
 		}
-		return validateGraphPathQuery(value.Index, value.ShortestPath.From, value.ShortestPath.To, value.ShortestPath.EdgeTypes, value.ShortestPath.MaxDepth, value.ShortestPath.MinWeight, value.ShortestPath.MaxWeight, value.ShortestPath.IncludeDocuments, value.ShortestPath.Fields)
+		return validateGraphPathQuery(value.Index, value.ShortestPath.From, value.ShortestPath.To, value.ShortestPath.Filter, value.ShortestPath.EdgeTypes, value.ShortestPath.MaxDepth, value.ShortestPath.MinWeight, value.ShortestPath.MaxWeight, value.ShortestPath.IncludeDocuments, value.ShortestPath.Fields)
 	default:
 		if isNullGraphJSON(kShortestPaths) {
 			return fmt.Errorf("graph query k_shortest_paths must not be null")
 		}
-		value, err := query.AsGraphKShortestPathsQuery()
-		if err != nil {
-			return err
+		var value GraphKShortestPathsQuery
+		if err := query.DecodeStrictInto(&value); err != nil {
+			return fmt.Errorf("antfly: invalid graph k-shortest-paths query: %w", err)
 		}
 		if value.KShortestPaths.K < 1 || value.KShortestPaths.K > 100 {
 			return fmt.Errorf("graph k must be between 1 and 100")
 		}
-		return validateGraphPathQuery(value.Index, value.KShortestPaths.From, value.KShortestPaths.To, value.KShortestPaths.EdgeTypes, value.KShortestPaths.MaxDepth, value.KShortestPaths.MinWeight, value.KShortestPaths.MaxWeight, value.KShortestPaths.IncludeDocuments, value.KShortestPaths.Fields)
+		return validateGraphPathQuery(value.Index, value.KShortestPaths.From, value.KShortestPaths.To, value.KShortestPaths.Filter, value.KShortestPaths.EdgeTypes, value.KShortestPaths.MaxDepth, value.KShortestPaths.MinWeight, value.KShortestPaths.MaxWeight, value.KShortestPaths.IncludeDocuments, value.KShortestPaths.Fields)
 	}
 }
 
@@ -222,6 +212,9 @@ func decodeCanonicalGraphResult(
 			return nil, fmt.Errorf("antfly: bindings graph result exceeds %d rows", maxGraphHydratedBindings)
 		}
 		for rowIndex, row := range value.Rows {
+			if len(row) > maxGraphMatchNodes {
+				return nil, fmt.Errorf("antfly: bindings graph result row %d has at most %d properties", rowIndex, maxGraphMatchNodes)
+			}
 			for alias, binding := range row {
 				if !validGraphIdentifier(alias) {
 					return nil, fmt.Errorf("antfly: bindings graph result row %d has an invalid alias", rowIndex)
@@ -912,6 +905,254 @@ func validGraphDocumentJSONPointer(path string) bool {
 	return true
 }
 
+// validateGraphDocumentFilter validates the graph-specific closed union at the
+// public request boundary. Generated oneOf wrappers retain raw JSON, so their
+// nested members need explicit variant selection before strict concrete-model
+// decoding can enforce additionalProperties: false.
+func validateGraphDocumentFilter(filter GraphDocumentFilter, depth int, visited *int) error {
+	(*visited)++
+	if depth > 64 || *visited > 16_384 {
+		return fmt.Errorf("antfly: graph document filter exceeds the query complexity budget")
+	}
+	encoded, err := json.Marshal(filter)
+	if err != nil {
+		return err
+	}
+	trimmed := strings.TrimSpace(string(encoded))
+	if trimmed == "" || trimmed == "null" {
+		return nil // The containing filter property is optional.
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &members); err != nil || len(members) == 0 {
+		return fmt.Errorf("antfly: graph document filter must be an object")
+	}
+
+	validatePath := func(path string) error {
+		if !validGraphDocumentJSONPointer(path) {
+			return fmt.Errorf("antfly: graph document filter path must be a valid RFC 6901 JSON Pointer")
+		}
+		return nil
+	}
+	present := func(name string) bool {
+		raw, ok := members[name]
+		return ok && !isNullGraphJSON(raw)
+	}
+
+	switch {
+	case present("term") && present("fuzziness"):
+		var value oapi.GraphDocumentFuzzyFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		if err := validatePath(value.Path); err != nil {
+			return err
+		}
+		if value.PrefixLength < 0 || value.PrefixLength > 255 {
+			return fmt.Errorf("antfly: graph document filter prefix_length must be between 0 and 255")
+		}
+		fuzziness, err := json.Marshal(value.Fuzziness)
+		if err != nil {
+			return err
+		}
+		var scalar any
+		if err := json.Unmarshal(fuzziness, &scalar); err != nil {
+			return err
+		}
+		switch scalar := scalar.(type) {
+		case float64:
+			if scalar < 0 || scalar > 2 || scalar != math.Trunc(scalar) {
+				return fmt.Errorf("antfly: graph document filter fuzziness must be 0, 1, 2, or auto")
+			}
+		case string:
+			if scalar != "auto" {
+				return fmt.Errorf("antfly: graph document filter fuzziness must be 0, 1, 2, or auto")
+			}
+		default:
+			return fmt.Errorf("antfly: graph document filter fuzziness must be 0, 1, 2, or auto")
+		}
+		return nil
+	case present("term"):
+		var value oapi.GraphDocumentTermFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		return validatePath(value.Path)
+	case present("prefix"):
+		var value oapi.GraphDocumentPrefixFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		return validatePath(value.Path)
+	case present("regexp"):
+		var value oapi.GraphDocumentRegexpFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		return validatePath(value.Path)
+	case present("wildcard"):
+		var value oapi.GraphDocumentWildcardFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		return validatePath(value.Path)
+	case present("numeric_range"):
+		var value oapi.GraphDocumentNumericRangeFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		body := value.NumericRange
+		if err := validatePath(body.Path); err != nil {
+			return err
+		}
+		if body.Min == nil && body.Max == nil {
+			return fmt.Errorf("antfly: graph numeric range requires min or max")
+		}
+		if body.Min != nil && body.Max != nil && *body.Min > *body.Max {
+			return fmt.Errorf("antfly: graph numeric range min must not exceed max")
+		}
+		return nil
+	case present("term_range"):
+		var value oapi.GraphDocumentTermRangeFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		if err := validatePath(value.TermRange.Path); err != nil {
+			return err
+		}
+		if value.TermRange.Min == nil && value.TermRange.Max == nil {
+			return fmt.Errorf("antfly: graph term range requires min or max")
+		}
+		return nil
+	case present("date_range"):
+		var value oapi.GraphDocumentDateRangeFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		if err := validatePath(value.DateRange.Path); err != nil {
+			return err
+		}
+		if value.DateRange.Start == nil && value.DateRange.End == nil {
+			return fmt.Errorf("antfly: graph date range requires start or end")
+		}
+		start, err := normalizeGraphDateBound(value.DateRange.Start, "start")
+		if err != nil {
+			return err
+		}
+		end, err := normalizeGraphDateBound(value.DateRange.End, "end")
+		if err != nil {
+			return err
+		}
+		if start != nil && end != nil && start.After(*end) {
+			return fmt.Errorf("antfly: graph date range start must not exceed end")
+		}
+		return nil
+	case present("match_all"):
+		var value oapi.GraphDocumentMatchAllFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		if value.MatchAll == nil || len(value.MatchAll) != 0 {
+			return fmt.Errorf("antfly: graph match_all body must be an empty object")
+		}
+		return nil
+	case present("match_none"):
+		var value oapi.GraphDocumentMatchNoneFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		if value.MatchNone == nil || len(value.MatchNone) != 0 {
+			return fmt.Errorf("antfly: graph match_none body must be an empty object")
+		}
+		return nil
+	case present("ids"):
+		var value oapi.GraphDocumentIdsFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		if len(value.Ids) == 0 || len(value.Ids) > 10_000 {
+			return fmt.Errorf("antfly: graph ids must contain between 1 and 10000 values")
+		}
+		return validateNonEmptyUnique("graph id", value.Ids)
+	case present("bool"):
+		var value oapi.GraphDocumentBoolFieldFilter
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		return validatePath(value.Path)
+	case present("conjuncts"):
+		var value GraphDocumentFilterConjunction
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		if len(value.Conjuncts) == 0 || len(value.Conjuncts) > 64 {
+			return fmt.Errorf("antfly: graph filter conjuncts must contain between 1 and 64 entries")
+		}
+		for i, child := range value.Conjuncts {
+			if err := validateGraphDocumentFilter(child, depth+1, visited); err != nil {
+				return fmt.Errorf("antfly: graph filter conjunct %d: %w", i, err)
+			}
+		}
+		return nil
+	case present("disjuncts"):
+		var value GraphDocumentFilterDisjunction
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		if len(value.Disjuncts) == 0 || len(value.Disjuncts) > 64 {
+			return fmt.Errorf("antfly: graph filter disjuncts must contain between 1 and 64 entries")
+		}
+		if value.Min != nil && *value.Min > uint32(len(value.Disjuncts)) {
+			return fmt.Errorf("antfly: graph disjunction min exceeds its number of clauses")
+		}
+		for i, child := range value.Disjuncts {
+			if err := validateGraphDocumentFilter(child, depth+1, visited); err != nil {
+				return fmt.Errorf("antfly: graph filter disjunct %d: %w", i, err)
+			}
+		}
+		return nil
+	case present("filter") || present("must") || present("should") || present("must_not"):
+		var value GraphDocumentFilterBoolean
+		if err := filter.DecodeStrictInto(&value); err != nil {
+			return err
+		}
+		if present("filter") {
+			if err := validateGraphDocumentFilter(value.Filter, depth+1, visited); err != nil {
+				return fmt.Errorf("antfly: graph bool filter: %w", err)
+			}
+		}
+		for _, clauseGroup := range []struct {
+			name    string
+			clauses []GraphDocumentFilter
+		}{
+			{name: "must", clauses: value.Must.Conjuncts},
+			{name: "should", clauses: value.Should.Disjuncts},
+			{name: "must_not", clauses: value.MustNot.Disjuncts},
+		} {
+			name, clause := clauseGroup.name, clauseGroup.clauses
+			if !present(name) {
+				continue
+			}
+			if len(clause) == 0 || len(clause) > 64 {
+				return fmt.Errorf("antfly: graph bool %s must contain between 1 and 64 entries", name)
+			}
+			for i, child := range clause {
+				if err := validateGraphDocumentFilter(child, depth+1, visited); err != nil {
+					return fmt.Errorf("antfly: graph bool %s clause %d: %w", name, i, err)
+				}
+			}
+		}
+		if present("should") && value.Should.Min != nil && *value.Should.Min > uint32(len(value.Should.Disjuncts)) {
+			return fmt.Errorf("antfly: graph bool should min exceeds its number of clauses")
+		}
+		if present("must_not") && value.MustNot.Min != nil && *value.MustNot.Min > uint32(len(value.MustNot.Disjuncts)) {
+			return fmt.Errorf("antfly: graph bool must_not min exceeds its number of clauses")
+		}
+		return nil
+	default:
+		return fmt.Errorf("antfly: unsupported graph document filter variant")
+	}
+}
+
 // NewGraphMatchQuery wraps a MATCH query in the canonical GraphQuery union.
 func NewGraphMatchQuery(query GraphMatchQuery) (GraphQuery, error) {
 	if err := validateGraphMatchQuery(query); err != nil {
@@ -934,7 +1175,7 @@ func NewGraphTraverseQuery(query GraphTraverseQuery) (GraphQuery, error) {
 
 // NewGraphShortestPathQuery wraps a shortest-path query in the canonical GraphQuery union.
 func NewGraphShortestPathQuery(query GraphShortestPathQuery) (GraphQuery, error) {
-	if err := validateGraphPathQuery(query.Index, query.ShortestPath.From, query.ShortestPath.To, query.ShortestPath.EdgeTypes, query.ShortestPath.MaxDepth, query.ShortestPath.MinWeight, query.ShortestPath.MaxWeight, query.ShortestPath.IncludeDocuments, query.ShortestPath.Fields); err != nil {
+	if err := validateGraphPathQuery(query.Index, query.ShortestPath.From, query.ShortestPath.To, query.ShortestPath.Filter, query.ShortestPath.EdgeTypes, query.ShortestPath.MaxDepth, query.ShortestPath.MinWeight, query.ShortestPath.MaxWeight, query.ShortestPath.IncludeDocuments, query.ShortestPath.Fields); err != nil {
 		return GraphQuery{}, err
 	}
 	var result GraphQuery
@@ -947,7 +1188,7 @@ func NewGraphKShortestPathsQuery(query GraphKShortestPathsQuery) (GraphQuery, er
 	if query.KShortestPaths.K < 1 || query.KShortestPaths.K > 100 {
 		return GraphQuery{}, fmt.Errorf("antfly: graph k must be between 1 and 100")
 	}
-	if err := validateGraphPathQuery(query.Index, query.KShortestPaths.From, query.KShortestPaths.To, query.KShortestPaths.EdgeTypes, query.KShortestPaths.MaxDepth, query.KShortestPaths.MinWeight, query.KShortestPaths.MaxWeight, query.KShortestPaths.IncludeDocuments, query.KShortestPaths.Fields); err != nil {
+	if err := validateGraphPathQuery(query.Index, query.KShortestPaths.From, query.KShortestPaths.To, query.KShortestPaths.Filter, query.KShortestPaths.EdgeTypes, query.KShortestPaths.MaxDepth, query.KShortestPaths.MinWeight, query.KShortestPaths.MaxWeight, query.KShortestPaths.IncludeDocuments, query.KShortestPaths.Fields); err != nil {
 		return GraphQuery{}, err
 	}
 	var result GraphQuery
@@ -1125,12 +1366,16 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 		return fmt.Errorf("antfly: graph match exceeds the %d optional-pattern complexity budget", maxGraphOptionalPatterns)
 	}
 	complexity := graphMatchComplexity{nodes: len(query.Match.Nodes), edges: len(query.Match.Edges)}
+	filterVisited := 0
 	for alias, node := range query.Match.Nodes {
 		if !validGraphIdentifier(alias) {
 			return invalidGraphIdentifier("graph alias")
 		}
 		if node.Table != "" && strings.TrimSpace(node.Table) == "" {
 			return fmt.Errorf("antfly: graph alias %q table must not be blank", alias)
+		}
+		if err := validateGraphDocumentFilter(node.Filter, 0, &filterVisited); err != nil {
+			return fmt.Errorf("antfly: graph alias %q filter: %w", alias, err)
 		}
 	}
 	visible := make(map[string]struct{}, len(query.Match.Nodes))
@@ -1190,7 +1435,7 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 			return err
 		}
 		introduced := make(map[string]struct{}, len(optional.Nodes))
-		for alias := range optional.Nodes {
+		for alias, node := range optional.Nodes {
 			if !validGraphIdentifier(alias) {
 				return invalidGraphIdentifier("optional graph alias")
 			}
@@ -1198,6 +1443,12 @@ func validateGraphMatchQuery(query GraphMatchQuery) error {
 				return fmt.Errorf("antfly: duplicate optional graph alias %q", alias)
 			}
 			introduced[alias] = struct{}{}
+			if node.Table != "" && strings.TrimSpace(node.Table) == "" {
+				return fmt.Errorf("antfly: optional graph alias %q table must not be blank", alias)
+			}
+			if err := validateGraphDocumentFilter(node.Filter, 0, &filterVisited); err != nil {
+				return fmt.Errorf("antfly: optional graph alias %q filter: %w", alias, err)
+			}
 		}
 		optionalVisible := make(map[string]struct{}, len(visible)+len(introduced))
 		for alias := range visible {
@@ -1332,15 +1583,6 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 	if err := rejectUnknownGraphFields("graph where expression", members, "and", "not_equal", "not_exists"); err != nil {
 		return err
 	}
-	type whereJSON struct {
-		And       []json.RawMessage       `json:"and"`
-		NotEqual  *GraphNotEqualPredicate `json:"not_equal"`
-		NotExists *GraphNotExistsPattern  `json:"not_exists"`
-	}
-	var value whereJSON
-	if err := json.Unmarshal(encoded, &value); err != nil {
-		return err
-	}
 	_, hasAnd := members["and"]
 	_, hasNotEqual := members["not_equal"]
 	_, hasNotExists := members["not_exists"]
@@ -1354,7 +1596,8 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 		return fmt.Errorf("antfly: graph where expression must contain exactly one predicate form")
 	}
 	if hasAnd {
-		if err := rejectUnknownGraphFields("graph where-and", members, "and"); err != nil {
+		var value GraphWhereAnd
+		if err := where.DecodeStrictInto(&value); err != nil {
 			return err
 		}
 		if len(value.And) == 0 {
@@ -1364,21 +1607,15 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 			return fmt.Errorf("antfly: graph where-and exceeds %d expressions", maxGraphMatchPredicates)
 		}
 		for _, child := range value.And {
-			var expression GraphWhereExpression
-			if err := json.Unmarshal(child, &expression); err != nil {
-				return err
-			}
-			if err := validateGraphWhereExpression(expression, aliases, complexity, depth+1); err != nil {
+			if err := validateGraphWhereExpression(child, aliases, complexity, depth+1); err != nil {
 				return err
 			}
 		}
 	}
 	if hasNotEqual {
-		if err := rejectUnknownGraphFields("graph where not_equal", members, "not_equal"); err != nil {
+		var value GraphWhereNotEqual
+		if err := where.DecodeStrictInto(&value); err != nil {
 			return err
-		}
-		if value.NotEqual == nil {
-			return fmt.Errorf("antfly: graph where not_equal must not be null")
 		}
 		if err := complexity.addPredicate(); err != nil {
 			return err
@@ -1391,11 +1628,9 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 		}
 	}
 	if hasNotExists {
-		if err := rejectUnknownGraphFields("graph where not_exists", members, "not_exists"); err != nil {
+		var value GraphWhereNotExists
+		if err := where.DecodeStrictInto(&value); err != nil {
 			return err
-		}
-		if value.NotExists == nil {
-			return fmt.Errorf("antfly: graph where not_exists must not be null")
 		}
 		if err := complexity.addPredicate(); err != nil {
 			return err
@@ -1439,11 +1674,8 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 		}
 	}
 	if hasBindings {
-		if err := rejectUnknownGraphFields("graph return", members, "bindings", "limit", "include_documents", "fields"); err != nil {
-			return err
-		}
 		var value GraphBindingsReturn
-		if err := json.Unmarshal(encoded, &value); err != nil {
+		if err := graphReturn.DecodeStrictInto(&value); err != nil {
 			return err
 		}
 		if err := validateGraphBindingsProjection(
@@ -1461,11 +1693,8 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 		}
 		return nil
 	}
-	if err := rejectUnknownGraphFields("graph return", members, "aggregates"); err != nil {
-		return err
-	}
 	var value GraphAggregatesReturn
-	if err := json.Unmarshal(encoded, &value); err != nil {
+	if err := graphReturn.DecodeStrictInto(&value); err != nil {
 		return err
 	}
 	return validateGraphAggregates(value.Aggregates, known)
@@ -1609,6 +1838,10 @@ func validateGraphTraverseQuery(query GraphTraverseQuery) error {
 	if err := validateGraphSelector(query.Traverse.Start); err != nil {
 		return err
 	}
+	filterVisited := 0
+	if err := validateGraphDocumentFilter(query.Traverse.Filter, 0, &filterVisited); err != nil {
+		return fmt.Errorf("antfly: graph traversal filter: %w", err)
+	}
 	if query.Traverse.MaxDepth < 0 || query.Traverse.MaxDepth > 64 {
 		return fmt.Errorf("antfly: graph max depth must be 0 or between 1 and 64")
 	}
@@ -1632,12 +1865,16 @@ func validateGraphTraverseQuery(query GraphTraverseQuery) error {
 	return nil
 }
 
-func validateGraphPathQuery(index string, from, to GraphPathEndpoint, edgeTypes []string, maxDepth int, minWeight, maxWeight *float64, includeDocuments bool, fields []string) error {
+func validateGraphPathQuery(index string, from, to GraphPathEndpoint, filter GraphDocumentFilter, edgeTypes []string, maxDepth int, minWeight, maxWeight *float64, includeDocuments bool, fields []string) error {
 	if strings.TrimSpace(index) == "" {
 		return fmt.Errorf("antfly: graph index must not be empty")
 	}
 	if from.Key == "" || to.Key == "" {
 		return fmt.Errorf("antfly: graph path endpoints must not be empty")
+	}
+	filterVisited := 0
+	if err := validateGraphDocumentFilter(filter, 0, &filterVisited); err != nil {
+		return fmt.Errorf("antfly: graph path filter: %w", err)
 	}
 	if maxDepth < 0 || maxDepth > 64 {
 		return fmt.Errorf("antfly: graph max depth must be 0 or between 1 and 64")
@@ -1671,16 +1908,6 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 	if err := rejectUnknownGraphFields("graph selector", members, "keys", "identities", "result_ref", "binding", "limit"); err != nil {
 		return err
 	}
-	var value struct {
-		Keys       []string            `json:"keys"`
-		Identities []GraphPathEndpoint `json:"identities"`
-		ResultRef  string              `json:"result_ref"`
-		Binding    string              `json:"binding"`
-		Limit      int                 `json:"limit"`
-	}
-	if err := json.Unmarshal(encoded, &value); err != nil {
-		return err
-	}
 	_, hasKeys := members["keys"]
 	_, hasIdentities := members["identities"]
 	_, hasResultRef := members["result_ref"]
@@ -1694,7 +1921,8 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 		return fmt.Errorf("antfly: graph selector must contain exactly one selector form")
 	}
 	if hasKeys {
-		if err := rejectUnknownGraphFields("graph key selector", members, "keys"); err != nil {
+		var value GraphKeyNodeSelector
+		if err := selector.DecodeStrictInto(&value); err != nil {
 			return err
 		}
 		if len(value.Keys) > 10_000 {
@@ -1705,7 +1933,8 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 		}
 	}
 	if hasIdentities {
-		if err := rejectUnknownGraphFields("graph identity selector", members, "identities"); err != nil {
+		var value GraphIdentityNodeSelector
+		if err := selector.DecodeStrictInto(&value); err != nil {
 			return err
 		}
 		if err := validateGraphIdentities(value.Identities); err != nil {
@@ -1713,7 +1942,8 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 		}
 	}
 	if hasResultRef {
-		if err := rejectUnknownGraphFields("graph result selector", members, "result_ref", "binding", "limit"); err != nil {
+		var value GraphResultRefNodeSelector
+		if err := selector.DecodeStrictInto(&value); err != nil {
 			return err
 		}
 		if isNullGraphJSON(members["result_ref"]) {

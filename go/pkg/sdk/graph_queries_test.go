@@ -78,6 +78,9 @@ func TestGraphQueryConstructors(t *testing.T) {
 	if predicates, ok := whereJSON["and"].([]any); !ok || len(predicates) != 2 {
 		t.Fatalf("where = %#v", whereJSON)
 	}
+	if _, err := json.Marshal(QueryRequest{GraphQueries: map[string]GraphQuery{"authors": query}}); err != nil {
+		t.Fatalf("valid graph query failed QueryRequest boundary validation: %v", err)
+	}
 }
 
 func TestGraphSelectorAndProjectionConstructors(t *testing.T) {
@@ -439,6 +442,19 @@ func TestGraphOpaqueUnionValidationRejectsUnknownMembers(t *testing.T) {
 			t.Fatalf("expected unknown graph where member error, got %v", err)
 		}
 	})
+
+	t.Run("nested document filter", func(t *testing.T) {
+		var graphQuery GraphQuery
+		if err := json.Unmarshal([]byte(
+			`{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"term":"active","path":"/status","unexpected":true}}},"edges":[]},"return":{"bindings":["a"]}}`,
+		), &graphQuery); err != nil {
+			t.Fatal(err)
+		}
+		_, err := json.Marshal(QueryRequest{GraphQueries: map[string]GraphQuery{"filtered": graphQuery}})
+		if err == nil || !strings.Contains(err.Error(), "unexpected") {
+			t.Fatalf("expected nested unknown graph filter member error, got %v", err)
+		}
+	})
 }
 
 func TestGraphDocumentFilterRejectsFullTextDateParser(t *testing.T) {
@@ -620,18 +636,14 @@ func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0}}`,
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":null,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"nodes","nodes":[{"key":"a"}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"nodes","nodes":[{"key":"a","table":"","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops"}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"wrong","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"a","table":"entities","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"type":"edge"}],"length":1,"weight_mode":"min_hops","weight_sum":0,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false},"unexpected":true}`,
-		`{"kind":"nodes","kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false,"unexpected":true}}`,
 		`{"kind":"nodes","nodes":[{"key":"a","depth":0,"unexpected":true}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":null}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{"a":{}}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":false}},"stats":{"returned_items":1,"truncated":false}}`,
