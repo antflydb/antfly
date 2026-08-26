@@ -6804,16 +6804,17 @@ pub const ProvisionedTableWriteSource = struct {
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = self.active_table_activities.items[index];
         if (entry.repair_handoff_status_pending == 0 or !entry.repair_handoff_clear_observed) return;
-        // Handoff edges are causally ordered by the visibility callbacks:
-        // pending always invalidates an older clear. Only post-clear
-        // publication debt may borrow the repair route. This includes paused
-        // or terminal durable repair: the next pass performs no repair work,
-        // but remains the only exact owner that can retry a fenced
-        // authoritative status publication.
+        // Pending callbacks invalidate an owner audit, but clear callbacks are
+        // deliberately not settlement evidence: DB hooks can overlap and
+        // therefore arrive out of durable commit order. Only publication debt
+        // created by the aggregate owner's post-operation audit may borrow the
+        // repair route. This includes paused durable repair: the next pass
+        // performs no repair work, but remains the only exact owner that can
+        // retry a fenced authoritative status publication.
         result.index_repair_pending = true;
     }
 
-    fn markRepairHandoffClearBestEffort(
+    fn markRepairHandoffOwnerAuditCompleteBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
         group_id: u64,
@@ -6824,6 +6825,11 @@ pub const ProvisionedTableWriteSource = struct {
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
         const entry = &self.active_table_activities.items[index];
         if (entry.repair_handoff_status_pending == 0) return;
+        // This transition is reserved for the aggregate scheduler owner after
+        // its durable repair-state read under the group operation lease. A DB
+        // clear callback may only enqueue that audit: callback invocations copy
+        // their hook under a mutex and can complete in the opposite order from
+        // their durable mutations.
         entry.repair_handoff_clear_observed = true;
         entry.repair_handoff_generation = self.nextRepairHandoffGenerationLocked();
     }
@@ -8832,12 +8838,13 @@ pub const ProvisionedTableWriteSource = struct {
             .index_repair_cleared => {
                 self.invalidateReadCache(table_name);
                 self.invalidateRuntimeStatusCache(table_name);
-                self.markRepairHandoffClearBestEffort(table_name, group_id);
                 // Visibility callbacks can overlap after copying their hook.
-                // Never let an older clear delete a causally newer pending
-                // wake. Keep the group queued for one aggregate audit; only
-                // that generation-fenced owner may retire ordinary repair
-                // debt. Explicit drop remains the destructive remove path.
+                // A clear edge is therefore an audit trigger, never settlement
+                // evidence: an older clear can finish after a newer durable
+                // pending edge whose callback is still running. Keep the group
+                // queued; only the aggregate owner may classify durable repair
+                // state and authorize status publication. Explicit drop remains
+                // the destructive remove path.
                 self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
                 self.notifyLocalChange(table_name, .data);
                 return;
@@ -23164,7 +23171,10 @@ fn catchUpManagedDb(
         initial_index_repair_intents;
 
     if (mode == .index_repair_only) {
-        if (!initial_index_repair_debt) return .{};
+        if (!initial_index_repair_debt) {
+            source.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
+            return .{};
+        }
         if (had_debt or restore_repair_needed or needs_dense_artifact_maintenance) {
             // Full startup/restore catch-up owns these mutations under its
             // exclusive lifecycle fence. Retain the exact index-repair queue
@@ -23196,6 +23206,7 @@ fn catchUpManagedDb(
     var repaired_restore_runtime = false;
     var repaired_dense_artifacts = false;
     var repaired_artifact_metadata = false;
+    var attempted_index_repairs: usize = 0;
     var repaired_indexes: usize = 0;
     var degraded_indexes: usize = 0;
     var made_progress = false;
@@ -23295,6 +23306,7 @@ fn catchUpManagedDb(
     }
 
     if (mode == .all_debt and !initial_repair_debt) {
+        source.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .idle, db));
         return .{};
     }
@@ -23318,6 +23330,7 @@ fn catchUpManagedDb(
     }
 
     if (mode == .all_debt and !initial_repair_debt and !repaired_restore_runtime and !repaired_dense_artifacts) {
+        source.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
         return .{};
     }
 
@@ -23349,6 +23362,7 @@ fn catchUpManagedDb(
             };
         }
         const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, index_repair_options);
+        attempted_index_repairs = repair.attempted;
         repaired_indexes = repair.repaired;
         degraded_indexes = repair.degraded;
         made_progress = made_progress or repair.attempted != 0 or repair.repaired != 0 or repair.discovered != 0;
@@ -23364,14 +23378,6 @@ fn catchUpManagedDb(
                 .index_repair_degraded = repair.degraded != 0,
                 .index_repair_disk_wait = repair.disk_waits != 0,
                 .index_repair_retry_at_ms = repair.next_retry_at_ms,
-            };
-        }
-        if (degraded_indexes != 0) {
-            return .{
-                .had_debt = true,
-                .made_progress = made_progress,
-                .index_repair_attempted = repair.attempted != 0,
-                .index_repair_degraded = true,
             };
         }
     }
@@ -23423,13 +23429,6 @@ fn catchUpManagedDb(
         }
     }
     repair_summary = try db.indexRepairIntentSummary(alloc);
-    if (repair_summary.paused != 0) {
-        return .{
-            .had_debt = true,
-            .made_progress = made_progress,
-            .index_repair_paused = true,
-        };
-    }
     if (repair_summary.terminal != 0) {
         const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(source, alloc, table_name, group_id, db);
         return .{
@@ -23448,6 +23447,24 @@ fn catchUpManagedDb(
             .index_repair_pending = !terminal_status_published,
         };
     }
+    if (repair_summary.paused != 0) {
+        source.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
+        return .{
+            .had_debt = true,
+            .made_progress = made_progress,
+            .index_repair_paused = true,
+            .index_repair_attempted = attempted_index_repairs != 0,
+            .index_repair_repaired = repaired_indexes != 0,
+            .index_repair_degraded = degraded_indexes != 0,
+        };
+    }
+    // Runnable, terminal, and load-failure states have all been ruled out by
+    // this aggregate owner while it retains its operation lease. Paused work
+    // is durably parked and clean work is complete; either can release the
+    // structural snapshot-only fence after the corresponding authoritative
+    // status publication. A later pending callback advances the generation
+    // and fences that publication before it can settle the handoff.
+    source.markRepairHandoffOwnerAuditCompleteBestEffort(table_name, group_id);
     const index_only_result = mode == .index_repair_only or mode == .index_repair_prerequisite;
     const result_had_debt = if (index_only_result) initial_index_repair_debt else initial_repair_debt;
     return .{
@@ -23457,7 +23474,7 @@ fn catchUpManagedDb(
         else
             had_debt or repaired_artifact_metadata or repaired_restore_runtime or repaired_dense_artifacts or repaired_indexes > 0,
         .made_progress = made_progress,
-        .index_repair_attempted = advance_index_repairs and repaired_indexes != 0,
+        .index_repair_attempted = advance_index_repairs and attempted_index_repairs != 0,
         .index_repair_repaired = repaired_indexes != 0,
         .index_repair_degraded = degraded_indexes != 0,
     };
@@ -34283,8 +34300,9 @@ test "structural repair handoff keeps status fenced through final shard visibili
     try std.testing.expectEqual(@as(usize, 1), debt_capture.unrelated_enqueue_calls);
 
     // Repair of an early shard may finish while the structural request is
-    // still reconciling later shards. Its clear and authoritative observation
-    // must settle shard authority without opening the table-wide status fence.
+    // still reconciling later shards. Its clear queues an aggregate audit; the
+    // owner's authoritative durable observation then settles shard authority
+    // without opening the table-wide status fence.
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
         &source,
         "docs",
@@ -34292,6 +34310,7 @@ test "structural repair handoff keeps status fenced through final shard visibili
         null,
         .index_repair_cleared,
     );
+    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7001);
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
         &source,
         "docs",
@@ -34334,6 +34353,7 @@ test "structural repair handoff keeps status fenced through final shard visibili
         .index_repair_cleared,
     );
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
+    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7002);
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
         &source,
         "docs",
@@ -34351,6 +34371,7 @@ test "structural repair handoff keeps status fenced through final shard visibili
         null,
         .index_repair_cleared,
     );
+    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7003);
     ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
         &source,
         "docs",
@@ -34393,8 +34414,8 @@ test "repair handoff status settles after authoritative cached publication" {
 
     // A repair result can be sampled before a resident writer emits a newer
     // pending edge. Route retention must preserve that edge without replaying
-    // the stale completion as a clear; only its own later clear may settle it.
-    source.markRepairHandoffClearBestEffort("docs", 7001);
+    // the stale owner audit as a clear.
+    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7001);
     source.markRepairHandoffPendingBestEffort("docs", 7001);
     var stale_completion = ProvisionedTableWriteSource.StartupCatchUpResult{
         .index_repair_repaired = true,
@@ -34403,7 +34424,19 @@ test "repair handoff status settles after authoritative cached publication" {
     try std.testing.expect(!stale_completion.index_repair_pending);
     try std.testing.expect(source.captureRepairHandoffPublicationTokenBestEffort("docs", 7001, true) == null);
 
-    source.markRepairHandoffClearBestEffort("docs", 7001);
+    // Reproduce the DB hook inversion directly: an older clear callback may
+    // resume after the newer pending callback. It must only enqueue an audit
+    // and cannot make the handoff publishable from callback arrival order.
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+        &source,
+        "docs",
+        7001,
+        null,
+        .index_repair_cleared,
+    );
+    try std.testing.expect(source.captureRepairHandoffPublicationTokenBestEffort("docs", 7001, true) == null);
+
+    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7001);
     var publication_retry = ProvisionedTableWriteSource.StartupCatchUpResult{};
     source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &publication_retry);
     try std.testing.expect(publication_retry.index_repair_pending);
@@ -34498,7 +34531,7 @@ test "terminal repair publication settles handoff or retains one fenced retry" {
     source.reserveStructuralReconcileStatus("docs");
     source.ensureStructuralRepairHandoffStatus("docs", 7002);
     source.releaseStructuralReconcileStatus("docs");
-    source.markRepairHandoffClearBestEffort("docs", 7002);
+    source.markRepairHandoffOwnerAuditCompleteBestEffort("docs", 7002);
     const Fence = struct {
         cache: *runtime_status.TableRuntimeSnapshotCache,
         calls: usize = 0,
