@@ -33,7 +33,8 @@ class CreateGraphIndexRequest:
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
         sources (list[GraphArtifactSourceConfig] | Unset): Ordered chunk or JSON asset streams whose edge-like values
             are unioned into this graph index. Artifact names must be unique within the array because the artifact name is
-            the source identity. Earlier sources win when multiple sources materialize the same edge identity.
+            the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires
+            index_capabilities.artifact_sources=true and is rejected by serverless deployments.
         summarizer (GeneratorConfig | Unset): A unified configuration for a generative AI provider.
              Example: {'provider': 'openai', 'model': 'gpt-4.1', 'temperature': 0.7, 'max_tokens': 2048}.
         template (str | Unset): Handlebars template for generating summarizer input text.
@@ -45,7 +46,8 @@ class CreateGraphIndexRequest:
         max_edges_per_document (int | Unset): Maximum number of distinct visible edges materialized per document after
             source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000).
             Independent aggregate reconciliation budgets bound work across overlapping source manifests.
-        source (GraphArtifactSourceConfig | Unset): Artifact stream materialized into graph edges.
+        source (GraphArtifactSourceConfig | Unset): Artifact stream materialized into graph edges. Artifact-backed graph
+            sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments.
         artifact (GraphArtifactProducerConfig | Unset): Asset producer used by an artifact-backed graph index.
         algebraic_planning (GraphAlgebraicPlanningConfig | Unset): Optional algebraic planning features for graph
             traversal.

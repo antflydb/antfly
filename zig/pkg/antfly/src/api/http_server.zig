@@ -2245,6 +2245,7 @@ pub const ApiHttpServer = struct {
         errdefer status.deinit(alloc);
         status.auth_enabled = self.cfg.auth_enabled;
         status.deployment_mode = self.cfg.deployment_mode;
+        status.index_capabilities.artifact_sources = self.cfg.deployment_mode != .serverless;
         status.storage = self.currentStorageRuntimeStatus();
         if (self.cfg.secret_store) |secret_store| {
             _ = secret_store.refreshIfChanged() catch |err| {

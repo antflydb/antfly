@@ -60360,7 +60360,7 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     try db.addIndex(.{
         .name = "ft_document_units",
         .kind = .full_text,
-        .config_json = "{\"artifact_name\":\"document_units_v1\"}",
+        .config_json = "{\"field\":\"text\",\"sources\":[{\"artifact\":\"document_units_v1\"}]}",
     });
     try db.addIndex(.{
         .name = "ft_document_chunks",
@@ -60470,6 +60470,17 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     });
     defer unit_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), unit_result.total_hits);
+
+    // The artifact contains operational strings such as unit_type in addition
+    // to text. A selective artifact index must not leak those fields into its
+    // postings, including through the schema-less _all projection.
+    var excluded_metadata = try db.search(alloc, .{
+        .index_name = "ft_document_units",
+        .full_text = .{ .match = .{ .field = "unit_type", .text = "document" } },
+        .return_mode = .chunk,
+    });
+    defer excluded_metadata.deinit();
+    try std.testing.expectEqual(@as(u32, 0), excluded_metadata.total_hits);
 
     var chunk_result = try db.search(alloc, .{
         .index_name = "ft_document_chunks",

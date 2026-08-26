@@ -17,8 +17,8 @@ T = TypeVar("T", bound="CreatedFullTextIndexConfig")
 
 @_attrs_define
 class CreatedFullTextIndexConfig:
-    """Canonical full-text configuration returned after creation. Single-source request aliases are represented through
-    sources.
+    """Canonical full-text configuration returned after creation. Single-source alternative request forms are represented
+    through sources.
 
         Attributes:
             sources (list[ArtifactIndexSource] | Unset):

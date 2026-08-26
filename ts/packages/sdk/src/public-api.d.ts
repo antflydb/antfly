@@ -2703,6 +2703,15 @@ export interface components {
              */
             retry_after_ms?: number;
         };
+        /** @description The requested index depends on a capability unavailable in the current deployment. */
+        UnsupportedIndexCapabilityError: {
+            /** @enum {string} */
+            error: "unsupported_index_capability";
+            /** @enum {string} */
+            message: "artifact-backed index sources are not supported by this deployment";
+            /** @enum {boolean} */
+            retryable: false;
+        };
         /** @description The metadata service does not yet provide the consistency capability required by backup. */
         MetadataCapabilityUnavailableError: {
             /**
@@ -3026,6 +3035,11 @@ export interface components {
          * @enum {string}
          */
         ClusterHealth: "unknown" | "healthy" | "unhealthy" | "degraded" | "error";
+        /** @description Deployment-level index capabilities clients can inspect before submitting index mutations. */
+        IndexRuntimeCapabilities: {
+            /** @description Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments. */
+            artifact_sources: boolean;
+        };
         ClusterStatus: {
             health: components["schemas"]["ClusterHealth"];
             /** @description Optional message providing details about the health status */
@@ -3037,6 +3051,7 @@ export interface components {
              * @enum {string}
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
+            index_capabilities?: components["schemas"]["IndexRuntimeCapabilities"];
             secret_store?: components["schemas"]["SecretStoreStatus"];
             runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
@@ -3054,6 +3069,7 @@ export interface components {
              * @enum {string}
              */
             deployment_mode?: "embedded" | "distributed" | "standalone" | "serverless";
+            index_capabilities?: components["schemas"]["IndexRuntimeCapabilities"];
             secret_store?: components["schemas"]["SecretStoreStatus"];
             runtime_config?: components["schemas"]["RuntimeConfigStatus"];
             storage?: components["schemas"]["StorageRuntimeStatus"];
@@ -8341,13 +8357,13 @@ export interface components {
             artifact: string;
         };
         FullTextIndexConfig: {
-            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. */
+            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["ArtifactIndexSource"][];
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
-            /** @description Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. Omit to index the default text projection. */
+            /** @description Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection. */
             field?: string;
-            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. */
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             artifact_name?: string;
         };
         /** @description Create a full-text index. */
@@ -9314,9 +9330,9 @@ export interface components {
             dimension?: number;
             /** @description Field to extract embeddings from (managed indexes only; not allowed when external=true) */
             field?: string;
-            /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. */
+            /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["ArtifactIndexSource"][];
-            /** @description Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. */
+            /** @description Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             embedding_name?: string;
             /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
             source_artifact_name?: string;
@@ -9391,7 +9407,7 @@ export interface components {
         GraphArtifactContextConfig: {
             doc_fields?: string[];
         };
-        /** @description Artifact stream materialized into graph edges. */
+        /** @description Artifact stream materialized into graph edges. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments. */
         GraphArtifactSourceConfig: {
             artifact: string;
             /** @description Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`. */
@@ -9508,7 +9524,7 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
-            /** @description Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. */
+            /** @description Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["GraphArtifactSourceConfig"][];
             /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];
@@ -9524,7 +9540,7 @@ export interface components {
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
             /** @description Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests. */
             max_edges_per_document?: number;
-            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. */
+            /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             source?: components["schemas"]["GraphArtifactSourceConfig"];
             /** @description Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name. */
             artifact?: components["schemas"]["GraphArtifactProducerConfig"];
@@ -12091,7 +12107,7 @@ export interface components {
             /** @description Normalized inline managed enrichment definitions required by this index. */
             enrichments?: components["schemas"]["CreatedEnrichmentConfig"][];
         };
-        /** @description Canonical full-text configuration returned after creation. Single-source request aliases are represented through sources. */
+        /** @description Canonical full-text configuration returned after creation. Single-source alternative request forms are represented through sources. */
         CreatedFullTextIndexConfig: {
             sources?: components["schemas"]["ArtifactIndexSource"][];
             mem_only?: boolean;
@@ -14010,6 +14026,15 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Invalid index configuration or a deployment capability mismatch */
+        IndexMutationBadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["UnsupportedIndexCapabilityError"] | components["schemas"]["Error"];
+            };
+        };
         /** @description Request body exceeds the configured size limit */
         PayloadTooLarge: {
             headers: {
@@ -15408,7 +15433,7 @@ export interface operations {
                     "application/json": components["schemas"]["Table"];
                 };
             };
-            400: components["responses"]["BadRequest"];
+            400: components["responses"]["IndexMutationBadRequest"];
             /** @description Durable destinations cannot be bound to this credential type */
             422: {
                 headers: {
@@ -16473,7 +16498,7 @@ export interface operations {
                     "application/json": components["schemas"]["CreatedIndex"];
                 };
             };
-            400: components["responses"]["BadRequest"];
+            400: components["responses"]["IndexMutationBadRequest"];
             404: components["responses"]["NotFound"];
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["Conflict"];

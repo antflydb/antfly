@@ -27,12 +27,15 @@ class CreateFullTextIndexRequest:
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
         sources (list[ArtifactIndexSource] | Unset): Chunk or textual asset streams indexed together; every artifact
-            record is an independent full-text member.
+            record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by
+            serverless deployments.
         mem_only (bool | Unset): Whether to use memory-only storage
         field (str | Unset): Content field indexed as text. With an artifact source, this selects the field within each
-            artifact record; without one, it selects a document field. Omit to index the default text projection.
+            artifact record; without one, it selects a document field. String values and arrays of strings are indexed;
+            missing, null, and non-text values produce no posting. Omit to index the default text projection.
         artifact_name (str | Unset): Single-source convenience form. Mutually exclusive with sources; normalized
-            responses use sources.
+            responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless
+            deployments.
     """
 
     type_: CreateFullTextIndexRequestType

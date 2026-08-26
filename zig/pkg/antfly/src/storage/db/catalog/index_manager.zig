@@ -1369,6 +1369,7 @@ pub const IndexManager = struct {
         config: types.IndexConfig,
         chunk_name: ?[]u8,
         source_artifact_names: [][]u8 = &.{},
+        selected_field: ?[]u8 = null,
         text_analysis: introducer_mod.TextAnalysisConfig,
         observed_field_analyzers: []mapper.ObservedFieldAnalyzer = &.{},
         runtime_schema: ?schema_mod.TableSchema,
@@ -2481,6 +2482,7 @@ pub const IndexManager = struct {
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
         for (entry.source_artifact_names) |name| self.alloc.free(name);
         if (entry.source_artifact_names.len > 0) self.alloc.free(entry.source_artifact_names);
+        if (entry.selected_field) |field| self.alloc.free(field);
         introducer_mod.freeTextAnalysisConfig(self.alloc, entry.text_analysis);
         for (entry.observed_field_analyzers) |item| {
             self.alloc.free(item.field_name);
@@ -8880,9 +8882,9 @@ pub const IndexManager = struct {
         };
     }
 
-    fn allTextIndexesSchemaLess(self: *const IndexManager) bool {
+    fn allTextIndexesAllowSchemaLessFastProjection(self: *const IndexManager) bool {
         for (self.text_indexes.items) |entry| {
-            if (entry.runtime_schema != null) return false;
+            if (entry.runtime_schema != null or entry.selected_field != null) return false;
         }
         return true;
     }
@@ -8901,7 +8903,7 @@ pub const IndexManager = struct {
             const source_batch = try mapper.buildTextProjectionSourceBatchFromWritesWithOptions(
                 arena,
                 writes,
-                try self.textProjectionOptionsForSchema(arena, self.allTextIndexesSchemaLess()),
+                try self.textProjectionOptionsForSchema(arena, self.allTextIndexesAllowSchemaLessFastProjection()),
             );
 
             for (self.text_indexes.items) |*entry| {
@@ -11146,6 +11148,7 @@ pub const IndexManager = struct {
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .chunk_name = if (text_cfg.source_artifact_name) |name| try self.alloc.dupe(u8, name) else null,
                     .source_artifact_names = try cloneOwnedStrings(self.alloc, text_cfg.source_artifact_names),
+                    .selected_field = if (text_cfg.selected_field) |field| try self.alloc.dupe(u8, field) else null,
                     .text_analysis = text_analysis,
                     .observed_field_analyzers = observed_field_analyzers,
                     .runtime_schema = runtime_schema,
@@ -13757,7 +13760,7 @@ pub const IndexManager = struct {
         const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
             arena,
             docs,
-            try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null),
+            try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null and entry.selected_field == null),
         );
         return try self.indexPreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_batch.docs);
     }
@@ -13982,7 +13985,13 @@ pub const IndexManager = struct {
                 const projection_alloc = if (detailed_profile_enabled) projection_tracking.allocator() else projection_arena_state.allocator();
                 var observed_field_analyzers = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
                 defer observed_field_analyzers.deinit(projection_alloc);
-                var builder = mapper.TextProjectionBatchBuilder.init(projection_alloc, entry.text_analysis, entry.runtime_schema, &observed_field_analyzers);
+                var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(
+                    projection_alloc,
+                    entry.text_analysis,
+                    entry.runtime_schema,
+                    &observed_field_analyzers,
+                    entry.selected_field,
+                );
                 defer builder.deinit();
 
                 var source_end = source_start;
@@ -18527,11 +18536,13 @@ pub fn denseConfigArtifactNamesAlloc(alloc: Allocator, cfg: types.IndexConfig) !
 const TextConfig = struct {
     source_artifact_name: ?[]u8 = null,
     source_artifact_names: [][]u8 = &.{},
+    selected_field: ?[]u8 = null,
 
     fn deinit(self: *const TextConfig, alloc: Allocator) void {
         if (self.source_artifact_name) |source_artifact_name| alloc.free(source_artifact_name);
         for (self.source_artifact_names) |name| alloc.free(name);
         if (self.source_artifact_names.len > 0) alloc.free(self.source_artifact_names);
+        if (self.selected_field) |field| alloc.free(field);
     }
 };
 
@@ -18983,6 +18994,12 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
         return error.InvalidIndexConfig;
     }
 
+    const selected_field = if (root.object.get("field")) |value| blk: {
+        if (value != .string or value.string.len == 0) return error.InvalidIndexConfig;
+        break :blk try alloc.dupe(u8, value.string);
+    } else null;
+    errdefer if (selected_field) |field| alloc.free(field);
+
     return .{
         .source_artifact_name = if (root.object.get("artifact_name")) |value|
             try alloc.dupe(u8, value.string)
@@ -18991,6 +19008,7 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
         else
             null,
         .source_artifact_names = source_artifact_names,
+        .selected_field = selected_field,
     };
 }
 
@@ -20754,11 +20772,20 @@ const TextProjectionProvenance = struct {
         cfg: types.IndexConfig,
         schema: ?schema_mod.TableSchema,
     ) !TextProjectionProvenance {
+        // Field-selective projection uses the second semantic witness. Give
+        // only those generations a new durable witness so an
+        // existing whole-document posting set cannot be interpreted as if it
+        // had been selectively projected. Default projections retain their
+        // prior witness and avoid an unnecessary fleet-wide rebuild.
+        const projection_seed: u64 = if (try textConfigSelectsField(alloc, cfg.config_json))
+            0x41545052534d0002
+        else
+            0x41545052534d0001;
         const schema_fingerprint = if (schema) |value| blk: {
             const encoded = try schema_mod.serializeTextProjectionSchema(alloc, value);
             defer alloc.free(encoded);
-            break :blk std.hash.Wyhash.hash(0x41545052534d0001, encoded);
-        } else std.hash.Wyhash.hash(0x41545052534d0001, "schema-less");
+            break :blk std.hash.Wyhash.hash(projection_seed, encoded);
+        } else std.hash.Wyhash.hash(projection_seed, "schema-less");
         return .{
             .coverage_generation = coverageGenerationForConfig(cfg),
             .index_config_hash = types.indexConfigHash(cfg),
@@ -20809,6 +20836,13 @@ const TextProjectionProvenance = struct {
         };
     }
 };
+
+fn textConfigSelectsField(alloc: Allocator, raw: []const u8) !bool {
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidIndexConfig;
+    return parsed.value.object.get("field") != null;
+}
 
 fn saveTextProjectionProvenance(
     persistent: *persistent_mod.PersistentIndex,
@@ -22936,18 +22970,25 @@ test "parseTextConfig prefers source artifact name and accepts legacy chunk name
 test "parseTextConfig accepts multiple artifact sources and rejects mixed aliases" {
     const alloc = std.testing.allocator;
     var cfg = try parseTextConfig(alloc,
-        \\{"sources":[{"artifact":"title_chunks_v1"},{"artifact":"body_assets_v1"}]}
+        \\{"field":"text","sources":[{"artifact":"title_chunks_v1"},{"artifact":"body_assets_v1"}]}
     );
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), cfg.source_artifact_names.len);
     try std.testing.expectEqualStrings("title_chunks_v1", cfg.source_artifact_names[0]);
     try std.testing.expectEqualStrings("body_assets_v1", cfg.source_artifact_names[1]);
+    try std.testing.expectEqualStrings("text", cfg.selected_field.?);
 
     try std.testing.expectError(error.InvalidIndexConfig, parseTextConfig(alloc,
         \\{"artifact_name":"legacy","sources":[{"artifact":"current"}]}
     ));
     try std.testing.expectError(error.InvalidIndexConfig, parseTextConfig(alloc,
         \\{"sources":[{"artifact":"body_assets_v1","path":"$.body"}]}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseTextConfig(alloc,
+        \\{"field":"","sources":[{"artifact":"body_assets_v1"}]}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseTextConfig(alloc,
+        \\{"field":7,"sources":[{"artifact":"body_assets_v1"}]}
     ));
 }
 

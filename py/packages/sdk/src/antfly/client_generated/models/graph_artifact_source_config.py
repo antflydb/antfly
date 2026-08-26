@@ -19,20 +19,21 @@ T = TypeVar("T", bound="GraphArtifactSourceConfig")
 
 @_attrs_define
 class GraphArtifactSourceConfig:
-    """Artifact stream materialized into graph edges.
+    """Artifact stream materialized into graph edges. Artifact-backed graph sources require
+    index_capabilities.artifact_sources=true and are rejected by serverless deployments.
 
-    Attributes:
-        artifact (str):
-        path (str | Unset): Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field
-            names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
-        format_ (GraphArtifactSourceConfigFormat | Unset):  Default:
-            GraphArtifactSourceConfigFormat.EXTRACTION_RELATION.
-        mention_edge_type (str | Unset):
-        nodes (GraphArtifactNodeMappingConfig | Unset): Maps each artifact item to graph node identifiers.
-        edge (GraphArtifactEdgeMappingConfig | Unset): Maps each artifact item to an edge type, weight, and public
-            metadata.
-        context (GraphArtifactContextConfig | Unset): Document fields made available to graph mapping templates through
-            `_doc.value`.
+        Attributes:
+            artifact (str):
+            path (str | Unset): Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field
+                names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
+            format_ (GraphArtifactSourceConfigFormat | Unset):  Default:
+                GraphArtifactSourceConfigFormat.EXTRACTION_RELATION.
+            mention_edge_type (str | Unset):
+            nodes (GraphArtifactNodeMappingConfig | Unset): Maps each artifact item to graph node identifiers.
+            edge (GraphArtifactEdgeMappingConfig | Unset): Maps each artifact item to an edge type, weight, and public
+                metadata.
+            context (GraphArtifactContextConfig | Unset): Document fields made available to graph mapping templates through
+                `_doc.value`.
     """
 
     artifact: str

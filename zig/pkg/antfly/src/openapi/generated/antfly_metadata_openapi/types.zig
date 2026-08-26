@@ -881,6 +881,7 @@ pub const ClusterStatus = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
@@ -894,6 +895,7 @@ pub const ClusterTopology = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
@@ -1611,6 +1613,12 @@ pub const HierarchyProjection = struct {
 pub const IncompleteDetails = struct {
     /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
     reason: []const u8,
+};
+
+/// Deployment-level index capabilities clients can inspect before submitting index mutations.
+pub const IndexRuntimeCapabilities = struct {
+    /// Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments.
+    artifact_sources: bool,
 };
 
 pub const IndexStatus = struct {
@@ -3766,6 +3774,13 @@ pub const UnsupportedHierarchyGroupingError = struct {
     /// Select source grouping, omit group_by for direct members, or use a homogeneous chunk-backed index.
     action: []const u8,
     /// Retrying the same request cannot succeed without changing its hierarchy grouping.
+    retryable: bool,
+};
+
+/// The requested index depends on a capability unavailable in the current deployment.
+pub const UnsupportedIndexCapabilityError = struct {
+    @"error": []const u8,
+    message: []const u8,
     retryable: bool,
 };
 

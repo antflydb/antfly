@@ -385,6 +385,7 @@ from .index_readiness_state import IndexReadinessState
 from .index_readiness_status import IndexReadinessStatus
 from .index_repair_status import IndexRepairStatus
 from .index_repair_status_state import IndexRepairStatusState
+from .index_runtime_capabilities import IndexRuntimeCapabilities
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
@@ -829,6 +830,9 @@ from .unsupported_hierarchy_grouping_error_error import UnsupportedHierarchyGrou
 from .unsupported_hierarchy_grouping_error_field import UnsupportedHierarchyGroupingErrorField
 from .unsupported_hierarchy_grouping_error_reason import UnsupportedHierarchyGroupingErrorReason
 from .unsupported_hierarchy_grouping_error_status import UnsupportedHierarchyGroupingErrorStatus
+from .unsupported_index_capability_error import UnsupportedIndexCapabilityError
+from .unsupported_index_capability_error_error import UnsupportedIndexCapabilityErrorError
+from .unsupported_index_capability_error_message import UnsupportedIndexCapabilityErrorMessage
 from .unsupported_query_error import UnsupportedQueryError
 from .unsupported_query_error_error import UnsupportedQueryErrorError
 from .unsupported_query_error_status import UnsupportedQueryErrorStatus
@@ -1233,6 +1237,7 @@ __all__ = (
     "IndexReadinessStatus",
     "IndexRepairStatus",
     "IndexRepairStatusState",
+    "IndexRuntimeCapabilities",
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
@@ -1673,6 +1678,9 @@ __all__ = (
     "UnsupportedHierarchyGroupingErrorField",
     "UnsupportedHierarchyGroupingErrorReason",
     "UnsupportedHierarchyGroupingErrorStatus",
+    "UnsupportedIndexCapabilityError",
+    "UnsupportedIndexCapabilityErrorError",
+    "UnsupportedIndexCapabilityErrorMessage",
     "UnsupportedQueryError",
     "UnsupportedQueryErrorError",
     "UnsupportedQueryErrorStatus",

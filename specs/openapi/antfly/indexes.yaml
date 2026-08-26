@@ -129,7 +129,7 @@ components:
       type: object
       additionalProperties: false
       required: [artifact]
-      description: "Artifact stream materialized into graph edges."
+      description: "Artifact stream materialized into graph edges. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments."
       properties:
         artifact: { type: string, minLength: 1 }
         path:
@@ -439,7 +439,7 @@ components:
         execution: { $ref: "#/components/schemas/IndexExecutionConfig" }
     CreatedFullTextIndexConfig:
       type: object
-      description: "Canonical full-text configuration returned after creation. Single-source request aliases are represented through sources."
+      description: "Canonical full-text configuration returned after creation. Single-source alternative request forms are represented through sources."
       properties:
         sources:
           type: array
@@ -642,7 +642,7 @@ components:
           items:
             $ref: "#/components/schemas/ArtifactIndexSource"
           x-go-type-skip-optional-pointer: true
-          description: "Chunk or textual asset streams indexed together; every artifact record is an independent full-text member."
+          description: "Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -651,12 +651,12 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           minLength: 1
-          description: "Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. Omit to index the default text projection."
+          description: "Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection."
         artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
           minLength: 1
-          description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources."
+          description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
     AlgebraicIndexConfig:
       type: object
       description: "Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned."
@@ -986,11 +986,12 @@ components:
             Embedding artifact streams indexed together. Each artifact record is an independent
             vector member identified by (artifact name, source key). All sources must use the same
             dense vector space or sparse token space. Not allowed with external, field, template,
-            chunker, embedding_name, or source_artifact_name.
+            chunker, embedding_name, or source_artifact_name. Requires
+            index_capabilities.artifact_sources=true and is rejected by serverless deployments.
         embedding_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources."
+          description: "Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -1985,7 +1986,7 @@ components:
           items:
             $ref: "#/components/schemas/GraphArtifactSourceConfig"
           x-go-type-skip-optional-pointer: true
-          description: "Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity."
+          description: "Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
         summarizer:
           description: "Configuration for generating node summaries (enables tree navigation in Retrieval Agent)"
           $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
@@ -2009,7 +2010,7 @@ components:
           maximum: 1000000
           description: "Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests."
         source:
-          description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources."
+          description: "Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
           $ref: "#/components/schemas/GraphArtifactSourceConfig"
         artifact:
           $ref: "#/components/schemas/GraphArtifactProducerConfig"

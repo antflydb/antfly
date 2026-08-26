@@ -226,9 +226,9 @@ pub const CreateEmbeddingsIndexRequest = struct {
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
-    /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name.
+    /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources.
+    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
@@ -262,13 +262,13 @@ pub const CreateFullTextIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member.
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
-    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. Omit to index the default text projection.
+    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection.
     field: ?[]const u8 = null,
-    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
     type: []const u8,
 };
@@ -281,7 +281,7 @@ pub const CreateGraphIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity.
+    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
@@ -291,7 +291,7 @@ pub const CreateGraphIndexRequest = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
-    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     source: ?GraphArtifactSourceConfig = null,
     /// Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name.
     artifact: ?GraphArtifactProducerConfig = null,
@@ -456,7 +456,7 @@ pub const CreatedFullTextIndex = struct {
     type: []const u8,
 };
 
-/// Canonical full-text configuration returned after creation. Single-source request aliases are represented through sources.
+/// Canonical full-text configuration returned after creation. Single-source alternative request forms are represented through sources.
 pub const CreatedFullTextIndexConfig = struct {
     sources: ?[]const ArtifactIndexSource = null,
     mem_only: ?bool = null,
@@ -848,9 +848,9 @@ pub const EmbeddingsIndexConfig = struct {
     dimension: ?i64 = null,
     /// Field to extract embeddings from (managed indexes only; not allowed when external=true)
     field: ?[]const u8 = null,
-    /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name.
+    /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources.
+    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
@@ -1103,13 +1103,13 @@ pub const ExecutionPolicy = struct {
 };
 
 pub const FullTextIndexConfig = struct {
-    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member.
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
-    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. Omit to index the default text projection.
+    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection.
     field: ?[]const u8 = null,
-    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
 };
 
@@ -1251,7 +1251,7 @@ pub const GraphArtifactProducerSourceConfig = struct {
     value: []const u8,
 };
 
-/// Artifact stream materialized into graph edges.
+/// Artifact stream materialized into graph edges. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments.
 pub const GraphArtifactSourceConfig = struct {
     artifact: []const u8,
     /// Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
@@ -1270,7 +1270,7 @@ pub const GraphBoundedTraversalConfig = struct {
 
 /// Configuration for graph index type
 pub const GraphIndexConfig = struct {
-    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity.
+    /// Ordered chunk or JSON asset streams whose edge-like values are unioned into this graph index. Artifact names must be unique within the array because the artifact name is the source identity. Earlier sources win when multiple sources materialize the same edge identity. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const GraphArtifactSourceConfig = null,
     /// Configuration for generating node summaries (enables tree navigation in Retrieval Agent)
     summarizer: ?antfly_generating_openapi.GeneratorConfig = null,
@@ -1280,7 +1280,7 @@ pub const GraphIndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
-    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     source: ?GraphArtifactSourceConfig = null,
     /// Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name.
     artifact: ?GraphArtifactProducerConfig = null,
@@ -1572,13 +1572,13 @@ pub const IndexConfig = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member.
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
-    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. Omit to index the default text projection.
+    /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection.
     field: ?[]const u8 = null,
-    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     artifact_name: ?[]const u8 = null,
     publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
@@ -1589,7 +1589,7 @@ pub const IndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources.
+    /// Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
     /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
@@ -1614,7 +1614,7 @@ pub const IndexConfig = struct {
     edge_types: ?[]const EdgeTypeConfig = null,
     /// Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests.
     max_edges_per_document: ?i64 = null,
-    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources.
+    /// Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     source: ?GraphArtifactSourceConfig = null,
     /// Single asset-producer shorthand. It must be paired with exactly one source selecting the same artifact name.
     artifact: ?GraphArtifactProducerConfig = null,

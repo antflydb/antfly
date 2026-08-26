@@ -48,9 +48,11 @@ class CreateEmbeddingsIndexRequest:
         sources (list[ArtifactIndexSource] | Unset): Embedding artifact streams indexed together. Each artifact record
             is an independent vector member identified by (artifact name, source key). All sources must use the same dense
             vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or
-            source_artifact_name.
+            source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless
+            deployments.
         embedding_name (str | Unset): Single-source convenience form. Mutually exclusive with sources; accepted requests
-            are normalized to sources.
+            are normalized to sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless
+            deployments.
         source_artifact_name (str | Unset): Artifact stream consumed by the embedding enrichment backing this vector
             index. This is descriptive public configuration; the matching enrichment defines the materialized source.
         template (str | Unset): Handlebars template for generating prompts (managed indexes only; not allowed when

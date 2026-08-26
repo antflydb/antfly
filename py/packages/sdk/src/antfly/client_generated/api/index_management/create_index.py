@@ -16,6 +16,7 @@ from ...models.created_full_text_index import CreatedFullTextIndex
 from ...models.created_graph_index import CreatedGraphIndex
 from ...models.error import Error
 from ...models.storage_resource_exhausted_error import StorageResourceExhaustedError
+from ...models.unsupported_index_capability_error import UnsupportedIndexCapabilityError
 from ...types import Response
 
 
@@ -61,6 +62,8 @@ def _parse_response(
     | CreatedFullTextIndex
     | CreatedGraphIndex
     | Error
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
     | None
 ):
@@ -104,7 +107,23 @@ def _parse_response(
         return response_201
 
     if response.status_code == 400:
-        response_400 = Error.from_dict(response.json())
+
+        def _parse_response_400(data: object) -> Error | UnsupportedIndexCapabilityError:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                response_400_type_0 = UnsupportedIndexCapabilityError.from_dict(data)
+
+                return response_400_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            response_400_type_1 = Error.from_dict(data)
+
+            return response_400_type_1
+
+        response_400 = _parse_response_400(response.json())
 
         return response_400
 
@@ -157,6 +176,8 @@ def _build_response(
     | CreatedFullTextIndex
     | CreatedGraphIndex
     | Error
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
 ]:
     return Response(
@@ -182,6 +203,8 @@ def sync_detailed(
     | CreatedFullTextIndex
     | CreatedGraphIndex
     | Error
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
 ]:
     """Add an index to a table
@@ -198,7 +221,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError]
+        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | UnsupportedIndexCapabilityError | StorageResourceExhaustedError]
     """
 
     kwargs = _get_kwargs(
@@ -229,6 +252,8 @@ def sync(
     | CreatedFullTextIndex
     | CreatedGraphIndex
     | Error
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
     | None
 ):
@@ -246,7 +271,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError
+        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | UnsupportedIndexCapabilityError | StorageResourceExhaustedError
     """
 
     return sync_detailed(
@@ -272,6 +297,8 @@ async def asyncio_detailed(
     | CreatedFullTextIndex
     | CreatedGraphIndex
     | Error
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
 ]:
     """Add an index to a table
@@ -288,7 +315,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError]
+        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | UnsupportedIndexCapabilityError | StorageResourceExhaustedError]
     """
 
     kwargs = _get_kwargs(
@@ -317,6 +344,8 @@ async def asyncio(
     | CreatedFullTextIndex
     | CreatedGraphIndex
     | Error
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
     | None
 ):
@@ -334,7 +363,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | StorageResourceExhaustedError
+        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | UnsupportedIndexCapabilityError | StorageResourceExhaustedError
     """
 
     return (

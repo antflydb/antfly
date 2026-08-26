@@ -832,12 +832,6 @@ pub const HttpHandler = struct {
             return try textResponse(self.alloc, 404, "not found");
         };
         defer self.alloc.free(next_indexes_json);
-        validateServerlessIndexCatalog(self.alloc, next_indexes_json) catch |err| switch (err) {
-            error.UnsupportedServerlessArtifactIndexSources => return try unsupportedArtifactIndexSourcesResponse(self.alloc),
-            error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
-            error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid index configuration"),
-            else => return err,
-        };
 
         const updated = try self.catalog.setTableDefinition(
             table_name,
@@ -4781,7 +4775,6 @@ pub const HttpHandler = struct {
             return error.NotFound;
         };
         defer alloc.free(next_indexes_json);
-        validateServerlessIndexCatalog(alloc, next_indexes_json) catch return error.InternalFailure;
         request.ensureActive() catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
@@ -6825,6 +6818,14 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     try std.testing.expectEqual(api_types.RuntimeRole.combined, parsed_status.value.role);
     try std.testing.expectEqual(@as(u64, 1), parsed_status.value.tick_interval_ms);
     try std.testing.expectEqual(@as(usize, 0), parsed_status.value.targets.len);
+
+    // Serverless diagnostics are additive to the public status schema so every
+    // generated SDK can discover the capability before attempting a mutation.
+    var public_status = try parseJsonTestBody(metadata_openapi.ClusterStatus, alloc, status.body);
+    defer public_status.deinit();
+    try std.testing.expectEqual(metadata_openapi.ClusterHealth.healthy, public_status.value.health);
+    try std.testing.expectEqualStrings("serverless", public_status.value.deployment_mode.?);
+    try std.testing.expect(!public_status.value.index_capabilities.?.artifact_sources);
 
     var health = try handler.handle(.{
         .method = .get,

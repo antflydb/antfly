@@ -1479,6 +1479,21 @@ components:
   schemas:
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
+    UnsupportedIndexCapabilityError:
+      type: object
+      additionalProperties: false
+      description: The requested index depends on a capability unavailable in the current deployment.
+      required: [error, message, retryable]
+      properties:
+        error:
+          type: string
+          enum: [unsupported_index_capability]
+        message:
+          type: string
+          enum: [artifact-backed index sources are not supported by this deployment]
+        retryable:
+          type: boolean
+          enum: [false]
     MetadataCapabilityUnavailableError:
       type: object
       additionalProperties: false
@@ -1879,6 +1894,15 @@ components:
         - degraded
         - error
       description: Overall health status of the cluster
+    IndexRuntimeCapabilities:
+      type: object
+      additionalProperties: false
+      required: [artifact_sources]
+      description: Deployment-level index capabilities clients can inspect before submitting index mutations.
+      properties:
+        artifact_sources:
+          type: boolean
+          description: Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments.
     ClusterStatus:
       type: object
       required:
@@ -1898,6 +1922,8 @@ components:
           type: string
           enum: [embedded, distributed, standalone, serverless]
           description: Runtime deployment topology
+        index_capabilities:
+          $ref: "#/components/schemas/IndexRuntimeCapabilities"
         secret_store:
           $ref: "#/components/schemas/SecretStoreStatus"
         runtime_config:
@@ -1924,6 +1950,8 @@ components:
           type: string
           enum: [embedded, distributed, standalone, serverless]
           description: Runtime deployment topology
+        index_capabilities:
+          $ref: "#/components/schemas/IndexRuntimeCapabilities"
         secret_store:
           $ref: "#/components/schemas/SecretStoreStatus"
         runtime_config:
@@ -8642,6 +8670,18 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    IndexMutationBadRequest:
+      description: Invalid index configuration or a deployment capability mismatch
+      content:
+        application/json:
+          schema:
+            # The generic Error schema intentionally accepts this structured
+            # shape, so these alternatives overlap by design. Keep the typed
+            # capability error first for generators that parse alternatives in
+            # declaration order.
+            anyOf:
+              - $ref: "#/components/schemas/UnsupportedIndexCapabilityError"
+              - $ref: "#/components/schemas/Error"
     PayloadTooLarge:
       description: Request body exceeds the configured size limit
       content:
@@ -10163,7 +10203,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Table"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          $ref: "#/components/responses/IndexMutationBadRequest"
         "422":
           description: Durable destinations cannot be bound to this credential type
           content:
@@ -11468,7 +11508,7 @@ paths:
               schema:
                 $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          $ref: "#/components/responses/IndexMutationBadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
         "405":
