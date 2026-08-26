@@ -34080,6 +34080,8 @@ test "metal_compute: primitive tanh saturates large finite inputs" {
 }
 
 test "metal_compute: qualified A4B slot layout is bounded and page aligned" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+
     var request: ops.RunMoeBlockRequest = undefined;
     request.hidden_size = 2816;
     request.inter_size = 704;
@@ -34163,6 +34165,8 @@ test "metal_compute: mapped A4B gate up fusion requires one packed descriptor" {
 }
 
 test "metal_compute: packed Q4 slot copier honors expert and fused projection offsets" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     const in_dim: usize = 32;
     const out_dim: usize = 32;
