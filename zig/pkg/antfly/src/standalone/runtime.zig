@@ -22,6 +22,7 @@ const group_ids = @import("../common/group_ids.zig");
 const threaded_io_limits = @import("../common/threaded_io_limits.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const process_memory_budget = @import("../common/process_memory_budget.zig");
+const preload_model_spec = @import("../common/preload_model_spec.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("inference_bridge.zig");
@@ -3425,34 +3426,12 @@ fn validPreloadModelKind(value: []const u8) bool {
         std.mem.eql(u8, value, "extractor");
 }
 
-fn validInferenceBackend(value: []const u8) bool {
-    return std.mem.eql(u8, value, "native") or
-        std.mem.eql(u8, value, "onnx") or
-        std.mem.eql(u8, value, "metal") or
-        std.mem.eql(u8, value, "cuda") or
-        std.mem.eql(u8, value, "xla") or
-        std.mem.eql(u8, value, "pjrt") or
-        std.mem.eql(u8, value, "wasm") or
-        std.mem.eql(u8, value, "webgpu");
-}
-
 fn parsePreloadModelFlag(value: []const u8) !inference_bridge.WarmModel {
-    const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
-    const kind_name = value[0..separator];
-    var model_name = value[separator + 1 ..];
-    var backend: ?[]const u8 = null;
-    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
-        const backend_name = model_name[0..backend_separator];
-        if (validInferenceBackend(backend_name)) {
-            backend = backend_name;
-            model_name = model_name[backend_separator + 1 ..];
-        }
-    }
-    if (model_name.len == 0) return error.InvalidArguments;
+    const spec = try preload_model_spec.parse(value);
     return .{
-        .kind = inference_bridge.String.init(if (validPreloadModelKind(kind_name)) kind_name else return error.InvalidArguments),
-        .name = inference_bridge.String.init(model_name),
-        .backend = inference_bridge.OptionalString.init(backend),
+        .kind = inference_bridge.String.init(if (validPreloadModelKind(spec.kind)) spec.kind else return error.InvalidArguments),
+        .name = inference_bridge.String.init(spec.name),
+        .backend = inference_bridge.OptionalString.init(spec.backend),
     };
 }
 
