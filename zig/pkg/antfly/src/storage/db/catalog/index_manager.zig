@@ -11004,24 +11004,33 @@ pub const IndexManager = struct {
 
     fn configHasPendingSparseEmbeddingArtifactReplay(self: *IndexManager, store: anytype, cfg: types.IndexConfig) !bool {
         if (cfg.kind != .sparse_vector) return false;
-        const expected_embedding_name = try self.sparseConfigEmbeddingNameAlloc(cfg);
-        defer self.alloc.free(expected_embedding_name);
+        var refs = try self.artifactRefsFromConfig(cfg);
+        defer refs.deinit(self.alloc);
 
         const Context = struct {
             alloc: Allocator,
-            expected_embedding_name: []const u8,
+            embedding_name: ?[]const u8,
+            embedding_names: []const []const u8,
             found: bool = false,
+
+            fn matches(_: *const @This(), artifact_key: []const u8, embedding_name: []const u8) bool {
+                return (internal_keys.isEmbeddingArtifactKey(artifact_key) and internal_keys.matchesEmbeddingArtifactName(artifact_key, embedding_name)) or
+                    (internal_keys.isDerivedEmbeddingArtifactKey(artifact_key) and internal_keys.matchesDerivedEmbeddingArtifactName(artifact_key, embedding_name));
+            }
 
             fn handle(ctx: *@This(), _: u64, payload: []const u8) !void {
                 if (ctx.found) return;
                 var decoded = try change_journal_mod.decodeRecord(ctx.alloc, payload);
                 defer decoded.deinit();
                 for (decoded.record.changed_artifact_keys) |artifact_key| {
-                    if (internal_keys.isEmbeddingArtifactKey(artifact_key) and internal_keys.matchesEmbeddingArtifactName(artifact_key, ctx.expected_embedding_name)) {
-                        ctx.found = true;
-                        return;
+                    if (ctx.embedding_name) |embedding_name| {
+                        if (ctx.matches(artifact_key, embedding_name)) {
+                            ctx.found = true;
+                            return;
+                        }
                     }
-                    if (internal_keys.isDerivedEmbeddingArtifactKey(artifact_key) and internal_keys.matchesDerivedEmbeddingArtifactName(artifact_key, ctx.expected_embedding_name)) {
+                    for (ctx.embedding_names) |embedding_name| {
+                        if (!ctx.matches(artifact_key, embedding_name)) continue;
                         ctx.found = true;
                         return;
                     }
@@ -11031,21 +11040,14 @@ pub const IndexManager = struct {
 
         var ctx = Context{
             .alloc = self.alloc,
-            .expected_embedding_name = expected_embedding_name,
+            .embedding_name = refs.embedding_name,
+            .embedding_names = refs.embedding_names,
         };
         store.forEachReplayEntryFromHint(0, .sparse_vector, &ctx, Context.handle) catch |err| switch (err) {
             error.ReplayIndexUnavailable => return false,
             else => return err,
         };
         return ctx.found;
-    }
-
-    fn sparseConfigEmbeddingNameAlloc(self: *IndexManager, cfg: types.IndexConfig) ![]u8 {
-        if (try parseSparseGeneratorConfig(self.alloc, cfg.config_json)) |generator| {
-            defer generator.deinit(self.alloc);
-            if (generator.embedding_name) |embedding_name| return try self.alloc.dupe(u8, embedding_name);
-        }
-        return try self.alloc.dupe(u8, cfg.name);
     }
 
     fn appendOpenedIndex(self: *IndexManager, opened: OpenedIndex) !void {
@@ -11465,7 +11467,7 @@ pub const IndexManager = struct {
                     self.getEnrichment(.embedding, referenced_embedding_name)
                 else
                     null;
-                if (sparse_cfg.embedding_name != null and referenced_embedding == null and !sparse_cfg.external) {
+                if (sparse_generator == null and sparse_cfg.embedding_name != null and referenced_embedding == null and !sparse_cfg.external) {
                     return error.InvalidIndexConfig;
                 }
                 if (referenced_embedding) |embedding_cfg| {
@@ -12102,7 +12104,7 @@ pub const IndexManager = struct {
                 if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
             }
             if (entry.embedding_name) |embedding_name| {
-                if (!entry.external and self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
+                if (!entry.external and !entry.managed_direct_field and self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
             }
             for (entry.embedding_names) |embedding_name| {
                 const enrichment = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidEnrichmentConfig;
@@ -19424,26 +19426,30 @@ fn parseSparseConfig(alloc: Allocator, raw: []const u8) !SparseConfig {
     if (root != .object) return error.InvalidIndexConfig;
 
     const field = root.object.get("field") orelse return error.InvalidIndexConfig;
+    if (field != .string or field.string.len == 0) return error.InvalidIndexConfig;
+    const external = if (root.object.get("external")) |value|
+        if (value == .bool) value.bool else return error.InvalidIndexConfig
+    else
+        false;
+    const embedding_name_value = root.object.get("embedding_name");
+    if (embedding_name_value) |value| {
+        if (value != .string or value.string.len == 0) return error.InvalidIndexConfig;
+    }
     const embedding_names = try parseArtifactSourcesAlloc(alloc, root.object);
     errdefer {
         for (embedding_names) |name| alloc.free(name);
         if (embedding_names.len > 0) alloc.free(embedding_names);
     }
     if (embedding_names.len > 0 and root.object.get("embedding_name") != null) return error.InvalidIndexConfig;
+    const field_name = try alloc.dupe(u8, field.string);
+    errdefer alloc.free(field_name);
+    const embedding_name = if (embedding_name_value) |value| try alloc.dupe(u8, value.string) else null;
+    errdefer if (embedding_name) |name| alloc.free(name);
     return .{
-        .field_name = try alloc.dupe(u8, field.string),
-        .embedding_name = if (root.object.get("embedding_name")) |value|
-            if (value == .string and value.string.len > 0)
-                try alloc.dupe(u8, value.string)
-            else
-                return error.InvalidIndexConfig
-        else
-            null,
+        .field_name = field_name,
+        .embedding_name = embedding_name,
         .embedding_names = embedding_names,
-        .external = if (root.object.get("external")) |value|
-            if (value == .bool) value.bool else return error.InvalidIndexConfig
-        else
-            false,
+        .external = external,
     };
 }
 
@@ -22736,6 +22742,9 @@ test "sparse single-source embedding name drives generation replay and search" {
     try std.testing.expectEqualStrings("document_sparse_v1", entry.embedding_name.?);
     try std.testing.expect(manager.sparseIndexConsumesEmbedding("document_sparse", "document_sparse_v1"));
     try std.testing.expect(try manager.configRequiresEnrichmentReplay(entry.config));
+    var artifact_refs = try manager.artifactRefsFromConfig(entry.config);
+    defer artifact_refs.deinit(alloc);
+    try std.testing.expectEqualStrings("document_sparse_v1", artifact_refs.embedding_name.?);
 
     const generated = try manager.planGeneratedEnrichments(alloc, "doc:generated", "{\"body\":\"sparse text\"}", &.{}, &.{});
     defer {

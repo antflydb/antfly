@@ -72,12 +72,7 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Verify embedded Antfarm bundle
-        working-directory: .
-        run: diff -qr ts/apps/antfarm/dist zig/pkg/antfly/antfarm
-
-      - name: Upload canonical Antfarm bundle on mismatch
-        if: failure()
+      - name: Upload canonical Antfarm bundle
         uses: actions/upload-artifact@v6
         with:
           name: antfarm-linux-node-${{ matrix.node-version }}-${{ github.sha }}
@@ -87,6 +82,22 @@ jobs:
 
       - name: Run tests
         run: pnpm test
+
+  embedded-antfarm:
+    name: Verify embedded Antfarm bundle
+    needs: [test]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download canonical Antfarm bundle
+        uses: actions/download-artifact@v6
+        with:
+          name: antfarm-linux-node-24.16.0-${{ github.sha }}
+          path: ts/apps/antfarm/dist
+
+      - name: Verify checked-in bundle
+        run: diff -qr ts/apps/antfarm/dist zig/pkg/antfly/antfarm
 
   playwright:
     needs: [test]
@@ -122,7 +133,7 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 24.x
+          node-version: 24.16.0
 
       - name: Configure pnpm cache
         run: pnpm config set store-dir "$PNPM_STORE_PATH"
