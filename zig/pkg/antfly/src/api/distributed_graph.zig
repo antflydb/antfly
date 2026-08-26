@@ -3733,8 +3733,6 @@ const BudgetedGraphPath = struct {
     }
 };
 
-const retained_hash_entry_overhead = 3 * @sizeOf(usize);
-
 fn growRetainedLease(
     lease: *graph_work_budget.RetainedLease,
     added_bytes: usize,
@@ -3745,6 +3743,41 @@ fn growRetainedLease(
         return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     try lease.resize(next);
     return previous;
+}
+
+const RetainedHashGrowth = struct {
+    capacity: usize,
+    bytes: usize,
+};
+
+fn retainedHashGrowth(
+    comptime Key: type,
+    comptime Value: type,
+    current_capacity: usize,
+    next_count: usize,
+) !RetainedHashGrowth {
+    const target_capacity = try graph_work_budget.hashMapCapacityForCount(
+        next_count,
+        std.hash_map.default_max_load_percentage,
+    );
+    if (target_capacity <= current_capacity) return .{
+        .capacity = current_capacity,
+        .bytes = 0,
+    };
+    const current_bytes = try graph_work_budget.hashMapRetainedBytes(
+        Key,
+        Value,
+        current_capacity,
+    );
+    const target_bytes = try graph_work_budget.hashMapRetainedBytes(
+        Key,
+        Value,
+        target_capacity,
+    );
+    return .{
+        .capacity = target_capacity,
+        .bytes = target_bytes - current_bytes,
+    };
 }
 
 fn restoreRetainedLease(
@@ -3781,10 +3814,18 @@ fn insertGraphPathIdentity(
     budget: *graph_pattern_mod.WorkBudget,
 ) !bool {
     const key_len = try graphPathIdentityEncodedLen(path);
+    const next_count = std.math.add(usize, set.count(), 1) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const growth = retainedHashGrowth(
+        []const u8,
+        void,
+        set.capacity(),
+        next_count,
+    ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     const retained_bytes = std.math.add(
         usize,
         key_len,
-        @sizeOf([]const u8) + retained_hash_entry_overhead,
+        growth.bytes,
     ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     const previous = try growRetainedLease(lease, retained_bytes, budget);
     const key = graphPathToKey(alloc, path) catch |err| {
@@ -3796,11 +3837,13 @@ fn insertGraphPathIdentity(
         restoreRetainedLease(lease, previous);
         return false;
     }
-    set.put(alloc, key, {}) catch |err| {
+    set.ensureTotalCapacity(alloc, @intCast(next_count)) catch |err| {
         alloc.free(key);
         restoreRetainedLease(lease, previous);
         return err;
     };
+    std.debug.assert(set.capacity() <= growth.capacity);
+    set.putAssumeCapacityNoClobber(key, {});
     return true;
 }
 
@@ -3812,20 +3855,32 @@ fn insertExcludedNodeIdentity(
     identity: graph_node_identity.Ref,
 ) !bool {
     if (set.contains(identity)) return false;
-    var retained_bytes = std.math.add(
-        usize,
-        @sizeOf(graph_node_identity.Key) + retained_hash_entry_overhead,
-        identity.key.len,
+    const next_count = std.math.add(usize, set.count(), 1) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const growth = retainedHashGrowth(
+        graph_node_identity.Key,
+        void,
+        set.capacity(),
+        next_count,
     ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
-    if (identity.table) |table| retained_bytes = std.math.add(usize, retained_bytes, table.len) catch
+    var key_bytes = identity.key.len;
+    if (identity.table) |table| key_bytes = std.math.add(usize, key_bytes, table.len) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const retained_bytes = std.math.add(usize, key_bytes, growth.bytes) catch
         return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     const previous = try growRetainedLease(lease, retained_bytes, budget);
-    const inserted = set.putIfAbsent(alloc, identity, {}) catch |err| {
+    var owned = graph_node_identity.Key.init(alloc, identity) catch |err| {
         restoreRetainedLease(lease, previous);
         return err;
     };
-    if (!inserted) restoreRetainedLease(lease, previous);
-    return inserted;
+    set.ensureTotalCapacity(alloc, next_count) catch |err| {
+        owned.deinit(alloc);
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    std.debug.assert(set.capacity() <= growth.capacity);
+    set.putOwnedAssumeCapacityNoClobber(owned, {});
+    return true;
 }
 
 fn insertExcludedEdgeIdentity(
@@ -3840,10 +3895,18 @@ fn insertExcludedEdgeIdentity(
 ) !bool {
     const parts = [_][]const u8{ table, src, tgt, edge_type };
     const key_len = try compositeIdentityEncodedLen(&parts);
+    const next_count = std.math.add(usize, set.count(), 1) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const growth = retainedHashGrowth(
+        []const u8,
+        void,
+        set.capacity(),
+        next_count,
+    ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     const retained_bytes = std.math.add(
         usize,
         key_len,
-        @sizeOf([]const u8) + retained_hash_entry_overhead,
+        growth.bytes,
     ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     const previous = try growRetainedLease(lease, retained_bytes, budget);
     const key = compositeIdentityAlloc(alloc, &parts) catch |err| {
@@ -3855,11 +3918,13 @@ fn insertExcludedEdgeIdentity(
         restoreRetainedLease(lease, previous);
         return false;
     }
-    set.put(alloc, key, {}) catch |err| {
+    set.ensureTotalCapacity(alloc, @intCast(next_count)) catch |err| {
         alloc.free(key);
         restoreRetainedLease(lease, previous);
         return err;
     };
+    std.debug.assert(set.capacity() <= growth.capacity);
+    set.putAssumeCapacityNoClobber(key, {});
     return true;
 }
 
@@ -3905,6 +3970,12 @@ test "Yen scratch reservations fail before allocation and release exactly" {
         try ensureBudgetedPathListCapacity(alloc, &paths, &paths_lease, &budget);
         try std.testing.expect(paths_lease.bytes >= @sizeOf(BudgetedGraphPath));
         try std.testing.expect(try insertGraphPathIdentity(alloc, &seen, &seen_lease, path, &budget));
+        const expected_seen_bytes = try std.math.add(
+            usize,
+            try graphPathIdentityEncodedLen(path),
+            try graph_work_budget.hashMapRetainedBytes([]const u8, void, seen.capacity()),
+        );
+        try std.testing.expectEqual(expected_seen_bytes, seen_lease.bytes);
         const seen_bytes = budget.retained_state_bytes;
         try std.testing.expect(seen_bytes > 0);
         try std.testing.expect(!try insertGraphPathIdentity(alloc, &seen, &seen_lease, path, &budget));
@@ -3921,6 +3992,16 @@ test "Yen scratch reservations fail before allocation and release exactly" {
             &budget,
             .{ .table = "docs", .key = "a" },
         ));
+        const expected_node_bytes = try std.math.add(
+            usize,
+            "docs".len + "a".len,
+            try graph_work_budget.hashMapRetainedBytes(
+                graph_node_identity.Key,
+                void,
+                excluded_nodes.capacity(),
+            ),
+        );
+        try std.testing.expectEqual(expected_node_bytes, excluded_nodes_lease.bytes);
         const node_bytes = budget.retained_state_bytes;
         try std.testing.expect(!try insertExcludedNodeIdentity(
             alloc,
@@ -3949,6 +4030,13 @@ test "Yen scratch reservations fail before allocation and release exactly" {
             "b",
             "links",
         ));
+        const edge_parts = [_][]const u8{ "docs", "a", "b", "links" };
+        const expected_edge_bytes = try std.math.add(
+            usize,
+            try compositeIdentityEncodedLen(&edge_parts),
+            try graph_work_budget.hashMapRetainedBytes([]const u8, void, excluded_edges.capacity()),
+        );
+        try std.testing.expectEqual(expected_edge_bytes, excluded_edges_lease.bytes);
         const edge_bytes = budget.retained_state_bytes;
         try std.testing.expect(!try insertExcludedEdgeIdentity(
             alloc,

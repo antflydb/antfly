@@ -2665,7 +2665,7 @@ pub const QueryUnprocessableError = union(enum) {
     }
 };
 
-/// A validated Antfly query retained as raw JSON by Go servers and clients.
+/// A validated Antfly query retained as raw JSON by Go and Zig servers and clients.
 pub const RawQuery = std.json.Value;
 
 /// Bounded request to list table repair issues.

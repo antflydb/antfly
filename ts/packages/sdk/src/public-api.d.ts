@@ -6421,7 +6421,7 @@ export interface components {
              */
             packed_values: string;
         };
-        /** @description A validated Antfly query retained as raw JSON by Go servers and clients. */
+        /** @description A validated Antfly query retained as raw JSON by Go and Zig servers and clients. */
         RawQuery: components["schemas"]["Query"];
         HierarchyProjection: {
             /**

@@ -78,6 +78,19 @@ pub const TypeGenerator = struct {
     fn generateNamedType(self: *TypeGenerator, name: []const u8, schema: types.Schema) !void {
         const type_name = try naming.toTypeName(self.arena, name);
 
+        // Some schemas deliberately retain arbitrary validated JSON instead of
+        // exposing their referenced union as a generated Zig type. Honor that
+        // intent before composition handling so a transparent oneOf wrapper
+        // cannot accidentally turn a forward-compatible raw surface into a
+        // best-effort structural union.
+        if (schema.extensions.get("x-zig-type")) |override| {
+            if (!std.mem.eql(u8, override, "std.json.Value"))
+                return error.InvalidOpenApiSchema;
+            if (schema.description) |desc| try self.w.docComment(desc);
+            try self.w.line("pub const {s} = std.json.Value;", .{type_name});
+            return;
+        }
+
         // String enum
         if (schema.enum_values.len > 0) {
             try self.generateEnum(type_name, schema);
@@ -1315,6 +1328,45 @@ test "named free-form object preserves arbitrary JSON" {
     try gen.generateAll(&doc);
 
     try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const DocumentQuery = std.json.Value;") != null);
+}
+
+test "explicit Zig raw JSON override wins over nested structural unions" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var leaf_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try leaf_props.put(arena, "term", .{ .schema = .{ .schema_type = .{ .single = "string" } } });
+    var override_extensions = std.StringArrayHashMapUnmanaged([]const u8){};
+    try override_extensions.put(arena, "x-zig-type", "std.json.Value");
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "Term", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = leaf_props,
+        .required = &.{"term"},
+    } });
+    try schemas.put(arena, "Query", .{ .schema = .{
+        .one_of = &.{.{ .ref = .{ .ref_string = "#/components/schemas/Term" } }},
+    } });
+    try schemas.put(arena, "RawQuery", .{ .schema = .{
+        .one_of = &.{.{ .ref = .{ .ref_string = "#/components/schemas/Query" } }},
+        .extensions = override_extensions,
+    } });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+
+    try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const RawQuery = std.json.Value;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const RawQuery = union(enum) {") == null);
 }
 
 test "named typed map preserves additional property values" {

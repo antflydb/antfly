@@ -470,6 +470,41 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 	}
 }
 
+func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
+	malformed := []string{
+		`{"kind":"nodes"}`,
+		`{"kind":"nodes","nodes":[],"paths":[]}`,
+		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0}}`,
+		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[{"key":"","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false},"unexpected":true}`,
+		`{"kind":"bindings","rows":[],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":false}},"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"aggregates","aggregates":{"count":{"value":"1.0","exact":true}},"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}`,
+	}
+
+	for _, encoded := range malformed {
+		t.Run(encoded, func(t *testing.T) {
+			var canonical GraphQueryResult
+			if err := json.Unmarshal([]byte(encoded), &canonical); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeGraphQueryResult(canonical); err == nil {
+				t.Fatal("expected canonical graph query result to be rejected")
+			}
+
+			var result GraphResult
+			if err := json.Unmarshal([]byte(encoded), &result); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := DecodeGraphResult(result); err == nil {
+				t.Fatal("expected canonical graph result to be rejected")
+			}
+		})
+	}
+}
+
 func TestGraphMatchConstructorRequiresDeclaredSourceAnchor(t *testing.T) {
 	graphReturn, err := NewGraphBindingsReturn([]string{"a"}, GraphBindingsOptions{})
 	if err != nil {

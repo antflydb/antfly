@@ -133,6 +133,20 @@ pub fn Map(comptime Value: type) type {
             return true;
         }
 
+        pub fn capacity(self: *const Self) usize {
+            return self.inner.capacity();
+        }
+
+        pub fn ensureTotalCapacity(self: *Self, alloc: Allocator, total_count: usize) !void {
+            try self.inner.ensureTotalCapacity(alloc, @intCast(total_count));
+        }
+
+        /// Insert an already-owned key after ensureTotalCapacity. Ownership of
+        /// `key` transfers to the map and no allocation can occur here.
+        pub fn putOwnedAssumeCapacityNoClobber(self: *Self, key: Key, value: Value) void {
+            self.inner.putAssumeCapacityNoClobber(key, value);
+        }
+
         pub fn count(self: *const Self) usize {
             return self.inner.count();
         }

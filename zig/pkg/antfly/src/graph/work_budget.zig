@@ -16,6 +16,46 @@ pub const default_max_scanned_anchors: usize = 1_000_000;
 pub const default_max_intermediate_states: usize = 100_000;
 pub const default_max_retained_state_bytes: usize = 64 * 1024 * 1024;
 
+/// `std.HashMapUnmanaged` uses an eight-slot minimum allocation and power-of-two
+/// capacity at its configured load percentage. These helpers mirror that
+/// public allocation shape and conservatively include the allocation header,
+/// metadata byte per slot, alignment padding, keys, and values. Callers reserve
+/// the returned bytes before asking the allocator to grow the map.
+pub fn hashMapCapacityForCount(count: usize, max_load_percentage: u64) !usize {
+    if (count == 0) return 0;
+    if (max_load_percentage == 0 or max_load_percentage > 100)
+        return error.InvalidLoadPercentage;
+    const scaled = try std.math.mul(u64, @intCast(count), 100);
+    const required = try std.math.add(u64, scaled / max_load_percentage, 1);
+    const capacity = std.math.ceilPowerOfTwo(usize, @intCast(required)) catch
+        return error.CapacityOverflow;
+    return @max(@as(usize, 8), capacity);
+}
+
+pub fn hashMapRetainedBytes(comptime Key: type, comptime Value: type, capacity: usize) !usize {
+    if (capacity == 0) return 0;
+    // HashMap's header contains values/keys pointers and the capacity. Three
+    // machine words are a conservative representation on every supported ABI.
+    var total = try std.math.add(usize, 3 * @sizeOf(usize), capacity);
+    total = std.mem.alignForward(usize, total, @alignOf(Key));
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, capacity, @sizeOf(Key)),
+    );
+    total = std.mem.alignForward(usize, total, @alignOf(Value));
+    total = try std.math.add(
+        usize,
+        total,
+        try std.math.mul(usize, capacity, @sizeOf(Value)),
+    );
+    return std.mem.alignForward(
+        usize,
+        total,
+        @max(@alignOf(usize), @max(@alignOf(Key), @alignOf(Value))),
+    );
+}
+
 pub const Dimension = enum {
     explored_nodes,
     explored_edges,
@@ -206,4 +246,15 @@ test "retained expansion state has an explicit byte ceiling" {
     try budget.retainStateBytes(4);
     budget.releaseStateBytes(4);
     try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+test "hash map retained bytes track capacity rather than entry count" {
+    try std.testing.expectEqual(@as(usize, 0), try hashMapCapacityForCount(0, 80));
+    try std.testing.expectEqual(@as(usize, 8), try hashMapCapacityForCount(1, 80));
+    try std.testing.expectEqual(@as(usize, 8), try hashMapCapacityForCount(6, 80));
+    try std.testing.expectEqual(@as(usize, 16), try hashMapCapacityForCount(7, 80));
+    try std.testing.expectEqual(
+        @as(usize, 160),
+        try hashMapRetainedBytes([]const u8, void, 8),
+    );
 }

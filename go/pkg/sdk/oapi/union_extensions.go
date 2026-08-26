@@ -13,7 +13,12 @@
 
 package oapi
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
+)
 
 // DecodeInto decodes the retained GraphResult JSON directly into value.
 // It lets SDK adapters inspect a small discriminator probe without first
@@ -26,4 +31,33 @@ func (t GraphResult) DecodeInto(value any) error {
 // an intermediate JSON map.
 func (t GraphQueryResult) DecodeInto(value any) error {
 	return json.Unmarshal(t.union, value)
+}
+
+// DecodeStrictInto decodes the selected canonical GraphResult shape while
+// enforcing additionalProperties: false throughout typed objects. It reads
+// directly from the retained union bytes and therefore does not copy large
+// result arrays before decoding them.
+func (t GraphResult) DecodeStrictInto(value any) error {
+	return decodeStrict(t.union, value)
+}
+
+// DecodeStrictInto is the canonical GraphQueryResult equivalent.
+func (t GraphQueryResult) DecodeStrictInto(value any) error {
+	return decodeStrict(t.union, value)
+}
+
+func decodeStrict(encoded []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }

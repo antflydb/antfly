@@ -13890,7 +13890,8 @@ components:
       oneOf:
         - $ref: '#/components/schemas/Query'
       x-go-type: json.RawMessage
-      description: A validated Antfly query retained as raw JSON by Go servers and clients.
+      x-zig-type: std.json.Value
+      description: A validated Antfly query retained as raw JSON by Go and Zig servers and clients.
     HierarchyProjection:
       type: object
       additionalProperties: false
