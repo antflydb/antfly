@@ -11021,8 +11021,16 @@ func firstNonEmptyString(values ...string) string {
 }
 
 func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int, clusters ...*antflyv1.AntflyCluster) bool {
-	if !haPlannedActionDependenciesSucceeded(actions, index, clusters...) {
-		return false
+	historySatisfied := haPlannedActionDependenciesSucceeded(actions, index, clusters...)
+	durableSatisfied := false
+	if !historySatisfied {
+		if index < 0 || index >= len(actions) {
+			return false
+		}
+		durableSatisfied = haPlannedActionDependencySatisfiedByDurableStatus(status, actions[index])
+		if !durableSatisfied {
+			return false
+		}
 	}
 	action := actions[index]
 	if action.DependsOn == "" {
@@ -11047,7 +11055,37 @@ func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, ac
 		}
 		return haFormerPrimaryActionSucceededWithPromotionEvidence(status, dependency)
 	}
-	return false
+	return durableSatisfied
+}
+
+// haPlannedActionDependencySatisfiedByDurableStatus prevents a completed
+// promotion from becoming an unsatisfiable dependency after the transient
+// PromoteStandby action is compacted from status. Only DemoteFormerPrimary may
+// cross that compaction boundary, and it must match the exact durable promotion
+// and fencing receipt. Other missing dependencies continue to fail closed.
+func haPlannedActionDependencySatisfiedByDurableStatus(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	if haActionKind(action.Kind) != haActionDemoteFormerPrimary ||
+		haActionKind(action.DependsOn) != haActionPromoteStandby {
+		return false
+	}
+	promotion := haPromotionReceipt(status)
+	if promotion == nil ||
+		strings.TrimSpace(action.StandbyName) != strings.TrimSpace(promotion.OldPrimaryID) ||
+		strings.TrimSpace(action.AdminNodeID) != strings.TrimSpace(promotion.OldPrimaryID) ||
+		action.FenceAuthority != promotion.FenceAuthority ||
+		action.FenceGeneration != promotion.FenceGeneration ||
+		strings.TrimSpace(action.FenceHolder) != strings.TrimSpace(promotion.PromotedStandbyID) ||
+		action.TargetLSN != haPromotionRequiredLSN(promotion) ||
+		haPromotionObservedLSN(promotion) < haPromotionRequiredLSN(promotion) {
+		return false
+	}
+	if routeFrom := strings.TrimSpace(action.RouteFrom); routeFrom != "" && routeFrom != strings.TrimSpace(promotion.OldPrimaryID) {
+		return false
+	}
+	if routeTo := strings.TrimSpace(action.RouteTo); routeTo != "" && routeTo != strings.TrimSpace(promotion.PromotedStandbyID) {
+		return false
+	}
+	return true
 }
 
 func haPrimaryRouteActionHasPromotionEvidence(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int) bool {

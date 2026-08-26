@@ -5666,6 +5666,64 @@ func TestHAFormerPrimaryActionRequiresPromotionReceiptEvidence(t *testing.T) {
 	g.Expect(haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)).To(BeFalse())
 }
 
+func TestHADemoteDependencySurvivesPromotionActionCompaction(t *testing.T) {
+	g := NewWithT(t)
+	status := &antflyv1.HAStatus{LastPromotion: &antflyv1.HAPromotionStatus{
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  1,
+		ParentEpoch:       1,
+		NewTimelineID:     2,
+		NewEpoch:          2,
+		RequiredLSN:       718,
+		ObservedLSN:       718,
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration:   2,
+		FenceToken:        "ha-fence-token",
+	}}
+	demote := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		DependsOn:       string(haActionPromoteStandby),
+		StandbyName:     "primary-a",
+		AdminNodeID:     "primary-a",
+		TargetLSN:       718,
+		RouteFrom:       "primary-a",
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration: 2,
+		FenceHolder:     "standby-a",
+	}
+
+	// The transient PromoteStandby action has been compacted, but its exact
+	// durable receipt still authorizes the dependent assessment.
+	g.Expect(haPlannedActionDependenciesSucceededForStatus(status, []antflyv1.HAPlannedActionStatus{demote}, 0)).To(BeTrue())
+
+	for name, mutate := range map[string]func(*antflyv1.HAPlannedActionStatus, *antflyv1.HAPromotionStatus){
+		"old primary": func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.StandbyName = "other" },
+		"admin node":  func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.AdminNodeID = "standby-a" },
+		"fence authority": func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) {
+			a.FenceAuthority = antflyv1.HAFencingAuthorityExternal
+		},
+		"fence generation":   func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.FenceGeneration++ },
+		"fence holder":       func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.FenceHolder = "other" },
+		"promotion boundary": func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.TargetLSN++ },
+		"route source":       func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.RouteFrom = "other" },
+		"route target":       func(a *antflyv1.HAPlannedActionStatus, _ *antflyv1.HAPromotionStatus) { a.RouteTo = "other" },
+		"receipt token":      func(_ *antflyv1.HAPlannedActionStatus, p *antflyv1.HAPromotionStatus) { p.FenceToken = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := demote
+			promotion := *status.LastPromotion
+			mutate(&candidate, &promotion)
+			candidateStatus := &antflyv1.HAStatus{LastPromotion: &promotion}
+			NewWithT(t).Expect(haPlannedActionDependenciesSucceededForStatus(candidateStatus, []antflyv1.HAPlannedActionStatus{candidate}, 0)).To(BeFalse())
+		})
+	}
+
+	nonDemote := demote
+	nonDemote.Kind = string(haActionRewindFormerPrimary)
+	g.Expect(haPlannedActionDependenciesSucceededForStatus(status, []antflyv1.HAPlannedActionStatus{nonDemote}, 0)).To(BeFalse())
+}
+
 func TestReconcileHAAdminJobsExecutesSeedFinishAndBootstrap(t *testing.T) {
 	g := NewWithT(t)
 
