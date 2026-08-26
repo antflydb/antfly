@@ -2596,6 +2596,35 @@ fn classifyExtractionResolutionFailure(err: anyerror) ExtractionResolutionFailur
     };
 }
 
+fn compatibilityBackendsForSessionManager(
+    session_manager: *const backends_mod.SessionManager,
+    required_scratch: *[1]backends_mod.BackendType,
+) ![]const backends_mod.BackendType {
+    return session_manager.requiredBackendCandidates(
+        session_manager.preferred_backends,
+        required_scratch,
+    );
+}
+
+test "compatibility backend candidates honor required policy" {
+    var session_manager = backends_mod.SessionManager.init(std.testing.allocator);
+    session_manager.preferred_backends = &.{ .native, .cuda };
+    session_manager.required_backend = .cuda;
+    session_manager.required_backend_invalid = false;
+    var required_scratch: [1]backends_mod.BackendType = undefined;
+    try std.testing.expectEqualSlices(
+        backends_mod.BackendType,
+        &.{.cuda},
+        try compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+
+    session_manager.required_backend = .pjrt;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+}
+
 pub const Node = struct {
     config: NodeConfig,
     allocator: std.mem.Allocator,
@@ -2713,6 +2742,7 @@ pub const Node = struct {
         try config.kernel_jit.validate();
         try config.prompt_cache.validate();
         var session_manager = backends_mod.SessionManager.init(allocator);
+        try session_manager.validateRequiredBackendPolicy();
         session_manager.kernel_jit = config.kernel_jit;
         try graph_mod.kernel_jit.validateMetalProfileBackend(
             backends_mod.BackendType.metal.available(),
@@ -2872,6 +2902,11 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !CompatibilitySummary {
+        var required_backend_scratch: [1]backends_mod.BackendType = undefined;
+        const compatibility_backends = try compatibilityBackendsForSessionManager(
+            &self.session_manager,
+            &required_backend_scratch,
+        );
         var io_impl: ?std.Io.Threaded = null;
         defer if (io_impl) |*threaded| threaded.deinit();
         const io = self.session_manager.io orelse blk: {
@@ -2930,7 +2965,7 @@ pub const Node = struct {
                 allocator,
                 model_path,
                 &man,
-                self.session_manager.preferred_backends,
+                compatibility_backends,
             );
 
             var verification_manifest = try manifest_mod.loadListingFromDir(
@@ -5986,7 +6021,10 @@ pub const Node = struct {
             self.config.allow_unknown_models,
         )) |response|
             return response;
-        const allow_onnx = effective_draft_model_name == null and
+        const required_policy_allows_onnx = self.session_manager.allowsDirectBackend(.onnx) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        const allow_onnx = required_policy_allows_onnx and
+            effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
             (body.backend == null or backend_selection.native_choice == .onnx);
 
@@ -6320,6 +6358,10 @@ pub const Node = struct {
             .metal
         else
             backend_selection.compiled_partition_backend;
+        native_backend_choice.validateRequiredCompiledBackend(
+            &self.session_manager,
+            effective_compiled_partition_backend,
+        ) catch |err| return modelLoadFailureResponse(ctx, err);
         const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
             .whole_model
         else
@@ -10904,7 +10946,11 @@ pub const Node = struct {
 
     fn readyzHandler(self: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
         const snapshot = self.readiness_inventory.load();
-        const is_ready = snapshot.initialized and snapshot.counts.total() > 0;
+        const required_backend_ready = blk: {
+            self.session_manager.validateRequiredBackendPolicy() catch break :blk false;
+            break :blk true;
+        };
+        const is_ready = required_backend_ready and snapshot.initialized and snapshot.counts.total() > 0;
         const status_text = if (is_ready) "ready" else "not_ready";
         const status_code: u16 = if (is_ready) 200 else 503;
         return ctx.status(status_code).json(.{
@@ -15220,6 +15266,19 @@ test "readyz serves only the published inventory snapshot" {
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"ready\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"generators\":2") != null);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"embedders\":1") != null);
+    }
+
+    node.session_manager.required_backend_invalid = true;
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/readyz");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.readyzHandler(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"not_ready\"") != null);
     }
 }
 
