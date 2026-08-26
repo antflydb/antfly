@@ -43,6 +43,7 @@ const Headers = @import("../core/headers.zig").Headers;
 const HeaderName = @import("../core/headers.zig").HeaderName;
 const containsCrLf = @import("../core/headers.zig").containsCrLf;
 const Parser = @import("../protocol/parser.zig").Parser;
+const ParserErrorReason = @import("../protocol/parser.zig").ErrorReason;
 const http = @import("../protocol/http.zig");
 const Socket = @import("../net/socket.zig").Socket;
 const Address = @import("../net/socket.zig").Address;
@@ -199,7 +200,7 @@ fn routeErrorStatus(err: anyerror) ?u16 {
         error.Canceled, error.Cancelled => null,
         error.Timeout => 408,
         error.DeadlineExceeded => 504,
-        error.BodyTooLarge, error.StreamTooLong, error.ValueTooLong => 413,
+        error.BodyTooLarge, error.StreamDataOverflow, error.StreamTooLong, error.ValueTooLong => 413,
         error.BodyCapacityExceeded => 429,
         error.EndOfStream,
         error.SyntaxError,
@@ -210,6 +211,10 @@ fn routeErrorStatus(err: anyerror) ?u16 {
         => 400,
         else => 500,
     };
+}
+
+fn parserErrorStatus(reason: ParserErrorReason) u16 {
+    return if (reason == .body_too_large) 413 else 400;
 }
 
 fn routeErrorBody(code: u16) []const u8 {
@@ -1826,7 +1831,7 @@ pub const Server = struct {
                 }
                 leftover -= consumed;
                 if (parser.isError()) {
-                    try self.sendError(&sock, 400);
+                    try self.sendError(&sock, parserErrorStatus(parser.getErrorReason()));
                     return;
                 }
                 if (!self.reserveH1BodyAfterHeaders(&parser, &h1_body_reserved)) {
@@ -1897,7 +1902,7 @@ pub const Server = struct {
                 }
                 leftover = n - consumed;
                 if (parser.isError()) {
-                    try self.sendError(&sock, 400);
+                    try self.sendError(&sock, parserErrorStatus(parser.getErrorReason()));
                     return;
                 }
                 if (!self.reserveH1BodyAfterHeaders(&parser, &h1_body_reserved)) {
@@ -3378,12 +3383,15 @@ test "routeErrorStatus maps oversized route errors to payload too large" {
     try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.ValueTooLong));
     try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.StreamTooLong));
     try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.BodyTooLarge));
+    try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.StreamDataOverflow));
     try std.testing.expectEqual(@as(?u16, 429), routeErrorStatus(error.BodyCapacityExceeded));
     try std.testing.expectEqual(@as(?u16, 408), routeErrorStatus(error.Timeout));
     try std.testing.expectEqual(@as(?u16, 504), routeErrorStatus(error.DeadlineExceeded));
     try std.testing.expectEqual(@as(?u16, 500), routeErrorStatus(error.UnexpectedRouteFailure));
     try std.testing.expectEqual(@as(?u16, null), routeErrorStatus(error.Canceled));
     try std.testing.expectEqual(@as(?u16, null), routeErrorStatus(error.Cancelled));
+    try std.testing.expectEqual(@as(u16, 413), parserErrorStatus(.body_too_large));
+    try std.testing.expectEqual(@as(u16, 400), parserErrorStatus(.malformed_request_line));
     try std.testing.expectEqualStrings(
         "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
         routeErrorBody(400),
