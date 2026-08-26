@@ -2158,26 +2158,54 @@ pub fn searchProfiledRequest(
     elapsed_fn_u64: fn (u64) u64,
 ) !search_types.ProfiledSearchResults {
     if (!search_types.requiresExhaustiveCoverage(req)) {
-        return try searchProfiledRequestAttempt(self, req, null, false, now_fn_u64, elapsed_fn_u64);
+        return try searchProfiledRequestAttempt(self, req, null, false, null, now_fn_u64, elapsed_fn_u64);
     }
 
     const Index = comptime childType(@TypeOf(self));
     var pessimistic = false;
     while (true) {
         const capture_durable_snapshot = pessimistic and comptime @hasDecl(Index, "beginCompleteSnapshotRead");
+        if (capture_durable_snapshot) {
+            // The durable attempt captures both the publication metadata and
+            // its MVCC transaction under the reader fence. It therefore has
+            // no pre-fence token to invalidate and must terminate rather than
+            // joining an unbounded retry loop behind queued publishers.
+            notifyBeforeDurableSnapshotCaptureForTestIfSupported(self);
+            var durable_generation: ?u64 = null;
+            return searchProfiledRequestAttempt(
+                self,
+                req,
+                null,
+                true,
+                &durable_generation,
+                now_fn_u64,
+                elapsed_fn_u64,
+            ) catch |err| {
+                if (err == error.IncompletePublishedSnapshot) {
+                    if (durable_generation) |generation| {
+                        noteIncompletePublishedSnapshotIfSupported(self, generation);
+                    }
+                }
+                return err;
+            };
+        }
         const token = CompleteSnapshotAttempt{
             .snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation),
             .mutation_epoch = publishedMutationEpoch(self),
         };
 
-        const profiled = (if (capture_durable_snapshot)
-            searchProfiledRequestAttempt(self, req, token.snapshot, true, now_fn_u64, elapsed_fn_u64)
-        else
-            searchProfiledRequestAttempt(self, req, token.snapshot, false, now_fn_u64, elapsed_fn_u64)) catch |err| {
+        const profiled = searchProfiledRequestAttempt(
+            self,
+            req,
+            token.snapshot,
+            false,
+            null,
+            now_fn_u64,
+            elapsed_fn_u64,
+        ) catch |err| {
             const attempt_current = completeSnapshotAttemptStillCurrent(self, token);
             if (err == error.StalePublishedSnapshot or
                 (err == error.IncompletePublishedSnapshot and
-                    !capture_durable_snapshot and
                     !attempt_current))
             {
                 // The attempt overlapped a publisher. Retry under a short
@@ -2193,7 +2221,6 @@ pub fn searchProfiledRequest(
             return err;
         };
 
-        if (capture_durable_snapshot) return profiled;
         if (completeSnapshotAttemptStillCurrent(self, token)) return profiled;
 
         var stale = profiled;
@@ -2224,6 +2251,7 @@ fn searchProfiledRequestAttempt(
     req: search_types.SearchRequest,
     expected_snapshot: ?SearchPublishedSnapshot,
     comptime capture_durable_snapshot: bool,
+    captured_generation_out: ?*?u64,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !search_types.ProfiledSearchResults {
@@ -2236,12 +2264,22 @@ fn searchProfiledRequestAttempt(
     try search_types.checkCancelled(req);
     const coverage_policy = search_types.coveragePolicy(req);
     const exhaustive_coverage = coverage_policy == .complete_snapshot;
-    var published_snapshot = expected_snapshot orelse try loadStableSearchPublishedSnapshot(self, req.cancellation);
+    var snapshot_fence_held = false;
+    if (capture_durable_snapshot and comptime @hasDecl(Index, "beginCompleteSnapshotRead")) {
+        try self.beginCompleteSnapshotRead(req.cancellation);
+        snapshot_fence_held = true;
+    }
+    errdefer if (snapshot_fence_held) self.endCompleteSnapshotRead();
+
+    var published_snapshot = if (capture_durable_snapshot)
+        try loadStableSearchPublishedSnapshot(self, req.cancellation)
+    else
+        expected_snapshot orelse try loadStableSearchPublishedSnapshot(self, req.cancellation);
+    if (captured_generation_out) |out| out.* = published_snapshot.publish_generation;
     if (published_snapshot.active_count == 0) {
-        if (capture_durable_snapshot and comptime @hasDecl(Index, "beginCompleteSnapshotRead")) {
-            try self.beginCompleteSnapshotRead(req.cancellation);
-            defer self.endCompleteSnapshotRead();
-            if (!publishedSnapshotStillCurrent(self, published_snapshot)) return error.StalePublishedSnapshot;
+        if (snapshot_fence_held) {
+            self.endCompleteSnapshotRead();
+            snapshot_fence_held = false;
             const empty = search_results.SearchResults.init(self.alloc, req.k);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{ .results = empty, .profile = profile };
@@ -2256,38 +2294,27 @@ fn searchProfiledRequestAttempt(
         }
         published_snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation);
     }
-    var coverage_tracker = CompleteCoverageTracker.init(try beginCompleteCoverageValidationIfSupported(
-        self,
-        exhaustive_coverage,
-        published_snapshot.publish_generation,
-        req.cancellation,
-    ), published_snapshot.active_count);
-    defer if (coverage_tracker.claim_held) {
-        finishCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, false);
-    };
+    var coverage_claim = CompleteCoverageValidationClaim{ .enabled = false, .held = false };
+    if (!capture_durable_snapshot) {
+        coverage_claim = try beginCompleteCoverageValidationIfSupported(
+            self,
+            exhaustive_coverage,
+            published_snapshot.publish_generation,
+            req.cancellation,
+        );
+    }
     // A waiter may have spent time behind the generation validator. Do not
     // retain an MVCC snapshot or request workspace while waiting, and honor a
     // disconnect before acquiring either resource.
     try search_types.checkCancelled(req);
     const setup_start = total_start;
     const txn_start = now_fn_u64();
-    var snapshot_fence_held = false;
-    if (capture_durable_snapshot and comptime @hasDecl(Index, "beginCompleteSnapshotRead")) {
-        try self.beginCompleteSnapshotRead(req.cancellation);
-        snapshot_fence_held = true;
-        if (!publishedSnapshotStillCurrent(self, published_snapshot)) {
-            self.endCompleteSnapshotRead();
-            snapshot_fence_held = false;
-            return error.StalePublishedSnapshot;
-        }
-    }
-    errdefer if (snapshot_fence_held) self.endCompleteSnapshotRead();
     var txn = if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverage"))
         try self.beginRuntimeSearchTxnForCoverage(exhaustive_coverage)
     else
         try self.beginRuntimeSearchTxn();
     defer txn.abort();
-    if (exhaustive_coverage and !publishedSnapshotStillCurrent(self, published_snapshot)) {
+    if (!capture_durable_snapshot and exhaustive_coverage and !publishedSnapshotStillCurrent(self, published_snapshot)) {
         return error.StalePublishedSnapshot;
     }
     if (snapshot_fence_held) {
@@ -2295,6 +2322,21 @@ fn searchProfiledRequestAttempt(
         snapshot_fence_held = false;
     }
     if (exhaustive_coverage) notifyCompleteSnapshotCapturedForTestIfSupported(self);
+    if (capture_durable_snapshot) {
+        // Validation can wait on another query's generation flight. Hold the
+        // captured MVCC transaction, but never the publication fence, while
+        // waiting so publishers remain independent of the O(N) traversal.
+        coverage_claim = try beginCompleteCoverageValidationIfSupported(
+            self,
+            exhaustive_coverage,
+            published_snapshot.publish_generation,
+            req.cancellation,
+        );
+    }
+    var coverage_tracker = CompleteCoverageTracker.init(coverage_claim, published_snapshot.active_count);
+    defer if (coverage_tracker.claim_held) {
+        finishCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, false);
+    };
     hbc_runtime.beginSearchEpoch(self);
     defer hbc_runtime.endSearchEpoch(self);
     const use_search_cache = !capture_durable_snapshot;
@@ -2795,6 +2837,13 @@ fn notifyCompleteSnapshotCapturedForTestIfSupported(self: anytype) void {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "notifyCompleteSnapshotCapturedForTest")) {
         self.notifyCompleteSnapshotCapturedForTest();
+    }
+}
+
+fn notifyBeforeDurableSnapshotCaptureForTestIfSupported(self: anytype) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "notifyBeforeDurableSnapshotCaptureForTest")) {
+        self.notifyBeforeDurableSnapshotCaptureForTest();
     }
 }
 

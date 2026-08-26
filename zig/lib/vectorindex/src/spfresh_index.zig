@@ -702,15 +702,21 @@ pub fn selectFlatRabitqPostingsAlloc(
     }
 
     var posting_count: usize = 0;
+    var max_block_count: usize = 0;
     for (directory.blocks) |*block| {
         posting_count = std.math.add(usize, posting_count, block.posting_ids.len) catch return error.OutOfMemory;
+        max_block_count = @max(max_block_count, block.posting_ids.len);
     }
     std.debug.assert(posting_count == directory.posting_count);
     const needs_merge = cancellation != null and posting_count > cancellable_flat_sort_chunk_size;
     const previous_accounted_bytes = scratch_handle.accounted_bytes;
     const Index = comptime @TypeOf(self.*);
     if (comptime @hasDecl(Index, "reserveSearchScratchBytes")) {
-        const target_bytes = try scratch.projectedBytesWithFlatProbeCapacity(posting_count, needs_merge);
+        const target_bytes = try scratch.projectedBytesWithFlatProbeCapacity(
+            posting_count,
+            needs_merge,
+            max_block_count,
+        );
         try self.reserveSearchScratchBytes(scratch_handle, target_bytes);
     }
     errdefer if (comptime @hasDecl(Index, "rollbackSearchScratchBytes")) {

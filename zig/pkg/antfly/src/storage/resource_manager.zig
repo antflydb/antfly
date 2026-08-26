@@ -796,11 +796,23 @@ pub const ResourceManager = struct {
         const target_bytes = blk: {
             lockAtomic(&self.mutex);
             defer self.mutex.unlock();
-            const hard = self.memory.budget.hard_limit_bytes;
-            if (hard == 0) return 0;
-            const projected = self.memory.used_bytes +| additional_bytes;
-            if (projected <= hard) return 0;
-            break :blk projected - hard;
+            const memory_hard = self.memory.budget.hard_limit_bytes;
+            const memory_target = if (memory_hard == 0)
+                0
+            else
+                (self.memory.used_bytes +| additional_bytes) -| memory_hard;
+            const requester_state = &self.slices[sliceIndex(requester)];
+            const slice_hard = requester_state.budget.hard_limit_bytes;
+            // Only dense search currently has reclaimable retained capacity in
+            // the requester's own slice. Do not evict unrelated caches for a
+            // hard-limit violation they cannot resolve.
+            const slice_target = if (requester != .dense_search_working_set or slice_hard == 0)
+                0
+            else
+                (requester_state.used_bytes +| additional_bytes) -| slice_hard;
+            const target = @max(memory_target, slice_target);
+            if (target == 0) return 0;
+            break :blk target;
         };
 
         _ = self.reclaim_requests.fetchAdd(1, .monotonic);
@@ -811,11 +823,12 @@ pub const ResourceManager = struct {
         const start_cursor = self.reclaimer_cursor;
         self.reclaimer_cursor = (self.reclaimer_cursor + 1) % self.reclaimers.len;
         self.reclaimer_mutex.unlock();
-        // HBC exact vectors are the cheapest derivative, followed by LSM
-        // blocks. Two passes make this priority independent of registration
-        // order while still permitting either cache to borrow unused bytes.
-        for ([_]Slice{ .hbc_node_metadata_cache, .lsm_block_table_cache }) |candidate_slice| {
-            if (candidate_slice == requester) continue;
+        // Idle search scratch is cheaper to reconstruct than cached index or
+        // table content. Include the requester's own search slice so one index
+        // can reuse capacity retained by another; callbacks use non-blocking
+        // owner locks and therefore skip an in-flight scratch handle safely.
+        for ([_]Slice{ .dense_search_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache }) |candidate_slice| {
+            if (candidate_slice == requester and candidate_slice != .dense_search_working_set) continue;
             while (visited_count < max_reclaimers) {
                 lockAtomic(&self.reclaimer_mutex);
                 var remaining_weight: u64 = 0;
@@ -3227,6 +3240,35 @@ test "foreground admission reclaims cache bytes and retries atomically" {
     try std.testing.expectEqual(@as(u64, 100), stats.memory.used_bytes);
     try std.testing.expectEqual(@as(u64, 1), stats.reclaim_requests);
     try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
+}
+
+test "dense search admission reclaims retained scratch from its own slice" {
+    const ReclaimContext = struct {
+        manager: *ResourceManager,
+        accounted: u64,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.dense_search_working_set, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.dense_search_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var retained = ReclaimContext{ .manager = &manager, .accounted = 0 };
+    manager.observeUsage(.dense_search_working_set, &retained.accounted, 80);
+    const identity = try manager.registerReclaimer(.dense_search_working_set, &retained, ReclaimContext.reclaim);
+    defer manager.unregisterReclaimer(identity);
+
+    var active: u64 = 0;
+    try manager.adjustUsage(.dense_search_working_set, &active, 30);
+    try std.testing.expectEqual(@as(u64, 70), retained.accounted);
+    try std.testing.expectEqual(@as(u64, 30), active);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.dense_search_working_set).used_bytes);
 }
 
 test "resource manager apportions reclaim across weighted cache owners" {

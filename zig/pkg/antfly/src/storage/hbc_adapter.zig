@@ -81,6 +81,9 @@ pub fn setTestGetVectorViewOrScratchHook(ctx: ?*anyopaque, hook: ?TestGetVectorV
 const TestCompleteSnapshotCaptureHook = *const fn (?*anyopaque, *HBCIndex) void;
 var test_complete_snapshot_capture_ctx: ?*anyopaque = null;
 var test_complete_snapshot_capture_hook: ?TestCompleteSnapshotCaptureHook = null;
+const TestBeforeDurableSnapshotCaptureHook = *const fn (?*anyopaque, *HBCIndex) void;
+var test_before_durable_snapshot_capture_ctx: ?*anyopaque = null;
+var test_before_durable_snapshot_capture_hook: ?TestBeforeDurableSnapshotCaptureHook = null;
 
 // ============================================================================
 // Configuration
@@ -2224,6 +2227,7 @@ pub const HBCIndex = struct {
     metadata_clock_hand: usize,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     local_reclaimer_identity: u64 = 0,
+    search_workspace_reclaimer_identity: u64 = 0,
     bind_shared_cache_resource_manager: bool = true,
     shared_cache: ?*Cache = null,
     shared_cache_registered: bool = false,
@@ -3032,6 +3036,7 @@ pub const HBCIndex = struct {
             .metadata_clock_hand = 0,
             .resource_manager = null,
             .local_reclaimer_identity = 0,
+            .search_workspace_reclaimer_identity = 0,
             .bind_shared_cache_resource_manager = true,
             .shared_cache = null,
             .shared_cache_registered = false,
@@ -3416,6 +3421,7 @@ pub const HBCIndex = struct {
         // its previous value for the same manager.
         if (self.resource_manager == resource_manager) {
             self.bind_shared_cache_resource_manager = bind_shared_cache_resource_manager;
+            self.ensureSearchWorkspaceReclaimer(resource_manager);
             if (self.shared_cache) |cache| {
                 if (bind_shared_cache_resource_manager) cache.attachResourceManager(resource_manager);
                 return;
@@ -3438,6 +3444,8 @@ pub const HBCIndex = struct {
         if (self.resource_manager) |old_manager| {
             old_manager.unregisterReclaimer(self.local_reclaimer_identity);
             self.local_reclaimer_identity = 0;
+            old_manager.unregisterReclaimer(self.search_workspace_reclaimer_identity);
+            self.search_workspace_reclaimer_identity = 0;
             old_manager.observeUsage(.dense_search_working_set, &self.search_workspace_bytes_accounted, 0);
             old_manager.observeUsage(.dense_routing_working_set, &self.routing_scratch_bytes_accounted, 0);
             old_manager.observeUsage(.dense_apply_working_set, &self.apply_workspace_bytes_accounted, 0);
@@ -3454,6 +3462,7 @@ pub const HBCIndex = struct {
         resource_manager.observeUsage(.dense_routing_working_set, &self.routing_scratch_bytes_accounted, current_routing_bytes);
         resource_manager.observeUsage(.dense_apply_working_set, &self.apply_workspace_bytes_accounted, current_apply_bytes);
         self.detached_hbc_accounting.attach(resource_manager);
+        self.ensureSearchWorkspaceReclaimer(resource_manager);
         if (self.shared_cache) |cache| {
             if (bind_shared_cache_resource_manager) cache.attachResourceManager(resource_manager);
             return;
@@ -3478,6 +3487,33 @@ pub const HBCIndex = struct {
         }
         self.refreshHbcCacheUsage();
         return before -| (self.hbcCacheBytes() +| self.detached_hbc_accounting.current());
+    }
+
+    fn ensureSearchWorkspaceReclaimer(
+        self: *HBCIndex,
+        manager: *resource_manager_mod.ResourceManager,
+    ) void {
+        if (self.search_workspace_reclaimer_identity != 0) return;
+        self.search_workspace_reclaimer_identity = manager.registerReclaimer(
+            .dense_search_working_set,
+            self,
+            reclaimSearchWorkspaceForResourceManager,
+        ) catch 0;
+    }
+
+    fn reclaimSearchWorkspaceForResourceManager(context: *anyopaque, target_bytes: u64) u64 {
+        const self: *HBCIndex = @ptrCast(@alignCast(context));
+        if (target_bytes == 0 or !self.scratch_mu.tryLock()) return 0;
+        defer self.scratch_mu.unlock();
+        const scratch = if (self.cached_scratch) |*cached| cached else return 0;
+        const max_candidates = @max(
+            @as(usize, @intCast(self.metadata.branching_factor)),
+            @as(usize, @intCast(self.metadata.leaf_size)),
+        );
+        const reclaimed = scratch.reclaimRetainedWorkspace(self.alloc, target_bytes, max_candidates);
+        if (reclaimed == 0) return 0;
+        self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| reclaimed);
+        return reclaimed;
     }
 
     pub fn attachSharedCache(self: *HBCIndex, cache: *Cache) void {
@@ -4049,6 +4085,8 @@ pub const HBCIndex = struct {
         if (self.resource_manager) |manager| {
             manager.unregisterReclaimer(self.local_reclaimer_identity);
             self.local_reclaimer_identity = 0;
+            manager.unregisterReclaimer(self.search_workspace_reclaimer_identity);
+            self.search_workspace_reclaimer_identity = 0;
         }
         if (self.shared_cache == null) {
             self.clearNodeCache();
@@ -4499,6 +4537,13 @@ pub const HBCIndex = struct {
         if (!builtin.is_test) return;
         if (test_complete_snapshot_capture_hook) |hook| {
             hook(test_complete_snapshot_capture_ctx, self);
+        }
+    }
+
+    pub fn notifyBeforeDurableSnapshotCaptureForTest(self: *HBCIndex) void {
+        if (!builtin.is_test) return;
+        if (test_before_durable_snapshot_capture_hook) |hook| {
+            hook(test_before_durable_snapshot_capture_ctx, self);
         }
     }
 
@@ -9068,6 +9113,78 @@ test "complete snapshot retry releases publication fence after durable txn captu
     try std.testing.expect(!idx.generationRepairPending());
 }
 
+test "durable snapshot captures a publisher immediately before its fence" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 64,
+        .branching_factor = 4,
+        .use_quantization = false,
+    });
+    defer idx.close();
+    try idx.insert(1, &.{ 0, 0 });
+    try idx.insert(2, &.{ 1, 0 });
+    try idx.insert(3, &.{ 0, 1 });
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    const HookContext = struct {
+        io: std.Io,
+        captures: usize = 0,
+        before_durable_captures: usize = 0,
+        writer_failed: std.atomic.Value(bool) = .init(false),
+
+        fn publishConcurrentInsert(index: *HBCIndex, vector_id: u64, failed: *std.atomic.Value(bool)) void {
+            index.insert(vector_id, &.{ 1, 1 }) catch failed.store(true, .release);
+        }
+
+        fn publishAndWait(self: *@This(), index: *HBCIndex, vector_id: u64) void {
+            var writer = std.Io.async(self.io, publishConcurrentInsert, .{ index, vector_id, &self.writer_failed });
+            writer.await(self.io);
+        }
+
+        fn onCapture(raw_ctx: ?*anyopaque, index: *HBCIndex) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.captures += 1;
+            if (self.captures == 1) self.publishAndWait(index, 4);
+        }
+
+        fn beforeDurableCapture(raw_ctx: ?*anyopaque, index: *HBCIndex) void {
+            const self: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            self.before_durable_captures += 1;
+            self.publishAndWait(index, 5);
+        }
+    };
+    var hook_ctx = HookContext{ .io = io_impl.io() };
+    test_complete_snapshot_capture_ctx = &hook_ctx;
+    test_complete_snapshot_capture_hook = HookContext.onCapture;
+    test_before_durable_snapshot_capture_ctx = &hook_ctx;
+    test_before_durable_snapshot_capture_hook = HookContext.beforeDurableCapture;
+    defer {
+        test_complete_snapshot_capture_ctx = null;
+        test_complete_snapshot_capture_hook = null;
+        test_before_durable_snapshot_capture_ctx = null;
+        test_before_durable_snapshot_capture_hook = null;
+    }
+
+    var results = try idx.searchWithRequest(.{
+        .query = &.{ 0, 0 },
+        .k = 5,
+        .search_effort = 1,
+        .load_metadata = false,
+    });
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 2), hook_ctx.captures);
+    try std.testing.expectEqual(@as(usize, 1), hook_ctx.before_durable_captures);
+    try std.testing.expect(!hook_ctx.writer_failed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 5), idx.stats().active_count);
+    try std.testing.expectEqual(@as(usize, 5), results.getHits().len);
+}
+
 test "durable incomplete snapshot terminates when publication advances during traversal" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -10885,6 +11002,168 @@ test "exhaustive search workspace is admitted before growth and released after r
     try std.testing.expectEqual(@as(usize, 0), cached.lookups.len);
     try std.testing.expectEqual(@as(usize, 0), cached.key_views.len);
     try std.testing.expectEqual(@as(usize, 0), cached.values.len);
+}
+
+test "flat block scoring workspace is included in exhaustive pre-admission" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const dims: usize = 2;
+    const leaf_size: usize = 2;
+    const branching_factor: usize = 2;
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = dims,
+        .leaf_size = leaf_size,
+        .branching_factor = branching_factor,
+        .search_width = 32,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .flat_centroid_block_size = 32,
+        .flat_centroid_probe_count = 0,
+    });
+    var idx_open = true;
+    defer if (idx_open) idx.close();
+    for (0..128) |i| {
+        const value: f32 = @floatFromInt(i);
+        try idx.insert(@intCast(i + 1), &.{ value, value / 8 });
+    }
+
+    // Materialize the immutable directory, then return the cached request
+    // scratch to its bounded shape so this test controls every later growth.
+    var warm = try idx.searchWithRequest(.{
+        .query = &.{ 0, 0 },
+        .k = 3,
+        .search_effort = 0.5,
+        .load_metadata = false,
+    });
+    warm.deinit();
+    const directory = idx.flat_centroid_directory orelse return error.TestUnexpectedResult;
+    var max_block_count: usize = 0;
+    for (directory.blocks) |block| max_block_count = @max(max_block_count, block.posting_ids.len);
+    try std.testing.expect(max_block_count > leaf_size);
+
+    const cached = &(idx.cached_scratch orelse return error.TestUnexpectedResult);
+    const before_trim = cached.bytes();
+    const trimmed = cached.reclaimRetainedWorkspace(alloc, std.math.maxInt(u64), leaf_size);
+    idx.search_workspace_bytes_accounted -|= trimmed;
+    try std.testing.expect(cached.bytes() < before_trim);
+
+    // Model the exact state at flat selection: complete-coverage buffers have
+    // already been admitted and allocated, but neither the frontier nor the
+    // directory block-scoring workspace has grown yet.
+    var model = try vectorindex_search_runtime.SearchScratch.init(
+        alloc,
+        dims,
+        branching_factor,
+        leaf_size,
+    );
+    defer model.deinit(alloc);
+    _ = model.reclaimRetainedWorkspace(alloc, std.math.maxInt(u64), leaf_size);
+    try model.ensureCoverageMemberCapacity(alloc, 8_192);
+    try model.ensureLookupCapacity(alloc, 8_192);
+    try model.resetCoverageVisited(alloc, idx.metadata.node_count);
+    const frontier_only = try model.projectedBytesWithFlatProbeCapacity(directory.posting_count, false, 0);
+    const complete_flat = try model.projectedBytesWithFlatProbeCapacity(
+        directory.posting_count,
+        false,
+        max_block_count,
+    );
+    try std.testing.expect(complete_flat > frontier_only);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+        .soft_limit_bytes = frontier_only,
+        .hard_limit_bytes = frontier_only,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer {
+        idx.close();
+        idx_open = false;
+        resource_manager.deinit(alloc);
+    }
+    idx.attachResourceManager(&resource_manager);
+
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        idx.searchWithRequest(.{
+            .query = &.{ 0, 0 },
+            .k = 3,
+            .search_effort = 1,
+            .load_metadata = false,
+        }),
+    );
+
+    const stats = resource_manager.sliceStats(.dense_search_working_set);
+    try std.testing.expect(stats.peak_bytes <= frontier_only);
+    try std.testing.expect(stats.hard_limit_rejections > 0);
+    const rejected = &(idx.cached_scratch orelse return error.TestUnexpectedResult);
+    try std.testing.expect(rejected.vector_batch.len <= dims * leaf_size);
+    try std.testing.expect(rejected.positions.len <= leaf_size);
+    try std.testing.expectEqual(@as(usize, 0), rejected.flat_probes.len);
+}
+
+test "resource pressure reclaims retained flat search scratch" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const dims: usize = 16;
+    const leaf_size: usize = 2;
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = dims,
+        .leaf_size = leaf_size,
+        .branching_factor = 2,
+        .search_width = 32,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .flat_centroid_block_size = 64,
+        .flat_centroid_probe_count = 0,
+    });
+    var idx_open = true;
+    defer if (idx_open) idx.close();
+    var vector: [dims]f32 = undefined;
+    for (0..192) |i| {
+        for (&vector, 0..) |*value, dim| value.* = @floatFromInt(i + dim);
+        try idx.insert(@intCast(i + 1), &vector);
+    }
+    @memset(&vector, 0);
+    var warm = try idx.searchWithRequest(.{
+        .query = &vector,
+        .k = 3,
+        .search_effort = 0.5,
+        .load_metadata = false,
+    });
+    warm.deinit();
+
+    var baseline = try vectorindex_search_runtime.SearchScratch.init(alloc, dims, 2, leaf_size);
+    defer baseline.deinit(alloc);
+    const baseline_bytes = baseline.bytes();
+    const retained_before = idx.search_workspace_bytes_accounted;
+    try std.testing.expect(retained_before > baseline_bytes);
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+        .hard_limit_bytes = baseline_bytes,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer {
+        idx.close();
+        idx_open = false;
+        resource_manager.deinit(alloc);
+    }
+    idx.attachResourceManager(&resource_manager);
+
+    const reclaimed = resource_manager.reclaimForAllocation(.dense_search_working_set, 1);
+    try std.testing.expect(reclaimed > 0);
+    try std.testing.expect(idx.search_workspace_bytes_accounted < retained_before);
+    try std.testing.expect(resource_manager.sliceStats(.dense_search_working_set).used_bytes <= baseline_bytes);
+    const cached = &(idx.cached_scratch orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(usize, 0), cached.flat_probes.len);
+    try std.testing.expectEqual(@as(usize, dims), cached.transformed_query.len);
+    try std.testing.expectEqual(@as(usize, leaf_size), cached.member_ids.len);
 }
 
 test "hbc leaf split matrix reports dense apply workspace bytes" {

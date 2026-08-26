@@ -58,6 +58,7 @@ pub const SearchScratch = struct {
 
     pub fn init(alloc: Allocator, dims: usize, max_branching: usize, max_leaf: usize) !SearchScratch {
         const max_candidates = @max(max_branching, max_leaf);
+        const vector_value_count = std.math.mul(usize, dims, max_candidates) catch return error.OutOfMemory;
         const estimate = try quantizer.RaBitQuantizer.EstimateScratch.init(alloc, dims);
         errdefer {
             var tmp = estimate;
@@ -69,7 +70,7 @@ pub const SearchScratch = struct {
         errdefer alloc.free(centroid);
         const vector = try alloc.alloc(f32, dims);
         errdefer alloc.free(vector);
-        const vector_batch = try alloc.alloc(f32, dims * max_candidates);
+        const vector_batch = try alloc.alloc(f32, vector_value_count);
         errdefer alloc.free(vector_batch);
         const member_ids = try alloc.alloc(u64, max_leaf);
         errdefer alloc.free(member_ids);
@@ -132,6 +133,7 @@ pub const SearchScratch = struct {
     }
 
     pub fn ensureVectorFetchCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
+        const vector_value_count = std.math.mul(usize, self.dims, needed) catch return error.OutOfMemory;
         if (self.positions.len < needed) self.positions = try alloc.realloc(self.positions, needed);
         if (self.vector_ids.len < needed) self.vector_ids = try alloc.realloc(self.vector_ids, needed);
         if (self.metadata.len < needed) self.metadata = try alloc.realloc(self.metadata, needed);
@@ -139,7 +141,7 @@ pub const SearchScratch = struct {
         if (self.vector_views.len < needed) self.vector_views = try alloc.realloc(self.vector_views, needed);
         if (self.distances.len < needed) self.distances = try alloc.realloc(self.distances, needed);
         if (self.error_bounds.len < needed) self.error_bounds = try alloc.realloc(self.error_bounds, needed);
-        if (self.vector_batch.len < self.dims * needed) self.vector_batch = try alloc.realloc(self.vector_batch, self.dims * needed);
+        if (self.vector_batch.len < vector_value_count) self.vector_batch = try alloc.realloc(self.vector_batch, vector_value_count);
     }
 
     pub fn ensureRerankCapacity(self: *SearchScratch, alloc: Allocator, needed: usize) !void {
@@ -166,13 +168,72 @@ pub const SearchScratch = struct {
         }
     }
 
-    pub fn projectedBytesWithFlatProbeCapacity(self: *const SearchScratch, needed: usize, needs_merge: bool) !u64 {
+    pub fn projectedBytesWithFlatProbeCapacity(
+        self: *const SearchScratch,
+        needed: usize,
+        needs_merge: bool,
+        vector_fetch_needed: usize,
+    ) !u64 {
         var projected = self.bytes();
         projected = try addSliceGrowthBytes(search_types.FlatCentroidProbe, projected, self.flat_probes.len, needed);
         if (needs_merge) {
             projected = try addSliceGrowthBytes(search_types.FlatCentroidProbe, projected, self.flat_probe_merge.len, needed);
         }
+        projected = try addSliceGrowthBytes(usize, projected, self.positions.len, vector_fetch_needed);
+        projected = try addSliceGrowthBytes(u64, projected, self.vector_ids.len, vector_fetch_needed);
+        projected = try addSliceGrowthBytes(?[]const u8, projected, self.metadata.len, vector_fetch_needed);
+        projected = try addSliceGrowthBytes(RerankLookup, projected, self.lookups.len, vector_fetch_needed);
+        projected = try addSliceGrowthBytes([]const u8, projected, self.key_views.len, vector_fetch_needed);
+        projected = try addSliceGrowthBytes(?[]const u8, projected, self.values.len, vector_fetch_needed);
+        projected = try addSliceGrowthBytes([]const f32, projected, self.vector_views.len, vector_fetch_needed);
+        projected = try addSliceGrowthBytes(f32, projected, self.distances.len, vector_fetch_needed);
+        projected = try addSliceGrowthBytes(f32, projected, self.error_bounds.len, vector_fetch_needed);
+        const vector_value_count = std.math.mul(usize, self.dims, vector_fetch_needed) catch return error.OutOfMemory;
+        projected = try addSliceGrowthBytes(f32, projected, self.vector_batch.len, vector_value_count);
         return projected;
+    }
+
+    /// Release index-sized buffers retained by a completed search. The normal
+    /// bounded scratch stays hot; buffers that grew beyond the configured tree
+    /// fanout are disposable and can be rebuilt on the next flat scan.
+    pub fn reclaimRetainedWorkspace(
+        self: *SearchScratch,
+        alloc: Allocator,
+        target_bytes: u64,
+        max_candidates: usize,
+    ) u64 {
+        if (target_bytes == 0) return 0;
+        var reclaimed: u64 = 0;
+        reclaimed +|= freeSliceAboveRetainedCapacity(search_types.FlatCentroidProbe, alloc, &self.flat_probes, 0);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(search_types.FlatCentroidProbe, alloc, &self.flat_probe_merge, 0);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(CoverageMember, alloc, &self.coverage_members, 0);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(usize, alloc, &self.coverage_visited_words, 0);
+        if (reclaimed >= target_bytes) return reclaimed;
+
+        const baseline_vector_values = std.math.mul(usize, self.dims, max_candidates) catch std.math.maxInt(usize);
+        reclaimed +|= freeSliceAboveRetainedCapacity(f32, alloc, &self.vector_batch, baseline_vector_values);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(usize, alloc, &self.positions, max_candidates);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(u64, alloc, &self.vector_ids, max_candidates);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(?[]const u8, alloc, &self.metadata, max_candidates);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(RerankLookup, alloc, &self.lookups, max_candidates);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity([]const u8, alloc, &self.key_views, max_candidates);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(?[]const u8, alloc, &self.values, max_candidates);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity([]const f32, alloc, &self.vector_views, max_candidates);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(f32, alloc, &self.distances, max_candidates);
+        if (reclaimed >= target_bytes) return reclaimed;
+        reclaimed +|= freeSliceAboveRetainedCapacity(f32, alloc, &self.error_bounds, max_candidates);
+        return reclaimed;
     }
 
     pub fn projectedBytesForExhaustiveCoverage(
@@ -294,6 +355,19 @@ fn addSliceGrowthBytes(comptime T: type, current_bytes: u64, current_len: usize,
     return std.math.add(u64, current_bytes, growth_bytes) catch return error.OutOfMemory;
 }
 
+fn freeSliceAboveRetainedCapacity(
+    comptime T: type,
+    alloc: Allocator,
+    values: *[]T,
+    retained_capacity: usize,
+) u64 {
+    if (values.len <= retained_capacity) return 0;
+    const reclaimed = byteLen(values.*);
+    alloc.free(values.*);
+    values.* = &.{};
+    return reclaimed;
+}
+
 test "SearchScratch grows error bounds with vector fetch capacity" {
     const alloc = std.testing.allocator;
     var scratch = try SearchScratch.init(alloc, 4, 2, 2);
@@ -339,6 +413,47 @@ test "SearchScratch accounts reusable flat frontier workspace" {
 
     try std.testing.expect(scratch.bytes() >= bytes_before +
         2 * 4_097 * @sizeOf(search_types.FlatCentroidProbe));
+}
+
+test "SearchScratch flat projection includes block scoring workspace" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 1_536, 16, 64);
+    defer scratch.deinit(alloc);
+
+    const frontier_only = try scratch.projectedBytesWithFlatProbeCapacity(10_000, false, 0);
+    const with_block_scoring = try scratch.projectedBytesWithFlatProbeCapacity(10_000, false, 8_192);
+    try std.testing.expect(with_block_scoring > frontier_only + 48 * 1024 * 1024);
+
+    try scratch.ensureFlatProbeCapacity(alloc, 10_000, false);
+    try scratch.ensureVectorFetchCapacity(alloc, 8_192);
+    try std.testing.expectEqual(with_block_scoring, scratch.bytes());
+}
+
+test "SearchScratch vector fetch rejects dimension overflow before growth" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 2, 2, 2);
+    defer scratch.deinit(alloc);
+    const before = scratch.bytes();
+    scratch.dims = std.math.maxInt(usize);
+
+    try std.testing.expectError(error.OutOfMemory, scratch.ensureVectorFetchCapacity(alloc, 2));
+    try std.testing.expectEqual(before, scratch.bytes());
+}
+
+test "SearchScratch pressure reclaim preserves bounded hot workspace" {
+    const alloc = std.testing.allocator;
+    var scratch = try SearchScratch.init(alloc, 8, 4, 4);
+    defer scratch.deinit(alloc);
+    try scratch.ensureFlatProbeCapacity(alloc, 1_024, true);
+    try scratch.ensureVectorFetchCapacity(alloc, 128);
+
+    const reclaimed = scratch.reclaimRetainedWorkspace(alloc, std.math.maxInt(u64), 4);
+    try std.testing.expect(reclaimed > 0);
+    try std.testing.expectEqual(@as(usize, 0), scratch.flat_probes.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.flat_probe_merge.len);
+    try std.testing.expectEqual(@as(usize, 8), scratch.transformed_query.len);
+    try std.testing.expectEqual(@as(usize, 4), scratch.member_ids.len);
+    try std.testing.expectEqual(@as(usize, 4), scratch.flags.len);
 }
 
 fn estimateScratchBytes(scratch: *const quantizer.RaBitQuantizer.EstimateScratch) u64 {
