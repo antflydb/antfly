@@ -895,6 +895,90 @@ func TestHAPlannedActionStatusesRetainSuccessfulFormerPrimaryAssessmentUntilDisp
 	}
 }
 
+func TestHAPlannedActionStatusesRetainAlreadyCurrentAssessmentAsDisposition(t *testing.T) {
+	ha := &antflyv1.HighAvailabilitySpec{
+		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},
+		Standbys: []antflyv1.HAStandbySpec{{
+			Name:     "old-primary",
+			AdminURL: "http://old-primary-ha.default.svc:8081",
+		}},
+	}
+	assessment := antflyv1.HAPlannedActionStatus{
+		Kind:            string(haActionDemoteFormerPrimary),
+		Phase:           string(haActionPhaseRejoin),
+		Executor:        string(haActionExecutorAdminAPI),
+		DependsOn:       string(haActionPromoteStandby),
+		StandbyName:     "old-primary",
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 4,
+		AdminURL:        "http://old-primary-ha.default.svc:8081",
+		AdminNodeID:     "old-primary",
+		AdminMethod:     "POST",
+		AdminPath:       haAdminRejoinAssessPath,
+		AdminJobName:    haAdminDirectAPIName,
+		AdminJobPhase:   haAdminJobPhaseSucceeded,
+		AdminResult: &antflyv1.HAAdminActionResultStatus{
+			SchemaVersion:    1,
+			ActionID:         "rejoin_assess:old-primary",
+			ActionKind:       "rejoin_assess",
+			ActionTarget:     "old-primary",
+			ActionState:      "assessed",
+			ActionNodeID:     "old-primary",
+			RejoinAction:     "already_current",
+			RejoinReason:     "current_timeline",
+			FormerNodeID:     "old-primary",
+			TargetTimelineID: 2,
+			TargetEpoch:      2,
+			ForkLSN:          10,
+			FormerLastLSN:    10,
+			RetainedFromLSN:  8,
+		},
+	}
+	status := &antflyv1.HAStatus{
+		LastPromotion: &antflyv1.HAPromotionStatus{
+			OldPrimaryID:      "old-primary",
+			PromotedStandbyID: "standby-a",
+			ParentTimelineID:  1,
+			ParentEpoch:       1,
+			NewTimelineID:     2,
+			NewEpoch:          2,
+			RequiredLSN:       10,
+			ObservedLSN:       10,
+			FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceGeneration:   4,
+			FenceToken:        "ha-fence-token",
+		},
+		FormerPrimary: &antflyv1.HAFormerPrimaryStatus{
+			NodeID:           "old-primary",
+			Fenced:           true,
+			FenceAuthority:   antflyv1.HAFencingAuthorityKubernetesLease,
+			FenceHolder:      "standby-a",
+			FenceGeneration:  4,
+			TargetTimelineID: 2,
+			TargetEpoch:      2,
+			ForkLSN:          10,
+			FormerLastLSN:    10,
+			RetainedFromLSN:  8,
+			AssessedAction:   "already_current",
+			AssessedReason:   "current_timeline",
+		},
+		PlannedActions: []antflyv1.HAPlannedActionStatus{assessment},
+	}
+
+	retained := haPlannedActionStatuses(nil, ha, status)
+	completed, ok := haPlannedActionByKind(retained, haActionDemoteFormerPrimary)
+	if !ok || completed.AdminJobPhase != haAdminJobPhaseSucceeded || completed.AdminResult == nil ||
+		completed.AdminResult.RejoinAction != "already_current" {
+		t.Fatalf("expected terminal already-current assessment receipt to remain auditable, got %#v", retained)
+	}
+
+	status.LastPromotion.FenceGeneration++
+	if stale := haPlannedActionStatuses(nil, ha, status); len(stale) != 0 {
+		t.Fatalf("expected receipt with mismatched promotion fence to be dropped, got %#v", stale)
+	}
+}
+
 func TestHACompletedFormerPrimaryRewindRemainsIdempotentAcrossRetentionMovement(t *testing.T) {
 	ha := &antflyv1.HighAvailabilitySpec{
 		Admin: &antflyv1.HAAdminSpec{PrimaryURL: "http://primary-ha.default.svc:8081"},

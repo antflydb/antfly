@@ -1945,10 +1945,10 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 		}
 	}
 	retainedSeedActions := haRetainedCompletedSeedActions(actions, ha, status)
-	if len(actions) == 0 && completedRewind == nil && len(retainedSeedActions) == 0 {
+	retainedAssessment := haRetainedFormerPrimaryAssessment(actions, status)
+	if len(actions) == 0 && completedRewind == nil && retainedAssessment == nil && len(retainedSeedActions) == 0 {
 		return nil
 	}
-	retainedAssessment := haRetainedFormerPrimaryAssessment(actions, status)
 	outCapacity := len(actions)
 	if completedRewind != nil {
 		outCapacity++
@@ -1964,6 +1964,10 @@ func haPlannedActionStatuses(actions []haPlannedAction, ha *antflyv1.HighAvailab
 			retainedAssessment = nil
 		}
 		out = append(out, *completedRewind)
+	}
+	if len(actions) == 0 && retainedAssessment != nil {
+		out = append(out, *retainedAssessment)
+		retainedAssessment = nil
 	}
 	for _, action := range actions {
 		if retainedAssessment != nil &&
@@ -2284,15 +2288,23 @@ func haRetainedFormerPrimaryAssessment(actions []haPlannedAction, status *antfly
 			hasDisposition = true
 		}
 	}
-	if !hasDisposition {
-		return nil
-	}
 	for i := range status.PlannedActions {
 		previous := status.PlannedActions[i]
 		if haActionKind(previous.Kind) != haActionDemoteFormerPrimary ||
 			previous.AdminJobPhase != haAdminJobPhaseSucceeded ||
 			!haFormerPrimaryDemotePreserveAllowed(status, previous) ||
 			!haAdminActionSucceededWithStatusEvidence(status, previous) {
+			continue
+		}
+		// already_current is a terminal, typed disposition produced by the
+		// assessment itself, so there is intentionally no rewind or reseed plan
+		// to keep this receipt alive. Retain the exact completed action while it
+		// remains bound to the promotion fence; Colony consumes it as the durable
+		// authority for advancing the former-primary topology state.
+		if previous.AdminResult != nil && previous.AdminResult.RejoinAction == "already_current" {
+			return previous.DeepCopy()
+		}
+		if !hasDisposition {
 			continue
 		}
 		return previous.DeepCopy()
