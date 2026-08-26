@@ -3669,6 +3669,93 @@ test "H1 body deadline starts after headers and rejects a stalled upload" {
     try std.testing.expect(!State.handled.load(.acquire));
 }
 
+test "H1 oversized content length returns 413 before handler admission" {
+    const State = struct {
+        var handled = std.atomic.Value(usize).init(0);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            _ = handled.fetchAdd(1, .acq_rel);
+            return ctx.text("ok");
+        }
+    };
+    State.handled.store(0, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_body_size = 4,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.get("/ok", State.handler);
+    try server.post("/upload", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("oversized-body listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+
+    // Exercise the first-request parser path. The declared size is rejected
+    // from the headers alone, before allocating or invoking the handler.
+    {
+        var client = try Socket.connect(server.boundAddress().?, client_io);
+        defer client.close();
+        try client.setRecvTimeout(5_000);
+        try client.sendAll(
+            "POST /upload HTTP/1.1\r\n" ++
+                "Host: test\r\n" ++
+                "Content-Length: 5\r\n" ++
+                "Connection: close\r\n\r\n",
+        );
+
+        var response: [1024]u8 = undefined;
+        const n = try client.recv(&response);
+        try std.testing.expect(mem.indexOf(u8, response[0..n], "HTTP/1.1 413 ") != null);
+        try std.testing.expectEqual(@as(usize, 0), State.handled.load(.acquire));
+    }
+
+    // Exercise the leftover/pipelined parser path as well. The first request
+    // is admitted, while the oversized second request receives its own 413.
+    {
+        var client = try Socket.connect(server.boundAddress().?, client_io);
+        defer client.close();
+        try client.setRecvTimeout(5_000);
+        try client.sendAll(
+            "GET /ok HTTP/1.1\r\n" ++
+                "Host: test\r\n\r\n" ++
+                "POST /upload HTTP/1.1\r\n" ++
+                "Host: test\r\n" ++
+                "Content-Length: 5\r\n" ++
+                "Connection: close\r\n\r\n",
+        );
+
+        var response: [2048]u8 = undefined;
+        var response_len: usize = 0;
+        while (response_len < response.len) {
+            const n = try client.recv(response[response_len..]);
+            if (n == 0) break;
+            response_len += n;
+        }
+        const bytes = response[0..response_len];
+        try std.testing.expectEqual(@as(usize, 2), mem.count(u8, bytes, "HTTP/1.1"));
+        try std.testing.expect(mem.indexOf(u8, bytes, "HTTP/1.1 200 ") != null);
+        try std.testing.expect(mem.indexOf(u8, bytes, "HTTP/1.1 413 ") != null);
+        try std.testing.expectEqual(@as(usize, 1), State.handled.load(.acquire));
+    }
+}
+
 test "H1 handler failure after stream commit closes without a second response" {
     const State = struct {
         fn handler(ctx: *Context) anyerror!Response {
