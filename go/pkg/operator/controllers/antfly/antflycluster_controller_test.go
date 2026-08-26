@@ -6334,6 +6334,23 @@ func TestHAPortableArtifactJobActionFreezesBothPVCsAndRejectsStaleTopology(t *te
 	g.Expect(bound.SourcePVCUID).To(Equal("source-uid-1"))
 	g.Expect(bound.TargetPVCUID).To(Equal("target-uid-1"))
 
+	cluster.Spec.HighAvailability.Runtime = &antflyv1.HARuntimeSpec{StartupGate: &antflyv1.HAStartupGateSpec{
+		Policy: antflyv1.HAStartupGatePolicyRequireActivatedSeed, ReceiptMatchPolicy: antflyv1.HAReceiptMatchPolicyExact,
+		RequiredReceipt: &antflyv1.HARequiredSeedActivationReceipt{
+			TopologyID: "local-topology", TopologyGeneration: 1, NodeID: "promoted-primary", SlotName: "promoted-primary",
+			Generation: "initial-promoted-primary-1", TargetPVCName: "source-data", TargetPVCUID: "source-uid-1",
+		},
+	}}
+	_, ready, err = reconciler.haPortableArtifactJobAction(context.Background(), cluster, action)
+	g.Expect(err).NotTo(HaveOccurred(), "a promoted primary's local boot gate must not block repair of another PVC")
+	g.Expect(ready).To(BeTrue())
+
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCName = "target-data"
+	_, _, err = reconciler.haPortableArtifactJobAction(context.Background(), cluster, action)
+	g.Expect(err).To(MatchError(ContainSubstring("stale relative to the desired startup gate")),
+		"an action targeting the gated PVC must still match the complete receipt contract")
+	cluster.Spec.HighAvailability.Runtime = nil
+
 	staleTopology := action
 	staleTopology.TopologyGeneration = 6
 	_, _, err = reconciler.haPortableArtifactJobAction(context.Background(), cluster, staleTopology)

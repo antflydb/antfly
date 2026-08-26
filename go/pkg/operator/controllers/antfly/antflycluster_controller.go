@@ -6481,14 +6481,23 @@ func (r *AntflyClusterReconciler) haPortableArtifactJobAction(ctx context.Contex
 			return action, false, fmt.Errorf("HA %s startup gate omits its exact receipt contract", action.Kind)
 		}
 		required := gate.RequiredReceipt
-		if action.TopologyID != strings.TrimSpace(required.TopologyID) ||
-			action.TopologyGeneration != required.TopologyGeneration ||
-			action.TopologyNodeID != strings.TrimSpace(required.NodeID) ||
-			action.TargetPVCName != strings.TrimSpace(required.TargetPVCName) ||
-			action.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) ||
-			action.SlotName != strings.TrimSpace(required.SlotName) ||
-			action.SeedArtifactGeneration != strings.TrimSpace(required.Generation) {
-			return action, false, fmt.Errorf("HA %s topology binding is stale relative to the desired startup gate", action.Kind)
+		gateTargetPVC := strings.TrimSpace(required.TargetPVCName)
+		if gateTargetPVC == "" {
+			return action, false, fmt.Errorf("HA %s startup gate omits its target PVC identity", action.Kind)
+		}
+		// A promoted primary retains the exact gate that binds its own pre-seeded
+		// PVC across restarts. Portable repair for a different target PVC must not
+		// compare against that local boot contract. If the action does target the
+		// gated PVC, retain the full exact-match barrier below.
+		if action.TargetPVCName == gateTargetPVC {
+			if action.TopologyID != strings.TrimSpace(required.TopologyID) ||
+				action.TopologyGeneration != required.TopologyGeneration ||
+				action.TopologyNodeID != strings.TrimSpace(required.NodeID) ||
+				action.TargetPVCUID != strings.TrimSpace(required.TargetPVCUID) ||
+				action.SlotName != strings.TrimSpace(required.SlotName) ||
+				action.SeedArtifactGeneration != strings.TrimSpace(required.Generation) {
+				return action, false, fmt.Errorf("HA %s topology binding is stale relative to the desired startup gate", action.Kind)
+			}
 		}
 	}
 	targetPVC := &corev1.PersistentVolumeClaim{}
