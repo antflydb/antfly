@@ -14782,6 +14782,45 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 	}
 }
 
+func TestDataStatefulSetAdvertisesStablePodDNS(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(appsv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "stable-routes", Namespace: "antfly-system"},
+		Spec: antflyv1.AntflyClusterSpec{
+			Image: "antfly:latest",
+			DataNodes: antflyv1.DataNodesSpec{
+				Replicas: 3,
+				API:      antflyv1.APISpec{Port: 12380},
+				Raft:     antflyv1.APISpec{Port: 9021},
+				Health:   antflyv1.APISpec{Port: 4200},
+			},
+			Storage: antflyv1.StorageSpec{StorageClass: "standard", DataStorage: "1Gi"},
+			Config:  "{}",
+		},
+	}
+	client := newHAControllerTestClient(t, s, cluster)
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+
+	g.Expect(reconciler.reconcileDataStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
+
+	sts := &appsv1.StatefulSet{}
+	g.Expect(client.Get(context.Background(), types.NamespacedName{
+		Name: cluster.Name + "-data", Namespace: cluster.Namespace,
+	}, sts)).To(Succeed())
+	g.Expect(sts.Spec.ServiceName).To(Equal("stable-routes-data"))
+	args := sts.Spec.Template.Spec.Containers[0].Args[0]
+	g.Expect(args).To(ContainSubstring("--api-host ${POD_IP}"))
+	g.Expect(args).To(ContainSubstring("--raft-host ${POD_IP}"))
+	g.Expect(args).To(ContainSubstring("--api-advertise-url http://${HOSTNAME}.stable-routes-data.antfly-system.svc.cluster.local:12380"))
+	g.Expect(args).To(ContainSubstring("--raft-advertise-url http://${HOSTNAME}.stable-routes-data.antfly-system.svc.cluster.local:9021"))
+}
+
 func TestUpdateStatus_Standalone(t *testing.T) {
 	g := NewWithT(t)
 
