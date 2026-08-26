@@ -336,9 +336,13 @@ pub fn validateArtifact(
     io: std.Io,
     artifact_or_manifest_path: []const u8,
 ) !ValidationResult {
+    const session_manager = backends.SessionManager.init(allocator);
+    try session_manager.validateRequiredBackendPolicy();
+
     if (compiled_artifact.isPackageManifestPath(artifact_or_manifest_path)) {
         var parsed = try compiled_artifact.readPackageManifest(allocator, io, artifact_or_manifest_path);
         defer parsed.deinit();
+        try validateArtifactBackendPolicy(&session_manager, parsed.value.backend);
         var prefill_count: usize = 0;
         var decode_count: usize = 0;
         for (parsed.value.artifacts) |entry| {
@@ -377,6 +381,7 @@ pub fn validateArtifact(
     var parsed = try compiled_artifact.readManifest(allocator, io, manifest_path);
     defer parsed.deinit();
     const manifest = parsed.value;
+    try validateArtifactBackendPolicy(&session_manager, manifest.backend);
 
     if (std.mem.eql(u8, manifest.backend, "onnx")) {
         if (!build_options.enable_onnx) return error.BackendUnavailable;
