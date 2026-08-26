@@ -6707,6 +6707,18 @@ pub const ProvisionedTableWriteSource = struct {
         return true;
     }
 
+    fn repairHandoffStatusPendingBestEffort(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+    ) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, group_id) orelse return false;
+        return self.active_table_activities.items[index].repair_handoff_status_pending != 0;
+    }
+
     fn markRepairHandoffClearBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
@@ -9837,6 +9849,12 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         self.retireReadersAfterIndexRepairCompletion(table_name, result);
+        if (result.index_repair_repaired and !result.index_repair_pending and !result.terminal_degraded) {
+            // The bounded repair's post-check is the durable proof that no
+            // runnable or unavailable generation remains. Record that edge
+            // even if a visibility callback was delayed behind publication.
+            self.markRepairHandoffClearBestEffort(table_name, group_id);
+        }
         if (result.terminal_degraded) {
             // catchUpManagedDb publishes the terminal observation with startup
             // provenance. Do not relabel it as a fresh live-writer snapshot.
@@ -9859,6 +9877,13 @@ pub const ProvisionedTableWriteSource = struct {
         } else {
             try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(self, alloc, table_name, group_id, .idle, db));
             startup_status_active = false;
+        }
+        if (self.repairHandoffStatusPendingBestEffort(table_name, group_id)) {
+            // A fenced status observation cannot be the last owner of a
+            // structural repair handoff. Retain the exact scheduler route
+            // until a later pass publishes after the clear edge and settles
+            // snapshot-only authority, even when durable repair is complete.
+            result.index_repair_pending = true;
         }
         self.updateStartupCatchUpBackoff(group_id, startupCatchUpMonotonicMs(), backoff_epoch, &result);
         preserve_startup_cache = shouldPreserveStartupWriteCache(result);
@@ -34526,6 +34551,7 @@ test "structural reconcile publishes durable index repair debt once per group" {
     var attempted_repair = false;
     var repaired = false;
     var repair_passes: usize = 0;
+    var publication_fenced = false;
     {
         // Exercise the cold-owner path that CI can reach when an idle writer
         // cache entry is retired between structural handoff and repair.
@@ -34534,6 +34560,32 @@ test "structural reconcile publishes durable index repair debt once per group" {
         const status = source.beginStatusRequest("docs");
         try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.snapshot_only, status);
         source.endStatusRequest("docs", status);
+        const PublicationFence = struct {
+            source: *ProvisionedTableWriteSource,
+            cache: *runtime_status.TableRuntimeSnapshotCache,
+            fenced: bool = false,
+            clear_publications: usize = 0,
+
+            fn run(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const io = self.source.table_activity_threaded.io();
+                self.source.table_activity_mutex.lockUncancelable(io);
+                const clear_observed = if (self.source.findTableActivityLocked("docs", 7001)) |index|
+                    self.source.active_table_activities.items[index].repair_handoff_clear_observed
+                else
+                    false;
+                self.source.table_activity_mutex.unlock(io);
+                if (!clear_observed) return;
+                self.clear_publications += 1;
+                // Fence both the clear callback's publication and the
+                // caller's final consistent publication. The next scheduler
+                // pass must own recovery of the still-pending handoff.
+                if (self.clear_publications > 2) return;
+                self.cache.invalidateTable("docs");
+                self.fenced = self.clear_publications == 2;
+            }
+        };
+        var publication_fence = PublicationFence{ .source = &source, .cache = &snapshot_cache };
         const RepairWorker = struct {
             source: *ProvisionedTableWriteSource,
             indexes_json: []const u8,
@@ -34572,15 +34624,20 @@ test "structural reconcile publishes durable index repair debt once per group" {
         // Snapshot-only status is observational and cannot delay the cold
         // repair owner. The repair's clear plus final cached publication must
         // retire shard authority without another structural pass.
+        const previous_publish_hook = test_before_runtime_status_publish_hook;
+        test_before_runtime_status_publish_hook = .{ .ptr = &publication_fence, .run = PublicationFence.run };
+        defer test_before_runtime_status_publish_hook = previous_publish_hook;
         worker.run();
         if (worker.err) |err| return err;
         attempted_repair = worker.attempted_repair;
         repaired = worker.repaired;
         repair_passes = worker.repair_passes;
+        publication_fenced = publication_fence.fenced;
     }
-    try std.testing.expect(repair_passes >= 2);
+    try std.testing.expect(repair_passes >= 3);
     try std.testing.expect(attempted_repair);
     try std.testing.expect(repaired);
+    try std.testing.expect(publication_fenced);
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
     // Repair's visibility hook may repeat the idempotent exact-debt enqueue as
     // each bounded pass discovers the durable intent. Only a subsequent
