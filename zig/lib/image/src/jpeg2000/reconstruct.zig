@@ -1057,147 +1057,280 @@ pub fn assemblePlanesFromTier1IrreversibleAtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) ![][]i32 {
-    const default_coding_style = state.coding_style orelse return error.MissingCodingStyle;
+    var assembler = try IrreversiblePlaneAssembler.init(allocator, state);
+    defer assembler.deinit();
+    for (execution.codeblocks) |*codeblock_state| {
+        try assembler.appendCodeblock(codeblock_state);
+    }
+    return assembler.finish(discard_levels);
+}
 
-    const tile_w: u32 = state.header.width;
-    const tile_h: u32 = state.header.height;
+pub const IrreversiblePlaneAssembler = struct {
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    comp_widths: []usize,
+    comp_heights: []usize,
+    comp_origin_x: []usize,
+    comp_origin_y: []usize,
+    f32_planes: [][]f32,
+    initialized_planes: usize = 0,
+    plane_buffers_owned: bool = true,
+    finished: bool = false,
 
-    // Per-component dimensions accounting for SIZ XRsiz/YRsiz subsampling.
-    const comp_widths = try allocator.alloc(usize, state.header.components.len);
-    defer allocator.free(comp_widths);
-    const comp_heights = try allocator.alloc(usize, state.header.components.len);
-    defer allocator.free(comp_heights);
-    const comp_origin_x = try allocator.alloc(usize, state.header.components.len);
-    defer allocator.free(comp_origin_x);
-    const comp_origin_y = try allocator.alloc(usize, state.header.components.len);
-    defer allocator.free(comp_origin_y);
-    for (state.header.components, 0..) |comp, component_index| {
-        const dims = tile.componentDimensionsAt(state.header.x_offset, state.header.y_offset, tile_w, tile_h, comp.xrsiz, comp.yrsiz);
-        comp_widths[component_index] = @intCast(dims.width);
-        comp_heights[component_index] = @intCast(dims.height);
-        comp_origin_x[component_index] = @intCast(dims.origin_x);
-        comp_origin_y[component_index] = @intCast(dims.origin_y);
+    pub fn init(allocator: std.mem.Allocator, state: *const codestream.State) !IrreversiblePlaneAssembler {
+        _ = state.coding_style orelse return error.MissingCodingStyle;
+        const component_count = state.header.components.len;
+        const comp_widths = try allocator.alloc(usize, component_count);
+        errdefer allocator.free(comp_widths);
+        const comp_heights = try allocator.alloc(usize, component_count);
+        errdefer allocator.free(comp_heights);
+        const comp_origin_x = try allocator.alloc(usize, component_count);
+        errdefer allocator.free(comp_origin_x);
+        const comp_origin_y = try allocator.alloc(usize, component_count);
+        errdefer allocator.free(comp_origin_y);
+        const f32_planes = try allocator.alloc([]f32, component_count);
+        errdefer allocator.free(f32_planes);
+        var initialized_planes: usize = 0;
+        errdefer {
+            for (f32_planes[0..initialized_planes]) |plane| allocator.free(plane);
+        }
+        for (state.header.components, 0..) |component, component_index| {
+            const dims = tile.componentDimensionsAt(
+                state.header.x_offset,
+                state.header.y_offset,
+                state.header.width,
+                state.header.height,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            comp_widths[component_index] = @intCast(dims.width);
+            comp_heights[component_index] = @intCast(dims.height);
+            comp_origin_x[component_index] = @intCast(dims.origin_x);
+            comp_origin_y[component_index] = @intCast(dims.origin_y);
+            f32_planes[component_index] = try allocator.alloc(
+                f32,
+                comp_widths[component_index] * comp_heights[component_index],
+            );
+            initialized_planes += 1;
+            @memset(f32_planes[component_index], 0.0);
+        }
+        return .{
+            .allocator = allocator,
+            .state = state,
+            .comp_widths = comp_widths,
+            .comp_heights = comp_heights,
+            .comp_origin_x = comp_origin_x,
+            .comp_origin_y = comp_origin_y,
+            .f32_planes = f32_planes,
+            .initialized_planes = initialized_planes,
+        };
     }
 
-    // Allocate f32 planes for the irreversible pipeline.
-    const f32_planes = try allocator.alloc([]f32, state.header.components.len);
-    defer {
-        for (f32_planes) |p| allocator.free(p);
-        allocator.free(f32_planes);
-    }
-    for (f32_planes, 0..) |*fp, i| {
-        fp.* = try allocator.alloc(f32, comp_widths[i] * comp_heights[i]);
-        @memset(fp.*, 0.0);
-    }
-
-    // Place dequantized coefficients into the f32 planes.
-    for (execution.codeblocks) |codeblock_state| {
+    pub fn appendCodeblock(self: *IrreversiblePlaneAssembler, codeblock_state: *const packet.Tier1CodeblockState) !void {
+        if (self.finished) return error.InvalidPlaneAssemblyState;
         const component_index: usize = codeblock_state.coordinate.component_index;
-        if (component_index >= f32_planes.len) return error.InvalidPlaneIndex;
-        const coding_style = try tile.effectiveCodingStyle(state, component_index);
-        const qcd = quantizationStyleForComponent(state, component_index) orelse return error.MissingQuantizationStyle;
-        const fp = f32_planes[component_index];
-        const cw = comp_widths[component_index];
-        const ch = comp_heights[component_index];
+        if (component_index >= self.f32_planes.len) return error.InvalidPlaneIndex;
+        const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
+        const quantization_style = quantizationStyleForComponent(self.state, component_index) orelse
+            return error.MissingQuantizationStyle;
+        const plane = self.f32_planes[component_index];
+        const component_width = self.comp_widths[component_index];
+        const component_height = self.comp_heights[component_index];
         const rect = codeblock_state.rect;
-        const rect_w: usize = rect.width();
-        const rect_h: usize = rect.height();
-        const bo = bandOffsetOrigin(
-            cw,
-            ch,
-            comp_origin_x[component_index],
-            comp_origin_y[component_index],
+        const rect_width: usize = rect.width();
+        const rect_height: usize = rect.height();
+        const band_offset = bandOffsetOrigin(
+            component_width,
+            component_height,
+            self.comp_origin_x[component_index],
+            self.comp_origin_y[component_index],
             coding_style.decomposition_levels,
             codeblock_state.coordinate.resolution_index,
             codeblock_state.subband,
         );
-
         const step_value = quantization.stepValueForSubband(
-            qcd.style,
-            qcd.step_values,
+            quantization_style.style,
+            quantization_style.step_values,
             codeblock_state.coordinate.resolution_index,
             codeblock_state.subband,
         ) orelse return error.InvalidQuantizationSegment;
-        const precision = state.header.components[component_index].bits_per_component;
-        const openjpeg_compat = !producedByAntfly(state.comments);
-        const gain: u8 = if (openjpeg_compat) 0 else quantization.irreversibleSubbandGain(codeblock_state.subband);
+        const precision = self.state.header.components[component_index].bits_per_component;
+        const openjpeg_compat = !producedByAntfly(self.state.comments);
+        const gain: u8 = if (openjpeg_compat)
+            0
+        else
+            quantization.irreversibleSubbandGain(codeblock_state.subband);
         const step_size: f32 = @floatCast(quantization.stepSizeIrreversible(step_value, precision, gain));
-        const roi_shift = roiShiftForComponent(state, component_index);
+        const roi_shift = roiShiftForComponent(self.state, component_index);
 
         var y: usize = 0;
-        while (y < rect_h) : (y += 1) {
+        while (y < rect_height) : (y += 1) {
             var x: usize = 0;
-            while (x < rect_w) : (x += 1) {
-                const dst_x: usize = bo.x + rect.x0 + x;
-                const dst_y: usize = bo.y + rect.y0 + y;
-                if (dst_x >= cw or dst_y >= ch) return error.InvalidPlaneIndex;
-                const cell = codeblock_state.grid.cells[y * rect_w + x];
-                const signed_i: i32 = if (cell.flags.sign) -cell.magnitude else cell.magnitude;
-                const signed_mag = dequantizedMagnitudeForRoi(signed_i, roi_shift, codeblock_state.magnitude_scale);
-                fp[dst_y * cw + dst_x] = signed_mag * step_size;
+            while (x < rect_width) : (x += 1) {
+                const dst_x: usize = band_offset.x + rect.x0 + x;
+                const dst_y: usize = band_offset.y + rect.y0 + y;
+                if (dst_x >= component_width or dst_y >= component_height)
+                    return error.InvalidPlaneIndex;
+                const cell = codeblock_state.grid.cells[y * rect_width + x];
+                const signed_value: i32 = if (cell.flags.sign) -cell.magnitude else cell.magnitude;
+                const magnitude = dequantizedMagnitudeForRoi(
+                    signed_value,
+                    roi_shift,
+                    codeblock_state.magnitude_scale,
+                );
+                plane[dst_y * component_width + dst_x] = magnitude * step_size;
             }
         }
     }
 
-    // Apply iterative inverse 9/7 wavelet transform.
-    for (f32_planes, 0..) |fp, component_index| {
-        const coding_style = try tile.effectiveCodingStyle(state, component_index);
-        if (coding_style.decomposition_levels > 0) {
+    pub fn finish(self: *IrreversiblePlaneAssembler, discard_levels: u8) ![][]i32 {
+        if (self.finished or self.initialized_planes != self.f32_planes.len)
+            return error.InvalidPlaneAssemblyState;
+        const default_coding_style = self.state.coding_style orelse
+            return error.MissingCodingStyle;
+
+        for (self.f32_planes, 0..) |plane, component_index| {
+            const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
+            if (coding_style.decomposition_levels == 0) continue;
             const component_discard = @min(discard_levels, coding_style.decomposition_levels);
             try inverseWavelet97MultiLevelOriginAtResolution(
-                allocator,
-                fp,
-                comp_widths[component_index],
-                comp_heights[component_index],
-                comp_origin_x[component_index],
-                comp_origin_y[component_index],
+                self.allocator,
+                plane,
+                self.comp_widths[component_index],
+                self.comp_heights[component_index],
+                self.comp_origin_x[component_index],
+                self.comp_origin_y[component_index],
                 coding_style.decomposition_levels,
                 component_discard,
-                !producedByAntfly(state.comments),
+                !producedByAntfly(self.state.comments),
             );
         }
+
+        if (default_coding_style.multiple_component_transform and self.f32_planes.len == 3) {
+            const all_same = self.comp_widths[0] == self.comp_widths[1] and
+                self.comp_widths[1] == self.comp_widths[2] and
+                self.comp_heights[0] == self.comp_heights[1] and
+                self.comp_heights[1] == self.comp_heights[2];
+            if (all_same) {
+                if (try buildCustomMctMatrixFromState(
+                    self.allocator,
+                    self.state,
+                    @intCast(self.f32_planes.len),
+                )) |matrix| {
+                    defer self.allocator.free(matrix.forward);
+                    defer self.allocator.free(matrix.inverse);
+                    defer self.allocator.free(matrix.offsets);
+                    try color_transform.applyCustomMctInverse(matrix, self.f32_planes);
+                } else {
+                    color_transform.inverseIct(
+                        self.f32_planes[0],
+                        self.f32_planes[1],
+                        self.f32_planes[2],
+                    );
+                }
+            }
+        }
+
+        const planes = try self.allocator.alloc([]i32, self.f32_planes.len);
+        errdefer self.allocator.free(planes);
+        for (self.f32_planes, 0..) |float_plane, component_index| {
+            const plane: []i32 = @as(
+                [*]i32,
+                @ptrCast(@alignCast(float_plane.ptr)),
+            )[0..float_plane.len];
+            roundF32PlaneToI32(plane, float_plane);
+            planes[component_index] = plane;
+        }
+        self.plane_buffers_owned = false;
+        errdefer {
+            for (planes) |plane| self.allocator.free(plane);
+        }
+
+        if (discard_levels > 0) {
+            try cropPlanesToResolution(
+                self.allocator,
+                self.state,
+                planes,
+                self.comp_widths,
+                self.comp_heights,
+                self.comp_origin_x,
+                self.comp_origin_y,
+                discard_levels,
+            );
+        }
+        self.finished = true;
+        return planes;
     }
 
-    // Apply inverse ICT (or a custom MCT reconstructed from MCT/MCC/MCO
-    // markers) if multiple component transform is enabled. ICT requires all
-    // three components to share dimensions; skip when subsampling disagrees
-    // between components.
-    if (default_coding_style.multiple_component_transform and f32_planes.len == 3) {
-        const all_same = comp_widths[0] == comp_widths[1] and comp_widths[1] == comp_widths[2] and
-            comp_heights[0] == comp_heights[1] and comp_heights[1] == comp_heights[2];
-        if (all_same) {
-            if (try buildCustomMctMatrixFromState(allocator, state, @intCast(f32_planes.len))) |matrix| {
-                defer allocator.free(matrix.forward);
-                defer allocator.free(matrix.inverse);
-                defer allocator.free(matrix.offsets);
-                try color_transform.applyCustomMctInverse(matrix, f32_planes);
-            } else {
-                color_transform.inverseIct(f32_planes[0], f32_planes[1], f32_planes[2]);
+    pub fn deinit(self: *IrreversiblePlaneAssembler) void {
+        if (self.plane_buffers_owned) {
+            for (self.f32_planes[0..self.initialized_planes]) |plane| {
+                self.allocator.free(plane);
             }
+        }
+        self.allocator.free(self.f32_planes);
+        self.allocator.free(self.comp_widths);
+        self.allocator.free(self.comp_heights);
+        self.allocator.free(self.comp_origin_x);
+        self.allocator.free(self.comp_origin_y);
+        self.* = undefined;
+    }
+};
+
+pub fn interleaveComponentPlanesU8(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: [][]i32,
+) ![]u8 {
+    if (raw_planes.len != state.header.components.len) return error.InvalidPlaneLength;
+    const image_width: usize = @intCast(state.header.width);
+    const image_height: usize = @intCast(state.header.height);
+    const planes = try allocator.alloc([]i32, raw_planes.len);
+    defer allocator.free(planes);
+    const owned_upsampled = try allocator.alloc(bool, raw_planes.len);
+    defer allocator.free(owned_upsampled);
+    @memset(owned_upsampled, false);
+    defer {
+        for (planes, 0..) |plane, component_index| {
+            if (owned_upsampled[component_index]) allocator.free(plane);
         }
     }
 
-    // Convert f32 planes to i32 (round to nearest).
-    const planes = try allocator.alloc([]i32, state.header.components.len);
-    errdefer allocator.free(planes);
-    var allocated: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < allocated) : (i += 1) allocator.free(planes[i]);
-    }
-    for (f32_planes, 0..) |fp, component_index| {
-        planes[component_index] = try allocator.alloc(i32, comp_widths[component_index] * comp_heights[component_index]);
-        allocated += 1;
-        roundF32PlaneToI32(planes[component_index], fp);
+    for (state.header.components, 0..) |component, component_index| {
+        const dims = tile.componentDimensions(
+            state.header.width,
+            state.header.height,
+            component.xrsiz,
+            component.yrsiz,
+        );
+        const component_width: usize = @intCast(dims.width);
+        const component_height: usize = @intCast(dims.height);
+        if (component_width == image_width and component_height == image_height) {
+            planes[component_index] = raw_planes[component_index];
+        } else {
+            planes[component_index] = try upsample.upsampleI32(
+                allocator,
+                .bilinear,
+                raw_planes[component_index],
+                component_width,
+                component_height,
+                image_width,
+                image_height,
+            );
+            owned_upsampled[component_index] = true;
+        }
     }
 
-    if (discard_levels > 0) {
-        try cropPlanesToResolution(allocator, state, planes, comp_widths, comp_heights, comp_origin_x, comp_origin_y, discard_levels);
-    }
-
-    return planes;
+    const first_component = state.header.components[0];
+    return interleavePlanesU8(
+        allocator,
+        planes,
+        state.header.width,
+        state.header.height,
+        first_component.bits_per_component,
+        first_component.is_signed,
+    );
 }
-
 /// Apply N-level inverse 9/7 wavelet transform iteratively on f32 data.
 fn inverseWavelet97MultiLevel(
     allocator: std.mem.Allocator,
@@ -1242,22 +1375,26 @@ fn inverseWavelet97MultiLevelOriginAtResolution(
         const phase_y: u1 = @intCast(resolutionOriginAt(origin_y, reduce) & 1);
         if (active_w == 0 or active_h == 0) continue;
 
-        const sub = try allocator.alloc(f32, active_w * active_h);
-        defer allocator.free(sub);
-        var y: usize = 0;
-        while (y < active_h) : (y += 1) {
-            @memcpy(sub[y * active_w .. y * active_w + active_w], plane[y * width .. y * width + active_w]);
-        }
-
         if (openjpeg_compat) {
-            try wavelet.inverse97LevelInPlacePhaseOpenJpeg(allocator, sub, active_w, active_h, phase_x, phase_y);
+            try wavelet.inverse97LevelInPlaceStridedPhaseOpenJpeg(
+                allocator,
+                plane,
+                active_w,
+                active_h,
+                width,
+                phase_x,
+                phase_y,
+            );
         } else {
-            try wavelet.inverse97LevelInPlacePhase(allocator, sub, active_w, active_h, phase_x, phase_y);
-        }
-
-        y = 0;
-        while (y < active_h) : (y += 1) {
-            @memcpy(plane[y * width .. y * width + active_w], sub[y * active_w .. y * active_w + active_w]);
+            try wavelet.inverse97LevelInPlaceStridedPhase(
+                allocator,
+                plane,
+                active_w,
+                active_h,
+                width,
+                phase_x,
+                phase_y,
+            );
         }
     }
 }
