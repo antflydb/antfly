@@ -37,7 +37,8 @@ class CreatedGraphIndex:
             creation. Only non-secret provider settings are represented.
         template (str | Unset):
         edge_types (list[EdgeTypeConfig] | Unset):
-        max_edges_per_document (int | Unset):
+        max_edges_per_document (int | Unset): Maximum number of visible edges materialized per document. Zero uses the
+            server safety limit (currently 1,000,000).
         sources (list[CreatedGraphArtifactSourceConfig] | Unset):
         artifact (CreatedGraphArtifactProducerConfig | Unset): Credential-free graph artifact producer configuration
             returned after creation.

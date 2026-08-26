@@ -406,6 +406,7 @@ components:
       type: object
       description: "Credential-free normalized embeddings configuration returned after creation."
       properties:
+        publication_policy: { $ref: "#/components/schemas/IndexPublicationPolicy" }
         coverage_policy: { $ref: "#/components/schemas/DerivedCoveragePolicy" }
         external: { type: boolean, default: false }
         sparse: { type: boolean, default: false }
@@ -660,18 +661,27 @@ components:
       type: string
       enum:
         - pending
+        - queryable_partial
         - ready
         - failed
-      description: "Authoritative query-readiness state for the desired index incarnation."
+      description: "Authoritative query-readiness and completeness state for the desired index incarnation."
     IndexReadinessStatus:
       type: object
       additionalProperties: false
       required:
         - state
+        - queryable
+        - complete
         - pending_reasons
       properties:
         state:
           $ref: '#/components/schemas/IndexReadinessState'
+        queryable:
+          type: boolean
+          description: "Whether the published generation can safely answer queries."
+        complete:
+          type: boolean
+          description: "Whether the desired incarnation has complete coverage and publication according to its configured policies."
         incarnation:
           type: string
           description: "Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents."
@@ -901,6 +911,17 @@ components:
           type: object
           additionalProperties: true
           description: "Artifact promotion replay diagnostics."
+    IndexPublicationPolicy:
+      type: string
+      enum:
+        - progressive
+        - atomic
+      default: progressive
+      description: >-
+        Publication behavior for a managed embeddings index. `progressive`
+        makes a safely checkpointed active generation queryable before initial
+        source coverage is complete. `atomic` keeps a new generation
+        unavailable until complete validation and activation.
     EmbeddingsIndexConfig:
       type: object
       description: >-
@@ -916,6 +937,8 @@ components:
         - [sources, embedding_name]
         - [sources, source_artifact_name]
       properties:
+        publication_policy:
+          $ref: "#/components/schemas/IndexPublicationPolicy"
         coverage_policy:
           $ref: "#/components/schemas/DerivedCoveragePolicy"
           description: >-
@@ -963,8 +986,7 @@ components:
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          deprecated: true
-          description: "Deprecated index-level description of an embedding producer input. Put this field on the matching embedding enrichment and select its output through sources."
+          description: "Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source."
         template:
           x-go-type-skip-optional-pointer: true
           type: string

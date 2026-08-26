@@ -1070,7 +1070,7 @@ test "table contract public response omits unknown nested provider fields" {
     defer std.testing.allocator.free(response);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"}}",
+        "{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"dimension\":384,\"embedder\":{\"provider\":\"openai\",\"model\":\"text-embedding-3-small\"}}",
         response,
     );
 }

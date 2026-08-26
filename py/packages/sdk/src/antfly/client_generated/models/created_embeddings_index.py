@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..models.created_embeddings_index_type import CreatedEmbeddingsIndexType
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
+from ..models.index_publication_policy import IndexPublicationPolicy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -33,6 +34,9 @@ class CreatedEmbeddingsIndex:
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[CreatedEnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required
             by this index.
+        publication_policy (IndexPublicationPolicy | Unset): Publication behavior for a managed embeddings index.
+            `progressive` makes a safely checkpointed active generation queryable before initial source coverage is
+            complete. `atomic` keeps a new generation unavailable until complete validation and activation.
         coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
             completeness.
         external (bool | Unset):  Default: False.
@@ -64,6 +68,7 @@ class CreatedEmbeddingsIndex:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
+    publication_policy: IndexPublicationPolicy | Unset = UNSET
     coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
     sparse: bool | Unset = False
@@ -97,6 +102,10 @@ class CreatedEmbeddingsIndex:
             for enrichments_item_data in self.enrichments:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
+
+        publication_policy: str | Unset = UNSET
+        if not isinstance(self.publication_policy, Unset):
+            publication_policy = self.publication_policy.value
 
         coverage_policy: str | Unset = UNSET
         if not isinstance(self.coverage_policy, Unset):
@@ -161,6 +170,8 @@ class CreatedEmbeddingsIndex:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
+        if publication_policy is not UNSET:
+            field_dict["publication_policy"] = publication_policy
         if coverage_policy is not UNSET:
             field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
@@ -221,6 +232,13 @@ class CreatedEmbeddingsIndex:
                 enrichments_item = CreatedEnrichmentConfig.from_dict(enrichments_item_data)
 
                 enrichments.append(enrichments_item)
+
+        _publication_policy = d.pop("publication_policy", UNSET)
+        publication_policy: IndexPublicationPolicy | Unset
+        if isinstance(_publication_policy, Unset):
+            publication_policy = UNSET
+        else:
+            publication_policy = IndexPublicationPolicy(_publication_policy)
 
         _coverage_policy = d.pop("coverage_policy", UNSET)
         coverage_policy: DerivedCoveragePolicy | Unset
@@ -297,6 +315,7 @@ class CreatedEmbeddingsIndex:
             description=description,
             version=version,
             enrichments=enrichments,
+            publication_policy=publication_policy,
             coverage_policy=coverage_policy,
             external=external,
             sparse=sparse,

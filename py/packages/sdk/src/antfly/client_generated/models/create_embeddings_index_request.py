@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..models.create_embeddings_index_request_type import CreateEmbeddingsIndexRequestType
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
+from ..models.index_publication_policy import IndexPublicationPolicy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -32,6 +33,9 @@ class CreateEmbeddingsIndexRequest:
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
+        publication_policy (IndexPublicationPolicy | Unset): Publication behavior for a managed embeddings index.
+            `progressive` makes a safely checkpointed active generation queryable before initial source coverage is
+            complete. `atomic` keeps a new generation unavailable until complete validation and activation.
         coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
             completeness.
         external (bool | Unset): When true, embeddings are supplied externally via _embeddings and the index does not
@@ -47,8 +51,8 @@ class CreateEmbeddingsIndexRequest:
             source_artifact_name.
         embedding_name (str | Unset): Single-source convenience form. Mutually exclusive with sources; accepted requests
             are normalized to sources.
-        source_artifact_name (str | Unset): Deprecated index-level description of an embedding producer input. Put this
-            field on the matching embedding enrichment and select its output through sources.
+        source_artifact_name (str | Unset): Artifact stream consumed by the embedding enrichment backing this vector
+            index. This is descriptive public configuration; the matching enrichment defines the materialized source.
         template (str | Unset): Handlebars template for generating prompts (managed indexes only; not allowed when
             external=true). See https://handlebarsjs.com/guide/ for more information. Example: Hello, {{#if (eq Name
             "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old..
@@ -245,6 +249,7 @@ class CreateEmbeddingsIndexRequest:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
+    publication_policy: IndexPublicationPolicy | Unset = UNSET
     coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
     sparse: bool | Unset = False
@@ -278,6 +283,10 @@ class CreateEmbeddingsIndexRequest:
             for enrichments_item_data in self.enrichments:
                 enrichments_item = enrichments_item_data.to_dict()
                 enrichments.append(enrichments_item)
+
+        publication_policy: str | Unset = UNSET
+        if not isinstance(self.publication_policy, Unset):
+            publication_policy = self.publication_policy.value
 
         coverage_policy: str | Unset = UNSET
         if not isinstance(self.coverage_policy, Unset):
@@ -345,6 +354,8 @@ class CreateEmbeddingsIndexRequest:
             field_dict["version"] = version
         if enrichments is not UNSET:
             field_dict["enrichments"] = enrichments
+        if publication_policy is not UNSET:
+            field_dict["publication_policy"] = publication_policy
         if coverage_policy is not UNSET:
             field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
@@ -408,6 +419,13 @@ class CreateEmbeddingsIndexRequest:
                 enrichments_item = EnrichmentConfig.from_dict(enrichments_item_data)
 
                 enrichments.append(enrichments_item)
+
+        _publication_policy = d.pop("publication_policy", UNSET)
+        publication_policy: IndexPublicationPolicy | Unset
+        if isinstance(_publication_policy, Unset):
+            publication_policy = UNSET
+        else:
+            publication_policy = IndexPublicationPolicy(_publication_policy)
 
         _coverage_policy = d.pop("coverage_policy", UNSET)
         coverage_policy: DerivedCoveragePolicy | Unset
@@ -487,6 +505,7 @@ class CreateEmbeddingsIndexRequest:
             description=description,
             version=version,
             enrichments=enrichments,
+            publication_policy=publication_policy,
             coverage_policy=coverage_policy,
             external=external,
             sparse=sparse,

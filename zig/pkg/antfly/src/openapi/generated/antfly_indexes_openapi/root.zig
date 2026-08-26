@@ -63,6 +63,7 @@ pub const GraphSourceArtifactStatus = types.GraphSourceArtifactStatus;
 pub const GraphTemplateValue = types.GraphTemplateValue;
 pub const IndexConfig = types.IndexConfig;
 pub const IndexExecutionConfig = types.IndexExecutionConfig;
+pub const IndexPublicationPolicy = types.IndexPublicationPolicy;
 pub const IndexReadinessState = types.IndexReadinessState;
 pub const IndexReadinessStatus = types.IndexReadinessStatus;
 pub const IndexRepairStatus = types.IndexRepairStatus;

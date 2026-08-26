@@ -8288,6 +8288,12 @@ export interface components {
             type: "full_text";
         };
         /**
+         * @description Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
+         * @default progressive
+         * @enum {string}
+         */
+        IndexPublicationPolicy: "progressive" | "atomic";
+        /**
          * @description How generation-scoped source outcomes determine derived-index completeness.
          * @default strict
          * @enum {string}
@@ -9217,6 +9223,7 @@ export interface components {
         };
         /** @description Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected. */
         EmbeddingsIndexConfig: {
+            publication_policy?: components["schemas"]["IndexPublicationPolicy"];
             /** @description Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field. */
             coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
             /**
@@ -9237,10 +9244,7 @@ export interface components {
             sources?: components["schemas"]["ArtifactIndexSource"][];
             /** @description Single-source convenience form. Mutually exclusive with sources; accepted requests are normalized to sources. */
             embedding_name?: string;
-            /**
-             * @deprecated
-             * @description Deprecated index-level description of an embedding producer input. Put this field on the matching embedding enrichment and select its output through sources.
-             */
+            /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
             source_artifact_name?: string;
             /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
@@ -9442,7 +9446,7 @@ export interface components {
             template?: string;
             /** @description List of edge types with their configurations */
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
-            /** @description Maximum number of edges per document (0 = unlimited) */
+            /** @description Maximum number of visible edges materialized per document. Zero uses the server safety limit (currently 1,000,000). */
             max_edges_per_document?: number;
             /** @description Single-source convenience form. Mutually exclusive with sources; normalized responses use sources. */
             source?: components["schemas"]["GraphArtifactSourceConfig"];
@@ -9715,12 +9719,16 @@ export interface components {
             enrichments?: components["schemas"]["EnrichmentConfig"][];
         } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
         /**
-         * @description Authoritative query-readiness state for the desired index incarnation.
+         * @description Authoritative query-readiness and completeness state for the desired index incarnation.
          * @enum {string}
          */
-        IndexReadinessState: "pending" | "ready" | "failed";
+        IndexReadinessState: "pending" | "queryable_partial" | "ready" | "failed";
         IndexReadinessStatus: {
             state: components["schemas"]["IndexReadinessState"];
+            /** @description Whether the published generation can safely answer queries. */
+            queryable: boolean;
+            /** @description Whether the desired incarnation has complete coverage and publication according to its configured policies. */
+            complete: boolean;
             /** @description Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents. */
             incarnation?: string;
             /**
@@ -12058,6 +12066,7 @@ export interface components {
         };
         /** @description Credential-free normalized embeddings configuration returned after creation. */
         CreatedEmbeddingsIndexConfig: {
+            publication_policy?: components["schemas"]["IndexPublicationPolicy"];
             coverage_policy?: components["schemas"]["DerivedCoveragePolicy"];
             /** @default false */
             external?: boolean;
@@ -12123,6 +12132,7 @@ export interface components {
             summarizer?: components["schemas"]["CreatedProviderConfig"];
             template?: string;
             edge_types?: components["schemas"]["EdgeTypeConfig"][];
+            /** @description Maximum number of visible edges materialized per document. Zero uses the server safety limit (currently 1,000,000). */
             max_edges_per_document?: number;
             sources?: components["schemas"]["CreatedGraphArtifactSourceConfig"][];
             artifact?: components["schemas"]["CreatedGraphArtifactProducerConfig"];

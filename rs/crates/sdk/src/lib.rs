@@ -474,6 +474,7 @@ impl Default for types::CreateEmbeddingsIndexRequest {
             field: None,
             mem_only: None,
             min_weight: None,
+            publication_policy: Some(types::IndexPublicationPolicy::Progressive),
             source_artifact_name: None,
             sources: None,
             sparse: false,
