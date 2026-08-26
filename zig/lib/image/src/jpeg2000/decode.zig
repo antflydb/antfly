@@ -369,13 +369,12 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
     defer packet_model.deinit(allocator);
 
     const policy = policiesForState(&decode_state);
-    const coding_style = decode_state.coding_style orelse return error.MissingCodingStyle;
-    const pixels = if (coding_style.wavelet_transform == 0) blk: {
-        var assembler = try reconstruct.IrreversiblePlaneAssembler.init(allocator, &decode_state);
+    const pixels = if (try reconstruct.StreamingPlaneAssembler.canAssemble(&decode_state)) blk: {
+        var assembler = try reconstruct.StreamingPlaneAssembler.init(allocator, &decode_state);
         defer assembler.deinit();
         const Visitor = struct {
             fn visit(context: *anyopaque, codeblock_state: *const packet.Tier1CodeblockState) !void {
-                const plane_assembler: *reconstruct.IrreversiblePlaneAssembler = @ptrCast(@alignCast(context));
+                const plane_assembler: *reconstruct.StreamingPlaneAssembler = @ptrCast(@alignCast(context));
                 try plane_assembler.appendCodeblock(codeblock_state);
             }
         };
