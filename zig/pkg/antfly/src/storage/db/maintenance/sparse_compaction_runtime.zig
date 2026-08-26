@@ -459,24 +459,38 @@ test "sparse compaction defers backend cancellation through mandatory retirement
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const Retirer = struct {
-        fn run(runtime: *SparseCompactionRuntime, retired: *std.atomic.Value(bool)) Io.Cancelable!void {
+        fn run(
+            runtime: *SparseCompactionRuntime,
+            cancellation_point_ready: *std.atomic.Value(bool),
+            release_blocker: *std.atomic.Value(bool),
+            retired: *std.atomic.Value(bool),
+        ) Io.Cancelable!void {
+            const io = runtime.io_impl.?.io();
+            cancellation_point_ready.store(true, .release);
+            io.sleep(.fromSeconds(60), .awake) catch |err| switch (err) {
+                error.Canceled => io.recancel(),
+            };
+
+            // `recancel` guarantees the mandatory section begins with a real
+            // backend cancellation pending. Let the independent lock owner
+            // drain only after that invariant is established.
+            release_blocker.store(true, .release);
             var retirement = MandatoryApplyRetirement.acquire(runtime) catch unreachable;
             defer retirement.deinit();
             retired.store(true, .release);
             try retirement.releaseAndCheckCancellation();
         }
     };
-    const CancelContext = struct {
-        future: *Io.Future(Io.Cancelable!void),
-        io: Io,
-        started: std.atomic.Value(bool) = .init(false),
-        cancel_error: ?anyerror = null,
+    const Blocker = struct {
+        apply_lock: *apply_rw_lock_mod.ApplyRwLock,
+        held: *std.atomic.Value(bool),
+        release: *const std.atomic.Value(bool),
 
         fn run(ctx: *@This()) void {
-            ctx.started.store(true, .release);
-            ctx.future.cancel(ctx.io) catch |err| {
-                ctx.cancel_error = err;
-            };
+            ctx.apply_lock.lockShared();
+            ctx.held.store(true, .release);
+            while (!ctx.release.load(.acquire)) std.Thread.yield() catch {};
+            ctx.apply_lock.unlockShared();
         }
     };
 
@@ -493,51 +507,52 @@ test "sparse compaction defers backend cancellation through mandatory retirement
         .apply_mutex = &apply_lock,
         .config = .{ .enabled = true },
     };
-    var retired = std.atomic.Value(bool).init(false);
+    var blocker_held = std.atomic.Value(bool).init(false);
+    var release_blocker = std.atomic.Value(bool).init(false);
+    var blocker_ctx = Blocker{
+        .apply_lock = &apply_lock,
+        .held = &blocker_held,
+        .release = &release_blocker,
+    };
+    const blocker_thread = try std.Thread.spawn(.{}, Blocker.run, .{&blocker_ctx});
+    var blocker_active = true;
+    defer if (blocker_active) {
+        release_blocker.store(true, .release);
+        blocker_thread.join();
+    };
+    while (!blocker_held.load(.acquire)) std.Thread.yield() catch {};
 
-    apply_lock.lockShared();
-    var shared_held = true;
-    var future = Io.async(io, Retirer.run, .{ &runtime, &retired });
+    var cancellation_point_ready = std.atomic.Value(bool).init(false);
+    var retired = std.atomic.Value(bool).init(false);
+    var future = Io.async(io, Retirer.run, .{
+        &runtime,
+        &cancellation_point_ready,
+        &release_blocker,
+        &retired,
+    });
     var future_active = true;
-    defer {
-        // A retirement waiter has cancellation blocked by design. Always
-        // unblock the lock before awaiting it during failure cleanup.
-        if (shared_held) apply_lock.unlockShared();
-        if (future_active) _ = future.cancel(io) catch {};
-    }
-    var waiter_joined = false;
+    defer if (future_active) {
+        release_blocker.store(true, .release);
+        _ = future.cancel(io) catch {};
+    };
+    var cancellation_point_joined = false;
     for (0..5_000) |_| {
-        if (apply_lock.exclusive_waiters.load(.acquire) != 0) {
-            waiter_joined = true;
+        if (cancellation_point_ready.load(.acquire)) {
+            cancellation_point_joined = true;
             break;
         }
         try io.sleep(.fromMilliseconds(1), .awake);
     }
-    try std.testing.expect(waiter_joined);
+    try std.testing.expect(cancellation_point_joined);
 
-    var cancel_ctx = CancelContext{ .future = &future, .io = io };
-    const cancel_thread = try std.Thread.spawn(.{}, CancelContext.run, .{&cancel_ctx});
-    var cancel_thread_active = true;
-    defer if (cancel_thread_active) {
-        if (shared_held) {
-            apply_lock.unlockShared();
-            shared_held = false;
-        }
-        cancel_thread.join();
-    };
-    while (!cancel_ctx.started.load(.acquire)) std.Thread.yield() catch {};
-    // `Future.cancel` blocks until the protected task reaches its explicit
-    // post-retirement cancellation point. Give the canceling thread time to
-    // publish its request before allowing the apply lock to become available.
-    try io.sleep(.fromMilliseconds(10), .awake);
-    apply_lock.unlockShared();
-    shared_held = false;
-    cancel_thread.join();
-    cancel_thread_active = false;
+    const result = future.cancel(io);
     future_active = false;
+    release_blocker.store(true, .release);
+    blocker_thread.join();
+    blocker_active = false;
 
+    try std.testing.expectError(error.Canceled, result);
     try std.testing.expect(retired.load(.acquire));
-    try std.testing.expectEqual(error.Canceled, cancel_ctx.cancel_error.?);
     try std.testing.expectEqual(@as(u64, 0), apply_lock.exclusive_waiters.load(.acquire));
     try std.testing.expect(apply_lock.tryLockExclusive());
     apply_lock.unlockExclusive();
