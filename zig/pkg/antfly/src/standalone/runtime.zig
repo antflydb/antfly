@@ -3443,9 +3443,10 @@ fn parsePreloadModelFlag(value: []const u8) !inference_bridge.WarmModel {
     var backend: ?[]const u8 = null;
     if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
         const backend_name = model_name[0..backend_separator];
-        if (!validInferenceBackend(backend_name)) return error.InvalidArguments;
-        backend = backend_name;
-        model_name = model_name[backend_separator + 1 ..];
+        if (validInferenceBackend(backend_name)) {
+            backend = backend_name;
+            model_name = model_name[backend_separator + 1 ..];
+        }
     }
     if (model_name.len == 0) return error.InvalidArguments;
     return .{
@@ -6089,6 +6090,24 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_preload_models.items[0].name.slice());
     try std.testing.expectEqualStrings("metal", cfg.inference_preload_models.items[0].backend.slice().?);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
+}
+
+test "parse cli preserves registry variants and recognizes explicit preload backends" {
+    var argv = [_][*:0]const u8{
+        "--preload-model",
+        "embedder:owner/model:i8",
+        "--preload-model",
+        "generator:metal:owner/model:Q4_K_M",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iter);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.inference_preload_models.items.len);
+    try std.testing.expectEqualStrings("owner/model:i8", cfg.inference_preload_models.items[0].name.slice());
+    try std.testing.expect(cfg.inference_preload_models.items[0].backend.slice() == null);
+    try std.testing.expectEqualStrings("owner/model:Q4_K_M", cfg.inference_preload_models.items[1].name.slice());
+    try std.testing.expectEqualStrings("metal", cfg.inference_preload_models.items[1].backend.slice().?);
 }
 
 test "parse cli accepts HA primary runtime flags" {
