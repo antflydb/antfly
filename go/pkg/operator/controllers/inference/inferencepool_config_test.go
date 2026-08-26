@@ -159,3 +159,11 @@ func TestZigWarmModelKindUsesRegistryTaskPrecedence(t *testing.T) {
 	g.Expect(zigWarmModelKind([]string{"generate", "rerank"})).To(Equal("reranker"))
 	g.Expect(zigWarmModelKind(nil)).To(Equal("generator"))
 }
+
+func TestInferenceWarmModelNamePreservesVariant(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(inferenceWarmModelName("BAAI/bge-small-en-v1.5:i8")).To(Equal("BAAI/bge-small-en-v1.5:i8"))
+	g.Expect(inferenceWarmModelName("hf:owner/model:i8")).To(Equal("owner/model:i8"))
+	g.Expect(inferenceWarmModelName("owner/model")).To(Equal("owner/model"))
+	g.Expect(inferenceWarmModelName("s3://bucket/model")).To(Equal("s3://bucket/model"))
+}

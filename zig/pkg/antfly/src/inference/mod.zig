@@ -51,7 +51,10 @@ test "inference module compiles" {
 }
 
 test "bedrock provider request helpers" {
+    try bedrock.testBedrockSigningClockUsesUnixWallTime();
+    try bedrock.testBedrockSigningDatesUseCalendarMonthNumbers();
     try bedrock.testTitanMultimodalBodyOmitsEmptyInputText();
+    try bedrock.testTitanMultimodalTextBodyUsesEmbeddingConfig();
     try bedrock.testTitanMultimodalBodyCombinesTextAndRejectsMultipleImages();
     try bedrock.testTitanMultimodalBodyAcceptsDataUriAndRejectsRemoteUrl();
     try bedrock.testCohereV4BodyUsesBedrockImageUrlDataUri();
@@ -61,6 +64,7 @@ test "bedrock provider request helpers" {
     try bedrock.testCredentialUrlEncoding();
     try bedrock.testRequestShapeBatchesByProviderRequest();
     try bedrock.testBedrockInvokePathEscapesModelId();
+    try bedrock.testBedrockCanonicalUriDoubleEncodesEscapedModelId();
     try bedrock.testBedrockSignerUsesBedrockServiceScope();
     try bedrock.testBedrockSignerSignsGetRequests();
     try bedrock.testEndpointHostIncludesExplicitPort();
