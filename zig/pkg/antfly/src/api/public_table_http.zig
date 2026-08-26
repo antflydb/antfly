@@ -856,7 +856,17 @@ const GraphQueryModeDiagnostic = struct {
 };
 
 pub fn graphQueryModeUnsupportedBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    return try graphQueryCapabilityUnsupportedBody(alloc, body, null);
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
+    defer if (parsed) |*value| value.deinit();
+    var diagnostic = if (parsed) |value| graphQueryModeDiagnostic(value.value) else GraphQueryModeDiagnostic{};
+    if (graph_query_diagnostic.take()) |recorded| {
+        diagnostic = .{
+            .operation = recorded.operation,
+            .mode = recorded.mode,
+            .reason = @tagName(recorded.reason),
+        };
+    }
+    return try graphQueryModeUnsupportedBodyForDiagnostic(alloc, diagnostic);
 }
 
 pub fn graphQueryCapabilityUnsupportedBody(
@@ -882,6 +892,13 @@ pub fn graphQueryCapabilityUnsupportedBody(
             diagnostic.reason = value;
         }
     }
+    return try graphQueryModeUnsupportedBodyForDiagnostic(alloc, diagnostic);
+}
+
+fn graphQueryModeUnsupportedBodyForDiagnostic(
+    alloc: std.mem.Allocator,
+    diagnostic: GraphQueryModeDiagnostic,
+) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
         .@"error" = "graph_query_mode_unsupported",
@@ -894,6 +911,8 @@ pub fn graphQueryCapabilityUnsupportedBody(
 }
 
 fn graphQueryModeUnsupportedMessage(reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, reason, "legacy_graph_searches_not_supported"))
+        return "serverless graph queries require graph_queries; graph_searches is available only on stateful/provisioned Antfly during its compatibility window";
     if (std.mem.eql(u8, reason, "external_alias_document_filter_not_supported"))
         return "this runtime snapshot cannot evaluate stored-document filters on aliases outside the queried table; remove that alias filter or use coordinator-backed execution";
     if (std.mem.eql(u8, reason, "external_alias_source_not_supported"))
@@ -3982,6 +4001,40 @@ test "runtime graph capability diagnostics preserve the failing named operation"
     try std.testing.expectEqualStrings("later_match", parsed.value.operation);
     try std.testing.expectEqualStrings("match", parsed.value.mode);
     try std.testing.expectEqualStrings("external_alias_source_not_supported", parsed.value.reason);
+}
+
+test "recorded graph mode diagnostics explain serverless legacy rejection" {
+    graph_query_diagnostic.reset();
+    defer graph_query_diagnostic.reset();
+    graph_query_diagnostic.record(
+        "$request",
+        "graph_searches",
+        .legacy_graph_searches_not_supported,
+    );
+
+    const body = try graphQueryModeUnsupportedBody(
+        std.testing.allocator,
+        "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\"}}}",
+    );
+    defer std.testing.allocator.free(body);
+    var parsed = try ant_json.parseFromSlice(
+        metadata_openapi.GraphQueryModeUnsupportedError,
+        std.testing.allocator,
+        body,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("$request", parsed.value.operation);
+    try std.testing.expectEqualStrings("graph_searches", parsed.value.mode);
+    try std.testing.expectEqualStrings(
+        "legacy_graph_searches_not_supported",
+        parsed.value.reason,
+    );
+    try std.testing.expectEqualStrings(
+        "serverless graph queries require graph_queries; graph_searches is available only on stateful/provisioned Antfly during its compatibility window",
+        parsed.value.message,
+    );
 }
 
 test "public table query handler maps unsupported exact sort" {

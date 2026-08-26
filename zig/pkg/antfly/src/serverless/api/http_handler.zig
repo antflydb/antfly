@@ -2651,6 +2651,16 @@ pub const HttpHandler = struct {
         };
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch return null;
         defer raw_request.deinit();
+        const has_legacy_graph_request = raw_request.value == .object and
+            if (raw_request.value.object.get("graph_searches")) |value| value != .null else false;
+        if (has_legacy_graph_request) {
+            graph_query_diagnostic.record(
+                "$request",
+                "graph_searches",
+                .legacy_graph_searches_not_supported,
+            );
+            return error.UnsupportedQueryRequest;
+        }
         const has_graph_request = raw_request.value == .object and
             (raw_request.value.object.get("graph_queries") != null or
                 raw_request.value.object.get("graph_searches") != null);
@@ -10810,6 +10820,28 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqualStrings("doc-b", binding_b.key);
     try std.testing.expectEqualStrings("doc-c", binding_c.key);
 
+    var legacy_pattern = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/query",
+        .body =
+        \\{"graph_searches":{"two_hop":{"type":"neighbors","index":"graph_idx","start_nodes":{"keys":["doc-a"]}}},"limit":10}
+        ,
+    });
+    defer legacy_pattern.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), legacy_pattern.status);
+    var parsed_legacy_pattern = try parseJsonTestBody(
+        metadata_openapi.GraphQueryModeUnsupportedError,
+        alloc,
+        legacy_pattern.body,
+    );
+    defer parsed_legacy_pattern.deinit();
+    try std.testing.expectEqualStrings("$request", parsed_legacy_pattern.value.operation);
+    try std.testing.expectEqualStrings("graph_searches", parsed_legacy_pattern.value.mode);
+    try std.testing.expectEqualStrings(
+        "legacy_graph_searches_not_supported",
+        parsed_legacy_pattern.value.reason,
+    );
+
     var invalid_version_neighbors = try handler.handle(.{
         .method = .post,
         .path = "/internal/v1/namespaces/docs/query/versions/1/graph/neighbors",
@@ -11034,6 +11066,30 @@ test "serverless public graph query rejects exact sort controls" {
         "{\"graph_queries\":{\"related\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"max_depth\":1}}},\"limti\":10}",
         .none,
     ));
+
+    graph_query_diagnostic.reset();
+    try std.testing.expectError(error.UnsupportedQueryRequest, handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}}}",
+        .none,
+    ));
+    const legacy_diagnostic = graph_query_diagnostic.take() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("$request", legacy_diagnostic.operation);
+    try std.testing.expectEqualStrings("graph_searches", legacy_diagnostic.mode);
+    try std.testing.expectEqual(
+        graph_query_diagnostic.Reason.legacy_graph_searches_not_supported,
+        legacy_diagnostic.reason,
+    );
+
+    // Generated clients may serialize nullable optional fields explicitly.
+    // Null remains equivalent to omission and must not select the graph path.
+    try std.testing.expect((try handler.handleTablePublicGraphQueryRequest(
+        "docs",
+        "docs",
+        "{\"graph_searches\":null}",
+        .none,
+    )) == null);
 }
 
 test "serverless public graph reader shares weighted traversal and k shortest semantics" {
