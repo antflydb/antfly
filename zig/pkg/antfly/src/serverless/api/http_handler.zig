@@ -6690,11 +6690,26 @@ fn textResponse(alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
 }
 
 fn unsupportedMixedSourceReturnModeResponse(alloc: Allocator) !HttpResponse {
-    return textResponse(
+    return jsonResponse(alloc, 422, public_table_http.UnsupportedHierarchyGroupingError{});
+}
+
+test "serverless mixed hierarchy grouping response uses the public contract" {
+    const alloc = std.testing.allocator;
+    var response = try unsupportedMixedSourceReturnModeResponse(alloc);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type);
+    var parsed = try std.json.parseFromSlice(
+        public_table_http.UnsupportedHierarchyGroupingError,
         alloc,
-        422,
-        "mixed document/chunk vector indexes support return_mode parent, parent_with_chunks, member, or chunk; unit modes require homogeneous chunk sources",
+        response.body,
+        .{},
     );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_hierarchy_grouping", parsed.value.@"error");
+    try std.testing.expectEqualStrings("use_source_grouping_or_direct_members", parsed.value.action);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "return_mode") == null);
 }
 
 test "serverless http handler serves internal namespace lifecycle, admission, and query head" {

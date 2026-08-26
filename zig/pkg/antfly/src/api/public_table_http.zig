@@ -698,6 +698,37 @@ pub fn hierarchyCursorStaleBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
+/// Stable, non-retryable public error for hierarchy grouping that cannot be
+/// represented by a heterogeneous document/chunk vector index. Keep this in
+/// sync with UnsupportedHierarchyGroupingError in the public OpenAPI contract.
+pub const UnsupportedHierarchyGroupingError = struct {
+    status: u16 = 422,
+    @"error": []const u8 = "unsupported_hierarchy_grouping",
+    message: []const u8 = "mixed document/chunk vector indexes cannot group at hierarchy unit level; use hierarchy.group_by.level=source, omit hierarchy.group_by for direct members, or query a homogeneous chunk-backed index",
+    reason: []const u8 = "mixed_document_chunk_sources",
+    field: []const u8 = "hierarchy.group_by.level",
+    action: []const u8 = "use_source_grouping_or_direct_members",
+    retryable: bool = false,
+};
+
+pub fn unsupportedHierarchyGroupingBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, UnsupportedHierarchyGroupingError{}, .{});
+}
+
+/// Stable fallback for unsupported queries that do not have a more specific
+/// structured diagnostic. Keep this in sync with UnsupportedQueryError in the
+/// public OpenAPI contract.
+pub const UnsupportedQueryError = struct {
+    status: u16 = 422,
+    @"error": []const u8 = "unsupported_query_request",
+    message: []const u8 = "unsupported query request",
+    retryable: bool = false,
+};
+
+pub fn unsupportedQueryBody(alloc: std.mem.Allocator) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, UnsupportedQueryError{}, .{});
+}
+
 pub fn isNonRetryableTableStorageReadError(err: anyerror) bool {
     return switch (err) {
         error.InvalidManifest,
@@ -858,7 +889,7 @@ pub fn handleTableQueryRequest(
     query_contract.validatePublicQuerySortTupleContract(alloc, body) catch |err| switch (err) {
         error.InvalidQueryRequest => {
             std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
-            return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+            return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
         },
     };
     const response_body = api.executeTableQueryRequest(alloc, table_name, body, row_filter_json) catch |err| {
@@ -866,7 +897,7 @@ pub fn handleTableQueryRequest(
             error.InvalidQueryRequest => {
                 if (db_mod.peekLastSortRejectionDiagnostic() != null) {
                     std.log.warn("public table query invalid exact sort table={s} err={}", .{ table_name, err });
-                    return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+                    return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
                 }
                 std.log.err("public table query invalid table={s} err={}", .{ table_name, err });
                 return .{ .status = 400, .body = try alloc.dupe(u8, "invalid query request") };
@@ -897,7 +928,8 @@ pub fn handleTableQueryRequest(
             ),
             error.UnsupportedMixedSourceReturnMode => return .{
                 .status = 422,
-                .body = try alloc.dupe(u8, "mixed document/chunk vector indexes support return_mode parent, parent_with_chunks, member, or chunk; unit modes require homogeneous chunk sources"),
+                .body = try unsupportedHierarchyGroupingBody(alloc),
+                .json = true,
             },
             error.NotFound => {
                 std.log.err("public table query missing table={s} err={}", .{ table_name, err });
@@ -929,7 +961,7 @@ pub fn handleTableQueryRequest(
             },
             error.QueryCandidateBudgetExceeded => {
                 std.log.warn("public table query candidate budget exceeded table={s} err={}", .{ table_name, err });
-                return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc) };
+                return .{ .status = 422, .body = try queryCandidateBudgetExceededBody(alloc), .json = true };
             },
             error.HierarchyCursorStale => {
                 std.log.info("public hierarchy traversal cursor stale table={s}", .{table_name});
@@ -968,7 +1000,7 @@ pub fn handleTableQueryRequest(
             },
             error.UnsupportedExactSort => {
                 std.log.warn("public table query unsupported exact sort table={s} err={}", .{ table_name, err });
-                return .{ .status = 422, .body = try unsupportedExactSortBody(alloc) };
+                return .{ .status = 422, .body = try unsupportedExactSortBody(alloc), .json = true };
             },
             error.Canceled => return error.Canceled,
             error.DeadlineExceeded => return error.DeadlineExceeded,
@@ -2711,7 +2743,15 @@ test "public table query handler preserves structured filter and mixed-source di
     );
     defer mixed_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 422), mixed_resp.status);
-    try std.testing.expect(std.mem.indexOf(u8, mixed_resp.body, "return_mode parent, parent_with_chunks, member, or chunk") != null);
+    try std.testing.expect(mixed_resp.json);
+    var mixed_error = try std.json.parseFromSlice(UnsupportedHierarchyGroupingError, std.testing.allocator, mixed_resp.body, .{});
+    defer mixed_error.deinit();
+    try std.testing.expectEqualStrings("unsupported_hierarchy_grouping", mixed_error.value.@"error");
+    try std.testing.expectEqualStrings("mixed_document_chunk_sources", mixed_error.value.reason);
+    try std.testing.expectEqualStrings("hierarchy.group_by.level", mixed_error.value.field);
+    try std.testing.expectEqualStrings("use_source_grouping_or_direct_members", mixed_error.value.action);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_error.value.message, "return_mode") == null);
+    try std.testing.expect(!mixed_error.value.retryable);
 }
 
 test "public table query handler preserves retryable failure status" {
@@ -3057,6 +3097,7 @@ test "public table query handler maps invalid exact sort diagnostics" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expect(resp.json);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
@@ -3115,6 +3156,7 @@ test "public table query handler rejects unknown sort tuple properties before di
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expect(resp.json);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
@@ -3175,6 +3217,7 @@ test "public table query handler maps candidate budget exhaustion" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expect(resp.json);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,
@@ -3235,6 +3278,7 @@ test "public table query handler maps unsupported exact sort" {
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expect(resp.json);
     var parsed = try std.json.parseFromSlice(struct {
         status: u16,
         @"error": []const u8,

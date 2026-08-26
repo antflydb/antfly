@@ -638,6 +638,10 @@ from .query_builder_request_example_documents_item import QueryBuilderRequestExa
 from .query_builder_result import QueryBuilderResult
 from .query_builder_result_plan import QueryBuilderResultPlan
 from .query_builder_result_query import QueryBuilderResultQuery
+from .query_filter_error import QueryFilterError
+from .query_filter_error_error import QueryFilterErrorError
+from .query_filter_error_field import QueryFilterErrorField
+from .query_filter_error_status import QueryFilterErrorStatus
 from .query_hierarchy import QueryHierarchy
 from .query_hit import QueryHit
 from .query_hit_hierarchy import QueryHitHierarchy
@@ -819,6 +823,15 @@ from .traversal_result_document import TraversalResultDocument
 from .traversal_rules import TraversalRules
 from .traverse_response import TraverseResponse
 from .tree_search_config import TreeSearchConfig
+from .unsupported_hierarchy_grouping_error import UnsupportedHierarchyGroupingError
+from .unsupported_hierarchy_grouping_error_action import UnsupportedHierarchyGroupingErrorAction
+from .unsupported_hierarchy_grouping_error_error import UnsupportedHierarchyGroupingErrorError
+from .unsupported_hierarchy_grouping_error_field import UnsupportedHierarchyGroupingErrorField
+from .unsupported_hierarchy_grouping_error_reason import UnsupportedHierarchyGroupingErrorReason
+from .unsupported_hierarchy_grouping_error_status import UnsupportedHierarchyGroupingErrorStatus
+from .unsupported_query_error import UnsupportedQueryError
+from .unsupported_query_error_error import UnsupportedQueryErrorError
+from .unsupported_query_error_status import UnsupportedQueryErrorStatus
 from .update_extension_request import UpdateExtensionRequest
 from .update_manifest_ref import UpdateManifestRef
 from .update_password_request import UpdatePasswordRequest
@@ -1469,6 +1482,10 @@ __all__ = (
     "QueryBuilderResult",
     "QueryBuilderResultPlan",
     "QueryBuilderResultQuery",
+    "QueryFilterError",
+    "QueryFilterErrorError",
+    "QueryFilterErrorField",
+    "QueryFilterErrorStatus",
     "QueryHierarchy",
     "QueryHit",
     "QueryHitHierarchy",
@@ -1650,6 +1667,15 @@ __all__ = (
     "TraversalRules",
     "TraverseResponse",
     "TreeSearchConfig",
+    "UnsupportedHierarchyGroupingError",
+    "UnsupportedHierarchyGroupingErrorAction",
+    "UnsupportedHierarchyGroupingErrorError",
+    "UnsupportedHierarchyGroupingErrorField",
+    "UnsupportedHierarchyGroupingErrorReason",
+    "UnsupportedHierarchyGroupingErrorStatus",
+    "UnsupportedQueryError",
+    "UnsupportedQueryErrorError",
+    "UnsupportedQueryErrorStatus",
     "UpdateExtensionRequest",
     "UpdateManifestRef",
     "UpdatePasswordRequest",

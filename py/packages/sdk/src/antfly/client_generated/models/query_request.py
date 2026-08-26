@@ -195,7 +195,8 @@ class QueryRequest:
             size predictable. The presence of this object selects the canonical contract:
             without `group_by` or `children`, including when the object is empty, direct index
             matches are returned. `ancestors` only controls projected context and never changes result
-            cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+            cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+            source-grouped result shape.
         limit (int | Unset): Maximum number of top-level results to return. For semantic_search, this is the topk
             parameter.
             This does not limit nested matches attached through hierarchy.group_by.matches;

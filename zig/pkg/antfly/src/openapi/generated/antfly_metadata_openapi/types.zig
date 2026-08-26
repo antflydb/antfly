@@ -2161,7 +2161,18 @@ pub const QueryBuilderResult = struct {
     warnings: ?[]const []const u8 = null,
 };
 
-/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+/// A public filter or exclusion query contains an invalid or unsupported node.
+pub const QueryFilterError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    field: []const u8,
+    /// Stable name of the first invalid or unsupported filter node.
+    offending_node: []const u8,
+    retryable: bool,
+};
+
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit source-grouped result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
@@ -2179,7 +2190,7 @@ pub const QueryHit = struct {
     /// Scores partitioned by index when using RRF search.
     _index_scores: ?std.json.Value = null,
     _source: ?std.json.Value = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. V0.2-compatible implicit rollup requests continue to use the deprecated `chunks` field instead of `matches`.
     hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
@@ -2203,7 +2214,7 @@ pub const QueryHitHierarchy = struct {
     position: ?[]const u8 = null,
     /// Composite source hierarchy revision to which the position and cursor are bound.
     revision: ?[]const u8 = null,
-    /// Legacy child chunk hits included for source-level rollups.
+    /// Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
     chunks: ?[]const HierarchyMatchHit = null,
 };
 
@@ -3739,6 +3750,34 @@ pub const TreeSearchConfig = struct {
     max_depth: ?i64 = null,
     /// Number of branches to explore at each level
     beam_width: ?i64 = null,
+};
+
+/// A requested hierarchy grouping level cannot represent every member of the selected heterogeneous index.
+pub const UnsupportedHierarchyGroupingError = struct {
+    status: i32,
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable remediation using only public query fields.
+    message: []const u8,
+    /// Stable reason the requested hierarchy level is unavailable.
+    reason: []const u8,
+    /// Public request field that selected the unsupported grouping level.
+    field: []const u8,
+    /// Select source grouping, omit group_by for direct members, or use a homogeneous chunk-backed index.
+    action: []const u8,
+    /// Retrying the same request cannot succeed without changing its hierarchy grouping.
+    retryable: bool,
+};
+
+/// A query requests an unsupported feature without a more specific structured diagnostic.
+pub const UnsupportedQueryError = struct {
+    status: i32,
+    /// Stable machine-readable error code.
+    @"error": []const u8,
+    /// Human-readable error summary.
+    message: []const u8,
+    /// Retrying the same request cannot succeed without changing it.
+    retryable: bool,
 };
 
 pub const WebSearchConnection = struct {

@@ -33,7 +33,8 @@ class QueryHitHierarchy:
             request.
         position (str | Unset): Opaque format-neutral position used for sequential hierarchy traversal.
         revision (str | Unset): Composite source hierarchy revision to which the position and cursor are bound.
-        chunks (list[HierarchyMatchHit] | Unset): Legacy child chunk hits included for source-level rollups.
+        chunks (list[HierarchyMatchHit] | Unset): Deprecated child chunk hits included by the v0.2-compatible implicit
+            source rollup.
     """
 
     level: QueryHitHierarchyLevel | Unset = UNSET

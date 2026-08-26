@@ -2877,6 +2877,78 @@ export interface components {
              */
             retryable: false;
         };
+        /** @description A requested hierarchy grouping level cannot represent every member of the selected heterogeneous index. */
+        UnsupportedHierarchyGroupingError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description Stable machine-readable error code.
+             * @enum {string}
+             */
+            error: "unsupported_hierarchy_grouping";
+            /** @description Human-readable remediation using only public query fields. */
+            message: string;
+            /**
+             * @description Stable reason the requested hierarchy level is unavailable.
+             * @enum {string}
+             */
+            reason: "mixed_document_chunk_sources";
+            /**
+             * @description Public request field that selected the unsupported grouping level.
+             * @enum {string}
+             */
+            field: "hierarchy.group_by.level";
+            /**
+             * @description Select source grouping, omit group_by for direct members, or use a homogeneous chunk-backed index.
+             * @enum {string}
+             */
+            action: "use_source_grouping_or_direct_members";
+            /**
+             * @description Retrying the same request cannot succeed without changing its hierarchy grouping.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
+        /** @description A query requests an unsupported feature without a more specific structured diagnostic. */
+        UnsupportedQueryError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 422;
+            /**
+             * @description Stable machine-readable error code.
+             * @enum {string}
+             */
+            error: "unsupported_query_request";
+            /** @description Human-readable error summary. */
+            message: string;
+            /**
+             * @description Retrying the same request cannot succeed without changing it.
+             * @enum {boolean}
+             */
+            retryable: false;
+        };
+        /** @description A public filter or exclusion query contains an invalid or unsupported node. */
+        QueryFilterError: {
+            /**
+             * Format: int32
+             * @enum {integer}
+             */
+            status: 400 | 422;
+            /** @enum {string} */
+            error: "invalid_query_request" | "unsupported_query_request";
+            message: string;
+            /** @enum {string} */
+            field: "filter_query" | "exclusion_query";
+            /** @description Stable name of the first invalid or unsupported filter node. */
+            offending_node: string;
+            /** @enum {boolean} */
+            retryable: false;
+        };
         ExactSortError: {
             /**
              * @description Stable error class.
@@ -6323,7 +6395,8 @@ export interface components {
          *     size predictable. The presence of this object selects the canonical contract:
          *     without `group_by` or `children`, including when the object is empty, direct index
          *     matches are returned. `ancestors` only controls projected context and never changes result
-         *     cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+         *     cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+         *     source-grouped result shape.
          */
         QueryHierarchy: {
             group_by?: components["schemas"]["HierarchyGroupBy"];
@@ -7380,7 +7453,7 @@ export interface components {
             revision?: string;
             /**
              * @deprecated
-             * @description Legacy child chunk hits included for source-level rollups.
+             * @description Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
              */
             chunks?: components["schemas"]["HierarchyMatchHit"][];
         };
@@ -7414,7 +7487,8 @@ export interface components {
              *     group includes nested matches. Standard fields include `level`,
              *     `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`, and
              *     `ancestors` with response-local or requested DB-backed source/unit context when available.
-             *     Legacy rollup requests continue to use `chunks` instead of `matches`.
+             *     V0.2-compatible implicit rollup requests continue to use the deprecated
+             *     `chunks` field instead of `matches`.
              */
             hierarchy?: components["schemas"]["QueryHitHierarchy"];
             /**
@@ -14068,6 +14142,15 @@ export interface components {
                 "application/json": components["schemas"]["ExactSortError"];
             };
         };
+        /** @description The query is valid JSON but requests an unsupported execution or result contract */
+        UnsupportedQuery: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["ExactSortError"] | components["schemas"]["QueryFilterError"] | components["schemas"]["UnsupportedHierarchyGroupingError"] | components["schemas"]["UnsupportedQueryError"];
+            };
+        };
         /** @description The hierarchy changed after the traversal cursor was issued */
         HierarchyCursorStale: {
             headers: {
@@ -15102,7 +15185,7 @@ export interface operations {
                 };
             };
             409: components["responses"]["HierarchyCursorStale"];
-            422: components["responses"]["UnsupportedExactSort"];
+            422: components["responses"]["UnsupportedQuery"];
             500: components["responses"]["QueryInternalServerError"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
         };
@@ -15389,7 +15472,7 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["HierarchyCursorStale"];
-            422: components["responses"]["UnsupportedExactSort"];
+            422: components["responses"]["UnsupportedQuery"];
             500: components["responses"]["QueryInternalServerError"];
             503: components["responses"]["QueryTemporarilyUnavailable"];
         };

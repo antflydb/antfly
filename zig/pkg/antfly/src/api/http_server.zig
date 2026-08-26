@@ -11916,12 +11916,8 @@ pub const ApiHttpServer = struct {
             error.UnsupportedQueryRequest => if (queryBodyHasSortPageControls(self.alloc, body))
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
-                try contextual_operations.textAlloc(self.alloc, 422, "unsupported query request"),
-            error.UnsupportedMixedSourceReturnMode => try contextual_operations.textAlloc(
-                self.alloc,
-                422,
-                "mixed document/chunk vector indexes support return_mode parent, parent_with_chunks, member, or chunk; unit modes require homogeneous chunk sources",
-            ),
+                try contextualUnsupportedQueryResponse(self.alloc),
+            error.UnsupportedMixedSourceReturnMode => try contextualUnsupportedHierarchyGroupingResponse(self.alloc),
             error.IdentityReadGenerationChanged => try contextualRetryableTextResponse(self.alloc, 409, "identity read generation changed"),
             error.HierarchyCursorStale => try contextualHierarchyCursorStaleResponse(self.alloc),
             error.QueryCandidateBudgetExceeded => try contextualQueryCandidateBudgetExceededResponse(self.alloc),
@@ -14699,6 +14695,22 @@ fn contextualHierarchyCursorStaleResponse(alloc: std.mem.Allocator) !contextual_
         .status = 409,
         .content_type = "application/json",
         .body = try public_table_http.hierarchyCursorStaleBody(alloc),
+    };
+}
+
+fn contextualUnsupportedHierarchyGroupingResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return .{
+        .status = 422,
+        .content_type = "application/json",
+        .body = try public_table_http.unsupportedHierarchyGroupingBody(alloc),
+    };
+}
+
+fn contextualUnsupportedQueryResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return .{
+        .status = 422,
+        .content_type = "application/json",
+        .body = try public_table_http.unsupportedQueryBody(alloc),
     };
 }
 
@@ -18662,15 +18674,18 @@ test "api http unsupported filter query response names the offending node" {
     try std.testing.expect(!parsed.value.retryable);
 }
 
-test "api http unsupported unsorted query response remains generic" {
+test "api http unsupported unsorted query response is machine readable" {
     const alloc = std.testing.allocator;
     db_mod.resetLastSortRejectionDiagnostic();
-    var resp = try contextual_operations.textAlloc(alloc, 422, "unsupported query request");
+    var resp = try contextualUnsupportedQueryResponse(alloc);
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), resp.status);
-    try std.testing.expectEqualStrings("text/plain", resp.content_type);
-    try std.testing.expectEqualStrings("unsupported query request", resp.body);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
+    var parsed = try std.json.parseFromSlice(public_table_http.UnsupportedQueryError, alloc, resp.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", parsed.value.@"error");
+    try std.testing.expect(!parsed.value.retryable);
 }
 
 test "api http stale hierarchy cursor response is actionable and machine readable" {
@@ -18694,6 +18709,26 @@ test "api http stale hierarchy cursor response is actionable and machine readabl
     try std.testing.expectEqualStrings("hierarchy_cursor_stale", parsed.value.@"error");
     try std.testing.expectEqualStrings("restart_hierarchy_traversal", parsed.value.action);
     try std.testing.expectEqualStrings("search_after", parsed.value.restart_without);
+    try std.testing.expect(!parsed.value.retryable);
+}
+
+test "api http mixed hierarchy grouping response uses the public contract" {
+    const alloc = std.testing.allocator;
+    var resp = try contextualUnsupportedHierarchyGroupingResponse(alloc);
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type);
+    var parsed = try std.json.parseFromSlice(
+        public_table_http.UnsupportedHierarchyGroupingError,
+        alloc,
+        resp.body,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_hierarchy_grouping", parsed.value.@"error");
+    try std.testing.expectEqualStrings("hierarchy.group_by.level", parsed.value.field);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "return_mode") == null);
     try std.testing.expect(!parsed.value.retryable);
 }
 

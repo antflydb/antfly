@@ -3441,7 +3441,7 @@ paths:
         '409':
           $ref: '#/components/responses/HierarchyCursorStale'
         '422':
-          $ref: '#/components/responses/UnsupportedExactSort'
+          $ref: '#/components/responses/UnsupportedQuery'
         '503':
           $ref: '#/components/responses/QueryTemporarilyUnavailable'
         '500':
@@ -3924,7 +3924,7 @@ paths:
         '409':
           $ref: '#/components/responses/HierarchyCursorStale'
         '422':
-          $ref: '#/components/responses/UnsupportedExactSort'
+          $ref: '#/components/responses/UnsupportedQuery'
         '404':
           $ref: '#/components/responses/NotFound'
         '503':
@@ -8232,6 +8232,119 @@ components:
           enum:
             - false
           description: Retrying the same cursor cannot succeed; restart traversal instead.
+    UnsupportedHierarchyGroupingError:
+      type: object
+      additionalProperties: false
+      description: A requested hierarchy grouping level cannot represent every member of the selected
+        heterogeneous index.
+      required:
+        - status
+        - error
+        - message
+        - reason
+        - field
+        - action
+        - retryable
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 422
+        error:
+          type: string
+          enum:
+            - unsupported_hierarchy_grouping
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable remediation using only public query fields.
+        reason:
+          type: string
+          enum:
+            - mixed_document_chunk_sources
+          description: Stable reason the requested hierarchy level is unavailable.
+        field:
+          type: string
+          enum:
+            - hierarchy.group_by.level
+          description: Public request field that selected the unsupported grouping level.
+        action:
+          type: string
+          enum:
+            - use_source_grouping_or_direct_members
+          description: Select source grouping, omit group_by for direct members, or use a homogeneous
+            chunk-backed index.
+        retryable:
+          type: boolean
+          enum:
+            - false
+          description: Retrying the same request cannot succeed without changing its hierarchy grouping.
+    UnsupportedQueryError:
+      type: object
+      additionalProperties: false
+      description: A query requests an unsupported feature without a more specific structured diagnostic.
+      required:
+        - status
+        - error
+        - message
+        - retryable
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 422
+        error:
+          type: string
+          enum:
+            - unsupported_query_request
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable error summary.
+        retryable:
+          type: boolean
+          enum:
+            - false
+          description: Retrying the same request cannot succeed without changing it.
+    QueryFilterError:
+      type: object
+      additionalProperties: false
+      description: A public filter or exclusion query contains an invalid or unsupported node.
+      required:
+        - status
+        - error
+        - message
+        - field
+        - offending_node
+        - retryable
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 400
+            - 422
+        error:
+          type: string
+          enum:
+            - invalid_query_request
+            - unsupported_query_request
+        message:
+          type: string
+        field:
+          type: string
+          enum:
+            - filter_query
+            - exclusion_query
+        offending_node:
+          type: string
+          description: Stable name of the first invalid or unsupported filter node.
+        retryable:
+          type: boolean
+          enum:
+            - false
     ExactSortError:
       type: object
       additionalProperties: false
@@ -13727,7 +13840,9 @@ components:
 
         matches are returned. `ancestors` only controls projected context and never changes result
 
-        cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+        cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+
+        source-grouped result shape.
       allOf:
         - not:
             description: Relevance grouping and sequential child traversal are separate operations.
@@ -15458,7 +15573,7 @@ components:
         chunks:
           type: array
           deprecated: true
-          description: Legacy child chunk hits included for source-level rollups.
+          description: Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
           items:
             $ref: '#/components/schemas/HierarchyMatchHit'
     QueryHit:
@@ -15515,7 +15630,9 @@ components:
 
             `ancestors` with response-local or requested DB-backed source/unit context when available.
 
-            Legacy rollup requests continue to use `chunks` instead of `matches`.
+            V0.2-compatible implicit rollup requests continue to use the deprecated
+
+            `chunks` field instead of `matches`.
         _sort:
           type: array
           items: {}
@@ -26107,6 +26224,16 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ExactSortError'
+    UnsupportedQuery:
+      description: The query is valid JSON but requests an unsupported execution or result contract
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/ExactSortError'
+              - $ref: '#/components/schemas/QueryFilterError'
+              - $ref: '#/components/schemas/UnsupportedHierarchyGroupingError'
+              - $ref: '#/components/schemas/UnsupportedQueryError'
     HierarchyCursorStale:
       description: The hierarchy changed after the traversal cursor was issued
       content:
