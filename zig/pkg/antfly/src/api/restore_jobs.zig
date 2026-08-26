@@ -27,6 +27,25 @@ const max_cluster_failure_details: usize = 8;
 const max_cluster_failure_table_name_bytes: usize = 256;
 const max_cluster_failure_error_bytes: usize = 256;
 const restore_job_format_version: u32 = 4;
+const restore_retry_min_ms: u64 = 100;
+const restore_retry_max_ms: u64 = 5_000;
+
+fn restoreRetryDelayMs(job_id: u64, attempt_id: u64) u64 {
+    const exponent: u6 = @intCast(@min(attempt_id -| 1, 6));
+    const exponential_ms: u64 = @min(
+        restore_retry_min_ms << exponent,
+        restore_retry_max_ms * 4 / 5,
+    );
+    var mixed = job_id ^ (attempt_id *% 0x9e3779b97f4a7c15);
+    mixed ^= mixed >> 30;
+    mixed *%= 0xbf58476d1ce4e5b9;
+    mixed ^= mixed >> 27;
+    const jitter_span: u64 = exponential_ms / 2 + 1;
+    return @min(
+        restore_retry_max_ms,
+        exponential_ms * 3 / 4 + mixed % jitter_span,
+    );
+}
 
 pub const Scope = enum { table, cluster };
 pub const Phase = enum { queued, running, succeeded, failed, cancelled };
@@ -197,8 +216,14 @@ pub const ReplicatedPersistence = extern struct {
                 .delete_many = Self.deleteMany,
             };
 
-            fn fail(err: anyerror) runtime_error_abi.Status {
-                return runtime_error_abi.statusFromError(err);
+            fn fail(comptime operation: []const u8, err: anyerror) runtime_error_abi.Status {
+                if (!runtime_error_abi.errorHasStableDetail(err)) {
+                    std.log.err("replicated restore persistence callback failed operation={s} err={s}", .{ operation, @errorName(err) });
+                }
+                return runtime_error_abi.statusFromErrorWithFallback(
+                    err,
+                    error.RestoreJobPersistenceUnavailable,
+                );
             }
 
             fn load(
@@ -207,12 +232,12 @@ pub const ReplicatedPersistence = extern struct {
                 out: *AbiRows,
             ) callconv(.c) runtime_error_abi.Status {
                 if (!allocator.valid())
-                    return fail(error.UnsupportedVersion);
+                    return fail("load", error.UnsupportedVersion);
                 const alloc = allocator.asStd();
-                const rows = local.load(ptr, alloc) catch |err| return fail(err);
+                const rows = local.load(ptr, alloc) catch |err| return fail("load", err);
                 const abi_rows = alloc.alloc(AbiRow, rows.len) catch |err| {
                     freeRows(alloc, rows);
-                    return fail(err);
+                    return fail("load", err);
                 };
                 for (rows, 0..) |row, index| {
                     abi_rows[index] = .{
@@ -235,8 +260,8 @@ pub const ReplicatedPersistence = extern struct {
                 out: *runtime_memory_abi.OptionalOwnedBytes,
             ) callconv(.c) runtime_error_abi.Status {
                 if (!allocator.valid())
-                    return fail(error.UnsupportedVersion);
-                const value = local.get(ptr, allocator.asStd(), key.slice()) catch |err| return fail(err);
+                    return fail("get", error.UnsupportedVersion);
+                const value = local.get(ptr, allocator.asStd(), key.slice()) catch |err| return fail("get", err);
                 out.* = if (value) |bytes| .{
                     .bytes = .{ .ptr = bytes.ptr, .len = bytes.len },
                     .present = 1,
@@ -249,7 +274,7 @@ pub const ReplicatedPersistence = extern struct {
                 key: runtime_memory_abi.Bytes,
                 value: runtime_memory_abi.Bytes,
             ) callconv(.c) runtime_error_abi.Status {
-                local.put(ptr, key.slice(), value.slice()) catch |err| return fail(err);
+                local.put(ptr, key.slice(), value.slice()) catch |err| return fail("put", err);
                 return .ok;
             }
 
@@ -257,7 +282,7 @@ pub const ReplicatedPersistence = extern struct {
                 ptr: *anyopaque,
                 key: runtime_memory_abi.Bytes,
             ) callconv(.c) runtime_error_abi.Status {
-                local.delete(ptr, key.slice()) catch |err| return fail(err);
+                local.delete(ptr, key.slice()) catch |err| return fail("delete", err);
                 return .ok;
             }
 
@@ -268,13 +293,13 @@ pub const ReplicatedPersistence = extern struct {
                 key_count: usize,
             ) callconv(.c) runtime_error_abi.Status {
                 if (!allocator.valid())
-                    return fail(error.UnsupportedVersion);
+                    return fail("delete_many", error.UnsupportedVersion);
                 const alloc = allocator.asStd();
-                const keys = alloc.alloc([]const u8, key_count) catch |err| return fail(err);
+                const keys = alloc.alloc([]const u8, key_count) catch |err| return fail("delete_many", err);
                 defer alloc.free(keys);
                 const abi_keys = if (key_count == 0) &.{} else keys_ptr.?[0..key_count];
                 for (abi_keys, 0..) |key, index| keys[index] = key.slice();
-                local.delete_many(ptr, keys) catch |err| return fail(err);
+                local.delete_many(ptr, keys) catch |err| return fail("delete_many", err);
                 return .ok;
             }
         };
@@ -1294,7 +1319,6 @@ pub const Store = struct {
         alloc: std.mem.Allocator,
         expected: JobState,
         err_name: []const u8,
-        retry_delay_ns: u64,
     ) ![]u8 {
         self.lock();
         defer self.mutex.unlock();
@@ -1322,11 +1346,7 @@ pub const Store = struct {
         self.compactPendingFullyLocked();
         try self.pending.ensureUnusedCapacity(self.alloc, 1);
         const dispatch_sequence = try self.allocateDispatchSequenceLocked();
-        const delay_ms = std.math.divCeil(
-            u64,
-            retry_delay_ns,
-            std.time.ns_per_ms,
-        ) catch std.math.maxInt(u64);
+        const delay_ms = restoreRetryDelayMs(parsed.value.job_id, parsed.value.attempt_id);
         const not_before_ms = nowMillis() +| delay_ms;
         const encoded = try self.updateLocked(alloc, parsed.value, .{
             .phase = .queued,
@@ -2036,6 +2056,8 @@ const TestReplicatedPersistence = struct {
     // 0 = open, 1 = pause the next point read after snapshotting, 2 = paused,
     // 3 = released. Tests use this to deterministically model a delayed read.
     get_gate: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    fail_load_private: bool = false,
+    fail_put_private: bool = false,
     fail_delete_many: bool = false,
 
     fn init(alloc: std.mem.Allocator) TestReplicatedPersistence {
@@ -2063,6 +2085,7 @@ const TestReplicatedPersistence = struct {
 
     fn load(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicatedPersistence.OwnedRow {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
+        if (self.fail_load_private) return error.TestRestoreJobLoadPrivateFailure;
         const out = try alloc.alloc(ReplicatedPersistence.OwnedRow, self.rows.count());
         var initialized: usize = 0;
         errdefer {
@@ -2095,6 +2118,7 @@ const TestReplicatedPersistence = struct {
 
     fn put(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
+        if (self.fail_put_private) return error.TestRestoreJobPutPrivateFailure;
         const owned_value = try self.alloc.dupe(u8, value);
         errdefer self.alloc.free(owned_value);
         if (self.rows.getPtr(key)) |existing| {
@@ -2192,6 +2216,60 @@ test "failed destination authorization refresh reuses the idempotent restore job
     var changed = adopted_request;
     changed.backup_id = "different";
     try std.testing.expectError(error.IdempotencyConflict, store.start(alloc, changed));
+}
+
+test "replicated restore persistence maps private callback errors to stable unavailability" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    const replicated = persistence.persistence();
+
+    persistence.fail_load_private = true;
+    try std.testing.expectError(
+        error.RestoreJobPersistenceUnavailable,
+        replicated.load(std.testing.allocator),
+    );
+    persistence.fail_load_private = false;
+    persistence.fail_put_private = true;
+    try std.testing.expectError(
+        error.RestoreJobPersistenceUnavailable,
+        replicated.put("restore/jobs/1", "{}"),
+    );
+}
+
+test "replicated restore begin failure can requeue the consumed FIFO entry" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const encoded = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "daily",
+        .location = "s3://archive/daily",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:cluster",
+        .idempotency_key = "requeue-private-begin-failure",
+    });
+    defer std.testing.allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(JobState, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+
+    const pending = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(pending);
+    try std.testing.expectEqualSlices(u64, &.{parsed.value.job_id}, pending);
+
+    persistence.fail_put_private = true;
+    try std.testing.expectError(
+        error.RestoreJobPersistenceUnavailable,
+        store.begin(std.testing.allocator, parsed.value.job_id),
+    );
+    persistence.fail_put_private = false;
+    try store.requeuePending(parsed.value.job_id);
+
+    const retried = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(retried);
+    try std.testing.expectEqualSlices(u64, &.{parsed.value.job_id}, retried);
 }
 
 test "delayed replicated restore refresh cannot regress a running job" {
@@ -2372,6 +2450,29 @@ test "successful restore completion wins a racing cancellation" {
     try std.testing.expect(parsed_completed.value.last_error == null);
 }
 
+test "restore retry delay is bounded across attempt categories" {
+    const job_ids = [_]u64{ 0, 1, 42, 0x9e3779b97f4a7c15, std.math.maxInt(u64) };
+    for (job_ids) |job_id| {
+        var attempt_id: u64 = 0;
+        while (attempt_id < 256) : (attempt_id += 1) {
+            const delay_ms = restoreRetryDelayMs(job_id, attempt_id);
+            const exponent: u6 = @intCast(@min(attempt_id -| 1, 6));
+            const exponential_ms: u64 = @min(
+                restore_retry_min_ms << exponent,
+                restore_retry_max_ms * 4 / 5,
+            );
+            const minimum_ms = exponential_ms * 3 / 4;
+            const maximum_ms = @min(
+                restore_retry_max_ms,
+                minimum_ms + exponential_ms / 2,
+            );
+            try std.testing.expect(delay_ms >= minimum_ms);
+            try std.testing.expect(delay_ms <= maximum_ms);
+        }
+    }
+    try std.testing.expect(restoreRetryDelayMs(42, 2) > restoreRetryDelayMs(42, 1));
+}
+
 test "retryable restore contention durably requeues progress and honors cancellation" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
@@ -2379,14 +2480,16 @@ test "retryable restore contention durably requeues progress and honors cancella
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
-    const started = try store.start(std.testing.allocator, .{
+    const request: StartRequest = .{
         .scope = .cluster,
         .backup_id = "daily",
         .location = "s3://archive/daily",
         .connection = "archive-reader",
         .table_names = &.{ "docs", "events" },
         .idempotency_namespace = "principal:admin:cluster",
-    });
+        .idempotency_key = "retry-contention",
+    };
+    const started = try store.start(std.testing.allocator, request);
     defer std.testing.allocator.free(started);
     var parsed_started = try std.json.parseFromSlice(
         JobState,
@@ -2420,7 +2523,6 @@ test "retryable restore contention durably requeues progress and honors cancella
         std.testing.allocator,
         parsed_running.value,
         "BackupRepositoryBusy",
-        0,
     );
     defer std.testing.allocator.free(retried);
     var parsed_retried = try std.json.parseFromSlice(
@@ -2443,39 +2545,32 @@ test "retryable restore contention durably requeues progress and honors cancella
 
     const pending = try store.takePendingIds(std.testing.allocator, 1);
     defer std.testing.allocator.free(pending);
-    try std.testing.expectEqualSlices(
-        u64,
-        &.{parsed_running.value.job_id},
-        pending,
-    );
-    const resumed = (try store.begin(
-        std.testing.allocator,
-        parsed_running.value.job_id,
-    )).?;
-    defer std.testing.allocator.free(resumed);
-    var parsed_resumed = try std.json.parseFromSlice(
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
+    try std.testing.expect((store.nextPendingDelayMs() orelse 0) > 0);
+
+    const replayed = try store.start(std.testing.allocator, request);
+    defer std.testing.allocator.free(replayed);
+    var parsed_replayed = try std.json.parseFromSlice(
         JobState,
         std.testing.allocator,
-        resumed,
+        replayed,
         .{},
     );
-    defer parsed_resumed.deinit();
-    try std.testing.expectEqual(
-        parsed_running.value.attempt_id + 1,
-        parsed_resumed.value.attempt_id,
-    );
-    try std.testing.expectEqual(@as(?u16, 0), parsed_resumed.value.active_table_index);
+    defer parsed_replayed.deinit();
+    try std.testing.expectEqual(parsed_retried.value.job_id, parsed_replayed.value.job_id);
+    try std.testing.expectEqual(parsed_retried.value.dispatch_sequence, parsed_replayed.value.dispatch_sequence);
+    try std.testing.expectEqual(parsed_retried.value.not_before_ms, parsed_replayed.value.not_before_ms);
+    try std.testing.expectEqual(@as(?u16, 0), parsed_replayed.value.active_table_index);
 
     const cancelling = (try store.cancel(
         std.testing.allocator,
-        parsed_resumed.value.job_id,
+        parsed_replayed.value.job_id,
     )).?;
     std.testing.allocator.free(cancelling);
     const cancelled = try store.retryRunning(
         std.testing.allocator,
-        parsed_resumed.value,
+        parsed_running.value,
         "BackupRepositoryBusy",
-        0,
     );
     defer std.testing.allocator.free(cancelled);
     var parsed_cancelled = try std.json.parseFromSlice(
@@ -2490,6 +2585,47 @@ test "retryable restore contention durably requeues progress and honors cancella
         "cancel_requested",
         parsed_cancelled.value.last_error.?,
     );
+}
+
+test "retryable restore requeue always persists attempt backoff" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const started = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "contended",
+        .location = "s3://archive/contended",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:cluster",
+    });
+    defer std.testing.allocator.free(started);
+    var parsed_started = try std.json.parseFromSlice(JobState, std.testing.allocator, started, .{});
+    defer parsed_started.deinit();
+
+    const running = (try store.begin(std.testing.allocator, parsed_started.value.job_id)).?;
+    defer std.testing.allocator.free(running);
+    var parsed_running = try std.json.parseFromSlice(JobState, std.testing.allocator, running, .{});
+    defer parsed_running.deinit();
+
+    const before_ms = nowMillis();
+    const retried = try store.retryRunning(
+        std.testing.allocator,
+        parsed_running.value,
+        "BackupRepositoryBusy",
+    );
+    defer std.testing.allocator.free(retried);
+    const after_ms = nowMillis();
+    var parsed_retried = try std.json.parseFromSlice(JobState, std.testing.allocator, retried, .{});
+    defer parsed_retried.deinit();
+
+    try std.testing.expect(parsed_retried.value.not_before_ms >= before_ms + 75);
+    try std.testing.expect(parsed_retried.value.not_before_ms <= after_ms + 5_000);
+    const pending = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
 }
 
 test "delayed restore contention yields FIFO capacity to unrelated jobs" {
@@ -2538,7 +2674,6 @@ test "delayed restore contention yields FIFO capacity to unrelated jobs" {
         std.testing.allocator,
         parsed_running.value,
         "BackupRepositoryBusy",
-        60 * std.time.ns_per_s,
     );
     defer std.testing.allocator.free(retried);
 

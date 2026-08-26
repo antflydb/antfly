@@ -35,6 +35,43 @@ const table_create_contract = @import("table_create_contract.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
+pub const max_table_name_bytes: usize = 255;
+pub const max_table_create_transport_bytes: usize = 32 * 1024 * 1024;
+const forwarded_table_create_envelope_bytes: usize = 38;
+pub const max_table_create_body_bytes: usize =
+    (max_table_create_transport_bytes - forwarded_table_create_envelope_bytes - 2 * max_table_name_bytes) / 2;
+
+pub fn validateTableCreateBodySize(body_len: usize) !void {
+    if (body_len > max_table_create_body_bytes)
+        return error.CreateTableRequestTooLarge;
+}
+
+pub fn validateTableMutationName(table_name: []const u8) !void {
+    if (table_name.len == 0 or table_name.len > max_table_name_bytes)
+        return error.InvalidTableName;
+    for (table_name) |byte| {
+        if (std.ascii.isControl(byte)) return error.InvalidTableName;
+    }
+}
+
+test "table mutation names preserve the public contract" {
+    try validateTableMutationName("vmp_media_item_embedding-v0.2~candidate");
+    try validateTableMutationName("sales/archive");
+    try validateTableMutationName("sales%2Farchive");
+    try validateTableMutationName("sales archive");
+    try validateTableMutationName(".hidden");
+    try validateTableMutationName("..");
+    try std.testing.expectError(error.InvalidTableName, validateTableMutationName(""));
+
+    const too_long: [max_table_name_bytes + 1]u8 = @splat('a');
+    try std.testing.expectError(error.InvalidTableName, validateTableMutationName(&too_long));
+
+    for (0..32) |control| {
+        const name = [_]u8{ 'a', @intCast(control), 'b' };
+        try std.testing.expectError(error.InvalidTableName, validateTableMutationName(&name));
+    }
+    try std.testing.expectError(error.InvalidTableName, validateTableMutationName("a\x7fb"));
+}
 
 fn validateIndexesValue(value: std.json.Value, comptime trusted_catalog: bool) !void {
     if (value != .object) return error.InvalidCreateTableRequest;
@@ -677,6 +714,33 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
 
 pub fn parseStoredCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !CreateTableRequest {
     return parseCreateTableRequestWithOptions(alloc, body, true);
+}
+
+/// Encodes an already-normalized request for the trusted internal metadata
+/// hop. The output must round-trip through `parseStoredCreateTableRequest`;
+/// the stricter public parser intentionally rejects normalized artifacts such
+/// as private index fields and the backend-managed schema version.
+pub fn encodeStoredCreateTableRequestAlloc(alloc: std.mem.Allocator, req: CreateTableRequest) ![]u8 {
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{}", .{});
+    if (req.num_shards) |num_shards| {
+        try root.object.put(arena, "num_shards", .{ .integer = @intCast(num_shards) });
+    }
+    if (req.description) |description| {
+        try root.object.put(arena, "description", .{ .string = description });
+    }
+    if (req.schema_json) |schema_json| {
+        try root.object.put(arena, "schema", try std.json.parseFromSliceLeaky(std.json.Value, arena, schema_json, .{}));
+    }
+    if (req.indexes_json) |indexes_json| {
+        try root.object.put(arena, "indexes", try std.json.parseFromSliceLeaky(std.json.Value, arena, indexes_json, .{}));
+    }
+    if (req.replication_sources_json) |replication_sources_json| {
+        try root.object.put(arena, "replication_sources", try std.json.parseFromSliceLeaky(std.json.Value, arena, replication_sources_json, .{}));
+    }
+    return try std.json.Stringify.valueAlloc(alloc, root, .{});
 }
 
 pub fn validateCreateSchemaVersion(value: std.json.Value, comptime allow_normalized_version_zero: bool) !void {
@@ -4342,6 +4406,39 @@ test "create table raw parser accepts its canonical full text output" {
     try std.testing.expectEqual(@as(?u32, 6), second.num_shards);
     try std.testing.expect(std.mem.indexOf(u8, second.indexes_json.?, "\"full_text_index_v0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, second.indexes_json.?, "\"title_body\"") != null);
+}
+
+test "stored create table encoding round-trips a normalized public request" {
+    var parsed = try parseCreateTableRequest(std.testing.allocator, "{\"num_shards\":2,\"description\":\"docs \\\"quoted\\\" table\",\"schema\":{\"kind\":\"demo\"},\"indexes\":{\"title_body\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}},\"replication_sources\":[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]}");
+    defer parsed.deinit(std.testing.allocator);
+
+    const encoded = try encodeStoredCreateTableRequestAlloc(std.testing.allocator, parsed);
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(std.testing.allocator, encoded),
+    );
+    var decoded = try parseStoredCreateTableRequest(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(parsed.num_shards, decoded.num_shards);
+    try std.testing.expectEqualStrings(parsed.description.?, decoded.description.?);
+    try std.testing.expectEqualStrings(parsed.schema_json.?, decoded.schema_json.?);
+    try std.testing.expectEqualStrings(parsed.indexes_json.?, decoded.indexes_json.?);
+    try std.testing.expectEqualStrings(parsed.replication_sources_json.?, decoded.replication_sources_json.?);
+}
+
+test "stored create table encoding preserves empty requests" {
+    const encoded = try encodeStoredCreateTableRequestAlloc(std.testing.allocator, .{});
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings("{}", encoded);
+
+    var decoded = try parseStoredCreateTableRequest(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?u32, null), decoded.num_shards);
+    try std.testing.expect(decoded.description == null);
+    try std.testing.expect(decoded.schema_json == null);
 }
 
 test "create table parser rejects schemas that cannot derive runtime mappings" {

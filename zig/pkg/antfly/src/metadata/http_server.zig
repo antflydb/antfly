@@ -42,6 +42,19 @@ const platform_time = @import("antfly_platform").time;
 const routes = @import("http_routes.zig");
 const service = @import("service.zig");
 
+const max_forwarded_table_create_body_bytes = tables_api.max_table_create_transport_bytes;
+const max_restore_progress_body_bytes: usize = 64 * 1024;
+
+fn validateForwardedCreateTableBodySize(body_len: usize) !void {
+    if (body_len > max_forwarded_table_create_body_bytes)
+        return error.CreateTableRequestTooLarge;
+}
+
+fn validateRestoreProgressBodySize(body_len: usize) !void {
+    if (body_len > max_restore_progress_body_bytes)
+        return error.RestoreProgressRequestTooLarge;
+}
+
 pub const MetadataHttpServerConfig = struct {};
 
 pub const SplitRequest = table_operations.SplitRequest;
@@ -82,6 +95,7 @@ pub const AdminSource = struct {
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        preflight_table_mutation_authority: ?*const fn (ptr: *anyopaque) anyerror!void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         restore_table: ?*const fn (
@@ -106,6 +120,8 @@ pub const AdminSource = struct {
         upsert_store: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord) anyerror!void = null,
         report_store_status: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) anyerror!void = null,
         upsert_schema_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) anyerror!void = null,
+        upsert_restore_progress: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) anyerror!void = null,
+        remove_restore_progress: ?*const fn (ptr: *anyopaque, table_id: u64, node_id: u64, group_id: u64) anyerror!void = null,
         trigger_reallocate: ?*const fn (ptr: *anyopaque) anyerror!void = null,
         request_split: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: SplitRequest) anyerror!void = null,
         request_merge: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: MergeRequest) anyerror!void = null,
@@ -165,6 +181,11 @@ pub const AdminSource = struct {
 
     pub fn freeAdminSnapshot(self: AdminSource, snapshot: *metadata_api.AdminSnapshot) void {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
+    }
+
+    pub fn preflightTableMutationAuthority(self: AdminSource) !void {
+        const preflight = self.vtable.preflight_table_mutation_authority orelse return;
+        try preflight(self.ptr);
     }
 
     pub fn createTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
@@ -255,6 +276,16 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, record);
     }
 
+    pub fn upsertRestoreProgress(self: AdminSource, alloc: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) !void {
+        const fn_ptr = self.vtable.upsert_restore_progress orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, record);
+    }
+
+    pub fn removeRestoreProgress(self: AdminSource, table_id: u64, node_id: u64, group_id: u64) !void {
+        const fn_ptr = self.vtable.remove_restore_progress orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, table_id, node_id, group_id);
+    }
+
     pub fn triggerReallocate(self: AdminSource) !void {
         const fn_ptr = self.vtable.trigger_reallocate orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr);
@@ -334,6 +365,7 @@ pub const AdminSource = struct {
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
+                .preflight_table_mutation_authority = metadataServicePreflightTableMutationAuthority,
                 .create_table = metadataServiceCreateTable,
                 .replace_table_definition = metadataServiceReplaceTableDefinition,
                 .restore_table = metadataServiceRestoreTable,
@@ -350,6 +382,8 @@ pub const AdminSource = struct {
                 .upsert_store = metadataServiceUpsertStore,
                 .report_store_status = metadataServiceReportStoreStatus,
                 .upsert_schema_progress = metadataServiceUpsertSchemaProgress,
+                .upsert_restore_progress = metadataServiceUpsertRestoreProgress,
+                .remove_restore_progress = metadataServiceRemoveRestoreProgress,
                 .trigger_reallocate = metadataServiceTriggerReallocate,
                 .request_split = metadataServiceRequestSplit,
                 .request_merge = metadataServiceRequestMerge,
@@ -379,6 +413,7 @@ pub const AdminSource = struct {
                 .validate_publication = metadataHttpServiceValidatePublication,
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
+                .preflight_table_mutation_authority = metadataHttpServicePreflightTableMutationAuthority,
                 .create_table = metadataHttpServiceCreateTable,
                 .replace_table_definition = metadataHttpServiceReplaceTableDefinition,
                 .restore_table = metadataHttpServiceRestoreTable,
@@ -395,6 +430,8 @@ pub const AdminSource = struct {
                 .upsert_store = metadataHttpServiceUpsertStore,
                 .report_store_status = metadataHttpServiceReportStoreStatus,
                 .upsert_schema_progress = metadataHttpServiceUpsertSchemaProgress,
+                .upsert_restore_progress = metadataHttpServiceUpsertRestoreProgress,
+                .remove_restore_progress = metadataHttpServiceRemoveRestoreProgress,
                 .trigger_reallocate = metadataHttpServiceTriggerReallocate,
                 .request_split = metadataHttpServiceRequestSplit,
                 .request_merge = metadataHttpServiceRequestMerge,
@@ -497,6 +534,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         const table = tables_api.deriveTableRecord(table_name, req);
@@ -531,6 +569,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceDropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
@@ -657,6 +696,18 @@ pub const AdminSource = struct {
     fn metadataServiceUpsertSchemaProgress(ptr: *anyopaque, _: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         try svc.upsertSchemaProgress(record);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceUpsertRestoreProgress(ptr: *anyopaque, _: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.upsertRestoreProgress(record);
+        try flushMetadataServiceMutation(svc);
+    }
+
+    fn metadataServiceRemoveRestoreProgress(ptr: *anyopaque, table_id: u64, node_id: u64, group_id: u64) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.removeRestoreProgress(table_id, node_id, group_id);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -838,8 +889,24 @@ pub const AdminSource = struct {
         svc.freeAdminSnapshot(snapshot);
     }
 
+    fn metadataServicePreflightTableMutationAuthority(ptr: *anyopaque) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
+    }
+
+    fn metadataHttpServicePreflightTableMutationAuthority(ptr: *anyopaque) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
+    }
+
     fn metadataHttpServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
+        createTableOnLocalHttpService(svc, alloc, table_name, req) catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
+    }
+
+    fn createTableOnLocalHttpService(svc: *service.MetadataHttpService, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         const table = tables_api.deriveTableRecord(table_name, req);
@@ -877,6 +944,12 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceDropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
+        dropTableOnLocalHttpService(svc, alloc, table_name) catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
+    }
+
+    fn dropTableOnLocalHttpService(svc: *service.MetadataHttpService, alloc: std.mem.Allocator, table_name: []const u8) !void {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
@@ -1003,6 +1076,18 @@ pub const AdminSource = struct {
     fn metadataHttpServiceUpsertSchemaProgress(ptr: *anyopaque, _: std.mem.Allocator, record: metadata_table_manager.SchemaProgressRecord) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         try svc.upsertSchemaProgress(record);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceUpsertRestoreProgress(ptr: *anyopaque, _: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.upsertRestoreProgress(record);
+        try flushMetadataHttpServiceMutation(svc);
+    }
+
+    fn metadataHttpServiceRemoveRestoreProgress(ptr: *anyopaque, table_id: u64, node_id: u64, group_id: u64) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.removeRestoreProgress(table_id, node_id, group_id);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1182,6 +1267,11 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
         try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
+        try server.postWithBodyLimit(routes.Routes.internal_restore_progress, max_restore_progress_body_bytes, httpx.Handler.bind(self, metadataUpsertRestoreProgress));
+        try server.delete(
+            routes.Routes.internal_restore_progress ++ "/:table_id/:node_id/:group_id",
+            httpx.Handler.bind(self, metadataRemoveRestoreProgress),
+        );
         try server.post(routes.Routes.internal_extension_restore, httpx.Handler.bind(self, metadataRestoreExtensions));
         const extension_path = routes.Routes.internal_extensions_prefix ++ ":extension_name";
         try server.post(extension_path, httpx.Handler.bind(self, metadataInstallExtension));
@@ -1191,8 +1281,10 @@ pub const MetadataHttpServer = struct {
         try server.post(extension_path ++ routes.Routes.internal_extension_disable_suffix, httpx.Handler.bind(self, metadataDisableExtension));
         try server.put(extension_path ++ routes.Routes.internal_extension_config_suffix, httpx.Handler.bind(self, metadataConfigureExtension));
 
+        try server.postWithBodyLimit(routes.Routes.internal_forwarded_table_create, max_forwarded_table_create_body_bytes, httpx.Handler.bind(self, metadataCreateTableForwarded));
+        try server.post(routes.Routes.internal_forwarded_table_drop, httpx.Handler.bind(self, metadataDropTableForwarded));
         const table_path = routes.Routes.internal_tables_prefix ++ ":table_name";
-        try server.post(table_path, httpx.Handler.bind(self, metadataCreateTable));
+        try server.postWithBodyLimit(table_path, tables_api.max_table_create_body_bytes, httpx.Handler.bind(self, metadataCreateTable));
         try server.delete(table_path, httpx.Handler.bind(self, metadataDropTable));
         try server.put(table_path ++ routes.Routes.internal_table_definition_suffix, httpx.Handler.bind(self, metadataReplaceTableDefinition));
         try server.put(table_path ++ routes.Routes.internal_table_schema_suffix, httpx.Handler.bind(self, metadataUpdateTableSchema));
@@ -1405,6 +1497,8 @@ pub const MetadataHttpServer = struct {
                 .validate_table_publication = validateTablePublicationOperation,
                 .trigger_reallocate = triggerReallocateOperation,
                 .upsert_schema_progress = upsertSchemaProgressOperation,
+                .upsert_restore_progress = upsertRestoreProgressOperation,
+                .remove_restore_progress = removeRestoreProgressOperation,
             },
         } };
     }
@@ -1429,6 +1523,16 @@ pub const MetadataHttpServer = struct {
         return self.source.upsertSchemaProgress(alloc, record);
     }
 
+    fn upsertRestoreProgressOperation(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.RestoreProgressRecord) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.upsertRestoreProgress(alloc, record);
+    }
+
+    fn removeRestoreProgressOperation(ptr: *anyopaque, table_id: u64, node_id: u64, group_id: u64) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.removeRestoreProgress(table_id, node_id, group_id);
+    }
+
     fn metadataMutationError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         if (err == error.UnsupportedOperation) return ctx.status(405).text("unsupported operation");
         if (err == error.ReallocationProtocolUpgradeRequired)
@@ -1441,6 +1545,15 @@ pub const MetadataHttpServer = struct {
                 http_common.metadata_mutation_not_admitted_header,
                 http_common.metadata_mutation_not_admitted_value,
             );
+        }
+        if (err == error.MetadataMutationOutcomeUnknown) {
+            // Authority moved after the mutation may have been admitted. Emit
+            // the broad retry hint without the non-admission proof so
+            // at-most-once clients converge through observation instead of a
+            // blind replay.
+            try ctx.setHeader("Retry-After", "1");
+            try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
+            return ctx.status(503).text("metadata authority unavailable");
         }
         return metadataReadError(ctx, err);
     }
@@ -1482,6 +1595,37 @@ pub const MetadataHttpServer = struct {
         defer parsed.deinit();
         self.mutationOperations().upsertSchemaProgress(ctx.allocator, requestContext(ctx), parsed.value) catch |err|
             return metadataMutationError(ctx, err);
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataUpsertRestoreProgress(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
+        const body = (try ctx.body()) orelse "";
+        validateRestoreProgressBodySize(body.len) catch
+            return ctx.status(413).text("restore progress request too large");
+        var parsed = std.json.parseFromSlice(metadata_table_manager.RestoreProgressRecord, ctx.allocator, body, .{}) catch
+            return ctx.status(400).text("invalid restore progress request");
+        defer parsed.deinit();
+        metadata_table_manager.validateRestoreProgressRecord(parsed.value) catch
+            return ctx.status(400).text("invalid restore progress request");
+        self.mutationOperations().upsertRestoreProgress(ctx.allocator, requestContext(ctx), parsed.value) catch |err|
+            return metadataMutationError(ctx, err);
+        return ctx.status(202).text("accepted");
+    }
+
+    fn metadataRemoveRestoreProgress(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const table_id = numericParam(ctx, "table_id", false) catch
+            return ctx.status(400).text("invalid restore progress removal request");
+        const node_id = numericParam(ctx, "node_id", false) catch
+            return ctx.status(400).text("invalid restore progress removal request");
+        const group_id = numericParam(ctx, "group_id", false) catch
+            return ctx.status(400).text("invalid restore progress removal request");
+        self.mutationOperations().removeRestoreProgress(
+            requestContext(ctx),
+            table_id,
+            node_id,
+            group_id,
+        ) catch |err| return metadataMutationError(ctx, err);
         return ctx.status(202).text("accepted");
     }
 
@@ -1875,14 +2019,52 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataCreateTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        );
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
-        var request = parseCreateTableRequest(ctx.allocator, (try ctx.body()) orelse "") catch
+        return self.executeMetadataCreateTable(ctx, table_name, (try ctx.body()) orelse "");
+    }
+
+    fn metadataCreateTableForwarded(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        );
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
+        const body = (try ctx.body()) orelse "";
+        validateForwardedCreateTableBodySize(body.len) catch
+            return ctx.status(413).text("create table request too large");
+        var forwarded = std.json.parseFromSlice(
+            routes.ForwardedCreateTableMutation,
+            ctx.allocator,
+            body,
+            .{ .allocate = .alloc_always },
+        ) catch return ctx.status(400).text("invalid forwarded create table request");
+        defer forwarded.deinit();
+        tables_api.validateTableMutationName(forwarded.value.table_name) catch
+            return ctx.status(400).text("invalid table name");
+        return self.executeMetadataCreateTable(ctx, forwarded.value.table_name, forwarded.value.definition_json);
+    }
+
+    fn executeMetadataCreateTable(
+        self: *MetadataHttpServer,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+        definition_json: []const u8,
+    ) !httpx.Response {
+        tables_api.validateTableCreateBodySize(definition_json.len) catch
+            return ctx.status(413).text("create table request too large");
+        var request = parseCreateTableRequest(ctx.allocator, definition_json) catch
             return ctx.status(400).text("invalid create table request");
         defer request.deinit(ctx.allocator);
         self.tableOperations().create(ctx.allocator, requestContext(ctx), table_name, request) catch |err| switch (err) {
+            error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
-            else => return metadataReadError(ctx, err),
+            else => return metadataMutationError(ctx, err),
         };
         return ctx.status(201).text("created");
     }
@@ -1905,13 +2087,44 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataDropTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        );
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        return self.executeMetadataDropTable(ctx, table_name);
+    }
+
+    fn metadataDropTableForwarded(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        );
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
+        var forwarded = std.json.parseFromSlice(
+            routes.ForwardedDropTableMutation,
+            ctx.allocator,
+            (try ctx.body()) orelse "",
+            .{ .allocate = .alloc_always },
+        ) catch return ctx.status(400).text("invalid forwarded drop table request");
+        defer forwarded.deinit();
+        tables_api.validateTableMutationName(forwarded.value.table_name) catch
+            return ctx.status(400).text("invalid table name");
+        return self.executeMetadataDropTable(ctx, forwarded.value.table_name);
+    }
+
+    fn executeMetadataDropTable(
+        self: *MetadataHttpServer,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+    ) !httpx.Response {
         self.tableOperations().drop(ctx.allocator, requestContext(ctx), table_name) catch |err| switch (err) {
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
-            else => return metadataReadError(ctx, err),
+            else => return metadataMutationError(ctx, err),
         };
         return ctx.status(204).text("");
     }
@@ -5249,6 +5462,375 @@ test "metadata http server returns retryable authority response when reconcile l
     try std.testing.expectEqual(@as(usize, 1), source.create_calls);
     try std.testing.expectEqualStrings(http_common.metadata_not_leader_value, resp.headers.get(http_common.metadata_not_leader_header).?);
     try std.testing.expect(resp.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
+}
+
+test "metadata http server forwards table names outside path-segment syntax through JSON bodies" {
+    const FakeSource = struct {
+        create_calls: usize = 0,
+        drop_calls: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .create_table = createTable,
+                    .drop_table = dropTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.UnexpectedStatusCall;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshotCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn createTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            _: tables_api.CreateTableRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("sales/archive", table_name);
+            self.create_calls += 1;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("sales archive", table_name);
+            self.drop_calls += 1;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+
+    const create_body = try std.json.Stringify.valueAlloc(std.testing.allocator, routes.ForwardedCreateTableMutation{
+        .table_name = "sales/archive",
+        .definition_json = "{}",
+    }, .{});
+    defer std.testing.allocator.free(create_body);
+    var create_resp = try server.executeTypedHandlerWithBodyForTest(
+        .POST,
+        routes.Routes.internal_forwarded_table_create,
+        &.{},
+        create_body,
+        MetadataHttpServer.metadataCreateTableForwarded,
+    );
+    defer create_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 201), create_resp.status.code);
+    try std.testing.expectEqual(@as(usize, 1), source.create_calls);
+    try std.testing.expectEqualStrings(
+        routes.Routes.table_mutation_protocol_value,
+        create_resp.headers.get(routes.Routes.table_mutation_protocol_header).?,
+    );
+
+    const drop_body = try std.json.Stringify.valueAlloc(std.testing.allocator, routes.ForwardedDropTableMutation{
+        .table_name = "sales archive",
+    }, .{});
+    defer std.testing.allocator.free(drop_body);
+    var drop_resp = try server.executeTypedHandlerWithBodyForTest(
+        .POST,
+        routes.Routes.internal_forwarded_table_drop,
+        &.{},
+        drop_body,
+        MetadataHttpServer.metadataDropTableForwarded,
+    );
+    defer drop_resp.deinit();
+    try std.testing.expectEqual(@as(u16, 204), drop_resp.status.code);
+    try std.testing.expectEqual(@as(usize, 1), source.drop_calls);
+    try std.testing.expectEqualStrings(
+        routes.Routes.table_mutation_protocol_value,
+        drop_resp.headers.get(routes.Routes.table_mutation_protocol_header).?,
+    );
+}
+
+test "metadata table mutation followers reject bodies before parsing or size admission" {
+    const FakeSource = struct {
+        preflight_calls: usize = 0,
+        mutation_calls: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .preflight_table_mutation_authority = preflightTableMutationAuthority,
+                    .create_table = createTable,
+                    .drop_table = dropTable,
+                    .upsert_restore_progress = upsertRestoreProgress,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.UnexpectedStatusCall;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshotCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn preflightTableMutationAuthority(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.preflight_calls += 1;
+            return error.NotLeader;
+        }
+
+        fn createTable(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: tables_api.CreateTableRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutation_calls += 1;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutation_calls += 1;
+        }
+
+        fn upsertRestoreProgress(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: metadata_table_manager.RestoreProgressRecord,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.mutation_calls += 1;
+        }
+    };
+
+    const Expect = struct {
+        fn rejected(
+            server: *MetadataHttpServer,
+            uri: []const u8,
+            params: []const httpx.RouteParam,
+            body: []const u8,
+            comptime handler: anytype,
+        ) !void {
+            var resp = try server.executeTypedHandlerWithBodyForTest(.POST, uri, params, body, handler);
+            defer resp.deinit();
+            try std.testing.expectEqual(@as(u16, 503), resp.status.code);
+            try std.testing.expectEqualStrings(
+                http_common.metadata_mutation_not_admitted_value,
+                resp.headers.get(http_common.metadata_mutation_not_admitted_header).?,
+            );
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    const table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "docs" }};
+
+    const oversized = try std.testing.allocator.alloc(u8, tables_api.max_table_create_body_bytes + 1);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 'x');
+    try Expect.rejected(&server, "/internal/v1/tables/docs", &table_params, oversized, MetadataHttpServer.metadataCreateTable);
+    try Expect.rejected(&server, routes.Routes.internal_forwarded_table_create, &.{}, "{", MetadataHttpServer.metadataCreateTableForwarded);
+    try Expect.rejected(&server, routes.Routes.internal_forwarded_table_drop, &.{}, "{", MetadataHttpServer.metadataDropTableForwarded);
+    try Expect.rejected(&server, routes.Routes.internal_restore_progress, &.{}, oversized, MetadataHttpServer.metadataUpsertRestoreProgress);
+    try std.testing.expectEqual(@as(usize, 4), source.preflight_calls);
+    try std.testing.expectEqual(@as(usize, 0), source.mutation_calls);
+}
+
+test "metadata mutation body bounds return 413 at max plus one before JSON parsing" {
+    const FakeSource = struct {
+        restore_progress_calls: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .upsert_restore_progress = upsertRestoreProgress,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.UnexpectedStatusCall;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshotCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertRestoreProgress(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: metadata_table_manager.RestoreProgressRecord,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.restore_progress_calls += 1;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    const table_params = [_]httpx.RouteParam{.{ .name = "table_name", .value = "docs" }};
+
+    const create_body = try std.testing.allocator.alloc(u8, tables_api.max_table_create_body_bytes + 1);
+    defer std.testing.allocator.free(create_body);
+    @memset(create_body, 'x');
+    {
+        var at_limit = try server.executeTypedHandlerWithBodyForTest(
+            .POST,
+            "/internal/v1/tables/docs",
+            &table_params,
+            create_body[0..tables_api.max_table_create_body_bytes],
+            MetadataHttpServer.metadataCreateTable,
+        );
+        defer at_limit.deinit();
+        try std.testing.expectEqual(@as(u16, 400), at_limit.status.code);
+    }
+    {
+        var over_limit = try server.executeTypedHandlerWithBodyForTest(
+            .POST,
+            "/internal/v1/tables/docs",
+            &table_params,
+            create_body,
+            MetadataHttpServer.metadataCreateTable,
+        );
+        defer over_limit.deinit();
+        try std.testing.expectEqual(@as(u16, 413), over_limit.status.code);
+    }
+
+    try validateForwardedCreateTableBodySize(max_forwarded_table_create_body_bytes);
+    try std.testing.expectError(
+        error.CreateTableRequestTooLarge,
+        validateForwardedCreateTableBodySize(max_forwarded_table_create_body_bytes + 1),
+    );
+    const worst_name: [tables_api.max_table_name_bytes]u8 = @splat('\\');
+    const worst_definition = try std.testing.allocator.alloc(u8, tables_api.max_table_create_body_bytes);
+    defer std.testing.allocator.free(worst_definition);
+    @memset(worst_definition, '\\');
+    const definition_prefix = "{\"description\":\"";
+    const definition_suffix = "\"}";
+    @memcpy(worst_definition[0..definition_prefix.len], definition_prefix);
+    @memcpy(worst_definition[worst_definition.len - definition_suffix.len ..], definition_suffix);
+    var parsed_definition = try tables_api.parseStoredCreateTableRequest(std.testing.allocator, worst_definition);
+    defer parsed_definition.deinit(std.testing.allocator);
+    const worst_forwarded = try std.json.Stringify.valueAlloc(std.testing.allocator, routes.ForwardedCreateTableMutation{
+        .table_name = &worst_name,
+        .definition_json = worst_definition,
+    }, .{});
+    defer std.testing.allocator.free(worst_forwarded);
+    try std.testing.expect(worst_forwarded.len <= max_forwarded_table_create_body_bytes);
+
+    const restore_body = try std.testing.allocator.alloc(u8, max_restore_progress_body_bytes + 1);
+    defer std.testing.allocator.free(restore_body);
+    @memset(restore_body, 'x');
+    {
+        var at_limit = try server.executeTypedHandlerWithBodyForTest(
+            .POST,
+            routes.Routes.internal_restore_progress,
+            &.{},
+            restore_body[0..max_restore_progress_body_bytes],
+            MetadataHttpServer.metadataUpsertRestoreProgress,
+        );
+        defer at_limit.deinit();
+        try std.testing.expectEqual(@as(u16, 400), at_limit.status.code);
+    }
+    {
+        var over_limit = try server.executeTypedHandlerWithBodyForTest(
+            .POST,
+            routes.Routes.internal_restore_progress,
+            &.{},
+            restore_body,
+            MetadataHttpServer.metadataUpsertRestoreProgress,
+        );
+        defer over_limit.deinit();
+        try std.testing.expectEqual(@as(u16, 413), over_limit.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 0), source.restore_progress_calls);
+}
+
+test "metadata restore progress rejects semantic violations before mutation admission" {
+    const FakeSource = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .upsert_restore_progress = upsertRestoreProgress,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.UnexpectedStatusCall;
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshotCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertRestoreProgress(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: metadata_table_manager.RestoreProgressRecord,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+    };
+
+    const valid_body =
+        \\{"table_id":7,"node_id":2,"group_id":7001,"backup_id":"backup-7","artifact_backup_id":"artifact-7","location":"s3://archive/backups","snapshot_path":"artifact-7/groups/7001.afb","artifact_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","primary_restored":true,"runtime_repair_complete":true,"phase":"complete"}
+    ;
+    const invalid_body =
+        \\{"table_id":7,"node_id":2,"group_id":7001,"backup_id":"backup-7","artifact_backup_id":"artifact-7","location":"s3://archive/backups","snapshot_path":"artifact-7/groups/7001.afb","artifact_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","primary_restored":true,"runtime_repair_complete":true,"phase":"runtime_repair"}
+    ;
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    {
+        var invalid = try server.executeTypedHandlerWithBodyForTest(
+            .POST,
+            routes.Routes.internal_restore_progress,
+            &.{},
+            invalid_body,
+            MetadataHttpServer.metadataUpsertRestoreProgress,
+        );
+        defer invalid.deinit();
+        try std.testing.expectEqual(@as(u16, 400), invalid.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+    {
+        var valid = try server.executeTypedHandlerWithBodyForTest(
+            .POST,
+            routes.Routes.internal_restore_progress,
+            &.{},
+            valid_body,
+            MetadataHttpServer.metadataUpsertRestoreProgress,
+        );
+        defer valid.deinit();
+        try std.testing.expectEqual(@as(u16, 202), valid.status.code);
+    }
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
 }
 
 test "metadata mutation pre-admission responses prove proposal was not admitted" {

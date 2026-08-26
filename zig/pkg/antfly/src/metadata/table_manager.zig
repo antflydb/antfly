@@ -859,6 +859,301 @@ pub const RestoreProgressRecord = struct {
     updated_at_ms: u64 = 0,
 };
 
+pub const max_restore_progress_backup_id_bytes: usize = 128;
+pub const max_restore_progress_location_bytes: usize = 4096;
+pub const max_restore_progress_snapshot_path_bytes: usize = 4096;
+pub const max_restore_progress_last_error_bytes: usize = 4096;
+
+fn validRestoreProgressBackupId(value: []const u8) bool {
+    if (value.len == 0 or value.len > max_restore_progress_backup_id_bytes) return false;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return false;
+    }
+    return !std.mem.eql(u8, value, ".") and !std.mem.eql(u8, value, "..");
+}
+
+fn validRestoreProgressText(value: []const u8, max_bytes: usize, allow_empty: bool) bool {
+    if ((!allow_empty and value.len == 0) or value.len > max_bytes) return false;
+    for (value) |byte| {
+        if (std.ascii.isControl(byte)) return false;
+    }
+    return true;
+}
+
+fn validRestoreProgressSnapshotPath(path: []const u8) bool {
+    if (!validRestoreProgressText(path, max_restore_progress_snapshot_path_bytes, false) or
+        std.fs.path.isAbsolute(path) or
+        std.mem.indexOfScalar(u8, path, '\\') != null)
+    {
+        return false;
+    }
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return false;
+    }
+    return true;
+}
+
+fn validRestoreProgressSha256(value: []const u8) bool {
+    if (value.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
+    return true;
+}
+
+fn restoreProgressPhaseInProgress(phase: []const u8) bool {
+    const phases = [_][]const u8{
+        "runtime_repair",
+        "reset_watermarks",
+        "rebuild_graph",
+        "rebuild_artifacts",
+        "replay_enrichments",
+        "drain_async",
+        "rebuild_replayed_artifacts",
+        "sync_indexes",
+    };
+    for (phases) |candidate| {
+        if (std.mem.eql(u8, phase, candidate)) return true;
+    }
+    return false;
+}
+
+pub fn validateRestoreProgressRecord(record: RestoreProgressRecord) !void {
+    if (record.table_id == 0 or record.node_id == 0 or !group_ids.isDataGroupId(record.group_id) or
+        !validRestoreProgressBackupId(record.backup_id) or
+        !validRestoreProgressBackupId(record.artifact_backup_id) or
+        !validRestoreProgressText(record.location, max_restore_progress_location_bytes, false) or
+        !validRestoreProgressSnapshotPath(record.snapshot_path) or
+        !validRestoreProgressSha256(record.artifact_sha256) or
+        !record.primary_restored or
+        !validRestoreProgressText(record.last_error, max_restore_progress_last_error_bytes, true))
+    {
+        return error.InvalidRestoreProgressRecord;
+    }
+    if (std.mem.eql(u8, record.phase, "complete")) {
+        if (!record.runtime_repair_complete) return error.InvalidRestoreProgressRecord;
+    } else if (!restoreProgressPhaseInProgress(record.phase) or record.runtime_repair_complete) {
+        return error.InvalidRestoreProgressRecord;
+    }
+}
+
+test "restore progress admission validates every field category and semantic state" {
+    const valid_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const valid: RestoreProgressRecord = .{
+        .table_id = 7,
+        .node_id = 2,
+        .group_id = 7001,
+        .backup_id = "backup-7",
+        .artifact_backup_id = "artifact-7",
+        .location = "s3://archive/backups",
+        .snapshot_path = "artifact-7/groups/7001.afb",
+        .artifact_sha256 = valid_sha256,
+        .primary_restored = true,
+        .phase = "runtime_repair",
+    };
+
+    const in_progress_phases = [_][]const u8{
+        "runtime_repair",
+        "reset_watermarks",
+        "rebuild_graph",
+        "rebuild_artifacts",
+        "replay_enrichments",
+        "drain_async",
+        "rebuild_replayed_artifacts",
+        "sync_indexes",
+    };
+    for (in_progress_phases) |phase| {
+        var candidate = valid;
+        candidate.phase = phase;
+        try validateRestoreProgressRecord(candidate);
+    }
+    var complete = valid;
+    complete.runtime_repair_complete = true;
+    complete.phase = "complete";
+    try validateRestoreProgressRecord(complete);
+
+    const max_backup_id: [max_restore_progress_backup_id_bytes]u8 = @splat('b');
+    const max_artifact_backup_id: [max_restore_progress_backup_id_bytes]u8 = @splat('a');
+    const max_location: [max_restore_progress_location_bytes]u8 = @splat('l');
+    const max_snapshot_path: [max_restore_progress_snapshot_path_bytes]u8 = @splat('s');
+    const max_last_error: [max_restore_progress_last_error_bytes]u8 = @splat('e');
+    var boundary = valid;
+    boundary.backup_id = &max_backup_id;
+    boundary.artifact_backup_id = &max_artifact_backup_id;
+    boundary.location = &max_location;
+    boundary.snapshot_path = &max_snapshot_path;
+    boundary.last_error = &max_last_error;
+    try validateRestoreProgressRecord(boundary);
+
+    const too_long_backup_id: [max_restore_progress_backup_id_bytes + 1]u8 = @splat('b');
+    const too_long_location: [max_restore_progress_location_bytes + 1]u8 = @splat('l');
+    const too_long_snapshot_path: [max_restore_progress_snapshot_path_bytes + 1]u8 = @splat('s');
+    const too_long_last_error: [max_restore_progress_last_error_bytes + 1]u8 = @splat('e');
+    const invalid = [_]RestoreProgressRecord{
+        blk: {
+            var candidate = valid;
+            candidate.table_id = 0;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.node_id = 0;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.group_id = 0;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.group_id = group_ids.main_metadata_group_id;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.backup_id = "";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.backup_id = &too_long_backup_id;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.backup_id = "not/a/backup";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.artifact_backup_id = "";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.artifact_backup_id = "artifact?7";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.location = "";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.location = &too_long_location;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.location = "s3://archive/\x00backups";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.snapshot_path = "";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.snapshot_path = &too_long_snapshot_path;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.snapshot_path = "/absolute/artifact.afb";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.snapshot_path = "artifact/../escape.afb";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.snapshot_path = "artifact\\escape.afb";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.artifact_sha256 = "short";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeF";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.phase = "unknown";
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.primary_restored = false;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.runtime_repair_complete = true;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = complete;
+            candidate.runtime_repair_complete = false;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.last_error = &too_long_last_error;
+            break :blk candidate;
+        },
+        blk: {
+            var candidate = valid;
+            candidate.last_error = "bad\nerror";
+            break :blk candidate;
+        },
+    };
+    for (invalid) |candidate| {
+        try std.testing.expectError(
+            error.InvalidRestoreProgressRecord,
+            validateRestoreProgressRecord(candidate),
+        );
+    }
+}
+
+pub fn findRestoreProgress(
+    records: []const RestoreProgressRecord,
+    table_id: u64,
+    node_id: u64,
+    group_id: u64,
+) ?RestoreProgressRecord {
+    for (records) |record| {
+        if (record.table_id == table_id and record.node_id == node_id and record.group_id == group_id) {
+            return record;
+        }
+    }
+    return null;
+}
+
+pub fn restoreProgressEquivalent(a: RestoreProgressRecord, b: RestoreProgressRecord) bool {
+    return a.table_id == b.table_id and
+        a.node_id == b.node_id and
+        a.group_id == b.group_id and
+        std.mem.eql(u8, a.backup_id, b.backup_id) and
+        std.mem.eql(u8, a.artifact_backup_id, b.artifact_backup_id) and
+        std.mem.eql(u8, a.location, b.location) and
+        std.mem.eql(u8, a.snapshot_path, b.snapshot_path) and
+        std.mem.eql(u8, a.artifact_sha256, b.artifact_sha256) and
+        a.primary_restored == b.primary_restored and
+        a.runtime_repair_complete == b.runtime_repair_complete and
+        std.mem.eql(u8, a.phase, b.phase) and
+        std.mem.eql(u8, a.last_error, b.last_error);
+}
+
 pub const ReplicationSourceStatusRecord = struct {
     table_id: u64,
     source_ordinal: u32,

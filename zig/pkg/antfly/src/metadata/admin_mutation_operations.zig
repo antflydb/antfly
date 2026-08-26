@@ -19,6 +19,8 @@ pub const Source = struct {
         validate_table_publication: *const fn (*anyopaque, metadata_api.CatalogTablePublicationContract) anyerror!bool,
         trigger_reallocate: *const fn (*anyopaque) anyerror!void,
         upsert_schema_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.SchemaProgressRecord) anyerror!void,
+        upsert_restore_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.RestoreProgressRecord) anyerror!void,
+        remove_restore_progress: *const fn (*anyopaque, u64, u64, u64) anyerror!void,
     };
 };
 
@@ -57,9 +59,31 @@ pub const Operations = struct {
         try request.ensureActive();
         try self.source.vtable.upsert_schema_progress(self.source.ptr, alloc, record);
     }
+
+    pub fn upsertRestoreProgress(
+        self: Operations,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        record: metadata_table_manager.RestoreProgressRecord,
+    ) !void {
+        try request.ensureActive();
+        try metadata_table_manager.validateRestoreProgressRecord(record);
+        try self.source.vtable.upsert_restore_progress(self.source.ptr, alloc, record);
+    }
+
+    pub fn removeRestoreProgress(
+        self: Operations,
+        request: operation.RequestContext,
+        table_id: u64,
+        node_id: u64,
+        group_id: u64,
+    ) !void {
+        try request.ensureActive();
+        try self.source.vtable.remove_restore_progress(self.source.ptr, table_id, node_id, group_id);
+    }
 };
 
-test "metadata admin mutations reject canceled work before reaching their source" {
+test "metadata admin mutations reject canceled or invalid restore progress before reaching their source" {
     const FakeSource = struct {
         calls: usize = 0,
 
@@ -84,6 +108,16 @@ test "metadata admin mutations reject canceled work before reaching their source
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
         }
+
+        fn upsertRestoreProgress(ptr: *anyopaque, _: std.mem.Allocator, _: metadata_table_manager.RestoreProgressRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+
+        fn removeRestoreProgress(ptr: *anyopaque, _: u64, _: u64, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
     };
 
     var source = FakeSource{};
@@ -94,11 +128,25 @@ test "metadata admin mutations reject canceled work before reaching their source
             .validate_table_publication = FakeSource.validateTablePublication,
             .trigger_reallocate = FakeSource.triggerReallocate,
             .upsert_schema_progress = FakeSource.upsertSchemaProgress,
+            .upsert_restore_progress = FakeSource.upsertRestoreProgress,
+            .remove_restore_progress = FakeSource.removeRestoreProgress,
         },
     } };
     var canceled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, operations.triggerReallocate(.{
         .cancellation = operation.CancellationToken.fromAtomic(&canceled),
     }));
+    try std.testing.expectError(error.Canceled, operations.removeRestoreProgress(.{
+        .cancellation = operation.CancellationToken.fromAtomic(&canceled),
+    }, 1, 2, 3));
+    try std.testing.expectError(
+        error.InvalidRestoreProgressRecord,
+        operations.upsertRestoreProgress(std.testing.allocator, .{}, .{
+            .table_id = 0,
+            .node_id = 2,
+            .group_id = 3,
+            .backup_id = "backup-3",
+        }),
+    );
     try std.testing.expectEqual(@as(usize, 0), source.calls);
 }

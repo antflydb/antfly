@@ -851,8 +851,24 @@ pub fn applyRestoreIntentIfNeededWithOptions(
     range: table_manager.RangeRecord,
     open_options: backups_api.OpenOptions,
 ) !void {
-    const restore = resolveRestoreIntent(range, table) orelse return;
-    try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
+    const restore = restoreSourceFromRecords(range, table, open_options) orelse return;
+    try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, restore, .{
+        .expected_table_name = table.name,
+        .expected_identity_namespace = doc_identity.Namespace{
+            .table_id = table.table_id,
+            .shard_id = table_manager.rangeDocIdentityShardId(range),
+            .range_id = table_manager.rangeDocIdentityRangeId(range),
+        },
+    });
+}
+
+pub fn restoreSourceFromRecords(
+    range: table_manager.RangeRecord,
+    table: table_manager.TableRecord,
+    open_options: backups_api.OpenOptions,
+) ?backup_restore.RestoreSource {
+    const restore = resolveRestoreIntent(range, table) orelse return null;
+    return .{
         .backup_id = restore.backup_id,
         .artifact_backup_id = restore.artifact_backup_id,
         .location = restore.location,
@@ -861,14 +877,7 @@ pub fn applyRestoreIntentIfNeededWithOptions(
         .expected_artifact_size_bytes = restore.artifact_size_bytes,
         .expected_artifact_sha256 = restore.artifact_sha256,
         .open_options = open_options,
-    }, .{
-        .expected_table_name = table.name,
-        .expected_identity_namespace = doc_identity.Namespace{
-            .table_id = table.table_id,
-            .shard_id = table_manager.rangeDocIdentityShardId(range),
-            .range_id = table_manager.rangeDocIdentityRangeId(range),
-        },
-    });
+    };
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {

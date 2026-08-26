@@ -28,6 +28,7 @@ const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
 const bedrock = @import("../inference/bedrock.zig");
 const httpx = @import("httpx");
+const objectstore = @import("objectstore");
 const extension_domain = @import("../extensions/mod.zig");
 const google_auth = @import("antfly_google").auth;
 const backup_contract = @import("backup_contract.zig");
@@ -12845,6 +12846,7 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
             _: ?[]const u8,
             _: ?[]const u8,
             max_response_size: ?usize,
+            _: ?objectstore.CancellationToken,
         ) !object_storage.S3.TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             const parsed = try std.Uri.parse(url);

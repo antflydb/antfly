@@ -2959,7 +2959,9 @@ pub fn build(b: *std.Build) void {
             "restore job store is idempotent and fenced",
             "restore idempotency keys are scoped by principal and resource",
             "successful restore completion wins a racing cancellation",
+            "restore retry delay is bounded across attempt categories",
             "retryable restore contention durably requeues progress and honors cancellation",
+            "retryable restore requeue always persists attempt backoff",
             "delayed restore contention yields FIFO capacity to unrelated jobs",
             "restore job runnable queue drains incrementally and preserves insertion order",
             "replicated restore leadership rebuild preserves FIFO and recovers running attempts",
@@ -2979,6 +2981,22 @@ pub fn build(b: *std.Build) void {
     const run_api_restore_jobs_tests = addFilteredTestRunArtifact(b, api_restore_jobs_tests);
     const lib_api_restore_jobs_test_step = b.step("lib-api-restore-jobs-test", "Run durable restore job store tests");
     lib_api_restore_jobs_test_step.dependOn(&run_api_restore_jobs_tests.step);
+    const api_restore_retry_backoff_tests = b.addTest(.{
+        .root_module = api_restore_jobs_test_mod,
+        .filters = &.{
+            "restore retry delay is bounded across attempt categories",
+            "retryable restore requeue always persists attempt backoff",
+            "retryable restore contention durably requeues progress and honors cancellation",
+            "delayed restore contention yields FIFO capacity to unrelated jobs",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_api_restore_retry_backoff_tests = addFilteredTestRunArtifact(b, api_restore_retry_backoff_tests);
+    const lib_api_restore_retry_backoff_test_step = b.step("lib-api-restore-retry-backoff-test", "Run restore retry backoff regressions");
+    lib_api_restore_retry_backoff_test_step.dependOn(&run_api_restore_retry_backoff_tests.step);
 
     const portable_backup_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/portable_backup_test_root.zig"),
@@ -3529,6 +3547,7 @@ pub fn build(b: *std.Build) void {
     };
     const unit_progress_skip_filters = root_test_skip_filters;
     const lib_unit_default_filters = [_][]const u8{
+        "bedrock provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
         "restore runtime store persists checkpoints and requeues interrupted work",
@@ -3804,6 +3823,18 @@ pub fn build(b: *std.Build) void {
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
+    const lib_bedrock_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"bedrock provider request helpers"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_bedrock_tests = addFilteredTestRunArtifact(b, lib_bedrock_tests);
+    const lib_bedrock_test_step = b.step("lib-bedrock-test", "Run focused Bedrock provider tests");
+    lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
+
     const api_http_runtime_default_filters = [_][]const u8{
         "api http client round-trips public status and internal capability routes",
         "api http retryable embedding failures provide retry guidance",
@@ -3938,6 +3969,18 @@ pub fn build(b: *std.Build) void {
     const run_cmd_tests = addFilteredTestRunArtifact(b, cmd_tests);
     const cmd_test_step = b.step("cmd-test", "Run Antfly command and client CLI tests");
     cmd_test_step.dependOn(&run_cmd_tests.step);
+    const cmd_restore_poll_tests = b.addTest(.{
+        .root_module = cmd_test_mod,
+        .filters = &.{"cmd.cli.backup.test.restore polling response classification"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_cmd_restore_poll_tests = addFilteredTestRunArtifact(b, cmd_restore_poll_tests);
+    const cmd_restore_poll_test_step = b.step("cmd-restore-poll-test", "Run restore CLI polling classification regression");
+    cmd_restore_poll_test_step.dependOn(&run_cmd_restore_poll_tests.step);
 
     const lite_cmd_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_cmd_test.zig"),
@@ -4023,6 +4066,7 @@ pub fn build(b: *std.Build) void {
             "host records backup restore bootstrap failure when no handler is available",
             "file replica catalog persists backup restore bootstrap records across reopen",
             "replica catalog rejects invalid backup restore authority and integrity bindings",
+            "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4295,12 +4339,16 @@ pub fn build(b: *std.Build) void {
         "data runtime local group status provider collects and caches group statuses",
         "data runtime storage ownership fingerprint excludes transient placement progress",
         "data descriptor factory separates bootstrap voters from transport peers",
+        "data descriptor factory restores persisted voters before metadata peer discovery",
         "data descriptor factory bootstraps pristine group from complete intent peer set",
         "placement peer collection preserves complete intent peers during partial projection",
         "placement topology refuses partial transition bootstrap voters",
         "data runtime local group status reflects active transition readiness",
         "data runtime local group status uses metadata transition observation when local pair is absent",
         "data runtime local group status prefers merged snapshot readiness fallback",
+        "data runtime remote admin snapshot clone owns parser-backed slices",
+        "data runtime remote admin snapshot clone releases partial ownership",
+        "data runtime remote metadata status stabilizes parser-backed role",
         "data runtime status refresh publishes placeholder when live managed writer is busy and cache entry is missing",
         "data runtime status refresh publishes sibling placeholder when only one group has managed writer",
         "data runtime status refresh budget preserves fresh cached group status for visible generation",
@@ -4392,6 +4440,7 @@ pub fn build(b: *std.Build) void {
         "data runtime HA replication HTTP budget covers base64 apply envelope",
         "data server keeps upstream replication availability failures nonfatal",
         "data runtime records HA standby apply failures without stopping run round",
+        "data restore progress publishes only absent or changed state",
     };
     const lib_data_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
@@ -4408,6 +4457,18 @@ pub fn build(b: *std.Build) void {
     const run_lib_data_runtime_tests = addFilteredTestRunArtifact(b, lib_data_runtime_tests);
     const lib_data_runtime_test_step = b.step("lib-data-runtime-test", "Run focused data runtime tests");
     lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
+    const lib_data_restore_progress_tests = b.addTest(.{
+        .root_module = data_runtime_test_mod,
+        .filters = &.{"data restore progress publishes only absent or changed state"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_lib_data_restore_progress_tests = addFilteredTestRunArtifact(b, lib_data_restore_progress_tests);
+    const lib_data_restore_progress_test_step = b.step("lib-data-restore-progress-test", "Run restore progress change-detection regression only");
+    lib_data_restore_progress_test_step.dependOn(&run_lib_data_restore_progress_tests.step);
 
     const lib_data_storage_default_filters = [_][]const u8{
         "data storage module tests are reachable",
@@ -4425,6 +4486,8 @@ pub fn build(b: *std.Build) void {
         "db split sync coordinator can prepare source split again after rollback",
         "db split successor bootstrap atomically replaces stale destination generation",
         "data raft apply store applies delete operations into group state",
+        "data raft apply store accepts equivalent restart replay with different batch boundaries",
+        "data raft apply store accepts restart replay split below the durable watermark",
         "data raft protocol barrier persists and transfers in snapshots",
         "data raft protocol request observation never waits for generation preparation",
         "data raft apply store prepared snapshot retains its MVCC view across later writes",
@@ -4490,6 +4553,29 @@ pub fn build(b: *std.Build) void {
     );
     const lib_data_storage_test_step = b.step("lib-data-storage-test", "Run focused data storage tests");
     lib_data_storage_test_step.dependOn(&run_lib_data_storage_tests.step);
+    const lib_data_raft_replay_runtime_filters = &.{
+        "data raft apply store accepts equivalent restart replay with different batch boundaries",
+        "data raft apply store accepts restart replay split below the durable watermark",
+    };
+    const lib_data_raft_replay_tests = b.addTest(.{
+        .root_module = data_storage_test_mod,
+        .filters = compileFiltersWithAnchors(
+            b,
+            &.{"data storage module tests are reachable"},
+            lib_data_raft_replay_runtime_filters,
+        ),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_data_raft_replay_tests = addFilteredTestRunArtifactWithRuntimeFilters(
+        b,
+        lib_data_raft_replay_tests,
+        lib_data_raft_replay_runtime_filters,
+    );
+    const lib_data_raft_replay_test_step = b.step("lib-data-raft-replay-test", "Run durable replay equivalence regressions only");
+    lib_data_raft_replay_test_step.dependOn(&run_lib_data_raft_replay_tests.step);
 
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -5532,7 +5618,7 @@ pub fn build(b: *std.Build) void {
             "cluster backup maintenance queue retains distinct locations with bounded deduplication",
             "cluster backup maintenance queue rotates repositories without allocation",
             "cluster backup maintenance queue expires inactive repositories",
-            "restore repository contention backoff is bounded and increasing",
+            "restore retry delay is bounded across attempt categories",
             "restore retry deadline wakeup is interruptible without polling",
             "owned backup runtime has a finite worker ceiling",
             "backup staging uses configured storage authority and exclusive generations",
@@ -5829,8 +5915,10 @@ pub fn build(b: *std.Build) void {
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{
             "transaction request parsers reject invalid unsigned integers and accept legacy epochs",
+            "transaction request parsers release owned prefixes after malformed input",
             "transaction read snapshot map keys preserve embedded delimiters",
             "transaction session commit response includes retry hints for doc identity availability conflicts",
+            "hosted participant rediscovery retries only pre-decision leader unavailability",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -6175,11 +6263,23 @@ pub fn build(b: *std.Build) void {
     api_transactions_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
     const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
     api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
+    const api_table_writes_managed_cluster_regression_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{
+            "provisioned writer cache starts DB workers after stable entry installation",
+            "cold replicated apply preserves declared full text projection across retained reopen",
+        },
+    });
+    const run_api_table_writes_managed_cluster_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_managed_cluster_regression_tests);
+    const api_table_writes_managed_cluster_regression_step = b.step("api-table-writes-managed-cluster-regression-test", "Run focused managed-cluster ownership and schema regressions");
+    api_table_writes_managed_cluster_regression_step.dependOn(&run_api_table_writes_managed_cluster_regression_tests.step);
     const api_table_writes_production_regression_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
+            "provisioned writer cache starts DB workers after stable entry installation",
             "table write source restore acquires lifecycle unless caller reserves it",
             "provisioned native backup restore repeats through shared read and write owners",
+            "replica root restore reconcile publishes or recovers a fenced generation",
             "provisioned create succeeds when post-commit runtime status is fenced",
             "provisioned create reuses a generation opened by startup reconciliation",
             "provisioned create installs managed enrichment despite a matching stale fingerprint",
@@ -6228,6 +6328,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up allocation failure preserves bounded retry",
             "standby HA replay reconciles managed indexes without opening the public write gate",
+            "cold replicated apply preserves declared full text projection across retained reopen",
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed structural catch-up leaves pending enrichment with the asynchronous owner",
             "managed structural catch-up does not delegate an empty producer handoff",
@@ -6277,6 +6378,14 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
+    const api_table_writes_restore_repeat_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = &.{
+            "provisioned native backup restore repeats through shared read and write owners",
+            "replica root restore reconcile publishes or recovers a fenced generation",
+        },
+    });
+    const run_api_table_writes_restore_repeat_tests = addFilteredTestRunArtifact(b, api_table_writes_restore_repeat_tests);
     const run_api_table_writes_production_regression_unit_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
     // These stateful suites each open several DB/index runtimes. Keep their
     // aggregate-gate runs on one lane so bounded CI hosts do not convert
@@ -6286,7 +6395,7 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_production_regression_step = b.step("api-table-writes-production-regression-test", "Run focused restore and writer-cache lifecycle regressions");
     api_table_writes_production_regression_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const api_table_writes_restore_repeat_step = b.step("api-table-writes-restore-repeat-test", "Run the focused shared-owner native restore regression");
-    api_table_writes_restore_repeat_step.dependOn(&run_api_table_writes_production_regression_tests.step);
+    api_table_writes_restore_repeat_step.dependOn(&run_api_table_writes_restore_repeat_tests.step);
     const api_table_writes_cache_lifecycle_step = b.step("api-table-writes-cache-lifecycle-test", "Run focused writer-cache dirty ownership regressions");
     api_table_writes_cache_lifecycle_step.dependOn(&run_api_table_writes_production_regression_tests.step);
     const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
@@ -6434,6 +6543,42 @@ pub fn build(b: *std.Build) void {
     const run_lib_metadata_service_tests = addFilteredTestRunArtifact(b, lib_metadata_service_tests);
     const lib_metadata_service_test_step = b.step("lib-metadata-service-test", "Run metadata service/control-loop integration tests");
     lib_metadata_service_test_step.dependOn(&run_lib_metadata_service_tests.step);
+    const lib_metadata_restore_progress_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "metadata service restore progress update is not erased by stale projection",
+            "restore progress admission validates every field category and semantic state",
+            "metadata admin mutations reject canceled or invalid restore progress before reaching their source",
+            "metadata service restore progress entrypoints validate before raft admission",
+            "metadata restore progress rejects semantic violations before mutation admission",
+            "metadata mutation body bounds return 413 at max plus one before JSON parsing",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_metadata_restore_progress_tests = addFilteredTestRunArtifact(b, lib_metadata_restore_progress_tests);
+    const lib_metadata_restore_progress_test_step = b.step("lib-metadata-restore-progress-test", "Run the focused restore progress publication regression");
+    lib_metadata_restore_progress_test_step.dependOn(&run_lib_metadata_restore_progress_tests.step);
+    const lib_metadata_table_forwarding_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "metadata http client forwards table create and drop to the internal route",
+            "metadata http client rejects invalid forwarded table names before I/O",
+            "metadata http server forwards table names outside path-segment syntax through JSON bodies",
+            "metadata table mutation followers reject bodies before parsing or size admission",
+            "metadata mutation body bounds return 413 at max plus one before JSON parsing",
+            "routed table mutation bounds the canonical create body before route selection",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_metadata_table_forwarding_tests = addFilteredTestRunArtifact(b, lib_metadata_table_forwarding_tests);
+    const lib_metadata_table_forwarding_test_step = b.step("lib-metadata-table-forwarding-test", "Run follower table-mutation forwarding regressions only");
+    lib_metadata_table_forwarding_test_step.dependOn(&run_lib_metadata_table_forwarding_tests.step);
 
     const lib_metadata_logic_default_filters = [_][]const u8{
         "metadata reconciler",
@@ -6481,6 +6626,15 @@ pub fn build(b: *std.Build) void {
         "metadata http server accepts internal reallocate and split merge routes",
         "metadata http server returns 400 for invalid internal restore backup locations",
         "metadata http server returns retryable authority response when reconcile lease is not held",
+        "metadata http client forwards table create and drop to the internal route",
+        "metadata http client rejects invalid forwarded table names before I/O",
+        "metadata http server forwards table names outside path-segment syntax through JSON bodies",
+        "metadata table mutation followers reject bodies before parsing or size admission",
+        "metadata mutation body bounds return 413 at max plus one before JSON parsing",
+        "metadata restore progress rejects semantic violations before mutation admission",
+        "restore progress admission validates every field category and semantic state",
+        "metadata admin mutations reject canceled or invalid restore progress before reaching their source",
+        "metadata service restore progress entrypoints validate before raft admission",
     };
     const lib_metadata_logic_runtime_filters = selectTestFilters(b, &lib_metadata_logic_default_filters);
     const lib_metadata_logic_tests = b.addTest(.{
@@ -10192,15 +10346,15 @@ pub fn build(b: *std.Build) void {
                 // budget can overlap more units while a smaller cgroup
                 // automatically schedules only the subset that fits.
                 // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
-                // platform frameworks. Linux ARM64 reached 4.99 GB in the
-                // v0.2.1-rc0 release build, so reserve 6 GiB rather than
-                // forcing the scheduler to discard a completed 4 GiB claim.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 6) * 1024 * 1024 * 1024,
+                // platform frameworks. Linux ARM64 reached 8.96 GB in a
+                // production ReleaseFast build, so reserve 10 GiB.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
                 // Before the serverless split, clean aarch64-macOS ReleaseFast
                 // storage codegen reached 17.42 GB (16.23 GiB). Keep the old
                 // conservative reservations until both release runners have
-                // measured the smaller storage-only closure.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
+                // measured the smaller storage-only closure. Linux ARM64 also
+                // exceeds 18 GiB in a production ReleaseFast build.
+                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 24) * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
                 // Its cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS

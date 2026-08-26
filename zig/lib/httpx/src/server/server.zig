@@ -199,7 +199,7 @@ fn routeErrorStatus(err: anyerror) ?u16 {
         error.Canceled, error.Cancelled => null,
         error.Timeout => 408,
         error.DeadlineExceeded => 504,
-        error.BodyTooLarge, error.StreamTooLong, error.ValueTooLong => 413,
+        error.BodyTooLarge, error.StreamDataOverflow, error.StreamTooLong, error.ValueTooLong => 413,
         error.BodyCapacityExceeded => 429,
         error.EndOfStream,
         error.SyntaxError,
@@ -1355,6 +1355,10 @@ pub const Server = struct {
         try self.router.add(method, path, handler);
     }
 
+    pub fn routeWithBodyLimit(self: *Self, method: types.Method, path: []const u8, max_body_size: usize, handler: anytype) !void {
+        try self.router.addWithBodyLimit(method, path, handler, max_body_size);
+    }
+
     /// Registers a route with borrowed opaque data copied into Context.
     pub fn routeWithData(self: *Self, method: types.Method, path: []const u8, handler: anytype, data: *anyopaque) !void {
         try self.router.addWithData(method, path, handler, data);
@@ -1368,6 +1372,10 @@ pub const Server = struct {
     /// Registers a POST route.
     pub fn post(self: *Self, path: []const u8, handler: anytype) !void {
         try self.route(.POST, path, handler);
+    }
+
+    pub fn postWithBodyLimit(self: *Self, path: []const u8, max_body_size: usize, handler: anytype) !void {
+        try self.routeWithBodyLimit(.POST, path, max_body_size, handler);
     }
 
     /// Registers a PUT route.
@@ -1774,6 +1782,8 @@ pub const Server = struct {
         parser.max_body_size = self.config.max_body_size;
         parser.max_headers = self.config.max_headers;
         parser.body_budget = &self.body_budget;
+        parser.request_body_limit_context = self;
+        parser.request_body_limit_resolver = resolveRequestBodyLimit;
 
         var first_request = true;
         var request_active = false;
@@ -1826,7 +1836,7 @@ pub const Server = struct {
                 }
                 leftover -= consumed;
                 if (parser.isError()) {
-                    try self.sendError(&sock, 400);
+                    try self.sendError(&sock, if (parser.getErrorReason() == .body_too_large) 413 else 400);
                     return;
                 }
                 if (!self.reserveH1BodyAfterHeaders(&parser, &h1_body_reserved)) {
@@ -1897,7 +1907,7 @@ pub const Server = struct {
                 }
                 leftover = n - consumed;
                 if (parser.isError()) {
-                    try self.sendError(&sock, 400);
+                    try self.sendError(&sock, if (parser.getErrorReason() == .body_too_large) 413 else 400);
                     return;
                 }
                 if (!self.reserveH1BodyAfterHeaders(&parser, &h1_body_reserved)) {
@@ -2106,6 +2116,13 @@ pub const Server = struct {
         if (!self.h1_body_budget.tryReserve(1)) return false;
         reserved.* = true;
         return true;
+    }
+
+    fn resolveRequestBodyLimit(ptr: *anyopaque, method: types.Method, request_target: []const u8) ?usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const path = if (mem.indexOfScalar(u8, request_target, '?')) |query| request_target[0..query] else request_target;
+        const route_limit = self.router.bodySizeLimit(method, path) orelse return null;
+        return @min(route_limit, self.config.max_body_size);
     }
 
     /// Handles an HTTP/1.1 → HTTP/2 upgrade (h2c, RFC 7540 §3.2).
@@ -2857,6 +2874,29 @@ pub const Server = struct {
             h2.stream_manager.removeStream(stream_id);
             return false;
         }
+        var method: ?types.Method = null;
+        var request_target: ?[]const u8 = null;
+        if (stream.request_headers) |headers| for (headers) |header| {
+            if (mem.eql(u8, header.name, ":method")) {
+                method = types.Method.fromString(header.value);
+            } else if (mem.eql(u8, header.name, ":path")) {
+                request_target = header.value;
+            }
+        };
+        if (method) |request_method| {
+            if (request_target) |target| {
+                if (resolveRequestBodyLimit(self, request_method, target)) |limit| {
+                    stream.max_data_size = limit;
+                    if (stream.content_length) |content_length| {
+                        if (content_length > limit) {
+                            self.sendH2Error(h2, sock, stream_id, 413) catch {};
+                            h2.stream_manager.removeStream(stream_id);
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
         stream.data_event = data_event;
         return true;
     }
@@ -3378,6 +3418,7 @@ test "routeErrorStatus maps oversized route errors to payload too large" {
     try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.ValueTooLong));
     try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.StreamTooLong));
     try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.BodyTooLarge));
+    try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.StreamDataOverflow));
     try std.testing.expectEqual(@as(?u16, 429), routeErrorStatus(error.BodyCapacityExceeded));
     try std.testing.expectEqual(@as(?u16, 408), routeErrorStatus(error.Timeout));
     try std.testing.expectEqual(@as(?u16, 504), routeErrorStatus(error.DeadlineExceeded));
@@ -3408,6 +3449,21 @@ test "routeErrorStatus maps oversized route errors to payload too large" {
         "{\"error\":\"INTERNAL_ERROR\",\"message\":\"internal server error\"}",
         routeErrorBody(500),
     );
+}
+
+test "route body limits resolve before transport body admission" {
+    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{ .max_body_size = 1024 });
+    defer server.deinit();
+    const handler = struct {
+        fn h(ctx: *Context) !Response {
+            return ctx.text("ok");
+        }
+    }.h;
+    try server.postWithBodyLimit("/bounded/:id", 64, handler);
+    try server.post("/global", handler);
+
+    try std.testing.expectEqual(@as(?usize, 64), Server.resolveRequestBodyLimit(&server, .POST, "/bounded/7?x=1"));
+    try std.testing.expectEqual(@as(?usize, null), Server.resolveRequestBodyLimit(&server, .POST, "/global"));
 }
 
 test "Context queryDecoded decodes percent escapes exactly once" {

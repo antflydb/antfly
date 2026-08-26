@@ -513,6 +513,7 @@ pub const MultiRaft = struct {
         // visible to the next reconciliation pass.
         if (self.hooks.replica_catalog) |catalog| _ = try catalog.removeReplica(group_id);
         std.debug.assert(self.removeGroup(group_id));
+        if (self.hooks.state_machine) |state_machine| state_machine.retireGroup(group_id);
         if (self.hooks.group_storage) |group_storage| group_storage.retireGroup(group_id);
     }
 
@@ -687,6 +688,34 @@ pub const MultiRaft = struct {
         const transport_advance_start_ns = clock.monotonicNs();
         if (self.hooks.transport) |transport| try transport.advanceTimeMs(virtual_time.now_ms);
         round.transport_advance_elapsed_ns = clock.elapsedSinceNs(transport_advance_start_ns);
+        round.elapsed_ns = clock.elapsedSinceNs(round_start_ns);
+        return round;
+    }
+
+    /// Drains work already made ready without advancing the Raft clock. This
+    /// lets request paths help publish proposals while the runtime's cadence
+    /// owner remains solely responsible for elections and heartbeats.
+    pub fn runProgressRound(self: *MultiRaft, max_ready_steps: usize) !HostRound {
+        const round_start_ns = clock.monotonicNs();
+        var drain_diag = DrainReadyDiagnostics{};
+        const drain_ready_start_ns = clock.monotonicNs();
+        const ready_result = try self.drainReadyWithDiagnostics(max_ready_steps, &drain_diag);
+
+        var round: HostRound = .{
+            .processed_groups = ready_result.processed_groups,
+            .processed_ready_steps = ready_result.processed_ready_steps,
+            .virtual_round = self.scheduler.round(),
+            .virtual_time_ms = self.scheduler.nowMs(),
+            .drain_ready_elapsed_ns = clock.elapsedSinceNs(drain_ready_start_ns),
+            .drain_ready_scan_elapsed_ns = drain_diag.scan_elapsed_ns,
+            .persist_batch_begin_elapsed_ns = drain_diag.persist_batch_begin_elapsed_ns,
+            .persist_batch_finish_elapsed_ns = drain_diag.persist_batch_finish_elapsed_ns,
+            .outbox_drain_elapsed_ns = drain_diag.outbox_drain_elapsed_ns,
+            .apply_flush_elapsed_ns = drain_diag.apply_flush_elapsed_ns,
+            .transport_flush_elapsed_ns = drain_diag.transport_flush_elapsed_ns,
+            .slowest_ready_group = drain_diag.slowest_ready_group,
+        };
+        self.metrics.processed_groups += round.processed_groups;
         round.elapsed_ns = clock.elapsedSinceNs(round_start_ns);
         return round;
     }
@@ -2090,4 +2119,62 @@ test "multi raft owns real groups" {
     defer std.testing.allocator.free(ready_ids);
     try std.testing.expectEqual(@as(usize, 0), ready_ids.len);
     try std.testing.expect(runtime.removeGroup(11));
+}
+
+test "multi raft progress round drains ready work without advancing raft time" {
+    const TransportCounter = struct {
+        advance_time_calls: usize = 0,
+
+        fn iface(self: *@This()) transport_iface.Transport {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .send_messages = sendMessages,
+                    .advance_time_ms = advanceTimeMs,
+                },
+            };
+        }
+
+        fn sendMessages(_: *anyopaque, _: core.types.GroupId, _: []const core.Message) !void {}
+
+        fn advanceTimeMs(ptr: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.advance_time_calls += 1;
+        }
+    };
+
+    var transport = TransportCounter{};
+    var runtime = MultiRaft.init(std.testing.allocator, .{}, .{ .transport = transport.iface() });
+    defer runtime.deinit();
+
+    var storage = core.MemoryStorage.init(std.testing.allocator);
+    defer storage.deinit();
+
+    var peers = [_]core.types.NodeId{1};
+    try runtime.addGroup(.{
+        .group_id = 12,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = 12,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = storage.storage(),
+    });
+    try runtime.campaignGroup(12);
+
+    const before = runtime.metricsSnapshot();
+    const before_advance_time_calls = transport.advance_time_calls;
+    const round = try runtime.runProgressRound(16);
+    const after = runtime.metricsSnapshot();
+
+    try std.testing.expect(round.processed_ready_steps > 0);
+    try std.testing.expectEqual(@as(usize, 0), round.ticked_groups);
+    try std.testing.expectEqual(before.rounds, after.rounds);
+    try std.testing.expectEqual(before.virtual_round, after.virtual_round);
+    try std.testing.expectEqual(before.virtual_time_ms, after.virtual_time_ms);
+    try std.testing.expectEqual(before_advance_time_calls, transport.advance_time_calls);
 }

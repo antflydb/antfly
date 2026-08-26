@@ -89,6 +89,7 @@ const Factory = struct {
     alloc: std.mem.Allocator,
     store: *raft_engine.core.MemoryStorage,
     metadata_group_id: u64,
+    admit_data_replicas: bool,
     metadata_peer_node_ids: []u64 = &.{},
 
     fn deinit(self: *@This()) void {
@@ -102,8 +103,14 @@ const Factory = struct {
             .vtable = &.{
                 .build_descriptor = buildDescriptor,
                 .free_descriptor = freeDescriptor,
+                .accepts_record = acceptsRecord,
             },
         };
+    }
+
+    fn acceptsRecord(ptr: *anyopaque, record: antfly.raft.catalog.ReplicaRecord) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.admit_data_replicas or record.group_id == self.metadata_group_id;
     }
 
     fn buildDescriptor(ptr: *anyopaque, record: antfly.raft.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
@@ -361,7 +368,7 @@ pub const ServerConfig = struct {
     replica_root_dir: []const u8,
     replica_catalog_path: []const u8,
     snapshot_root_dir: []const u8,
-    observe_local_replica_root: bool = true,
+    observe_local_replica_root: bool = false,
     replica_state_backend: antfly.raft.ReplicaStateBackend = .wal,
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 0,
@@ -454,6 +461,7 @@ pub const Server = struct {
             .alloc = alloc,
             .store = result.store,
             .metadata_group_id = cfg.metadata_group_id,
+            .admit_data_replicas = cfg.observe_local_replica_root,
             .metadata_peer_node_ids = try allocMetadataPeerNodeIds(alloc, cfg.local_node_id, cfg.metadata_cluster_peers),
         };
         errdefer result.factory.deinit();
@@ -469,9 +477,14 @@ pub const Server = struct {
         errdefer alloc.free(result.admin_bind_host);
         result.reallocation_protocol_peers = try reallocationProtocolPeersFromClusterPeers(alloc, cfg.metadata_cluster_peers);
         errdefer freeReallocationProtocolPeers(alloc, result.reallocation_protocol_peers);
+        const restore_open_options: antfly.public_api.backups.OpenOptions = .{
+            .node_config = cfg.api_server_cfg.node_config,
+            .secret_store = cfg.secret_store,
+        };
         const service_cfg = antfly.metadata_service.MetadataServiceConfig{
             .observe_local_replica_root = cfg.observe_local_replica_root,
             .backend_runtime = cfg.backend_runtime,
+            .restore_open_options = restore_open_options,
             .secret_store = cfg.secret_store,
             .reallocation_protocol_peers = result.reallocation_protocol_peers,
         };
@@ -495,6 +508,7 @@ pub const Server = struct {
                     },
                 },
                 .wal_replica_state = metadataWalReplicaStateConfig(),
+                .restore_open_options = restore_open_options,
             },
             .admin_listener = .{
                 .bind_host = result.admin_bind_host,
@@ -1866,6 +1880,132 @@ test "metadata runtime server uses wal replica state backend by default" {
     try std.testing.expect(server.server.svc.raft.host.owned_file_replica_provider == null);
 }
 
+test "metadata runtime server does not observe colocated data replica roots by default" {
+    const cfg: ServerConfig = .{
+        .replica_root_dir = "replicas",
+        .replica_catalog_path = "replica-catalog",
+        .snapshot_root_dir = "snapshots",
+    };
+
+    try std.testing.expect(!cfg.observe_local_replica_root);
+}
+
+test "dedicated metadata runtime keeps control reconciliation without hosting colliding data placement" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-dedicated-control/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-dedicated-control/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-dedicated-control/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var server = try Server.init(std.testing.allocator, .{
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root,
+    });
+    defer server.deinit();
+    try server.start();
+    try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
+
+    var status = try server.status();
+    var rounds: usize = 0;
+    while (status.reconcile_lease_owner_node_id != 1 and rounds < 32) : (rounds += 1) {
+        try server.runRound();
+        status = try server.status();
+    }
+    try std.testing.expectEqual(@as(u64, 1), status.reconcile_lease_owner_node_id);
+    try std.testing.expect(status.reconcile_lease_held_by_local);
+    const now_ms: u64 = @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
+    try std.testing.expect(status.reconcile_lease_expires_at_ms > now_ms);
+
+    const data_group_id: u64 = 71;
+    server.metadataHttpService().setLifecycleReconcileHook(null);
+    try server.metadataHttpService().upsertNode(.{ .node_id = 1 });
+    try server.metadataHttpService().upsertReplicaIntent(.{
+        .record = .{
+            .group_id = data_group_id,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .bootstrap_mode = .empty,
+        },
+        .peer_node_ids = &.{1},
+    }, null, 0, false);
+    for (0..8) |_| try server.runRound();
+
+    try std.testing.expectEqual(
+        antfly.raft.HostedReplicaStatus.absent,
+        server.server.svc.raft.host.status(data_group_id),
+    );
+    const projected_intents = try server.metadataHttpService().listProjectedPlacementIntents(std.testing.allocator);
+    defer server.metadataHttpService().freeProjectedPlacementIntents(std.testing.allocator, projected_intents);
+    try std.testing.expectEqual(@as(usize, 1), projected_intents.len);
+    try std.testing.expectEqual(data_group_id, projected_intents[0].record.group_id);
+    const hosted_group_ids = try server.server.svc.raft.host.http_host.host.listGroupIds(std.testing.allocator);
+    defer std.testing.allocator.free(hosted_group_ids);
+    try std.testing.expectEqualSlices(u64, &.{group_ids.main_metadata_group_id}, hosted_group_ids);
+    status = try server.status();
+    try std.testing.expectEqual(@as(usize, 1), status.metadata_raft_transport_served_groups);
+}
+
+test "dedicated metadata WAL restart skips stale data replica catalog records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-dedicated-catalog/replicas", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-dedicated-catalog/catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-dedicated-catalog/snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+    const stale_data_group_id: u64 = 72;
+
+    {
+        var colocated = try Server.init(std.testing.allocator, .{
+            .replica_root_dir = replica_root,
+            .replica_catalog_path = replica_catalog_path,
+            .snapshot_root_dir = snapshot_root,
+            .observe_local_replica_root = true,
+        });
+        defer colocated.deinit();
+        try colocated.start();
+        try colocated.bootstrapLocal(group_ids.main_metadata_group_id, 1);
+        _ = try colocated.server.svc.raft.host.http_host.host.ensureReplica(.{
+            .group_id = stale_data_group_id,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .bootstrap_mode = .empty,
+        });
+    }
+
+    var dedicated = try Server.init(std.testing.allocator, .{
+        .replica_root_dir = replica_root,
+        .replica_catalog_path = replica_catalog_path,
+        .snapshot_root_dir = snapshot_root,
+    });
+    defer dedicated.deinit();
+
+    const hosted_group_ids = try dedicated.server.svc.raft.host.http_host.host.listGroupIds(std.testing.allocator);
+    defer std.testing.allocator.free(hosted_group_ids);
+    try std.testing.expectEqualSlices(u64, &.{group_ids.main_metadata_group_id}, hosted_group_ids);
+    try std.testing.expectError(
+        error.ReplicaAdmissionRejected,
+        dedicated.server.svc.raft.host.http_host.host.ensureReplica(.{
+            .group_id = stale_data_group_id,
+            .replica_id = 1,
+            .local_node_id = 1,
+            .bootstrap_mode = .persisted,
+        }),
+    );
+
+    const replica_catalog = dedicated.server.svc.raft.host.owned_replica_catalog orelse return error.TestExpectedEqual;
+    const catalog_records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
+    defer antfly.raft.catalog.freeReplicaRecords(std.testing.allocator, catalog_records);
+    try std.testing.expectEqual(@as(usize, 2), catalog_records.len);
+}
+
 test "metadata runtime legacy multi-node cluster config does not require orchestration endpoints at startup" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2368,6 +2508,7 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
 
     const HookCtx = struct {
         runs: usize = 0,
+        last_options: ?antfly.metadata.table_provisioner.ReconcileReplicaRootOptions = null,
 
         fn run(
             ptr: *anyopaque,
@@ -2375,10 +2516,15 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
         ) anyerror!antfly.metadata.table_provisioner.ProvisionSummary {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.runs += 1;
-            _ = request;
+            self.last_options = request.reconcile_options;
             return .{};
         }
     };
+
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var node_config: antfly.common.config.Config = undefined;
+    var secret_store: antfly.common.secrets.FileStore = undefined;
 
     var server = try Server.init(std.testing.allocator, .{
         .local_node_id = 1,
@@ -2387,6 +2533,9 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
         .replica_catalog_path = replica_catalog_path,
         .snapshot_root_dir = snapshot_root,
         .observe_local_replica_root = true,
+        .backend_runtime = backend_runtime.ptr(),
+        .secret_store = &secret_store,
+        .api_server_cfg = .{ .node_config = &node_config },
     });
     defer server.deinit();
     try server.start();
@@ -2405,4 +2554,15 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
         try server.runRound();
     }
     try std.testing.expect(hook_ctx.runs > 0);
+    const reconcile_options = hook_ctx.last_options orelse return error.TestExpectedEqual;
+    try std.testing.expect(reconcile_options.backend_runtime == backend_runtime.ptr());
+    try std.testing.expect(reconcile_options.restore_open_options.node_config == &node_config);
+    try std.testing.expect(reconcile_options.restore_open_options.secret_store == &secret_store);
+    const actual_io = reconcile_options.restore_open_options.io orelse return error.TestExpectedEqual;
+    const expected_io = backend_runtime.ptr().io() orelse return error.TestExpectedEqual;
+    try std.testing.expect(actual_io.userdata == expected_io.userdata);
+    try std.testing.expect(actual_io.vtable == expected_io.vtable);
+    const bootstrapper = server.server.svc.raft.host.owned_backup_restore_bootstrapper orelse return error.TestExpectedEqual;
+    try std.testing.expect(bootstrapper.open_options.node_config == &node_config);
+    try std.testing.expect(bootstrapper.open_options.secret_store == &secret_store);
 }
