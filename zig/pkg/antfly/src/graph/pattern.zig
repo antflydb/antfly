@@ -368,7 +368,62 @@ pub const DistinctBudget = struct {
         self.remaining_identities -= 1;
         self.remaining_identity_bytes -= identity_bytes;
     }
+
+    /// Charge retained container storage used to index and return exact
+    /// identities. The byte ceiling is deliberately conservative and
+    /// request-consumptive: transient reallocations cannot be used to exceed
+    /// admission by repeatedly growing and releasing distinct sets.
+    pub fn consumeRetainedBytes(self: *DistinctBudget, bytes: usize) !void {
+        if (bytes > self.remaining_identity_bytes)
+            return error.GraphDistinctBudgetExceeded;
+        self.remaining_identity_bytes -= bytes;
+    }
 };
+
+pub fn ensureBorrowedDistinctMapCapacity(
+    alloc: Allocator,
+    budget: *DistinctBudget,
+    map: *node_identity.BorrowedMap(void),
+    count: usize,
+) !void {
+    const target_capacity = work_budget_mod.hashMapCapacityForCount(
+        count,
+        std.hash_map.default_max_load_percentage,
+    ) catch return error.GraphDistinctBudgetExceeded;
+    if (target_capacity <= map.capacity()) return;
+    const current_bytes = work_budget_mod.hashMapRetainedBytes(
+        node_identity.Ref,
+        void,
+        map.capacity(),
+    ) catch return error.GraphDistinctBudgetExceeded;
+    const target_bytes = work_budget_mod.hashMapRetainedBytes(
+        node_identity.Ref,
+        void,
+        target_capacity,
+    ) catch return error.GraphDistinctBudgetExceeded;
+    try budget.consumeRetainedBytes(target_bytes - current_bytes);
+    try map.ensureTotalCapacity(alloc, count);
+}
+
+pub fn ensureDistinctValueCapacity(
+    alloc: Allocator,
+    budget: *DistinctBudget,
+    values: *std.ArrayListUnmanaged(node_identity.Ref),
+    count: usize,
+) !void {
+    if (count <= values.capacity) return;
+    const doubled = std.math.mul(usize, values.capacity, 2) catch
+        return error.GraphDistinctBudgetExceeded;
+    const target_capacity = @max(count, @max(@as(usize, 8), doubled));
+    const added_capacity = target_capacity - values.capacity;
+    const added_bytes = std.math.mul(
+        usize,
+        added_capacity,
+        @sizeOf(node_identity.Ref),
+    ) catch return error.GraphDistinctBudgetExceeded;
+    try budget.consumeRetainedBytes(added_bytes);
+    try values.ensureTotalCapacityPrecise(alloc, target_capacity);
+}
 
 const MatchState = struct {
     bindings: []PatternBinding,
@@ -2071,7 +2126,7 @@ const StreamingCountAccumulator = struct {
     spec: CountAggregateSpec,
     distinct_budget: *DistinctBudget,
     value: u128 = 0,
-    seen: node_identity.Map(void) = .{},
+    seen: node_identity.BorrowedMap(void) = .{},
     distinct_values: std.ArrayListUnmanaged(node_identity.Ref) = .empty,
 
     fn observe(self: *StreamingCountAccumulator, alloc: Allocator, state: ConjunctiveState) !void {
@@ -2087,13 +2142,31 @@ const StreamingCountAccumulator = struct {
         const ref = node_identity.Ref{ .table = binding.table, .key = binding.key };
         if (self.seen.contains(ref)) return;
         try self.distinct_budget.consume(ref);
+        try ensureDistinctValueCapacity(
+            alloc,
+            self.distinct_budget,
+            &self.distinct_values,
+            self.distinct_values.items.len + 1,
+        );
+        try ensureBorrowedDistinctMapCapacity(
+            alloc,
+            self.distinct_budget,
+            &self.seen,
+            self.distinct_values.items.len + 1,
+        );
         try appendOwnedIdentity(alloc, &self.distinct_values, binding.table, binding.key);
         const owned = self.distinct_values.items[self.distinct_values.items.len - 1];
-        _ = try self.seen.putIfAbsent(alloc, owned, {});
+        self.seen.putAssumeCapacityNoClobber(owned, {});
         self.value = @intCast(self.distinct_values.items.len);
     }
 
     fn finish(self: *StreamingCountAccumulator, alloc: Allocator) !CountAggregateResult {
+        const output_bytes = std.math.mul(
+            usize,
+            self.distinct_values.items.len,
+            @sizeOf(node_identity.Ref),
+        ) catch return error.GraphDistinctBudgetExceeded;
+        try self.distinct_budget.consumeRetainedBytes(output_bytes);
         const values = try self.distinct_values.toOwnedSlice(alloc);
         self.distinct_values = .empty;
         return .{ .value = self.value, .distinct_values = values };
@@ -3903,7 +3976,7 @@ test "exact distinct aggregates share a fail-closed identity and byte budget" {
 
     // Repeated identities are retained once per distinct set, but separate
     // aggregate specs share the request budget because each owns a set.
-    var shared_budget = DistinctBudget.init(2, 1024);
+    var shared_budget = DistinctBudget.init(2, 2048);
     const repeated = try aggregateConjunctivePatternWithEdgeReader(
         std.testing.allocator,
         Reader{},
@@ -3919,6 +3992,7 @@ test "exact distinct aggregates share a fail-closed identity and byte budget" {
     try std.testing.expectEqual(@as(u128, 1), repeated[0].value);
     try std.testing.expectEqual(@as(u128, 1), repeated[1].value);
     try std.testing.expectEqual(@as(usize, 0), shared_budget.remaining_identities);
+    try std.testing.expect(shared_budget.remaining_identity_bytes < 2048 - 8);
 
     var byte_budget = DistinctBudget.init(10, 3);
     try std.testing.expectError(

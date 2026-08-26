@@ -96,6 +96,59 @@ const AdaptedContext = struct {
     }
 };
 
+const RefContext = struct {
+    pub fn hash(_: RefContext, value: Ref) u64 {
+        return hashIdentity(value.table, value.key);
+    }
+
+    pub fn eql(_: RefContext, left: Ref, right: Ref) bool {
+        if ((left.table == null) != (right.table == null)) return false;
+        if (left.table) |left_table| {
+            if (!std.mem.eql(u8, left_table, right.table.?)) return false;
+        }
+        return std.mem.eql(u8, left.key, right.key);
+    }
+};
+
+/// A map whose identity slices are owned by another stable container. This is
+/// useful when the identities must also be returned to a caller: the result
+/// list remains the sole payload owner and the hash index retains only slice
+/// descriptors and hash metadata.
+pub fn BorrowedMap(comptime Value: type) type {
+    return struct {
+        const Self = @This();
+        const Inner = std.HashMapUnmanaged(
+            Ref,
+            Value,
+            RefContext,
+            std.hash_map.default_max_load_percentage,
+        );
+
+        inner: Inner = .empty,
+
+        pub fn contains(self: *const Self, ref: Ref) bool {
+            return self.inner.contains(ref);
+        }
+
+        pub fn capacity(self: *const Self) usize {
+            return self.inner.capacity();
+        }
+
+        pub fn ensureTotalCapacity(self: *Self, alloc: Allocator, total_count: usize) !void {
+            try self.inner.ensureTotalCapacity(alloc, @intCast(total_count));
+        }
+
+        pub fn putAssumeCapacityNoClobber(self: *Self, ref: Ref, value: Value) void {
+            self.inner.putAssumeCapacityNoClobber(ref, value);
+        }
+
+        pub fn deinit(self: *Self, alloc: Allocator) void {
+            self.inner.deinit(alloc);
+            self.* = .{};
+        }
+    };
+}
+
 pub fn Map(comptime Value: type) type {
     return struct {
         const Self = @This();

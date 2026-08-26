@@ -3828,6 +3828,8 @@ pub fn build(b: *std.Build) void {
         "query parser owns graph match anchor through its required node alias",
         "query merge allocation scales with the selected page",
         "graph merge enforces query-wide row limit and exact distinct identity",
+        "graph coordinator distinct merge shares one fail-closed request budget",
+        "graph coordinator rejects merged node collections above the public cap",
         "graph merge rejects missing and inexact aggregate shards",
         "graph merge rejects missing duplicate and unknown traversal operations",
         "graph query dependency sorting enforces request-wide operation bounds",
