@@ -570,6 +570,7 @@ pub const AdminSource = struct {
         var updated = table.*;
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
         try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataServiceMutation(svc);
     }
@@ -916,6 +917,7 @@ pub const AdminSource = struct {
         var updated = table.*;
         updated.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
+        try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
         try svc.replaceTableDefinition(table.*, updated);
         try flushMetadataHttpServiceMutation(svc);
     }

@@ -62,10 +62,10 @@ export default defineConfig({
   //   include: ["@antfly/components"],
   // },
   build: {
-    // Oxc's native minifier currently emits host-dependent bytes on macOS and
-    // Linux, which makes the checked-in embedded dashboard impossible to
-    // reproduce across developer and CI environments. Esbuild produces stable
-    // output for this browser bundle on every supported host.
+    // Oxc's native minifier emits host-dependent bytes. Esbuild is stable
+    // within the pinned Linux/Node toolchain used as the canonical producer
+    // by ts-ci; local builds remain useful for development but are not the
+    // release artifact authority.
     minify: "esbuild",
     // Produce a single JS + CSS bundle. The dashboard is embedded into the Go
     // binary via go:embed so code-splitting has no benefit — it only inflates

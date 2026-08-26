@@ -367,19 +367,30 @@ pub fn validateArtifactEnrichmentsForTableIndexesJson(
     const enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
     defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
     try validateArtifactEnrichmentConfigs(alloc, enrichments);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(indexes_json), .{});
+    defer parsed.deinit();
+    try validateArtifactIndexReferences(parsed.value, enrichments);
+}
+
+/// Validate only properties that can be decided from one create-index request.
+/// Upstream artifacts and source references are intentionally checked against
+/// the merged table catalog by `validateArtifactEnrichmentsForTableIndexesJson`.
+pub fn validateArtifactEnrichmentsForIndexRequestJson(
+    alloc: std.mem.Allocator,
+    index_json: []const u8,
+) !void {
+    const enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, index_json);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
+    try validateArtifactEnrichmentConfigDefinitions(alloc, enrichments);
 }
 
 pub fn validateArtifactEnrichmentConfigs(
     alloc: std.mem.Allocator,
     configs: []const db_mod.types.EnrichmentConfig,
 ) !void {
-    for (configs, 0..) |cfg, i| {
-        try enrichment_config_validation.validatePublicConfig(alloc, cfg);
-        for (configs[0..i]) |prior| {
-            if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
-            if (!artifactEnrichmentConfigsEqual(prior, cfg)) return error.ConflictingEnrichmentConfig;
-        }
-        if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
+    try validateArtifactEnrichmentConfigDefinitions(alloc, configs);
+    for (configs) |cfg| {
         switch (cfg.kind) {
             .chunk => {
                 if (cfg.source_artifact_name.len > 0 and findArtifactEnrichmentConfig(configs, .asset, cfg.source_artifact_name) == null) {
@@ -394,6 +405,172 @@ pub fn validateArtifactEnrichmentConfigs(
             .asset => {},
         }
     }
+}
+
+fn validateArtifactEnrichmentConfigDefinitions(
+    alloc: std.mem.Allocator,
+    configs: []const db_mod.types.EnrichmentConfig,
+) !void {
+    for (configs, 0..) |cfg, i| {
+        try enrichment_config_validation.validatePublicConfig(alloc, cfg);
+        for (configs[0..i]) |prior| {
+            if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
+            if (!artifactEnrichmentConfigsEqual(prior, cfg)) return error.ConflictingEnrichmentConfig;
+        }
+        if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
+    }
+}
+
+fn validateArtifactIndexReferences(
+    root: std.json.Value,
+    configs: []const db_mod.types.EnrichmentConfig,
+) !void {
+    if (root != .object) return error.InvalidEnrichmentConfig;
+    var it = root.object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        if (entry.value_ptr.* != .object) continue;
+        const object = entry.value_ptr.object;
+        const type_value = object.get("type");
+        const index_type = if (type_value) |value|
+            if (value == .string) value.string else continue
+        else
+            continue;
+
+        if (std.mem.eql(u8, index_type, "embeddings")) {
+            const external = if (object.get("external")) |value| value == .bool and value.bool else false;
+            if (!external) {
+                try validateEmbeddingArtifactReferences(object, configs);
+            }
+        } else if (std.mem.eql(u8, index_type, "full_text")) {
+            if (object.get("artifact_name")) |value| {
+                if (value != .string or !artifactConfigExistsForKinds(configs, value.string, &.{ .asset, .chunk }))
+                    return error.InvalidEnrichmentConfig;
+            }
+            if (object.get("chunk_name")) |value| {
+                if (value != .string or findArtifactEnrichmentConfig(configs, .chunk, value.string) == null)
+                    return error.InvalidEnrichmentConfig;
+            }
+            try validateArtifactSourceArrayForKinds(configs, object.get("sources"), &.{ .asset, .chunk });
+        } else if (std.mem.eql(u8, index_type, "graph")) {
+            if (object.get("source")) |value| {
+                if (value != .object) return error.InvalidEnrichmentConfig;
+                const artifact = value.object.get("artifact") orelse return error.InvalidEnrichmentConfig;
+                if (artifact != .string or !graphArtifactConfigExists(object, configs, artifact.string))
+                    return error.InvalidEnrichmentConfig;
+            }
+            if (object.get("sources")) |sources| {
+                if (sources != .array) return error.InvalidEnrichmentConfig;
+                for (sources.array.items) |source| {
+                    if (source != .object) return error.InvalidEnrichmentConfig;
+                    const artifact = source.object.get("artifact") orelse return error.InvalidEnrichmentConfig;
+                    if (artifact != .string or !graphArtifactConfigExists(object, configs, artifact.string))
+                        return error.InvalidEnrichmentConfig;
+                }
+            }
+        }
+    }
+}
+
+fn graphArtifactConfigExists(
+    object: anytype,
+    configs: []const db_mod.types.EnrichmentConfig,
+    name: []const u8,
+) bool {
+    if (artifactConfigExistsForKinds(configs, name, &.{ .asset, .chunk })) return true;
+    const producer = object.get("artifact") orelse return false;
+    if (producer != .object) return false;
+    const producer_name = producer.object.get("name") orelse return false;
+    if (producer_name != .string or !std.mem.eql(u8, producer_name.string, name)) return false;
+    const producer_kind = producer.object.get("kind") orelse return true;
+    return producer_kind == .string and
+        (std.mem.eql(u8, producer_kind.string, "asset") or std.mem.eql(u8, producer_kind.string, "chunk"));
+}
+
+fn validateEmbeddingArtifactReferences(
+    object: anytype,
+    configs: []const db_mod.types.EnrichmentConfig,
+) !void {
+    const sparse = if (object.get("sparse")) |value| value == .bool and value.bool else false;
+    const dims: u32 = if (object.get("dimension") orelse object.get("dims")) |value|
+        if (value == .integer) std.math.cast(u32, value.integer) orelse return error.InvalidEnrichmentConfig else return error.InvalidEnrichmentConfig
+    else
+        0;
+    if (object.get("embedding_name")) |value| {
+        if (value != .string) return error.InvalidEnrichmentConfig;
+        const cfg = findArtifactEnrichmentConfig(configs, .embedding, value.string) orelse return error.InvalidEnrichmentConfig;
+        try validateEmbeddingArtifactShape(cfg, sparse, dims);
+    }
+
+    const sources = object.get("sources") orelse return;
+    if (sources != .array) return error.InvalidEnrichmentConfig;
+    var explicit_vector_space: ?[]const u8 = null;
+    var implicit_producer: ?[]const u8 = null;
+    var saw_explicit = false;
+    var saw_implicit = false;
+    for (sources.array.items) |source| {
+        if (source != .object) return error.InvalidEnrichmentConfig;
+        const artifact = source.object.get("artifact") orelse return error.InvalidEnrichmentConfig;
+        if (artifact != .string) return error.InvalidEnrichmentConfig;
+        const cfg = findArtifactEnrichmentConfig(configs, .embedding, artifact.string) orelse return error.InvalidEnrichmentConfig;
+        try validateEmbeddingArtifactShape(cfg, sparse, dims);
+        if (sources.array.items.len <= 1) continue;
+        if (cfg.vector_space.len > 0) {
+            saw_explicit = true;
+            if (explicit_vector_space) |expected| {
+                if (!std.mem.eql(u8, expected, cfg.vector_space)) return error.InvalidEnrichmentConfig;
+            } else {
+                explicit_vector_space = cfg.vector_space;
+            }
+        } else {
+            saw_implicit = true;
+            if (cfg.producer_json.len == 0) return error.InvalidEnrichmentConfig;
+            if (implicit_producer) |expected| {
+                if (!std.mem.eql(u8, expected, cfg.producer_json)) return error.InvalidEnrichmentConfig;
+            } else {
+                implicit_producer = cfg.producer_json;
+            }
+        }
+    }
+    if (saw_explicit and saw_implicit) return error.InvalidEnrichmentConfig;
+}
+
+fn validateEmbeddingArtifactShape(
+    cfg: db_mod.types.EnrichmentConfig,
+    sparse: bool,
+    dims: u32,
+) !void {
+    if (sparse) {
+        if (cfg.expected_dims != 0) return error.InvalidEnrichmentConfig;
+    } else if (dims > 0 and cfg.expected_dims > 0 and cfg.expected_dims != dims) {
+        return error.InvalidEnrichmentConfig;
+    }
+}
+
+fn validateArtifactSourceArrayForKinds(
+    configs: []const db_mod.types.EnrichmentConfig,
+    maybe_sources: ?std.json.Value,
+    kinds: []const db_mod.types.EnrichmentKind,
+) !void {
+    const sources = maybe_sources orelse return;
+    if (sources != .array) return error.InvalidEnrichmentConfig;
+    for (sources.array.items) |source| {
+        if (source != .object) return error.InvalidEnrichmentConfig;
+        const artifact = source.object.get("artifact") orelse return error.InvalidEnrichmentConfig;
+        if (artifact != .string or !artifactConfigExistsForKinds(configs, artifact.string, kinds))
+            return error.InvalidEnrichmentConfig;
+    }
+}
+
+fn artifactConfigExistsForKinds(
+    configs: []const db_mod.types.EnrichmentConfig,
+    name: []const u8,
+    kinds: []const db_mod.types.EnrichmentKind,
+) bool {
+    for (kinds) |kind| {
+        if (findArtifactEnrichmentConfig(configs, kind, name) != null) return true;
+    }
+    return false;
 }
 
 pub fn sortArtifactEnrichmentsByDependency(configs: []db_mod.types.EnrichmentConfig) void {
@@ -5088,6 +5265,80 @@ test "index metadata validates artifact enrichment graph" {
     try validateArtifactEnrichmentsForTableIndexesJson(
         std.testing.allocator,
         "{\"enrichments\":[{\"name\":\"chunks\",\"kind\":\"chunk\",\"field\":\"text\",\"source_artifact_name\":\"units\",\"chunk_size\":512},{\"name\":\"units\",\"kind\":\"asset\",\"field\":\"url\"}]}",
+    );
+}
+
+test "merged index metadata validates artifact consumer references" {
+    const existing =
+        \\{"enrichments":[{"name":"document_units_v1","kind":"asset","field":"url"},{"name":"document_chunks_v1","kind":"chunk","field":"text","source_artifact_name":"document_units_v1","chunk_size":512}]}
+    ;
+    const valid = try addIndexToTableIndexesJson(
+        std.testing.allocator,
+        existing,
+        "document_vectors",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}],\"enrichments\":[{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"document_chunks_v1\",\"expected_dims\":3}]}",
+    );
+    defer std.testing.allocator.free(valid);
+    try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, valid);
+
+    const missing_embedding = try addIndexToTableIndexesJson(
+        std.testing.allocator,
+        existing,
+        "document_vectors",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"missing_dense_v1\"}]}",
+    );
+    defer std.testing.allocator.free(missing_embedding);
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, missing_embedding),
+    );
+
+    const missing_text = try addIndexToTableIndexesJson(
+        std.testing.allocator,
+        existing,
+        "document_text",
+        "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"missing_chunks_v1\"}]}",
+    );
+    defer std.testing.allocator.free(missing_text);
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, missing_text),
+    );
+
+    const missing_graph = try addIndexToTableIndexesJson(
+        std.testing.allocator,
+        existing,
+        "document_graph",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"missing_relations_v1\",\"nodes\":{\"model\":\"external\",\"target\":\"{{ _item.id }}\"}}]}",
+    );
+    defer std.testing.allocator.free(missing_graph);
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, missing_graph),
+    );
+
+    const incompatible_vectors = try addIndexToTableIndexesJson(
+        std.testing.allocator,
+        "{\"enrichments\":[{\"name\":\"title_dense_v1\",\"kind\":\"embedding\",\"field\":\"title\",\"expected_dims\":3,\"vector_space\":\"search:v1\"},{\"name\":\"body_dense_v2\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3,\"vector_space\":\"search:v2\"}]}",
+        "document_vectors",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"title_dense_v1\"},{\"artifact\":\"body_dense_v2\"}]}",
+    );
+    defer std.testing.allocator.free(incompatible_vectors);
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, incompatible_vectors),
+    );
+
+    const dense_sparse_mismatch = try addIndexToTableIndexesJson(
+        std.testing.allocator,
+        "{\"enrichments\":[{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"expected_dims\":3}]}",
+        "document_sparse",
+        "{\"type\":\"embeddings\",\"sparse\":true,\"embedding_name\":\"document_dense_v1\"}",
+    );
+    defer std.testing.allocator.free(dense_sparse_mismatch);
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, dense_sparse_mismatch),
     );
 }
 

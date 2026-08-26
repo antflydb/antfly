@@ -296,7 +296,7 @@ pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, index_name: []const u8,
         else => return err,
     };
     errdefer alloc.free(normalized);
-    indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, normalized) catch |err| switch (err) {
+    indexes_api.validateArtifactEnrichmentsForIndexRequestJson(alloc, normalized) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidCreateIndexRequest,
     };
@@ -1056,6 +1056,16 @@ test "table contract admits and projects explicit embedding vector space" {
     const response = try indexes_api.encodeCreatedIndexConfig(std.testing.allocator, "document_vectors", config_json);
     defer std.testing.allocator.free(response);
     try std.testing.expect(std.mem.count(u8, response, "\"vector_space\":\"searchaf:v1\"") == 2);
+}
+
+test "create index request defers upstream artifact resolution to merged catalog" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_vectors",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}],\"enrichments\":[{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"document_chunks_v1\",\"expected_dims\":3}]}",
+    );
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "document_chunks_v1") != null);
 }
 
 test "table contract rejects malformed multi-source members" {

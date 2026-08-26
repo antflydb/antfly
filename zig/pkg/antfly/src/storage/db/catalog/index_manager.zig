@@ -7541,10 +7541,14 @@ pub const IndexManager = struct {
                 defer sparse_cfg.deinit(self.alloc);
                 const sparse_generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (sparse_generator) |generator| generator.deinit(self.alloc);
-                const referenced_embedding = if (sparse_generator == null)
-                    self.getEnrichment(.embedding, cfg.name)
+                const referenced_embedding_name = sparse_cfg.embedding_name orelse cfg.name;
+                const referenced_embedding = if (sparse_generator == null and sparse_cfg.embedding_names.len == 0 and !sparse_cfg.external)
+                    self.getEnrichment(.embedding, referenced_embedding_name)
                 else
                     null;
+                if (referenced_embedding) |embedding_cfg| {
+                    if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
+                }
                 return .{
                     .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
@@ -7555,6 +7559,8 @@ pub const IndexManager = struct {
                         null,
                     .embedding_name = if (sparse_generator) |generator|
                         if (generator.embedding_name) |embedding_name| try self.alloc.dupe(u8, embedding_name) else try self.alloc.dupe(u8, cfg.name)
+                    else if (sparse_cfg.embedding_name) |embedding_name|
+                        try self.alloc.dupe(u8, embedding_name)
                     else
                         try self.alloc.dupe(u8, cfg.name),
                     .embedding_names = try cloneOwnedStrings(self.alloc, sparse_cfg.embedding_names),
@@ -10929,7 +10935,9 @@ pub const IndexManager = struct {
                 }
                 const sparse_cfg = try parseSparseConfig(self.alloc, cfg.config_json);
                 defer sparse_cfg.deinit(self.alloc);
-                return sparse_cfg.embedding_names.len > 0;
+                if (sparse_cfg.embedding_names.len > 0) return true;
+                return sparse_cfg.embedding_name != null and !sparse_cfg.external and
+                    self.getEnrichment(.embedding, sparse_cfg.embedding_name.?) != null;
             },
             .graph => {
                 var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
@@ -11452,10 +11460,17 @@ pub const IndexManager = struct {
                 defer sparse_cfg.deinit(self.alloc);
                 const sparse_generator = try parseSparseGeneratorConfig(self.alloc, cfg.config_json);
                 defer if (sparse_generator) |generator| generator.deinit(self.alloc);
-                const referenced_embedding = if (sparse_generator == null and sparse_cfg.embedding_names.len == 0)
-                    self.getEnrichment(.embedding, cfg.name)
+                const referenced_embedding_name = sparse_cfg.embedding_name orelse cfg.name;
+                const referenced_embedding = if (sparse_generator == null and sparse_cfg.embedding_names.len == 0 and !sparse_cfg.external)
+                    self.getEnrichment(.embedding, referenced_embedding_name)
                 else
                     null;
+                if (sparse_cfg.embedding_name != null and referenced_embedding == null and !sparse_cfg.external) {
+                    return error.InvalidIndexConfig;
+                }
+                if (referenced_embedding) |embedding_cfg| {
+                    if (embedding_cfg.expected_dims != 0) return error.InvalidIndexConfig;
+                }
                 var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
                 var multi_source_supports_unit_grouping = sparse_cfg.embedding_names.len > 0;
                 var multi_source_vector_space: ?[]const u8 = null;
@@ -11515,7 +11530,7 @@ pub const IndexManager = struct {
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .field_name = try self.alloc.dupe(u8, sparse_cfg.field_name),
                     .external = sparse_cfg.external,
-                    .managed_direct_field = !sparse_cfg.external and sparse_generator == null and referenced_embedding == null and sparse_cfg.embedding_names.len == 0,
+                    .managed_direct_field = !sparse_cfg.external and sparse_generator == null and sparse_cfg.embedding_name == null and referenced_embedding == null and sparse_cfg.embedding_names.len == 0,
                     .chunk_name = if (sparse_generator) |generator| blk: {
                         const chunk_cfg = resolveChunkGenerator(self, generator);
                         break :blk if (generatorHasChunking(chunk_cfg)) try self.alloc.dupe(u8, chunk_cfg.artifact_name) else null;
@@ -11532,7 +11547,10 @@ pub const IndexManager = struct {
                             try self.alloc.dupe(u8, embedding_name)
                         else
                             try self.alloc.dupe(u8, cfg.name);
-                    } else try self.alloc.dupe(u8, cfg.name),
+                    } else if (sparse_cfg.embedding_name) |embedding_name|
+                        try self.alloc.dupe(u8, embedding_name)
+                    else
+                        try self.alloc.dupe(u8, cfg.name),
                     .embedding_names = try cloneOwnedStrings(self.alloc, sparse_cfg.embedding_names),
                     .supports_unit_grouping = if (sparse_cfg.embedding_names.len > 0)
                         multi_source_supports_unit_grouping
@@ -12073,7 +12091,7 @@ pub const IndexManager = struct {
                 if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
             }
             if (entry.embedding_name) |embedding_name| {
-                if (!entry.external and self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
+                if (!entry.external and !entry.managed_direct_field and self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
             }
             for (entry.embedding_names) |embedding_name| {
                 if (self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
@@ -12082,6 +12100,9 @@ pub const IndexManager = struct {
         for (self.sparse_indexes.items) |entry| {
             if (entry.chunk_name) |chunk_name| {
                 if (self.getEnrichment(.chunk, chunk_name) == null) return error.InvalidEnrichmentConfig;
+            }
+            if (entry.embedding_name) |embedding_name| {
+                if (!entry.external and self.getEnrichment(.embedding, embedding_name) == null) return error.InvalidEnrichmentConfig;
             }
             for (entry.embedding_names) |embedding_name| {
                 const enrichment = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidEnrichmentConfig;
@@ -18634,10 +18655,12 @@ const GeneratorConfig = struct {
 const SparseConfig = struct {
     field_name: []u8,
     external: bool = false,
+    embedding_name: ?[]u8 = null,
     embedding_names: [][]u8 = &.{},
 
     fn deinit(self: *const SparseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
+        if (self.embedding_name) |name| alloc.free(name);
         for (self.embedding_names) |name| alloc.free(name);
         if (self.embedding_names.len > 0) alloc.free(self.embedding_names);
     }
@@ -19409,6 +19432,13 @@ fn parseSparseConfig(alloc: Allocator, raw: []const u8) !SparseConfig {
     if (embedding_names.len > 0 and root.object.get("embedding_name") != null) return error.InvalidIndexConfig;
     return .{
         .field_name = try alloc.dupe(u8, field.string),
+        .embedding_name = if (root.object.get("embedding_name")) |value|
+            if (value == .string and value.string.len > 0)
+                try alloc.dupe(u8, value.string)
+            else
+                return error.InvalidIndexConfig
+        else
+            null,
         .embedding_names = embedding_names,
         .external = if (root.object.get("external")) |value|
             if (value == .bool) value.bool else return error.InvalidIndexConfig
@@ -22672,6 +22702,69 @@ test "parseSparseConfig accepts external embedding indexes" {
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("sparse", cfg.field_name);
     try std.testing.expect(cfg.external);
+}
+
+test "sparse single-source embedding name drives generation replay and search" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"sparse-test\"}";
+    try manager.addEnrichment(&store, .{
+        .name = "document_sparse_v1",
+        .kind = .embedding,
+        .field = "body",
+        .producer_json = producer_json,
+    });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "document_sparse",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse_embedding\",\"embedding_name\":\"document_sparse_v1\"}",
+    }});
+
+    const entry = manager.sparseIndex("document_sparse") orelse return error.IndexNotFound;
+    try std.testing.expectEqualStrings("document_sparse_v1", entry.embedding_name.?);
+    try std.testing.expect(manager.sparseIndexConsumesEmbedding("document_sparse", "document_sparse_v1"));
+    try std.testing.expect(try manager.configRequiresEnrichmentReplay(entry.config));
+
+    const generated = try manager.planGeneratedEnrichments(alloc, "doc:generated", "{\"body\":\"sparse text\"}", &.{}, &.{});
+    defer {
+        for (generated) |request| enrichment_types.freeGeneratedRequest(alloc, request);
+        alloc.free(generated);
+    }
+    try std.testing.expectEqual(@as(usize, 1), generated.len);
+    try std.testing.expectEqual(enrichment_types.GeneratedEnrichmentKind.sparse_embedding, generated[0].kind);
+    try std.testing.expectEqualStrings("document_sparse_v1", generated[0].embedding_name);
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:1", "document_sparse_v1");
+    defer alloc.free(artifact_key);
+    const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, null, &.{ 7, 42 }, &.{ 1.5, 0.5 });
+    defer alloc.free(payload);
+    try store.put(artifact_key, payload);
+    const writes = [_]mapper.SparseEmbeddingWrite{.{
+        .index_name = @constCast("document_sparse"),
+        .doc_key = @constCast("doc:1"),
+        .artifact_key = artifact_key,
+        .indices = &.{},
+        .values = &.{},
+    }};
+    try manager.applySparseEmbeddingWritesByName(&store, "document_sparse", &writes);
+
+    const query = sparse_mod.SparseVector{ .indices = &.{ 7, 42 }, .values = &.{ 1.5, 0.5 } };
+    const results = try entry.index.search(alloc, &query, 1);
+    defer sparse_mod.SparseIndex.freeResults(alloc, results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("doc:1", results[0].doc_id);
 }
 
 test "parseDenseGeneratorConfig parses source_template" {
