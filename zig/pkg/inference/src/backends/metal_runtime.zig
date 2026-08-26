@@ -11690,6 +11690,7 @@ fn runMetalJitQuantFixture(
     warmup_iters: u32,
     measure_iters: u32,
 ) !u64 {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     var elapsed_nanos: u64 = 0;
     const rc = termite_metal_run_jit_quant_route_check(
         request.provider,
@@ -11743,6 +11744,7 @@ fn runMetalJitPairedQuantFixture(
     measure_iters: u32,
     baseline_first: bool,
 ) !MetalJitPairedNanos {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     if (baseline_output.len != candidate_output.len) return error.InvalidMetalJitQualificationOutput;
     var result = MetalJitPairedNanos{ .baseline = 0, .candidate = 0 };
     const rc = termite_metal_run_jit_quant_route_paired_measure(
@@ -12602,6 +12604,7 @@ fn createNamedMetalScheduleCandidatePipeline(
     schedule: quant_kernel_compiler.KernelSchedule,
     device: MetalDeviceInfo,
 ) !*RawMetalGeneratedPipeline {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     const kernel_name = try allocator.dupeZ(u8, kernel_name_raw);
     defer allocator.free(kernel_name);
     var error_buffer: [4096]u8 = @splat(0);
@@ -12637,6 +12640,7 @@ fn activateMetalExactQkvCompanion(
     if (getenvFlagEnabled("TERMITE_METAL_DISABLE_GENERATED_QKV")) return false;
     const op = artifact.matmulOp() orelse return false;
     if (op.epilogue != .none or (op.format != .q4_k and op.format != .q6_k)) return false;
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     if (!owner.canOwnExactJitPipeline()) return error.TooManyExactJitPipelines;
     const emitted = try quant_kernel_compiler.emitMetalQkvScheduleCandidateSource(allocator, artifact, schedule);
     defer emitted.deinit(allocator);
@@ -13334,6 +13338,7 @@ fn activateMetalQualifiedProfileKernel(
         return error.QualifiedKernelEvidenceMismatch;
     }
 
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     const generated = try createMetalScheduleCandidatePipeline(
         context.allocator,
         artifact,
@@ -13548,6 +13553,7 @@ fn metalJitQualificationWork(job: *MetalJitQualificationJob) anyerror!void {
 fn metalJitActivateQualifiedJob(job: *MetalJitQualificationJob) !void {
     job.outcome = .qualified;
     if (!job.mode.activates()) return;
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     if (termite_metal_jit_route_activation_allowed(@intFromEnum(job.route.slot)) != 1) {
         job.outcome = .rejected;
         return error.MetalJitActivationDisabled;
@@ -15833,7 +15839,12 @@ fn sleepMetalProbeRetry() void {
 // still flip the state back to available.
 var metal_device_probe_state = std.atomic.Value(u8).init(0);
 
-pub fn metalDeviceAvailable() bool {
+pub inline fn metalDeviceAvailable() bool {
+    if (comptime !build_options.enable_metal) return false;
+    return metalDeviceAvailableEnabled();
+}
+
+fn metalDeviceAvailableEnabled() bool {
     switch (metal_device_probe_state.load(.acquire)) {
         2 => return true,
         1 => {

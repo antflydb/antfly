@@ -84,6 +84,7 @@ scripts/__pycache__/
 .pnpm-store/
 .worktrees/
 .tools/
+/unsloth_compiled_cache/
 
 /datasets/
 
