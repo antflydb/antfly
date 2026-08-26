@@ -16789,6 +16789,15 @@ components:
               type: string
               enum:
                 - full_text
+    IndexPublicationPolicy:
+      type: string
+      enum:
+        - progressive
+        - atomic
+      default: progressive
+      description: Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed
+        active generation queryable before initial source coverage is complete. `atomic` keeps a new generation
+        unavailable until complete validation and activation.
     DerivedCoveragePolicy:
       type: string
       enum:
@@ -18030,6 +18039,8 @@ components:
         (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be
         auto-detected.
       properties:
+        publication_policy:
+          $ref: '#/components/schemas/IndexPublicationPolicy'
         coverage_policy:
           $ref: '#/components/schemas/DerivedCoveragePolicy'
           description: 'Source-unit completeness policy for managed embeddings. `strict` requires one
@@ -18829,18 +18840,28 @@ components:
       type: string
       enum:
         - pending
+        - queryable_partial
         - ready
         - failed
-      description: Authoritative query-readiness state for the desired index incarnation.
+      description: Authoritative query-readiness and completeness state for the desired index incarnation.
     IndexReadinessStatus:
       type: object
       additionalProperties: false
       required:
         - state
+        - queryable
+        - complete
         - pending_reasons
       properties:
         state:
           $ref: '#/components/schemas/IndexReadinessState'
+        queryable:
+          type: boolean
+          description: Whether the published generation can safely answer queries.
+        complete:
+          type: boolean
+          description: Whether the desired incarnation has complete coverage and publication according
+            to its configured policies.
         incarnation:
           type: string
           description: Opaque identity for the desired index incarnation. Clients may compare it for equality
@@ -22635,6 +22656,8 @@ components:
       type: object
       description: Credential-free normalized embeddings configuration returned after creation.
       properties:
+        publication_policy:
+          $ref: '#/components/schemas/IndexPublicationPolicy'
         coverage_policy:
           $ref: '#/components/schemas/DerivedCoveragePolicy'
         external:

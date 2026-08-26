@@ -37,15 +37,19 @@ pub fn defaultMlDir(allocator: std.mem.Allocator) []const u8 {
     return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "ml" }) catch "./ml";
 }
 
+/// Compatibility wrapper for callers that also resolve a data directory.
+/// Model discovery deliberately remains independent of the database data root.
 pub fn defaultModelsDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
-    if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value| return value;
-    return std.fs.path.join(allocator, &.{ data_dir, "inference", "models" }) catch defaultModelsDir(allocator);
+    _ = data_dir;
+    return defaultModelsDir(allocator);
 }
 
 pub fn defaultModelsDirForDataDirAlloc(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+    _ = data_dir;
     if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value|
         return try allocator.dupe(u8, value);
-    return try std.fs.path.join(allocator, &.{ data_dir, "inference", "models" });
+    const home = platform.env.getenv("HOME") orelse return try allocator.dupe(u8, "./models");
+    return try std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "models" });
 }
 
 pub fn defaultMlDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {

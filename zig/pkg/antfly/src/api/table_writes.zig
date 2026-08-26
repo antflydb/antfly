@@ -20056,6 +20056,15 @@ fn catchUpManagedIndexCreate(
 
     const requires_enrichment_replay = try db.core.indexRequiresEnrichmentReplay(index_name);
     if (requires_enrichment_replay) {
+        // A completed managed dense generation already proves source outcome
+        // coverage, durable replay convergence, physical artifact cardinality,
+        // and a quiet HBC publication boundary. Re-forcing every stored source
+        // at this point does not add recovery authority; it replays historical
+        // delete/upsert windows over the final deterministic chunk identities
+        // and can regress an otherwise ready generation.
+        if (try db.completedManagedDenseGenerationIsServiceable(alloc, index_name)) {
+            return .complete;
+        }
         if (db.enrichment_runtime != null) {
             const appended = try db.reprocessGeneratedEnrichmentFromStoredDocsWithProgress(
                 alloc,
@@ -20282,6 +20291,56 @@ test "managed structural catch-up does not delegate an empty producer handoff" {
         ManagedIndexCreateCatchUp.complete,
         try catchUpManagedIndexCreate(alloc, &db, "semantic_idx", true),
     );
+}
+
+test "managed structural catch-up does not replay a completed dense generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/managed-complete-dense-no-replay",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var deterministic = db_embedder.DeterministicDenseEmbedder{};
+    var db = try db_mod.DB.open(alloc, path, .{
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"alpha beta gamma delta epsilon zeta eta theta iota kappa\"}",
+        }},
+        .sync_level = .write,
+    });
+    const cfg = db_mod.types.IndexConfig{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","chunk_name":"semantic_chunks","chunk_size":4,"chunk_overlap":1}}
+        ,
+        .coverage_generation = 73,
+    };
+    const repair_id = (try db.admitManagedIndex(cfg)) orelse return error.TestUnexpectedResult;
+    try db.runUntilIdle();
+    const completed = try db.advanceIndexRepairIntent(alloc, repair_id, .{});
+    try std.testing.expect(completed.repaired);
+    try std.testing.expect(try db.completedManagedDenseGenerationIsServiceable(alloc, cfg.name));
+
+    const dense_target_before = try db.core.store.latestReplaySequenceForHint(.dense_vector, 0);
+    const enrichment_target_before = try db.core.store.latestReplaySequenceForHint(.enrichment, 0);
+    try std.testing.expectEqual(
+        ManagedIndexCreateCatchUp.complete,
+        try catchUpManagedIndexCreate(alloc, &db, cfg.name, true),
+    );
+    try std.testing.expectEqual(dense_target_before, try db.core.store.latestReplaySequenceForHint(.dense_vector, 0));
+    try std.testing.expectEqual(enrichment_target_before, try db.core.store.latestReplaySequenceForHint(.enrichment, 0));
 }
 
 const ManagedIndexReplayPosition = struct {
