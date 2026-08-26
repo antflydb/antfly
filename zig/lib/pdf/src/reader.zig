@@ -15,10 +15,13 @@
 const std = @import("std");
 const syntax = @import("syntax.zig");
 const text_encoding = @import("text_encoding.zig");
+const jbig2 = @import("jbig2.zig");
 const image_lib = @import("antfly_image");
 const font_lib = @import("antfly_font");
 
 const Allocator = std.mem.Allocator;
+
+const DecodedRgbaImage = struct { rgba: []u8, width: u32, height: u32 };
 
 pub const default_max_decoded_stream_bytes: usize = 64 * 1024 * 1024;
 pub const default_max_decode_working_set_bytes: usize = 128 * 1024 * 1024;
@@ -3506,7 +3509,11 @@ pub const Reader = struct {
         };
     }
 
-    fn decodeImageToRgbaAlloc(self: *const Reader, obj: *const syntax.Object) anyerror!struct { rgba: []u8, width: u32, height: u32 } {
+    fn decodeImageToRgbaAlloc(self: *const Reader, obj: *const syntax.Object) anyerror!DecodedRgbaImage {
+        return try self.decodeImageToRgbaWithOptionsAlloc(obj, false);
+    }
+
+    fn decodeImageToRgbaWithOptionsAlloc(self: *const Reader, obj: *const syntax.Object, jbig2_soft_mask: bool) anyerror!DecodedRgbaImage {
         const width_i = (obj.get("Width") orelse return error.UnsupportedPdfRendering).asInteger() orelse return error.UnsupportedPdfRendering;
         const height_i = (obj.get("Height") orelse return error.UnsupportedPdfRendering).asInteger() orelse return error.UnsupportedPdfRendering;
         const image_mask = if (obj.get("ImageMask")) |v| switch (v.*) {
@@ -3521,9 +3528,11 @@ pub const Reader = struct {
             8;
         if (width_i <= 0 or height_i <= 0) return error.UnsupportedPdfRendering;
         const has_ccitt = streamHasFilter(obj.get("Filter"), "CCITTFaxDecode");
+        const has_jbig2 = streamHasFilter(obj.get("Filter"), "JBIG2Decode");
         const has_jpx = streamHasFilter(obj.get("Filter"), "JPXDecode");
-        if (!image_mask and !has_ccitt and !has_jpx and bits_i != 1 and bits_i != 2 and bits_i != 4 and bits_i != 8) return error.UnsupportedPdfRendering;
+        if (!image_mask and !has_ccitt and !has_jbig2 and !has_jpx and bits_i != 1 and bits_i != 2 and bits_i != 4 and bits_i != 8) return error.UnsupportedPdfRendering;
         if (!image_mask and has_ccitt and bits_i != 1) return error.UnsupportedPdfRendering;
+        if (!image_mask and has_jbig2 and bits_i != 1) return error.UnsupportedPdfRendering;
         if (image_mask and bits_i != 1) return error.UnsupportedPdfRendering;
 
         const width: u32 = @intCast(width_i);
@@ -3531,6 +3540,72 @@ pub const Reader = struct {
         const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedPdfRendering;
         if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
         const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
+        if (has_jbig2) {
+            const raw = try self.readRawStreamData(obj);
+            const encoded = try decodeStreamFiltersBeforeOwnedAlloc(
+                self.alloc,
+                raw,
+                obj.get("Filter").?,
+                obj.get("DecodeParms"),
+                "JBIG2Decode",
+                self.decode_limits,
+            );
+            defer self.alloc.free(encoded);
+
+            var globals: ?[]u8 = null;
+            defer if (globals) |bytes| self.alloc.free(bytes);
+            if (streamFilterParamFor(obj.get("Filter"), obj.get("DecodeParms"), "JBIG2Decode")) |param| {
+                var resolved_param = try self.resolveValue(param);
+                defer resolved_param.deinit(self.alloc);
+                if (resolved_param.get("JBIG2Globals")) |globals_obj| {
+                    var resolved_globals = try self.resolveValue(globals_obj);
+                    defer resolved_globals.deinit(self.alloc);
+                    if (resolved_globals != .stream) return error.UnsupportedPdfRendering;
+                    globals = try self.readDecodedStreamData(&resolved_globals);
+                }
+            }
+
+            var decoded = try jbig2.decodeAlloc(
+                self.alloc,
+                if (globals) |bytes| bytes else null,
+                encoded,
+                self.decode_limits.max_decoded_stream_bytes,
+            );
+            defer decoded.deinit(self.alloc);
+            if (decoded.width != width or decoded.height != height) return error.UnsupportedPdfRendering;
+
+            const rgba = try self.alloc.alloc(u8, rgba_len);
+            errdefer self.alloc.free(rgba);
+            if (image_mask) {
+                try decodeImageMaskToRgba(rgba, width, height, decoded.pixels, obj.get("Decode"));
+                return .{ .rgba = rgba, .width = width, .height = height };
+            }
+
+            const samples = try unpackPackedGraySamplesAlloc(self.alloc, decoded.pixels, width, height, 1);
+            defer self.alloc.free(samples);
+            // PDF producers use JBIG2's black-pixel convention for soft-mask
+            // coverage. Treat those decoded bits as coverage directly; applying
+            // an image Decode inversion here reverses the mask in real MRC PDFs.
+            const decode_obj = if (jbig2_soft_mask) null else obj.get("Decode");
+            const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
+            var resolved_color_space = try self.resolveValue(color_space_obj);
+            defer resolved_color_space.deinit(self.alloc);
+            if (resolved_color_space.asName()) |color_space| {
+                try decodeDeviceColorSpaceToRgba(rgba, pixel_count, samples, color_space, decode_obj);
+            } else if (resolved_color_space == .array) {
+                if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+                    // handled
+                } else if (try self.tryDecodeCalibratedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+                    // handled
+                } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+                    // handled
+                } else {
+                    try self.decodeIndexedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj);
+                }
+            } else return error.UnsupportedPdfRendering;
+            try self.applyImageTransparencyAlloc(rgba, width, height, obj);
+            return .{ .rgba = rgba, .width = width, .height = height };
+        }
         if (has_ccitt) {
             const raw = try self.readRawStreamData(obj);
             defer self.alloc.free(raw);
@@ -4147,13 +4222,11 @@ pub const Reader = struct {
             var resolved = try self.resolveValue(smask_obj);
             defer resolved.deinit(self.alloc);
             if (resolved == .stream) {
-                const smask = self.decodeImageToRgbaAlloc(&resolved) catch |err| switch (err) {
-                    // A transparency mask is optional decoration. Unsupported
-                    // legacy mask codecs (notably JBIG2) should not make the
-                    // underlying page image unusable for OCR.
-                    error.UnsupportedPdfRendering, error.UnsupportedStreamFilter => return,
-                    else => return err,
-                };
+                // A soft mask is part of the image's pixel definition, not
+                // optional decoration. Propagate unsupported codecs so the
+                // caller can use a capable page renderer instead of silently
+                // sending a corrupted image downstream.
+                const smask = try self.decodeImageToRgbaWithOptionsAlloc(&resolved, true);
                 defer self.alloc.free(smask.rgba);
                 if (smask.width == width and smask.height == height) {
                     applySoftMaskAlpha(rgba, smask.rgba);
@@ -4167,10 +4240,7 @@ pub const Reader = struct {
             if (resolved == .array) {
                 applyColorKeyMask(rgba, resolved.array);
             } else if (resolved == .stream) {
-                const mask = self.decodeImageToRgbaAlloc(&resolved) catch |err| switch (err) {
-                    error.UnsupportedPdfRendering, error.UnsupportedStreamFilter => return,
-                    else => return err,
-                };
+                const mask = try self.decodeImageToRgbaAlloc(&resolved);
                 defer self.alloc.free(mask.rgba);
                 if (mask.width == width and mask.height == height) {
                     const mask_is_stencil = if (resolved.get("ImageMask")) |value| switch (value.*) {
@@ -13318,6 +13388,56 @@ test "reader applies soft mask image alpha" {
     try std.testing.expectEqual(@as(usize, 1), runs.len);
     try std.testing.expectEqual(@as(u8, 255), runs[0].rgba[0]);
     try std.testing.expectEqual(@as(u8, 128), runs[0].rgba[3]);
+}
+
+test "reader rejects a malformed JBIG2 soft mask instead of dropping it" {
+    const alloc = std.testing.allocator;
+    const image_data = &.{ 255, 255, 255 };
+    const unsupported_mask_data = &.{0};
+    const content = "q\n1 0 0 1 0 0 cm\n/Im1 Do\nQ\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ image_data.len, image_data },
+        ),
+        try std.fmt.allocPrint(
+            alloc,
+            "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ unsupported_mask_data.len, unsupported_mask_data },
+        ),
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+    defer alloc.free(objects[5]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |obj_src, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, obj_src);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 7\n0000000000 65535 f \n");
+    for (offsets) |off| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{off});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 7 /Root 1 0 R >>\n");
+
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.TruncatedJbig2Stream, reader.extractPageImageRunsAlloc(1));
 }
 
 test "reader applies color key mask array" {
