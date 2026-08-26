@@ -207,7 +207,7 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
 
     pub fn runOnce(self: *SparseCompactionRuntime) !bool {
         var maybe_task: ?index_manager_mod.IndexManager.SparseCompactionTask = null;
-        if (!lockApplyExclusiveBackoff(self)) return false;
+        if (!lockApplyExclusiveCancellable(self)) return false;
         maybe_task = self.index_manager.beginSparseCompactionTask() catch |err| {
             self.apply_mutex.unlockExclusive();
             return err;
@@ -228,7 +228,7 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
 
         // A started task must retire before structural mutation can close its
         // generation. The stopper waits without holding the apply lock.
-        lockApplyExclusive(self.apply_mutex);
+        lockApplyExclusiveForRetirement(self);
         defer self.apply_mutex.unlockExclusive();
         _ = try self.index_manager.finishSparseCompactionTask(&task, &result);
         return true;
@@ -295,16 +295,43 @@ fn isShutdown(runtime: *SparseCompactionRuntime) bool {
     return runtime.shutdown;
 }
 
-fn lockApplyExclusiveBackoff(runtime: *SparseCompactionRuntime) bool {
-    while (!runtime.apply_mutex.tryLockExclusive()) {
-        if (isShutdown(runtime)) return false;
-        sleepMs(runtime, 1);
-    }
+fn lockApplyExclusiveCancellable(runtime: *SparseCompactionRuntime) bool {
+    const io_impl = runtime.io_impl orelse return false;
+    const Cancellation = struct {
+        runtime: *SparseCompactionRuntime,
+
+        pub fn isCancelled(self: @This()) bool {
+            return isShutdown(self.runtime);
+        }
+    };
+    runtime.apply_mutex.lockExclusiveIo(
+        io_impl.io(),
+        @as(?Cancellation, .{ .runtime = runtime }),
+    ) catch |err| switch (err) {
+        error.Cancelled => return false,
+    };
     return true;
 }
 
-fn lockApplyExclusive(lock: *apply_rw_lock_mod.ApplyRwLock) void {
-    lock.lockExclusive();
+fn lockApplyExclusiveForRetirement(runtime: *SparseCompactionRuntime) void {
+    const io_impl = runtime.io_impl orelse {
+        runtime.apply_mutex.lockExclusive();
+        return;
+    };
+    const NeverCancelled = struct {
+        pub fn isCancelled(_: @This()) bool {
+            return false;
+        }
+    };
+    runtime.apply_mutex.lockExclusiveIo(
+        io_impl.io(),
+        @as(?NeverCancelled, null),
+    ) catch {
+        // A started task must always retire. If the surrounding Io scope was
+        // externally cancelled, finish through the synchronous lock rather
+        // than abandoning the task generation.
+        runtime.apply_mutex.lockExclusive();
+    };
 }
 
 fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {

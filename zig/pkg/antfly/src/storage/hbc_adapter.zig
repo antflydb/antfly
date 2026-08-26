@@ -3572,6 +3572,52 @@ pub const HBCIndex = struct {
         }
     }
 
+    /// Admit index-sized search growth before allocating it. The
+    /// scratch mutex serializes the shared observer ledger across concurrent
+    /// request handles; ordinary bounded search growth stays on the existing
+    /// telemetry-only path.
+    pub fn reserveSearchScratchBytes(self: *HBCIndex, handle: *ScratchHandle, target_bytes: u64) !void {
+        if (target_bytes <= handle.accounted_bytes) return;
+        lockAtomic(&self.scratch_mu);
+        defer self.scratch_mu.unlock();
+
+        const delta = target_bytes - handle.accounted_bytes;
+        const next_total = std.math.add(u64, self.search_workspace_bytes_accounted, delta) catch
+            return error.ResourceBudgetExceeded;
+        if (self.resource_manager) |manager| {
+            try manager.adjustUsage(.dense_search_working_set, &self.search_workspace_bytes_accounted, next_total);
+        } else {
+            self.search_workspace_bytes_accounted = next_total;
+        }
+        handle.accounted_bytes = target_bytes;
+    }
+
+    /// Undo a successful pre-admission when the corresponding allocation
+    /// fails. Shrink is always permitted by ResourceManager.
+    pub fn rollbackSearchScratchBytes(self: *HBCIndex, handle: *ScratchHandle, previous_bytes: u64) void {
+        if (previous_bytes >= handle.accounted_bytes) return;
+        lockAtomic(&self.scratch_mu);
+        defer self.scratch_mu.unlock();
+
+        const delta = handle.accounted_bytes - previous_bytes;
+        self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| delta);
+        handle.accounted_bytes = previous_bytes;
+    }
+
+    /// Reconcile post-request shrink under the same serialization used for
+    /// pre-admission. Growth here remains telemetry-only because all
+    /// index-sized growth is admitted before allocation.
+    pub fn reconcileSearchScratchBytes(self: *HBCIndex, handle: *ScratchHandle, next_bytes: u64) void {
+        lockAtomic(&self.scratch_mu);
+        defer self.scratch_mu.unlock();
+        if (next_bytes > handle.accounted_bytes) {
+            self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted +| (next_bytes - handle.accounted_bytes));
+        } else if (next_bytes < handle.accounted_bytes) {
+            self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted -| (handle.accounted_bytes - next_bytes));
+        }
+        handle.accounted_bytes = next_bytes;
+    }
+
     fn currentApplyWorkspaceBytes(self: *const HBCIndex) u64 {
         const staged_node_key_bytes = @as(u64, @intCast(self.deferred_node_keys.count())) *
             @as(u64, @intCast(@sizeOf(u128) + @sizeOf(DeferredNodeValue)));
@@ -9022,6 +9068,81 @@ test "complete snapshot retry releases publication fence after durable txn captu
     try std.testing.expect(!idx.generationRepairPending());
 }
 
+test "durable incomplete snapshot terminates when publication advances during traversal" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 64,
+        .branching_factor = 4,
+        .use_quantization = false,
+    });
+    defer idx.close();
+    try idx.insert(1, &.{ 0, 0 });
+    try idx.insert(2, &.{ 1, 0 });
+    try idx.insert(3, &.{ 0, 1 });
+    {
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        var key_buf: [10]u8 = undefined;
+        try idx.deleteNamespaced(&txn, .vecs, encodeVecKey(&key_buf, 1));
+        try txn.commit();
+    }
+    idx.invalidateVectorCache(1);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const HookContext = struct {
+        io: std.Io,
+        captures: usize = 0,
+        writer_failed: std.atomic.Value(bool) = .init(false),
+
+        fn publishConcurrentInsert(index: *HBCIndex, vector_id: u64, failed: *std.atomic.Value(bool)) void {
+            index.insert(vector_id, &.{ 1, 1 }) catch failed.store(true, .release);
+        }
+
+        fn onCapture(raw_ctx: ?*anyopaque, index: *HBCIndex) void {
+            const ctx: *@This() = @ptrCast(@alignCast(raw_ctx.?));
+            ctx.captures += 1;
+            // Keep both the optimistic and durable corrupt snapshots stale.
+            // A durable failure must still terminate; retrying it can livelock
+            // indefinitely when publishers remain active.
+            if (ctx.captures > 2) return;
+            var writer = std.Io.async(
+                ctx.io,
+                publishConcurrentInsert,
+                .{ index, @as(u64, 3) + ctx.captures, &ctx.writer_failed },
+            );
+            writer.await(ctx.io);
+        }
+    };
+    var hook_ctx = HookContext{ .io = io };
+    test_complete_snapshot_capture_ctx = &hook_ctx;
+    test_complete_snapshot_capture_hook = HookContext.onCapture;
+    defer {
+        test_complete_snapshot_capture_ctx = null;
+        test_complete_snapshot_capture_hook = null;
+    }
+
+    try std.testing.expectError(
+        error.IncompletePublishedSnapshot,
+        idx.searchWithRequest(.{
+            .query = &.{ 0, 0 },
+            .k = 3,
+            .search_effort = 1,
+            .load_metadata = false,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 2), hook_ctx.captures);
+    try std.testing.expect(!hook_ctx.writer_failed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 5), idx.stats().active_count);
+    try std.testing.expect(!idx.generationRepairPending());
+}
+
 test "aborted published transaction cannot leak staged topology through caches" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -10698,6 +10819,72 @@ test "hbc search scratch reports bytes to resource manager" {
 
     idx.close();
     try std.testing.expectEqual(@as(u64, 0), resource_manager.sliceStats(.dense_search_working_set).used_bytes);
+}
+
+test "exhaustive search workspace is admitted before growth and released after rejection" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 2,
+        .branching_factor = 2,
+        .search_width = 16,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .flat_centroid_block_size = 4,
+        .flat_centroid_probe_count = 0,
+    });
+    var idx_open = true;
+    defer if (idx_open) idx.close();
+    for (0..64) |i| {
+        const value: f32 = @floatFromInt(i);
+        try idx.insert(@intCast(i + 1), &.{ value, value / 8 });
+    }
+
+    // Materialize only the bounded baseline before setting a hard limit. The
+    // first exhaustive request must pre-admit its index-sized coverage and
+    // flat-frontier buffers instead of allocating and reporting afterward.
+    var scratch_handle = try idx.acquireSearchScratch();
+    idx.releaseSearchScratch(&scratch_handle);
+    const baseline_bytes = idx.search_workspace_bytes_accounted;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+        .soft_limit_bytes = baseline_bytes + 1,
+        .hard_limit_bytes = baseline_bytes + 1,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer {
+        idx.close();
+        idx_open = false;
+        resource_manager.deinit(alloc);
+    }
+    idx.attachResourceManager(&resource_manager);
+
+    try std.testing.expectError(
+        error.ResourceBudgetExceeded,
+        idx.searchWithRequest(.{
+            .query = &.{ 0, 0 },
+            .k = 3,
+            .search_effort = 1,
+            .load_metadata = false,
+        }),
+    );
+
+    const stats = resource_manager.sliceStats(.dense_search_working_set);
+    try std.testing.expectEqual(idx.search_workspace_bytes_accounted, stats.used_bytes);
+    try std.testing.expect(stats.used_bytes <= baseline_bytes);
+    try std.testing.expect(stats.hard_limit_rejections > 0);
+    const cached = &(idx.cached_scratch orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(usize, 0), cached.flat_probes.len);
+    try std.testing.expectEqual(@as(usize, 0), cached.flat_probe_merge.len);
+    try std.testing.expectEqual(@as(usize, 0), cached.coverage_members.len);
+    try std.testing.expectEqual(@as(usize, 0), cached.coverage_visited_words.len);
+    try std.testing.expectEqual(@as(usize, 0), cached.lookups.len);
+    try std.testing.expectEqual(@as(usize, 0), cached.key_views.len);
+    try std.testing.expectEqual(@as(usize, 0), cached.values.len);
 }
 
 test "hbc leaf split matrix reports dense apply workspace bytes" {

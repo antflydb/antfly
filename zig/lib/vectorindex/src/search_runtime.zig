@@ -166,6 +166,53 @@ pub const SearchScratch = struct {
         }
     }
 
+    pub fn projectedBytesWithFlatProbeCapacity(self: *const SearchScratch, needed: usize, needs_merge: bool) !u64 {
+        var projected = self.bytes();
+        projected = try addSliceGrowthBytes(search_types.FlatCentroidProbe, projected, self.flat_probes.len, needed);
+        if (needs_merge) {
+            projected = try addSliceGrowthBytes(search_types.FlatCentroidProbe, projected, self.flat_probe_merge.len, needed);
+        }
+        return projected;
+    }
+
+    pub fn projectedBytesForExhaustiveCoverage(
+        self: *const SearchScratch,
+        node_count: u64,
+        assignment_capacity: usize,
+    ) !u64 {
+        var projected = self.bytes();
+        if (assignment_capacity != 0) {
+            projected = try addSliceGrowthBytes(CoverageMember, projected, self.coverage_members.len, assignment_capacity);
+            projected = try addSliceGrowthBytes(RerankLookup, projected, self.lookups.len, assignment_capacity);
+            projected = try addSliceGrowthBytes([]const u8, projected, self.key_views.len, assignment_capacity);
+            projected = try addSliceGrowthBytes(?[]const u8, projected, self.values.len, assignment_capacity);
+        }
+        const word_bits = @bitSizeOf(usize);
+        const words_u64 = std.math.divCeil(u64, node_count, word_bits) catch return error.OutOfMemory;
+        const words = std.math.cast(usize, words_u64) orelse return error.OutOfMemory;
+        return try addSliceGrowthBytes(usize, projected, self.coverage_visited_words.len, words);
+    }
+
+    /// Exhaustive coverage scales with the published index, unlike the normal
+    /// bounded request workspace. Do not pin those buffers in the per-index
+    /// scratch cache after the request has released its resource reservation.
+    pub fn clearExhaustiveWorkspace(self: *SearchScratch, alloc: Allocator) void {
+        alloc.free(self.flat_probes);
+        alloc.free(self.flat_probe_merge);
+        alloc.free(self.coverage_members);
+        alloc.free(self.coverage_visited_words);
+        alloc.free(self.lookups);
+        alloc.free(self.key_views);
+        alloc.free(self.values);
+        self.flat_probes = &.{};
+        self.flat_probe_merge = &.{};
+        self.coverage_members = &.{};
+        self.coverage_visited_words = &.{};
+        self.lookups = &.{};
+        self.key_views = &.{};
+        self.values = &.{};
+    }
+
     pub fn resetCoverageVisited(self: *SearchScratch, alloc: Allocator, node_count: u64) !void {
         const word_bits = @bitSizeOf(usize);
         const words_u64 = std.math.divCeil(u64, node_count, word_bits) catch return error.OutOfMemory;
@@ -240,6 +287,13 @@ fn byteLen(values: anytype) u64 {
     return @as(u64, @intCast(values.len * @sizeOf(std.meta.Child(@TypeOf(values)))));
 }
 
+fn addSliceGrowthBytes(comptime T: type, current_bytes: u64, current_len: usize, needed: usize) !u64 {
+    if (needed <= current_len) return current_bytes;
+    const growth_len = needed - current_len;
+    const growth_bytes = std.math.mul(u64, @intCast(growth_len), @sizeOf(T)) catch return error.OutOfMemory;
+    return std.math.add(u64, current_bytes, growth_bytes) catch return error.OutOfMemory;
+}
+
 test "SearchScratch grows error bounds with vector fetch capacity" {
     const alloc = std.testing.allocator;
     var scratch = try SearchScratch.init(alloc, 4, 2, 2);
@@ -267,6 +321,12 @@ test "SearchScratch accounts coverage buffers and detects repeated nodes" {
     try std.testing.expect(scratch.markCoverageNodeVisited(130, 130));
     try std.testing.expect(!scratch.markCoverageNodeVisited(130, 130));
     try std.testing.expect(!scratch.markCoverageNodeVisited(131, 130));
+
+    scratch.clearExhaustiveWorkspace(alloc);
+    try std.testing.expectEqual(@as(usize, 0), scratch.coverage_members.len);
+    try std.testing.expectEqual(@as(usize, 0), scratch.lookups.len);
+    try scratch.ensureVectorFetchCapacity(alloc, 5);
+    try std.testing.expect(scratch.lookups.len >= 5);
 }
 
 test "SearchScratch accounts reusable flat frontier workspace" {

@@ -707,13 +707,16 @@ pub fn selectFlatRabitqPostingsAlloc(
     }
     std.debug.assert(posting_count == directory.posting_count);
     const needs_merge = cancellation != null and posting_count > cancellable_flat_sort_chunk_size;
-    try scratch.ensureFlatProbeCapacity(self.alloc, posting_count, needs_merge);
+    const previous_accounted_bytes = scratch_handle.accounted_bytes;
     const Index = comptime @TypeOf(self.*);
-    if (comptime @hasDecl(Index, "refreshSearchScratchAccounting")) {
-        // Account both retained buffers before scoring starts so large flat
-        // frontiers are never invisible to resource telemetry/governance.
-        self.refreshSearchScratchAccounting(scratch_handle);
+    if (comptime @hasDecl(Index, "reserveSearchScratchBytes")) {
+        const target_bytes = try scratch.projectedBytesWithFlatProbeCapacity(posting_count, needs_merge);
+        try self.reserveSearchScratchBytes(scratch_handle, target_bytes);
     }
+    errdefer if (comptime @hasDecl(Index, "rollbackSearchScratchBytes")) {
+        self.rollbackSearchScratchBytes(scratch_handle, previous_accounted_bytes);
+    };
+    try scratch.ensureFlatProbeCapacity(self.alloc, posting_count, needs_merge);
     const probes = scratch.flat_probes[0..posting_count];
     var probe_count: usize = 0;
 

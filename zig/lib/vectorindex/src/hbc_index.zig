@@ -2176,7 +2176,9 @@ pub fn searchProfiledRequest(
             searchProfiledRequestAttempt(self, req, token.snapshot, false, now_fn_u64, elapsed_fn_u64)) catch |err| {
             const attempt_current = completeSnapshotAttemptStillCurrent(self, token);
             if (err == error.StalePublishedSnapshot or
-                (err == error.IncompletePublishedSnapshot and !attempt_current))
+                (err == error.IncompletePublishedSnapshot and
+                    !capture_durable_snapshot and
+                    !attempt_current))
             {
                 // The attempt overlapped a publisher. Retry under a short
                 // reader fence to capture a durable MVCC transaction.
@@ -2305,13 +2307,14 @@ fn searchProfiledRequestAttempt(
     const scratch_start = now_fn_u64();
     var scratch_handle = try self.acquireSearchScratch();
     profile.scratch_acquire_ns += elapsed_fn_u64(scratch_start);
+    const scratch = &scratch_handle.scratch;
     defer {
+        if (exhaustive_coverage) scratch.clearExhaustiveWorkspace(self.alloc);
         if (comptime @hasDecl(Index, "refreshSearchScratchAccounting")) {
             self.refreshSearchScratchAccounting(&scratch_handle);
         }
         self.releaseSearchScratch(&scratch_handle);
     }
-    const scratch = &scratch_handle.scratch;
     const transformed_query = self.transformVector(req.query, scratch.transformed_query);
     const transformed_query_measure: f32 = switch (self.config.metric) {
         .l2_squared => vec.dot(req.query, req.query),
@@ -2331,16 +2334,25 @@ fn searchProfiledRequestAttempt(
     const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
     const root_node_id = published_snapshot.root_node;
 
-    try coverage_tracker.prepare(self, scratch);
     if (exhaustive_coverage) {
-        try scratch.resetCoverageVisited(self.alloc, published_snapshot.node_count);
+        const previous_accounted_bytes = scratch_handle.accounted_bytes;
+        if (comptime @hasDecl(Index, "reserveSearchScratchBytes")) {
+            const assignment_capacity = if (coverage_tracker.enabled)
+                CompleteCoverageTracker.assignment_batch_size
+            else
+                0;
+            const target_bytes = try scratch.projectedBytesForExhaustiveCoverage(
+                published_snapshot.node_count,
+                assignment_capacity,
+            );
+            try self.reserveSearchScratchBytes(&scratch_handle, target_bytes);
+        }
+        errdefer if (comptime @hasDecl(Index, "rollbackSearchScratchBytes")) {
+            self.rollbackSearchScratchBytes(&scratch_handle, previous_accounted_bytes);
+        };
     }
-    if (exhaustive_coverage and comptime @hasDecl(Index, "refreshSearchScratchAccounting")) {
-        // Coverage storage is retained by SearchScratch and governed just like
-        // the rest of the request workspace. Account immediately after growth
-        // so a large first-generation validation is never invisible.
-        self.refreshSearchScratchAccounting(&scratch_handle);
-    }
+    try coverage_tracker.prepare(self, scratch);
+    if (exhaustive_coverage) try scratch.resetCoverageVisited(self.alloc, published_snapshot.node_count);
 
     var candidates = std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan).initContext({});
     defer candidates.deinit(self.alloc);
