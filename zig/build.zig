@@ -3529,6 +3529,7 @@ pub fn build(b: *std.Build) void {
     };
     const unit_progress_skip_filters = root_test_skip_filters;
     const lib_unit_default_filters = [_][]const u8{
+        "bedrock provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
         "restore runtime store persists checkpoints and requeues interrupted work",
@@ -3803,6 +3804,18 @@ pub fn build(b: *std.Build) void {
     }
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
+
+    const lib_bedrock_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"bedrock provider request helpers"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_bedrock_tests = addFilteredTestRunArtifact(b, lib_bedrock_tests);
+    const lib_bedrock_test_step = b.step("lib-bedrock-test", "Run focused Bedrock provider tests");
+    lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
         "api http client round-trips public status and internal capability routes",
