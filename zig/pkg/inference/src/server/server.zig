@@ -2742,6 +2742,7 @@ pub const Node = struct {
         try config.kernel_jit.validate();
         try config.prompt_cache.validate();
         var session_manager = backends_mod.SessionManager.init(allocator);
+        try session_manager.validateRequiredBackendPolicy();
         session_manager.kernel_jit = config.kernel_jit;
         try graph_mod.kernel_jit.validateMetalProfileBackend(
             backends_mod.BackendType.metal.available(),
@@ -10944,7 +10945,11 @@ pub const Node = struct {
 
     fn readyzHandler(self: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
         const snapshot = self.readiness_inventory.load();
-        const is_ready = snapshot.initialized and snapshot.counts.total() > 0;
+        const required_backend_ready = blk: {
+            self.session_manager.validateRequiredBackendPolicy() catch break :blk false;
+            break :blk true;
+        };
+        const is_ready = required_backend_ready and snapshot.initialized and snapshot.counts.total() > 0;
         const status_text = if (is_ready) "ready" else "not_ready";
         const status_code: u16 = if (is_ready) 200 else 503;
         return ctx.status(status_code).json(.{
@@ -15260,6 +15265,19 @@ test "readyz serves only the published inventory snapshot" {
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"ready\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"generators\":2") != null);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"embedders\":1") != null);
+    }
+
+    node.session_manager.required_backend_invalid = true;
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/readyz");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.readyzHandler(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"not_ready\"") != null);
     }
 }
 

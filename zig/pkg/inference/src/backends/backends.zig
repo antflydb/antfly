@@ -178,6 +178,18 @@ pub const SessionManager = struct {
         return copy;
     }
 
+    /// Validate the process-level required backend before a server publishes
+    /// readiness or an artifact path begins execution. Required backends must
+    /// be compiled into this binary and support the direct session-loading
+    /// contract used by the inference runtime. PJRT is intentionally rejected
+    /// until the runtime has a consistent compiled-only loading path.
+    pub fn validateRequiredBackendPolicy(self: *const SessionManager) !void {
+        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        const backend = self.required_backend orelse return;
+        if (!backend.available() or !backend.supportsDirectSessionLoad())
+            return error.RequiredBackendUnavailable;
+    }
+
     pub fn loadModel(self: *SessionManager, model_path: []const u8) !Session {
         return self.loadModelWithImportedOnnxContext(model_path, null);
     }
@@ -653,6 +665,36 @@ test "required backend gates backend-specific fast paths" {
 
     manager.required_backend_invalid = true;
     try std.testing.expectError(error.InvalidRequiredBackend, manager.allowsDirectBackend(.onnx));
+}
+
+test "required backend policy rejects unavailable and compiled-only backends" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = null;
+    manager.required_backend_invalid = false;
+    try manager.validateRequiredBackendPolicy();
+
+    manager.required_backend_invalid = true;
+    try std.testing.expectError(
+        error.InvalidRequiredBackend,
+        manager.validateRequiredBackendPolicy(),
+    );
+
+    manager.required_backend_invalid = false;
+    manager.required_backend = .pjrt;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        manager.validateRequiredBackendPolicy(),
+    );
+
+    manager.required_backend = .native;
+    if (BackendType.native.available()) {
+        try manager.validateRequiredBackendPolicy();
+    } else {
+        try std.testing.expectError(
+            error.RequiredBackendUnavailable,
+            manager.validateRequiredBackendPolicy(),
+        );
+    }
 }
 
 test "invalid required backend fails before model loading" {

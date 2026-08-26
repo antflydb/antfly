@@ -935,6 +935,9 @@ fn runParsedArtifactPrompt(
     no_chat_template: bool,
     raw_prompt: bool,
 ) !RunResult {
+    const session_manager = backends.SessionManager.init(allocator);
+    try validateArtifactBackendPolicy(&session_manager, artifact.backend);
+
     var model_manifest = try manifest_mod.loadFromDir(allocator, artifact.model_dir);
     defer {
         if (pjrtExecDebugEnabled() and std.mem.eql(u8, artifact.backend, "xla")) std.log.info("PJRT run-artifact model manifest deinit begin", .{});
@@ -989,6 +992,27 @@ fn runParsedArtifactPrompt(
         graph_input_ids,
         compare_host,
     );
+}
+
+fn validateArtifactBackendPolicy(
+    session_manager: *const backends.SessionManager,
+    artifact_backend_name: []const u8,
+) !void {
+    const artifact_backend = try native_backend_choice.compiledArtifactBackend(artifact_backend_name);
+    try native_backend_choice.validateRequiredCompiledBackend(session_manager, artifact_backend);
+}
+
+test "run-artifact rejects a compiled backend outside the required policy" {
+    var session_manager = backends.SessionManager.init(std.testing.allocator);
+    session_manager.required_backend = .native;
+    session_manager.required_backend_invalid = false;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        validateArtifactBackendPolicy(&session_manager, "onnx"),
+    );
+
+    session_manager.required_backend = null;
+    try validateArtifactBackendPolicy(&session_manager, "onnx");
 }
 
 fn runPreparedArtifactPrompt(
