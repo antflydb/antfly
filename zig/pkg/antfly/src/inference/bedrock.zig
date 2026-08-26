@@ -162,7 +162,7 @@ pub const CredentialCache = struct {
         self.mutex.unlock(io);
         defer self.finishCall(io);
         while (true) {
-            const now = currentUnixSeconds();
+            const now = try currentUnixSeconds();
             self.mutex.lockUncancelable(io);
             if (self.closing) {
                 self.mutex.unlock(io);
@@ -194,12 +194,16 @@ pub const CredentialCache = struct {
             self.mutex.unlock(io);
 
             var fresh = resolveCredentialsUncached(alloc, http, region, source) catch |err| {
+                const fallback_now = currentUnixSeconds() catch |clock_err| {
+                    self.finishFailedRefresh(io);
+                    return clock_err;
+                };
                 self.mutex.lockUncancelable(io);
                 self.refreshing = false;
                 const closing = self.closing;
                 const fallback = if (!closing and self.cached != null) blk: {
                     const snapshot = self.cached.?;
-                    if (snapshot.source_key != source_key or !snapshot.credentials.isUnexpired(currentUnixSeconds())) break :blk null;
+                    if (snapshot.source_key != source_key or !snapshot.credentials.isUnexpired(fallback_now)) break :blk null;
                     snapshot.retain();
                     break :blk snapshot;
                 } else null;
@@ -331,9 +335,7 @@ pub const Provider = struct {
             defer arena_state.deinit();
             const arena = arena_state.allocator();
 
-            var body = std.json.ObjectMap.empty;
-            try body.put(arena, "inputText", .{ .string = text });
-            if (self.options.dimension > 0) try body.put(arena, "dimensions", .{ .integer = self.options.dimension });
+            const body = try textEmbeddingBody(arena, model, text, self.options.dimension);
             var result = try self.invokeEmbeddingsValue(alloc, model, .{ .object = body });
             defer result.deinit();
             if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
@@ -541,6 +543,18 @@ fn titanMultimodalBody(alloc: std.mem.Allocator, parts: []const template_mod.Con
         try cfg.put(alloc, "outputEmbeddingLength", .{ .integer = dimension });
         try body.put(alloc, "embeddingConfig", .{ .object = cfg });
     }
+    return body;
+}
+
+fn textEmbeddingBody(alloc: std.mem.Allocator, model: []const u8, text: []const u8, dimension: u32) !std.json.ObjectMap {
+    if (std.mem.startsWith(u8, model, "amazon.titan-embed-image")) {
+        return try titanMultimodalBody(alloc, &.{.{ .text = text }}, dimension);
+    }
+
+    var body = std.json.ObjectMap.empty;
+    errdefer body.deinit(alloc);
+    try body.put(alloc, "inputText", .{ .string = text });
+    if (dimension > 0) try body.put(alloc, "dimensions", .{ .integer = dimension });
     return body;
 }
 
@@ -1033,7 +1047,7 @@ fn signHeadersAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []cons
 }
 
 fn signRequestHeadersAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []const u8, method: []const u8, host: []const u8, path: []const u8, body: []const u8) ![]HeaderPair {
-    const timestamp = currentUnixSeconds();
+    const timestamp = try currentUnixSeconds();
     const amz_date = try formatAmzDateAlloc(alloc, timestamp);
     errdefer alloc.free(amz_date);
     const scope_date = try formatScopeDateAlloc(alloc, timestamp);
@@ -1058,7 +1072,9 @@ fn signRequestHeadersAlloc(alloc: std.mem.Allocator, creds: Credentials, region:
 fn authorizationValueAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []const u8, method: []const u8, path: []const u8, headers: []const HeaderPair, payload_hash: []const u8, amz_date: []const u8, scope_date: []const u8) ![]u8 {
     var canonical_headers = try canonicalHeadersAlloc(alloc, headers);
     defer canonical_headers.deinit(alloc);
-    const canonical_request = try std.fmt.allocPrint(alloc, "{s}\n{s}\n\n{s}\n{s}\n{s}", .{ method, path, canonical_headers.header_block, canonical_headers.signed_headers, payload_hash });
+    const canonical_path = try canonicalUriPathAlloc(alloc, path);
+    defer alloc.free(canonical_path);
+    const canonical_request = try std.fmt.allocPrint(alloc, "{s}\n{s}\n\n{s}\n{s}\n{s}", .{ method, canonical_path, canonical_headers.header_block, canonical_headers.signed_headers, payload_hash });
     defer alloc.free(canonical_request);
     const canonical_hash = try sha256HexAlloc(alloc, canonical_request);
     defer alloc.free(canonical_hash);
@@ -1071,6 +1087,10 @@ fn authorizationValueAlloc(alloc: std.mem.Allocator, creds: Credentials, region:
     const signature = try hmacSha256HexAlloc(alloc, key, string_to_sign);
     defer alloc.free(signature);
     return try std.fmt.allocPrint(alloc, "AWS4-HMAC-SHA256 Credential={s}/{s}, SignedHeaders={s}, Signature={s}", .{ creds.access_key_id, scope, canonical_headers.signed_headers, signature });
+}
+
+fn canonicalUriPathAlloc(alloc: std.mem.Allocator, encoded_path: []const u8) ![]u8 {
+    return try percentEncodePathSegmentAlloc(alloc, encoded_path);
 }
 
 const CanonicalHeaders = struct {
@@ -1119,12 +1139,43 @@ fn endpointBaseAlloc(alloc: std.mem.Allocator, endpoint: []const u8) ![]u8 {
     return try alloc.dupe(u8, endpoint[0..end]);
 }
 
-fn currentUnixSeconds() u64 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn currentUnixSeconds() !u64 {
+    return unixSecondsFromTimestamp(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .real));
+}
+
+fn unixSecondsFromTimestamp(timestamp: std.Io.Timestamp) !u64 {
+    const nanoseconds = timestamp.toNanoseconds();
+    if (nanoseconds < 0) return error.InvalidSystemTime;
+    return @intCast(@divTrunc(nanoseconds, std.time.ns_per_s));
+}
+
+pub fn testBedrockSigningClockUsesUnixWallTime() !void {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
-    const now = std.Io.Timestamp.now(io_impl.io(), .awake);
-    const ns: u64 = @intCast(now.toNanoseconds());
-    return ns / std.time.ns_per_s;
+    const before = try unixSecondsFromTimestamp(std.Io.Timestamp.now(io_impl.io(), .real));
+    const actual = try currentUnixSeconds();
+    const after = try unixSecondsFromTimestamp(std.Io.Timestamp.now(io_impl.io(), .real));
+
+    try std.testing.expect(actual >= before);
+    try std.testing.expect(actual <= after);
+}
+
+pub fn testBedrockSigningDatesUseCalendarMonthNumbers() !void {
+    const amz_date = try formatAmzDateAlloc(std.testing.allocator, 0);
+    defer std.testing.allocator.free(amz_date);
+    const scope_date = try formatScopeDateAlloc(std.testing.allocator, 0);
+    defer std.testing.allocator.free(scope_date);
+
+    try std.testing.expectEqualStrings("19700101T000000Z", amz_date);
+    try std.testing.expectEqualStrings("19700101", scope_date);
+}
+
+test "bedrock signing clock uses Unix wall time" {
+    try testBedrockSigningClockUsesUnixWallTime();
+}
+
+test "bedrock signing dates use calendar month numbers" {
+    try testBedrockSigningDatesUseCalendarMonthNumbers();
 }
 
 fn formatAmzDateAlloc(alloc: std.mem.Allocator, unix_seconds: u64) ![]u8 {
@@ -1134,7 +1185,7 @@ fn formatAmzDateAlloc(alloc: std.mem.Allocator, unix_seconds: u64) ![]u8 {
     const day_seconds = epoch_seconds.getDaySeconds();
     return try std.fmt.allocPrint(alloc, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
         year_day.year,
-        @intFromEnum(month_day.month) + 1,
+        @intFromEnum(month_day.month),
         month_day.day_index + 1,
         day_seconds.getHoursIntoDay(),
         day_seconds.getMinutesIntoHour(),
@@ -1146,7 +1197,7 @@ fn formatScopeDateAlloc(alloc: std.mem.Allocator, unix_seconds: u64) ![]u8 {
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = unix_seconds };
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
-    return try std.fmt.allocPrint(alloc, "{d:0>4}{d:0>2}{d:0>2}", .{ year_day.year, @intFromEnum(month_day.month) + 1, month_day.day_index + 1 });
+    return try std.fmt.allocPrint(alloc, "{d:0>4}{d:0>2}{d:0>2}", .{ year_day.year, @intFromEnum(month_day.month), month_day.day_index + 1 });
 }
 
 fn signingKeyAlloc(alloc: std.mem.Allocator, secret: []const u8, scope_date: []const u8, region: []const u8) ![]u8 {
@@ -1221,6 +1272,16 @@ pub fn testTitanMultimodalBodyOmitsEmptyInputText() !void {
     try std.testing.expect(body.get("inputText") == null);
     try std.testing.expect(body.get("inputImage") != null);
     try std.testing.expect(body.get("embeddingConfig") != null);
+}
+
+pub fn testTitanMultimodalTextBodyUsesEmbeddingConfig() !void {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const body = try textEmbeddingBody(arena_state.allocator(), "amazon.titan-embed-image-v1", "text only", 1024);
+    try std.testing.expectEqualStrings("text only", body.get("inputText").?.string);
+    try std.testing.expect(body.get("dimensions") == null);
+    try std.testing.expectEqual(@as(i64, 1024), body.get("embeddingConfig").?.object.get("outputEmbeddingLength").?.integer);
 }
 
 pub fn testTitanMultimodalBodyCombinesTextAndRejectsMultipleImages() !void {
@@ -1363,6 +1424,15 @@ pub fn testBedrockInvokePathEscapesModelId() !void {
     try std.testing.expectEqualStrings("/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Ainference-profile%2Fus.amazon.titan-embed-text-v2%3A0/invoke", arn);
 }
 
+pub fn testBedrockCanonicalUriDoubleEncodesEscapedModelId() !void {
+    const alloc = std.testing.allocator;
+    const path = try bedrockInvokePathAlloc(alloc, "amazon.titan-embed-text-v2:0");
+    defer alloc.free(path);
+    const canonical_path = try canonicalUriPathAlloc(alloc, path);
+    defer alloc.free(canonical_path);
+    try std.testing.expectEqualStrings("/model/amazon.titan-embed-text-v2%253A0/invoke", canonical_path);
+}
+
 pub fn testBedrockSignerUsesBedrockServiceScope() !void {
     const alloc = std.testing.allocator;
     const creds = Credentials{ .access_key_id = "AKIA", .secret_access_key = "secret" };
@@ -1495,6 +1565,10 @@ test "request shape batches by provider request" {
 
 test "bedrock invoke path escapes model id" {
     try testBedrockInvokePathEscapesModelId();
+}
+
+test "bedrock canonical uri double encodes escaped model id" {
+    try testBedrockCanonicalUriDoubleEncodesEscapedModelId();
 }
 
 test "bedrock signer uses bedrock service scope" {
