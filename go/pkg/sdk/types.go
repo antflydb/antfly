@@ -49,6 +49,9 @@ type (
 	CreatedAlgebraicIndexType    = oapi.CreatedAlgebraicIndexType
 	IndexStatus                  = oapi.IndexStatus
 	IndexType                    = oapi.IndexType
+	IndexPublicationPolicy       = oapi.IndexPublicationPolicy
+	IndexReadinessState          = oapi.IndexReadinessState
+	DerivedCoveragePolicy        = oapi.DerivedCoveragePolicy
 
 	// Artifact types
 	DocumentArtifactChildRange               = oapi.DocumentArtifactChildRange
@@ -591,6 +594,21 @@ const (
 	CreateEmbeddingsIndexRequestTypeEmbeddings = oapi.CreateEmbeddingsIndexRequestTypeEmbeddings
 	CreateGraphIndexRequestTypeGraph           = oapi.CreateGraphIndexRequestTypeGraph
 	CreateAlgebraicIndexRequestTypeAlgebraic   = oapi.CreateAlgebraicIndexRequestTypeAlgebraic
+
+	// DerivedCoveragePolicy values
+	DerivedCoveragePolicyStrict     = oapi.DerivedCoveragePolicyStrict
+	DerivedCoveragePolicyPartial    = oapi.DerivedCoveragePolicyPartial
+	DerivedCoveragePolicyBestEffort = oapi.DerivedCoveragePolicyBestEffort
+
+	// IndexPublicationPolicy values
+	IndexPublicationPolicyProgressive = oapi.IndexPublicationPolicyProgressive
+	IndexPublicationPolicyAtomic      = oapi.IndexPublicationPolicyAtomic
+
+	// IndexReadinessState values
+	IndexReadinessStatePending          = oapi.IndexReadinessStatePending
+	IndexReadinessStateQueryablePartial = oapi.IndexReadinessStateQueryablePartial
+	IndexReadinessStateReady            = oapi.IndexReadinessStateReady
+	IndexReadinessStateFailed           = oapi.IndexReadinessStateFailed
 
 	// EnrichmentKind values
 	EnrichmentKindAsset     = oapi.EnrichmentKindAsset

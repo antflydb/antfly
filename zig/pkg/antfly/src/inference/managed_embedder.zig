@@ -1181,7 +1181,9 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
+    const publication_policy = cfg.publication_policy orelse .progressive;
     if (external and cfg.coverage_policy != null) return error.InvalidCreateTableRequest;
+    if (external and cfg.publication_policy != null) return error.InvalidCreateTableRequest;
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
 
@@ -1243,6 +1245,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
         try out.appendSlice(alloc, "{\"field\":");
         try appendJsonString(alloc, &out, source_field);
+        try appendPublicationPolicy(alloc, &out, publication_policy);
         try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
         if (cfg.top_k) |top_k| {
             try out.appendSlice(alloc, ",\"top_k\":");
@@ -1318,6 +1321,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try appendJsonString(alloc, &out, metric);
     try out.appendSlice(alloc, ",\"embedding_name\":");
     try appendJsonString(alloc, &out, artifact_embedding_name orelse index_name);
+    if (!external) try appendPublicationPolicy(alloc, &out, publication_policy);
     try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
 
     if (artifact_embedding_name != null) {
@@ -2704,6 +2708,15 @@ fn appendCoveragePolicyIfPresent(
     try appendJsonString(alloc, out, @tagName(value));
 }
 
+fn appendPublicationPolicy(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    policy: indexes_openapi.IndexPublicationPolicy,
+) !void {
+    try out.appendSlice(alloc, ",\"publication_policy\":");
+    try appendJsonString(alloc, out, @tagName(policy));
+}
+
 fn appendExecutionObjectIfPresent(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -2928,9 +2941,22 @@ test "managed embedder translates managed embeddings config into db generator co
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"field\":\"body\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dims\":384") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding_name\":\"semantic_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"publication_policy\":\"progressive\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"generator\":{\"kind\":\"dense_embedding\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"execution\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding\":{\"batch_items\":16,\"batch_bytes\":262144}") != null);
+}
+
+test "managed embedder preserves atomic publication policy" {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","publication_policy":"atomic","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , .{});
+    defer parsed.deinit();
+
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() });
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"publication_policy\":\"atomic\"") != null);
 }
 
 test "managed embedder rejects invalid execution batch policy" {
