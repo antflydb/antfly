@@ -61,6 +61,20 @@ const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
 const stored_destination_authorization = @import("stored_destination_authorization.zig");
 
+pub const LsmOwnerMetricStats = struct {
+    table_name: []u8,
+    group_id: u64,
+    owner_kind: db_mod.LsmOwnerKind,
+    owner_name: []u8,
+    maintenance: lsm_backend.Backend.MaintenanceStats,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.owner_name);
+        self.* = undefined;
+    }
+};
+
 fn publishRuntimeStatusGroupForTest(
     cache: *runtime_status.TableRuntimeSnapshotCache,
     table_name: []const u8,
@@ -11164,6 +11178,46 @@ pub const ProvisionedTableWriteSource = struct {
             }
         }
         return stats;
+    }
+
+    /// Returns a bounded-cardinality attribution snapshot for already-open
+    /// writer DBs. Labels identify the table group and concrete LSM owner, so
+    /// a primary-store clone cannot be mistaken for dense-index residency (or
+    /// vice versa). Contended DBs are skipped rather than delaying /metrics.
+    pub fn lsmOwnerStatsBestEffortAlloc(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+    ) ![]LsmOwnerMetricStats {
+        if (!self.local_db_mutex.tryLock()) return alloc.alloc(LsmOwnerMetricStats, 0);
+        defer self.local_db_mutex.unlock();
+
+        var result = std.ArrayListUnmanaged(LsmOwnerMetricStats).empty;
+        errdefer {
+            for (result.items) |*item| item.deinit(alloc);
+            result.deinit(alloc);
+        }
+        const cache = self.write_cache orelse return try result.toOwnedSlice(alloc);
+        for (cache.entries.items) |entry| {
+            var owners = (try entry.db.trySnapshotLsmOwnerStatsAlloc(alloc)) orelse continue;
+            var transferred: usize = 0;
+            defer {
+                for (owners[transferred..]) |*owner| owner.deinit(alloc);
+                alloc.free(owners);
+            }
+            for (owners) |owner| {
+                try result.ensureUnusedCapacity(alloc, 1);
+                const owned_table_name = try alloc.dupe(u8, entry.table_name);
+                result.appendAssumeCapacity(.{
+                    .table_name = owned_table_name,
+                    .group_id = entry.group_id,
+                    .owner_kind = owner.kind,
+                    .owner_name = owner.name,
+                    .maintenance = owner.maintenance,
+                });
+                transferred += 1;
+            }
+        }
+        return try result.toOwnedSlice(alloc);
     }
 
     pub fn lsmNativeStorageStatsBestEffort(self: *ProvisionedTableWriteSource) ?lsm_backend.NativeStorageStats {

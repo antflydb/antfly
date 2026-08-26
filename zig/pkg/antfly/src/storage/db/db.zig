@@ -4820,6 +4820,58 @@ pub const DB = struct {
         return self.snapshotLsmMaintenanceStatsLocked();
     }
 
+    pub const LsmOwnerKind = enum { primary, full_text, dense_vector };
+
+    pub const LsmOwnerStats = struct {
+        kind: LsmOwnerKind,
+        name: []u8,
+        maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.name);
+            self.* = undefined;
+        }
+    };
+
+    pub fn trySnapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) !?[]LsmOwnerStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+
+        var owners = std.ArrayListUnmanaged(LsmOwnerStats).empty;
+        errdefer {
+            for (owners.items) |*owner| owner.deinit(alloc);
+            owners.deinit(alloc);
+        }
+        if (self.core.primary_store_owner.snapshotLsmMaintenanceStats()) |maintenance| {
+            try owners.ensureUnusedCapacity(alloc, 1);
+            const primary_name = try alloc.dupe(u8, "primary");
+            owners.appendAssumeCapacity(.{
+                .kind = .primary,
+                .name = primary_name,
+                .maintenance = maintenance,
+            });
+        }
+        var index_owners = try self.core.index_manager.snapshotLsmOwnerStatsAlloc(alloc);
+        var transferred: usize = 0;
+        defer {
+            for (index_owners[transferred..]) |*owner| owner.deinit(alloc);
+            alloc.free(index_owners);
+        }
+        for (index_owners) |owner| {
+            try owners.append(alloc, .{
+                .kind = switch (owner.kind) {
+                    .full_text => .full_text,
+                    .dense_vector => .dense_vector,
+                    else => unreachable,
+                },
+                .name = owner.name,
+                .maintenance = owner.maintenance,
+            });
+            transferred += 1;
+        }
+        return try owners.toOwnedSlice(alloc);
+    }
+
     pub fn trySnapshotLsmMaintenanceStats(self: *DB) ?lsm_backend_mod.Backend.MaintenanceStats {
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
@@ -66056,6 +66108,18 @@ test "db batch persists per-index applied sequence watermark" {
     try std.testing.expectEqual(@as(u64, 0), index_lsm.immutable_memtables);
     try std.testing.expect(index_lsm.wal_checkpoint_current_segment > 0);
     try std.testing.expectEqual(@as(u64, 0), index_lsm.wal_checkpoint_lag_segments);
+
+    const owner_stats = (try db.trySnapshotLsmOwnerStatsAlloc(alloc)) orelse
+        return error.UnexpectedLsmOwnerStatsContention;
+    defer {
+        for (owner_stats) |*owner| owner.deinit(alloc);
+        alloc.free(owner_stats);
+    }
+    try std.testing.expectEqual(@as(usize, 2), owner_stats.len);
+    try std.testing.expectEqual(DB.LsmOwnerKind.primary, owner_stats[0].kind);
+    try std.testing.expectEqualStrings("primary", owner_stats[0].name);
+    try std.testing.expectEqual(DB.LsmOwnerKind.full_text, owner_stats[1].kind);
+    try std.testing.expectEqualStrings("ft_v1", owner_stats[1].name);
 }
 
 test "db managed projection checkpoints persist status and config identity" {

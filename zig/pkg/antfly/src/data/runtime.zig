@@ -1662,6 +1662,12 @@ pub const HealthSource = struct {
         const lsm_maintenance_stats = self.cachedLsmMaintenanceStats();
         try writeLsmMaintenanceSnapshotMetrics(writer, lsm_maintenance_stats);
         try writeLsmMaintenanceMetrics(writer, lsm_maintenance_stats.stats);
+        const lsm_owner_stats = try live_write_source.lsmOwnerStatsBestEffortAlloc(self.data_server.alloc);
+        defer {
+            for (lsm_owner_stats) |*owner| owner.deinit(self.data_server.alloc);
+            self.data_server.alloc.free(lsm_owner_stats);
+        }
+        try writeLsmOwnerCloneMetrics(writer, lsm_owner_stats);
         try writeLsmWriteMetrics(writer, live_write_source.lsmWriteStatsBestEffort());
         try writeTextMergeMetrics(writer, live_write_source.textMergeStatsBestEffort());
         var async_indexing_stats = live_write_source.asyncIndexingStatsBestEffort();
@@ -1763,6 +1769,54 @@ fn writeLsmMaintenanceSnapshotMetrics(writer: *std.Io.Writer, snapshot: HealthSo
     try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_age_seconds", "gauge", "Age of the cached LSM maintenance metrics snapshot", snapshot.age_ns / std.time.ns_per_s);
     try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_refreshes_total", "counter", "Cached LSM maintenance metrics snapshot refreshes completed", snapshot.refreshes);
     try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_last_refresh_duration_ns", "gauge", "Duration of the most recent LSM maintenance metrics snapshot refresh in monotonic nanoseconds", snapshot.last_refresh_duration_ns);
+}
+
+fn writeLsmOwnerCloneMetrics(
+    writer: *std.Io.Writer,
+    owners: []const antfly.public_api.table_writes.LsmOwnerMetricStats,
+) !void {
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_calls_total", "counter", "LSM mutable snapshot clone calls attributed to each primary store or index");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_bytes_total", "counter", "Total LSM mutable snapshot clone bytes attributed to each primary store or index");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_peak_bytes", "gauge", "Peak single LSM mutable snapshot clone bytes attributed to each primary store or index");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_active_bytes", "gauge", "Active bulk-ingest current-scan clone bytes attributed to each primary store or index");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_peak_active_bytes", "gauge", "Peak bulk-ingest current-scan clone bytes attributed to each primary store or index");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_calls_total", "counter", "LSM mutable snapshot clone calls attributed by owner and reader class");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_bytes_total", "counter", "Total LSM mutable snapshot clone bytes attributed by owner and reader class");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_peak_bytes", "gauge", "Peak LSM mutable snapshot clone bytes attributed by owner and reader class");
+
+    for (owners) |owner| {
+        var group_buf: [32]u8 = undefined;
+        const group = try std.fmt.bufPrint(&group_buf, "{d}", .{owner.group_id});
+        const owner_kind = switch (owner.owner_kind) {
+            .primary => "primary",
+            .full_text => "full_text",
+            .dense_vector => "dense_vector",
+        };
+        const labels = [_]health_metrics.PromLabel{
+            .{ .name = "table", .value = owner.table_name },
+            .{ .name = "group", .value = group },
+            .{ .name = "owner_kind", .value = owner_kind },
+            .{ .name = "owner", .value = owner.owner_name },
+        };
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_calls_total", &labels, owner.maintenance.mutable_snapshot_clone_calls);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_bytes_total", &labels, owner.maintenance.mutable_snapshot_clone_bytes_total);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_peak_bytes", &labels, owner.maintenance.mutable_snapshot_clone_peak_bytes);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_active_bytes", &labels, owner.maintenance.bulk_ingest_current_scan_clone_active_bytes);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_peak_active_bytes", &labels, owner.maintenance.bulk_ingest_current_scan_clone_peak_active_bytes);
+        for (owner.maintenance.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
+            const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+            const reason_labels = [_]health_metrics.PromLabel{
+                .{ .name = "table", .value = owner.table_name },
+                .{ .name = "group", .value = group },
+                .{ .name = "owner_kind", .value = owner_kind },
+                .{ .name = "owner", .value = owner.owner_name },
+                .{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) },
+            };
+            try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_calls_total", &reason_labels, reason_stats.calls);
+            try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_bytes_total", &reason_labels, reason_stats.bytes_total);
+            try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_peak_bytes", &reason_labels, reason_stats.peak_bytes);
+        }
+    }
 }
 
 fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.MaintenanceStats) !void {
@@ -2341,9 +2395,12 @@ fn writeLsmCacheMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.CacheStat
     try writeLsmCacheKindMetricFamily(writer, stats, .hits, "antfly_lsm_cache_hits_total", "counter", "Shared LSM cache hits");
     try writeLsmCacheKindMetricFamily(writer, stats, .misses, "antfly_lsm_cache_misses_total", "counter", "Shared LSM cache misses");
     try writeLsmCacheKindMetricFamily(writer, stats, .inserts, "antfly_lsm_cache_inserts_total", "counter", "Shared LSM cache inserts");
+    try writeLsmCacheKindMetricFamily(writer, stats, .transient_serves, "antfly_lsm_cache_transient_serves_total", "counter", "One-shot LSM cache loads served without admission");
+    try writeLsmCacheKindMetricFamily(writer, stats, .policy_bypasses, "antfly_lsm_cache_policy_bypasses_total", "counter", "LSM cache admissions bypassed by caller policy");
     try writeLsmCacheKindMetricFamily(writer, stats, .evictions, "antfly_lsm_cache_evictions_total", "counter", "Shared LSM cache evictions");
     try writeLsmCacheKindMetricFamily(writer, stats, .invalidations, "antfly_lsm_cache_invalidations_total", "counter", "Shared LSM cache invalidations");
     try writeLsmCacheKindMetricFamily(writer, stats, .waits, "antfly_lsm_cache_waits_total", "counter", "Shared LSM cache pending-load waits");
+    try writeLsmCacheKindMetricFamily(writer, stats, .used_bytes, "antfly_lsm_cache_kind_used_bytes", "gauge", "Shared LSM cache resident bytes by entry kind");
 }
 
 fn writeLsmNativeStorageMetrics(writer: *std.Io.Writer, stats: ?lsm_backend_mod.NativeStorageStats) !void {
@@ -2391,9 +2448,12 @@ const LsmCacheMetricField = enum {
     hits,
     misses,
     inserts,
+    transient_serves,
+    policy_bypasses,
     evictions,
     invalidations,
     waits,
+    used_bytes,
 };
 
 fn writeLsmCacheKindMetricFamily(
@@ -2429,9 +2489,12 @@ fn lsmCacheMetricValue(stats: lsm_backend_mod.CacheKindStats, field: LsmCacheMet
         .hits => stats.hits,
         .misses => stats.misses,
         .inserts => stats.inserts,
+        .transient_serves => stats.transient_serves,
+        .policy_bypasses => stats.policy_bypasses,
         .evictions => stats.evictions,
         .invalidations => stats.invalidations,
         .waits => stats.waits,
+        .used_bytes => @intCast(stats.used_bytes),
     };
 }
 
@@ -25088,6 +25151,28 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "# HELP antfly_lsm_cache_hits_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_hits_total{kind=\"run_table_index\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_waits_total{kind=\"run_table_block\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_transient_serves_total{kind=\"run_table_block\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_policy_bypasses_total{kind=\"run_table_block\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_kind_used_bytes{kind=\"run_table_block\"}") != null);
+
+    const owner_stats = [_]antfly.public_api.table_writes.LsmOwnerMetricStats{.{
+        .table_name = @constCast("docs"),
+        .group_id = 17,
+        .owner_kind = .dense_vector,
+        .owner_name = @constCast("embedding"),
+        .maintenance = .{
+            .mutable_snapshot_clone_calls = 3,
+            .mutable_snapshot_clone_bytes_total = 4096,
+            .mutable_snapshot_clone_peak_bytes = 2048,
+            .bulk_ingest_current_scan_clone_peak_active_bytes = 1024,
+        },
+    }};
+    writer = .fixed(&writer_buf);
+    try writeLsmOwnerCloneMetrics(&writer, &owner_stats);
+    const owner_output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_mutable_snapshot_clone_calls_total{table=\"docs\",group=\"17\",owner_kind=\"dense_vector\",owner=\"embedding\"} 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_mutable_snapshot_clone_bytes_total{table=\"docs\",group=\"17\",owner_kind=\"dense_vector\",owner=\"embedding\"} 4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_bulk_ingest_current_scan_clone_peak_active_bytes{table=\"docs\",group=\"17\",owner_kind=\"dense_vector\",owner=\"embedding\"} 1024") != null);
 
     writer = .fixed(&writer_buf);
     try writeLsmNativeStorageMetrics(&writer, .{

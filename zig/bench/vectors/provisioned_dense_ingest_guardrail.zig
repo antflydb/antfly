@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const antfly = @import("antfly-zig");
+const process_memory = @import("antfly_platform").process_memory;
 
 const db_mod = antfly.db;
 const db_types = db_mod.types;
@@ -113,6 +114,12 @@ const Config = struct {
     seed: u64 = 42,
     hold_before_final_drain_ms: u64 = 0,
     sync_level: db_types.SyncLevel = .write,
+    max_bulk_clone_calls: ?u64 = null,
+    max_bulk_clone_bytes: ?u64 = null,
+    max_bulk_clone_peak_bytes: ?u64 = null,
+    max_ingest_ms: ?u64 = null,
+    max_data_block_cache_bytes: ?u64 = null,
+    max_peak_footprint_bytes: ?u64 = null,
 };
 
 const Summary = struct {
@@ -143,10 +150,30 @@ const Summary = struct {
     lsm_total_runs: u64 = 0,
     lsm_l0_runs: u64 = 0,
     lsm_total_run_bytes: u64 = 0,
+    bulk_clone_calls: u64 = 0,
+    bulk_clone_bytes: u64 = 0,
+    bulk_clone_peak_bytes: u64 = 0,
+    primary_bulk_clone_calls: u64 = 0,
+    primary_bulk_clone_bytes: u64 = 0,
+    primary_bulk_clone_peak_bytes: u64 = 0,
+    dense_bulk_clone_calls: u64 = 0,
+    dense_bulk_clone_bytes: u64 = 0,
+    dense_bulk_clone_peak_bytes: u64 = 0,
+    lsm_cache_used_bytes: u64 = 0,
+    lsm_data_block_cache_used_bytes: u64 = 0,
+    lsm_data_block_cache_inserts: u64 = 0,
+    lsm_data_block_cache_transient_serves: u64 = 0,
+    lsm_data_block_cache_policy_bypasses: u64 = 0,
+    process_peak_resident_bytes: u64 = 0,
+    process_peak_footprint_bytes: u64 = 0,
 
     fn writeNsPerDoc(self: Summary) u64 {
         if (self.docs == 0) return 0;
         return self.write_ns / self.docs;
+    }
+
+    fn ingestNs(self: Summary) u64 {
+        return self.write_ns +| self.bulk_finish_ns +| self.final_drain_ns;
     }
 };
 
@@ -160,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
 
     const summary = try runProvisionedDenseIngest(alloc, std.mem.span(replica_root), cfg);
     printSummary(cfg, summary);
+    try enforceGuardrails(cfg, summary);
 }
 
 fn parseArgs(args_in: std.process.Args) !Config {
@@ -180,6 +208,18 @@ fn parseArgs(args_in: std.process.Args) !Config {
         } else if (std.mem.eql(u8, arg, "--sync-level")) {
             const raw = args.next() orelse return error.InvalidArgument;
             cfg.sync_level = db_types.parsePublicSyncLevelText(raw) orelse return error.InvalidArgument;
+        } else if (std.mem.eql(u8, arg, "--max-bulk-clone-calls")) {
+            cfg.max_bulk_clone_calls = try parseNextU64(&args, "--max-bulk-clone-calls");
+        } else if (std.mem.eql(u8, arg, "--max-bulk-clone-bytes")) {
+            cfg.max_bulk_clone_bytes = try parseNextU64(&args, "--max-bulk-clone-bytes");
+        } else if (std.mem.eql(u8, arg, "--max-bulk-clone-peak-bytes")) {
+            cfg.max_bulk_clone_peak_bytes = try parseNextU64(&args, "--max-bulk-clone-peak-bytes");
+        } else if (std.mem.eql(u8, arg, "--max-ingest-ms")) {
+            cfg.max_ingest_ms = try parseNextU64(&args, "--max-ingest-ms");
+        } else if (std.mem.eql(u8, arg, "--max-data-block-cache-bytes")) {
+            cfg.max_data_block_cache_bytes = try parseNextU64(&args, "--max-data-block-cache-bytes");
+        } else if (std.mem.eql(u8, arg, "--max-peak-footprint-bytes")) {
+            cfg.max_peak_footprint_bytes = try parseNextU64(&args, "--max-peak-footprint-bytes");
         } else {
             return error.InvalidArgument;
         }
@@ -348,6 +388,42 @@ fn runProvisionedDenseIngest(
     summary.lsm_l0_runs = lsm_stats.l0_runs;
     summary.lsm_total_run_bytes = lsm_stats.total_run_bytes;
 
+    const owner_stats = (try managed.dbPtr().trySnapshotLsmOwnerStatsAlloc(alloc)) orelse
+        return error.LsmOwnerStatsContended;
+    defer {
+        for (owner_stats) |*owner| owner.deinit(alloc);
+        alloc.free(owner_stats);
+    }
+    for (owner_stats) |owner| {
+        const bulk = owner.maintenance.mutable_snapshot_clone_by_reason[@intFromEnum(antfly.lsm_backend.MutableSnapshotReason.bulk_current_scan)];
+        summary.bulk_clone_calls +|= bulk.calls;
+        summary.bulk_clone_bytes +|= bulk.bytes_total;
+        summary.bulk_clone_peak_bytes = @max(summary.bulk_clone_peak_bytes, bulk.peak_bytes);
+        switch (owner.kind) {
+            .primary => {
+                summary.primary_bulk_clone_calls +|= bulk.calls;
+                summary.primary_bulk_clone_bytes +|= bulk.bytes_total;
+                summary.primary_bulk_clone_peak_bytes = @max(summary.primary_bulk_clone_peak_bytes, bulk.peak_bytes);
+            },
+            .dense_vector => {
+                summary.dense_bulk_clone_calls +|= bulk.calls;
+                summary.dense_bulk_clone_bytes +|= bulk.bytes_total;
+                summary.dense_bulk_clone_peak_bytes = @max(summary.dense_bulk_clone_peak_bytes, bulk.peak_bytes);
+            },
+            .full_text => {},
+        }
+    }
+
+    const cache_stats = storage.lsm_cache.snapshotStats();
+    summary.lsm_cache_used_bytes = @intCast(cache_stats.used_bytes);
+    summary.lsm_data_block_cache_used_bytes = @intCast(cache_stats.run_table_block.used_bytes +| cache_stats.run_table_physical_block.used_bytes);
+    summary.lsm_data_block_cache_inserts = cache_stats.run_table_block.inserts +| cache_stats.run_table_physical_block.inserts;
+    summary.lsm_data_block_cache_transient_serves = cache_stats.run_table_block.transient_serves +| cache_stats.run_table_physical_block.transient_serves;
+    summary.lsm_data_block_cache_policy_bypasses = cache_stats.run_table_block.policy_bypasses +| cache_stats.run_table_physical_block.policy_bypasses;
+    const memory_stats = process_memory.pressureSnapshot();
+    summary.process_peak_resident_bytes = memory_stats.peak_resident_bytes;
+    summary.process_peak_footprint_bytes = memory_stats.peak_footprint_bytes;
+
     return summary;
 }
 
@@ -484,6 +560,33 @@ fn printSummary(cfg: Config, summary: Summary) void {
         },
     );
     std.debug.print(
+        "  memory_guard ingest_ms={d} peak_resident_mb={d} peak_footprint_mb={d} bulk_clone_calls={d} bulk_clone_mb={d} bulk_clone_peak_mb={d} primary_calls={d} primary_mb={d} primary_peak_mb={d} dense_calls={d} dense_mb={d} dense_peak_mb={d}\n",
+        .{
+            @divTrunc(summary.ingestNs(), std.time.ns_per_ms),
+            @divTrunc(summary.process_peak_resident_bytes, 1024 * 1024),
+            @divTrunc(summary.process_peak_footprint_bytes, 1024 * 1024),
+            summary.bulk_clone_calls,
+            @divTrunc(summary.bulk_clone_bytes, 1024 * 1024),
+            @divTrunc(summary.bulk_clone_peak_bytes, 1024 * 1024),
+            summary.primary_bulk_clone_calls,
+            @divTrunc(summary.primary_bulk_clone_bytes, 1024 * 1024),
+            @divTrunc(summary.primary_bulk_clone_peak_bytes, 1024 * 1024),
+            summary.dense_bulk_clone_calls,
+            @divTrunc(summary.dense_bulk_clone_bytes, 1024 * 1024),
+            @divTrunc(summary.dense_bulk_clone_peak_bytes, 1024 * 1024),
+        },
+    );
+    std.debug.print(
+        "  lsm_cache total_mb={d} data_block_mb={d} data_block_inserts={d} data_block_transient_serves={d} data_block_policy_bypasses={d}\n",
+        .{
+            @divTrunc(summary.lsm_cache_used_bytes, 1024 * 1024),
+            @divTrunc(summary.lsm_data_block_cache_used_bytes, 1024 * 1024),
+            summary.lsm_data_block_cache_inserts,
+            summary.lsm_data_block_cache_transient_serves,
+            summary.lsm_data_block_cache_policy_bypasses,
+        },
+    );
+    std.debug.print(
         "  async begin={d} finish={d} flush_calls={d} flush_ms={d}\n",
         .{
             summary.async_begin_calls,
@@ -502,6 +605,33 @@ fn printSummary(cfg: Config, summary: Summary) void {
             @divTrunc(summary.hbc_quant_value_bytes, 1024 * 1024),
         },
     );
+}
+
+fn enforceGuardrails(cfg: Config, summary: Summary) !void {
+    if (cfg.max_bulk_clone_calls) |max| {
+        if (summary.bulk_clone_calls > max) return guardrailFailure("bulk_clone_calls", summary.bulk_clone_calls, max);
+    }
+    if (cfg.max_bulk_clone_bytes) |max| {
+        if (summary.bulk_clone_bytes > max) return guardrailFailure("bulk_clone_bytes", summary.bulk_clone_bytes, max);
+    }
+    if (cfg.max_bulk_clone_peak_bytes) |max| {
+        if (summary.bulk_clone_peak_bytes > max) return guardrailFailure("bulk_clone_peak_bytes", summary.bulk_clone_peak_bytes, max);
+    }
+    if (cfg.max_ingest_ms) |max| {
+        const actual = @divTrunc(summary.ingestNs(), std.time.ns_per_ms);
+        if (actual > max) return guardrailFailure("ingest_ms", actual, max);
+    }
+    if (cfg.max_data_block_cache_bytes) |max| {
+        if (summary.lsm_data_block_cache_used_bytes > max) return guardrailFailure("data_block_cache_bytes", summary.lsm_data_block_cache_used_bytes, max);
+    }
+    if (cfg.max_peak_footprint_bytes) |max| {
+        if (summary.process_peak_footprint_bytes > max) return guardrailFailure("peak_footprint_bytes", summary.process_peak_footprint_bytes, max);
+    }
+}
+
+fn guardrailFailure(name: []const u8, actual: u64, max: u64) error{GuardrailExceeded} {
+    std.debug.print("provisioned_dense_ingest_guardrail exceeded metric={s} actual={d} max={d}\n", .{ name, actual, max });
+    return error.GuardrailExceeded;
 }
 
 fn deterministicNoise(seed: u64, doc_idx: usize, dim_idx: usize) f32 {

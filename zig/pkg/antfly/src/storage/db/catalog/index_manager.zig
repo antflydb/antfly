@@ -252,6 +252,17 @@ pub const ManagedIndexRef = struct {
     estimated_dense_vector_bytes: u64 = 0,
 };
 
+pub const LsmOwnerStats = struct {
+    kind: types.IndexKind,
+    name: []u8,
+    maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
 pub const IndexBatchOptions = struct {
     compact_text: bool = true,
     compact_text_segment_threshold: ?usize = null,
@@ -3571,6 +3582,35 @@ pub const IndexManager = struct {
             }
         }
         return stats;
+    }
+
+    pub fn snapshotLsmOwnerStatsAlloc(self: *const IndexManager, alloc: Allocator) ![]LsmOwnerStats {
+        var owners = std.ArrayListUnmanaged(LsmOwnerStats).empty;
+        errdefer {
+            for (owners.items) |*owner| owner.deinit(alloc);
+            owners.deinit(alloc);
+        }
+        for (self.text_indexes.items) |*entry| {
+            const stats = entry.persistent.snapshotLsmMaintenanceStats() orelse continue;
+            try owners.ensureUnusedCapacity(alloc, 1);
+            const name = try alloc.dupe(u8, entry.config.name);
+            owners.appendAssumeCapacity(.{
+                .kind = .full_text,
+                .name = name,
+                .maintenance = stats,
+            });
+        }
+        for (self.dense_indexes.items) |*entry| {
+            const stats = entry.index.snapshotLsmMaintenanceStats() orelse continue;
+            try owners.ensureUnusedCapacity(alloc, 1);
+            const name = try alloc.dupe(u8, entry.config.name);
+            owners.appendAssumeCapacity(.{
+                .kind = .dense_vector,
+                .name = name,
+                .maintenance = stats,
+            });
+        }
+        return try owners.toOwnedSlice(alloc);
     }
 
     pub fn snapshotLsmWriteStats(self: *const IndexManager) lsm_backend_mod.Backend.WriteStats {

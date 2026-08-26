@@ -9856,6 +9856,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     provisioned_dense_ingest_guardrail_mod.addImport("antfly-zig", lib_mod);
+    provisioned_dense_ingest_guardrail_mod.addImport("antfly_platform", platform_mod);
 
     const provisioned_dense_ingest_guardrail = b.addExecutable(.{
         .name = "provisioned_dense_ingest_guardrail",
@@ -9867,6 +9868,9 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_provisioned_dense_ingest_guardrail.addArgs(args);
     } else {
+        // Keep deterministic memory regressions fail-closed while allowing
+        // enough wall-clock headroom for slower CI hosts. The cache threshold
+        // is 768 MiB and the process-footprint threshold is 3 GiB.
         run_provisioned_dense_ingest_guardrail.addArgs(&.{
             "--docs",
             "50000",
@@ -9876,6 +9880,18 @@ pub fn build(b: *std.Build) void {
             "100",
             "--sync-level",
             "write",
+            "--max-bulk-clone-calls",
+            "0",
+            "--max-bulk-clone-bytes",
+            "0",
+            "--max-bulk-clone-peak-bytes",
+            "0",
+            "--max-data-block-cache-bytes",
+            "805306368",
+            "--max-peak-footprint-bytes",
+            "3221225472",
+            "--max-ingest-ms",
+            "60000",
         });
     }
     const build_provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail-build", "Build the provisioned table dense ingest guardrail without running it");

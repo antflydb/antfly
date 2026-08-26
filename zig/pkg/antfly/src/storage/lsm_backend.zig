@@ -213,6 +213,7 @@ pub const MutableSnapshotReason = enum(u8) {
     namespace_read_txn,
     current_scan,
     other,
+    bulk_current_scan,
 };
 
 pub const mutable_snapshot_reason_count = @typeInfo(MutableSnapshotReason).@"enum".fields.len;
@@ -271,6 +272,7 @@ pub fn mutableSnapshotReasonName(reason: MutableSnapshotReason) []const u8 {
         .namespace_read_txn => "namespace_read_txn",
         .current_scan => "current_scan",
         .other => "other",
+        .bulk_current_scan => "bulk_current_scan",
     };
 }
 
@@ -2681,7 +2683,7 @@ pub const Backend = struct {
             self.bulk_ingest_current_scan_clone_budget_denials +|= 1;
             return null;
         }
-        var snapshot = self.cloneMutableStateWithReason(.other) catch |err| switch (err) {
+        var snapshot = self.cloneMutableStateWithReason(.bulk_current_scan) catch |err| switch (err) {
             error.OutOfMemory => {
                 self.bulk_ingest_current_scan_clone_oom_fallbacks +|= 1;
                 return null;
@@ -13651,6 +13653,115 @@ test "lsm backend bulk current scan clones mutable under memory cap" {
 
     try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
     bulk_active = false;
+}
+
+test "lsm backend replay scan freezes bulk mutable state without cloning it" {
+    var backend = Backend.init(std.testing.allocator, .{
+        .flush_threshold = 1024,
+        .wal_enabled = false,
+        .bulk_ingest_current_scan_clone_max_bytes = 1024 * 1024,
+    });
+    defer backend.close();
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    try backend.beginBulkIngestSession();
+    var bulk_active = true;
+    defer if (bulk_active) backend.abortBulkIngestSession();
+
+    const lane: u8 = 4;
+    const first_key = internal_keys.replayEntryKey(lane, 1);
+    const second_key = internal_keys.replayEntryKey(lane, 2);
+    {
+        var write = try runtime.beginWrite();
+        try write.put(first_key[0..], "first");
+        try write.put(second_key[0..], "second");
+        try write.commit();
+    }
+
+    const before_maintenance = backend.snapshotMaintenanceStats();
+    const before_writes = backend.snapshotWriteStats();
+    const Context = struct {
+        seen: usize = 0,
+
+        fn consume(self: *@This(), sequence: u64, payload: []const u8) !void {
+            self.seen += 1;
+            try std.testing.expectEqual(@as(u64, @intCast(self.seen)), sequence);
+            try std.testing.expectEqualStrings(if (sequence == 1) "first" else "second", payload);
+        }
+    };
+    var context = Context{};
+    const replay = try runtime.forEachReplayLaneFrom(lane, 1, 0, &context, Context.consume);
+
+    const after_maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(@as(usize, 2), context.seen);
+    try std.testing.expectEqual(@as(usize, 2), replay.matched_entries);
+    try std.testing.expectEqual(@as(u64, 2), replay.last_sequence);
+    try std.testing.expectEqual(before_maintenance.mutable_snapshot_clone_calls, after_maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 0), after_maintenance.bulk_ingest_current_scan_clone_active_bytes);
+    try std.testing.expectEqual(before_writes.immutable_rotations + 1, backend.snapshotWriteStats().immutable_rotations);
+
+    try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    bulk_active = false;
+}
+
+test "lsm backend replay scan serves run data blocks transiently" {
+    const alloc = std.testing.allocator;
+    var backing = storage_io.MemoryStorage.init(alloc);
+    defer backing.deinit();
+    var cache = Cache.init(alloc, DefaultCacheSizeBytes);
+    defer cache.deinit();
+
+    var backend = try Backend.open(alloc, "/lsm-replay-transient-blocks", .{
+        .storage = backing.storage(),
+        .cache = &cache,
+        .flush_threshold = 1024,
+        .wal_enabled = false,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(alloc, .{});
+    defer runtime.deinit();
+
+    const lane: u8 = 7;
+    const payload = "x" ** 1024;
+    {
+        var write = try runtime.beginWrite();
+        for (1..97) |sequence| {
+            const key = internal_keys.replayEntryKey(lane, @intCast(sequence));
+            try write.put(key[0..], payload);
+        }
+        try write.commit();
+    }
+    try backend.sync(true);
+
+    const before = cache.snapshotStats();
+    const Context = struct {
+        seen: usize = 0,
+
+        fn consume(self: *@This(), _: u64, value: []const u8) !void {
+            self.seen += 1;
+            try std.testing.expectEqual(@as(usize, 1024), value.len);
+        }
+    };
+    var context = Context{};
+    const replay = try runtime.forEachReplayLaneFrom(lane, 1, 0, &context, Context.consume);
+    const after = cache.snapshotStats();
+
+    try std.testing.expectEqual(@as(usize, 96), context.seen);
+    try std.testing.expectEqual(@as(usize, 96), replay.matched_entries);
+    try std.testing.expectEqual(
+        before.run_table_block.inserts + before.run_table_physical_block.inserts,
+        after.run_table_block.inserts + after.run_table_physical_block.inserts,
+    );
+    try std.testing.expect(
+        after.run_table_block.transient_serves + after.run_table_physical_block.transient_serves >
+            before.run_table_block.transient_serves + before.run_table_physical_block.transient_serves,
+    );
+    try std.testing.expect(
+        after.run_table_block.policy_bypasses + after.run_table_physical_block.policy_bypasses >
+            before.run_table_block.policy_bypasses + before.run_table_physical_block.policy_bypasses,
+    );
 }
 
 test "lsm backend bulk current scan rotates mutable above aggregate clone memory cap" {
