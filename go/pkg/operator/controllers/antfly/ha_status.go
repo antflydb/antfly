@@ -1514,7 +1514,7 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 			if runtimeOwnedSeed {
 				seedTargetLSN = runtimeOwnedSeedTargetLSN
 				if seedTargetLSN == 0 {
-					seedTargetLSN = haRuntimeOwnedInitialSeedTargetLSN(status)
+					seedTargetLSN = initialStandbyLSN(standby, haRuntimeOwnedInitialSeedTargetLSN(status))
 				}
 			}
 			if seedTargetLSN == 0 {

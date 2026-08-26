@@ -1559,7 +1559,7 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 		t.Fatalf("SEED_CAPTURE_NOT_RUNTIME_OWNED: capture must execute atomically in the mounted primary runtime, got %#v", actions[0])
 	}
 	if actions[4].Executor != string(haActionExecutorCLIJob) ||
-		actions[4].SeedArtifactGeneration != "base-standby-a-10" {
+		actions[4].TargetLSN != initial || actions[4].SeedArtifactGeneration != "base-standby-a-5" {
 		t.Fatalf("TARGET_ACTIVATION_MISSING: activation must be a generation-bound target-PVC job, got %#v", actions[4])
 	}
 	digest := strings.Repeat("a", 64)
@@ -1568,17 +1568,17 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 	cluster.Status.HAStatus.PlannedActions[0].AdminJobPhase = haAdminJobPhaseSucceeded
 	cluster.Status.HAStatus.PlannedActions[0].AdminResult = &antflyv1.HAAdminActionResultStatus{
 		SchemaVersion:          1,
-		ActionID:               "seed_capture:base-standby-a-10",
+		ActionID:               "seed_capture:base-standby-a-5",
 		ActionKind:             "seed_capture",
-		ActionTarget:           "base-standby-a-10",
+		ActionTarget:           "base-standby-a-5",
 		ActionState:            "applied",
 		ActionNodeID:           "primary-a",
 		SlotName:               "standby-a",
-		ManifestID:             "base-standby-a-10",
-		BackupLSN:              10,
-		CheckpointLSN:          10,
-		EndRecordLSN:           11,
-		SeedArtifactGeneration: "base-standby-a-10",
+		ManifestID:             "base-standby-a-5",
+		BackupLSN:              5,
+		CheckpointLSN:          5,
+		EndRecordLSN:           6,
+		SeedArtifactGeneration: "base-standby-a-5",
 		ManifestSHA256:         digest,
 		CaptureReceiptSHA256:   captureDigest,
 		SeedClusterID:          100,
@@ -1587,23 +1587,23 @@ func TestPlanHAPlansRuntimeOwnedCaptureAndActivationWithoutPrebuiltSeedFiles(t *
 		SeedSourcePlanSHA256:   digest,
 		SeedFileCount:          2,
 		SeedTotalBytes:         20,
-		SeedGenerationRoot:     "/antflydb/ha/seed-captures/generations/base-standby-a-10",
-		SeedContentRoot:        "/antflydb/ha/seed-captures/generations/base-standby-a-10/content",
-		SeedManifestPath:       "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha",
+		SeedGenerationRoot:     "/antflydb/ha/seed-captures/generations/base-standby-a-5",
+		SeedContentRoot:        "/antflydb/ha/seed-captures/generations/base-standby-a-5/content",
+		SeedManifestPath:       "/antflydb/ha/seed-captures/generations/base-standby-a-5/manifest.afha",
 		SeedAlreadyCaptured:    false,
 	}
 	(&AntflyClusterReconciler{}).updateHAStatusAndConditions(cluster)
 	publish := cluster.Status.HAStatus.PlannedActions[1]
-	if publish.SeedManifestPath != "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha" ||
-		publish.SeedContentRoot != "/antflydb/ha/seed-captures/generations/base-standby-a-10/content" ||
+	if publish.SeedManifestPath != "/antflydb/ha/seed-captures/generations/base-standby-a-5/manifest.afha" ||
+		publish.SeedContentRoot != "/antflydb/ha/seed-captures/generations/base-standby-a-5/content" ||
 		!reflect.DeepEqual(publish.AdminCommand, []string{
 			"artifact", "publish",
 			"--location", "s3://ha-seeds/cluster-a",
-			"--generation", "base-standby-a-10",
+			"--generation", "base-standby-a-5",
 			"--slot", "standby-a",
-			"--manifest", "/antflydb/ha/seed-captures/generations/base-standby-a-10/manifest.afha",
-			"--content-root", "/antflydb/ha/seed-captures/generations/base-standby-a-10/content",
-			"--capture-receipt", "/antflydb/ha/seed-captures/generations/base-standby-a-10/COMPLETE.json",
+			"--manifest", "/antflydb/ha/seed-captures/generations/base-standby-a-5/manifest.afha",
+			"--content-root", "/antflydb/ha/seed-captures/generations/base-standby-a-5/content",
+			"--capture-receipt", "/antflydb/ha/seed-captures/generations/base-standby-a-5/COMPLETE.json",
 			"--capture-receipt-sha256", captureDigest,
 			"--topology-id", "topology-a",
 			"--topology-generation", "7",
@@ -1697,6 +1697,11 @@ func TestPlanHAInitialPortableSeedIgnoresSyntheticStandbyStatusUntilPrimarySlotO
 		if !reflect.DeepEqual(gotKinds, wantKinds) {
 			t.Fatalf("PREMATURE_RESUME_SLOT: initial portable seed requires %v before a primary slot exists, got %v (%#v)", wantKinds, gotKinds, plan.Actions)
 		}
+		for _, action := range plan.Actions {
+			if action.TargetLSN != initial {
+				t.Fatalf("runtime-owned seed must preserve configured initial LSN %d for %s, got %#v", initial, action.Kind, action)
+			}
+		}
 	})
 
 	t.Run("reachable empty primary starts seed at the backup control record", func(t *testing.T) {
@@ -1778,8 +1783,8 @@ func TestPlanHAInitialPortableSeedIgnoresSyntheticStandbyStatusUntilPrimarySlotO
 			t.Fatalf("CAPTURE_PROGRESS_DROPPED: replan must preserve completed capture evidence, got %#v", actions[0])
 		}
 		for _, action := range actions {
-			if action.TargetLSN != 10 {
-				t.Fatalf("SEED_TARGET_RETARGETED: in-flight portable seed must remain frozen at LSN 10, got %#v", action)
+			if action.TargetLSN != initial {
+				t.Fatalf("SEED_TARGET_RETARGETED: in-flight portable seed must preserve requested boundary LSN %d while receipts carry the newer checkpoint, got %#v", initial, action)
 			}
 		}
 	})
