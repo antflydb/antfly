@@ -4315,6 +4315,7 @@ pub fn build(b: *std.Build) void {
         "data runtime repair debt hook targets the affected group queue",
         "data runtime repair failures preserve durable backoff and increase retry delay",
         "index repair fallback backoff never blocks an exact durable wake",
+        "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic",
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",

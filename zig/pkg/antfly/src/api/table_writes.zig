@@ -6716,12 +6716,14 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
+        if (result.terminal_degraded) return;
         const index = self.findTableActivityLocked(table_name, group_id) orelse return;
-        if (self.active_table_activities.items[index].repair_handoff_status_pending == 0) return;
+        const entry = self.active_table_activities.items[index];
+        if (entry.repair_handoff_status_pending == 0 or !entry.repair_handoff_clear_observed) return;
         // Handoff edges are causally ordered by the visibility callbacks:
-        // pending always invalidates an older clear. This audit may retain the
-        // route, but must never manufacture a clear from a result sampled
-        // before a newer pending callback.
+        // pending always invalidates an older clear. Only post-clear
+        // publication debt may borrow the repair route; ordinary paused or
+        // terminal handoffs are not runnable scheduler work.
         result.index_repair_pending = true;
     }
 
@@ -34223,10 +34225,16 @@ test "repair handoff status settles after authoritative cached publication" {
         .index_repair_repaired = true,
     };
     source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &stale_completion);
-    try std.testing.expect(stale_completion.index_repair_pending);
+    try std.testing.expect(!stale_completion.index_repair_pending);
     try std.testing.expect(!source.settleRepairHandoffStatusBestEffort("docs", 7001));
 
     source.markRepairHandoffClearBestEffort("docs", 7001);
+    var publication_retry = ProvisionedTableWriteSource.StartupCatchUpResult{};
+    source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &publication_retry);
+    try std.testing.expect(publication_retry.index_repair_pending);
+    var terminal = ProvisionedTableWriteSource.StartupCatchUpResult{ .terminal_degraded = true };
+    source.retainRepairRouteForPendingHandoffBestEffort("docs", 7001, &terminal);
+    try std.testing.expect(!terminal.index_repair_pending);
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
     try publishRuntimeStatusSnapshotConsistent(&source, alloc, "docs", 7001, &db);

@@ -565,6 +565,7 @@ const IndexRepairScheduleCandidate = struct {
     identity_range_id: u64 = 0,
     estimated_bytes: u64,
     queued: bool,
+    queue_wake_generation: ?u64 = null,
     cursor_distance: usize,
 };
 
@@ -585,6 +586,10 @@ test "index repair queue retains debt while leadership is temporarily unknown" {
 
 const IndexRepairQueueEntry = struct {
     first_seen_ms: u64,
+    // Assigned from the queue-wide generation. Scheduler retention preserves
+    // this value, while external/durable wakes replace it, so an older
+    // completion cannot delete a newer edge even after remove/recreate (ABA).
+    wake_generation: u64,
     next_retry_at_ms: u64 = 0,
     transient_failure_count: u32 = 0,
     immediate_wake_pending: bool = false,
@@ -4515,6 +4520,9 @@ pub const DataServer = struct {
     provisioned_index_repair_queue_head: ?u64 = null,
     provisioned_index_repair_queue_tail: ?u64 = null,
     provisioned_index_repair_queue_cursor: ?u64 = null,
+    // Protected by provisioned_index_repair_queue_mutex. Zero is reserved for
+    // uninitialized state and skipped on the practically unreachable wrap.
+    provisioned_index_repair_next_wake_generation: u64 = 1,
     // Immutable between repair passes and rebuilt only when the metadata epoch
     // changes. This keeps fixed-window reconciliation independent of the size
     // of the administrative snapshot on the steady-state hot path.
@@ -11924,6 +11932,15 @@ pub const DataServer = struct {
         self.provisioned_index_repair_not_before_ms.store(if (runnable) 0 else next_retry_at_ms, .monotonic);
     }
 
+    fn nextProvisionedIndexRepairWakeGenerationLocked(self: *DataServer) u64 {
+        const generation = self.provisioned_index_repair_next_wake_generation;
+        self.provisioned_index_repair_next_wake_generation +%= 1;
+        if (self.provisioned_index_repair_next_wake_generation == 0) {
+            self.provisioned_index_repair_next_wake_generation = 1;
+        }
+        return generation;
+    }
+
     fn enqueueProvisionedIndexRepairWithRetryForTable(
         self: *DataServer,
         table_name: ?[]const u8,
@@ -11945,6 +11962,9 @@ pub const DataServer = struct {
         lockAtomic(&self.provisioned_index_repair_queue_mutex);
         if (self.provisioned_index_repair_group_ages.getPtr(group_id)) |entry| {
             if (entry.table_name != null or table_name == null) {
+                if (wake == .immediate) {
+                    entry.wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked();
+                }
                 entry.transient_failure_count = 0;
                 entry.next_retry_at_ms = next_retry_at_ms;
                 if (wake == .immediate and !entry.immediate_wake_pending) {
@@ -11972,6 +11992,7 @@ pub const DataServer = struct {
             const previous = self.provisioned_index_repair_queue_tail;
             gop.value_ptr.* = .{
                 .first_seen_ms = now_ms,
+                .wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked(),
                 .previous_group_id = previous,
                 .table_name = owned_table_name,
             };
@@ -11989,6 +12010,9 @@ pub const DataServer = struct {
         if (gop.value_ptr.table_name == null) {
             gop.value_ptr.table_name = owned_table_name;
             owned_table_name = null;
+        }
+        if (gop.found_existing and wake == .immediate) {
+            gop.value_ptr.wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked();
         }
         gop.value_ptr.transient_failure_count = 0;
         gop.value_ptr.next_retry_at_ms = next_retry_at_ms;
@@ -12015,6 +12039,7 @@ pub const DataServer = struct {
             const previous = self.provisioned_index_repair_queue_tail;
             gop.value_ptr.* = .{
                 .first_seen_ms = now_ms,
+                .wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked(),
                 .previous_group_id = previous,
                 .table_name = owned_table_name,
             };
@@ -12084,10 +12109,7 @@ pub const DataServer = struct {
         try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, next_retry_at_ms, .retained);
     }
 
-    fn removeProvisionedIndexRepair(self: *DataServer, group_id: u64) void {
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        lockAtomic(&self.provisioned_index_repair_queue_mutex);
-        defer self.provisioned_index_repair_queue_mutex.unlock();
+    fn removeProvisionedIndexRepairLocked(self: *DataServer, group_id: u64, now_ms: u64) void {
         const removed = self.provisioned_index_repair_group_ages.get(group_id) orelse return;
         if (removed.previous_group_id) |previous| {
             self.provisioned_index_repair_group_ages.getPtr(previous).?.next_group_id = removed.next_group_id;
@@ -12113,6 +12135,28 @@ pub const DataServer = struct {
         }
         if (removed.table_name) |table_name| self.alloc.free(table_name);
         self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
+    }
+
+    fn removeProvisionedIndexRepair(self: *DataServer, group_id: u64) void {
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        defer self.provisioned_index_repair_queue_mutex.unlock();
+        self.removeProvisionedIndexRepairLocked(group_id, now_ms);
+    }
+
+    fn removeProvisionedIndexRepairIfUnchanged(
+        self: *DataServer,
+        group_id: u64,
+        expected_wake_generation: ?u64,
+    ) bool {
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        defer self.provisioned_index_repair_queue_mutex.unlock();
+        const current = self.provisioned_index_repair_group_ages.get(group_id) orelse return true;
+        const expected = expected_wake_generation orelse return false;
+        if (current.wake_generation != expected) return false;
+        self.removeProvisionedIndexRepairLocked(group_id, now_ms);
+        return true;
     }
 
     fn consumeProvisionedIndexRepairImmediateWake(self: *DataServer, group_id: u64) void {
@@ -12551,10 +12595,15 @@ pub const DataServer = struct {
             }
             schedule_candidates.deinit(self.alloc);
         }
-        var stale_queued_groups = std.ArrayListUnmanaged(u64).empty;
+        const StaleQueuedRepair = struct {
+            group_id: u64,
+            wake_generation: u64,
+        };
+        var stale_queued_groups = std.ArrayListUnmanaged(StaleQueuedRepair).empty;
         defer stale_queued_groups.deinit(self.alloc);
         const QueuedRepair = struct {
             group_id: u64,
+            wake_generation: u64,
             next_retry_at_ms: u64,
             table_name: ?[]u8,
             immediate_wake_pending: bool,
@@ -12590,6 +12639,7 @@ pub const DataServer = struct {
                 null;
             queued_repairs.append(self.alloc, .{
                 .group_id = group_id,
+                .wake_generation = entry.wake_generation,
                 .next_retry_at_ms = entry.next_retry_at_ms,
                 .table_name = queued_table_name,
                 .immediate_wake_pending = entry.immediate_wake_pending,
@@ -12625,7 +12675,10 @@ pub const DataServer = struct {
                     continue;
                 },
                 .remove => {
-                    stale_queued_groups.append(self.alloc, group_id) catch continue;
+                    stale_queued_groups.append(self.alloc, .{
+                        .group_id = group_id,
+                        .wake_generation = queued.wake_generation,
+                    }) catch continue;
                     continue;
                 },
             }
@@ -12648,6 +12701,7 @@ pub const DataServer = struct {
                 // single bounded repair slot.
                 .estimated_bytes = 1,
                 .queued = true,
+                .queue_wake_generation = queued.wake_generation,
                 .cursor_distance = 0,
             }) catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -12661,7 +12715,11 @@ pub const DataServer = struct {
             // fairness across subsequent passes.
             break;
         }
-        for (stale_queued_groups.items) |group_id| self.removeProvisionedIndexRepair(group_id);
+        for (stale_queued_groups.items) |stale| {
+            if (!self.removeProvisionedIndexRepairIfUnchanged(stale.group_id, stale.wake_generation)) {
+                found_pending = true;
+            }
+        }
 
         // Reconciliation uses a compact node-local routing index. Refreshing
         // that index may clone metadata once per epoch, but steady-state repair
@@ -12870,7 +12928,13 @@ pub const DataServer = struct {
                     return;
                 };
             } else {
-                self.removeProvisionedIndexRepair(group_id);
+                // The result owns only the wake that selected this attempt.
+                // A callback may enqueue newer repair debt while DB/status
+                // observation is finishing; never let the older completion
+                // remove that causally later edge.
+                if (!self.removeProvisionedIndexRepairIfUnchanged(group_id, candidate.queue_wake_generation)) {
+                    found_pending = true;
+                }
             }
             // A fallback route is consumed only after its durable outcome was
             // completed or its exact group was successfully retained in the
@@ -23849,6 +23913,7 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
 
     try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    const selected_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
     failing.fail_index = failing.alloc_index;
     server.alloc = failing.allocator();
@@ -23856,6 +23921,15 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // Retaining an existing exact wake must not allocate, even when its durable
     // retry deadline changes after a cooperative repair slice.
     try server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7001, 1234, .retained);
+    try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
+    try std.testing.expectEqual(selected_generation, server.provisioned_index_repair_group_ages.get(7001).?.wake_generation);
+
+    // A newer external wake is allocation-free too, but advances ownership.
+    // Completion of the selected generation cannot remove that later edge;
+    // fallback work selected without a queue entry cannot remove it either.
+    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    try std.testing.expect(!server.removeProvisionedIndexRepairIfUnchanged(7001, selected_generation));
+    try std.testing.expect(!server.removeProvisionedIndexRepairIfUnchanged(7001, null));
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
 
     // A fallback-discovered group does require queue storage. Failure must be
@@ -23868,7 +23942,17 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7002));
 
     server.alloc = alloc;
-    server.removeProvisionedIndexRepair(7001);
+    const current_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
+    try std.testing.expect(server.removeProvisionedIndexRepairIfUnchanged(7001, current_generation));
+    try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7001));
+
+    // Removal and recreation must not reuse the old ownership token. This is
+    // the ABA case: a completion holding the prior generation remains stale.
+    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    const recreated_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
+    try std.testing.expect(recreated_generation != current_generation);
+    try std.testing.expect(!server.removeProvisionedIndexRepairIfUnchanged(7001, current_generation));
+    try std.testing.expect(server.removeProvisionedIndexRepairIfUnchanged(7001, recreated_generation));
 }
 
 test "data runtime repair queue links and removes debt in constant time" {
