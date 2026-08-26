@@ -620,6 +620,17 @@ const IndexRepairQueueMutationGuard = union(enum) {
             .selected => |expected| expected != null and expected.? == wake_generation,
         };
     }
+
+    fn allowsMissing(self: @This()) bool {
+        return switch (self) {
+            .unguarded => true,
+            // A null selection is fallback discovery: it proved durable debt
+            // without selecting a queue owner and may materialize that route.
+            // A concrete selection is an outcome from an older queue owner and
+            // must never resurrect an entry removed by destructive lifecycle.
+            .selected => |expected| expected == null,
+        };
+    }
 };
 
 const IndexRepairRoute = struct {
@@ -11998,6 +12009,10 @@ pub const DataServer = struct {
                 return true;
             }
         }
+        if (!self.provisioned_index_repair_group_ages.contains(group_id) and !mutation_guard.allowsMissing()) {
+            self.provisioned_index_repair_queue_mutex.unlock();
+            return false;
+        }
         self.provisioned_index_repair_queue_mutex.unlock();
 
         // Allocate before getOrPut so an allocation failure cannot leave a new
@@ -12008,6 +12023,9 @@ pub const DataServer = struct {
         defer if (owned_table_name) |name| self.alloc.free(name);
         lockAtomic(&self.provisioned_index_repair_queue_mutex);
         defer self.provisioned_index_repair_queue_mutex.unlock();
+        if (!self.provisioned_index_repair_group_ages.contains(group_id) and !mutation_guard.allowsMissing()) {
+            return false;
+        }
         const gop = try self.provisioned_index_repair_group_ages.getOrPut(self.alloc, group_id);
         if (gop.found_existing and !mutation_guard.allowsExisting(gop.value_ptr.wake_generation)) {
             return false;
@@ -12095,16 +12113,22 @@ pub const DataServer = struct {
                 return result;
             }
         }
+        const mutation_guard = IndexRepairQueueMutationGuard{ .selected = expected_wake_generation };
+        if (!self.provisioned_index_repair_group_ages.contains(group_id) and !mutation_guard.allowsMissing()) {
+            self.provisioned_index_repair_queue_mutex.unlock();
+            return .{ .applied = false, .retry_at_ms = 0 };
+        }
         self.provisioned_index_repair_queue_mutex.unlock();
 
         var owned_table_name: ?[]u8 = try self.alloc.dupe(u8, table_name);
         defer if (owned_table_name) |name| self.alloc.free(name);
         lockAtomic(&self.provisioned_index_repair_queue_mutex);
         defer self.provisioned_index_repair_queue_mutex.unlock();
+        if (!self.provisioned_index_repair_group_ages.contains(group_id) and !mutation_guard.allowsMissing()) {
+            return .{ .applied = false, .retry_at_ms = 0 };
+        }
         const gop = try self.provisioned_index_repair_group_ages.getOrPut(self.alloc, group_id);
-        if (gop.found_existing and
-            !(IndexRepairQueueMutationGuard{ .selected = expected_wake_generation }).allowsExisting(gop.value_ptr.wake_generation))
-        {
+        if (gop.found_existing and !mutation_guard.allowsExisting(gop.value_ptr.wake_generation)) {
             return .{
                 .applied = false,
                 .retry_at_ms = gop.value_ptr.next_retry_at_ms,
@@ -24078,26 +24102,38 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     );
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7002));
 
-    server.alloc = alloc;
     const current_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
     try std.testing.expect(server.removeProvisionedIndexRepairIfUnchanged(7001, current_generation));
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7001));
 
-    // A selected result may recreate an absent route: clear publication can
-    // remove the entry before the result discovers that its exact status
-    // handoff still needs a continuation. Recreation gets fresh ownership, so
-    // another outcome holding the prior generation remains stale (ABA).
-    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+    // Destructive lifecycle removal is terminal for every scheduler outcome
+    // selected before it. Neither a pending result nor its failure path may
+    // recreate the removed route after the group-operation barrier is released.
+    try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
         "docs",
         7001,
         0,
         .retained,
         .{ .selected = current_generation },
     ));
-    const recreated_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
-    try std.testing.expect(recreated_generation != current_generation);
-    try std.testing.expect(!server.removeProvisionedIndexRepairIfUnchanged(7001, current_generation));
-    try std.testing.expect(server.removeProvisionedIndexRepairIfUnchanged(7001, recreated_generation));
+    const stale_failure = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001, current_generation);
+    try std.testing.expect(!stale_failure.applied);
+    try std.testing.expectEqual(@as(u64, 0), stale_failure.retry_at_ms);
+    try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7001));
+
+    // Fallback discovery selected no queue owner and independently proved
+    // durable debt, so it remains authorized to materialize an absent route.
+    server.alloc = alloc;
+    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+        "docs",
+        7001,
+        0,
+        .retained,
+        .{ .selected = null },
+    ));
+    const fallback_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
+    try std.testing.expect(fallback_generation != current_generation);
+    try std.testing.expect(server.removeProvisionedIndexRepairIfUnchanged(7001, fallback_generation));
 }
 
 test "data runtime repair queue links and removes debt in constant time" {
