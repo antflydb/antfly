@@ -336,6 +336,21 @@ pub fn validateArtifact(
     io: std.Io,
     artifact_or_manifest_path: []const u8,
 ) !ValidationResult {
+    const session_manager = backends.SessionManager.init(allocator);
+    return validateArtifactWithSessionManager(
+        allocator,
+        io,
+        artifact_or_manifest_path,
+        &session_manager,
+    );
+}
+
+fn validateArtifactWithSessionManager(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    artifact_or_manifest_path: []const u8,
+    session_manager: *const backends.SessionManager,
+) !ValidationResult {
     if (compiled_artifact.isPackageManifestPath(artifact_or_manifest_path)) {
         var parsed = try compiled_artifact.readPackageManifest(allocator, io, artifact_or_manifest_path);
         defer parsed.deinit();
@@ -379,6 +394,7 @@ pub fn validateArtifact(
     const manifest = parsed.value;
 
     if (std.mem.eql(u8, manifest.backend, "onnx")) {
+        try validateArtifactBackendPolicy(session_manager, manifest.backend);
         if (!build_options.enable_onnx) return error.BackendUnavailable;
         var session = try backends.onnx.createSession(allocator, manifest.artifact_path);
         defer session.close();
@@ -935,6 +951,9 @@ fn runParsedArtifactPrompt(
     no_chat_template: bool,
     raw_prompt: bool,
 ) !RunResult {
+    const session_manager = backends.SessionManager.init(allocator);
+    try validateArtifactBackendPolicy(&session_manager, artifact.backend);
+
     var model_manifest = try manifest_mod.loadFromDir(allocator, artifact.model_dir);
     defer {
         if (pjrtExecDebugEnabled() and std.mem.eql(u8, artifact.backend, "xla")) std.log.info("PJRT run-artifact model manifest deinit begin", .{});
@@ -989,6 +1008,27 @@ fn runParsedArtifactPrompt(
         graph_input_ids,
         compare_host,
     );
+}
+
+fn validateArtifactBackendPolicy(
+    session_manager: *const backends.SessionManager,
+    artifact_backend_name: []const u8,
+) !void {
+    const artifact_backend = try native_backend_choice.compiledArtifactBackend(artifact_backend_name);
+    try native_backend_choice.validateRequiredCompiledBackend(session_manager, artifact_backend);
+}
+
+test "run-artifact rejects a compiled backend outside the required policy" {
+    var session_manager = backends.SessionManager.init(std.testing.allocator);
+    session_manager.required_backend = .native;
+    session_manager.required_backend_invalid = false;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        validateArtifactBackendPolicy(&session_manager, "onnx"),
+    );
+
+    session_manager.required_backend = null;
+    try validateArtifactBackendPolicy(&session_manager, "onnx");
 }
 
 fn runPreparedArtifactPrompt(
@@ -2960,6 +3000,47 @@ test "parseArgs accepts validate without prompt" {
     try std.testing.expect(opts.validate);
 }
 
+test "validateArtifact keeps XLA metadata inspection outside execution policy" {
+    if (!build_options.enable_pjrt) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(base_dir);
+    const artifact_path = try std.fs.path.join(allocator, &.{ base_dir, "model.hlo" });
+    defer allocator.free(artifact_path);
+    const manifest_path = try std.fs.path.join(allocator, &.{ base_dir, "model.hlo.inference.json" });
+    defer allocator.free(manifest_path);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = artifact_path, .data = "hlo" });
+    try compiled_artifact.writeManifest(allocator, io, manifest_path, .{
+        .backend = "xla",
+        .kind = "stablehlo",
+        .model_dir = "/tmp/model",
+        .artifact_path = artifact_path,
+        .prompt_tokens = 1,
+        .seq_len = 1,
+        .query_seq_len = 1,
+        .attention_mode = "causal",
+        .raw_prompt = true,
+        .chat_template_applied = false,
+    });
+
+    var session_manager = backends.SessionManager.init(allocator);
+    session_manager.required_backend_invalid = true;
+    var validation = try validateArtifactWithSessionManager(
+        allocator,
+        io,
+        manifest_path,
+        &session_manager,
+    );
+    defer validation.deinit(allocator);
+    try std.testing.expectEqualStrings("xla", validation.backend);
+}
+
 test "validateArtifact summarizes package manifests" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3048,7 +3129,14 @@ test "validateArtifact summarizes package manifests" {
         },
     });
 
-    var validation = try validateArtifact(allocator, io, package_path);
+    var session_manager = backends.SessionManager.init(allocator);
+    session_manager.required_backend_invalid = true;
+    var validation = try validateArtifactWithSessionManager(
+        allocator,
+        io,
+        package_path,
+        &session_manager,
+    );
     defer validation.deinit(allocator);
     try std.testing.expect(validation.is_package);
     try std.testing.expectEqualStrings("xla", validation.backend);
