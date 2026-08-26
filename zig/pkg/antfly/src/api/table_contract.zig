@@ -1029,6 +1029,25 @@ test "table contract admits and preserves multi-source index requests" {
     }
 }
 
+test "table contract enforces stable graph source identities and numeric targets" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_graph",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":\"{{ _doc.key }}\",\"target\":42}}]}",
+    );
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"target\":42") != null);
+
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_graph",
+            "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":42,\"target\":\"doc:b\"}}]}",
+        ),
+    );
+}
+
 test "table contract admits and projects explicit embedding vector space" {
     const config_json = try parseCreateIndexRequest(std.testing.allocator, "document_vectors", "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"document_dense_v1\"},{\"artifact\":\"document_chunk_dense_v1\"}],\"enrichments\":[{\"name\":\"document_chunks_v1\",\"kind\":\"chunk\",\"field\":\"semantic_content\",\"chunk_size\":512},{\"name\":\"document_dense_v1\",\"kind\":\"embedding\",\"field\":\"semantic_content\",\"expected_dims\":3,\"vector_space\":\"searchaf:v1\"},{\"name\":\"document_chunk_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"document_chunks_v1\",\"expected_dims\":3,\"vector_space\":\"searchaf:v1\"}]}");
     defer std.testing.allocator.free(config_json);

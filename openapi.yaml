@@ -18207,9 +18207,15 @@ components:
               type: string
               enum:
                 - embeddings
+    GraphMaterializedSourceTemplate:
+      type: string
+      pattern: ^\{\{\s*(_doc\.key|_artifact\.value(\..+)?)\s*\}\}$
+      description: Stable owner identity for edges materialized from one artifact item. It must resolve
+        from the source document key or the durable artifact payload so replay and deletion can deterministically
+        replace prior edges. Omit it to use the source document key.
     GraphTemplateValue:
-      description: A literal numeric value or a Handlebars template evaluated for each materialized graph
-        item.
+      description: A literal string or finite numeric value, or a Handlebars template evaluated for each
+        materialized graph item.
       anyOf:
         - type: string
         - type: number
@@ -18226,7 +18232,7 @@ components:
             - external
           default: document
         source:
-          $ref: '#/components/schemas/GraphTemplateValue'
+          $ref: '#/components/schemas/GraphMaterializedSourceTemplate'
         target:
           $ref: '#/components/schemas/GraphTemplateValue'
     GraphArtifactEdgeMappingConfig:

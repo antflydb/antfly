@@ -9290,7 +9290,9 @@ export interface components {
              */
             type: "embeddings";
         };
-        /** @description A literal numeric value or a Handlebars template evaluated for each materialized graph item. */
+        /** @description Stable owner identity for edges materialized from one artifact item. It must resolve from the source document key or the durable artifact payload so replay and deletion can deterministically replace prior edges. Omit it to use the source document key. */
+        GraphMaterializedSourceTemplate: string;
+        /** @description A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item. */
         GraphTemplateValue: string | number;
         /** @description Maps each artifact item to graph node identifiers. */
         GraphArtifactNodeMappingConfig: {
@@ -9299,7 +9301,7 @@ export interface components {
              * @enum {string}
              */
             model?: "document" | "external";
-            source?: components["schemas"]["GraphTemplateValue"];
+            source?: components["schemas"]["GraphMaterializedSourceTemplate"];
             target?: components["schemas"]["GraphTemplateValue"];
         };
         /** @description Maps each artifact item to an edge type, weight, and public metadata. */

@@ -86,7 +86,7 @@ describe("artifact embedding index configuration", () => {
       {
         artifact: "relations_v1",
         path: "$.relations[*]",
-        nodes: { source: "{{source}}", target: "{{target}}" },
+        nodes: { source: "{{ _doc.key }}", target: 42 },
         edge: { type: "{{relation}}", metadata },
         context: { doc_fields: ["title", "url"] },
       },
@@ -94,6 +94,7 @@ describe("artifact embedding index configuration", () => {
     );
     metadata.nested.score = 2;
     expect(sources[0]?.edge?.metadata).toEqual({ origin: "extractor", nested: { score: 1 } });
+    expect(sources[0]?.nodes?.target).toBe(42);
     expect(sources[1]?.format).toBe("extraction_graph");
   });
 
@@ -107,6 +108,12 @@ describe("artifact embedding index configuration", () => {
     expect(() => graphIndexSources({ artifact: "relations", path: "$.relations[0]" })).toThrow(
       /path/
     );
+    expect(() =>
+      graphIndexSources({ artifact: "relations", nodes: { source: "{{ source }}" } })
+    ).toThrow(/nodes.source/);
+    expect(() =>
+      graphIndexSources({ artifact: "relations", nodes: { target: Number.POSITIVE_INFINITY } })
+    ).toThrow(/nodes.target/);
     expect(() =>
       graphIndexSources({ artifact: "relations", edge: { type: true } } as never)
     ).toThrow(/string or finite number/);

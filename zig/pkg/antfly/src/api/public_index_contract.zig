@@ -384,6 +384,7 @@ fn graphNodeMappingFieldValueMatches(field: []const u8, value: std.json.Value) b
         return value == .string and
             (std.mem.eql(u8, value.string, "document") or std.mem.eql(u8, value.string, "external"));
     }
+    if (std.mem.eql(u8, field, "source")) return isString(value);
     return isString(value) or isNumber(value);
 }
 

@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 MAX_ARTIFACT_SOURCES = 64
 _GRAPH_ARTIFACT_PATH = re.compile(r"^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$")
+_GRAPH_MATERIALIZED_SOURCE = re.compile(r"^\{\{\s*(_doc\.key|_artifact\.value(?:\..+)?)\s*\}\}$")
 
 
 def _validate_artifacts(artifacts: Sequence[object]) -> None:
@@ -87,7 +88,7 @@ class GraphNodeMapping:
 
     model: GraphNodeModel = "document"
     source: str | None = None
-    target: str | None = None
+    target: str | int | float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +132,17 @@ def graph_index_sources(*sources: GraphArtifactSource) -> list[dict[str, Any]]:
             raise ValueError(f"sources[{index}].format is invalid")
         if source.nodes is not None and source.nodes.model not in ("document", "external"):
             raise ValueError(f"sources[{index}].nodes.model is invalid")
+        if source.nodes is not None:
+            if source.nodes.source is not None and (
+                not isinstance(source.nodes.source, str)
+                or _GRAPH_MATERIALIZED_SOURCE.fullmatch(source.nodes.source) is None
+            ):
+                raise ValueError(f"sources[{index}].nodes.source must use _doc.key or _artifact.value")
+            target = source.nodes.target
+            if target is not None and (isinstance(target, bool) or not isinstance(target, (str, int, float))):
+                raise ValueError(f"sources[{index}].nodes.target must be a string or number")
+            if isinstance(target, (int, float)) and not isinstance(target, bool) and not isfinite(target):
+                raise ValueError(f"sources[{index}].nodes.target must be finite")
         if source.edge is not None:
             for field_name, value in (("type", source.edge.type), ("weight", source.edge.weight)):
                 if value is not None and (isinstance(value, bool) or not isinstance(value, (str, int, float))):

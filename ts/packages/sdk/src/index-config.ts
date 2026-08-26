@@ -25,6 +25,19 @@ function validateOptionalString(value: unknown, path: string): asserts value is 
   }
 }
 
+function isGraphMaterializedSourceTemplate(value: string): boolean {
+  const expression = value
+    .trim()
+    .match(/^\{\{\s*(.*?)\s*\}\}$/)?.[1]
+    ?.trim();
+  return (
+    expression === "_doc.key" ||
+    expression === "_artifact.value" ||
+    (expression?.startsWith("_artifact.value.") === true &&
+      expression.length > "_artifact.value.".length)
+  );
+}
+
 function validateOnlyKeys(
   value: Record<string, unknown>,
   allowed: readonly string[],
@@ -165,10 +178,14 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
       if (!isRecord(source.edge)) throw new TypeError(`sources[${index}].edge must be an object`);
       validateOnlyKeys(source.edge, ["type", "weight", "metadata"], `sources[${index}].edge`);
     }
-    for (const [fieldName, value] of [
-      ["source", source.nodes?.source],
-      ["target", source.nodes?.target],
-    ] as const) {
+    if (
+      source.nodes?.source !== undefined &&
+      (typeof source.nodes.source !== "string" ||
+        !isGraphMaterializedSourceTemplate(source.nodes.source))
+    ) {
+      throw new TypeError(`sources[${index}].nodes.source must use _doc.key or _artifact.value`);
+    }
+    for (const [fieldName, value] of [["target", source.nodes?.target]] as const) {
       if (
         value !== undefined &&
         typeof value !== "string" &&

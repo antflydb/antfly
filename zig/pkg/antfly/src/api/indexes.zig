@@ -979,7 +979,7 @@ fn appendPublicIndexConfig(
         }
     } else if (single_graph_source) |source| {
         try out.appendSlice(alloc, ",\"sources\":");
-        try appendCanonicalSingleGraphSource(alloc, out, source);
+        try appendCanonicalSingleGraphSource(alloc, out, config, source);
     } else if (single_embedding_artifact) |artifact| {
         try out.appendSlice(alloc, ",\"sources\":[{\"artifact\":");
         try appendJsonString(alloc, out, artifact.string);
@@ -995,6 +995,13 @@ fn appendPublicIndexConfig(
         if (single_embedding_artifact != null and
             (std.mem.eql(u8, entry.key_ptr.*, "embedding_name") or
                 std.mem.eql(u8, entry.key_ptr.*, "source_artifact_name"))) continue;
+        if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "artifact") and
+            isV0_2_0GraphShorthandArtifact(entry.value_ptr.*))
+        {
+            try out.appendSlice(alloc, ",\"artifact\":");
+            try appendCanonicalV0_2_0GraphShorthandArtifact(alloc, out, entry.value_ptr.*);
+            continue;
+        }
         if (!public_index_contract.isAllowedConfigField(index_type, entry.key_ptr.*)) continue;
         if (public_index_contract.isWriteOnlyConfigField(entry.key_ptr.*)) continue;
         if (isSensitivePublicConfigField(entry.key_ptr.*)) continue;
@@ -1023,6 +1030,7 @@ fn appendPublicIndexConfig(
 fn appendCanonicalSingleGraphSource(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
+    config: std.json.Value,
     source: std.json.Value,
 ) !void {
     try out.appendSlice(alloc, "[{");
@@ -1039,7 +1047,74 @@ fn appendCanonicalSingleGraphSource(
         try out.append(alloc, ':');
         try appendPublicConfigValue(alloc, out, entry.value_ptr.*, entry.key_ptr.*, child_shape);
     }
+    const v0_2_0_kind = source.object.get("kind");
+    if (v0_2_0_kind != null and v0_2_0_kind.? == .string and
+        std.mem.eql(u8, v0_2_0_kind.?.string, "artifact"))
+    {
+        for ([_][]const u8{ "nodes", "edge", "context" }) |field| {
+            const value = config.object.get(field) orelse continue;
+            if (!public_index_contract.createdFieldValueMatches(.graph_source, field, value)) continue;
+            const child_shape = public_index_contract.createdObjectShapeForChild(.graph_source, field);
+            if (!public_index_contract.createdValueMatchesShape(child_shape, value)) continue;
+            if (!first) try out.append(alloc, ',');
+            first = false;
+            try appendJsonString(alloc, out, field);
+            try out.append(alloc, ':');
+            try appendPublicConfigValue(alloc, out, value, field, child_shape);
+        }
+    }
     try out.appendSlice(alloc, "}]");
+}
+
+fn isV0_2_0GraphShorthandArtifact(value: std.json.Value) bool {
+    if (value != .object or value.object.get("source") != null) return false;
+    return value.object.get("field") != null or value.object.get("template") != null;
+}
+
+fn appendCanonicalV0_2_0GraphShorthandArtifact(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    artifact: std.json.Value,
+) !void {
+    try out.append(alloc, '{');
+    var first = true;
+    for ([_][]const u8{ "name", "kind" }) |field| {
+        const value = artifact.object.get(field) orelse continue;
+        if (value != .string or value.string.len == 0) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, out, field);
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, value.string);
+    }
+    const template = artifact.object.get("template");
+    const field = artifact.object.get("field");
+    const selected_kind: []const u8 = if (template != null and template.? == .string and template.?.string.len > 0)
+        "template"
+    else if (field != null and field.? == .string and field.?.string.len > 0)
+        "field"
+    else
+        return error.InvalidTableIndexMetadata;
+    const selected_value = if (std.mem.eql(u8, selected_kind, "template")) template.? else field.?;
+    if (!first) try out.append(alloc, ',');
+    first = false;
+    try out.appendSlice(alloc, "\"source\":{\"type\":");
+    try appendJsonString(alloc, out, selected_kind);
+    try out.appendSlice(alloc, ",\"value\":");
+    try appendJsonString(alloc, out, selected_value.string);
+    try out.append(alloc, '}');
+    for ([_][]const u8{ "content_type", "execution" }) |optional_field| {
+        const value = artifact.object.get(optional_field) orelse continue;
+        const child_shape = public_index_contract.createdObjectShapeForChild(.graph_artifact, optional_field);
+        if (!public_index_contract.createdFieldValueMatches(.graph_artifact, optional_field, value) or
+            !public_index_contract.createdValueMatchesShape(child_shape, value)) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, out, optional_field);
+        try out.append(alloc, ':');
+        try appendPublicConfigValue(alloc, out, value, optional_field, child_shape);
+    }
+    try out.append(alloc, '}');
 }
 
 fn isSensitivePublicConfigField(field: []const u8) bool {
@@ -4652,11 +4727,23 @@ test "created index configs normalize single-source input forms" {
         graph,
     );
 
+    const v0_2_0_graph = try encodeCreatedIndexConfig(
+        std.testing.allocator,
+        "relations",
+        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"nodes\":{\"source\":\"{{ _doc.key }}\",\"target\":42},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"template\":\"{{ body }}\",\"producer_json\":{\"api_key\":\"secret\"}}}",
+    );
+    defer std.testing.allocator.free(v0_2_0_graph);
+    try ant_json.testing.expectEqualJsonText(
+        std.testing.allocator,
+        "{\"name\":\"relations\",\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":\"{{ _doc.key }}\",\"target\":42}}],\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"template\",\"value\":\"{{ body }}\"}}}",
+        v0_2_0_graph,
+    );
+
     const embeddings = try encodeCreatedIndexConfig(std.testing.allocator, "vectors", "{\"type\":\"embeddings\",\"dimension\":3,\"embedding_name\":\"body_dense_v1\",\"source_artifact_name\":\"body_chunks_v1\"}");
     defer std.testing.allocator.free(embeddings);
     try ant_json.testing.expectEqualJsonText(
         std.testing.allocator,
-        "{\"name\":\"vectors\",\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"body_dense_v1\"}],\"dimension\":3}",
+        "{\"name\":\"vectors\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"sources\":[{\"artifact\":\"body_dense_v1\"}],\"dimension\":3}",
         embeddings,
     );
 }

@@ -153,10 +153,7 @@ func TestNewCreateIndexRequestPreservesCanonicalGraphMappingPayload(t *testing.T
 }
 
 func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
-	var source, target, edgeType, weight GraphTemplateValue
-	if err := source.FromGraphTemplateValue0("{{ _doc.key }}"); err != nil {
-		t.Fatalf("set source template: %v", err)
-	}
+	var target, edgeType, weight GraphTemplateValue
 	if err := target.FromGraphTemplateValue0("{{ _item.target.text }}"); err != nil {
 		t.Fatalf("set target template: %v", err)
 	}
@@ -173,7 +170,7 @@ func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
 			Format:   GraphArtifactSourceConfigFormatExtractionGraph,
 			Nodes: GraphArtifactNodeMappingConfig{
 				Model:  GraphArtifactNodeMappingConfigModelDocument,
-				Source: source,
+				Source: "{{ _doc.key }}",
 				Target: target,
 			},
 			Edge: GraphArtifactEdgeMappingConfig{
@@ -406,6 +403,12 @@ func TestNewGraphIndexSourcesValidatesAndCopies(t *testing.T) {
 	}
 	if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{Artifact: "relations", Path: "$.relations[0]"}); err == nil {
 		t.Fatal("unsupported graph artifact paths must be rejected")
+	}
+	if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{
+		Artifact: "relations",
+		Nodes:    GraphArtifactNodeMappingConfig{Source: "{{ source }}"},
+	}); err == nil {
+		t.Fatal("unstable graph source identities must be rejected")
 	}
 }
 

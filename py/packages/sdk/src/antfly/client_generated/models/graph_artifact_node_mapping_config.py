@@ -17,14 +17,15 @@ class GraphArtifactNodeMappingConfig:
 
     Attributes:
         model (GraphArtifactNodeMappingConfigModel | Unset):  Default: GraphArtifactNodeMappingConfigModel.DOCUMENT.
-        source (float | str | Unset): A literal numeric value or a Handlebars template evaluated for each materialized
-            graph item.
-        target (float | str | Unset): A literal numeric value or a Handlebars template evaluated for each materialized
-            graph item.
+        source (str | Unset): Stable owner identity for edges materialized from one artifact item. It must resolve from
+            the source document key or the durable artifact payload so replay and deletion can deterministically replace
+            prior edges. Omit it to use the source document key.
+        target (float | str | Unset): A literal string or finite numeric value, or a Handlebars template evaluated for
+            each materialized graph item.
     """
 
     model: GraphArtifactNodeMappingConfigModel | Unset = GraphArtifactNodeMappingConfigModel.DOCUMENT
-    source: float | str | Unset = UNSET
+    source: str | Unset = UNSET
     target: float | str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
@@ -32,11 +33,7 @@ class GraphArtifactNodeMappingConfig:
         if not isinstance(self.model, Unset):
             model = self.model.value
 
-        source: float | str | Unset
-        if isinstance(self.source, Unset):
-            source = UNSET
-        else:
-            source = self.source
+        source = self.source
 
         target: float | str | Unset
         if isinstance(self.target, Unset):
@@ -66,12 +63,7 @@ class GraphArtifactNodeMappingConfig:
         else:
             model = GraphArtifactNodeMappingConfigModel(_model)
 
-        def _parse_source(data: object) -> float | str | Unset:
-            if isinstance(data, Unset):
-                return data
-            return cast(float | str | Unset, data)
-
-        source = _parse_source(d.pop("source", UNSET))
+        source = d.pop("source", UNSET)
 
         def _parse_target(data: object) -> float | str | Unset:
             if isinstance(data, Unset):

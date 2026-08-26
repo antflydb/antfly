@@ -1230,7 +1230,7 @@ pub const GraphArtifactEdgeMappingConfig = struct {
 /// Maps each artifact item to graph node identifiers.
 pub const GraphArtifactNodeMappingConfig = struct {
     model: ?[]const u8 = null,
-    source: ?GraphTemplateValue = null,
+    source: ?GraphMaterializedSourceTemplate = null,
     target: ?GraphTemplateValue = null,
 };
 
@@ -1387,6 +1387,9 @@ pub const GraphIndexStats = struct {
     /// Algebraic graph execution health for bounded semiring traversal.
     algebraic_graph: ?std.json.Value = null,
 };
+
+/// Stable owner identity for edges materialized from one artifact item. It must resolve from the source document key or the durable artifact payload so replay and deletion can deterministically replace prior edges. Omit it to use the source document key.
+pub const GraphMaterializedSourceTemplate = []const u8;
 
 /// Defines how to select start/target nodes for graph queries
 pub const GraphNodeSelector = struct {
@@ -1555,7 +1558,7 @@ pub const GraphSourceArtifactStatus = struct {
     format: []const u8,
 };
 
-/// A literal numeric value or a Handlebars template evaluated for each materialized graph item.
+/// A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item.
 pub const GraphTemplateValue = std.json.Value;
 
 /// Configuration for an index

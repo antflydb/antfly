@@ -395,6 +395,9 @@ func NewGraphIndexSources(sources ...GraphArtifactSourceConfig) ([]GraphArtifact
 		if source.Nodes.Model != "" && source.Nodes.Model != GraphArtifactNodeMappingConfigModelDocument && source.Nodes.Model != GraphArtifactNodeMappingConfigModelExternal {
 			return nil, fmt.Errorf("sources[%d].nodes.model is invalid", i)
 		}
+		if source.Nodes.Source != "" && !validGraphMaterializedSourceTemplate(source.Nodes.Source) {
+			return nil, fmt.Errorf("sources[%d].nodes.source must use _doc.key or _artifact.value", i)
+		}
 		fields := append([]string(nil), source.Context.DocFields...)
 		fieldSet := make(map[string]struct{}, len(fields))
 		for j, field := range fields {
@@ -421,6 +424,16 @@ func NewGraphIndexSources(sources ...GraphArtifactSourceConfig) ([]GraphArtifact
 		seen[source.Artifact] = struct{}{}
 	}
 	return result, nil
+}
+
+func validGraphMaterializedSourceTemplate(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if !strings.HasPrefix(trimmed, "{{") || !strings.HasSuffix(trimmed, "}}") {
+		return false
+	}
+	expression := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "{{"), "}}"))
+	return expression == "_doc.key" || expression == "_artifact.value" ||
+		(strings.HasPrefix(expression, "_artifact.value.") && len(expression) > len("_artifact.value."))
 }
 
 func validGraphArtifactPath(path string) bool {

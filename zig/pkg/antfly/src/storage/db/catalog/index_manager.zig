@@ -19648,7 +19648,13 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
     if (root.object.get("execution") != null) return error.InvalidIndexConfig;
-    if (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null)
+    // v0.2.0 stored the artifact-source discriminator inside `source` while
+    // keeping mapping fields at the index root. Keep accepting that durable
+    // catalog shape, but do not let root mappings leak into the canonical
+    // untagged API or the ordered `sources` form.
+    const v0_2_0_tagged_artifact_source = graphSourceHasV0_2_0Kind(root, "artifact");
+    if (!v0_2_0_tagged_artifact_source and
+        (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null))
         return error.InvalidIndexConfig;
     if (root.object.get("sources") != null and root.object.get("source") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
@@ -19809,8 +19815,21 @@ fn initGraphArtifactSource(
 fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtifactSource {
     const source = root.object.get("source") orelse return null;
     if (source != .object) return error.InvalidIndexConfig;
-    if (!objectHasOnlyFields(source.object, &.{ "artifact", "path", "format", "mention_edge_type", "nodes", "edge", "context" })) return error.InvalidIndexConfig;
-    if (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null) return error.InvalidIndexConfig;
+    const v0_2_0_kind = source.object.get("kind");
+    if (v0_2_0_kind) |kind| {
+        if (kind != .string) return error.InvalidIndexConfig;
+        if (std.mem.eql(u8, kind.string, "document_field")) {
+            if (!objectHasOnlyFields(source.object, &.{ "kind", "field" })) return error.InvalidIndexConfig;
+            const field = source.object.get("field") orelse return error.InvalidIndexConfig;
+            if (field != .string or !std.mem.eql(u8, field.string, "_edges")) return error.InvalidIndexConfig;
+            return null;
+        }
+        if (!std.mem.eql(u8, kind.string, "artifact")) return error.InvalidIndexConfig;
+        if (!objectHasOnlyFields(source.object, &.{ "kind", "artifact", "path", "format", "mention_edge_type" })) return error.InvalidIndexConfig;
+    } else {
+        if (!objectHasOnlyFields(source.object, &.{ "artifact", "path", "format", "mention_edge_type", "nodes", "edge", "context" })) return error.InvalidIndexConfig;
+        if (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null) return error.InvalidIndexConfig;
+    }
 
     const artifact = source.object.get("artifact") orelse return error.InvalidIndexConfig;
     if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
@@ -19838,8 +19857,16 @@ fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtif
         .mention_edge_type = if (mention_edge_type.len > 0) try alloc.dupe(u8, mention_edge_type) else "",
     };
     errdefer out.deinit(alloc);
-    out.mapping = try parseGraphArtifactMapping(alloc, source);
+    out.mapping = try parseGraphArtifactMapping(alloc, if (v0_2_0_kind != null) root else source);
     return out;
+}
+
+fn graphSourceHasV0_2_0Kind(root: std.json.Value, expected_kind: []const u8) bool {
+    if (root != .object) return false;
+    const source = root.object.get("source") orelse return false;
+    if (source != .object) return false;
+    const kind = source.object.get("kind") orelse return false;
+    return kind == .string and std.mem.eql(u8, kind.string, expected_kind);
 }
 
 fn validateGraphArtifactPath(path: []const u8) !void {
@@ -19937,7 +19964,7 @@ fn validateGraphMaterializedSourceTemplate(template_source: []const u8) !void {
     const expr = std.mem.trim(u8, trimmed[2 .. trimmed.len - 2], &std.ascii.whitespace);
     if (std.mem.eql(u8, expr, "_doc.key")) return;
     if (std.mem.eql(u8, expr, "_artifact.value")) return;
-    if (std.mem.startsWith(u8, expr, "_artifact.value.")) return;
+    if (std.mem.startsWith(u8, expr, "_artifact.value.") and expr.len > "_artifact.value.".len) return;
     return error.InvalidIndexConfig;
 }
 
@@ -19973,21 +20000,37 @@ fn parseGraphShorthandAsset(alloc: Allocator, root: std.json.Value) !?enrichment
     const kind = artifact.object.get("kind") orelse return error.InvalidIndexConfig;
     if (kind != .string or !std.mem.eql(u8, kind.string, "asset")) return error.InvalidIndexConfig;
 
-    const source = artifact.object.get("source") orelse return error.InvalidIndexConfig;
-    if (source != .object) return error.InvalidIndexConfig;
-    const source_type = source.object.get("type") orelse return error.InvalidIndexConfig;
-    const source_value = source.object.get("value") orelse return error.InvalidIndexConfig;
-    if (source_type != .string or source_value != .string or source_value.string.len == 0)
-        return error.InvalidIndexConfig;
-
     var field: []const u8 = "";
     var template: []const u8 = "";
-    if (std.mem.eql(u8, source_type.string, "field")) {
-        field = source_value.string;
-    } else if (std.mem.eql(u8, source_type.string, "template")) {
-        template = source_value.string;
+    if (artifact.object.get("source")) |source| {
+        // The canonical shape is deliberately closed. The v0.2.0 `field` and
+        // `template` alternatives below are only for already-durable configs.
+        if (artifact.object.get("field") != null or artifact.object.get("template") != null) return error.InvalidIndexConfig;
+        if (source != .object or !objectHasOnlyFields(source.object, &.{ "type", "value" })) return error.InvalidIndexConfig;
+        const source_type = source.object.get("type") orelse return error.InvalidIndexConfig;
+        const source_value = source.object.get("value") orelse return error.InvalidIndexConfig;
+        if (source_type != .string or source_value != .string or source_value.string.len == 0)
+            return error.InvalidIndexConfig;
+        if (std.mem.eql(u8, source_type.string, "field")) {
+            field = source_value.string;
+        } else if (std.mem.eql(u8, source_type.string, "template")) {
+            template = source_value.string;
+        } else {
+            return error.InvalidIndexConfig;
+        }
     } else {
-        return error.InvalidIndexConfig;
+        const v0_2_0_field = artifact.object.get("field");
+        const v0_2_0_template = artifact.object.get("template");
+        if (v0_2_0_field == null and v0_2_0_template == null) return error.InvalidIndexConfig;
+        if (v0_2_0_field) |value| {
+            if (value != .string) return error.InvalidIndexConfig;
+            field = value.string;
+        }
+        if (v0_2_0_template) |value| {
+            if (value != .string) return error.InvalidIndexConfig;
+            template = value.string;
+        }
+        if (field.len == 0 and template.len == 0) return error.InvalidIndexConfig;
     }
     const content_type = if (artifact.object.get("content_type")) |value| blk: {
         if (value != .string) return error.InvalidIndexConfig;
@@ -20213,17 +20256,47 @@ test "graph config rejects artifact source combined with document field edge typ
     ));
 }
 
-test "graph config rejects removed source discriminator forms" {
+test "graph config loads v0.2.0 source discriminator forms" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+    var document_field = try parseGraphConfig(alloc,
         \\{"source":{"kind":"document_field","field":"_edges"}}
-    ));
+    );
+    defer document_field.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), document_field.artifact_sources.len);
+
+    var artifact = try parseGraphConfig(alloc,
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"nodes":{"source":"{{ _doc.key }}","target":"{{ _item.target }}"},"edge":{"type":"{{ _item.type }}"}}
+    );
+    defer artifact.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), artifact.artifact_sources.len);
+    try std.testing.expectEqualStrings("relations_v1", artifact.artifact_sources[0].artifact_name);
+    try std.testing.expectEqualStrings("{{ _doc.key }}", artifact.artifact_sources[0].mapping.source_template);
+    try std.testing.expectEqualStrings("{{ _item.target }}", artifact.artifact_sources[0].mapping.target_template);
+
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"document_field"}}
     ));
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"document_field","field":"links"}}
     ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"kind":"artifact","artifact":"relations_v1","nodes":{"target":"{{ _item.target }}"}}}
+    ));
+}
+
+test "graph config loads v0.2.0 shorthand artifact producers" {
+    const alloc = std.testing.allocator;
+    var field_cfg = try parseGraphConfig(alloc,
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json"}}
+    );
+    defer field_cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("body", field_cfg.shorthand_asset.?.source_field);
+
+    var template_cfg = try parseGraphConfig(alloc,
+        \\{"source":{"kind":"artifact","artifact":"relations_v1"},"artifact":{"name":"relations_v1","kind":"asset","template":"{{ body }}"}}
+    );
+    defer template_cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("{{ body }}", template_cfg.shorthand_asset.?.source_template);
 }
 
 fn parseMetric(raw: []const u8) !vector_mod.DistanceMetric {

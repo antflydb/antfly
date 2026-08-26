@@ -137,14 +137,14 @@ pub struct GraphIndexSourceSpec {
     pub context: Option<GraphContextMappingSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphNodeMappingSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<GraphNodeModel>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
+    pub target: Option<GraphTemplateOrNumber>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,6 +195,22 @@ pub fn graph_index_sources(
                 "sources[{source_index}].path must be $, a dot-separated field path, or end in [*]"
             )));
         }
+        if let Some(nodes) = source.nodes.as_ref() {
+            if let Some(source_template) = nodes.source.as_deref()
+                && !valid_graph_materialized_source_template(source_template)
+            {
+                return Err(IndexConfigError(format!(
+                    "sources[{source_index}].nodes.source must use _doc.key or _artifact.value"
+                )));
+            }
+            if let Some(GraphTemplateOrNumber::Number(value)) = nodes.target.as_ref()
+                && !value.is_finite()
+            {
+                return Err(IndexConfigError(format!(
+                    "sources[{source_index}].nodes.target must be finite"
+                )));
+            }
+        }
         if let Some(edge) = source.edge.as_ref() {
             for (field_name, value) in [
                 ("type", edge.edge_type.as_ref()),
@@ -227,6 +243,21 @@ pub fn graph_index_sources(
         }
     }
     Ok(sources)
+}
+
+fn valid_graph_materialized_source_template(value: &str) -> bool {
+    let trimmed = value.trim();
+    let Some(expression) = trimmed
+        .strip_prefix("{{")
+        .and_then(|value| value.strip_suffix("}}"))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    expression == "_doc.key"
+        || expression == "_artifact.value"
+        || (expression.starts_with("_artifact.value.")
+            && expression.len() > "_artifact.value.".len())
 }
 
 fn valid_graph_artifact_path(path: &str) -> bool {
@@ -547,9 +578,10 @@ mod tests {
     use super::{
         ArtifactEmbeddingIndexOptions, ArtifactEmbeddingSourceSpec, ArtifactFullTextIndexOptions,
         GraphArtifactFormat, GraphContextMappingSpec, GraphEdgeMappingSpec, GraphIndexSourceSpec,
-        GraphTemplateOrNumber, antfly_embedder, artifact_embedding_index_config,
-        artifact_full_text_index_config, artifact_full_text_index_config_with_options,
-        graph_index_sources, normalize_base_url, types,
+        GraphNodeMappingSpec, GraphNodeModel, GraphTemplateOrNumber, antfly_embedder,
+        artifact_embedding_index_config, artifact_full_text_index_config,
+        artifact_full_text_index_config_with_options, graph_index_sources, normalize_base_url,
+        types,
     };
 
     #[test]
@@ -640,7 +672,11 @@ mod tests {
             path: Some("$.relations[*]".into()),
             format: Some(GraphArtifactFormat::ExtractionRelation),
             mention_edge_type: None,
-            nodes: None,
+            nodes: Some(GraphNodeMappingSpec {
+                model: Some(GraphNodeModel::Document),
+                source: Some("{{ _doc.key }}".into()),
+                target: Some(GraphTemplateOrNumber::Number(42.0)),
+            }),
             edge: Some(GraphEdgeMappingSpec {
                 edge_type: Some(GraphTemplateOrNumber::Template("{{ _item.type }}".into())),
                 weight: Some(GraphTemplateOrNumber::Number(0.8)),
@@ -652,6 +688,13 @@ mod tests {
         }])
         .expect("valid graph source");
         assert_eq!(sources[0].path.as_deref(), Some("$.relations[*]"));
+        assert_eq!(
+            sources[0]
+                .nodes
+                .as_ref()
+                .and_then(|nodes| nodes.target.as_ref()),
+            Some(&GraphTemplateOrNumber::Number(42.0))
+        );
 
         let duplicate = GraphIndexSourceSpec {
             artifact: "same".into(),
@@ -662,7 +705,7 @@ mod tests {
             edge: None,
             context: None,
         };
-        assert!(graph_index_sources(vec![duplicate.clone(), duplicate]).is_err());
+        assert!(graph_index_sources(vec![duplicate.clone(), duplicate.clone()]).is_err());
         assert!(
             graph_index_sources(vec![GraphIndexSourceSpec {
                 artifact: "relations".into(),
@@ -675,6 +718,14 @@ mod tests {
             }])
             .is_err()
         );
+        let mut invalid_source = duplicate;
+        invalid_source.artifact = "relations".into();
+        invalid_source.nodes = Some(GraphNodeMappingSpec {
+            model: None,
+            source: Some("{{ source }}".into()),
+            target: None,
+        });
+        assert!(graph_index_sources(vec![invalid_source]).is_err());
     }
 
     #[test]
