@@ -908,6 +908,43 @@ fn replaceOwnedU64Slice(alloc: std.mem.Allocator, target: *[]u64, replacement: *
     replacement.* = null;
 }
 
+fn removeUniqueChildLinkAlloc(
+    alloc: std.mem.Allocator,
+    children: []const u64,
+    child_id: u64,
+) !?[]u64 {
+    var match_count: usize = 0;
+    for (children) |cid| {
+        if (cid == child_id) match_count += 1;
+    }
+    // A merge is safe only when the recorded parent owns exactly one link to
+    // the leaf. Zero links are a stale parent pointer; duplicate links are
+    // tree corruption. In either case, leave both postings untouched for the
+    // tree-link repair sweep instead of sizing a len-1 array incorrectly.
+    if (match_count != 1) return null;
+
+    const replacement = try alloc.alloc(u64, children.len - 1);
+    errdefer alloc.free(replacement);
+    var wi: usize = 0;
+    for (children) |cid| {
+        if (cid == child_id) continue;
+        replacement[wi] = cid;
+        wi += 1;
+    }
+    std.debug.assert(wi == replacement.len);
+    return replacement;
+}
+
+fn noteTreeLinkInconsistencyIfSupported(self: anytype) void {
+    const Index = comptime switch (@typeInfo(@TypeOf(self))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(self),
+    };
+    if (comptime @hasDecl(Index, "noteTreeLinkInconsistency")) {
+        self.noteTreeLinkInconsistency();
+    }
+}
+
 fn mergeUnderfullPostingWithNearestSibling(
     self: anytype,
     txn: anytype,
@@ -919,6 +956,17 @@ fn mergeUnderfullPostingWithNearestSibling(
     var parent = try self.loadNode(txn, leaf.parent);
     defer parent.deinit(self.alloc);
     try parent.ensureUnbacked(self.alloc);
+
+    var new_children: ?[]u64 = try removeUniqueChildLinkAlloc(self.alloc, parent.children, leaf.id);
+    defer if (new_children) |owned| self.alloc.free(owned);
+    if (new_children == null) {
+        std.log.warn(
+            "hbc: underfull leaf {d} is not uniquely linked by recorded parent {d}; skipping merge",
+            .{ leaf.id, leaf.parent },
+        );
+        noteTreeLinkInconsistencyIfSupported(self);
+        return false;
+    }
 
     var best_sibling_id: u64 = 0;
     var best_dist: f32 = std.math.inf(f32);
@@ -958,14 +1006,6 @@ fn mergeUnderfullPostingWithNearestSibling(
 
     for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
-    var new_children: ?[]u64 = try self.alloc.alloc(u64, parent.children.len - 1);
-    errdefer if (new_children) |owned| self.alloc.free(owned);
-    var wi_child: usize = 0;
-    for (parent.children) |cid| {
-        if (cid == leaf.id) continue;
-        new_children.?[wi_child] = cid;
-        wi_child += 1;
-    }
     replaceOwnedU64Slice(self.alloc, &parent.children, &new_children);
     try self.recomputeInternalCentroid(txn, &parent);
     try self.saveNodeWithOptionsMode(txn, &parent, save_options, false);
@@ -1263,6 +1303,18 @@ test "owned slice replacement survives later error cleanup" {
     };
 
     try std.testing.expectError(error.InjectedFailure, Runner.run(std.testing.allocator));
+}
+
+test "underfull merge child unlink requires exactly one parent link" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect((try removeUniqueChildLinkAlloc(alloc, &.{ 2, 3, 4 }, 9)) == null);
+    try std.testing.expect((try removeUniqueChildLinkAlloc(alloc, &.{ 2, 3, 2 }, 2)) == null);
+
+    const replacement = (try removeUniqueChildLinkAlloc(alloc, &.{ 2, 3, 4 }, 3)) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(replacement);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 4 }, replacement);
 }
 
 test "posting backlog stats starts clean" {

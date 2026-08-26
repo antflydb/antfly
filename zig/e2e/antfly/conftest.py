@@ -2145,6 +2145,14 @@ def slow_openai_embedder():
 
 
 @pytest.fixture(scope="function")
+def progressive_openai_embedder():
+    """Keep initial backfill observable without making the E2E minutes long."""
+    server = OpenAiEmbeddingServer(response_delay_s=0.05)
+    yield server.url
+    server.stop()
+
+
+@pytest.fixture(scope="function")
 def rate_limited_openai_embedder():
     server = RateLimitedOpenAiEmbeddingServer()
     yield server

@@ -209,6 +209,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+    publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
@@ -367,6 +368,7 @@ pub const CreatedEmbeddingsIndex = struct {
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const CreatedEnrichmentConfig = null,
+    publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
     external: ?bool = null,
     sparse: ?bool = null,
@@ -389,6 +391,7 @@ pub const CreatedEmbeddingsIndex = struct {
 
 /// Credential-free normalized embeddings configuration returned after creation.
 pub const CreatedEmbeddingsIndexConfig = struct {
+    publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
     external: ?bool = null,
     sparse: ?bool = null,
@@ -810,6 +813,7 @@ pub const EdgeTypeConfig = struct {
 
 /// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
+    publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
@@ -1527,6 +1531,7 @@ pub const IndexConfig = struct {
     field: ?[]const u8 = null,
     /// Generated artifact stream indexed as text. Use with matching inline enrichments.
     artifact_name: ?[]const u8 = null,
+    publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
@@ -1598,6 +1603,10 @@ pub const IndexConfig = struct {
         }
         if (self.artifact_name) |value| {
             try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        if (self.publication_policy) |value| {
+            try jw.objectField("publication_policy");
             try jw.write(value);
         }
         if (self.coverage_policy) |value| {
@@ -1712,15 +1721,43 @@ pub const IndexExecutionConfig = struct {
     embedding: ?ExecutionPolicy = null,
 };
 
-/// Authoritative query-readiness state for the desired index incarnation.
+/// Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
+pub const IndexPublicationPolicy = enum {
+    progressive,
+    atomic,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .progressive => "progressive",
+            .atomic => "atomic",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "progressive", .progressive },
+            .{ "atomic", .atomic },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Authoritative query-readiness and completeness state for the desired index incarnation.
 pub const IndexReadinessState = enum {
     pending,
+    queryable_partial,
     ready,
     failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .pending => "pending",
+            .queryable_partial => "queryable_partial",
             .ready => "ready",
             .failed => "failed",
         };
@@ -1734,6 +1771,7 @@ pub const IndexReadinessState = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "pending", .pending },
+            .{ "queryable_partial", .queryable_partial },
             .{ "ready", .ready },
             .{ "failed", .failed },
         });
@@ -1743,6 +1781,10 @@ pub const IndexReadinessState = enum {
 
 pub const IndexReadinessStatus = struct {
     state: IndexReadinessState,
+    /// Whether the published generation can safely answer queries.
+    queryable: bool,
+    /// Whether the desired incarnation has complete coverage and publication according to its configured policies.
+    complete: bool,
     /// Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
     /// Highest captured source/replay revision required by this readiness observation.
