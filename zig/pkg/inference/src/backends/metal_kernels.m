@@ -1623,12 +1623,24 @@ typedef struct termite_metal_decode_runtime {
     uint64_t moe_slot_route_hit_count;
     uint64_t moe_slot_route_miss_count;
     uint64_t moe_slot_all_hit_layer_count;
+    uint64_t moe_slot_map_publication_attempt_count;
+    uint64_t moe_slot_map_publication_success_count;
+    uint64_t moe_slot_arena_attempt_count;
+    uint64_t moe_slot_arena_success_count;
+    uint64_t moe_slot_upload_batch_count;
+    uint64_t moe_slot_upload_count;
+    uint64_t moe_slot_upload_bytes;
+    uint64_t moe_checkpoint_attempt_count;
+    uint64_t moe_checkpoint_all_hit_token_count;
+    uint64_t moe_checkpoint_miss_token_count;
+    uint64_t moe_checkpoint_replay_count;
     uint64_t mapped_moe_split_gate_up_dispatches;
     uint64_t mapped_moe_fused_gate_up_dispatches;
     uint64_t mapped_moe_down_dispatches;
     uint64_t mapped_moe_reduce_dispatches;
     uint64_t mapped_moe_broadcast_dispatches;
     uint8_t a4b_specialized_id_reported;
+    uint8_t a4b_selected_page_moe_reported;
     uint8_t a4b_route_select_tg_reported;
     uint8_t a4b_lm_head_nbodd_reported;
     uint8_t a4b_argmax_tg_reported;
@@ -2383,6 +2395,17 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t moe_slot_route_hit_count;
     uint64_t moe_slot_route_miss_count;
     uint64_t moe_slot_all_hit_layer_count;
+    uint64_t moe_slot_map_publication_attempt_count;
+    uint64_t moe_slot_map_publication_success_count;
+    uint64_t moe_slot_arena_attempt_count;
+    uint64_t moe_slot_arena_success_count;
+    uint64_t moe_slot_upload_batch_count;
+    uint64_t moe_slot_upload_count;
+    uint64_t moe_slot_upload_bytes;
+    uint64_t moe_checkpoint_attempt_count;
+    uint64_t moe_checkpoint_all_hit_token_count;
+    uint64_t moe_checkpoint_miss_token_count;
+    uint64_t moe_checkpoint_replay_count;
     uint64_t mapped_moe_split_gate_up_dispatches;
     uint64_t mapped_moe_fused_gate_up_dispatches;
     uint64_t mapped_moe_down_dispatches;
@@ -4249,6 +4272,17 @@ typedef struct termite_metal_linear_id_params {
     uint32_t expert_count;
     uint32_t reserved;
 } termite_metal_linear_id_params;
+
+typedef struct termite_metal_mapped_moe_projection_source {
+    const uint8_t *mapped_base;
+    size_t mapped_bytes;
+    size_t weight_offset;
+    size_t weight_bytes;
+    size_t row_stride;
+    size_t source_out_dim;
+    size_t row_offset;
+    size_t expert_count;
+} termite_metal_mapped_moe_projection_source;
 
 typedef struct termite_metal_a4b_id_replay_result {
     uint64_t warmup_iterations;
@@ -37797,6 +37831,8 @@ int termite_metal_decode_runtime_publish_moe_expert_slot_map(
     size_t expert_count
 ) {
     if (runtime == NULL || expert_to_slot == NULL) return -1;
+    runtime->moe_slot_map_publication_attempt_count = termite_metal_u64_saturating_add(
+        runtime->moe_slot_map_publication_attempt_count, 1);
     if (layer_index >= TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY ||
         expert_count == 0 || expert_count > TERMITE_METAL_MOE_EXPERT_CAPACITY) return -2;
     for (size_t expert = 0; expert < expert_count; ++expert) {
@@ -37817,6 +37853,8 @@ int termite_metal_decode_runtime_publish_moe_expert_slot_map(
         if (contents == NULL) return -6;
         memcpy(contents, expert_to_slot, bytes);
         runtime->moe_expert_slot_map_counts[layer_index] = (uint32_t)expert_count;
+        runtime->moe_slot_map_publication_success_count = termite_metal_u64_saturating_add(
+            runtime->moe_slot_map_publication_success_count, 1);
         return 0;
     }
 }
@@ -37923,7 +37961,16 @@ int termite_metal_decode_runtime_upload_moe_q4_0_slots(
         }
         termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_FFN_COPY);
         [blit endEncoding];
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
+        const int rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -9);
+        if (rc == 0) {
+            runtime->moe_slot_upload_batch_count = termite_metal_u64_saturating_add(
+                runtime->moe_slot_upload_batch_count, 1);
+            runtime->moe_slot_upload_count = termite_metal_u64_saturating_add(
+                runtime->moe_slot_upload_count, upload_count);
+            runtime->moe_slot_upload_bytes = termite_metal_u64_saturating_add(
+                runtime->moe_slot_upload_bytes, upload_bytes);
+        }
+        return rc;
     }
 }
 
@@ -37947,6 +37994,8 @@ int termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
     size_t output_offset
 ) {
     if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
+    runtime->moe_slot_arena_attempt_count = termite_metal_u64_saturating_add(
+        runtime->moe_slot_arena_attempt_count, 1);
     const bool use_folded_route_slots = runtime->a4b_route_slots_fold_valid != 0u &&
         runtime->a4b_route_slots_fold_layer_index == layer_index &&
         termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_A4B_ROUTE_SELECT_MAP_FOLD")) &&
@@ -38103,7 +38152,400 @@ int termite_metal_decode_runtime_moe_forward_q4_0_slots_device(
             threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->moe_slot_reduce_pipeline, reduce_total), 1, 1)];
         termite_metal_concurrent_planned_dependency_barrier(runtime, encoder, encoder_owned);
         termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+        const int rc = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -11);
+        if (rc == 0) {
+            runtime->moe_slot_arena_success_count = termite_metal_u64_saturating_add(
+                runtime->moe_slot_arena_success_count, 1);
+        }
+        return rc;
+    }
+}
+
+// Build one transient no-copy Metal alias around the VM pages intersecting a
+// selected expert projection.  Unlike termite_metal_make_shared_subbuffer,
+// this helper deliberately does not consult the persistent alias cache.
+static id<MTLBuffer> termite_metal_make_selected_expert_page_buffer(
+    termite_metal_decode_runtime *runtime,
+    const termite_metal_mapped_moe_projection_source *source,
+    size_t expert,
+    size_t logical_row_offset,
+    size_t logical_out_dim,
+    size_t *buffer_offset_out,
+    size_t *mapped_bytes_out
+) {
+    if (runtime == NULL || source == NULL || source->mapped_base == NULL ||
+        buffer_offset_out == NULL || mapped_bytes_out == NULL ||
+        source->mapped_bytes == 0 || source->weight_bytes == 0 ||
+        source->row_stride == 0 || source->source_out_dim == 0 ||
+        expert >= source->expert_count || logical_out_dim == 0 ||
+        logical_row_offset > source->source_out_dim ||
+        logical_out_dim > source->source_out_dim - logical_row_offset) return nil;
+    if (source->weight_offset > source->mapped_bytes ||
+        source->weight_bytes > source->mapped_bytes - source->weight_offset) return nil;
+    if (source->source_out_dim > SIZE_MAX / source->row_stride) return nil;
+    const size_t expert_stride = source->source_out_dim * source->row_stride;
+    if (expert > SIZE_MAX / expert_stride) return nil;
+    const size_t expert_relative = expert * expert_stride;
+    if (logical_row_offset > SIZE_MAX / source->row_stride) return nil;
+    const size_t row_relative = logical_row_offset * source->row_stride;
+    if (expert_relative > SIZE_MAX - row_relative) return nil;
+    const size_t logical_relative = expert_relative + row_relative;
+    if (logical_out_dim > SIZE_MAX / source->row_stride) return nil;
+    const size_t logical_bytes = logical_out_dim * source->row_stride;
+    if (logical_relative > source->weight_bytes ||
+        logical_bytes > source->weight_bytes - logical_relative ||
+        source->weight_offset > SIZE_MAX - logical_relative) return nil;
+    const size_t logical_offset = source->weight_offset + logical_relative;
+    if (logical_offset > source->mapped_bytes ||
+        logical_bytes > source->mapped_bytes - logical_offset) return nil;
+
+    const long raw_page_size = sysconf(_SC_PAGESIZE);
+    if (raw_page_size <= 0) return nil;
+    const size_t page_size = (size_t)raw_page_size;
+    const uintptr_t mapped_start = (uintptr_t)source->mapped_base;
+    if (mapped_start % page_size != 0 || source->mapped_bytes % page_size != 0 ||
+        logical_offset > UINTPTR_MAX - mapped_start) return nil;
+    const uintptr_t logical_start = mapped_start + logical_offset;
+    if (logical_bytes > UINTPTR_MAX - logical_start) return nil;
+    const uintptr_t logical_end = logical_start + logical_bytes;
+    const uintptr_t aligned_start = logical_start - (logical_start % page_size);
+    if (logical_end > UINTPTR_MAX - (page_size - 1u)) return nil;
+    const uintptr_t aligned_end = ((logical_end + page_size - 1u) / page_size) * page_size;
+    const uintptr_t mapped_end = mapped_start + source->mapped_bytes;
+    if (aligned_start < mapped_start || aligned_end > mapped_end || aligned_end <= aligned_start ||
+        aligned_end - aligned_start > SIZE_MAX) return nil;
+    const size_t mapped_bytes = (size_t)(aligned_end - aligned_start);
+    // The allocation may include only its two alignment edge pages beyond the
+    // logical projection.  This is the fail-closed guard against accidentally
+    // turning a selected-expert request back into a tensor- or model-wide map.
+    if (logical_bytes > SIZE_MAX - 2u * page_size ||
+        mapped_bytes > logical_bytes + 2u * page_size ||
+        !termite_metal_can_make_no_copy_buffer((const void *)aligned_start, mapped_bytes)) return nil;
+    id<MTLBuffer> buffer = [runtime->device
+        newBufferWithBytesNoCopy:(void *)aligned_start
+                          length:mapped_bytes
+                         options:MTLResourceStorageModeShared
+                     deallocator:nil];
+    if (buffer == nil) return nil;
+    buffer.label = @"antfly A4B selected expert pages";
+    *buffer_offset_out = (size_t)(logical_start - aligned_start);
+    *mapped_bytes_out = mapped_bytes;
+    return buffer;
+}
+
+// Host-visible route IDs are only 32 bytes for qualified A4B decode.  Once
+// those IDs are known, this path maps exactly the routed experts' page spans,
+// encodes the MoE, and retains the aliases only until the active GPU frame
+// completes.  No weight bytes are copied and no tensor/model-wide Metal
+// allocation is created.
+int termite_metal_decode_runtime_moe_forward_q4_0_selected_pages_device(
+    termite_metal_decode_runtime *runtime,
+    size_t layer_index,
+    const termite_metal_mapped_moe_projection_source *gate,
+    const termite_metal_mapped_moe_projection_source *up,
+    const termite_metal_mapped_moe_projection_source *down,
+    const uint32_t *expert_ids,
+    size_t expert_id_count,
+    void *input_handle,
+    size_t input_offset,
+    size_t rows,
+    size_t hidden_size,
+    size_t inter_size,
+    size_t num_experts,
+    size_t top_k,
+    uint32_t activation_kind,
+    uint32_t fuse_gate_up,
+    void *expert_scale_handle,
+    size_t expert_scale_offset,
+    void *output_handle,
+    size_t output_offset,
+    uint64_t *logical_weight_bytes_out,
+    uint64_t *mapped_page_bytes_out,
+    uint64_t *allocation_count_out
+) {
+    if (logical_weight_bytes_out != NULL) *logical_weight_bytes_out = 0;
+    if (mapped_page_bytes_out != NULL) *mapped_page_bytes_out = 0;
+    if (allocation_count_out != NULL) *allocation_count_out = 0;
+    if (runtime == NULL || gate == NULL || up == NULL || down == NULL ||
+        expert_ids == NULL || input_handle == NULL || output_handle == NULL ||
+        logical_weight_bytes_out == NULL || mapped_page_bytes_out == NULL ||
+        allocation_count_out == NULL) return -1;
+    if (layer_index >= TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY ||
+        runtime->q4_0_id_pipeline == nil ||
+        runtime->moe_merged_gate_up_activation_pipeline == nil ||
+        runtime->activation_multiply_pipeline == nil ||
+        runtime->moe_slot_reduce_pipeline == nil) return -2;
+    if (runtime->active_frame_cb == nil || runtime->submitted_frame_cb != nil) return -3;
+    if (rows != 1 || hidden_size == 0 || inter_size == 0 || num_experts == 0 ||
+        top_k == 0 || top_k > 8u || top_k > num_experts || expert_id_count != rows * top_k ||
+        hidden_size > UINT32_MAX || inter_size > UINT32_MAX || num_experts > UINT32_MAX ||
+        (hidden_size % 32u) != 0u || (inter_size % 32u) != 0u) return -4;
+    const size_t gate_row_stride = (hidden_size / 32u) * 18u;
+    const size_t down_row_stride = (inter_size / 32u) * 18u;
+    if (gate->expert_count != num_experts || up->expert_count != num_experts ||
+        down->expert_count != num_experts || gate->row_stride != gate_row_stride ||
+        up->row_stride != gate_row_stride || down->row_stride != down_row_stride ||
+        gate->row_offset > gate->source_out_dim || inter_size > gate->source_out_dim - gate->row_offset ||
+        up->row_offset > up->source_out_dim || inter_size > up->source_out_dim - up->row_offset ||
+        down->row_offset > down->source_out_dim || hidden_size > down->source_out_dim - down->row_offset) return -5;
+    const bool merged_gate_up = fuse_gate_up != 0u;
+    if (merged_gate_up &&
+        (gate->mapped_base != up->mapped_base || gate->mapped_bytes != up->mapped_bytes ||
+         gate->weight_offset != up->weight_offset || gate->weight_bytes != up->weight_bytes ||
+         gate->source_out_dim != inter_size * 2u || up->source_out_dim != gate->source_out_dim ||
+         gate->row_offset != 0u || up->row_offset != inter_size)) return -6;
+    for (size_t route = 0; route < expert_id_count; ++route) {
+        if ((size_t)expert_ids[route] >= num_experts) return -7;
+    }
+    const size_t route_rows = rows * top_k;
+    if (runtime->moe_route_ids_buffer == nil || runtime->moe_route_weights_buffer == nil ||
+        runtime->moe_route_capacity < route_rows * sizeof(uint32_t) ||
+        runtime->moe_route_ids_buffer.contents == NULL ||
+        memcmp(runtime->moe_route_ids_buffer.contents, expert_ids, route_rows * sizeof(uint32_t)) != 0) return -8;
+
+    size_t input_bytes = 0, output_bytes = 0, intermediate_bytes = 0, route_output_bytes = 0;
+    if (!termite_metal_size_mul3(rows, hidden_size, sizeof(float), &input_bytes) ||
+        !termite_metal_size_mul3(rows, hidden_size, sizeof(float), &output_bytes) ||
+        !termite_metal_size_mul3(route_rows, inter_size, sizeof(float), &intermediate_bytes) ||
+        !termite_metal_size_mul3(route_rows, hidden_size, sizeof(float), &route_output_bytes)) return -9;
+
+    @autoreleasepool {
+        id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle;
+        id<MTLBuffer> output = (__bridge id<MTLBuffer>)output_handle;
+        id<MTLBuffer> scale = expert_scale_handle == NULL
+            ? runtime->moe_route_weights_buffer
+            : (__bridge id<MTLBuffer>)expert_scale_handle;
+        if (input == nil || output == nil || scale == nil ||
+            input_offset > input.length || input_bytes > input.length - input_offset ||
+            output_offset > output.length || output_bytes > output.length - output_offset ||
+            (expert_scale_handle != NULL &&
+             (expert_scale_offset > scale.length || num_experts * sizeof(float) > scale.length - expert_scale_offset))) return -10;
+
+        size_t gate_intermediate_bytes = intermediate_bytes;
+        if (merged_gate_up && !termite_metal_size_mul(intermediate_bytes, 2u, &gate_intermediate_bytes)) return -11;
+        if (runtime->moe_slot_intermediate_capacity < gate_intermediate_bytes ||
+            runtime->moe_slot_gate_buffer == nil || runtime->moe_slot_up_buffer == nil)
+        {
+            id<MTLBuffer> gate_buffer = [runtime->device newBufferWithLength:gate_intermediate_bytes options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> up_buffer = [runtime->device newBufferWithLength:intermediate_bytes options:MTLResourceStorageModePrivate];
+            if (gate_buffer == nil || up_buffer == nil) return -11;
+            runtime->moe_slot_gate_buffer = gate_buffer;
+            runtime->moe_slot_up_buffer = up_buffer;
+            runtime->moe_slot_intermediate_capacity = gate_intermediate_bytes;
+        }
+        if (runtime->moe_slot_route_output_capacity < route_output_bytes ||
+            runtime->moe_slot_route_output_buffer == nil)
+        {
+            id<MTLBuffer> route_output = [runtime->device newBufferWithLength:route_output_bytes options:MTLResourceStorageModePrivate];
+            if (route_output == nil) return -11;
+            runtime->moe_slot_route_output_buffer = route_output;
+            runtime->moe_slot_route_output_capacity = route_output_bytes;
+        }
+
+        id<MTLBuffer> gate_views[8] = { nil, nil, nil, nil, nil, nil, nil, nil };
+        id<MTLBuffer> up_views[8] = { nil, nil, nil, nil, nil, nil, nil, nil };
+        id<MTLBuffer> down_views[8] = { nil, nil, nil, nil, nil, nil, nil, nil };
+        size_t gate_offsets[8] = { 0 };
+        size_t up_offsets[8] = { 0 };
+        size_t down_offsets[8] = { 0 };
+        uint64_t logical_weight_bytes = 0;
+        uint64_t mapped_page_bytes = 0;
+        uint64_t allocation_count = 0;
+        const uint64_t logical_per_route = merged_gate_up
+            ? (uint64_t)(inter_size * 2u) * gate->row_stride + (uint64_t)hidden_size * down->row_stride
+            : (uint64_t)inter_size * gate->row_stride + (uint64_t)inter_size * up->row_stride +
+                (uint64_t)hidden_size * down->row_stride;
+        if (logical_per_route > UINT64_MAX / route_rows ||
+            logical_per_route * route_rows > 64ull * 1024ull * 1024ull) return -12;
+        logical_weight_bytes = logical_per_route * route_rows;
+        for (size_t route = 0; route < route_rows; ++route) {
+            const size_t expert = expert_ids[route];
+            size_t mapped_bytes = 0;
+            gate_views[route] = termite_metal_make_selected_expert_page_buffer(
+                runtime,
+                gate,
+                expert,
+                merged_gate_up ? 0u : gate->row_offset,
+                merged_gate_up ? gate->source_out_dim : inter_size,
+                &gate_offsets[route],
+                &mapped_bytes);
+            if (gate_views[route] == nil) return -13;
+            if (mapped_page_bytes > UINT64_MAX - mapped_bytes) return -13;
+            mapped_page_bytes += mapped_bytes;
+            allocation_count += 1;
+            if (termite_metal_decode_runtime_retain_frame_resource(runtime, gate_views[route]) != 0) return -13;
+            if (!merged_gate_up) {
+                up_views[route] = termite_metal_make_selected_expert_page_buffer(
+                    runtime, up, expert, up->row_offset, inter_size, &up_offsets[route], &mapped_bytes);
+                if (up_views[route] == nil) return -13;
+                if (mapped_page_bytes > UINT64_MAX - mapped_bytes) return -13;
+                mapped_page_bytes += mapped_bytes;
+                allocation_count += 1;
+                if (termite_metal_decode_runtime_retain_frame_resource(runtime, up_views[route]) != 0) return -13;
+            }
+            down_views[route] = termite_metal_make_selected_expert_page_buffer(
+                runtime, down, expert, down->row_offset, hidden_size, &down_offsets[route], &mapped_bytes);
+            if (down_views[route] == nil) return -13;
+            if (mapped_page_bytes > UINT64_MAX - mapped_bytes) return -13;
+            mapped_page_bytes += mapped_bytes;
+            allocation_count += 1;
+            if (termite_metal_decode_runtime_retain_frame_resource(runtime, down_views[route]) != 0) return -13;
+        }
+        if (mapped_page_bytes > 64ull * 1024ull * 1024ull) return -14;
+
+        uint32_t zero_id = 0;
+        id<MTLBuffer> zero_id_buffer = [runtime->device
+            newBufferWithBytes:&zero_id
+                       length:sizeof(zero_id)
+                      options:MTLResourceStorageModeShared];
+        if (zero_id_buffer == nil ||
+            termite_metal_decode_runtime_retain_frame_resource(runtime, zero_id_buffer) != 0) return -15;
+
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil || frame_owned) return -16;
+
+        termite_metal_planned_encoder_range external_accesses[5];
+        size_t external_access_count = 0;
+#define TERMITE_PLAN_SELECTED_PAGE_MOE_ACCESS(access_buffer, offset, bytes, kind) do { \
+            if (termite_metal_planned_range_make((access_buffer), (offset), (bytes), (kind), \
+                    &external_accesses[external_access_count], -17) != 0) return -17; \
+            if (external_accesses[external_access_count].buffer != nil) external_access_count += 1; \
+        } while (0)
+        TERMITE_PLAN_SELECTED_PAGE_MOE_ACCESS(input, input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ);
+        TERMITE_PLAN_SELECTED_PAGE_MOE_ACCESS(runtime->moe_route_ids_buffer, 0, route_rows * sizeof(uint32_t), TERMITE_METAL_PLANNED_RANGE_READ);
+        TERMITE_PLAN_SELECTED_PAGE_MOE_ACCESS(runtime->moe_route_weights_buffer, 0, route_rows * sizeof(float), TERMITE_METAL_PLANNED_RANGE_READ);
+        if (expert_scale_handle != NULL) {
+            TERMITE_PLAN_SELECTED_PAGE_MOE_ACCESS(scale, expert_scale_offset, num_experts * sizeof(float), TERMITE_METAL_PLANNED_RANGE_READ);
+        }
+        TERMITE_PLAN_SELECTED_PAGE_MOE_ACCESS(output, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE);
+#undef TERMITE_PLAN_SELECTED_PAGE_MOE_ACCESS
+
+        BOOL encoder_owned = YES;
+        id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(
+            runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_FFN, &encoder_owned);
+        if (encoder == nil) return -17;
+        if (termite_metal_decode_runtime_prepare_planned_compute_accesses(
+                runtime, external_accesses, external_access_count, -17) != 0) {
+            termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+            return -17;
+        }
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        termite_metal_linear_id_params gate_params = {
+            .rows = 1u,
+            .in_dim = (uint32_t)hidden_size,
+            .out_dim = (uint32_t)(merged_gate_up ? inter_size * 2u : inter_size),
+            .row_blocks = (uint32_t)(hidden_size / 32u),
+            .source_out_dim = (uint32_t)(merged_gate_up ? inter_size * 2u : inter_size),
+            .row_offset = 0u,
+            .expert_count = 1u,
+            .reserved = 0u,
+        };
+        [encoder setComputePipelineState:runtime->q4_0_id_pipeline];
+        for (size_t route = 0; route < route_rows; ++route) {
+            [encoder setBuffer:input offset:input_offset atIndex:0];
+            [encoder setBuffer:gate_views[route] offset:gate_offsets[route] atIndex:1];
+            [encoder setBuffer:runtime->moe_slot_gate_buffer
+                         offset:route * (merged_gate_up ? inter_size * 2u : inter_size) * sizeof(float)
+                        atIndex:2];
+            [encoder setBuffer:zero_id_buffer offset:0 atIndex:3];
+            [encoder setBytes:&gate_params length:sizeof(gate_params) atIndex:4];
+            [encoder dispatchThreadgroups:MTLSizeMake((gate_params.out_dim + 7u) / 8u, 1u, 1u)
+                threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+        }
+        if (!merged_gate_up) {
+            termite_metal_linear_id_params up_params = gate_params;
+            for (size_t route = 0; route < route_rows; ++route) {
+                [encoder setBuffer:up_views[route] offset:up_offsets[route] atIndex:1];
+                [encoder setBuffer:runtime->moe_slot_up_buffer offset:route * inter_size * sizeof(float) atIndex:2];
+                [encoder setBytes:&up_params length:sizeof(up_params) atIndex:4];
+                [encoder dispatchThreadgroups:MTLSizeMake((inter_size + 7u) / 8u, 1u, 1u)
+                    threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+            }
+        }
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        termite_metal_apply_activation_params activation = {
+            .activation_kind = activation_kind,
+            .rows = (uint32_t)route_rows,
+            .dim = (uint32_t)inter_size,
+        };
+        if (merged_gate_up) {
+            [encoder setComputePipelineState:runtime->moe_merged_gate_up_activation_pipeline];
+            [encoder setBuffer:runtime->moe_slot_gate_buffer offset:0 atIndex:0];
+            [encoder setBuffer:runtime->moe_slot_up_buffer offset:0 atIndex:1];
+            [encoder setBytes:&activation length:sizeof(activation) atIndex:2];
+        } else {
+            [encoder setComputePipelineState:runtime->activation_multiply_pipeline];
+            [encoder setBuffer:runtime->moe_slot_gate_buffer offset:0 atIndex:0];
+            [encoder setBuffer:runtime->moe_slot_up_buffer offset:0 atIndex:1];
+            [encoder setBuffer:runtime->moe_slot_gate_buffer offset:0 atIndex:2];
+            [encoder setBytes:&activation length:sizeof(activation) atIndex:3];
+        }
+        const size_t activation_total = route_rows * inter_size;
+        [encoder dispatchThreads:MTLSizeMake(activation_total, 1u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(
+                termite_metal_thread_width(merged_gate_up
+                    ? runtime->moe_merged_gate_up_activation_pipeline
+                    : runtime->activation_multiply_pipeline, activation_total), 1u, 1u)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        termite_metal_linear_id_params down_params = {
+            .rows = 1u,
+            .in_dim = (uint32_t)inter_size,
+            .out_dim = (uint32_t)hidden_size,
+            .row_blocks = (uint32_t)(inter_size / 32u),
+            .source_out_dim = (uint32_t)hidden_size,
+            .row_offset = 0u,
+            .expert_count = 1u,
+            .reserved = 0u,
+        };
+        [encoder setComputePipelineState:runtime->q4_0_id_pipeline];
+        for (size_t route = 0; route < route_rows; ++route) {
+            [encoder setBuffer:(merged_gate_up ? runtime->moe_slot_up_buffer : runtime->moe_slot_gate_buffer)
+                         offset:route * inter_size * sizeof(float)
+                        atIndex:0];
+            [encoder setBuffer:down_views[route] offset:down_offsets[route] atIndex:1];
+            [encoder setBuffer:runtime->moe_slot_route_output_buffer offset:route * hidden_size * sizeof(float) atIndex:2];
+            [encoder setBuffer:zero_id_buffer offset:0 atIndex:3];
+            [encoder setBytes:&down_params length:sizeof(down_params) atIndex:4];
+            [encoder dispatchThreadgroups:MTLSizeMake((hidden_size + 7u) / 8u, 1u, 1u)
+                threadsPerThreadgroup:MTLSizeMake(64u, 1u, 1u)];
+        }
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        termite_metal_moe_slot_reduce_params reduce = {
+            .rows = (uint32_t)rows,
+            .top_k = (uint32_t)top_k,
+            .dim = (uint32_t)hidden_size,
+            .has_expert_scale = expert_scale_handle == NULL ? 0u : 1u,
+        };
+        [encoder setComputePipelineState:runtime->moe_slot_reduce_pipeline];
+        [encoder setBuffer:runtime->moe_slot_route_output_buffer offset:0 atIndex:0];
+        [encoder setBuffer:runtime->moe_route_ids_buffer offset:0 atIndex:1];
+        [encoder setBuffer:runtime->moe_route_weights_buffer offset:0 atIndex:2];
+        [encoder setBuffer:scale offset:expert_scale_handle == NULL ? 0 : expert_scale_offset atIndex:3];
+        [encoder setBuffer:output offset:output_offset atIndex:4];
+        [encoder setBytes:&reduce length:sizeof(reduce) atIndex:5];
+        [encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(
+                termite_metal_thread_width(runtime->moe_slot_reduce_pipeline, rows * hidden_size), 1u, 1u)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+
+        *logical_weight_bytes_out = logical_weight_bytes;
+        *mapped_page_bytes_out = mapped_page_bytes;
+        *allocation_count_out = allocation_count;
+        if (runtime->a4b_selected_page_moe_reported == 0u) {
+            fprintf(stderr,
+                "metal_a4b_selected_page_moe: enabled=1 logical_bytes=%llu mapped_page_bytes=%llu allocations=%llu persistent_cache=0 weight_copies=0 rollback=TERMITE_METAL_DISABLE_A4B_SELECTED_EXPERT_PAGE_MOE\n",
+                (unsigned long long)logical_weight_bytes,
+                (unsigned long long)mapped_page_bytes,
+                (unsigned long long)allocation_count);
+            runtime->a4b_selected_page_moe_reported = 1u;
+        }
+        return 0;
     }
 }
 
@@ -38885,6 +39327,8 @@ int termite_metal_decode_runtime_begin_moe_checkpoint(
     size_t layer_count
 ) {
     if (runtime == NULL || runtime->device == nil) return -1;
+    runtime->moe_checkpoint_attempt_count = termite_metal_u64_saturating_add(
+        runtime->moe_checkpoint_attempt_count, 1);
     if (runtime->active_frame_cb == nil || runtime->submitted_frame_cb != nil) return -2;
     if (layer_count == 0 || layer_count > TERMITE_METAL_MOE_LAYER_SLOT_CAPACITY) return -3;
     @autoreleasepool {
@@ -38931,7 +39375,23 @@ int termite_metal_decode_runtime_finish_moe_checkpoint(
         }
     }
     runtime->moe_checkpoint_layer_count = 0;
+    if (mask == 0) {
+        runtime->moe_checkpoint_all_hit_token_count = termite_metal_u64_saturating_add(
+            runtime->moe_checkpoint_all_hit_token_count, 1);
+    } else {
+        runtime->moe_checkpoint_miss_token_count = termite_metal_u64_saturating_add(
+            runtime->moe_checkpoint_miss_token_count, 1);
+    }
     *miss_mask_out = mask;
+    return 0;
+}
+
+int termite_metal_decode_runtime_note_moe_checkpoint_replay(
+    termite_metal_decode_runtime *runtime
+) {
+    if (runtime == NULL) return -1;
+    runtime->moe_checkpoint_replay_count = termite_metal_u64_saturating_add(
+        runtime->moe_checkpoint_replay_count, 1);
     return 0;
 }
 
@@ -55425,6 +55885,17 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->moe_slot_route_hit_count = runtime->moe_slot_route_hit_count;
     snapshot->moe_slot_route_miss_count = runtime->moe_slot_route_miss_count;
     snapshot->moe_slot_all_hit_layer_count = runtime->moe_slot_all_hit_layer_count;
+    snapshot->moe_slot_map_publication_attempt_count = runtime->moe_slot_map_publication_attempt_count;
+    snapshot->moe_slot_map_publication_success_count = runtime->moe_slot_map_publication_success_count;
+    snapshot->moe_slot_arena_attempt_count = runtime->moe_slot_arena_attempt_count;
+    snapshot->moe_slot_arena_success_count = runtime->moe_slot_arena_success_count;
+    snapshot->moe_slot_upload_batch_count = runtime->moe_slot_upload_batch_count;
+    snapshot->moe_slot_upload_count = runtime->moe_slot_upload_count;
+    snapshot->moe_slot_upload_bytes = runtime->moe_slot_upload_bytes;
+    snapshot->moe_checkpoint_attempt_count = runtime->moe_checkpoint_attempt_count;
+    snapshot->moe_checkpoint_all_hit_token_count = runtime->moe_checkpoint_all_hit_token_count;
+    snapshot->moe_checkpoint_miss_token_count = runtime->moe_checkpoint_miss_token_count;
+    snapshot->moe_checkpoint_replay_count = runtime->moe_checkpoint_replay_count;
     snapshot->mapped_moe_split_gate_up_dispatches = runtime->mapped_moe_split_gate_up_dispatches;
     snapshot->mapped_moe_fused_gate_up_dispatches = runtime->mapped_moe_fused_gate_up_dispatches;
     snapshot->mapped_moe_down_dispatches = runtime->mapped_moe_down_dispatches;

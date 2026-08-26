@@ -21,6 +21,7 @@ const gpu_hosted_store_mod = @import("gpu_hosted_store.zig");
 const native_compute_mod = @import("native_compute.zig");
 const native = @import("../backends/native.zig");
 const activations_mod = @import("../backends/activations.zig");
+const metal_runtime_mod = @import("../backends/metal_runtime.zig");
 const metal_tensor_mod = if (build_options.enable_metal) @import("../backends/metal_tensor.zig") else struct {
     pub const max_dims: usize = 8;
     pub const StorageMode = enum(c_int) {
@@ -45,6 +46,69 @@ const NativeWeightStore = native_compute_mod.WeightStore;
 const CT = ops.CT;
 const MetalTensor = metal_tensor_mod.MetalTensor;
 const QuantizedStorage = weight_source_mod.QuantizedStorage;
+
+const A4bMappedMoeRoute = enum {
+    /// Explicit high-memory route: all mapped MoE weights are resident.
+    resident,
+    /// Legacy opt-in probe kept for resident configurations without the full
+    /// resident route enabled.
+    layer0,
+
+    fn residencyPolicy(self: A4bMappedMoeRoute) metal_runtime_mod.A4bMappedMoeResidencyPolicy {
+        return if (self == .resident) .resident else .streamed;
+    }
+};
+
+fn resolveA4bMappedMoeRoute(
+    config: backend_contracts.A4bInferenceConfig,
+    layer_index: usize,
+    mapped_layer0_requested: bool,
+    resident_mapped_requested: bool,
+) error{A4bMetalRouteUnavailable}!?A4bMappedMoeRoute {
+    if (config.residency_mode == .auto) return error.A4bMetalRouteUnavailable;
+    if (resident_mapped_requested) {
+        if (config.residency_mode != .resident or
+            @as(u16, config.expert_cache_slots) != config.geometry.expert_count)
+        {
+            return error.A4bMetalRouteUnavailable;
+        }
+        return .resident;
+    }
+    if (mapped_layer0_requested and layer_index == 0) return .layer0;
+    return null;
+}
+
+fn a4bExpertSlotArenaEnabled() bool {
+    if (getenvBool("TERMITE_METAL_DISABLE_A4B_EXPERT_SLOT_ARENA")) return false;
+    return getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_ARENA");
+}
+
+fn a4bExpertSlotCheckpointReplayEnabled() bool {
+    if (!a4bExpertSlotArenaEnabled() or
+        getenvBool("TERMITE_METAL_DISABLE_A4B_EXPERT_SLOT_CHECKPOINT_REPLAY"))
+    {
+        return false;
+    }
+    return getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_CHECKPOINT_REPLAY");
+}
+
+fn a4bConfigAllowsPreparedResidentMoe(config: backend_contracts.A4bInferenceConfig) bool {
+    return config.residency_mode == .resident and
+        @as(u16, config.expert_cache_slots) == config.geometry.expert_count;
+}
+
+fn mappedMoeGateUpCanFuse(
+    gate: metal_runtime_mod.PackedMoeLinearDescriptor,
+    up: metal_runtime_mod.PackedMoeLinearDescriptor,
+    inter_size: usize,
+) bool {
+    const fused_out_dim = std.math.mul(usize, inter_size, 2) catch return false;
+    return gate.slot == up.slot and
+        gate.format == .q4_0 and up.format == .q4_0 and
+        gate.source_out_dim == fused_out_dim and up.source_out_dim == fused_out_dim and
+        gate.row_offset == 0 and up.row_offset == inter_size and
+        gate.expert_count == up.expert_count;
+}
 
 /// Read-only simulation of several bounded expert arenas. It consumes route
 /// IDs already returned by the authoritative selector and never publishes a
@@ -1216,6 +1280,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             )) return false;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         const config = self.data.a4b_inference orelse return false;
+        if (!a4bConfigAllowsPreparedResidentMoe(config)) return false;
         if (request.layer_index >= self.a4b_prepared_moe_layers.len or
             request.layer_index >= config.geometry.moe_layer_count or
             request.hidden_size != config.geometry.hidden_size or
@@ -5347,19 +5412,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             "TERMITE_METAL_ENABLE_A4B_RESIDENT_MAPPED_MOE",
             "TERMITE_METAL_DISABLE_A4B_RESIDENT_MAPPED_MOE",
         );
-        const slot_arena = getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_ARENA");
-        if (!mapped_layer0 and !resident_mapped_requested and !slot_arena) return null;
-        if (request.total != 1 or request.activation != .gelu_new or request.layer_index >= config.geometry.moe_layer_count or
-            request.hidden_size != config.geometry.hidden_size or request.inter_size != config.geometry.expert_intermediate_size or
-            request.num_experts != config.geometry.expert_count or request.top_k != config.geometry.top_k) return null;
-        const resident_mapped = resident_mapped_requested and
-            config.residency_mode == .resident and
-            @as(u16, config.expert_cache_slots) == config.geometry.expert_count;
-        if (resident_mapped_requested and !resident_mapped) return error.A4bMetalRouteUnavailable;
-        const fuse_gate_up = resident_mapped and a4bHighMemoryFeatureEnabled(
-            "TERMITE_METAL_ENABLE_A4B_FUSED_GATE_UP",
-            "TERMITE_METAL_DISABLE_A4B_FUSED_GATE_UP",
+        const selected_page_mapped = getenvBool("TERMITE_METAL_ENABLE_A4B_SELECTED_EXPERT_PAGE_MOE") and
+            !getenvBool("TERMITE_METAL_DISABLE_A4B_SELECTED_EXPERT_PAGE_MOE");
+        const slot_arena = a4bExpertSlotArenaEnabled();
+        const contract_qualified = request.total == 1 and request.activation == .gelu_new and
+            request.layer_index < config.geometry.moe_layer_count and
+            request.hidden_size == config.geometry.hidden_size and
+            request.inter_size == config.geometry.expert_intermediate_size and
+            request.num_experts == config.geometry.expert_count and
+            request.top_k == config.geometry.top_k;
+        if (!contract_qualified) return null;
+        const mapped_route = try resolveA4bMappedMoeRoute(
+            config,
+            request.layer_index,
+            mapped_layer0,
+            resident_mapped_requested,
         );
+        if (mapped_route == null and !selected_page_mapped and !slot_arena) return null;
         const layout = qualifiedMoeSlotLayout(request) orelse return null;
         if (layout.gate_bytes * 2 + layout.down_bytes != config.geometry.encoded_expert_bytes) return null;
         const gate_storage = packedMoeQ4Storage(request.w1, request.num_experts) orelse return null;
@@ -5369,32 +5438,117 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const logits = logits_buf.metal_tensor orelse return null;
         if (!logits.isDevice()) return null;
 
-        if (resident_mapped or (mapped_layer0 and request.layer_index == 0)) {
-            self.noteA4bMappedMoeAttempt(resident_mapped, fuse_gate_up);
+        if (selected_page_mapped) {
+            self.timing_stats.a4b_moe_selected_page_attempts +|= 1;
+            const gate_source = metal_runtime.mappedMoeProjectionSource(
+                gate_storage,
+                request.hidden_size,
+                request.inter_size,
+                request.num_experts,
+            ) orelse {
+                self.timing_stats.a4b_moe_selected_page_failures +|= 1;
+                return error.A4bMetalRouteUnavailable;
+            };
+            const up_source = metal_runtime.mappedMoeProjectionSource(
+                up_storage,
+                request.hidden_size,
+                request.inter_size,
+                request.num_experts,
+            ) orelse {
+                self.timing_stats.a4b_moe_selected_page_failures +|= 1;
+                return error.A4bMetalRouteUnavailable;
+            };
+            const down_source = metal_runtime.mappedMoeProjectionSource(
+                down_storage,
+                request.inter_size,
+                request.hidden_size,
+                request.num_experts,
+            ) orelse {
+                self.timing_stats.a4b_moe_selected_page_failures +|= 1;
+                return error.A4bMetalRouteUnavailable;
+            };
+            const routes = (try moeSelectRoutesOp(
+                self,
+                request.layer_index,
+                request.router_logits,
+                request.total,
+                request.num_experts,
+                request.top_k,
+                request.router_logit_scale,
+                self.allocator,
+            )) orelse {
+                self.timing_stats.a4b_moe_selected_page_failures +|= 1;
+                return error.A4bMetalRouteUnavailable;
+            };
+            defer self.allocator.free(routes.expert_ids);
+            defer self.allocator.free(routes.route_weights);
+
+            var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+            defer input.deinit();
+            var scale: ?MetalTensor = null;
+            defer if (scale) |*value| value.deinit();
+            if (request.expert_scale) |scale_ct| scale = try self.ownedDeviceMetalTensorFromCt(scale_ct);
+            const fuse_gate_up = metal_runtime.mappedMoeProjectionSourcesCanFuse(
+                gate_source,
+                up_source,
+                request.inter_size,
+            );
+            const result = (try metal_runtime.decoderRuntimeMoeForwardQ4_0SelectedPagesDevice(
+                self.provider_impl,
+                request.layer_index,
+                gate_source,
+                up_source,
+                down_source,
+                routes.expert_ids,
+                input,
+                request.total,
+                request.hidden_size,
+                request.inter_size,
+                request.num_experts,
+                request.top_k,
+                request.activation,
+                fuse_gate_up,
+                scale,
+            )) orelse {
+                self.timing_stats.a4b_moe_selected_page_failures +|= 1;
+                return error.A4bMetalRouteDispatchFailed;
+            };
+            self.timing_stats.a4b_moe_selected_page_successes +|= 1;
+            self.timing_stats.a4b_moe_selected_page_logical_bytes +|= result.logical_weight_bytes;
+            self.timing_stats.a4b_moe_selected_page_mapped_bytes +|= result.mapped_page_bytes;
+            self.timing_stats.a4b_moe_selected_page_allocations +|= result.allocation_count;
+            return self.ctFromOwnedMetalTensor(result.output);
+        }
+
+        if (mapped_route) |route| {
             const gate_descriptor = (try self.ensurePackedMoeLinearDescriptor(
                 request.w1,
                 request.hidden_size,
                 request.inter_size,
-            )) orelse {
-                self.noteA4bMappedMoeFailure(resident_mapped, fuse_gate_up);
-                return error.A4bMetalRouteUnavailable;
-            };
+            )) orelse return error.A4bMetalRouteUnavailable;
             const up_descriptor = (try self.ensurePackedMoeLinearDescriptor(
                 request.w3,
                 request.hidden_size,
                 request.inter_size,
-            )) orelse {
-                self.noteA4bMappedMoeFailure(resident_mapped, fuse_gate_up);
-                return error.A4bMetalRouteUnavailable;
-            };
+            )) orelse return error.A4bMetalRouteUnavailable;
             const down_descriptor = (try self.ensurePackedMoeLinearDescriptor(
                 request.w2,
                 request.inter_size,
                 request.hidden_size,
-            )) orelse {
-                self.noteA4bMappedMoeFailure(resident_mapped, fuse_gate_up);
-                return error.A4bMetalRouteUnavailable;
+            )) orelse return error.A4bMetalRouteUnavailable;
+            const fuse_requested = switch (route) {
+                .resident => a4bHighMemoryFeatureEnabled(
+                    "TERMITE_METAL_ENABLE_A4B_FUSED_GATE_UP",
+                    "TERMITE_METAL_DISABLE_A4B_FUSED_GATE_UP",
+                ),
+                .layer0 => false,
             };
+            const fuse_gate_up = fuse_requested and mappedMoeGateUpCanFuse(
+                gate_descriptor,
+                up_descriptor,
+                request.inter_size,
+            );
+            self.noteA4bMappedMoeAttempt(route, fuse_gate_up);
 
             self.timing_stats.a4b_moe_route_select_attempts += 1;
             if (!metal_runtime.decoderRuntimeSelectMoeRoutesBufferedDevice(
@@ -5407,7 +5561,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 request.router_logit_scale,
             )) {
                 self.timing_stats.a4b_moe_route_select_fallbacks += 1;
-                self.noteA4bMappedMoeFailure(resident_mapped, fuse_gate_up);
+                self.noteA4bMappedMoeFailure(route, fuse_gate_up);
                 return error.A4bMetalRouteUnavailable;
             }
             self.timing_stats.a4b_moe_route_select_successes += 1;
@@ -5417,7 +5571,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var scale: ?MetalTensor = null;
             defer if (scale) |*value| value.deinit();
             if (request.expert_scale) |scale_ct| scale = try self.ownedDeviceMetalTensorFromCt(scale_ct);
-            const selected_expert_prefetch = !resident_mapped and
+            const selected_expert_prefetch = route == .layer0 and
                 getenvBool("TERMITE_METAL_ENABLE_A4B_LAYER0_SELECTED_EXPERT_PREFETCH");
             if (selected_expert_prefetch) {
                 self.timing_stats.a4b_moe_mapped_layer0_selected_prefetch_attempts +|= 1;
@@ -5436,14 +5590,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 request.top_k,
                 request.activation,
                 selected_expert_prefetch,
-                resident_mapped,
+                route.residencyPolicy(),
                 fuse_gate_up,
                 scale,
             )) orelse {
                 if (selected_expert_prefetch) {
                     self.timing_stats.a4b_moe_mapped_layer0_selected_prefetch_failures +|= 1;
                 }
-                self.noteA4bMappedMoeFailure(resident_mapped, fuse_gate_up);
+                self.noteA4bMappedMoeFailure(route, fuse_gate_up);
                 return error.A4bMetalRouteDispatchFailed;
             };
             if (selected_expert_prefetch) {
@@ -5452,7 +5606,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 self.timing_stats.a4b_moe_mapped_layer0_selected_prefetch_logical_bytes +|=
                     selected_routes *| config.geometry.encoded_expert_bytes;
             }
-            self.noteA4bMappedMoeSuccess(resident_mapped, fuse_gate_up);
+            self.noteA4bMappedMoeSuccess(route, fuse_gate_up);
             return self.ctFromOwnedMetalTensor(output);
         }
         if (!slot_arena) return null;
@@ -5623,6 +5777,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.timing_stats.a4b_moe_slot_arena_failures += 1;
             return error.A4bMetalRouteDispatchFailed;
         }
+        if (repaired_count != 0) self.timing_stats.a4b_moe_slot_upload_batches += 1;
         self.timing_stats.a4b_moe_slot_uploads += repaired_count;
         self.timing_stats.a4b_moe_slot_upload_bytes += upload.len;
 
@@ -5650,42 +5805,45 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(output);
     }
 
-    fn noteA4bMappedMoeAttempt(self: *MetalCompute, resident: bool, fused_gate_up: bool) void {
-        if (resident) {
-            self.timing_stats.a4b_moe_resident_mapped_attempts += 1;
-            if (fused_gate_up) {
-                self.timing_stats.a4b_moe_resident_fused_gate_up_attempts += 1;
-            } else {
-                self.timing_stats.a4b_moe_resident_split_gate_up_attempts += 1;
-            }
-        } else {
-            self.timing_stats.a4b_moe_mapped_layer0_attempts += 1;
+    fn noteA4bMappedMoeAttempt(self: *MetalCompute, route: A4bMappedMoeRoute, fused_gate_up: bool) void {
+        switch (route) {
+            .layer0 => self.timing_stats.a4b_moe_mapped_layer0_attempts += 1,
+            .resident => {
+                self.timing_stats.a4b_moe_resident_mapped_attempts += 1;
+                if (fused_gate_up) {
+                    self.timing_stats.a4b_moe_resident_fused_gate_up_attempts += 1;
+                } else {
+                    self.timing_stats.a4b_moe_resident_split_gate_up_attempts += 1;
+                }
+            },
         }
     }
 
-    fn noteA4bMappedMoeFailure(self: *MetalCompute, resident: bool, fused_gate_up: bool) void {
-        if (resident) {
-            self.timing_stats.a4b_moe_resident_mapped_failures += 1;
-            if (fused_gate_up) {
-                self.timing_stats.a4b_moe_resident_fused_gate_up_failures += 1;
-            } else {
-                self.timing_stats.a4b_moe_resident_split_gate_up_failures += 1;
-            }
-        } else {
-            self.timing_stats.a4b_moe_mapped_layer0_failures += 1;
+    fn noteA4bMappedMoeFailure(self: *MetalCompute, route: A4bMappedMoeRoute, fused_gate_up: bool) void {
+        switch (route) {
+            .layer0 => self.timing_stats.a4b_moe_mapped_layer0_failures += 1,
+            .resident => {
+                self.timing_stats.a4b_moe_resident_mapped_failures += 1;
+                if (fused_gate_up) {
+                    self.timing_stats.a4b_moe_resident_fused_gate_up_failures += 1;
+                } else {
+                    self.timing_stats.a4b_moe_resident_split_gate_up_failures += 1;
+                }
+            },
         }
     }
 
-    fn noteA4bMappedMoeSuccess(self: *MetalCompute, resident: bool, fused_gate_up: bool) void {
-        if (resident) {
-            self.timing_stats.a4b_moe_resident_mapped_successes += 1;
-            if (fused_gate_up) {
-                self.timing_stats.a4b_moe_resident_fused_gate_up_successes += 1;
-            } else {
-                self.timing_stats.a4b_moe_resident_split_gate_up_successes += 1;
-            }
-        } else {
-            self.timing_stats.a4b_moe_mapped_layer0_successes += 1;
+    fn noteA4bMappedMoeSuccess(self: *MetalCompute, route: A4bMappedMoeRoute, fused_gate_up: bool) void {
+        switch (route) {
+            .layer0 => self.timing_stats.a4b_moe_mapped_layer0_successes += 1,
+            .resident => {
+                self.timing_stats.a4b_moe_resident_mapped_successes += 1;
+                if (fused_gate_up) {
+                    self.timing_stats.a4b_moe_resident_fused_gate_up_successes += 1;
+                } else {
+                    self.timing_stats.a4b_moe_resident_split_gate_up_successes += 1;
+                }
+            },
         }
     }
 
@@ -22144,7 +22302,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             moe.top_k,
             request.activation,
             false,
-            true,
+            .resident,
             true,
             prepared_ptr.expert_scale,
         )) orelse return null;
@@ -25180,10 +25338,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         top_k: usize,
     ) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (!getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_CHECKPOINT_REPLAY") or
-            !getenvBool("TERMITE_METAL_ENABLE_A4B_EXPERT_SLOT_ARENA") or
-            self.a4b_moe_synchronized_replay or self.a4b_moe_checkpoint_active) return false;
         const config = self.data.a4b_inference orelse return false;
+        if (!a4bExpertSlotCheckpointReplayEnabled() or
+            self.a4b_moe_synchronized_replay or self.a4b_moe_checkpoint_active) return false;
         if (layer_count != config.geometry.moe_layer_count or top_k != config.geometry.top_k) return false;
         const arena = if (self.a4b_expert_slot_arena) |*value| value else return false;
         if (!arena.layersAreFullyPopulated(layer_count)) return false;
@@ -25222,7 +25379,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (enabled and self.a4b_moe_checkpoint_active) return error.A4bMetalRouteUnavailable;
         self.a4b_moe_synchronized_replay = enabled;
-        if (enabled) self.timing_stats.a4b_moe_checkpoint_replays += 1;
+        if (enabled) {
+            self.timing_stats.a4b_moe_checkpoint_replays += 1;
+            if (!metal_runtime.decoderRuntimeNoteMoeCheckpointReplay(self.provider_impl)) {
+                return error.A4bMetalRouteUnavailable;
+            }
+        }
     }
 
     fn decoderRuntimeSubmitAndWaitFrameOp(ctx: *anyopaque) anyerror!void {
@@ -25440,6 +25602,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.a4b_moe_slot_route_hits = runtime_stats.moe_slot_route_hit_count;
         stats.a4b_moe_slot_route_misses = runtime_stats.moe_slot_route_miss_count;
         stats.a4b_moe_slot_all_hit_layers = runtime_stats.moe_slot_all_hit_layer_count;
+        stats.a4b_moe_slot_map_publications = runtime_stats.moe_slot_map_publication_success_count;
+        stats.a4b_moe_slot_map_publish_failures = runtime_stats.moe_slot_map_publication_attempt_count -|
+            runtime_stats.moe_slot_map_publication_success_count;
+        stats.a4b_moe_slot_arena_attempts = runtime_stats.moe_slot_arena_attempt_count;
+        stats.a4b_moe_slot_arena_successes = runtime_stats.moe_slot_arena_success_count;
+        stats.a4b_moe_slot_arena_failures = runtime_stats.moe_slot_arena_attempt_count -|
+            runtime_stats.moe_slot_arena_success_count;
+        stats.a4b_moe_slot_upload_batches = runtime_stats.moe_slot_upload_batch_count;
+        stats.a4b_moe_slot_uploads = runtime_stats.moe_slot_upload_count;
+        stats.a4b_moe_slot_upload_bytes = runtime_stats.moe_slot_upload_bytes;
+        stats.a4b_moe_checkpoint_attempts = runtime_stats.moe_checkpoint_attempt_count;
+        stats.a4b_moe_checkpoint_all_hit_tokens = runtime_stats.moe_checkpoint_all_hit_token_count;
+        stats.a4b_moe_checkpoint_miss_tokens = runtime_stats.moe_checkpoint_miss_token_count;
+        stats.a4b_moe_checkpoint_replays = runtime_stats.moe_checkpoint_replay_count;
         stats.decoder_runtime_frame_begins = runtime_stats.frame_begin_count -| self.runtime_frame_begin_baseline;
         stats.decoder_runtime_frame_submits = runtime_stats.frame_submit_count -| self.runtime_frame_submit_baseline;
         stats.decoder_runtime_frame_wait_nanos = runtime_stats.frame_wait_nanos -| self.runtime_frame_wait_baseline;
@@ -33915,6 +34091,75 @@ test "metal_compute: qualified A4B slot layout is bounded and page aligned" {
     try std.testing.expectEqual(@as(usize, 3_358_720), layout.expert_stride);
     try std.testing.expectEqual(@as(usize, 0), layout.expert_stride % (16 * 1024));
     try std.testing.expectEqual(@as(usize, 806_092_800), layout.expert_stride * 8 * 30);
+}
+
+test "metal_compute: streamed A4B policy rejects implicit mapped residency" {
+    const geometry = backend_contracts.qualified_a4b_geometries[0];
+    const streamed = try backend_contracts.buildA4bInferenceConfig(.{
+        .residency_mode = .streamed,
+        .memory_budget_mb = 2048,
+    }, geometry);
+    try std.testing.expect((try resolveA4bMappedMoeRoute(streamed, 0, false, false)) == null);
+    try std.testing.expect((try resolveA4bMappedMoeRoute(
+        streamed,
+        geometry.moe_layer_count - 1,
+        false,
+        false,
+    )) == null);
+    const layer0 = (try resolveA4bMappedMoeRoute(streamed, 0, true, false)) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(A4bMappedMoeRoute.layer0, layer0);
+    try std.testing.expectEqual(
+        metal_runtime_mod.A4bMappedMoeResidencyPolicy.streamed,
+        layer0.residencyPolicy(),
+    );
+    try std.testing.expect(!a4bConfigAllowsPreparedResidentMoe(streamed));
+    try std.testing.expectError(
+        error.A4bMetalRouteUnavailable,
+        resolveA4bMappedMoeRoute(streamed, 0, false, true),
+    );
+
+    const resident = try backend_contracts.buildA4bInferenceConfig(.{
+        .residency_mode = .resident,
+        .memory_budget_mb = 16384,
+    }, geometry);
+    try std.testing.expect(a4bConfigAllowsPreparedResidentMoe(resident));
+    try std.testing.expectEqual(
+        A4bMappedMoeRoute.resident,
+        (try resolveA4bMappedMoeRoute(resident, 1, false, true)).?,
+    );
+    try std.testing.expectEqual(
+        A4bMappedMoeRoute.layer0,
+        (try resolveA4bMappedMoeRoute(resident, 0, true, false)).?,
+    );
+    try std.testing.expect((try resolveA4bMappedMoeRoute(resident, 1, true, false)) == null);
+
+    var unresolved = streamed;
+    unresolved.residency_mode = .auto;
+    try std.testing.expectError(
+        error.A4bMetalRouteUnavailable,
+        resolveA4bMappedMoeRoute(unresolved, 0, false, false),
+    );
+}
+
+test "metal_compute: mapped A4B gate up fusion requires one packed descriptor" {
+    const gate = metal_runtime_mod.PackedMoeLinearDescriptor{
+        .slot = 17,
+        .format = .q4_0,
+        .source_out_dim = 1408,
+        .row_offset = 0,
+        .expert_count = 128,
+    };
+    var up = gate;
+    up.row_offset = 704;
+    try std.testing.expect(mappedMoeGateUpCanFuse(gate, up, 704));
+
+    up.slot += 1;
+    try std.testing.expect(!mappedMoeGateUpCanFuse(gate, up, 704));
+    up = gate;
+    up.row_offset = 704;
+    up.source_out_dim = 704;
+    try std.testing.expect(!mappedMoeGateUpCanFuse(gate, up, 704));
 }
 
 test "metal_compute: packed Q4 slot copier honors expert and fused projection offsets" {

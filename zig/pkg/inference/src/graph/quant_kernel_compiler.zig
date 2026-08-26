@@ -12452,9 +12452,21 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "decode_gqa_split unavailable; using paged attention fallback"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "(runtime->decode_gqa_split_explicitly_requested &&"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_SCRATCH_MAX_BYTES 2105344u"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "newBufferWithLength:split_scratch_capacity"));
+    // The explicitly gated frame-scratch mode double-buffers split-GQA
+    // scratch so an active frame never aliases the previously submitted one.
+    // Keep both allocations and their fail-closed readiness/lifecycle checks
+    // in the source contract.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "newBufferWithLength:split_scratch_capacity"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "runtime->attention_decode_gqa_split_scratch_buffer_alt ="));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "(!runtime->decode_gqa_split_frame_scratch_enabled ||"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "runtime->attention_decode_gqa_split_scratch_buffer_alt != nil"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "runtime->attention_decode_gqa_split_scratch_buffer_alt = nil;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "runtime->attention_decode_gqa_split_scratch_buffer_alt, &snapshot->scratch_bytes"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "options:MTLResourceStorageModePrivate"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "scratch_runtime->submitted_frame_cb != nil"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "termite_metal_decode_gqa_split_scratch_for_encoding("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "if (runtime->active_frame_cb != nil)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "if (runtime->submitted_frame_cb != nil) return nil;"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "? (runtime->submitted_frame_decode_gqa_split_scratch_slot ^ 1u)"));
 
     // Gemma4 E2B/E4B retain their exact 8Q with 1KV/2KV geometry. A4B is
     // admitted only through its high-memory feature gate and exact 16Q local
@@ -12476,6 +12488,48 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     // padding contaminate the MMA even when its probability is zero.
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "if (kc + kk8 * 8u + 8u <= p.kv_tokens)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "sv[vi] = vphys != 0xffffffffu ? v_half[vphys * p.v_row_stride + kv_head_base + d8 + vc] : half(0.0f)"));
+}
+
+test "metal runtime selected-page MoE closes owned encoders on access failure" {
+    const host_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    defer std.testing.allocator.free(host_source);
+
+    const start = std.mem.indexOf(
+        u8,
+        host_source,
+        "int termite_metal_decode_runtime_moe_forward_q4_0_selected_pages_device(",
+    ) orelse return error.MissingSelectedPageMoeEntryPoint;
+    const end = std.mem.indexOfPos(
+        u8,
+        host_source,
+        start,
+        "\n}\n\n// Device-routed A4B MoE",
+    ) orelse return error.MissingSelectedPageMoeEntryPointEnd;
+    const body = host_source[start..end];
+
+    // Validation that can return directly stays before encoder acquisition.
+    // Once an owned encoder exists, the only failing call must close it first.
+    const access_planning = std.mem.indexOf(
+        u8,
+        body,
+        "#define TERMITE_PLAN_SELECTED_PAGE_MOE_ACCESS",
+    ) orelse return error.MissingSelectedPageMoeAccessPlanning;
+    const encoder_acquisition = std.mem.indexOf(
+        u8,
+        body,
+        "id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(",
+    ) orelse return error.MissingSelectedPageMoeEncoderAcquisition;
+    try std.testing.expect(access_planning < encoder_acquisition);
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        body,
+        1,
+        "runtime, external_accesses, external_access_count, -17) != 0) {\n            termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);\n            return -17;\n        }",
+    ));
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, body, "termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);"),
+    );
 }
 
 test "metal runtime source gates aligned and unrolled Q4 MM to measured shapes" {

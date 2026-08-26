@@ -5584,7 +5584,7 @@ pub const ModelManager = struct {
             model_dir,
             self.session_manager.preferred_backends,
             true,
-            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request),
         );
     }
 
@@ -5598,10 +5598,7 @@ pub const ModelManager = struct {
             model_dir,
             preferred_backends,
             cache_default_alias,
-            inheritedA4bCachePolicy(
-                self.session_manager.a4b_inference_request,
-                cache_default_alias,
-            ),
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request),
         );
     }
 
@@ -6262,11 +6259,14 @@ const ModelLoadCachePolicy = struct {
 
 fn inheritedA4bCachePolicy(
     request: ?backend_contracts.A4bInferenceRequest,
-    accept_default_alias: bool,
 ) ModelLoadCachePolicy {
     return .{
         .a4b_request = request,
-        .accept_default_alias = accept_default_alias,
+        // Publishing a new default alias and consuming an existing one are
+        // separate decisions. Policy-free requests may reuse a matching
+        // qualified preload even when their call site does not publish new
+        // aliases. Explicit A4B policies still require their exact variant key.
+        .accept_default_alias = request == null,
     };
 }
 
@@ -6326,15 +6326,15 @@ test "A4B model cache keys isolate residency policies" {
     try std.testing.expect(std.mem.endsWith(u8, streamed_key, "a4b=streamed:4096"));
 }
 
-test "preferred-backend cache isolation also rejects the default alias" {
+test "inherited A4B policy isolates explicit loads but reuses policy-free aliases" {
     const request = backend_contracts.A4bInferenceRequest{
         .residency_mode = .streamed,
         .memory_budget_mb = 4096,
     };
-    const isolated = inheritedA4bCachePolicy(request, false);
+    const isolated = inheritedA4bCachePolicy(request);
     try std.testing.expectEqual(request, isolated.a4b_request.?);
     try std.testing.expect(!isolated.accept_default_alias);
-    try std.testing.expect(inheritedA4bCachePolicy(null, true).accept_default_alias);
+    try std.testing.expect(inheritedA4bCachePolicy(null).accept_default_alias);
 }
 
 test "explicit backend lookup reuses only a matching default alias" {
@@ -6392,13 +6392,13 @@ test "explicit backend lookup reuses only a matching default alias" {
         "model",
         &.{.metal},
         false,
-        .{},
+        inheritedA4bCachePolicy(null),
     );
     const mismatching = try manager.lookupLoadedModelLocked(
         "model",
         &.{.native},
         false,
-        .{},
+        inheritedA4bCachePolicy(null),
     );
     manager.unlockLoadedModels();
 
