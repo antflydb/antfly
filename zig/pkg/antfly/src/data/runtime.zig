@@ -3212,6 +3212,17 @@ pub const HAStandbyReplicationOptions = antfly.ha.http_replication_client.Replic
 pub const HAStandbyReplicationResult = antfly.ha.http_replication_client.Result;
 pub const HAStandbyReplicationLoopResult = antfly.ha.http_replication_client.LoopResult;
 
+fn haReplicationWindowReachedEnd(
+    upstream_end_of_wal: bool,
+    fetched_count: usize,
+    received_count: usize,
+    progress: antfly.ha.standby.Progress,
+) bool {
+    return upstream_end_of_wal and
+        received_count == fetched_count and
+        progress.applied_lsn == progress.received_lsn;
+}
+
 const HAStandbyReplicationErrorCode = enum(u8) {
     none = 0,
     HttpConnectionClosing,
@@ -4683,12 +4694,13 @@ pub const DataServer = struct {
     // fixed cadence and retries quickly only while repairs are landing.
     const dense_posting_maintenance_idle_interval_ns = 30 * std.time.ns_per_s;
     const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
-    // Applying a fetched batch holds ha_state_mutex so promotion cannot consume
-    // the standby while records are in flight. Keep that safety-critical window
-    // short enough that admin/fencing status remains responsive during a dense
-    // catch-up. Durable apply dominates the cost, so the additional internal
-    // fetches are preferable to multi-second control-plane starvation.
-    const ha_replication_default_max_records_per_apply = 64;
+    // Receiving and applying a fetched batch holds ha_state_mutex so promotion
+    // cannot consume the standby while records are in flight. Bound both the
+    // durable work count and elapsed apply time: record cost varies with LSM
+    // pressure, so a count-only window does not guarantee control-plane
+    // responsiveness. Pending apply debt is drained before accepting more WAL.
+    const ha_replication_default_max_records_per_apply = 8;
+    const ha_replication_default_apply_window_ns = 250 * std.time.ns_per_ms;
     const ha_replication_default_max_encoded_bytes_per_apply = 4 * 1024 * 1024;
     const ha_replication_default_max_response_bytes = 8 * 1024 * 1024;
     const ha_standby_replication_retry_interval_ns = 1 * std.time.ns_per_s;
@@ -5232,11 +5244,20 @@ pub const DataServer = struct {
             return error.HAStandbyStateChanged;
         }
 
-        const applied = client.applyFetched(
+        const apply_deadline_ns = platform_time.monotonicNs() +|
+            ha_replication_default_apply_window_ns;
+        const applied = client.applyFetchedWithOptions(
             &batch,
             standby,
             self,
             DataServer.applyHAReplicationRecordCallback,
+            .{
+                .standby_apply = .{
+                    .max_records = ha_replication_default_max_records_per_apply,
+                    .deadline_ns = apply_deadline_ns,
+                },
+                .drain_pending_before_receive = true,
+            },
         ) catch |err| {
             const status = standby.snapshot();
             const status_identity = status.identity;
@@ -5268,7 +5289,12 @@ pub const DataServer = struct {
             .current_lsn = batch.current_lsn,
             .last_sent_lsn = batch.last_sent_lsn,
             .next_lsn = batch.next_lsn,
-            .end_of_wal = batch.end_of_wal,
+            .end_of_wal = haReplicationWindowReachedEnd(
+                batch.end_of_wal,
+                batch.frames.len,
+                applied.received_count,
+                applied.progress,
+            ),
         };
     }
 
@@ -28945,7 +28971,25 @@ test "data runtime HA replication HTTP budget covers base64 apply envelope" {
 
 test "data runtime HA apply window remains bounded for control-plane liveness" {
     try std.testing.expect(DataServer.ha_replication_default_max_records_per_apply > 0);
-    try std.testing.expect(DataServer.ha_replication_default_max_records_per_apply <= 64);
+    try std.testing.expect(DataServer.ha_replication_default_max_records_per_apply <= 8);
+    try std.testing.expect(DataServer.ha_replication_default_apply_window_ns > 0);
+    try std.testing.expect(DataServer.ha_replication_default_apply_window_ns <= std.time.ns_per_s);
+}
+
+test "data runtime HA apply window does not report caught up with pending or deferred WAL" {
+    const caught_up = antfly.ha.standby.Progress{
+        .received_lsn = 10,
+        .applied_lsn = 10,
+        .safe_read_lsn = 10,
+    };
+    try std.testing.expect(haReplicationWindowReachedEnd(true, 8, 8, caught_up));
+    try std.testing.expect(!haReplicationWindowReachedEnd(false, 8, 8, caught_up));
+    try std.testing.expect(!haReplicationWindowReachedEnd(true, 8, 0, caught_up));
+
+    var pending = caught_up;
+    pending.applied_lsn = 9;
+    pending.safe_read_lsn = 9;
+    try std.testing.expect(!haReplicationWindowReachedEnd(true, 8, 8, pending));
 }
 
 test "data runtime records HA standby apply failures without stopping run round" {
