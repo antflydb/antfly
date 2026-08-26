@@ -79,9 +79,6 @@ pub const Parser = struct {
     max_header_size: usize = 8192,
     max_headers: usize = 100,
     max_body_size: usize = 100 * 1024 * 1024, // 100 MB
-    request_body_limit_context: ?*anyopaque = null,
-    request_body_limit_resolver: ?*const fn (*anyopaque, types.Method, []const u8) ?usize = null,
-    message_body_size_limit: usize = std.math.maxInt(usize),
     /// Optional process-wide reservation shared by all inbound connections.
     /// Fixed-length bodies reserve once at header completion; chunked bodies
     /// reserve incrementally as decoded payload bytes arrive.
@@ -239,7 +236,6 @@ pub const Parser = struct {
         self.header_bytes = 0;
         self.header_count = 0;
         self.total_body_bytes = 0;
-        self.message_body_size_limit = std.math.maxInt(usize);
     }
 
     fn releaseBodyBudget(self: *Self) void {
@@ -461,25 +457,10 @@ pub const Parser = struct {
             return;
         }
 
-        self.message_body_size_limit = self.max_body_size;
-        if (self.mode == .request) {
-            if (self.request_body_limit_resolver) |resolve| {
-                if (self.request_body_limit_context) |context| {
-                    if (self.method) |method| {
-                        if (self.path) |path| {
-                            if (resolve(context, method, path)) |route_limit| {
-                                self.message_body_size_limit = @min(self.message_body_size_limit, route_limit);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         if (self.chunked) {
             self.state = .chunk_size;
         } else if (self.content_length) |len| {
-            if (len > self.message_body_size_limit) {
+            if (len > self.max_body_size) {
                 self.state = .err;
                 self.error_reason = .body_too_large;
                 return;
@@ -523,7 +504,7 @@ pub const Parser = struct {
         }
 
         self.total_body_bytes += data.len;
-        if (self.total_body_bytes > self.message_body_size_limit) {
+        if (self.total_body_bytes > self.max_body_size) {
             self.state = .err;
             self.error_reason = .body_too_large;
             return error.BodyTooLarge;
@@ -550,7 +531,7 @@ pub const Parser = struct {
             return lr.consumed;
         };
 
-        if (self.current_chunk_size > self.message_body_size_limit) {
+        if (self.current_chunk_size > self.max_body_size) {
             self.state = .err;
             self.error_reason = .body_too_large;
             return lr.consumed;
@@ -574,7 +555,7 @@ pub const Parser = struct {
         const to_read = @min(data.len, remaining);
 
         self.total_body_bytes += to_read;
-        if (self.total_body_bytes > self.message_body_size_limit) {
+        if (self.total_body_bytes > self.max_body_size) {
             self.state = .err;
             self.error_reason = .body_too_large;
             return error.BodyTooLarge;
@@ -977,26 +958,6 @@ test "reject body too large via Content-Length" {
 
     // Parser should reject because 100 > 16.
     try std.testing.expect(parser.isError());
-}
-
-test "request route body limit rejects content length before body reservation" {
-    const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
-    defer parser.deinit();
-    parser.max_body_size = 1024;
-    parser.request_body_limit_context = @ptrCast(&parser);
-    parser.request_body_limit_resolver = struct {
-        fn resolve(_: *anyopaque, method: types.Method, path: []const u8) ?usize {
-            if (method == .POST and mem.eql(u8, path, "/bounded")) return 4;
-            return null;
-        }
-    }.resolve;
-
-    _ = try parser.feed("POST /bounded HTTP/1.1\r\nContent-Length: 5\r\n\r\n");
-    try std.testing.expect(parser.isError());
-    try std.testing.expectEqual(ErrorReason.body_too_large, parser.getErrorReason());
-    try std.testing.expectEqual(@as(usize, 0), parser.body_budget_reserved);
-    try std.testing.expectEqual(@as(usize, 0), parser.body_buffer.capacity);
 }
 
 test "reject body too large during chunked transfer" {

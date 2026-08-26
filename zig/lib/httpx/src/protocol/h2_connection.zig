@@ -341,7 +341,7 @@ pub const H2Connection = struct {
         // A handler can race a peer RST_STREAM while preparing its response.
         // Reject before touching flow-control windows or emitting an empty
         // END_STREAM DATA frame on a reset stream.
-        if (stream.responseWriteError(self.is_server)) |err| return err;
+        if (stream.responseWriteError()) |err| return err;
         if (stream.state == .closed and stream.cancellation.load(.acquire)) return error.StreamReset;
 
         if (data.len > std.math.maxInt(i32)) return error.FlowControlError;
@@ -380,7 +380,7 @@ pub const H2Connection = struct {
         var offset: usize = 0;
         while (offset < data.len) {
             const stream = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-            if (stream.responseWriteError(self.is_server)) |err| return err;
+            if (stream.responseWriteError()) |err| return err;
 
             const remaining = data.len - offset;
 
@@ -398,7 +398,7 @@ pub const H2Connection = struct {
                     self.send_window_event.reset();
                     // Re-check after reset (receive loop may have updated between our check and reset).
                     const s2 = self.stream_manager.getStream(stream_id) orelse return error.InvalidStreamId;
-                    if (s2.responseWriteError(self.is_server)) |err| return err;
+                    if (s2.responseWriteError()) |err| return err;
                     const sw2: usize = if (s2.send_window > 0) @intCast(s2.send_window) else 0;
                     const cw2: usize = if (self.stream_manager.connection_send_window > 0) @intCast(self.stream_manager.connection_send_window) else 0;
                     if (sw2 == 0 or cw2 == 0) {
@@ -770,7 +770,7 @@ pub const H2Connection = struct {
         // a peer RST_STREAM cannot emit response bytes (or mutate the shared
         // encoder state) after that stream has been reset.
         if (stream) |value| {
-            if (value.responseWriteError(self.is_server)) |err| return err;
+            if (value.responseWriteError()) |err| return err;
             // Some existing in-memory callers write an initial HEADERS frame
             // without first registering a stream. A peer reset is always
             // registered and marks cancellation, so guard that closed state

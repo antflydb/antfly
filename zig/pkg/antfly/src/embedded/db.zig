@@ -55,7 +55,7 @@ pub const InferenceStatus = support.lite.backend.InferenceStatus;
 
 pub const DB = struct {
     allocator: Allocator,
-    inner: *db_mod.DB,
+    inner: db_mod.DB,
     profile: Profile,
     open_mode: db_mod.OpenOptions.OpenMode,
     lite_inference_status: ?InferenceStatus = null,
@@ -88,7 +88,7 @@ pub const DB = struct {
     pub fn openWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
         return .{
             .allocator = alloc,
-            .inner = try db_mod.DB.openOwned(alloc, path, toDbOpenOptions(opts, profile)),
+            .inner = try db_mod.DB.open(alloc, path, toDbOpenOptions(opts, profile)),
             .profile = profile,
             .open_mode = opts.open_mode,
             .lite_inference_status = null,
@@ -118,7 +118,7 @@ pub const DB = struct {
         var db_opts = toDbOpenOptions(opts, profile);
         try lite_backend.configureDbOpenOptions(&db_opts);
 
-        const inner = db_mod.DB.openOwned(alloc, path, db_opts) catch |err| {
+        const inner = db_mod.DB.open(alloc, path, db_opts) catch |err| {
             return err;
         };
 
@@ -139,7 +139,7 @@ pub const DB = struct {
             self.inner.sync(true) catch {};
             self.inner.syncIndexes(true) catch {};
         }
-        self.inner.closeOwned();
+        self.inner.close();
         if (self.owned_lite_backend) |*lite_backend| {
             lite_backend.deinit();
         }
