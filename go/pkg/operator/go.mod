@@ -5,7 +5,7 @@ go 1.26.0
 replace github.com/antflydb/antfly/go/pkg/sdk => ../sdk
 
 require (
-	github.com/antflydb/antfly/go/pkg/sdk v0.0.1
+	github.com/antflydb/antfly/go/pkg/sdk v0.0.0-20260825153515-905be15098ca
 	github.com/onsi/ginkgo/v2 v2.27.5
 	github.com/onsi/gomega v1.38.3
 	github.com/prometheus/client_golang v1.23.2
