@@ -273,6 +273,7 @@ pub fn encodeGraphEdgeAlloc(
     updated_at: u64,
     metadata_json: []const u8,
 ) ![]u8 {
+    if (!std.math.isFinite(weight)) return error.InvalidGraphEdgeWeight;
     const payload_len = @sizeOf(u64) * 4 + @sizeOf(u32) + metadata_json.len;
     const total_len = header_len + payload_len;
     const out = try alloc.alloc(u8, total_len);
@@ -606,6 +607,16 @@ test "artifact codec encodes graph edge with version and source hash" {
     try std.testing.expectEqual(@as(u64, 10), decoded.created_at);
     try std.testing.expectEqual(@as(u64, 20), decoded.updated_at);
     try std.testing.expectEqualStrings("{\"k\":1}", decoded.metadata_json);
+}
+
+test "artifact codec rejects non-finite graph weights" {
+    const alloc = std.testing.allocator;
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |weight| {
+        try std.testing.expectError(
+            error.InvalidGraphEdgeWeight,
+            encodeGraphEdgeAlloc(alloc, null, 42, weight, 0, 0, "{}"),
+        );
+    }
 }
 
 test "artifact codec binds portable graph edge generation exactly once" {

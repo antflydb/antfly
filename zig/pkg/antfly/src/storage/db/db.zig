@@ -41831,6 +41831,7 @@ fn appendRelationItem(
         const trimmed = std.mem.trim(u8, rendered, &std.ascii.whitespace);
         break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
     } else jsonFloatField(item, "weight") orelse jsonFloatField(item, "confidence") orelse 1.0;
+    graph_mod.validateEdgeWeight(weight) catch return error.InvalidGraphEdges;
     const metadata_json = if (mapping.metadata_template_json.len > 0)
         try renderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else
@@ -53988,6 +53989,32 @@ test "db graph relation artifact materializer uses mapping templates" {
     try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"tenant\":\"tenant-a\"") != null);
 }
 
+test "graph artifact materializer rejects non-finite mapped weights" {
+    const alloc = std.testing.allocator;
+    const source = index_manager_mod.GraphArtifactSource{
+        .artifact_name = @constCast("relations_v1"),
+        .mapping = .{ .weight_template = @constCast("{{ _item.score }}") },
+    };
+    for ([_][]const u8{ "NaN", "Inf", "-Inf" }) |weight| {
+        const raw = try std.fmt.allocPrint(
+            alloc,
+            "{{\"type\":\"mentions\",\"target\":\"doc:b\",\"score\":\"{s}\"}}",
+            .{weight},
+        );
+        defer alloc.free(raw);
+        try std.testing.expectError(error.InvalidGraphEdges, graphWritesFromArtifactValueAlloc(
+            alloc,
+            "relations_graph",
+            "doc:a",
+            raw,
+            source,
+            "application/json",
+            null,
+            1,
+        ));
+    }
+}
+
 test "graph artifact parser enforces its independent raw item safety limit" {
     const alloc = std.testing.allocator;
     const source = index_manager_mod.GraphArtifactSource{
@@ -54136,6 +54163,86 @@ test "db graph relation artifact materializer replaces stale document edges" {
     const stale_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
     defer alloc.free(stale_key);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
+}
+
+test "db multi-source graph precedence falls back after winner deletion and reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addEnrichment(.{
+            .name = "primary_relations_v1",
+            .kind = .asset,
+            .field = "primary_relations",
+            .content_type = "application/json",
+        });
+        try db.addEnrichment(.{
+            .name = "fallback_relations_v1",
+            .kind = .asset,
+            .field = "fallback_relations",
+            .content_type = "application/json",
+        });
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{"sources":[{"artifact":"primary_relations_v1"},{"artifact":"fallback_relations_v1"}]}
+            ,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"primary_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":2,"winner":"primary"},"fallback_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":1,"winner":"fallback"}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        {
+            const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+            defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+            try std.testing.expectEqual(@as(f64, 2), edges[0].weight);
+            try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"winner\":\"primary\"") != null);
+        }
+
+        // Removing the higher-precedence artifact must reveal the retained
+        // lower-precedence payload instead of deleting the logical edge.
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"fallback_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":1,"winner":"fallback"}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqual(@as(f64, 1), edges[0].weight);
+        try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"winner\":\"fallback\"") != null);
+        try db.sync(true);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const reopened_edges = try reopened.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, reopened_edges);
+    try std.testing.expectEqual(@as(usize, 1), reopened_edges.len);
+    try std.testing.expectEqual(@as(f64, 1), reopened_edges[0].weight);
+    try std.testing.expect(std.mem.indexOf(u8, reopened_edges[0].metadata, "\"winner\":\"fallback\"") != null);
 }
 
 test "db graph relation artifact materializer deletes edges when asset source disappears" {
@@ -57311,8 +57418,6 @@ test "db document extraction skips stable unit local rewrites without text consu
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
     });
-    try std.testing.expect(db.core.textIndexSupportsUnitGrouping("ft_document_units"));
-    try std.testing.expect(db.core.textIndexSupportsUnitGrouping("ft_document_chunks"));
     try std.testing.expect(db.core.index_manager.denseIndex("dv_document_chunks").?.supports_unit_grouping);
 
     try db.batch(.{

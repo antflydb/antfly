@@ -49,6 +49,7 @@ interface CreateIndexDialogProps {
   tableName: string;
   onIndexCreated: () => void;
   schema: TableSchema | null;
+  artifactSourcesSupported?: boolean;
 }
 
 export function getSchemaFieldNames(schema: TableSchema | null): string[] {
@@ -129,6 +130,11 @@ export function parseAdvancedIndexConfig(source: string): IndexConfig {
   return value as IndexConfig;
 }
 
+function usesArtifactSources(config: IndexConfig): boolean {
+  const sources = (config as unknown as Record<string, unknown>).sources;
+  return Array.isArray(sources) && sources.length > 0;
+}
+
 const indexFormSchema = z
   .object({
     name: z.string().trim().min(1, "Index name is required."),
@@ -149,6 +155,17 @@ const indexFormSchema = z
     fullTextSourceType: z.enum(["document", "field", "artifacts"]),
     fullTextField: z.string().optional(),
     fullTextArtifacts: z.array(z.object({ artifact: z.string() })).max(64),
+    graphSourceType: z.enum(["artifacts", "document_fields"]),
+    graphEdgeTypes: z
+      .array(
+        z.object({
+          name: z.string(),
+          field: z.string().optional(),
+          topology: z.enum(["graph", "tree"]),
+          allowSelfLoops: z.boolean(),
+        })
+      )
+      .max(64),
     graphSources: z
       .array(
         z.object({
@@ -213,31 +230,35 @@ const indexFormSchema = z
       return;
     }
     if (data.indexType === "graph") {
-      validateNamedSources(data.graphSources, "graphSources", context);
-      data.graphSources.forEach((source, index) => {
-        const fields = splitContextFields(source.contextFields);
-        if (new Set(fields).size !== fields.length) {
-          context.addIssue({
-            code: "custom",
-            path: ["graphSources", index, "contextFields"],
-            message: "Context fields must be unique.",
-          });
-        }
-        if (source.edgeMetadata?.trim()) {
-          try {
-            const value: unknown = JSON.parse(source.edgeMetadata);
-            if (!value || typeof value !== "object" || Array.isArray(value)) {
-              throw new Error("not an object");
-            }
-          } catch {
+      if (data.graphSourceType === "document_fields") {
+        validateGraphEdgeTypes(data.graphEdgeTypes, context);
+      } else {
+        validateNamedSources(data.graphSources, "graphSources", context);
+        data.graphSources.forEach((source, index) => {
+          const fields = splitContextFields(source.contextFields);
+          if (new Set(fields).size !== fields.length) {
             context.addIssue({
               code: "custom",
-              path: ["graphSources", index, "edgeMetadata"],
-              message: "Edge metadata must be a JSON object.",
+              path: ["graphSources", index, "contextFields"],
+              message: "Context fields must be unique.",
             });
           }
-        }
-      });
+          if (source.edgeMetadata?.trim()) {
+            try {
+              const value: unknown = JSON.parse(source.edgeMetadata);
+              if (!value || typeof value !== "object" || Array.isArray(value)) {
+                throw new Error("not an object");
+              }
+            } catch {
+              context.addIssue({
+                code: "custom",
+                path: ["graphSources", index, "edgeMetadata"],
+                message: "Edge metadata must be a JSON object.",
+              });
+            }
+          }
+        });
+      }
       return;
     }
     if (!data.embedder.model.trim()) {
@@ -290,6 +311,7 @@ const indexFormSchema = z
 
 type IndexFormData = z.infer<typeof indexFormSchema>;
 type GraphSourceFormData = IndexFormData["graphSources"][number];
+type GraphEdgeTypeFormData = IndexFormData["graphEdgeTypes"][number];
 
 function splitContextFields(value: string | undefined): string[] {
   return (value ?? "")
@@ -329,6 +351,48 @@ function validateNamedSources(
     }
     seen.add(artifact);
   });
+}
+
+function validateGraphEdgeTypes(
+  edgeTypes: GraphEdgeTypeFormData[],
+  context: z.RefinementCtx
+): void {
+  if (edgeTypes.length === 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["graphEdgeTypes"],
+      message: "At least one edge type is required.",
+    });
+    return;
+  }
+  const seen = new Set<string>();
+  edgeTypes.forEach((edgeType, index) => {
+    const name = edgeType.name.trim();
+    if (!name) {
+      context.addIssue({
+        code: "custom",
+        path: ["graphEdgeTypes", index, "name"],
+        message: "Edge type name is required.",
+      });
+    } else if (seen.has(name)) {
+      context.addIssue({
+        code: "custom",
+        path: ["graphEdgeTypes", index, "name"],
+        message: "Edge type names must be unique.",
+      });
+    }
+    seen.add(name);
+  });
+}
+
+export function buildGraphEdgeTypeConfig(edgeType: GraphEdgeTypeFormData) {
+  const field = edgeType.field?.trim();
+  return {
+    name: edgeType.name.trim(),
+    ...(field ? { field } : {}),
+    topology: edgeType.topology,
+    allow_self_loops: edgeType.allowSelfLoops,
+  };
 }
 
 export function buildGraphSourceConfig(source: GraphSourceFormData) {
@@ -379,12 +443,29 @@ export function buildGraphSourceConfig(source: GraphSourceFormData) {
   };
 }
 
-const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) => {
-  const { control, watch } = useFormContext<IndexFormData>();
+const IndexKindForm: React.FC<{
+  schemaFields: string[];
+  artifactSourcesSupported: boolean;
+}> = ({ schemaFields, artifactSourcesSupported }) => {
+  const { control, setValue, watch } = useFormContext<IndexFormData>();
   const indexType = watch("indexType");
+  const sourceType = watch("sourceType");
   const fullTextSourceType = watch("fullTextSourceType");
+  const graphSourceType = watch("graphSourceType");
   const fullTextArtifacts = useFieldArray({ control, name: "fullTextArtifacts" });
   const graphSources = useFieldArray({ control, name: "graphSources" });
+  const graphEdgeTypes = useFieldArray({ control, name: "graphEdgeTypes" });
+
+  useEffect(() => {
+    if (artifactSourcesSupported) return;
+    if (sourceType === "artifacts") setValue("sourceType", "field", { shouldValidate: true });
+    if (fullTextSourceType === "artifacts") {
+      setValue("fullTextSourceType", "field", { shouldValidate: true });
+    }
+    if (graphSourceType === "artifacts") {
+      setValue("graphSourceType", "document_fields", { shouldValidate: true });
+    }
+  }, [artifactSourcesSupported, fullTextSourceType, graphSourceType, setValue, sourceType]);
 
   return (
     <div className="space-y-4">
@@ -430,7 +511,11 @@ const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) =
       />
 
       {indexType === "embeddings" ? (
-        <IndexForm schemaFields={schemaFields} showName={false} allowArtifactSources />
+        <IndexForm
+          schemaFields={schemaFields}
+          showName={false}
+          allowArtifactSources={artifactSourcesSupported}
+        />
       ) : indexType === "full_text" ? (
         <div className="space-y-3 rounded-md border p-3">
           <FormField
@@ -457,12 +542,14 @@ const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) =
                       </FormControl>
                       <FormLabel className="font-normal">Whole document</FormLabel>
                     </FormItem>
-                    <FormItem className="flex items-center gap-2 space-y-0">
-                      <FormControl>
-                        <RadioGroupItem value="artifacts" />
-                      </FormControl>
-                      <FormLabel className="font-normal">Artifact streams</FormLabel>
-                    </FormItem>
+                    {artifactSourcesSupported && (
+                      <FormItem className="flex items-center gap-2 space-y-0">
+                        <FormControl>
+                          <RadioGroupItem value="artifacts" />
+                        </FormControl>
+                        <FormLabel className="font-normal">Artifact streams</FormLabel>
+                      </FormItem>
+                    )}
                   </RadioGroup>
                 </FormControl>
               </FormItem>
@@ -555,220 +642,370 @@ const IndexKindForm: React.FC<{ schemaFields: string[] }> = ({ schemaFields }) =
         </div>
       ) : (
         <div className="space-y-3 rounded-md border p-3">
-          <p className="text-xs text-muted-foreground">
-            Sources are evaluated in order; earlier sources win when multiple artifacts produce the
-            same edge identity.
-          </p>
-          {graphSources.fields.map((source, index) => (
-            <div key={source.id} className="space-y-2 rounded-md border p-3">
-              <div className="grid gap-2 sm:grid-cols-2">
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.artifact`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Artifact</FormLabel>
-                      <FormControl>
-                        <Input placeholder="relations_v1" {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.path`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>JSON path</FormLabel>
-                      <FormControl>
-                        <Input placeholder="$.relations[*]" {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.format`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Format</FormLabel>
-                      <Select value={field.value} onValueChange={field.onChange}>
+          {artifactSourcesSupported ? (
+            <FormField
+              control={control}
+              name="graphSourceType"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Graph source</FormLabel>
+                  <FormControl>
+                    <RadioGroup
+                      onValueChange={field.onChange}
+                      value={field.value}
+                      className="flex gap-4"
+                    >
+                      <FormItem className="flex items-center gap-2 space-y-0">
                         <FormControl>
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
+                          <RadioGroupItem value="document_fields" />
                         </FormControl>
-                        <SelectContent>
-                          <SelectItem value="extraction_relation">Extraction relation</SelectItem>
-                          <SelectItem value="extraction_graph">Extraction graph</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.nodeModel`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Node model</FormLabel>
-                      <Select value={field.value} onValueChange={field.onChange}>
+                        <FormLabel className="font-normal">Document fields</FormLabel>
+                      </FormItem>
+                      <FormItem className="flex items-center gap-2 space-y-0">
                         <FormControl>
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
+                          <RadioGroupItem value="artifacts" />
                         </FormControl>
-                        <SelectContent>
-                          <SelectItem value="document">Document</SelectItem>
-                          <SelectItem value="external">External</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.mentionEdgeType`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Mention edge type</FormLabel>
-                      <FormControl>
-                        <Input placeholder="mentions" {...field} />
-                      </FormControl>
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.sourceNode`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Source node template</FormLabel>
-                      <FormControl>
-                        <Input placeholder="{{ _doc.key }}" {...field} />
-                      </FormControl>
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.targetNode`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Target node template</FormLabel>
-                      <FormControl>
-                        <Input placeholder="{{ _item.target.text }}" {...field} />
-                      </FormControl>
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.edgeType`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Edge type template</FormLabel>
-                      <FormControl>
-                        <Input placeholder="{{ _item.predicate }}" {...field} />
-                      </FormControl>
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.edgeWeight`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Edge weight</FormLabel>
-                      <FormControl>
-                        <Input placeholder="1.0 or {{ _item.confidence }}" {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.edgeMetadata`}
-                  render={({ field }) => (
-                    <FormItem className="sm:col-span-2">
-                      <FormLabel>Edge metadata JSON</FormLabel>
-                      <FormControl>
-                        <Textarea
-                          className="min-h-20 font-mono text-xs"
-                          placeholder={'{"evidence":"{{ _item.evidence }}"}'}
-                          {...field}
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={control}
-                  name={`graphSources.${index}.contextFields`}
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Context fields</FormLabel>
-                      <FormControl>
-                        <Input placeholder="title, body" {...field} />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              </div>
-              {graphSources.fields.length > 1 && (
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={index === 0}
-                    aria-label={`Move graph source ${index + 1} earlier`}
-                    onClick={() => graphSources.move(index, index - 1)}
-                  >
-                    Move earlier
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={index === graphSources.fields.length - 1}
-                    aria-label={`Move graph source ${index + 1} later`}
-                    onClick={() => graphSources.move(index, index + 1)}
-                  >
-                    Move later
-                  </Button>
-                  <Button type="button" variant="ghost" onClick={() => graphSources.remove(index)}>
-                    Remove source
-                  </Button>
-                </div>
+                        <FormLabel className="font-normal">Artifact streams</FormLabel>
+                      </FormItem>
+                    </RadioGroup>
+                  </FormControl>
+                </FormItem>
               )}
+            />
+          ) : (
+            <Alert>
+              <AlertDescription>
+                This deployment supports graph indexes over document fields. Artifact-backed graph
+                sources are unavailable.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {graphSourceType === "document_fields" ? (
+            <div className="space-y-3">
+              <p className="text-xs text-muted-foreground">
+                Each edge type reads target document IDs from its field. Leave the field empty to
+                use explicit <code>_edges</code> entries with the matching type.
+              </p>
+              {graphEdgeTypes.fields.map((edgeType, index) => (
+                <div key={edgeType.id} className="space-y-3 rounded-md border p-3">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <FormField
+                      control={control}
+                      name={`graphEdgeTypes.${index}.name`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Edge type</FormLabel>
+                          <FormControl>
+                            <Input placeholder="related" {...field} />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphEdgeTypes.${index}.field`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Target ID field (optional)</FormLabel>
+                          <FormControl>
+                            <Combobox
+                              options={schemaFields.map((value) => ({ value, label: value }))}
+                              value={field.value}
+                              onChange={field.onChange}
+                              placeholder="Select or enter field"
+                              allowCustomValue
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphEdgeTypes.${index}.topology`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Topology</FormLabel>
+                          <Select value={field.value} onValueChange={field.onChange}>
+                            <FormControl>
+                              <SelectTrigger>
+                                <SelectValue />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              <SelectItem value="graph">Graph</SelectItem>
+                              <SelectItem value="tree">Tree</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphEdgeTypes.${index}.allowSelfLoops`}
+                      render={({ field }) => (
+                        <FormItem className="flex items-center justify-between rounded-md border px-3 py-2">
+                          <FormLabel className="font-normal">Allow self-loops</FormLabel>
+                          <FormControl>
+                            <Switch checked={field.value} onCheckedChange={field.onChange} />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+                  {graphEdgeTypes.fields.length > 1 && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      onClick={() => graphEdgeTypes.remove(index)}
+                    >
+                      Remove edge type
+                    </Button>
+                  )}
+                </div>
+              ))}
+              <Button
+                type="button"
+                variant="outline"
+                disabled={graphEdgeTypes.fields.length >= 64}
+                onClick={() =>
+                  graphEdgeTypes.append({
+                    name: "",
+                    field: "",
+                    topology: "graph",
+                    allowSelfLoops: true,
+                  })
+                }
+              >
+                Add edge type
+              </Button>
             </div>
-          ))}
-          <Button
-            type="button"
-            variant="outline"
-            disabled={graphSources.fields.length >= 64}
-            onClick={() =>
-              graphSources.append({
-                artifact: "",
-                path: "",
-                format: "extraction_relation",
-                mentionEdgeType: "",
-                nodeModel: "document",
-                sourceNode: "",
-                targetNode: "",
-                edgeType: "",
-                edgeWeight: "",
-                edgeMetadata: "",
-                contextFields: "",
-              })
-            }
-          >
-            Add graph source
-          </Button>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-xs text-muted-foreground">
+                Sources are evaluated in order; earlier sources win when multiple artifacts produce
+                the same edge identity.
+              </p>
+              {graphSources.fields.map((source, index) => (
+                <div key={source.id} className="space-y-2 rounded-md border p-3">
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.artifact`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Artifact</FormLabel>
+                          <FormControl>
+                            <Input placeholder="relations_v1" {...field} />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.path`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>JSON path</FormLabel>
+                          <FormControl>
+                            <Input placeholder="$.relations[*]" {...field} />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.format`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Format</FormLabel>
+                          <Select value={field.value} onValueChange={field.onChange}>
+                            <FormControl>
+                              <SelectTrigger>
+                                <SelectValue />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              <SelectItem value="extraction_relation">
+                                Extraction relation
+                              </SelectItem>
+                              <SelectItem value="extraction_graph">Extraction graph</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.nodeModel`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Node model</FormLabel>
+                          <Select value={field.value} onValueChange={field.onChange}>
+                            <FormControl>
+                              <SelectTrigger>
+                                <SelectValue />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              <SelectItem value="document">Document</SelectItem>
+                              <SelectItem value="external">External</SelectItem>
+                            </SelectContent>
+                          </Select>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.mentionEdgeType`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Mention edge type</FormLabel>
+                          <FormControl>
+                            <Input placeholder="mentions" {...field} />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.sourceNode`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Source node template</FormLabel>
+                          <FormControl>
+                            <Input placeholder="{{ _doc.key }}" {...field} />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.targetNode`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Target node template</FormLabel>
+                          <FormControl>
+                            <Input placeholder="{{ _item.target.text }}" {...field} />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.edgeType`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Edge type template</FormLabel>
+                          <FormControl>
+                            <Input placeholder="{{ _item.predicate }}" {...field} />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.edgeWeight`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Edge weight</FormLabel>
+                          <FormControl>
+                            <Input placeholder="1.0 or {{ _item.confidence }}" {...field} />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.edgeMetadata`}
+                      render={({ field }) => (
+                        <FormItem className="sm:col-span-2">
+                          <FormLabel>Edge metadata JSON</FormLabel>
+                          <FormControl>
+                            <Textarea
+                              className="min-h-20 font-mono text-xs"
+                              placeholder={'{"evidence":"{{ _item.evidence }}"}'}
+                              {...field}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={control}
+                      name={`graphSources.${index}.contextFields`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel>Context fields</FormLabel>
+                          <FormControl>
+                            <Input placeholder="title, body" {...field} />
+                          </FormControl>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
+                  </div>
+                  {graphSources.fields.length > 1 && (
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={index === 0}
+                        aria-label={`Move graph source ${index + 1} earlier`}
+                        onClick={() => graphSources.move(index, index - 1)}
+                      >
+                        Move earlier
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={index === graphSources.fields.length - 1}
+                        aria-label={`Move graph source ${index + 1} later`}
+                        onClick={() => graphSources.move(index, index + 1)}
+                      >
+                        Move later
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        onClick={() => graphSources.remove(index)}
+                      >
+                        Remove source
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              ))}
+              <Button
+                type="button"
+                variant="outline"
+                disabled={graphSources.fields.length >= 64}
+                onClick={() =>
+                  graphSources.append({
+                    artifact: "",
+                    path: "",
+                    format: "extraction_relation",
+                    mentionEdgeType: "",
+                    nodeModel: "document",
+                    sourceNode: "",
+                    targetNode: "",
+                    edgeType: "",
+                    edgeWeight: "",
+                    edgeMetadata: "",
+                    contextFields: "",
+                  })
+                }
+              >
+                Add graph source
+              </Button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -781,6 +1018,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
   tableName,
   onIndexCreated,
   schema,
+  artifactSourcesSupported = false,
 }) => {
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"form" | "json">("form");
@@ -805,6 +1043,15 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
       fullTextSourceType: "field",
       fullTextField: "",
       fullTextArtifacts: [{ artifact: "" }],
+      graphSourceType: artifactSourcesSupported ? "artifacts" : "document_fields",
+      graphEdgeTypes: [
+        {
+          name: "",
+          field: "",
+          topology: "graph",
+          allowSelfLoops: true,
+        },
+      ],
       graphSources: [
         {
           artifact: "",
@@ -850,27 +1097,43 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
                 : {}),
           } as IndexConfig;
         } else if (data.indexType === "graph") {
-          indexConfig = {
-            name: data.name || "",
-            type: "graph",
-            sources: (data.graphSources ?? [])
-              .filter((source) => source?.artifact)
-              .map((source) =>
-                buildGraphSourceConfig({
-                  artifact: source?.artifact || "",
-                  path: source?.path,
-                  format: source?.format ?? "extraction_relation",
-                  mentionEdgeType: source?.mentionEdgeType,
-                  nodeModel: source?.nodeModel ?? "document",
-                  sourceNode: source?.sourceNode,
-                  targetNode: source?.targetNode,
-                  edgeType: source?.edgeType,
-                  edgeWeight: source?.edgeWeight,
-                  edgeMetadata: source?.edgeMetadata,
-                  contextFields: source?.contextFields,
-                })
-              ),
-          } as IndexConfig;
+          indexConfig =
+            data.graphSourceType === "document_fields"
+              ? ({
+                  name: data.name || "",
+                  type: "graph",
+                  edge_types: (data.graphEdgeTypes ?? [])
+                    .filter((edgeType) => edgeType?.name)
+                    .map((edgeType) =>
+                      buildGraphEdgeTypeConfig({
+                        name: edgeType?.name ?? "",
+                        field: edgeType?.field,
+                        topology: edgeType?.topology ?? "graph",
+                        allowSelfLoops: edgeType?.allowSelfLoops ?? true,
+                      })
+                    ),
+                } as IndexConfig)
+              : ({
+                  name: data.name || "",
+                  type: "graph",
+                  sources: (data.graphSources ?? [])
+                    .filter((source) => source?.artifact)
+                    .map((source) =>
+                      buildGraphSourceConfig({
+                        artifact: source?.artifact || "",
+                        path: source?.path,
+                        format: source?.format ?? "extraction_relation",
+                        mentionEdgeType: source?.mentionEdgeType,
+                        nodeModel: source?.nodeModel ?? "document",
+                        sourceNode: source?.sourceNode,
+                        targetNode: source?.targetNode,
+                        edgeType: source?.edgeType,
+                        edgeWeight: source?.edgeWeight,
+                        edgeMetadata: source?.edgeMetadata,
+                        contextFields: source?.contextFields,
+                      })
+                    ),
+                } as IndexConfig);
         } else {
           const sourceType = data.sourceType ?? "field";
           const artifactSources = data.artifactSources ?? [];
@@ -918,6 +1181,9 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
       let indexConfig: IndexConfig;
       if (viewMode === "json") {
         indexConfig = parseAdvancedIndexConfig(jsonSource);
+        if (!artifactSourcesSupported && usesArtifactSources(indexConfig)) {
+          throw new Error("Artifact-backed index sources are unavailable on this deployment.");
+        }
       } else if (data.indexType === "full_text") {
         indexConfig =
           data.fullTextSourceType === "artifacts"
@@ -936,11 +1202,18 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
                   : {}),
               } as IndexConfig);
       } else if (data.indexType === "graph") {
-        indexConfig = {
-          name: data.name,
-          type: "graph",
-          sources: graphIndexSources(...data.graphSources.map(buildGraphSourceConfig)),
-        } as IndexConfig;
+        indexConfig =
+          data.graphSourceType === "document_fields"
+            ? ({
+                name: data.name,
+                type: "graph",
+                edge_types: data.graphEdgeTypes.map(buildGraphEdgeTypeConfig),
+              } as IndexConfig)
+            : ({
+                name: data.name,
+                type: "graph",
+                sources: graphIndexSources(...data.graphSources.map(buildGraphSourceConfig)),
+              } as IndexConfig);
       } else {
         let embedderConfig: EmbedderConfig;
         const { provider, model, api_key, url, region } = data.embedder;
@@ -1112,7 +1385,10 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
               )}
             </div>
           ) : (
-            <IndexKindForm schemaFields={schemaFields} />
+            <IndexKindForm
+              schemaFields={schemaFields}
+              artifactSourcesSupported={artifactSourcesSupported}
+            />
           )}
           <FormActions>
             <DialogTrigger asChild>

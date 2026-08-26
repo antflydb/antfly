@@ -7768,6 +7768,32 @@ fn runtimeFreeGraphWriteFields(alloc: Allocator, write: types.GraphEdgeWrite) vo
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
 }
 
+test "enrichment runtime graph materializer rejects non-finite mapped weights" {
+    const alloc = std.testing.allocator;
+    const source = index_manager_mod.GraphArtifactSource{
+        .artifact_name = @constCast("relations_v1"),
+        .mapping = .{ .weight_template = @constCast("{{ _item.score }}") },
+    };
+    for ([_][]const u8{ "NaN", "Inf", "-Inf" }) |weight| {
+        const raw = try std.fmt.allocPrint(
+            alloc,
+            "{{\"type\":\"mentions\",\"target\":\"doc:b\",\"score\":\"{s}\"}}",
+            .{weight},
+        );
+        defer alloc.free(raw);
+        try std.testing.expectError(error.InvalidGraphEdges, runtimeGraphWritesFromArtifactValueAlloc(
+            alloc,
+            "relations_graph",
+            "doc:a",
+            raw,
+            source,
+            "application/json",
+            null,
+            100,
+        ));
+    }
+}
+
 fn runtimeAppendRelationItemsFromPath(
     alloc: Allocator,
     writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
@@ -7883,6 +7909,7 @@ fn runtimeAppendRelationItem(
         const trimmed = std.mem.trim(u8, rendered, &std.ascii.whitespace);
         break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
     } else runtimeJsonFloatField(item, "weight") orelse runtimeJsonFloatField(item, "confidence") orelse 1.0;
+    if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
     const metadata_json = if (mapping.metadata_template_json.len > 0)
         try runtimeRenderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else

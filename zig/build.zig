@@ -3821,7 +3821,7 @@ pub fn build(b: *std.Build) void {
         "api http server obtains query embedding policy from resource manager",
         "api http stale hierarchy cursor response is actionable and machine readable",
         "api http unsupported unsorted query response is machine readable",
-        "api http mixed hierarchy grouping response uses the public contract",
+        "api http unsupported hierarchy grouping response uses the public contract",
         "api http point lookup retries bounded local readiness races",
         "api http hierarchy traversal preserves policy and cursor across remote hydration seam",
         "api http public sort gate accepts synthetic hierarchy child positions",

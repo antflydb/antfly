@@ -103,6 +103,7 @@ pub fn encodeEdgeValueAlloc(
     updated_at: u64,
     metadata: []const u8,
 ) ![]u8 {
+    try validateEdgeWeight(weight);
     const encoded_len = std.math.add(usize, edge_value_header_len, metadata.len) catch
         return error.EdgeMetadataTooLarge;
     const buf = try alloc.alloc(u8, encoded_len);
@@ -113,6 +114,14 @@ pub fn encodeEdgeValueAlloc(
     std.mem.writeInt(u64, buf[16..24], updated_at, .little);
     @memcpy(buf[edge_value_header_len..], metadata);
     return buf;
+}
+
+/// Graph weights participate in filtering, ordering, and path arithmetic.
+/// Keeping the invariant at the storage boundary prevents malformed derived
+/// artifacts and callers that bypass public validation from persisting NaN or
+/// infinity and making those operations non-deterministic.
+pub fn validateEdgeWeight(weight: f64) !void {
+    if (!std.math.isFinite(weight)) return error.InvalidGraphEdgeWeight;
 }
 
 /// Decode edge value from binary format.
@@ -937,6 +946,7 @@ pub const GraphIndex = struct {
     pub fn batchApply(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete) !void {
         if (writes.len == 0 and deletes.len == 0) return;
 
+        for (writes) |write| try validateEdgeWeight(write.weight);
         try self.validateTreeBatchWrites(writes, deletes);
 
         var main_batch = try self.beginWriteOutgoingBatch();
@@ -1764,6 +1774,16 @@ test "graph edge encoding round-trip" {
     try std.testing.expectEqual(@as(u64, 1234567890), decoded.created_at);
     try std.testing.expectEqual(@as(u64, 1234567891), decoded.updated_at);
     try std.testing.expectEqualStrings("{\"key\":\"val\"}", decoded.metadata);
+}
+
+test "graph storage rejects non-finite edge weights" {
+    const alloc = std.testing.allocator;
+    for ([_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |weight| {
+        try std.testing.expectError(
+            error.InvalidGraphEdgeWeight,
+            encodeEdgeValueAlloc(alloc, weight, 0, 0, "{}"),
+        );
+    }
 }
 
 test "graph edge values support large metadata and reject truncated records" {

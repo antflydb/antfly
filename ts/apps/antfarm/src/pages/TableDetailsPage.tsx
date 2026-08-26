@@ -66,7 +66,6 @@ import AIQueryAssistant from "../components/AIQueryAssistant";
 import CreateIndexDialog from "../components/CreateIndexDialog";
 import DocumentBuilder from "../components/DocumentBuilder";
 import { GraphIndexExplorer } from "../components/GraphIndexExplorer";
-
 import BulkInsert from "../components/Insert";
 import JsonViewer from "../components/JsonViewer";
 import FieldSelector from "../components/querybuilder/FieldSelector";
@@ -76,6 +75,7 @@ import SearchBoxBuilder from "../components/SearchBoxBuilder";
 import DocumentSchemasForm from "../components/schema-builder/DocumentSchemasForm";
 import { DocumentArtifactsPanel } from "../components/table/DocumentArtifactsPanel";
 import { TableReprocessPanel } from "../components/table/TableReprocessPanel";
+import { useApi } from "../hooks/use-api-config";
 import {
   type BasicField,
   generateBasicFields,
@@ -242,6 +242,7 @@ interface TableDetailsPageProps {
 
 const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "overview" }) => {
   const theme = localStorage.getItem("theme") || "light";
+  const client = useApi();
   const { tableName } = useParams<{ tableName: string }>();
   const activeTableName = useRef(tableName);
   activeTableName.current = tableName;
@@ -260,6 +261,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [migration, setMigration] = useState<AntflyTable["migration"]>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [openCreateDialog, setOpenCreateDialog] = useState(false);
+  const [artifactSourcesSupported, setArtifactSourcesSupported] = useState(false);
   const [openDropDialog, setOpenDropDialog] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState<IndexStatus | null>(null);
   const [query, setQuery] = useState("");
@@ -269,6 +271,27 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [semanticQuery, setSemanticQuery] = useState(JSON.stringify({}, null, 2));
   const [selectedFields, setSelectedFields] = useState<string[]>([]);
   const [includeProfile, setIncludeProfile] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    setArtifactSourcesSupported(false);
+    void client
+      .getStatus()
+      .then((status) => {
+        if (active) {
+          const capabilities = status.index_capabilities as
+            | { artifact_sources?: unknown }
+            | undefined;
+          setArtifactSourcesSupported(capabilities?.artifact_sources === true);
+        }
+      })
+      .catch(() => {
+        if (active) setArtifactSourcesSupported(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [client]);
 
   // Derive search modes from input content instead of toggles
   const hasSemanticQuery = query.trim().length > 0 && queryIndexes.length > 0;
@@ -1532,6 +1555,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         tableName={tableName || ""}
         onIndexCreated={handleIndexCreated}
         schema={tableSchema}
+        artifactSourcesSupported={artifactSourcesSupported}
       />
       <Dialog open={openDropDialog} onOpenChange={setOpenDropDialog}>
         <DialogContent className="max-w-[450px]">

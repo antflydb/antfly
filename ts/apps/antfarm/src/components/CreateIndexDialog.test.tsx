@@ -2,14 +2,23 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TableSchema } from "../api";
 import CreateIndexDialog, {
+  buildGraphEdgeTypeConfig,
   buildGraphSourceConfig,
   getSchemaFieldNames,
   parseAdvancedIndexConfig,
 } from "./CreateIndexDialog";
 
 vi.mock("./IndexForm", () => ({
-  default: ({ schemaFields }: { schemaFields: string[] }) => (
-    <div data-testid="index-form">{schemaFields.join(",")}</div>
+  default: ({
+    schemaFields,
+    allowArtifactSources,
+  }: {
+    schemaFields: string[];
+    allowArtifactSources: boolean;
+  }) => (
+    <div data-testid="index-form" data-artifact-sources={allowArtifactSources}>
+      {schemaFields.join(",")}
+    </div>
   ),
 }));
 
@@ -74,6 +83,22 @@ describe("CreateIndexDialog", () => {
         metadata: { evidence: "{{ _item.evidence }}" },
       },
       context: { doc_fields: ["title", "body"] },
+    });
+  });
+
+  it("normalizes direct document-field graph edge types", () => {
+    expect(
+      buildGraphEdgeTypeConfig({
+        name: " citations ",
+        field: " cited_ids ",
+        topology: "tree",
+        allowSelfLoops: false,
+      })
+    ).toEqual({
+      name: "citations",
+      field: "cited_ids",
+      topology: "tree",
+      allow_self_loops: false,
     });
   });
 
@@ -238,6 +263,7 @@ describe("CreateIndexDialog", () => {
         tableName="docs"
         onIndexCreated={() => undefined}
         schema={null}
+        artifactSourcesSupported
       />
     );
 
@@ -251,5 +277,34 @@ describe("CreateIndexDialog", () => {
     expect(
       screen.getAllByPlaceholderText("relations_v1").map((input) => input.getAttribute("value"))
     ).toEqual(["fallback_relations", "primary_relations"]);
+  });
+
+  it("uses direct graph fields and hides artifact controls when unsupported", () => {
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      }
+    );
+    render(
+      <CreateIndexDialog
+        open
+        onClose={() => undefined}
+        tableName="docs"
+        onIndexCreated={() => undefined}
+        schema={null}
+        artifactSourcesSupported={false}
+      />
+    );
+
+    expect(screen.getByTestId("index-form").getAttribute("data-artifact-sources")).toBe("false");
+    fireEvent.click(screen.getByRole("radio", { name: "Graph" }));
+
+    expect(screen.getByText(/supports graph indexes over document fields/i)).toBeTruthy();
+    expect(screen.getByPlaceholderText("related")).toBeTruthy();
+    expect(screen.queryByPlaceholderText("relations_v1")).toBeNull();
+    expect(screen.queryByRole("radio", { name: "Artifact streams" })).toBeNull();
   });
 });
