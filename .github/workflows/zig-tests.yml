@@ -185,6 +185,8 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             scripts/install.sh \
             scripts/test_install_download_markers.sh \
+            scripts/test_quickstart_docs.py \
+            docs/guides/quickstart.mdx \
             .github/workflows/cli-publish.yml \
             .github/workflows/zig-tests.yml
           then
@@ -207,6 +209,7 @@ jobs:
       - name: Test release download markers
         run: |
           scripts/test_install_download_markers.sh
+          scripts/test_quickstart_docs.py
           sh -n scripts/install.sh
           bash -n scripts/test_install_download_markers.sh
 

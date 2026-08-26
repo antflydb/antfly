@@ -8,8 +8,46 @@ error() { echo "ERROR: $*" >&2; exit 1; }
 warning() { echo "WARNING: $*" >&2; }
 
 TEMP_DIR=$(mktemp -d)
-cleanup() { rm -rf "$TEMP_DIR"; }
+TRANSACTION_ACTIVE=0
+
+rollback_target() {
+    KEY="$1"
+    TARGET="$2"
+    [ -n "$TARGET" ] || return 0
+
+    NEW_TARGET="${TARGET}.antfly-new.$$"
+    BACKUP_TARGET="${TARGET}.antfly-backup.$$"
+    STATE_DIR="$TEMP_DIR/state/$KEY"
+
+    if [ -f "$STATE_DIR/activated" ]; then
+        rm -rf "$TARGET" || warning "Could not remove incomplete installation at $TARGET"
+    fi
+    if [ -f "$STATE_DIR/backed-up" ] && [ -e "$BACKUP_TARGET" ]; then
+        mv "$BACKUP_TARGET" "$TARGET" || warning "Could not restore previous installation at $TARGET"
+    fi
+    rm -rf "$NEW_TARGET" || true
+}
+
+rollback_installation() {
+    warning "Installation failed; restoring the previous Antfly installation"
+    rollback_target fish "${FISH_TARGET:-}"
+    rollback_target zsh "${ZSH_TARGET:-}"
+    rollback_target bash "${BASH_TARGET:-}"
+    rollback_target lib "${LIB_TARGET:-}"
+    rollback_target binary "${BIN_TARGET:-}"
+}
+
+cleanup() {
+    EXIT_CODE=$?
+    trap - EXIT HUP INT TERM
+    if [ "$TRANSACTION_ACTIVE" -eq 1 ]; then
+        rollback_installation
+    fi
+    rm -rf "$TEMP_DIR"
+    exit "$EXIT_CODE"
+}
 trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 available() { command -v "$1" >/dev/null; }
 
@@ -40,6 +78,89 @@ download_archive() {
             curl -A "antfly-installer/1" "$@"
             ;;
     esac
+}
+
+verify_archive_checksum() {
+    ARCHIVE_PATH="$1"
+    CHECKSUMS_PATH="$2"
+    ARCHIVE_NAME="$3"
+    EXPECTED_SHA256=""
+
+    while read -r CHECKSUM FILE_NAME; do
+        if [ "$FILE_NAME" = "$ARCHIVE_NAME" ]; then
+            EXPECTED_SHA256="$CHECKSUM"
+            break
+        fi
+    done < "$CHECKSUMS_PATH"
+
+    case "$EXPECTED_SHA256" in
+        ''|*[!0-9a-fA-F]*) error "Release checksums do not contain a valid SHA-256 for $ARCHIVE_NAME" ;;
+    esac
+    if [ "${#EXPECTED_SHA256}" -ne 64 ]; then
+        error "Release checksums contain an invalid SHA-256 for $ARCHIVE_NAME"
+    fi
+
+    if available sha256sum; then
+        set -- $(sha256sum "$ARCHIVE_PATH")
+        ACTUAL_SHA256="$1"
+    elif available shasum; then
+        set -- $(shasum -a 256 "$ARCHIVE_PATH")
+        ACTUAL_SHA256="$1"
+    else
+        error "Checksum verification requires sha256sum or shasum"
+    fi
+
+    if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+        error "Checksum verification failed for $ARCHIVE_NAME"
+    fi
+    status "Verified SHA-256 for $ARCHIVE_NAME"
+}
+
+prepare_target() {
+    KEY="$1"
+    SOURCE="$2"
+    TARGET="$3"
+    NEW_TARGET="${TARGET}.antfly-new.$$"
+    BACKUP_TARGET="${TARGET}.antfly-backup.$$"
+    STATE_DIR="$TEMP_DIR/state/$KEY"
+
+    if [ -e "$NEW_TARGET" ] || [ -e "$BACKUP_TARGET" ]; then
+        error "Refusing to overwrite an existing installer staging path for $TARGET"
+    fi
+
+    mkdir -p "$STATE_DIR" "$(dirname "$TARGET")"
+    if [ -d "$SOURCE" ]; then
+        mkdir "$NEW_TARGET"
+        cp -R "$SOURCE/." "$NEW_TARGET/"
+    else
+        cp "$SOURCE" "$NEW_TARGET"
+    fi
+    printf '%s\n' "$TARGET" > "$STATE_DIR/target"
+}
+
+activate_target() {
+    KEY="$1"
+    TARGET="$2"
+    NEW_TARGET="${TARGET}.antfly-new.$$"
+    BACKUP_TARGET="${TARGET}.antfly-backup.$$"
+    STATE_DIR="$TEMP_DIR/state/$KEY"
+
+    if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+        mv "$TARGET" "$BACKUP_TARGET"
+        : > "$STATE_DIR/backed-up"
+    fi
+    mv "$NEW_TARGET" "$TARGET"
+    : > "$STATE_DIR/activated"
+}
+
+finalize_target() {
+    KEY="$1"
+    TARGET="$2"
+    STATE_DIR="$TEMP_DIR/state/$KEY"
+    BACKUP_TARGET="${TARGET}.antfly-backup.$$"
+
+    rm -rf "$BACKUP_TARGET"
+    rm -rf "$STATE_DIR"
 }
 
 # Detect OS and architecture
@@ -102,14 +223,30 @@ EOF
 
     ARCHIVE_NAME="antfly_${VERSION_NUM}_${OS}_${ARCH}.tar.gz"
     DOWNLOAD_URL="https://releases.antfly.io/antfly/${TAG}/${ARCHIVE_NAME}"
+    CHECKSUMS_URL="https://releases.antfly.io/antfly/${TAG}/antfly_zig_checksums.txt"
 
     status "Downloading from $DOWNLOAD_URL..."
     if ! download_archive -fsSL "$DOWNLOAD_URL" -o "$TEMP_DIR/$ARCHIVE_NAME"; then
         error "Failed to download Antfly. Please check your internet connection and the version number."
     fi
 
+    status "Downloading release checksums..."
+    if ! download_archive -fsSL "$CHECKSUMS_URL" -o "$TEMP_DIR/antfly_zig_checksums.txt"; then
+        error "Failed to download release checksums for $TAG. Installation was not changed."
+    fi
+    verify_archive_checksum \
+        "$TEMP_DIR/$ARCHIVE_NAME" \
+        "$TEMP_DIR/antfly_zig_checksums.txt" \
+        "$ARCHIVE_NAME"
+
     status "Extracting archive..."
-    tar -xzf "$TEMP_DIR/$ARCHIVE_NAME" -C "$TEMP_DIR"
+    EXTRACT_DIR="$TEMP_DIR/extracted"
+    mkdir "$EXTRACT_DIR"
+    tar -xzf "$TEMP_DIR/$ARCHIVE_NAME" -C "$EXTRACT_DIR"
+
+    if [ ! -f "$EXTRACT_DIR/antfly" ]; then
+        error "Release archive does not contain the antfly binary"
+    fi
 
     # Determine install location
     if [ "$(id -u)" -eq 0 ]; then
@@ -120,82 +257,71 @@ EOF
         # Running as regular user
         INSTALL_DIR="$HOME/.local/bin"
         LIB_DIR="$HOME/.local/lib/antfly"
-        mkdir -p "$INSTALL_DIR"
     fi
 
-    status "Installing binaries to $INSTALL_DIR..."
+    BIN_TARGET="$INSTALL_DIR/antfly"
+    LIB_TARGET=""
+    BASH_TARGET=""
+    ZSH_TARGET=""
+    FISH_TARGET=""
 
-    # Install the Zig runtime.
-    if [ -f "$TEMP_DIR/antfly" ]; then
-        install_binary "$TEMP_DIR/antfly" "$INSTALL_DIR/antfly"
+    chmod +x "$EXTRACT_DIR/antfly"
+    if [ -d "$EXTRACT_DIR/lib" ]; then
+        LIB_TARGET="$LIB_DIR"
     fi
-    # Install bundled C ABI libraries.
-    if [ -d "$TEMP_DIR/lib" ]; then
-        status "Installing bundled runtime libraries to $LIB_DIR..."
-        if [ -w "$(dirname "$LIB_DIR")" ] || [ "$(id -u)" -eq 0 ]; then
-            mkdir -p "$LIB_DIR"
-            cp -r "$TEMP_DIR/lib/"* "$LIB_DIR/"
-        else
-            sudo mkdir -p "$LIB_DIR"
-            sudo cp -r "$TEMP_DIR/lib/"* "$LIB_DIR/"
-        fi
-        status "Installed runtime libraries to $LIB_DIR"
+    if [ -f "$EXTRACT_DIR/completions/antfly.bash" ]; then
+        BASH_COMPLETION_DIR="${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}/completions"
+        BASH_TARGET="$BASH_COMPLETION_DIR/antfly"
+    fi
+    if [ -f "$EXTRACT_DIR/completions/antfly.zsh" ]; then
+        ZSH_COMPLETION_DIR="${ZSH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions}"
+        ZSH_TARGET="$ZSH_COMPLETION_DIR/_antfly"
+    fi
+    if [ -f "$EXTRACT_DIR/completions/antfly.fish" ]; then
+        FISH_COMPLETION_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
+        FISH_TARGET="$FISH_COMPLETION_DIR/antfly.fish"
     fi
 
-    # Install shell completions if available
-    if [ -d "$TEMP_DIR/completions" ]; then
-        status "Installing shell completions..."
+    # Prepare every target before replacing any existing installation. If
+    # preparation or activation fails, the EXIT trap restores all old targets.
+    TRANSACTION_ACTIVE=1
+    prepare_target binary "$EXTRACT_DIR/antfly" "$BIN_TARGET"
+    [ -z "$LIB_TARGET" ] || prepare_target lib "$EXTRACT_DIR/lib" "$LIB_TARGET"
+    [ -z "$BASH_TARGET" ] || prepare_target bash "$EXTRACT_DIR/completions/antfly.bash" "$BASH_TARGET"
+    [ -z "$ZSH_TARGET" ] || prepare_target zsh "$EXTRACT_DIR/completions/antfly.zsh" "$ZSH_TARGET"
+    [ -z "$FISH_TARGET" ] || prepare_target fish "$EXTRACT_DIR/completions/antfly.fish" "$FISH_TARGET"
 
-        # Bash completions
-        if [ -f "$TEMP_DIR/completions/antfly.bash" ]; then
-            BASH_COMPLETION_DIR="${BASH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion}/completions"
-            mkdir -p "$BASH_COMPLETION_DIR"
-            cp "$TEMP_DIR/completions/antfly.bash" "$BASH_COMPLETION_DIR/antfly" 2>/dev/null || true
-        fi
+    status "Activating Antfly $TAG..."
+    activate_target binary "$BIN_TARGET"
+    [ -z "$LIB_TARGET" ] || activate_target lib "$LIB_TARGET"
+    [ -z "$BASH_TARGET" ] || activate_target bash "$BASH_TARGET"
+    [ -z "$ZSH_TARGET" ] || activate_target zsh "$ZSH_TARGET"
+    [ -z "$FISH_TARGET" ] || activate_target fish "$FISH_TARGET"
 
-        # Zsh completions
-        if [ -f "$TEMP_DIR/completions/antfly.zsh" ]; then
-            ZSH_COMPLETION_DIR="${ZSH_COMPLETION_USER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions}"
-            mkdir -p "$ZSH_COMPLETION_DIR"
-            cp "$TEMP_DIR/completions/antfly.zsh" "$ZSH_COMPLETION_DIR/_antfly" 2>/dev/null || true
-        fi
-
-        # Fish completions
-        if [ -f "$TEMP_DIR/completions/antfly.fish" ]; then
-            FISH_COMPLETION_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"
-            mkdir -p "$FISH_COMPLETION_DIR"
-            cp "$TEMP_DIR/completions/antfly.fish" "$FISH_COMPLETION_DIR/antfly.fish" 2>/dev/null || true
-        fi
-    fi
+    # Every new target is now active. Commit before removing backups so a
+    # cleanup failure cannot trigger a rollback after an earlier backup was
+    # already deleted and leave a mixed installation behind.
+    TRANSACTION_ACTIVE=0
+    finalize_target binary "$BIN_TARGET"
+    [ -z "$LIB_TARGET" ] || finalize_target lib "$LIB_TARGET"
+    [ -z "$BASH_TARGET" ] || finalize_target bash "$BASH_TARGET"
+    [ -z "$ZSH_TARGET" ] || finalize_target zsh "$ZSH_TARGET"
+    [ -z "$FISH_TARGET" ] || finalize_target fish "$FISH_TARGET"
 
     status "Antfly installation complete!"
-    status ""
-    status "Run 'antfly --help' to get started"
+    status "Installed antfly to $BIN_TARGET"
 
     # Check if install dir is in PATH
     case ":$PATH:" in
         *":$INSTALL_DIR:"*) ;;
         *)
             warning "$INSTALL_DIR is not in your PATH"
-            warning "Add the following to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-            warning "  export PATH=\"\$PATH:$INSTALL_DIR\""
+            warning "Run this command before continuing:"
+            warning "  export PATH=\"$INSTALL_DIR:\$PATH\""
             ;;
     esac
-}
 
-# Install a single binary to the target path
-install_binary() {
-    SRC="$1"
-    DST="$2"
-    if [ -w "$(dirname "$DST")" ] || [ "$(id -u)" -eq 0 ]; then
-        mv "$SRC" "$DST"
-        chmod +x "$DST"
-    else
-        status "Need sudo permission to install to $(dirname "$DST")"
-        sudo mv "$SRC" "$DST"
-        sudo chmod +x "$DST"
-    fi
-    status "Installed $(basename "$DST") to $DST"
+    status "Run '$BIN_TARGET --help' to get started"
 }
 
 # Main execution
@@ -209,8 +335,8 @@ main() {
 Antfly Installer
 
 Usage:
-  curl -fsSL https://antfly.io/install.sh | sh
-  curl -fsSL https://antfly.io/install.sh | sh -s -- v0.2.0
+  curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
+  curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh -s -- v0.2.0
 
 Options:
   -h, --help    Show this help message
@@ -232,6 +358,8 @@ Environment:
   By default, it installs to:
     - /usr/local/bin (if running as root)
     - ~/.local/bin (if running as regular user)
+
+  Release archives are verified using the SHA-256 published with the release.
 
 For more information, visit: https://docs.antfly.io
 EOF

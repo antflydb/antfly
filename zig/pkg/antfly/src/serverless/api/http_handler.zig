@@ -5720,6 +5720,10 @@ fn appendServerlessIndexStatusJson(
 ) !void {
     try out.appendSlice(alloc, "{\"readiness\":{\"state\":");
     try out.appendSlice(alloc, if (status.readiness_ready) "\"ready\"" else "\"pending\"");
+    try out.appendSlice(alloc, ",\"queryable\":");
+    try out.appendSlice(alloc, if (status.readiness_ready) "true" else "false");
+    try out.appendSlice(alloc, ",\"complete\":");
+    try out.appendSlice(alloc, if (status.readiness_ready) "true" else "false");
     if (status.readiness_incarnation) |incarnation| {
         try out.print(alloc, ",\"incarnation\":\"g-{x:0>16}\"", .{incarnation});
     }
@@ -6067,8 +6071,34 @@ test "serverless readiness serializes durable incarnation as an opaque token" {
         .doc_count = 0,
         .total_indexed = 0,
     });
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true,\"pending_reasons\":[]}}",
+        encoded.items,
+    );
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"incarnation\":\"g-000000000000002a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "_coverage_incarnation") == null);
+}
+
+test "serverless pending readiness is explicitly non-queryable and incomplete" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendServerlessIndexStatusJson(alloc, &encoded, .{
+        .readiness_ready = false,
+        .readiness_incarnation = null,
+        .readiness_target_revision = 7,
+        .readiness_published_revision = null,
+        .rebuilding = true,
+        .backfill_active = true,
+        .doc_count = 0,
+        .total_indexed = 0,
+    });
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"publication\"]}}",
+        encoded.items,
+    );
 }
 
 fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !void {
@@ -8595,7 +8625,7 @@ test "serverless create index normalization resolves and persists one probed emb
     defer alloc.free(response);
     try ant_json.testing.expectEqualJsonText(
         alloc,
-        "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
+        "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
         response,
     );
 }

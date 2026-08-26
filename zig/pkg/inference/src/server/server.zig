@@ -4596,6 +4596,7 @@ pub const Node = struct {
             .missing => ctx.status(404).json(.{
                 .@"error" = "MODEL_NOT_FOUND",
                 .message = "model not found",
+                .hint = "Run `antfly inference list`; pull the requested model or restart with --models-dir <path>",
             }),
             .internal => ctx.status(500).json(.{
                 .@"error" = "MODEL_RESOLUTION_FAILED",

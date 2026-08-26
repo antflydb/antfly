@@ -55,6 +55,8 @@ pub var test_stop_entered: std.atomic.Value(bool) = .init(false);
 pub var test_start_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_execute_admission_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_finish_admission_failures_remaining: std.atomic.Value(u32) = .init(0);
+pub var test_finish_lookup_required_remaining: std.atomic.Value(u32) = .init(0);
+pub var test_lookup_prepare_apply_lock_released: std.atomic.Value(bool) = .init(false);
 pub var test_wait_for_fd_admission: std.atomic.Value(bool) = .init(false);
 pub var test_fd_admission_entered: std.atomic.Value(bool) = .init(false);
 pub var test_fd_admission_canceled: std.atomic.Value(bool) = .init(false);
@@ -416,30 +418,64 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         };
         defer result.deinit(work_alloc);
 
-        lockApplyExclusive(self.apply_mutex);
-        const finish_fd_epoch = self.native_storage_pool.admissionEpoch();
-        _ = finishTextMergeTaskForRuntime(self.index_manager, &task, &result) catch |err| {
-            if (err == error.Canceled) {
-                self.index_manager.cancelTextMergeTask(&task);
+        while (true) {
+            lockApplyExclusive(self.apply_mutex);
+            const finish_fd_epoch = self.native_storage_pool.admissionEpoch();
+            _ = finishTextMergeTaskForRuntime(self.index_manager, &task, &result) catch |err| {
+                if (err == error.TextMergePublicationLookupRequired) {
+                    // A post-snapshot deletion needs an output identity map.
+                    // Release the database-wide apply lock before the O(n)
+                    // scan, then retry the short validate-and-publish phase.
+                    self.apply_mutex.unlockExclusive();
+                    if (builtin.is_test) {
+                        const lock_released = self.apply_mutex.tryLockExclusive();
+                        test_lookup_prepare_apply_lock_released.store(lock_released, .release);
+                        if (lock_released) self.apply_mutex.unlockExclusive();
+                    }
+                    index_manager_mod.IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result) catch |prepare_err| {
+                        lockApplyExclusive(self.apply_mutex);
+                        if (prepare_err == error.Canceled) {
+                            self.index_manager.cancelTextMergeTask(&task);
+                            self.apply_mutex.unlockExclusive();
+                            self.signalProducerAdmissionChanged();
+                            return prepare_err;
+                        }
+                        if (isRecoverableMergeAdmissionError(prepare_err)) {
+                            self.index_manager.cancelTextMergeTask(&task);
+                            self.deferForFdAdmissionError(prepare_err, finish_fd_epoch);
+                            self.apply_mutex.unlockExclusive();
+                            self.signalProducerAdmissionChanged();
+                            return false;
+                        }
+                        self.index_manager.noteTextMergeFailure(&task, prepare_err);
+                        self.apply_mutex.unlockExclusive();
+                        self.signalProducerAdmissionChanged();
+                        return prepare_err;
+                    };
+                    continue;
+                }
+                if (err == error.Canceled) {
+                    self.index_manager.cancelTextMergeTask(&task);
+                    self.apply_mutex.unlockExclusive();
+                    self.signalProducerAdmissionChanged();
+                    return err;
+                }
+                if (isRecoverableMergeAdmissionError(err)) {
+                    self.index_manager.cancelTextMergeTask(&task);
+                    self.deferForFdAdmissionError(err, finish_fd_epoch);
+                    self.apply_mutex.unlockExclusive();
+                    self.signalProducerAdmissionChanged();
+                    return false;
+                }
+                self.index_manager.noteTextMergeFailure(&task, err);
                 self.apply_mutex.unlockExclusive();
                 self.signalProducerAdmissionChanged();
                 return err;
-            }
-            if (isRecoverableMergeAdmissionError(err)) {
-                self.index_manager.cancelTextMergeTask(&task);
-                self.deferForFdAdmissionError(err, finish_fd_epoch);
-                self.apply_mutex.unlockExclusive();
-                self.signalProducerAdmissionChanged();
-                return false;
-            }
-            self.index_manager.noteTextMergeFailure(&task, err);
+            };
             self.apply_mutex.unlockExclusive();
             self.signalProducerAdmissionChanged();
-            return err;
-        };
-        self.apply_mutex.unlockExclusive();
-        self.signalProducerAdmissionChanged();
-        return true;
+            return true;
+        }
     }
 
     pub fn applyBackpressure(self: *TextMergeRuntime) BackpressureOutcome {
@@ -970,6 +1006,9 @@ fn finishTextMergeTaskForRuntime(
     task: *const index_manager_mod.IndexManager.TextMergeTask,
     result: *index_manager_mod.IndexManager.TextMergeResult,
 ) !bool {
+    if (builtin.is_test and consumeTestFailure(&test_finish_lookup_required_remaining)) {
+        return error.TextMergePublicationLookupRequired;
+    }
     if (builtin.is_test and consumeTestFailure(&test_finish_admission_failures_remaining)) {
         return error.PersistentDescriptorAdmissionExhausted;
     }
