@@ -36,8 +36,7 @@ class GraphIndexStats:
         total_edges (int | Unset): Total number of edges in the graph
         edge_types (GraphIndexStatsEdgeTypes | Unset): Count of edges per edge type
         source_artifacts (list[GraphSourceArtifactStatus] | Unset): Configured artifact sources in deterministic
-            precedence order. Catch-up and repair state is reported by the enclosing index status; deprecated per-item
-            compatibility projections must not be interpreted as source-specific telemetry.
+            precedence order. Catch-up and repair state is reported by the enclosing index status.
         rebuilding (bool | Unset): Whether the index is currently rebuilding
         repair (IndexRepairStatus | Unset): Compact user-facing state for an automatic index repair. Detailed
             diagnostics are available from the admin API and metrics.

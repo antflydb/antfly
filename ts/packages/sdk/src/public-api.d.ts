@@ -10215,7 +10215,7 @@ export interface components {
             edge_types?: {
                 [key: string]: number;
             };
-            /** @description Configured artifact sources in deterministic precedence order. Catch-up and repair state is reported by the enclosing index status; deprecated per-item compatibility projections must not be interpreted as source-specific telemetry. */
+            /** @description Configured artifact sources in deterministic precedence order. Catch-up and repair state is reported by the enclosing index status. */
             source_artifacts?: components["schemas"]["GraphSourceArtifactStatus"][];
             /** @description Whether the index is currently rebuilding */
             rebuilding?: boolean;

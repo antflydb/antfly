@@ -4408,7 +4408,7 @@ pub const GraphIndexStats = struct {
     total_edges: ?i64 = null,
     /// Count of edges per edge type
     edge_types: ?std.json.ArrayHashMap(i64) = null,
-    /// Configured artifact sources in deterministic precedence order. Catch-up and repair state is reported by the enclosing index status; deprecated per-item compatibility projections must not be interpreted as source-specific telemetry.
+    /// Configured artifact sources in deterministic precedence order. Catch-up and repair state is reported by the enclosing index status.
     source_artifacts: ?[]const GraphSourceArtifactStatus = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,

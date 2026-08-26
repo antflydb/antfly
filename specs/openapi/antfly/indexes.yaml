@@ -2066,7 +2066,7 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/GraphSourceArtifactStatus"
-          description: "Configured artifact sources in deterministic precedence order. Catch-up and repair state is reported by the enclosing index status; deprecated per-item compatibility projections must not be interpreted as source-specific telemetry."
+          description: "Configured artifact sources in deterministic precedence order. Catch-up and repair state is reported by the enclosing index status."
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean
