@@ -1685,12 +1685,31 @@ func planHA(cluster *antflyv1.AntflyCluster) haPlan {
 		plan.Actions = append(plan.Actions, action)
 	}
 	plan.FormerPrimary = haEvaluateFormerPrimary(status)
+	physicalIsolationRequiresPortableReseed := false
+	if promotion := haPromotionReceipt(status); promotion != nil &&
+		haSucceededFormerPrimaryIsolation(cluster, status, promotion) != nil &&
+		plan.FormerPrimary.RejoinRequired {
+		// A successful Kubernetes physical fence proves the former-primary
+		// process is gone (or has crossed the exact watchdog barrier) and the
+		// StatefulSet remains held at zero. Its pod-local replication log is
+		// therefore deliberately unavailable to the direct rewind API. Do not
+		// send an in-place rewind/reseed command to the promoted primary and
+		// pretend that it owns the old process's log. Publish the fail-closed
+		// portable-reseed disposition for the topology controller instead; it
+		// will bind a fresh seed artifact to the retained former-primary PVC.
+		plan.FormerPrimary.RewindPossible = false
+		plan.FormerPrimary.ReseedRequired = true
+		plan.FormerPrimary.Action = string(haActionReseedFormerPrimary)
+		plan.FormerPrimary.Reason = "FormerPrimaryPhysicallyIsolatedRequiresReseed"
+		physicalIsolationRequiresPortableReseed = true
+	}
 	formerPrimaryFenceDependency := haActionFenceFormerPrimary
 	if action := haFormerPrimaryFencePlannedAction(cluster, status); action.Kind != "" {
 		formerPrimaryFenceDependency = action.Kind
 		plan.Actions = append(plan.Actions, action)
 	}
-	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary, status); action.Kind != "" {
+	if action := haFormerPrimaryPlannedAction(plan.FormerPrimary, status); action.Kind != "" &&
+		(!physicalIsolationRequiresPortableReseed || action.Kind != haActionReseedFormerPrimary) {
 		// Assessment is meaningful only after the promotion receipt exists. The
 		// subsequent mutating rewind/reseed remains ordered behind the concrete
 		// former-primary fence so no old-timeline writer can race repair.

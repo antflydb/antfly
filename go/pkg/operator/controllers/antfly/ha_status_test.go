@@ -4606,6 +4606,57 @@ func validPhysicalIsolationReceiptFixture(now time.Time) (*antflyv1.AntflyCluste
 	return cluster, action
 }
 
+func TestPlanHAPhysicalIsolationRequiresPortableReseedWithoutCallingMissingFormerLog(t *testing.T) {
+	now := time.Date(2026, 8, 26, 21, 8, 36, 0, time.UTC)
+	cluster, isolation := validPhysicalIsolationReceiptFixture(now)
+	cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
+		ClusterID:         100,
+		OldPrimaryID:      "primary-a",
+		PromotedStandbyID: "standby-a",
+		ParentTimelineID:  4,
+		ParentEpoch:       6,
+		NewTimelineID:     5,
+		NewEpoch:          7,
+		SwitchLSN:         13,
+		RequiredLSN:       12,
+		ObservedLSN:       12,
+		FenceAuthority:    antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceGeneration:   2,
+		FenceReason:       "LeaseHeld",
+		FenceToken:        "ha-fence-token",
+	}
+	cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{
+		NodeID:          "primary-a",
+		Fenced:          true,
+		FenceAuthority:  antflyv1.HAFencingAuthorityKubernetesLease,
+		FenceHolder:     "standby-a",
+		FenceGeneration: 2,
+	}
+	cluster.Status.HAStatus.PlannedActions = []antflyv1.HAPlannedActionStatus{isolation}
+	if got := haSucceededFormerPrimaryIsolation(cluster, cluster.Status.HAStatus, cluster.Status.HAStatus.LastPromotion); got == nil {
+		t.Fatalf("fixture must carry valid completed physical isolation: %v", validateHAPhysicalIsolationIntent(cluster, &isolation))
+	}
+
+	plan := planHA(cluster)
+	if !plan.FormerPrimary.RejoinRequired || plan.FormerPrimary.RewindPossible ||
+		!plan.FormerPrimary.ReseedRequired ||
+		plan.FormerPrimary.Action != string(haActionReseedFormerPrimary) ||
+		plan.FormerPrimary.Reason != "FormerPrimaryPhysicallyIsolatedRequiresReseed" {
+		t.Fatalf("expected physical isolation to require portable reseed, got %#v", plan.FormerPrimary)
+	}
+	for _, action := range plan.Actions {
+		if action.Kind == haActionDemoteFormerPrimary || action.Kind == haActionRewindFormerPrimary ||
+			action.Kind == haActionReseedFormerPrimary {
+			t.Fatalf("physically absent former-primary log must not receive direct rejoin action: %#v", plan.Actions)
+		}
+	}
+	rendered := haPlannedActionStatuses(plan.Actions, cluster.Spec.HighAvailability, cluster.Status.HAStatus, cluster)
+	isolationPlan, ok := haPlannedActionByKind(rendered, haActionIsolateFormerPrimary)
+	if !ok || isolationPlan.AdminJobPhase != haAdminJobPhaseSucceeded || isolationPlan.PhysicalIsolationReceipt == nil {
+		t.Fatalf("expected exact physical-isolation evidence to remain durable, got %#v", isolationPlan)
+	}
+}
+
 func TestUpdateHAStatusBlocksAutomaticPromotionWithoutStandbyAdminURL(t *testing.T) {
 	cluster := haCluster()
 	cluster.Spec.HighAvailability.Admin = &antflyv1.HAAdminSpec{
