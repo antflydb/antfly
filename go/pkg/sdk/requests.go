@@ -18,10 +18,10 @@ package sdk
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"reflect"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/antflydb/antfly/go/pkg/sdk/query"
 )

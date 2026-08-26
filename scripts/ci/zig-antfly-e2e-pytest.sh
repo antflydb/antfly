@@ -17,27 +17,31 @@ set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../.." && pwd)"
-# Each module worker can run a multi-threaded standalone or serverless Antfly
-# process. Two workers keep the 8-CPU ARC jobs parallel without oversubscribing
-# the servers that exercise multi-shard transactions, scaling, and publication.
-default_workers=2
+# Lightweight checks can use four workers while the scheduler separately caps
+# concurrent Antfly processes and clusters.
+default_workers=4
 detected_workers="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
 if [[ "$detected_workers" =~ ^[1-9][0-9]*$ ]] && (( detected_workers < default_workers )); then
   default_workers="$detected_workers"
 fi
 workers="${ANTFLY_E2E_WORKERS:-$default_workers}"
+process_slots="${ANTFLY_E2E_PROCESS_SLOTS:-2}"
 
 if [[ ! "$workers" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "ANTFLY_E2E_WORKERS must be a non-negative integer; got: $workers" >&2
   exit 2
 fi
+if [[ ! "$process_slots" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ANTFLY_E2E_PROCESS_SLOTS must be a positive integer; got: $process_slots" >&2
+  exit 2
+fi
 
 cd "$repo_root/zig"
 if (( workers > 1 )); then
-  # Keep every module on one worker so module-scoped Antfly process reuse and
-  # its per-test cleanup remain a single coherent lifecycle.
+  # Isolation groups preserve shared fixture lifecycles; independent tests are
+  # scheduled longest-first without exceeding the Antfly process budget.
   exec uv run --project e2e/antfly pytest -q --continue-on-collection-errors \
-    -n "$workers" --dist=loadscope "$@"
+    -n "$workers" --dist=loadgroup --e2e-process-slots "$process_slots" "$@"
 fi
 
 exec uv run --project e2e/antfly pytest -q --continue-on-collection-errors "$@"

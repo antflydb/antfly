@@ -161,3 +161,49 @@ func TestValidateBackupImmutability_NoChange(t *testing.T) {
 		t.Errorf("expected no error when clusterRef is unchanged, got: %v", err)
 	}
 }
+
+func TestValidateCreate_BackupRequiresNamedConnection(t *testing.T) {
+	backup := &AntflyBackup{Spec: AntflyBackupSpec{
+		ClusterRef:  ClusterReference{Name: "cluster-a"},
+		Schedule:    "0 2 * * *",
+		Destination: BackupDestination{Location: "s3://archive/backups"},
+	}}
+
+	err := backup.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "spec.destination.connection is required") {
+		t.Fatalf("ValidateCreate() error = %v, want actionable connection requirement", err)
+	}
+}
+
+func TestValidateCreate_BackupAllowsFilesystemNamedConnection(t *testing.T) {
+	backup := &AntflyBackup{Spec: AntflyBackupSpec{
+		ClusterRef: ClusterReference{Name: "cluster-a"},
+		Schedule:   "0 2 * * *",
+		Destination: BackupDestination{
+			Location:   "file:///antflydb/backups",
+			Connection: "local-archive-writer",
+		},
+	}}
+
+	if err := backup.ValidateCreate(); err != nil {
+		t.Fatalf("ValidateCreate() error = %v, want filesystem connection accepted", err)
+	}
+}
+
+func TestValidateUpdate_BackupGrandfathersOnlyStatusUpdates(t *testing.T) {
+	old := &AntflyBackup{Spec: AntflyBackupSpec{
+		ClusterRef:  ClusterReference{Name: "cluster-a"},
+		Schedule:    "0 2 * * *",
+		Destination: BackupDestination{Location: "s3://archive/backups"},
+	}}
+	unchanged := old.DeepCopy()
+	if err := unchanged.ValidateUpdate(old); err != nil {
+		t.Fatalf("legacy status-only update rejected: %v", err)
+	}
+
+	changed := old.DeepCopy()
+	changed.Spec.Schedule = "0 3 * * *"
+	if err := changed.ValidateUpdate(old); err == nil || !strings.Contains(err.Error(), "connection is required") {
+		t.Fatalf("legacy spec mutation error = %v, want connection migration requirement", err)
+	}
+}

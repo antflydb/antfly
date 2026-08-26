@@ -240,6 +240,7 @@ def test_extension_package_routes_match_standalone_and_distributed(extension_ser
     _assert_extension_package_routes(extension_server)
 
 
+@pytest.mark.e2e_resource("antfly_process")
 def test_extension_memoryaf_wasm_runtime_required() -> None:
     if not os.environ.get("ANTFLY_WASMTIME_LIB"):
         pytest.skip("set ANTFLY_WASMTIME_LIB to run the required Wasmtime extension runtime e2e")

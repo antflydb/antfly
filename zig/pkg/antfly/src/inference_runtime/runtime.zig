@@ -16,6 +16,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const common_config = @import("../common/config.zig");
+const preload_model_spec = @import("../common/preload_model_spec.zig");
 const process_memory_budget = @import("../common/process_memory_budget.zig");
 const runtime_lifecycle = @import("../common/runtime_lifecycle.zig");
 const inference = @import("inference_server");
@@ -37,15 +38,19 @@ pub fn defaultMlDir(allocator: std.mem.Allocator) []const u8 {
     return std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "ml" }) catch "./ml";
 }
 
+/// Compatibility wrapper for callers that also resolve a data directory.
+/// Model discovery deliberately remains independent of the database data root.
 pub fn defaultModelsDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
-    if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value| return value;
-    return std.fs.path.join(allocator, &.{ data_dir, "inference", "models" }) catch defaultModelsDir(allocator);
+    _ = data_dir;
+    return defaultModelsDir(allocator);
 }
 
 pub fn defaultModelsDirForDataDirAlloc(allocator: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+    _ = data_dir;
     if (platform.env.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value|
         return try allocator.dupe(u8, value);
-    return try std.fs.path.join(allocator, &.{ data_dir, "inference", "models" });
+    const home = platform.env.getenv("HOME") orelse return try allocator.dupe(u8, "./models");
+    return try std.fs.path.join(allocator, &.{ home, ".antfly", "inference", "models" });
 }
 
 pub fn defaultMlDirForDataDir(allocator: std.mem.Allocator, data_dir: []const u8) []const u8 {
@@ -170,20 +175,11 @@ fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
 }
 
 fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
-    const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
-    const kind_name = value[0..separator];
-    var model_name = value[separator + 1 ..];
-    var backend: ?inference.backends.BackendType = null;
-    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
-        const backend_name = model_name[0..backend_separator];
-        backend = parseBackendType(backend_name) orelse return error.InvalidArguments;
-        model_name = model_name[backend_separator + 1 ..];
-    }
-    if (model_name.len == 0) return error.InvalidArguments;
+    const spec = try preload_model_spec.parse(value);
     return .{
-        .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
-        .name = model_name,
-        .backend = backend,
+        .kind = parsePreloadModelKind(spec.kind) orelse return error.InvalidArguments,
+        .name = spec.name,
+        .backend = if (spec.backend) |backend| parseBackendType(backend) orelse return error.InvalidArguments else null,
         .format = null,
         .quantization = null,
     };
@@ -255,6 +251,8 @@ pub fn runFromIterator(
         return try inference.compare_generate.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "finetune")) {
         return try inference.finetune_cli.main(init, try collectArgs(alloc, args));
+    } else if (std.mem.eql(u8, command, "cuda-info")) {
+        return try inference.cuda_info.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "smoke")) {
         return try inference.native_smoke.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "list")) {
@@ -830,6 +828,7 @@ fn printUsage() void {
         \\  extract     Run entity, relation, or structured extraction
         \\  compare     Compare generation outputs
         \\  finetune    Run LoRA finetuning
+        \\  cuda-info   Inspect the compiled CUDA artifact or validate a CUDA device
         \\  smoke       Run a model smoke test
         \\  list        List available models
         \\  pull        Download a HuggingFace model, or pull a hosted tabular_model.json predictor URL
@@ -876,6 +875,33 @@ test "inference runtime module compiles" {
     _ = run;
     _ = runFromIterator;
     _ = spawnServerProcess;
+}
+
+test "inference runtime preload parser preserves registry variants and explicit backends" {
+    const variant = try parsePreloadModelFlag("embedder:BAAI/bge-small-en-v1.5:i8");
+    try std.testing.expectEqual(.embedder, variant.kind);
+    try std.testing.expectEqualStrings("BAAI/bge-small-en-v1.5:i8", variant.name);
+    try std.testing.expectEqual(null, variant.backend);
+
+    const multi_component_variant = try parsePreloadModelFlag("generator:owner/model:gguf:Q4_K_M");
+    try std.testing.expectEqualStrings("owner/model:gguf:Q4_K_M", multi_component_variant.name);
+    try std.testing.expectEqual(null, multi_component_variant.backend);
+
+    const explicit_backend = try parsePreloadModelFlag("generator:metal:owner/model:Q4_K_M");
+    try std.testing.expectEqual(.generator, explicit_backend.kind);
+    try std.testing.expectEqualStrings("owner/model:Q4_K_M", explicit_backend.name);
+    try std.testing.expectEqual(.metal, explicit_backend.backend.?);
+
+    for ([_][]const u8{ "native", "onnx", "metal", "cuda", "xla", "pjrt", "wasm", "webgpu" }) |backend| {
+        var buffer: [96]u8 = undefined;
+        const value = try std.fmt.bufPrint(&buffer, "embedder:{s}:owner/model:i8", .{backend});
+        const spec = try preload_model_spec.parse(value);
+        try std.testing.expectEqualStrings(backend, spec.backend.?);
+        try std.testing.expectEqualStrings("owner/model:i8", spec.name);
+    }
+
+    try std.testing.expectError(error.InvalidArguments, preload_model_spec.parse("embedder:"));
+    try std.testing.expectError(error.InvalidArguments, preload_model_spec.parse("embedder:metal:"));
 }
 
 test "inference runtime preserves effective process envelope provenance" {

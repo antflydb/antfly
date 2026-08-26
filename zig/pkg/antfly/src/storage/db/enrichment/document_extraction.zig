@@ -25,7 +25,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         pub const reader = struct {
             pub const DecodeLimits = struct {
                 max_decoded_stream_bytes: usize = 64 * 1024 * 1024,
-                max_working_set_bytes: usize = 96 * 1024 * 1024,
+                max_working_set_bytes: usize = 128 * 1024 * 1024,
             };
 
             pub const Reader = struct {
@@ -64,6 +64,11 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                 }
             };
 
+            pub const TextOutputSpan = struct {
+                start: usize,
+                end: usize,
+            };
+
             pub const TextRun = struct {
                 text: []const u8,
                 x: f64 = 0,
@@ -76,6 +81,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                 advance_width: f64 = 0,
                 ascent: f64 = 0,
                 descent: f64 = 0,
+                output_span: ?TextOutputSpan = null,
 
                 pub fn deinit(_: *TextRun, _: Allocator) void {}
             };
@@ -93,8 +99,13 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         };
 
         pub const render = struct {
-            pub fn textRunBounds(_: reader.TextRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
-                return .{ .min_x = 0, .max_x = 0, .min_y = 0, .max_y = 0 };
+            pub fn textRunBounds(run: reader.TextRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
+                return .{
+                    .min_x = run.x,
+                    .max_x = run.x + run.advance_width,
+                    .min_y = run.y - run.descent,
+                    .max_y = run.y + run.ascent,
+                };
             }
         };
 
@@ -1693,11 +1704,15 @@ fn extractPdfTextRegionsFromRunsAlloc(
 
     var regions = std.ArrayListUnmanaged(TextRegion).empty;
     defer regions.deinit(alloc);
-    var search_from: usize = 0;
     for (runs) |run| {
         if (run.text.len == 0) continue;
-        const start = std.mem.indexOfPos(u8, page_text, search_from, run.text) orelse continue;
-        const end = start + run.text.len;
+        // A null span means reconstruction could not align this positioned run
+        // with the canonical page text. Substring matching is unsafe here: a
+        // degraded run can match unrelated text and receive the wrong bounds.
+        const output_span = run.output_span orelse continue;
+        if (output_span.start >= output_span.end or output_span.end > page_text.len) continue;
+        const start = output_span.start;
+        const end = output_span.end;
         const span_start = std.math.cast(u32, start) orelse continue;
         const span_end = std.math.cast(u32, end) orelse continue;
         const bounds = pdf.render.textRunBounds(run);
@@ -1705,9 +1720,62 @@ fn extractPdfTextRegionsFromRunsAlloc(
             .span = .{ span_start, span_end },
             .bbox = .{ bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y },
         });
-        search_from = end;
     }
     return try regions.toOwnedSlice(alloc);
+}
+
+test "PDF text regions use reconstructed output spans" {
+    const alloc = std.testing.allocator;
+    const runs = [_]pdf.reader.TextRun{
+        .{
+            .text = "Heading ",
+            .x = 10,
+            .y = 20,
+            .font_size = 10,
+            .advance_width = 40,
+            .ascent = 8,
+            .descent = 2,
+            .output_span = .{ .start = 0, .end = 7 },
+        },
+        .{
+            .text = "Body",
+            .x = 15,
+            .y = 5,
+            .font_size = 10,
+            .advance_width = 20,
+            .ascent = 7,
+            .descent = 3,
+            .output_span = .{ .start = 8, .end = 12 },
+        },
+    };
+    const regions = try extractPdfTextRegionsFromRunsAlloc(alloc, &runs, "Heading\nBody\n");
+    defer if (regions.len > 0) alloc.free(regions);
+
+    try std.testing.expectEqual(@as(usize, 2), regions.len);
+    try std.testing.expectEqual([2]u32{ 0, 7 }, regions[0].span);
+    try std.testing.expectEqual([2]u32{ 8, 12 }, regions[1].span);
+    const first_bounds = pdf.render.textRunBounds(runs[0]);
+    const second_bounds = pdf.render.textRunBounds(runs[1]);
+    try std.testing.expectEqual([4]f64{ first_bounds.min_x, first_bounds.min_y, first_bounds.max_x, first_bounds.max_y }, regions[0].bbox);
+    try std.testing.expectEqual([4]f64{ second_bounds.min_x, second_bounds.min_y, second_bounds.max_x, second_bounds.max_y }, regions[1].bbox);
+    try std.testing.expect(!std.mem.eql(f64, &regions[0].bbox, &regions[1].bbox));
+
+    const unaligned_runs = [_]pdf.reader.TextRun{.{
+        .text = "FR",
+        .x = 100,
+        .y = 200,
+        .font_size = 12,
+        .advance_width = 80,
+        .ascent = 9,
+        .descent = 3,
+        .output_span = null,
+    }};
+
+    // "FR" occurs in the canonical text, but this run has no validated
+    // alignment and must not borrow that unrelated span.
+    const unaligned_regions = try extractPdfTextRegionsFromRunsAlloc(alloc, &unaligned_runs, "FOURTH EDITION FR");
+    defer if (unaligned_regions.len > 0) alloc.free(unaligned_regions);
+    try std.testing.expectEqual(@as(usize, 0), unaligned_regions.len);
 }
 
 fn extractSingleTextUnitAlloc(

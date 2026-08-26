@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from ..models.algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
     from ..models.algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
     from ..models.algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
+    from ..models.index_readiness_status import IndexReadinessStatus
     from ..models.index_repair_status import IndexRepairStatus
 
 
@@ -29,6 +30,7 @@ class AlgebraicIndexStats:
 
         Attributes:
             index_type (AlgebraicIndexStatsIndexType): Discriminator for the index stats variant.
+            readiness (IndexReadinessStatus | Unset):
             error (str | Unset): Error message if stats could not be retrieved
             total_indexed (int | Unset): Number of documents reflected in the algebraic sidecar
             disk_usage (int | Unset): Size of the index in bytes
@@ -109,6 +111,7 @@ class AlgebraicIndexStats:
     """
 
     index_type: AlgebraicIndexStatsIndexType
+    readiness: IndexReadinessStatus | Unset = UNSET
     error: str | Unset = UNSET
     total_indexed: int | Unset = UNSET
     disk_usage: int | Unset = UNSET
@@ -180,6 +183,10 @@ class AlgebraicIndexStats:
 
     def to_dict(self) -> dict[str, Any]:
         index_type = self.index_type.value
+
+        readiness: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.readiness, Unset):
+            readiness = self.readiness.to_dict()
 
         error = self.error
 
@@ -336,6 +343,8 @@ class AlgebraicIndexStats:
                 "index_type": index_type,
             }
         )
+        if readiness is not UNSET:
+            field_dict["readiness"] = readiness
         if error is not UNSET:
             field_dict["error"] = error
         if total_indexed is not UNSET:
@@ -480,10 +489,18 @@ class AlgebraicIndexStats:
         from ..models.algebraic_index_stats_resolution import AlgebraicIndexStatsResolution
         from ..models.algebraic_index_stats_resolver_replay import AlgebraicIndexStatsResolverReplay
         from ..models.algebraic_index_stats_source_artifact import AlgebraicIndexStatsSourceArtifact
+        from ..models.index_readiness_status import IndexReadinessStatus
         from ..models.index_repair_status import IndexRepairStatus
 
         d = dict(src_dict)
         index_type = AlgebraicIndexStatsIndexType(d.pop("index_type"))
+
+        _readiness = d.pop("readiness", UNSET)
+        readiness: IndexReadinessStatus | Unset
+        if isinstance(_readiness, Unset):
+            readiness = UNSET
+        else:
+            readiness = IndexReadinessStatus.from_dict(_readiness)
 
         error = d.pop("error", UNSET)
 
@@ -656,6 +673,7 @@ class AlgebraicIndexStats:
 
         algebraic_index_stats = cls(
             index_type=index_type,
+            readiness=readiness,
             error=error,
             total_indexed=total_indexed,
             disk_usage=disk_usage,

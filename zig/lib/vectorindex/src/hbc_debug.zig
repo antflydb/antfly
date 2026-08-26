@@ -167,11 +167,12 @@ pub fn debugChildDistances(self: anytype, alloc: Allocator, node_id: u64, query:
     var txn = try self.beginReadTxn();
     defer txn.abort();
 
-    const node = try self.getNodePtr(&txn, node_id);
+    var node = try self.loadNode(&txn, node_id);
+    defer node.deinit(self.alloc);
     if (node.is_leaf) return error.NotInternal;
 
-    // Copy children to local storage before further getNodePtr calls
-    // which may trigger clearNodeCache and free the backing buffer.
+    // Keep traversal independent of later cache reads or generation
+    // replacement, even though loadNode currently returns an owned value.
     const child_ids = try alloc.dupe(u64, node.children);
     defer alloc.free(child_ids);
 
@@ -187,7 +188,8 @@ pub fn debugChildDistances(self: anytype, alloc: Allocator, node_id: u64, query:
 
     var out = try alloc.alloc(search_types.DebugNodeDistance, child_ids.len);
     for (child_ids, 0..) |child_id, i| {
-        const child = try self.getNodePtr(&txn, child_id);
+        var child = try self.loadNode(&txn, child_id);
+        defer child.deinit(self.alloc);
         out[i] = .{
             .node_id = child_id,
             .distance = vec.distanceToQuery(transformed_query, query_measure, child.centroid, self.config.metric),
@@ -221,7 +223,12 @@ fn debugScoreLoadedLeaf(self: anytype, alloc: Allocator, txn: anytype, leaf: *ty
     };
 
     const leaf_uses_nonquantized_payload = leaf.parent == 0;
-    if (leaf.members.len > 0 and (force_fresh_quantized or try self.getQuantized(txn, leaf.id, leaf_uses_nonquantized_payload, leaf.members.len) != null)) {
+    var quantized_handle = if (force_fresh_quantized)
+        null
+    else
+        try self.getQuantized(txn, leaf.id, leaf_uses_nonquantized_payload, leaf.members.len);
+    defer if (quantized_handle) |*handle| handle.deinit(self.alloc);
+    if (leaf.members.len > 0 and (force_fresh_quantized or quantized_handle != null)) {
         const approx_distances = try alloc.alloc(f32, count);
         defer alloc.free(approx_distances);
         const error_bounds = try alloc.alloc(f32, count);
@@ -256,7 +263,7 @@ fn debugScoreLoadedLeaf(self: anytype, alloc: Allocator, txn: anytype, leaf: *ty
                 owned_fresh = .{ .rabit = try self.quantizer.quantize(leaf.centroid, vectors.data, count) };
             }
             break :blk &owned_fresh.?;
-        } else (try self.getQuantized(txn, leaf.id, leaf_uses_nonquantized_payload, leaf.members.len)).?;
+        } else quantized_handle.?.ptr();
 
         try self.estimateQuantizedDistances(quantized, transformed_query, transformed_query_measure, approx_distances, error_bounds, &estimate);
 

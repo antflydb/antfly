@@ -71,6 +71,14 @@ pub fn shouldSkipLeafCandidate(
     epsilon: f32,
 ) bool {
     if (!approx_results.isFull()) return false;
+    // Once a leaf has a durable covering-radius bound, centroid distance is
+    // no longer a safe pruning score: a far centroid can still contain the
+    // nearest member. The ordered frontier performs sound lower-bound stops
+    // at batch boundaries; do not let the legacy per-leaf heuristic bypass
+    // that path. Old/fallback nodes retain the heuristic below.
+    if (candidate.bound_resolved and std.math.isFinite(candidate.lower_bound)) {
+        return false;
+    }
     if (candidate.distance < state.dynamic_pruning_min) {
         state.dynamic_pruning_min = candidate.distance;
         return false;
@@ -193,4 +201,27 @@ test "internal candidate pruning matches Go inner-product semantics" {
         .distance = -11.5,
         .error_bound = 0,
     }, &approx_results, &state, 0.1));
+}
+
+test "resolved leaf pruning defers to the ordered bound frontier" {
+    var approx_results = try search_results.ApproxSearchResults.initCapacity(std.testing.allocator, 1, 1, 1);
+    defer approx_results.deinit();
+    approx_results.addResult(1, 0.625, 0);
+
+    var state = BeamSearchState{ .dynamic_pruning_min = 0.5 };
+    try std.testing.expect(!shouldSkipLeafCandidate(.{
+        .id = 2,
+        .distance = 16,
+        .lower_bound = 0,
+        .bound_resolved = true,
+        .is_leaf = true,
+    }, &approx_results, &state, 0.1));
+    try std.testing.expect(!shouldSkipLeafCandidate(.{
+        .id = 3,
+        .distance = 1,
+        .lower_bound = 0.75,
+        .bound_resolved = true,
+        .is_leaf = true,
+    }, &approx_results, &state, 0.1));
+    try std.testing.expectEqual(@as(f32, 0.5), state.dynamic_pruning_min);
 }

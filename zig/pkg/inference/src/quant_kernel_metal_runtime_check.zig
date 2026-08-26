@@ -983,7 +983,7 @@ fn runMicrokernelCheck(allocator: std.mem.Allocator, check: CheckCase) !CheckRes
 // so the matmul machinery is untouched. This isolated float compare is a fast
 // pre-check for compile/dispatch/gross-logic errors ONLY — softmax is too
 // summation-sensitive for a tight isolated gate, so the real acceptance gate is
-// bit-identical *model tokens* (scripts/compare_metal_gemma4_e4b_qat.sh with the
+// bit-identical *model tokens* (scripts/gemma4/compare_metal_gemma4_e4b_qat.sh with the
 // generated route enabled). Every case is the "simplest case": q_len=1 decode,
 // f16 KV, single contiguous block, no sinks, softcap 0 — exercising GQA and the
 // causal + sliding-window masks against a self-contained CPU oracle.

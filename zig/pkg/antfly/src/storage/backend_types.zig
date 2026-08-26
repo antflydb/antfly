@@ -57,6 +57,21 @@ pub const WriteBatchMode = enum {
 pub const Namespace = struct {
     /// `null` represents the unnamed/default namespace.
     name: ?[]const u8 = null,
+
+    /// Governs whether data blocks loaded solely for this read should be
+    /// published in the shared LSM block cache. Indexes and bloom filters are
+    /// always retained normally. This is a read hint and is deliberately not
+    /// part of namespace identity or persisted state.
+    block_cache_admission: BlockCacheAdmission = .retain,
+
+    pub const BlockCacheAdmission = enum {
+        retain,
+        transient,
+    };
+
+    pub fn retainDataBlocks(self: Namespace) bool {
+        return self.block_cache_admission == .retain;
+    }
 };
 
 /// Range bounds used by ordered scans.

@@ -287,6 +287,16 @@ test "standalone inference keep alive parses compound durations and zero" {
     );
 }
 
+test "standalone data directory does not change the default models directory" {
+    const first = try antfly.inference_runtime.defaultModelsDirForDataDirAlloc(std.testing.allocator, "/tmp/antfly-data-a");
+    defer std.testing.allocator.free(first);
+    const second = try antfly.inference_runtime.defaultModelsDirForDataDirAlloc(std.testing.allocator, "/tmp/antfly-data-b");
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(!std.mem.startsWith(u8, first, "/tmp/antfly-data-"));
+}
+
 /// Creates the standalone inference implementation inside its focused codegen
 /// unit. The caller passes only ABI-safe launch settings, never CliConfig.
 pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*anyopaque {
@@ -356,6 +366,10 @@ pub fn linkedInferenceCreate(context: *const inference_bridge.CreateContext) !*a
         .kernel_jit = runtime_config.value.kernel_jit,
         .prompt_cache = runtime_config.value.prompt_cache,
     };
+    std.log.info("standalone inference paths models_dir={s} ml_dir={s}", .{
+        node_config.models_dir,
+        node_config.ml_dir,
+    });
     if (content_security) |*parsed| node_config.content_security = parsed.value;
     if (s3_credentials) |*parsed| node_config.s3_credentials = parsed.value;
     if (context.keep_alive.slice()) |value| node_config.keep_alive_ms = try parseKeepAliveMs(value);

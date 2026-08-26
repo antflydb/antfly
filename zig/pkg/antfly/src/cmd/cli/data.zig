@@ -19,6 +19,11 @@ const hbs = @import("handlebars");
 
 const default_batch_size: usize = 1000;
 const default_max_batches: usize = 100;
+// A successful load must establish a visibility boundary for commands that
+// immediately inspect the table (notably `index wait`). Raft `propose` only
+// acknowledges acceptance, so the API default could let a subsequent status
+// request observe the pre-load empty table before the proposed writes applied.
+const default_load_sync_level: antfly_client.types.SyncLevel = .write;
 const default_read_buffer_bytes: usize = 1024 * 1024;
 const default_max_line_bytes: usize = 16 * 1024 * 1024;
 const default_batch_bytes: usize = 8 * 1024 * 1024;
@@ -573,7 +578,7 @@ const LoadProcessor = struct {
         if (!self.opts.dry_run) {
             var resp = try self.client.?.batch(self.opts.table_name, .{
                 .inserts = self.batch.inserts,
-                .sync_level = self.opts.sync_level,
+                .sync_level = effectiveLoadSyncLevel(self.opts.sync_level),
             });
             defer resp.deinit();
             self.stats.committed += @intCast(self.batch.docs);
@@ -601,7 +606,7 @@ const LoadProcessor = struct {
             .table_name = self.opts.table_name,
             .id_field = self.opts.id_field,
             .id_template = self.opts.id_template,
-            .sync_level = if (self.opts.sync_level) |level| syncLevelName(level) else null,
+            .sync_level = syncLevelName(effectiveLoadSyncLevel(self.opts.sync_level)),
             .offset = self.last_committed_offset,
             .line_number = self.last_committed_line,
             .loaded = self.stats.loaded,
@@ -843,6 +848,24 @@ fn parseSyncLevel(text: []const u8) ?antfly_client.types.SyncLevel {
     return null;
 }
 
+fn effectiveLoadSyncLevel(configured: ?antfly_client.types.SyncLevel) antfly_client.types.SyncLevel {
+    return configured orelse default_load_sync_level;
+}
+
+fn checkpointSyncLevelMatches(
+    checkpoint_level: ?[]const u8,
+    configured: ?antfly_client.types.SyncLevel,
+) bool {
+    if (checkpoint_level) |checkpoint| {
+        return std.mem.eql(u8, checkpoint, syncLevelName(effectiveLoadSyncLevel(configured)));
+    }
+    // Checkpoint v1 originally encoded an omitted option as null, when the
+    // API default was propose. Both propose and the stronger current write
+    // boundary are safe continuations; other explicit levels remain a config
+    // mismatch just as before.
+    return configured == null or configured == .propose or configured == .write;
+}
+
 fn syncLevelName(level: antfly_client.types.SyncLevel) []const u8 {
     return switch (level) {
         .propose => "propose",
@@ -956,8 +979,7 @@ fn validateCheckpoint(cp: LoadCheckpoint, opts: LoadOptions, meta: FileMetadata)
     if (!std.mem.eql(u8, cp.table_name, opts.table_name)) return error.InvalidLoadCheckpoint;
     if (!optionalStringEql(cp.id_field, opts.id_field)) return error.InvalidLoadCheckpoint;
     if (!optionalStringEql(cp.id_template, opts.id_template)) return error.InvalidLoadCheckpoint;
-    const opts_sync_level = if (opts.sync_level) |level| syncLevelName(level) else null;
-    if (!optionalStringEql(cp.sync_level, opts_sync_level)) return error.InvalidLoadCheckpoint;
+    if (!checkpointSyncLevelMatches(cp.sync_level, opts.sync_level)) return error.InvalidLoadCheckpoint;
     if (cp.offset > meta.size) return error.InvalidLoadCheckpoint;
 }
 
@@ -1310,6 +1332,23 @@ test "load sync level parser supports public values" {
     try std.testing.expect(parseSyncLevel("full-text") == null);
 }
 
+test "load parser defaults to applied write visibility" {
+    var argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl" };
+    const parsed = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = argv[0..] }));
+    try std.testing.expect(parsed.value.sync_level == null);
+    try std.testing.expectEqual(
+        antfly_client.types.SyncLevel.write,
+        effectiveLoadSyncLevel(parsed.value.sync_level),
+    );
+
+    var propose_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--sync-level", "propose" };
+    const propose = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = propose_argv[0..] }));
+    try std.testing.expectEqual(
+        antfly_client.types.SyncLevel.propose,
+        effectiveLoadSyncLevel(propose.value.sync_level),
+    );
+}
+
 test "checkpoint validation rejects changed source and load config" {
     const cp = LoadCheckpoint{
         .source_path = "a.ndjson",
@@ -1344,6 +1383,17 @@ test "checkpoint validation rejects changed source and load config" {
         .id_field = "id",
         .sync_level = .full_text,
     }, .{ .size = 10, .mtime_ns = 99 }));
+    try validateCheckpoint(cp, .{
+        .table_name = "t",
+        .file_path = "a.ndjson",
+        .id_field = "id",
+    }, .{ .size = 10, .mtime_ns = 99 });
+    try std.testing.expectError(error.InvalidLoadCheckpoint, validateCheckpoint(cp, .{
+        .table_name = "t",
+        .file_path = "a.ndjson",
+        .id_field = "id",
+        .sync_level = .propose,
+    }, .{ .size = 10, .mtime_ns = 99 }));
 
     const template_cp = LoadCheckpoint{
         .source_path = "a.ndjson",
@@ -1358,6 +1408,24 @@ test "checkpoint validation rejects changed source and load config" {
         .file_path = "a.ndjson",
         .id_template = "{{tenant}}:{{id}}",
     }, .{ .size = 10, .mtime_ns = 99 });
+    try validateCheckpoint(template_cp, .{
+        .table_name = "t",
+        .file_path = "a.ndjson",
+        .id_template = "{{tenant}}:{{id}}",
+        .sync_level = .propose,
+    }, .{ .size = 10, .mtime_ns = 99 });
+    try validateCheckpoint(template_cp, .{
+        .table_name = "t",
+        .file_path = "a.ndjson",
+        .id_template = "{{tenant}}:{{id}}",
+        .sync_level = .write,
+    }, .{ .size = 10, .mtime_ns = 99 });
+    try std.testing.expectError(error.InvalidLoadCheckpoint, validateCheckpoint(template_cp, .{
+        .table_name = "t",
+        .file_path = "a.ndjson",
+        .id_template = "{{tenant}}:{{id}}",
+        .sync_level = .full_index,
+    }, .{ .size = 10, .mtime_ns = 99 }));
     try std.testing.expectError(error.InvalidLoadCheckpoint, validateCheckpoint(template_cp, .{
         .table_name = "t",
         .file_path = "a.ndjson",

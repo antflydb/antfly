@@ -448,11 +448,11 @@ E2B/E4B as a release-positive claim.
 zig build -j1 -Doptimize=ReleaseFast a4b-metal-id-replay -- \
   --warmups 3 --iterations 30
 
-python3 scripts/profile_metal_gemma4_a4b.py \
+python3 scripts/gemma4/profile_metal_gemma4_a4b.py \
   --binary zig-out/bin/antfly-inference --model "$MODEL" \
   --out-dir /tmp/a4b-profile --layers 15 --runs 3 --specialized
 
-python3 scripts/benchmark_metal_gemma4_parity.py \
+python3 scripts/gemma4/benchmark_metal_gemma4_parity.py \
   --antfly-bin zig-out/bin/antfly-inference \
   --llama-bin "$LLAMA_COMPLETION" --a4b-model "$MODEL" \
   --out-dir /tmp/a4b-parity --runs 3 \

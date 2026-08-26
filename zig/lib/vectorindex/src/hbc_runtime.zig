@@ -467,16 +467,6 @@ fn ensureMetadataCacheCapacity(self: anytype, key: u64) ?usize {
     return null;
 }
 
-pub fn getCachedNodePtr(self: anytype, node_id: u64) ?*const types.Node {
-    self.cache_mu.lockExclusive();
-    defer self.cache_mu.unlockExclusive();
-    if (self.node_cache.getPtr(node_id)) |cached| {
-        touchClock(self.node_clock_refs, self.node_cache_slots, node_id);
-        return nodeCacheValuePtr(cached);
-    }
-    return null;
-}
-
 pub fn getCachedNodeClone(self: anytype, node_id: u64) !?types.Node {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
@@ -487,32 +477,12 @@ pub fn getCachedNodeClone(self: anytype, node_id: u64) !?types.Node {
     return null;
 }
 
-pub fn getCachedQuantizedPtr(self: anytype, node_id: u64) ?*QuantizedSet {
-    self.cache_mu.lockExclusive();
-    defer self.cache_mu.unlockExclusive();
-    if (self.quantized_cache.getPtr(node_id)) |cached| {
-        touchClock(self.quantized_clock_refs, self.quantized_cache_slots, node_id);
-        return quantizedCacheValuePtr(cached);
-    }
-    return null;
-}
-
 pub fn getCachedQuantizedClone(self: anytype, node_id: u64) !?QuantizedSet {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
     if (self.quantized_cache.getPtr(node_id)) |cached| {
         touchClock(self.quantized_clock_refs, self.quantized_cache_slots, node_id);
         return try cloneQuantizedCacheValue(cached, self.alloc);
-    }
-    return null;
-}
-
-pub fn getCachedVector(self: anytype, vector_id: u64) ?[]const f32 {
-    self.cache_mu.lockExclusive();
-    defer self.cache_mu.unlockExclusive();
-    if (self.vector_cache.get(vector_id)) |cached| {
-        touchClock(self.vector_clock_refs, self.vector_cache_slots, vector_id);
-        return cached;
     }
     return null;
 }
@@ -530,7 +500,6 @@ pub fn getCachedMetadata(self: anytype, vector_id: u64) ?[]const u8 {
 pub fn cacheNode(self: anytype, node: *const types.Node) !void {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
-    if (self.active_searches.load(.acquire) > 1) return;
     if (self.config.max_cached_nodes == 0) return;
     const reserved_slot = ensureNodeCacheCapacity(self, node.id);
     invalidateNodeCache(self, node.id);
@@ -542,27 +511,9 @@ pub fn cacheNode(self: anytype, node: *const types.Node) !void {
     try self.node_cache_slots.put(self.alloc, node.id, slot);
 }
 
-pub fn cacheNodeOwned(self: anytype, node: types.Node) !*const types.Node {
-    var owned = node;
-    errdefer owned.deinit(self.alloc);
-    self.cache_mu.lockExclusive();
-    defer self.cache_mu.unlockExclusive();
-    if (self.config.max_cached_nodes == 0) return error.CacheDisabled;
-    const reserved_slot = ensureNodeCacheCapacity(self, owned.id);
-    invalidateNodeCache(self, owned.id);
-    const cached_value = try initNodeCacheValue(self, owned);
-    errdefer deinitNodeCacheValue(self.alloc, cached_value);
-    try self.node_cache.put(self.alloc, owned.id, cached_value);
-    const slot = reserved_slot orelse claimClockSlot(self.node_clock_keys, self.node_clock_hand, owned.id) orelse return error.CacheDisabled;
-    self.node_clock_refs[slot] = true;
-    try self.node_cache_slots.put(self.alloc, owned.id, slot);
-    return nodeCacheValuePtr(self.node_cache.getPtr(owned.id).?);
-}
-
 pub fn cacheQuantized(self: anytype, node_id: u64, qs: *const QuantizedSet) !void {
     self.cache_mu.lockExclusive();
     defer self.cache_mu.unlockExclusive();
-    if (self.active_searches.load(.acquire) > 1) return;
     if (self.config.max_cached_nodes == 0) return;
     const reserved_slot = ensureQuantizedCacheCapacity(self, node_id);
     invalidateQuantizedCache(self, node_id);
@@ -574,7 +525,7 @@ pub fn cacheQuantized(self: anytype, node_id: u64, qs: *const QuantizedSet) !voi
     try self.quantized_cache_slots.put(self.alloc, node_id, slot);
 }
 
-pub fn cacheQuantizedOwned(self: anytype, node_id: u64, qs: QuantizedSet) !*const QuantizedSet {
+pub fn cacheQuantizedOwned(self: anytype, node_id: u64, qs: QuantizedSet) !void {
     var owned = qs;
     errdefer owned.deinit(self.alloc);
     self.cache_mu.lockExclusive();
@@ -588,7 +539,6 @@ pub fn cacheQuantizedOwned(self: anytype, node_id: u64, qs: QuantizedSet) !*cons
     const slot = reserved_slot orelse claimClockSlot(self.quantized_clock_keys, self.quantized_clock_hand, node_id) orelse return error.CacheDisabled;
     self.quantized_clock_refs[slot] = true;
     try self.quantized_cache_slots.put(self.alloc, node_id, slot);
-    return quantizedCacheValuePtr(self.quantized_cache.getPtr(node_id).?);
 }
 
 pub fn cacheVector(self: anytype, vector_id: u64, vector_data: []const f32) ![]const f32 {
@@ -616,7 +566,9 @@ pub fn cacheMetadata(self: anytype, vector_id: u64, metadata: []const u8) ![]con
     const slot = reserved_slot orelse claimClockSlot(self.metadata_clock_keys, self.metadata_clock_hand, vector_id) orelse return error.CacheDisabled;
     self.metadata_clock_refs[slot] = true;
     try self.metadata_cache_slots.put(self.alloc, vector_id, slot);
-    return self.metadata_cache.get(vector_id).?;
+    // The cache owns its copy. Callers retain the transaction/request view;
+    // returning cache memory here would outlive the eviction lock.
+    return metadata;
 }
 
 pub fn acquireSearchScratch(self: anytype) !ScratchHandle {

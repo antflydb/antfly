@@ -66,7 +66,8 @@ pub fn isAllowedConfigField(kind: Kind, field: []const u8) bool {
         .full_text => std.mem.eql(u8, field, "mem_only") or
             std.mem.eql(u8, field, "field") or
             std.mem.eql(u8, field, "artifact_name"),
-        .embeddings => std.mem.eql(u8, field, "coverage_policy") or
+        .embeddings => std.mem.eql(u8, field, "publication_policy") or
+            std.mem.eql(u8, field, "coverage_policy") or
             std.mem.eql(u8, field, "external") or
             std.mem.eql(u8, field, "sparse") or
             std.mem.eql(u8, field, "dimension") or

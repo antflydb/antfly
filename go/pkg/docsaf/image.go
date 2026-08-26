@@ -6,8 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/ai"
-	"github.com/antflydb/antfly/go/pkg/libaf/reading"
+	"github.com/antflydb/antfly/go/pkg/docsaf/reading"
 )
 
 // ImageProcessor processes image files (PNG, JPEG, TIFF, WebP, BMP, GIF) by
@@ -73,7 +72,7 @@ func (p *ImageProcessor) Process(path, sourceURL, baseURL string, content []byte
 		mimeType = mt
 	}
 
-	results, err := p.Reader.Read(context.TODO(), []ai.BinaryContent{
+	results, err := p.Reader.Read(context.TODO(), []reading.BinaryContent{
 		{MIMEType: mimeType, Data: content},
 	}, p.ReadOptions)
 	if err != nil {

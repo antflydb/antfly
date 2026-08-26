@@ -25,6 +25,10 @@ pub const Namespace = enum {
     meta,
     quant,
     vecs,
+    /// Same durable namespace as `vecs`, but reads do not publish data blocks
+    /// in the backing LSM cache. Used when decoded exact vectors are retained
+    /// by the vector index's governed cache instead.
+    vecs_transient,
 };
 
 pub const BatchMode = enum {

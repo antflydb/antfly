@@ -360,6 +360,7 @@ components:
       type: object
       description: "Credential-free normalized embeddings configuration returned after creation."
       properties:
+        publication_policy: { $ref: "#/components/schemas/IndexPublicationPolicy" }
         coverage_policy: { $ref: "#/components/schemas/DerivedCoveragePolicy" }
         external: { type: boolean, default: false }
         sparse: { type: boolean, default: false }
@@ -571,6 +572,47 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API."
+    IndexReadinessState:
+      type: string
+      enum:
+        - pending
+        - queryable_partial
+        - ready
+        - failed
+      description: "Authoritative query-readiness and completeness state for the desired index incarnation."
+    IndexReadinessStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - state
+        - queryable
+        - complete
+        - pending_reasons
+      properties:
+        state:
+          $ref: '#/components/schemas/IndexReadinessState'
+        queryable:
+          type: boolean
+          description: "Whether the published generation can safely answer queries."
+        complete:
+          type: boolean
+          description: "Whether the desired incarnation has complete coverage and publication according to its configured policies."
+        incarnation:
+          type: string
+          description: "Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents."
+        target_revision:
+          type: integer
+          format: uint64
+          description: "Highest captured source/replay revision required by this readiness observation."
+        published_revision:
+          type: integer
+          format: uint64
+          description: "Highest revision published to the query-visible index represented by this observation."
+        pending_reasons:
+          type: array
+          items:
+            type: string
+          description: "Stable, machine-readable blockers. Empty when state is ready."
     IndexRepairStatus:
       type: object
       description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
@@ -600,6 +642,8 @@ components:
           enum:
             - full_text
           description: "Discriminator for the index stats variant."
+        readiness:
+          $ref: '#/components/schemas/IndexReadinessStatus'
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -782,6 +826,17 @@ components:
           type: object
           additionalProperties: true
           description: "Artifact promotion replay diagnostics."
+    IndexPublicationPolicy:
+      type: string
+      enum:
+        - progressive
+        - atomic
+      default: progressive
+      description: >-
+        Publication behavior for a managed embeddings index. `progressive`
+        makes a safely checkpointed active generation queryable before initial
+        source coverage is complete. `atomic` keeps a new generation
+        unavailable until complete validation and activation.
     EmbeddingsIndexConfig:
       type: object
       description: >-
@@ -790,6 +845,8 @@ components:
         When sparse is false (default), creates a dense vector index (HNSW).
         For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
       properties:
+        publication_policy:
+          $ref: "#/components/schemas/IndexPublicationPolicy"
         coverage_policy:
           $ref: "#/components/schemas/DerivedCoveragePolicy"
           description: >-
@@ -1152,6 +1209,8 @@ components:
           enum:
             - embeddings
           description: "Discriminator for the index stats variant."
+        readiness:
+          $ref: '#/components/schemas/IndexReadinessStatus'
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -1412,6 +1471,8 @@ components:
           enum:
             - algebraic
           description: "Discriminator for the index stats variant."
+        readiness:
+          $ref: '#/components/schemas/IndexReadinessStatus'
         error:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -1898,6 +1959,8 @@ components:
           enum:
             - graph
           description: "Discriminator for the index stats variant."
+        readiness:
+          $ref: '#/components/schemas/IndexReadinessStatus'
         error:
           x-go-type-skip-optional-pointer: true
           type: string

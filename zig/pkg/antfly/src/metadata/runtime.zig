@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const antfly = @import("runtime_root.zig");
+const internal_service_auth = @import("../api/internal_service_auth.zig");
 const fs_paths = @import("../common/fs_paths.zig");
 const group_ids = @import("../common/group_ids.zig");
 const build_options = @import("build_options");
@@ -32,6 +33,14 @@ const metadata_raft_election_max_ticks = 60;
 const metadata_bootstrap_campaign_retry_min_interval_ns: u64 = 500 * std.time.ns_per_ms;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
+const internal_service_secret_key = "antfly.internal_service.secret";
+const internal_service_verification_secret_key = "antfly.internal_service.verification_secret";
+const internal_service_issuer_key = "antfly.internal_service.issuer";
+const internal_service_rollout_mode_key = "antfly.internal_service.rollout_mode";
+
+fn isExpectedControlRoundError(err: anyerror) bool {
+    return antfly.metadata.authority.isRetryableError(err);
+}
 
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
@@ -882,6 +891,70 @@ pub fn runFromIterator(
         if (secret_store_initialized) &secret_store else null,
     );
     defer if (trusted_principal_secret) |value| alloc.free(value);
+    const internal_service_secret = try resolveMetadataRuntimeSecretValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_secret_key,
+    );
+    defer if (internal_service_secret) |value| alloc.free(value);
+    const internal_service_verification_secret = try resolveMetadataRuntimeSecretValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_verification_secret_key,
+    );
+    defer if (internal_service_verification_secret) |value| alloc.free(value);
+    const internal_service_issuer = try resolveMetadataRuntimeSecretValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_issuer_key,
+    );
+    defer if (internal_service_issuer) |value| alloc.free(value);
+    const internal_service_rollout_mode_raw = try resolveMetadataRuntimeSecretValue(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+        internal_service_rollout_mode_key,
+    );
+    defer if (internal_service_rollout_mode_raw) |value| alloc.free(value);
+    const internal_service_rollout_mode = internal_service_auth.parseRolloutMode(
+        internal_service_rollout_mode_raw,
+    ) catch |err| {
+        std.log.err("invalid {s}; expected enforce or migration", .{internal_service_rollout_mode_key});
+        return err;
+    };
+    internal_service_auth.validateRuntimeConfig(
+        internal_service_secret,
+        internal_service_verification_secret,
+        internal_service_issuer,
+    ) catch |err| {
+        std.log.err(
+            "metadata startup requires a dedicated internal service credential: configure {s} with at least {d} bytes and a printable {s}; err={s}",
+            .{ internal_service_secret_key, internal_service_auth.minimum_secret_bytes, internal_service_issuer_key, @errorName(err) },
+        );
+        return err;
+    };
+    internal_service_auth.validateCredentialIsolation(
+        internal_service_secret,
+        trusted_principal_secret,
+    ) catch |err| {
+        std.log.err(
+            "metadata startup rejected reused signing material: {s} must differ from {s}",
+            .{ internal_service_secret_key, trusted_principal_secret_key },
+        );
+        return err;
+    };
+    internal_service_auth.validateCredentialIsolation(
+        internal_service_verification_secret,
+        trusted_principal_secret,
+    ) catch |err| {
+        std.log.err("metadata startup rejected reused verification signing material; err={s}", .{@errorName(err)});
+        return err;
+    };
+    if (internal_service_rollout_mode == .migration) {
+        std.log.warn(
+            "SECURITY: internal RPC legacy migration mode is active; unsigned old-peer requests are temporarily accepted. Upgrade every peer, verify X-Antfly-Internal-Auth=legacy-migration disappears, then set {s}=enforce",
+            .{internal_service_rollout_mode_key},
+        );
+    }
     const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
@@ -953,6 +1026,14 @@ pub fn runFromIterator(
             .experimental = cli.experimental,
             .trusted_principal_secret = trusted_principal_secret,
             .trusted_principal_issuer = trusted_principal_issuer,
+            .internal_service_secret = internal_service_secret,
+            .internal_service_verification_secret = internal_service_verification_secret,
+            .internal_service_issuer = internal_service_issuer,
+            .internal_service_auth_capability = internal_service_auth.capability(
+                internal_service_rollout_mode,
+                internal_service_verification_secret != null,
+            ),
+            .internal_service_accept_legacy_unauthenticated = internal_service_rollout_mode == .migration,
             .user_manager = if (user_manager) |*manager| manager else null,
             .secret_store = if (secret_store_initialized) &secret_store else null,
             .remote_content = remote_content,
@@ -1034,7 +1115,14 @@ pub fn runFromIterator(
             }
         }
         const run_round_start_ns = platform_time.monotonicNs();
-        server.runControlRoundOnly() catch |err| return supervisor.fail("metadata", "control-round", err);
+        server.runControlRoundOnly() catch |err| {
+            // Leadership can change after a control round observes the local
+            // reconcile lease but before one of its proposals is admitted.
+            // Retry authority churn on the next tick instead of terminating a
+            // healthy follower; storage and process failures remain fatal.
+            if (!isExpectedControlRoundError(err))
+                return supervisor.fail("metadata", "control-round", err);
+        };
         const run_round_elapsed_ns = platform_time.monotonicNs() -| run_round_start_ns;
         if (run_round_elapsed_ns > antfly.metadata_service.metadata_run_round_slow_threshold_ns) {
             std.log.warn("metadata runRound slow elapsed_ms={d}", .{@divTrunc(run_round_elapsed_ns, std.time.ns_per_ms)});
@@ -1940,6 +2028,22 @@ test "metadata runtime retries bootstrap campaign only for leaderless voters" {
 
     status.soft.leader_id = null;
     try std.testing.expect(!metadataRaftStatusShouldBootstrapCampaign(status, 4));
+}
+
+test "metadata runtime retries authority loss from control rounds" {
+    const expected_errors = [_]anyerror{
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+        error.MetadataLinearizableReadTimeout,
+        error.MetadataSnapshotHeadMismatch,
+        error.ReconcileLeaseNotHeld,
+    };
+    for (expected_errors) |err| {
+        try std.testing.expect(isExpectedControlRoundError(err));
+    }
+    try std.testing.expect(!isExpectedControlRoundError(error.OutOfMemory));
+    try std.testing.expect(!isExpectedControlRoundError(error.Corrupted));
 }
 
 test "metadata runtime scales bootstrap campaign retry interval with tick" {

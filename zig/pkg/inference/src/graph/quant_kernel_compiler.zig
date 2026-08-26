@@ -2953,7 +2953,7 @@ pub const first_e2b_cuda_q4_0_down_f32_12288_exact_kernel_id = "antfly_q4_0_down
 pub const first_e2b_cuda_q4_0_down_f32_12288_exact_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_down_f32_e2b_12288_exact.cu";
 pub const first_e2b_cuda_q4_0_down_f32_12288_exact_ptx_path = "/tmp/antfly_q4_0_down_f32_e2b_12288_exact_v1.fatbin";
 pub const first_e2b_cuda_q4_0_down_f32_12288_exact_check_command = "nvcc -fatbin " ++ first_cuda_generated_fatbin_options ++ " " ++ first_e2b_cuda_q4_0_down_f32_12288_exact_source_path ++ " -o " ++ first_e2b_cuda_q4_0_down_f32_12288_exact_ptx_path;
-pub const first_e2b_cuda_q4_0_ffn_benchmark_command = "scripts/benchmark_gemma4_cuda_e2b_ffn.sh";
+pub const first_e2b_cuda_q4_0_ffn_benchmark_command = "scripts/gemma4/benchmark_gemma4_cuda_e2b_ffn.sh";
 pub const first_e2b_cuda_q4_0_q8_1_argmax_kernel_id = "antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1";
 pub const first_e2b_cuda_q4_0_q8_1_argmax_source_path = "src/ops/cuda/generated/quant_kernel_q4_0_q8_1_argmax_e2b_tile8.cu";
 pub const first_e2b_cuda_q4_0_q8_1_argmax_ptx_path = "/tmp/antfly_q4_0_q8_1_argmax_rows_stage1_tile8_v1.fatbin";
@@ -3057,7 +3057,7 @@ pub const first_decode_attention_1x_cuda_split4_hd512_schedule = cudaAttentionSc
 // it by default at the 512-token KV crossover, with
 // ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_SCORE_PREWORK=0 as the rollback.
 pub const first_decode_attention_1x_cuda_score_prework_runtime_evidence_command = "zig build quant-kernel-cuda-paged-attention-diff -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast -- --head-dim all --kv-len 2003 --pattern all --key-format all --value-format all --page-order all --heads 8 --kv-heads 2 --iterations 100";
-pub const first_decode_attention_1x_cuda_score_prework_promotion_evidence_command = "python3 scripts/validate_gemma4_cuda_candidate.py --kernel-id cuda.attention.gqa.decode.score_prework --qualification-profile screening --prompt-fixture scripts/fixtures/gemma4_long_context_v1.json --lengths 300 --prefill-chunk-size 512 --cache-dtype f16 --capture-kv-capacity 2432 --output-dir /tmp/antfly-score-prework-screening";
+pub const first_decode_attention_1x_cuda_score_prework_promotion_evidence_command = "python3 scripts/gemma4/validate_gemma4_cuda_candidate.py --kernel-id cuda.attention.gqa.decode.score_prework --qualification-profile screening --prompt-fixture scripts/gemma4/fixtures/gemma4_long_context_v1.json --lengths 300 --prefill-chunk-size 512 --cache-dtype f16 --capture-kv-capacity 2432 --output-dir /tmp/antfly-score-prework-screening";
 pub const first_decode_attention_1x_cuda_score_prework_hd256_kernel_id = cuda_renderer.generated_attention_hd256_score_prework_kernel_id;
 pub const first_decode_attention_1x_cuda_score_prework_hd256_source_path = "src/ops/cuda/generated/attention_decode_score_prework_hd256.cu";
 pub const first_decode_attention_1x_cuda_score_prework_hd256_check_command = "nvcc -fatbin -gencode=arch=compute_75,code=sm_75 -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_90,code=sm_90 -gencode=arch=compute_75,code=compute_75 src/ops/cuda/generated/attention_decode_score_prework_hd256.cu -o /tmp/antfly_gqa_attention_decode_score_prework_hd256_f32_v1.fatbin";
@@ -3074,7 +3074,7 @@ pub const first_decode_attention_1x_cuda_score_prework_hd512_schedule = cudaAtte
 // qualified SM89 Gemma 4 F16 geometry, with
 // ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE=off as the rollback.
 pub const first_prefill_flash_cuda_runtime_evidence_command = "zig build quant-kernel-cuda-paged-prefill-diff -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast -- --json";
-pub const first_prefill_flash_cuda_promotion_evidence_command = "python3 scripts/validate_gemma4_cuda_candidate.py --kernel-id cuda.attention.gqa.prefill.flash_f16_sm89 --qualification-profile screening --prompt-fixture scripts/fixtures/gemma4_long_context_v1.json --lengths 300 --prefill-chunk-size 512 --cache-dtype f16 --capture-kv-capacity 2432 --output-dir /tmp/antfly-flash-prefill-screening";
+pub const first_prefill_flash_cuda_promotion_evidence_command = "python3 scripts/gemma4/validate_gemma4_cuda_candidate.py --kernel-id cuda.attention.gqa.prefill.flash_f16_sm89 --qualification-profile screening --prompt-fixture scripts/gemma4/fixtures/gemma4_long_context_v1.json --lengths 300 --prefill-chunk-size 512 --cache-dtype f16 --capture-kv-capacity 2432 --output-dir /tmp/antfly-flash-prefill-screening";
 pub const first_prefill_flash_cuda_hd256_kernel_id = cuda_renderer.generated_flash_prefill_hd256_kernel_id;
 pub const first_prefill_flash_cuda_hd256_source_path = "src/ops/cuda/generated/attention_prefill_flash_sm89_hd256.cu";
 pub const first_prefill_flash_cuda_hd256_check_command = "nvcc -fatbin -gencode=arch=compute_89,code=sm_89 -gencode=arch=compute_89,code=compute_89 src/ops/cuda/generated/attention_prefill_flash_sm89_hd256.cu -o /tmp/antfly_gqa_attention_prefill_flash_sm89_hd256.fatbin";

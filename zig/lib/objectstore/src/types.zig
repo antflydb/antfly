@@ -15,6 +15,45 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Borrowed transport-neutral cancellation source for one object operation.
+/// The callback and context must remain valid until the synchronous operation
+/// returns. Providers adapt this directly to their HTTP transport so an active
+/// request can be interrupted instead of merely discarded after completion.
+pub const CancellationToken = struct {
+    ptr: *const anyopaque,
+    is_cancelled_fn: *const fn (*const anyopaque) bool,
+
+    pub fn fromAtomic(signal: *const std.atomic.Value(bool)) CancellationToken {
+        return .{
+            .ptr = signal,
+            .is_cancelled_fn = struct {
+                fn call(raw: *const anyopaque) bool {
+                    const value: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+                    return value.load(.acquire);
+                }
+            }.call,
+        };
+    }
+
+    pub fn fromCallback(
+        ptr: ?*const anyopaque,
+        is_cancelled_fn: ?*const fn (*const anyopaque) bool,
+    ) ?CancellationToken {
+        return .{
+            .ptr = ptr orelse return null,
+            .is_cancelled_fn = is_cancelled_fn orelse return null,
+        };
+    }
+
+    pub fn isCancelled(self: CancellationToken) bool {
+        return self.is_cancelled_fn(self.ptr);
+    }
+
+    pub fn check(self: CancellationToken) !void {
+        if (self.isCancelled()) return error.Canceled;
+    }
+};
+
 pub const ObjectChecksumAlgorithm = enum {
     crc32_base64,
     crc32c_base64,
@@ -105,6 +144,13 @@ pub const GetOptions = struct {
     /// Bound bytes buffered by transports for this request. Implementations
     /// must enforce this before returning a response body.
     max_response_bytes: ?usize = null,
+    /// Borrowed for the duration of this operation. Remote providers interrupt
+    /// their active transport; local providers check between bounded chunks.
+    cancellation: ?CancellationToken = null,
+};
+
+pub const StatOptions = struct {
+    cancellation: ?CancellationToken = null,
 };
 
 pub const DeleteOptions = struct {

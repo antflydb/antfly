@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'USAGE'
-usage: scripts/gemma4_cuda_production_gate.sh
+usage: scripts/gemma4/gemma4_cuda_production_gate.sh
 
 Runs the Gemma4 CUDA production-readiness gate against local models.
 

@@ -10789,6 +10789,7 @@ test "Metal native provider initializes fresh encoder workloads with encoder reg
 }
 
 test "Metal workload profile lifecycle is bounded and fail closed" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
     const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
     defer termite_metal_decode_runtime_destroy(runtime);
@@ -11535,12 +11536,24 @@ pub const MetalJitQualificationRequest = struct {
     generated: *const RawMetalGeneratedPipeline,
 };
 
+fn unavailableMetalJitQualification(
+    context: ?*anyopaque,
+    request: MetalJitQualificationRequest,
+) anyerror!MetalJitQualificationMeasurements {
+    _ = context;
+    _ = request;
+    return error.MetalJitUnavailable;
+}
+
 pub const MetalJitQualificationHarness = struct {
     context: ?*anyopaque = null,
     qualify_fn: *const fn (
         context: ?*anyopaque,
         request: MetalJitQualificationRequest,
-    ) anyerror!MetalJitQualificationMeasurements = liveMetalJitQualification,
+    ) anyerror!MetalJitQualificationMeasurements = if (build_options.enable_metal)
+        liveMetalJitQualification
+    else
+        unavailableMetalJitQualification,
 
     pub fn qualify(
         self: MetalJitQualificationHarness,
@@ -13296,6 +13309,10 @@ fn activateMetalQualifiedProfileKernel(
     {
         return error.StaleQualifiedKernelSchedule;
     }
+    // Keep the pure profile and schedule validation above available to
+    // non-Metal builds without retaining any Metal C ABI references in their
+    // test artifacts.
+    if (comptime !build_options.enable_metal) return error.MetalJitUnavailable;
     const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(
         context.allocator,
         artifact,
@@ -13539,6 +13556,10 @@ fn metalJitQualificationWork(job: *MetalJitQualificationJob) anyerror!void {
 }
 
 fn metalJitActivateQualifiedJob(job: *MetalJitQualificationJob) !void {
+    if (comptime !build_options.enable_metal) {
+        job.outcome = .rejected;
+        return error.MetalJitUnavailable;
+    }
     job.outcome = .qualified;
     if (!job.mode.activates()) return;
     if (termite_metal_jit_route_activation_allowed(@intFromEnum(job.route.slot)) != 1) {
