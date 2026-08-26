@@ -369,33 +369,62 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
     defer packet_model.deinit(allocator);
 
     const policy = policiesForState(&decode_state);
-    var execution = try packet.executeTier1SegmentsForState(
-        allocator,
-        &packet_model,
-        payload_info.payload,
-        &decode_state,
-        .standard,
-        policy.refinement,
-        policy.magnitude,
-        0,
-        .standard,
-    );
-    defer execution.deinit(allocator);
-
-    const pixels = try reconstruct.reconstructTier1ExecutionReportWithOptions(
-        allocator,
-        &decode_state,
-        &execution,
-        false, // no bounded plane fixups
-        false, // no bounded pixel fixups
-    );
+    const pixels = if (try reconstruct.StreamingPlaneAssembler.canAssemble(&decode_state)) blk: {
+        var assembler = try reconstruct.StreamingPlaneAssembler.init(allocator, &decode_state);
+        defer assembler.deinit();
+        const Visitor = struct {
+            fn visit(context: *anyopaque, codeblock_state: *const packet.Tier1CodeblockState) !void {
+                const plane_assembler: *reconstruct.StreamingPlaneAssembler = @ptrCast(@alignCast(context));
+                try plane_assembler.appendCodeblock(codeblock_state);
+            }
+        };
+        try packet.visitTier1CodeblocksForState(
+            allocator,
+            &packet_model,
+            payload_info.payload,
+            &decode_state,
+            .standard,
+            policy.refinement,
+            policy.magnitude,
+            0,
+            .standard,
+            .{ .context = &assembler, .visit = Visitor.visit },
+        );
+        const planes = try assembler.finish(0);
+        defer {
+            for (planes) |plane| allocator.free(plane);
+            allocator.free(planes);
+        }
+        break :blk try reconstruct.interleaveComponentPlanesU8(allocator, &decode_state, planes);
+    } else blk: {
+        var execution = try packet.executeTier1SegmentsForState(
+            allocator,
+            &packet_model,
+            payload_info.payload,
+            &decode_state,
+            .standard,
+            policy.refinement,
+            policy.magnitude,
+            0,
+            .standard,
+        );
+        defer execution.deinit(allocator);
+        const reconstruction = try reconstruct.reconstructTier1ExecutionReportWithOptions(
+            allocator,
+            &decode_state,
+            &execution,
+            false,
+            false,
+        );
+        break :blk reconstruction.pixels;
+    };
     return .{
         .allocator = allocator,
         .width = state.header.width,
         .height = state.header.height,
         .components = @intCast(state.header.components.len),
         .backend = .pure_zig,
-        .pixels = pixels.pixels,
+        .pixels = pixels,
         .jp2_color = jp2_color,
     };
 }
@@ -1779,6 +1808,104 @@ fn codestreamPayloadInfoWithPackedMode(
 
 fn readTestFile(allocator: std.mem.Allocator, sub_path: []const u8) ![]u8 {
     return compat.cwd().readFileAlloc(compat.io(), sub_path, allocator, .limited(1024 * 1024));
+}
+const TestPeakAllocator = struct {
+    backing: std.mem.Allocator,
+    live_bytes: usize = 0,
+    peak_live_bytes: usize = 0,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn recordGrowth(self: *@This(), bytes: usize) void {
+        self.live_bytes += bytes;
+        self.peak_live_bytes = @max(self.peak_live_bytes, self.live_bytes);
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const result = self.backing.rawAlloc(len, alignment, return_address) orelse return null;
+        self.recordGrowth(len);
+        return result;
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) bool {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        if (!self.backing.rawResize(memory, alignment, new_len, return_address)) return false;
+        if (new_len > memory.len) {
+            self.recordGrowth(new_len - memory.len);
+        } else {
+            self.live_bytes -= memory.len - new_len;
+        }
+        return true;
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        const result = self.backing.rawRemap(memory, alignment, new_len, return_address) orelse return null;
+        if (new_len > memory.len) {
+            self.recordGrowth(new_len - memory.len);
+        } else {
+            self.live_bytes -= memory.len - new_len;
+        }
+        return result;
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        self.backing.rawFree(memory, alignment, return_address);
+        self.live_bytes -= memory.len;
+    }
+};
+
+test "OfficeQA JPEG 2000 page decodes natively within bounded memory" {
+    const fixture = try readTestFile(
+        std.testing.allocator,
+        "testdata/image/jpeg2000/regression/officeqa-1985-page1-2319x3253.j2k",
+    );
+    defer std.testing.allocator.free(fixture);
+
+    var peak = TestPeakAllocator{ .backing = std.testing.allocator };
+    var decoded = try decodeU8Bytes(peak.allocator(), fixture);
+    try std.testing.expectEqual(@as(u32, 2319), decoded.width);
+    try std.testing.expectEqual(@as(u32, 3253), decoded.height);
+    try std.testing.expectEqual(@as(u8, 3), decoded.components);
+    try std.testing.expectEqual(@as(usize, 2319 * 3253 * 3), decoded.pixels.len);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(decoded.pixels, &digest, .{});
+    try std.testing.expectEqualStrings(
+        "bd592833fd9c09b0501d9eb6855c50e557d4df9afaca7d34963edb5af5c1363f",
+        &std.fmt.bytesToHex(digest, .lower),
+    );
+    try std.testing.expect(peak.peak_live_bytes <= 96 * 1024 * 1024);
+    decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), peak.live_bytes);
+}
+test "larger OfficeQA JPEG 2000 page decodes within 128 MiB" {
+    const fixture = try readTestFile(
+        std.testing.allocator,
+        "testdata/image/jpeg2000/regression/officeqa-1972-page204-2612x3564.j2k",
+    );
+    defer std.testing.allocator.free(fixture);
+
+    var peak = TestPeakAllocator{ .backing = std.testing.allocator };
+    var decoded = try decodeU8Bytes(peak.allocator(), fixture);
+    try std.testing.expectEqual(@as(u32, 2612), decoded.width);
+    try std.testing.expectEqual(@as(u32, 3564), decoded.height);
+    try std.testing.expectEqual(@as(u8, 3), decoded.components);
+    try std.testing.expectEqual(@as(usize, 2612 * 3564 * 3), decoded.pixels.len);
+    try std.testing.expect(peak.peak_live_bytes <= 128 * 1024 * 1024);
+    decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), peak.live_bytes);
 }
 
 test "decode OpenJPEG lossless 8x8 grayscale J2K" {

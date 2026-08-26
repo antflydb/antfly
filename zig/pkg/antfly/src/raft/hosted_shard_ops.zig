@@ -60,6 +60,8 @@ pub const HostedShardOperationAdapter = struct {
     executor: http_common.RequestExecutor,
     readiness: GroupTransitionReadinessSource,
     local_ops: ?shard_ops.ShardOperationAdapter = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -70,6 +72,18 @@ pub const HostedShardOperationAdapter = struct {
         local_ops: ?shard_ops.ShardOperationAdapter,
     ) HostedShardOperationAdapter {
         return initWithRouters(alloc, catalog, router, router, executor, readiness, local_ops);
+    }
+
+    pub fn withInternalServiceAuth(self: *HostedShardOperationAdapter, secret: ?[]const u8, issuer: ?[]const u8) *HostedShardOperationAdapter {
+        self.internal_service_secret = secret;
+        self.internal_service_issuer = issuer;
+        return self;
+    }
+
+    fn httpClient(self: *HostedShardOperationAdapter) api_http_client.ApiHttpClient {
+        var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client;
     }
 
     pub fn initWithRouters(
@@ -192,7 +206,7 @@ pub const HostedShardOperationAdapter = struct {
                 return observation;
             },
             .remote => |remote| {
-                var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
+                var client = self.httpClient();
                 return client.fetchGroupShardObserveSplit(remote.base_uri, record.source_group_id, record) catch |err| {
                     if (!isLeaderRediscoveryError(err)) return err;
                     break :preferred err;
@@ -223,7 +237,7 @@ pub const HostedShardOperationAdapter = struct {
                 return observation;
             },
             .remote => |remote| {
-                var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
+                var client = self.httpClient();
                 return client.fetchGroupShardObserveMerge(remote.base_uri, record.donor_group_id, record) catch |err| {
                     if (!isLeaderRediscoveryError(err)) return err;
                     break :preferred err;
@@ -252,7 +266,7 @@ pub const HostedShardOperationAdapter = struct {
                 };
             },
             .remote => |remote| {
-                var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
+                var client = self.httpClient();
                 _ = client.fetchGroupShardExecute(remote.base_uri, group_id, action) catch |err| {
                     if (!isLeaderRediscoveryError(err)) return err;
                     return try self.executeFromCandidates(router, group_id, action, attempted_node_id);
@@ -298,7 +312,7 @@ pub const HostedShardOperationAdapter = struct {
         const base_uri = (try self.data_router.nodeBaseUriForGroup(self.alloc, record.source_group_id, node_id)) orelse
             return error.UnknownGroup;
         defer self.alloc.free(base_uri);
-        var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
+        var client = self.httpClient();
         return try client.fetchGroupShardObserveSplit(base_uri, record.source_group_id, record);
     }
 
@@ -339,7 +353,7 @@ pub const HostedShardOperationAdapter = struct {
         const base_uri = (try self.data_router.nodeBaseUriForGroup(self.alloc, record.donor_group_id, node_id)) orelse
             return error.UnknownGroup;
         defer self.alloc.free(base_uri);
-        var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
+        var client = self.httpClient();
         return try client.fetchGroupShardObserveMerge(base_uri, record.donor_group_id, record);
     }
 
@@ -381,7 +395,7 @@ pub const HostedShardOperationAdapter = struct {
         const base_uri = (try router.nodeBaseUriForGroup(self.alloc, group_id, node_id)) orelse
             return error.UnknownGroup;
         defer self.alloc.free(base_uri);
-        var client = api_http_client.ApiHttpClient.init(self.alloc, self.executor);
+        var client = self.httpClient();
         _ = try client.fetchGroupShardExecute(base_uri, group_id, action);
     }
 
@@ -444,6 +458,8 @@ pub const HostedShardDbAdapter = struct {
     router: api_table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
     local_db: ?metadata_mod.ShardDbAdapter = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -459,6 +475,18 @@ pub const HostedShardDbAdapter = struct {
             .executor = executor,
             .local_db = local_db,
         };
+    }
+
+    pub fn withInternalServiceAuth(self: *HostedShardDbAdapter, secret: ?[]const u8, issuer: ?[]const u8) *HostedShardDbAdapter {
+        self.internal_service_secret = secret;
+        self.internal_service_issuer = issuer;
+        return self;
+    }
+
+    fn httpClient(self: *HostedShardDbAdapter, alloc: std.mem.Allocator) api_http_client.ApiHttpClient {
+        var client = api_http_client.ApiHttpClient.init(alloc, self.executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client;
     }
 
     pub fn adapter(self: *HostedShardDbAdapter) metadata_mod.ShardDbAdapter {
@@ -526,7 +554,7 @@ pub const HostedShardDbAdapter = struct {
             const base_uri = (try self.router.nodeBaseUriForGroup(self.alloc, group_id, node_id)) orelse continue;
             defer self.alloc.free(base_uri);
             saw_candidate = true;
-            var client = api_http_client.ApiHttpClient.init(alloc, self.executor);
+            var client = self.httpClient(alloc);
             const candidate_median_key = client.fetchGroupDbMedianKey(base_uri, group_id) catch |err| {
                 if (isLeaderRediscoveryError(err)) continue;
                 return err;
@@ -554,7 +582,7 @@ pub const HostedShardDbAdapter = struct {
             },
             .remote => |remote| {
                 try tried_node_ids.append(self.alloc, remote.node_id);
-                var client = api_http_client.ApiHttpClient.init(alloc, self.executor);
+                var client = self.httpClient(alloc);
                 return try client.fetchGroupDbMedianKey(remote.base_uri, group_id);
             },
         };
@@ -948,8 +976,12 @@ test "hosted shard db adapter routes median key to remote leader" {
         }
     };
 
+    const internal_service_secret = "hosted-shard-db-test-internal-service-secret-v1";
+    const internal_service_issuer = "hosted-shard-db-test";
     var server = api_http_server.ApiHttpServer.init(std.heap.page_allocator, .{
         .shard_db_adapter = FakeRemoteShardDb.adapter(),
+        .internal_service_secret = internal_service_secret,
+        .internal_service_issuer = internal_service_issuer,
     }, FakeStatus.iface(), null, null);
     defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
@@ -1007,8 +1039,10 @@ test "hosted shard db adapter routes median key to remote leader" {
         executor.executor(),
         null,
     );
+    _ = hosted.withInternalServiceAuth(internal_service_secret, internal_service_issuer);
 
-    const median_key = (try hosted.adapter().fetchMedianKey(std.testing.allocator, 88)).?;
+    const median_key = (try hosted.adapter().fetchMedianKey(std.testing.allocator, 88)) orelse
+        return error.TestExpectedMedianKey;
     defer std.testing.allocator.free(median_key);
     try std.testing.expectEqualStrings("doc:m", median_key);
     try std.testing.expectError(error.UnsupportedOperation, hosted.adapter().schemaIndexReady(std.testing.allocator, "docs", 88, 2, 1));

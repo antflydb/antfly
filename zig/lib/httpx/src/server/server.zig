@@ -43,6 +43,7 @@ const Headers = @import("../core/headers.zig").Headers;
 const HeaderName = @import("../core/headers.zig").HeaderName;
 const containsCrLf = @import("../core/headers.zig").containsCrLf;
 const Parser = @import("../protocol/parser.zig").Parser;
+const ParserErrorReason = @import("../protocol/parser.zig").ErrorReason;
 const http = @import("../protocol/http.zig");
 const Socket = @import("../net/socket.zig").Socket;
 const Address = @import("../net/socket.zig").Address;
@@ -238,7 +239,7 @@ fn routeErrorStatus(err: anyerror) ?u16 {
         error.Canceled, error.Cancelled => null,
         error.Timeout => 408,
         error.DeadlineExceeded => 504,
-        error.BodyTooLarge, error.StreamTooLong, error.ValueTooLong => 413,
+        error.BodyTooLarge, error.StreamDataOverflow, error.StreamTooLong, error.ValueTooLong => 413,
         error.BodyCapacityExceeded => 429,
         error.EndOfStream,
         error.SyntaxError,
@@ -249,6 +250,10 @@ fn routeErrorStatus(err: anyerror) ?u16 {
         => 400,
         else => 500,
     };
+}
+
+fn parserErrorStatus(reason: ParserErrorReason) u16 {
+    return if (reason == .body_too_large) 413 else 400;
 }
 
 fn routeErrorBody(code: u16) []const u8 {
@@ -1888,7 +1893,7 @@ pub const Server = struct {
                 }
                 leftover -= consumed;
                 if (parser.isError()) {
-                    try self.sendError(&sock, 400);
+                    try self.sendError(&sock, parserErrorStatus(parser.getErrorReason()));
                     return;
                 }
                 if (!self.reserveH1BodyAfterHeaders(&parser, &h1_body_reserved)) {
@@ -1956,7 +1961,7 @@ pub const Server = struct {
                 }
                 leftover = n - consumed;
                 if (parser.isError()) {
-                    try self.sendError(&sock, 400);
+                    try self.sendError(&sock, parserErrorStatus(parser.getErrorReason()));
                     return;
                 }
                 if (!self.reserveH1BodyAfterHeaders(&parser, &h1_body_reserved)) {
@@ -3458,12 +3463,15 @@ test "routeErrorStatus maps oversized route errors to payload too large" {
     try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.ValueTooLong));
     try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.StreamTooLong));
     try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.BodyTooLarge));
+    try std.testing.expectEqual(@as(?u16, 413), routeErrorStatus(error.StreamDataOverflow));
     try std.testing.expectEqual(@as(?u16, 429), routeErrorStatus(error.BodyCapacityExceeded));
     try std.testing.expectEqual(@as(?u16, 408), routeErrorStatus(error.Timeout));
     try std.testing.expectEqual(@as(?u16, 504), routeErrorStatus(error.DeadlineExceeded));
     try std.testing.expectEqual(@as(?u16, 500), routeErrorStatus(error.UnexpectedRouteFailure));
     try std.testing.expectEqual(@as(?u16, null), routeErrorStatus(error.Canceled));
     try std.testing.expectEqual(@as(?u16, null), routeErrorStatus(error.Cancelled));
+    try std.testing.expectEqual(@as(u16, 413), parserErrorStatus(.body_too_large));
+    try std.testing.expectEqual(@as(u16, 400), parserErrorStatus(.malformed_request_line));
     try std.testing.expectEqualStrings(
         "{\"error\":\"INVALID_REQUEST\",\"message\":\"invalid request\"}",
         routeErrorBody(400),
@@ -3739,6 +3747,93 @@ test "H1 body deadline starts after headers and rejects a stalled upload" {
     const n = try client.recv(&response);
     try std.testing.expect(mem.indexOf(u8, response[0..n], " 408 ") != null);
     try std.testing.expect(!State.handled.load(.acquire));
+}
+
+test "H1 oversized content length returns 413 before handler admission" {
+    const State = struct {
+        var handled = std.atomic.Value(usize).init(0);
+
+        fn handler(ctx: *Context) anyerror!Response {
+            _ = handled.fetchAdd(1, .acq_rel);
+            return ctx.text("ok");
+        }
+    };
+    State.handled.store(0, .release);
+
+    const allocator = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var server = Server.initWithConfig(allocator, io_impl.io(), .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .max_body_size = 4,
+        .h1_disconnect_cancellation = .disabled,
+    });
+    defer server.deinit();
+    try server.get("/ok", State.handler);
+    try server.post("/upload", State.handler);
+    try server.bind();
+
+    const listener_thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *Server) void {
+            s.listen() catch |err| std.debug.panic("oversized-body listener failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        listener_thread.join();
+    }
+    while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
+
+    const client_io = std.Io.Threaded.global_single_threaded.io();
+
+    // Exercise the first-request parser path. The declared size is rejected
+    // from the headers alone, before allocating or invoking the handler.
+    {
+        var client = try Socket.connect(server.boundAddress().?, client_io);
+        defer client.close();
+        try client.setRecvTimeout(5_000);
+        try client.sendAll(
+            "POST /upload HTTP/1.1\r\n" ++
+                "Host: test\r\n" ++
+                "Content-Length: 5\r\n" ++
+                "Connection: close\r\n\r\n",
+        );
+
+        var response: [1024]u8 = undefined;
+        const n = try client.recv(&response);
+        try std.testing.expect(mem.indexOf(u8, response[0..n], "HTTP/1.1 413 ") != null);
+        try std.testing.expectEqual(@as(usize, 0), State.handled.load(.acquire));
+    }
+
+    // Exercise the leftover/pipelined parser path as well. The first request
+    // is admitted, while the oversized second request receives its own 413.
+    {
+        var client = try Socket.connect(server.boundAddress().?, client_io);
+        defer client.close();
+        try client.setRecvTimeout(5_000);
+        try client.sendAll(
+            "GET /ok HTTP/1.1\r\n" ++
+                "Host: test\r\n\r\n" ++
+                "POST /upload HTTP/1.1\r\n" ++
+                "Host: test\r\n" ++
+                "Content-Length: 5\r\n" ++
+                "Connection: close\r\n\r\n",
+        );
+
+        var response: [2048]u8 = undefined;
+        var response_len: usize = 0;
+        while (response_len < response.len) {
+            const n = try client.recv(response[response_len..]);
+            if (n == 0) break;
+            response_len += n;
+        }
+        const bytes = response[0..response_len];
+        try std.testing.expectEqual(@as(usize, 2), mem.count(u8, bytes, "HTTP/1.1"));
+        try std.testing.expect(mem.indexOf(u8, bytes, "HTTP/1.1 200 ") != null);
+        try std.testing.expect(mem.indexOf(u8, bytes, "HTTP/1.1 413 ") != null);
+        try std.testing.expectEqual(@as(usize, 1), State.handled.load(.acquire));
+    }
 }
 
 test "H1 handler failure after stream commit closes without a second response" {

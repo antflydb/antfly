@@ -3880,6 +3880,8 @@ pub const HostedProvisionedTableReadSource = struct {
     router: table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
     io_impl: ?FanoutIo = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     distributed_graph_lifecycle_hook: ?distributed_graph.LifecycleHook = null,
@@ -3917,6 +3919,31 @@ pub const HostedProvisionedTableReadSource = struct {
     pub fn withBackendRuntime(self: *HostedProvisionedTableReadSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableReadSource {
         self.backend_runtime = backend_runtime;
         return self;
+    }
+
+    pub fn withInternalServiceAuth(
+        self: *HostedProvisionedTableReadSource,
+        secret: ?[]const u8,
+        issuer: ?[]const u8,
+    ) *HostedProvisionedTableReadSource {
+        self.internal_service_secret = secret;
+        self.internal_service_issuer = issuer;
+        return self;
+    }
+
+    fn internalExecutor(self: *HostedProvisionedTableReadSource) http_common.RequestExecutor {
+        return .{ .ptr = self, .vtable = &.{ .execute = executeInternalRequest } };
+    }
+
+    fn executeInternalRequest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: http_common.HttpRequest,
+    ) anyerror!http_common.HttpResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var client = http_client.ApiHttpClient.init(alloc, self.executor);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client.executeRequest(request);
     }
 
     pub fn withGroupVisibleRootGeneration(self: *HostedProvisionedTableReadSource, generation_source: ?GroupVisibleRootGenerationSource) *HostedProvisionedTableReadSource {
@@ -4035,7 +4062,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
         return switch (route) {
             .local => try documentArtifactManifestProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency, false),
-            .remote => |remote| documentArtifactManifestRemote(self.executor, alloc, remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
+            .remote => |remote| documentArtifactManifestRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
                 error.UnexpectedHttpStatus, error.NotFound => null,
                 else => err,
             },
@@ -4054,7 +4081,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
         return switch (route) {
             .local => try documentArtifactManifestsProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency, false),
-            .remote => |remote| documentArtifactManifestsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, doc_key) catch |err| switch (err) {
+            .remote => |remote| documentArtifactManifestsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, doc_key) catch |err| switch (err) {
                 error.UnexpectedHttpStatus, error.NotFound => null,
                 else => err,
             },
@@ -4073,7 +4100,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         return switch (route) {
             .local => try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency),
-            .remote => |remote| lookupRemote(self.executor, alloc, remote.base_uri, group_id, table_name, key, opts, consistency) catch |err| switch (err) {
+            .remote => |remote| lookupRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, key, opts, consistency) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4116,7 +4143,7 @@ pub const HostedProvisionedTableReadSource = struct {
             }
             const base_uri = (try self.router.nodeBaseUriForGroup(alloc, group_id, node_id)) orelse continue;
             defer alloc.free(base_uri);
-            if (lookupRemote(self.executor, alloc, base_uri, group_id, table_name, key, opts, consistency)) |result| {
+            if (lookupRemote(self.internalExecutor(), alloc, base_uri, group_id, table_name, key, opts, consistency)) |result| {
                 return result;
             } else |err| switch (err) {
                 error.UnexpectedHttpStatus => continue,
@@ -4178,7 +4205,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
             var result = switch (route) {
                 .local => try scanProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, group_opts, consistency, false),
-                .remote => |remote| try scanRemote(self.executor, alloc, remote.base_uri, group_id, table_name, from_key, to_key, group_opts),
+                .remote => |remote| try scanRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, from_key, to_key, group_opts),
             } orelse return null;
             defer result.deinit(alloc);
 
@@ -4308,7 +4335,7 @@ pub const HostedProvisionedTableReadSource = struct {
                     }
                 },
                 .remote => |remote| {
-                    const summary = try preflightRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req, max_work);
+                    const summary = try preflightRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req, max_work);
                     if (first_summary == null) {
                         first_summary = summary;
                     } else {
@@ -4467,7 +4494,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinPartitionRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinPartitionRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4488,7 +4515,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinRowsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinRowsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4509,7 +4536,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinUnmatchedRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinUnmatchedRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4530,7 +4557,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinFinalizeRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+            .remote => |remote| joinFinalizeRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4550,7 +4577,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => null,
-            .remote => |remote| joinJobStateRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+            .remote => |remote| joinJobStateRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
             },
@@ -4623,7 +4650,7 @@ pub const HostedProvisionedTableReadSource = struct {
                         ctx.namespace.range_id,
                     );
                 }
-                break :blk try graphExpandRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req);
+                break :blk try graphExpandRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req);
             },
         };
     }
@@ -4655,7 +4682,7 @@ pub const HostedProvisionedTableReadSource = struct {
 
         return switch (route) {
             .local => try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency),
-            .remote => |remote| try graphEdgesRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req),
+            .remote => |remote| try graphEdgesRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req),
         };
     }
 };
@@ -4900,7 +4927,7 @@ fn collectHostedSearchRequestTextStatsParallel(
                     body_inner,
                     false,
                 ),
-                .remote => |remote| textStatsRemote(source.executor, arena, remote.base_uri, group_id, table_name_inner, body_inner, req_inner),
+                .remote => |remote| textStatsRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, body_inner, req_inner),
             } catch |err| {
                 slot.err = err;
                 return;
@@ -5068,7 +5095,7 @@ fn queryHostedAcrossGroupsParallel(
                     group_req,
                     consistency_inner,
                 ),
-                .remote => |remote| queryRemote(source.executor, arena, remote.base_uri, group_id, table_name_inner, group_req),
+                .remote => |remote| queryRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, group_req),
             } catch |err| {
                 slot.err = err;
                 return;
@@ -6340,7 +6367,7 @@ fn preflightHostedGroupsParallel(
                     false,
                 ),
                 .remote => |remote| preflightRemote(
-                    source.executor,
+                    source.internalExecutor(),
                     arena,
                     remote.base_uri,
                     group_id,
@@ -7809,7 +7836,7 @@ fn queryHostedAcrossGroupsPhase(
         defer route.deinit(alloc);
         shard_results[i] = switch (route) {
             .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, group_req, consistency),
-            .remote => |remote| try queryRemote(self.executor, alloc, remote.base_uri, group_id, table_name, group_req),
+            .remote => |remote| try queryRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, group_req),
         };
         initialized += 1;
         result_identity_generations[i] = shard_results[i].identity_read_generation;
@@ -8083,7 +8110,7 @@ fn executeHostedGraphHydrate(
                     ctx.namespace.range_id,
                 );
             }
-            break :blk try graphHydrateRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req);
+            break :blk try graphHydrateRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req);
         },
     };
 }
@@ -8157,7 +8184,7 @@ fn executeHostedGraphGetEdges(
 
     return switch (route) {
         .local => graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency),
-        .remote => |remote| try graphEdgesRemote(self.executor, alloc, remote.base_uri, group_id, table_name, req),
+        .remote => |remote| try graphEdgesRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req),
     };
 }
 
@@ -14048,7 +14075,7 @@ fn collectHostedAlgebraicDistributedPartials(
                 };
             },
             .remote => |remote| blk: {
-                var response = (algebraicPartialsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, group_req) catch return null) orelse return null;
+                var response = (algebraicPartialsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req) catch return null) orelse return null;
                 defer response.deinit(alloc);
                 break :blk try parseAlgebraicPartialsResponse(alloc, response.json);
             },
@@ -15535,7 +15562,7 @@ fn collectHostedSearchRequestTextStats(
             defer route.deinit(alloc);
             var response = switch (route) {
                 .local => (try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse return error.TableNotFound,
-                .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
+                .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
             };
             defer response.deinit(alloc);
             shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -15565,7 +15592,7 @@ fn collectHostedSearchRequestTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -15692,7 +15719,7 @@ fn collectHostedAggregationTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -15738,7 +15765,7 @@ fn collectHostedAggregationBackgroundTextStats(
         defer route.deinit(alloc);
         var response = switch (route) {
             .local => (try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse return error.TableNotFound,
-            .remote => |remote| (try textStatsRemote(self.executor, alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
+            .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
         shard_stats[i] = try parseBackgroundTextStatsResponse(alloc, response.json);

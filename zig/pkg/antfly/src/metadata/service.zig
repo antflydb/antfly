@@ -490,6 +490,8 @@ pub const MetadataServiceConfig = struct {
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*common_secrets.FileStore = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     reallocation_protocol_peers: []const ReallocationProtocolPeer = &.{},
 };
@@ -1768,6 +1770,8 @@ pub const MetadataService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     json_response_calls: std.atomic.Value(u64) = .init(0),
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
@@ -1823,6 +1827,8 @@ pub const MetadataService = struct {
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
+            .internal_service_secret = cfg.internal_service_secret,
+            .internal_service_issuer = cfg.internal_service_issuer,
             .destination_authorizer = cfg.destination_authorizer,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHostService.init(alloc, host_cfg, host_deps, cfg.raft, deps.raft),
@@ -3645,6 +3651,8 @@ pub const MetadataHttpService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
@@ -3705,6 +3713,8 @@ pub const MetadataHttpService = struct {
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
             .secret_store = cfg.secret_store,
+            .internal_service_secret = cfg.internal_service_secret,
+            .internal_service_issuer = cfg.internal_service_issuer,
             .destination_authorizer = cfg.destination_authorizer,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
@@ -6359,6 +6369,10 @@ pub const MetadataHttpService = struct {
         );
         _ = hosted_write_source.withBackendRuntime(runtime);
         _ = hosted_write_source.withSecretStore(self.secret_store);
+        _ = hosted_write_source.withInternalServiceAuth(
+            self.internal_service_secret,
+            self.internal_service_issuer,
+        );
         _ = hosted_write_source.withDestinationAuthorization(self.destination_authorizer);
         const write_source = self.cdc_write_source_override orelse hosted_write_source.source();
         var coordinator = metadata_replication_backfill.SnapshotBackfillCoordinator{

@@ -11,7 +11,10 @@ import (
 // ValidateCreate validates the restore configuration when creating a new restore.
 // Called by controller fallback when webhooks are disabled.
 func (r *AntflyRestore) ValidateCreate() error {
-	return r.ValidateAntflyRestore()
+	if err := r.ValidateAntflyRestore(); err != nil {
+		return err
+	}
+	return r.ValidateRestoreConnection()
 }
 
 // ValidateUpdate validates the restore configuration when updating an existing restore.
@@ -38,7 +41,22 @@ Problem: The restore operation is already in phase '%s'.
 
 Solution: Delete this AntflyRestore and create a new one if you need different settings.`, old.Status.Phase)
 	}
-	return r.ValidateAntflyRestore()
+	if err := r.ValidateAntflyRestore(); err != nil {
+		return err
+	}
+	return r.ValidateRestoreConnection()
+}
+
+// ValidateRestoreConnection enforces the network API's named-connection
+// contract while the controller retains upgrade-safe handling for legacy CRs.
+func (r *AntflyRestore) ValidateRestoreConnection() error {
+	if strings.TrimSpace(r.Spec.Source.Connection) == "" {
+		return fmt.Errorf("spec.source.connection is required; configure an external_io connection with restore.read and migrate any legacy credentialsSecret before starting this restore")
+	}
+	if r.Spec.Source.CredentialsSecret != nil {
+		return fmt.Errorf("spec.source.credentialsSecret is deprecated and cannot be used with network restores; configure credentials on spec.source.connection")
+	}
+	return nil
 }
 
 // ValidateAntflyRestore performs all validation checks
@@ -106,10 +124,8 @@ in your credentials secret.`, source.Location)
 	if source.Connection != "" && source.CredentialsSecret != nil {
 		return fmt.Errorf("spec.source.connection and spec.source.credentialsSecret are mutually exclusive")
 	}
-	if source.Connection != "" && !strings.HasPrefix(source.Location, "s3://") {
-		return fmt.Errorf("spec.source.connection requires an s3:// location")
-	}
-
+	// Both object and filesystem locations are authorized by the named
+	// external_io connection at runtime.
 	return nil
 }
 

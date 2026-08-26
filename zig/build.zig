@@ -3073,8 +3073,23 @@ pub fn build(b: *std.Build) void {
         .root_module = image_test_mod,
     });
     const run_lib_image_tests = b.addRunArtifact(lib_image_tests);
+    const jpeg2000_decode_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/image/src/jpeg2000/decode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const jpeg2000_decode_tests = b.addTest(.{
+        .root_module = jpeg2000_decode_test_mod,
+    });
+    const run_jpeg2000_decode_tests = b.addRunArtifact(jpeg2000_decode_tests);
+    const jpeg2000_decode_test_step = b.step(
+        "lib-image-jpeg2000-test",
+        "Run direct JPEG 2000 decoder tests",
+    );
+    jpeg2000_decode_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
     lib_image_test_step.dependOn(&run_lib_image_tests.step);
+    lib_image_test_step.dependOn(&run_jpeg2000_decode_tests.step);
 
     const pdf_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/pdf_test_root.zig"),
@@ -3426,6 +3441,21 @@ pub fn build(b: *std.Build) void {
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
 
+    const lib_preload_model_spec_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "preload model spec parser categorizes registry variants and backends",
+            "inference runtime preload parser preserves registry variants and explicit backends",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_preload_model_spec_tests = addFilteredTestRunArtifact(b, lib_preload_model_spec_tests);
+    const lib_preload_model_spec_test_step = b.step("lib-preload-model-spec-test", "Run preload model CLI parser tests");
+    lib_preload_model_spec_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
+
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{ "file secret store", "remote content runtime" },
@@ -3538,6 +3568,7 @@ pub fn build(b: *std.Build) void {
     };
     const unit_progress_skip_filters = root_test_skip_filters;
     const lib_unit_default_filters = [_][]const u8{
+        "bedrock provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
         "restore runtime store persists checkpoints and requeues interrupted work",
@@ -3814,6 +3845,18 @@ pub fn build(b: *std.Build) void {
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
+    const lib_bedrock_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"bedrock provider request helpers"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_bedrock_tests = addFilteredTestRunArtifact(b, lib_bedrock_tests);
+    const lib_bedrock_test_step = b.step("lib-bedrock-test", "Run focused Bedrock provider tests");
+    lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
+
     const api_http_runtime_default_filters = [_][]const u8{
         "api http client round-trips public status and internal capability routes",
         "api http retryable embedding failures provide retry guidance",
@@ -3835,6 +3878,7 @@ pub fn build(b: *std.Build) void {
         "table read source distinguishes unavailable physical capability observation",
         "generated route policy inventory is unique and describes wire modes",
         "linked API dispatch preserves kernel-owned ingress policy",
+        "opaque host middleware protects direct internal routes across the kernel ABI",
         "linked transport projects the universal request cancellation callback",
         "linked transport admits a streaming body before the kernel pulls it",
         "linked callbacks preserve streaming and cancellation semantics",
@@ -4364,6 +4408,7 @@ pub fn build(b: *std.Build) void {
         "data runtime repair debt hook targets the affected group queue",
         "data runtime repair failures preserve durable backoff and increase retry delay",
         "index repair fallback backoff never blocks an exact durable wake",
+        "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic",
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",
@@ -5443,18 +5488,23 @@ pub fn build(b: *std.Build) void {
         "api http server document scan requires table read permission",
         "transaction principals bind sessions to credential identity",
         "api transaction sessions enforce principal permissions and row filters",
-        "query builder runtime preflight injects mandatory row filter",
-        "MCP document sampling pushes mandatory row filters into storage scans",
-        "usermgr api key permission intersection narrows owner and key wildcards",
         "stored destination admission requires write permission on every eventual sink",
+        "query builder runtime preflight injects mandatory row filter",
         "stored destination envelopes cannot be forged and validate on resume",
         "stored destination grants bind credential source and live permissions",
+        "api http client forwards bounded raft batch routing context without allocation",
+        "api http client authenticates only the internal API namespace",
+        "MCP document sampling pushes mandatory row filters into storage scans",
+        "internal service credentials cannot authorize public inference routes",
         "legacy restore jobs resume only when backed-up definitions are sink free",
         "failed destination authorization refresh reuses the idempotent restore job",
         "destination authorization adoption requires source table admin",
         "legacy stored destinations can be adopted idempotently",
         "api http server cluster restore",
         "cluster restore repository errors preserve operational failure semantics",
+        "internal namespace requires a service principal except HA",
+        "usermgr api key permission intersection narrows owner and key wildcards",
+        "httpx internal control routes call typed operations directly",
     };
     const authorization_sink_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -6311,6 +6361,8 @@ pub fn build(b: *std.Build) void {
             "structural reconcile publishes durable index repair debt once per group",
             "structural repair handoff keeps status fenced through final shard visibility",
             "repair handoff status settles after authoritative cached publication",
+            "live repair final audit excludes concurrent group mutation through publication",
+            "terminal repair publication settles handoff or retains one fenced retry",
             "managed create publication handoff releases on converged owner publication",
             "managed dense publication handoff releases when its incarnation is superseded",
             "resident DB retry preparation waits outside admission for writer publication",
@@ -6327,6 +6379,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up allocation failure preserves bounded retry",
+            "managed startup catch-up quarantines repeated zero progress with bounded backoff",
             "standby HA replay reconciles managed indexes without opening the public write gate",
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed structural catch-up leaves pending enrichment with the asynchronous owner",
@@ -6579,6 +6632,7 @@ pub fn build(b: *std.Build) void {
         "metadata linearizable snapshot fences and frees one owned response",
         "metadata linearizable snapshot detects concurrent projection changes",
         "coherent linearizable snapshot retries a torn capture and preserves request context",
+        "metadata http client signs internal routes without leaking authority to public routes",
         "metadata http client fetches one bounded linearizable snapshot",
         "metadata http client treats missing linearizable snapshot route as unsupported",
         "metadata http server accepts internal reallocate and split merge routes",
@@ -7714,6 +7768,7 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
             "parse cli accepts canonical host port and models dir flags",
+            "parse cli preserves registry variants and recognizes explicit preload backends",
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
             "parse cli accepts HA standby runtime flags",
@@ -7803,6 +7858,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
+    unit_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_httpx_transport_regression_tests.step);
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
@@ -7832,6 +7888,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_mcp_tests.step);
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
+    unit_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     unit_test_step.dependOn(&run_lib_pdf_tests.step);
     unit_test_step.dependOn(&run_lib_scraping_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
