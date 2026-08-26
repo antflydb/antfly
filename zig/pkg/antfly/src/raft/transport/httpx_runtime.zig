@@ -79,6 +79,13 @@ pub const Runtime = struct {
         self.* = undefined;
     }
 
+    /// Publish listener shutdown without joining or destroying its owner.
+    /// Deployment teardown uses this before driving a shared deterministic
+    /// scheduler to quiescence.
+    pub fn requestStop(self: *Runtime) void {
+        self.listener.requestStop();
+    }
+
     pub fn setTarget(self: *Runtime, target: common.RequestExecutor) void {
         self.handler.target = target;
     }

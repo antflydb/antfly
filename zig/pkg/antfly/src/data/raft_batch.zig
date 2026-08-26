@@ -21,6 +21,7 @@ pub const protocol_version = internal_batch_forwarding.raft_batch_protocol_versi
 pub const timestamp_protocol_version = internal_batch_forwarding.raft_batch_timestamp_protocol_version;
 pub const activation_barrier_protocol_version = internal_batch_forwarding.raft_batch_activation_barrier_protocol_version;
 pub const merge_transition_protocol_version = internal_batch_forwarding.raft_batch_merge_transition_protocol_version;
+pub const split_delta_predecessor_protocol_version = internal_batch_forwarding.raft_batch_split_delta_predecessor_protocol_version;
 
 pub const OwnedReplicatedBatch = struct {
     table_name: []u8,
@@ -111,6 +112,9 @@ pub fn decode(alloc: std.mem.Allocator, payload: []const u8) !OwnedReplicatedBat
 
 test "raft protocol barrier is fail closed for legacy batch parsers" {
     try std.testing.expect(activation_barrier_protocol_version > timestamp_protocol_version);
+    try std.testing.expect(merge_transition_protocol_version > activation_barrier_protocol_version);
+    try std.testing.expect(split_delta_predecessor_protocol_version > merge_transition_protocol_version);
+    try std.testing.expectEqual(protocol_version, split_delta_predecessor_protocol_version);
     const encoded = try encodeProtocolBarrier(std.testing.allocator, "docs", timestamp_protocol_version);
     defer std.testing.allocator.free(encoded);
 
@@ -208,6 +212,9 @@ test "raft batch round trips internal split replication identity" {
             .source_group_id = 41,
             .destination_group_id = 42,
             .identity_namespace = namespace,
+            .operation = .delta,
+            .sequence = 19,
+            .previous_sequence = 17,
         },
     });
     defer std.testing.allocator.free(encoded);
@@ -219,6 +226,8 @@ test "raft batch round trips internal split replication identity" {
     try std.testing.expectEqual(@as(u64, 41), replication.source_group_id);
     try std.testing.expectEqual(@as(u64, 42), replication.destination_group_id);
     try std.testing.expect(replication.identity_namespace.eql(namespace));
+    try std.testing.expectEqual(@as(u64, 19), replication.sequence);
+    try std.testing.expectEqual(@as(u64, 17), replication.previous_sequence.?);
 }
 
 test "raft batch round trips internal merge checkpoint" {

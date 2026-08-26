@@ -74,6 +74,11 @@ const ExternalWake = struct {
     eligible_through: u64,
 };
 
+const ExternalResourceSequence = struct {
+    resource_id: ids.StableId,
+    next_sequence: u64 = 1,
+};
+
 const Task = struct {
     kernel: *Kernel,
     id: ids.StableId,
@@ -129,7 +134,11 @@ const Task = struct {
         if (self.status == .waiting_group) {
             if (self.waiting_on_group) |group| self.kernel.cancelGroupTasks(group);
         }
-        if (self.status != .finished and self.status != .running and self.status != .runnable) {
+        // `Future.await` is not a cancellation point. Keep the parent parked
+        // until the target publishes its result; `finishCurrent` will resume
+        // it. Waking the parent early would let `await` observe an unfinished
+        // target and violate both result ownership and stack lifetime.
+        if (self.status != .waiting_future and self.status != .finished and self.status != .running and self.status != .runnable) {
             self.makeRunnable();
         }
     }
@@ -189,6 +198,7 @@ pub const Kernel = struct {
     futex_wakes: std.ArrayListUnmanaged(FutexWake) = .empty,
     futex_identities: std.ArrayListUnmanaged(FutexIdentity) = .empty,
     external_wakes: std.ArrayListUnmanaged(ExternalWake) = .empty,
+    external_resource_sequences: std.ArrayListUnmanaged(ExternalResourceSequence) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Kernel {
         if (config.stack_size < 64 * 1024) return error.VoprIoStackTooSmall;
@@ -208,6 +218,7 @@ pub const Kernel = struct {
         self.futex_wakes.deinit(self.allocator);
         self.futex_identities.deinit(self.allocator);
         self.external_wakes.deinit(self.allocator);
+        self.external_resource_sequences.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -289,6 +300,15 @@ pub const Kernel = struct {
         if (target.kernel != self or target.group != null or target.result_len != result.len or
             !result_alignment.compare(.lte, .fromByteUnits(storage_alignment)))
             return error.InvalidVoprIoFuture;
+        // Scenario teardown runs on the harness fiber. A task which has
+        // already unwound no longer needs an awaiter: copy its result and reap
+        // it directly. Unfinished tasks still require an in-runtime awaiter so
+        // ordinary scheduling and cancellation remain trace-visible.
+        if (target.status == .finished and self.currentTask() == null) {
+            @memcpy(result, target.resultBytes());
+            self.removeAndDestroyTask(target);
+            return;
+        }
         const awaiter = self.currentTask() orelse return error.VoprIoAwaitOutsideTask;
         if (target == awaiter or target.awaiter != null) return error.InvalidVoprIoFuture;
         if (target.status != .finished) {
@@ -308,6 +328,16 @@ pub const Kernel = struct {
         if (target.kernel != self) return error.InvalidVoprIoFuture;
         target.requestCancel();
         try self.await(any_future, result, result_alignment);
+    }
+
+    /// Request cooperative cancellation for every unfinished fiber. The
+    /// caller must subsequently drive scheduler transitions until
+    /// `isQuiescent` becomes true, allowing task defers to release production
+    /// ownership instead of discarding fiber stacks at runtime teardown.
+    pub fn requestCancelAll(self: *Kernel) void {
+        for (self.tasks.items) |task| {
+            if (task.status != .finished) task.requestCancel();
+        }
     }
 
     pub fn groupAsync(
@@ -483,6 +513,29 @@ pub const Kernel = struct {
         try task.checkCancel();
     }
 
+    /// Atomically park the current task and publish one readiness completion.
+    /// This is the consumer-after-readiness counterpart to `wakeExternal` and
+    /// prevents socket accept/read fast paths from disappearing from the
+    /// scheduler merely because production work reached the wait slightly
+    /// later within an otherwise atomic transition.
+    pub fn waitExternalReady(self: *Kernel, resource_id: ids.StableId) !void {
+        const task = self.currentTask() orelse return error.VoprIoOperationOutsideTask;
+        try task.checkCancel();
+        const wait_sequence = self.allocateWaitSequence();
+        const wake_sequence = try self.allocateExternalWakeSequence(resource_id);
+        try self.external_wakes.append(self.allocator, .{
+            .resource_id = resource_id,
+            .remaining = 1,
+            .sequence = wake_sequence,
+            .eligible_through = wait_sequence,
+        });
+        task.external_id = resource_id;
+        task.external_wait_sequence = wait_sequence;
+        task.status = .waiting_external;
+        self.yieldCurrent(task);
+        try task.checkCancel();
+    }
+
     /// Make waking an external waiter a scheduler-visible choice. A wake with
     /// no current waiter is intentionally discarded; modeled resources retain
     /// their own readiness state, so a later consumer observes it immediately.
@@ -491,7 +544,7 @@ pub const Kernel = struct {
         try self.external_wakes.append(self.allocator, .{
             .resource_id = resource_id,
             .remaining = max_waiters,
-            .sequence = try self.allocateSequence(),
+            .sequence = try self.allocateExternalWakeSequence(resource_id),
             .eligible_through = self.next_wait_sequence - 1,
         });
     }
@@ -809,7 +862,18 @@ pub const Kernel = struct {
     }
 
     fn ensureFutexIdentity(self: *Kernel, ptr: *const u32) !ids.StableId {
-        if (self.futexIdentity(ptr)) |existing| return existing;
+        // A futex address is only an identity while its contention epoch is
+        // live. Allocators may reuse the same address for an unrelated mutex
+        // after every waiter has gone away; retaining the old mapping forever
+        // would make later scheduler IDs depend on heap layout. Concurrent
+        // waiters still share one identity because the first waiter is already
+        // published before another can enter this single-transition kernel.
+        for (self.futex_identities.items, 0..) |identity, index| {
+            if (identity.ptr != ptr) continue;
+            if (self.hasFutexWaiter(ptr)) return identity.id;
+            _ = self.futex_identities.orderedRemove(index);
+            break;
+        }
         const sequence = try self.allocateSequence();
         const logical_id = ids.derive("sim-io.futex", capability_kernel_id, sequence);
         try self.futex_identities.append(self.allocator, .{ .ptr = ptr, .id = logical_id });
@@ -822,6 +886,20 @@ pub const Kernel = struct {
         return result;
     }
 
+    fn allocateExternalWakeSequence(self: *Kernel, resource_id: ids.StableId) !u64 {
+        for (self.external_resource_sequences.items) |*resource| {
+            if (resource.resource_id != resource_id) continue;
+            if (resource.next_sequence == std.math.maxInt(u64))
+                return error.VoprIoSequenceExhausted;
+            const result = resource.next_sequence;
+            resource.next_sequence += 1;
+            return result;
+        }
+        try self.external_resource_sequences.append(self.allocator, .{ .resource_id = resource_id });
+        self.external_resource_sequences.items[self.external_resource_sequences.items.len - 1].next_sequence = 2;
+        return 1;
+    }
+
     fn futexIdentity(self: *const Kernel, ptr: *const u32) ?ids.StableId {
         for (self.futex_identities.items) |identity| {
             if (identity.ptr == ptr) return identity.id;
@@ -831,6 +909,18 @@ pub const Kernel = struct {
 
     const capability_kernel_id = ids.stable("sim-io", "task-kernel-v1");
 };
+
+test "inactive futex address reuse starts a new logical contention epoch" {
+    var kernel = try Kernel.init(std.testing.allocator, .{});
+    defer kernel.deinit();
+    var word: u32 = 0;
+
+    const first = try kernel.ensureFutexIdentity(&word);
+    const second = try kernel.ensureFutexIdentity(&word);
+    try std.testing.expect(first != second);
+    try std.testing.expectEqual(@as(usize, 1), kernel.futex_identities.items.len);
+    try std.testing.expectEqual(second, kernel.futexIdentity(&word).?);
+}
 
 test "task kernel parks future await and exposes each resume" {
     const Adapter = struct {

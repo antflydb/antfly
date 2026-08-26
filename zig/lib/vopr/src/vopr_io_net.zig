@@ -35,6 +35,7 @@ pub const WaitPort = struct {
     pub const VTable = struct {
         wait: *const fn (*anyopaque, ids.StableId) anyerror!void,
         wake: *const fn (*anyopaque, ids.StableId, u32) anyerror!void,
+        ready: ?*const fn (*anyopaque, ids.StableId) anyerror!void = null,
     };
 
     pub fn wait(self: WaitPort, resource_id: ids.StableId) !void {
@@ -43,6 +44,15 @@ pub const WaitPort = struct {
 
     pub fn wake(self: WaitPort, resource_id: ids.StableId, max_waiters: u32) !void {
         return self.vtable.wake(self.ptr, resource_id, max_waiters);
+    }
+
+    /// Park and publish one scheduler-visible readiness completion atomically.
+    /// Modeled resources use this when readiness existed before the consumer
+    /// called wait, keeping producer-first and consumer-first arrival orders
+    /// on the same explicit completion path.
+    pub fn ready(self: WaitPort, resource_id: ids.StableId) !void {
+        const ready_fn = self.vtable.ready orelse return error.ReadyWaitUnsupported;
+        return ready_fn(self.ptr, resource_id);
     }
 };
 
@@ -219,6 +229,11 @@ pub const Network = struct {
     pub fn accept(self: *Network, handle: std.Io.net.Socket.Handle) std.Io.net.Server.AcceptError!std.Io.net.Socket {
         const listener = self.getSocket(handle) orelse return error.SocketNotListening;
         if (listener.kind != .listener or listener.closed) return error.SocketNotListening;
+        if (listener.pending_accept.items.len != 0) {
+            self.wait_port.?.ready(listener.acceptResource()) catch |err| return mapWaitAcceptError(err);
+            if (listener.closed) return error.SocketNotListening;
+            if (self.faults.network_down) return error.NetworkDown;
+        }
         while (listener.pending_accept.items.len == 0) {
             self.wait_port.?.wait(listener.acceptResource()) catch |err| return mapWaitAcceptError(err);
             if (listener.closed) return error.SocketNotListening;

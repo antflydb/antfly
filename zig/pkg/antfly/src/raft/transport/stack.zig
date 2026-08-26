@@ -92,6 +92,10 @@ pub const HttpTransportStack = struct {
         self.* = undefined;
     }
 
+    pub fn beginShutdown(self: *HttpTransportStack) void {
+        self.driver.beginShutdown();
+    }
+
     pub fn runtimeHooks(self: *HttpTransportStack) raft_engine.runtime.multi_raft.RuntimeHooks {
         return .{
             .transport = self.transport_host.transport(),

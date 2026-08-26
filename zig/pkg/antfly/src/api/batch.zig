@@ -258,6 +258,10 @@ fn parseBatchRequestWithOptions(
         const shard_id = try parseInternalU64(shard_value);
         const range_id = try parseInternalU64(range_value);
         const sequence = try parseInternalU64(sequence_value);
+        const previous_sequence = if (object.get("previous_sequence")) |previous_value|
+            try parseInternalU64(previous_value)
+        else
+            null;
         const bootstrap_sequence = if (object.get("bootstrap_sequence")) |bootstrap_value|
             try parseInternalU64(bootstrap_value)
         else
@@ -265,6 +269,10 @@ fn parseBatchRequestWithOptions(
         const operation = std.meta.stringToEnum(db_mod.types.SplitReplicationContext.Operation, operation_value.string) orelse
             return error.InvalidBatchRequest;
         if (transition_id == 0 or attempt_epoch == 0 or source_group_id == 0 or destination_group_id == 0 or table_id == 0 or shard_id == 0 or range_id == 0) return error.InvalidBatchRequest;
+        if (previous_sequence) |previous| {
+            if (operation != .delta or sequence == 0 or previous >= sequence)
+                return error.InvalidBatchRequest;
+        }
         break :replication .{
             .transition_id = transition_id,
             .attempt_epoch = attempt_epoch,
@@ -277,6 +285,7 @@ fn parseBatchRequestWithOptions(
             },
             .operation = operation,
             .sequence = sequence,
+            .previous_sequence = previous_sequence,
             .bootstrap_sequence = bootstrap_sequence,
         };
     };
@@ -698,6 +707,9 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         if (replication.bootstrap_sequence) |sequence| {
             try writer.print(",\"bootstrap_sequence\":\"{d}\"", .{sequence});
         }
+        if (replication.previous_sequence) |sequence| {
+            try writer.print(",\"previous_sequence\":\"{d}\"", .{sequence});
+        }
         try writer.writeByte('}');
     }
     if (req.merge_replication) |replication| {
@@ -1092,6 +1104,9 @@ test "internal batch split identity round trips the full u64 id space" {
                 .shard_id = max - 1,
                 .range_id = max - 2,
             },
+            .operation = .delta,
+            .sequence = max - 6,
+            .previous_sequence = max - 7,
         },
     });
     defer std.testing.allocator.free(encoded);
@@ -1106,6 +1121,25 @@ test "internal batch split identity round trips the full u64 id space" {
     try std.testing.expectEqual(max, replication.identity_namespace.table_id);
     try std.testing.expectEqual(max - 1, replication.identity_namespace.shard_id);
     try std.testing.expectEqual(max - 2, replication.identity_namespace.range_id);
+    try std.testing.expectEqual(max - 6, replication.sequence);
+    try std.testing.expectEqual(max - 7, replication.previous_sequence.?);
+}
+
+test "internal batch parser rejects invalid split delta predecessor fences" {
+    const non_delta =
+        \\{"_split_replication":{"transition_id":1,"attempt_epoch":1,"source_group_id":2,"destination_group_id":3,"namespace_table_id":4,"namespace_shard_id":5,"namespace_range_id":6,"operation":"bootstrap","sequence":7,"previous_sequence":6}}
+    ;
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        parseInternalBatchRequest(std.testing.allocator, non_delta),
+    );
+    const non_monotonic =
+        \\{"_split_replication":{"transition_id":1,"attempt_epoch":1,"source_group_id":2,"destination_group_id":3,"namespace_table_id":4,"namespace_shard_id":5,"namespace_range_id":6,"operation":"delta","sequence":7,"previous_sequence":7}}
+    ;
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        parseInternalBatchRequest(std.testing.allocator, non_monotonic),
+    );
 }
 
 test "internal batch parser owns and round trips split transition" {

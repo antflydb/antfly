@@ -154,7 +154,7 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
     desired_running: bool = false,
     paused: bool = false,
-    shutdown: bool = false,
+    shutdown: std.atomic.Value(bool) = .init(false),
     stats_value: types.TransactionRecoveryStats = .{},
     future: ?Io.Future(void) = null,
     scan_after: ?transactions_mod.TxnId = null,
@@ -255,7 +255,7 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
         if (self.future != null or self.paused or !self.desired_running) return;
         const io = self.io orelse return error.MissingBackendRuntimeIo;
         self.mutex.lockUncancelable(io);
-        self.shutdown = false;
+        self.shutdown.store(false, .release);
         self.mutex.unlock(io);
         self.future = try io.concurrent(workerMain, .{self});
     }
@@ -264,12 +264,19 @@ pub const Runtime = if (builtin.os.tag == .freestanding) struct {
         const io = self.io orelse return false;
         if (self.future == null) return false;
         self.mutex.lockUncancelable(io);
-        self.shutdown = true;
+        self.shutdown.store(true, .release);
         self.mutex.unlock(io);
         self.future.?.cancel(io);
         self.future = null;
         self.ownership.release();
         return true;
+    }
+
+    /// Publish shutdown without joining the worker. Borrowed deterministic
+    /// schedulers use this before draining fibers; ordinary owners continue to
+    /// use `stop`, which publishes the same flag and joins the future.
+    pub fn beginTeardown(self: *Runtime) void {
+        self.shutdown.store(true, .release);
     }
 
     pub fn stats(self: *Runtime) types.TransactionRecoveryStats {
@@ -603,10 +610,7 @@ fn sleepInterval(runtime: *Runtime) void {
 }
 
 fn isShutdown(runtime: *Runtime) bool {
-    const io = runtime.io orelse return runtime.shutdown;
-    runtime.mutex.lockUncancelable(io);
-    defer runtime.mutex.unlock(io);
-    return runtime.shutdown;
+    return runtime.shutdown.load(.acquire);
 }
 
 fn recordRun(runtime: *Runtime, now_ns: u64, summary: RunSummary, failed: bool) void {

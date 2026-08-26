@@ -258,6 +258,110 @@ pub const PrefixedFairSeeded = struct {
     }
 };
 
+/// Forces a reviewed prefix, postpones virtual time while work is runnable,
+/// and keeps selecting the current fiber until it parks or finishes. This is
+/// a deterministic cooperative event-loop witness policy: broad campaigns
+/// should still vary scheduler choices, while production-sized clean exact
+/// gates can make forward progress without spending most of their budget on
+/// unrelated ready service fibers.
+pub const PrefixedCooperativeSeeded = struct {
+    pub const default_max_non_time_choices: usize = 256;
+
+    prefix: []const ids.StableId,
+    cursor: usize = 0,
+    preferred_actor: ?ids.StableId = null,
+    non_time_choices: usize = 0,
+    max_non_time_choices: usize = default_max_non_time_choices,
+    fallback: Seeded,
+
+    pub fn init(prefix: []const ids.StableId, seed: u64) PrefixedCooperativeSeeded {
+        return .{ .prefix = prefix, .fallback = Seeded.init(seed) };
+    }
+
+    pub fn source(self: *PrefixedCooperativeSeeded) Source {
+        return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
+    }
+
+    fn choose(ptr: *anyopaque, request: Request) !ids.StableId {
+        const self: *PrefixedCooperativeSeeded = @ptrCast(@alignCast(ptr));
+        if (self.cursor < self.prefix.len) {
+            const selected_id = self.prefix[self.cursor];
+            defer self.cursor += 1;
+            return self.noteSelection(request, selected_id);
+        }
+        if (self.non_time_choices >= self.max_non_time_choices) {
+            for (request.enabled) |candidate| {
+                if (isTimeAdvance(candidate.name))
+                    return self.noteSelection(request, candidate.id);
+            }
+        }
+        if (self.preferred_actor) |actor_id| {
+            for (request.enabled) |candidate| {
+                if (candidate.actor_id == actor_id and
+                    std.mem.eql(u8, candidate.name, "sim-io.task_resume"))
+                    return self.noteSelection(request, candidate.id);
+            }
+            self.preferred_actor = null;
+        }
+
+        var runnable_count: usize = 0;
+        var weighted = false;
+        var total_weight: u64 = 0;
+        for (request.enabled) |candidate| {
+            if (isTimeAdvance(candidate.name)) continue;
+            runnable_count += 1;
+            if (candidate.weight == 0) return error.InvalidTransitionWeight;
+            weighted = weighted or candidate.weight != 1;
+            total_weight = std.math.add(u64, total_weight, candidate.weight) catch
+                return error.ChoiceWeightOverflow;
+        }
+        const selected_id = if (runnable_count == 0)
+            try Seeded.choose(&self.fallback, request)
+        else blk: {
+            var ordinal = if (weighted)
+                self.fallback.prng.random().uintLessThan(u64, total_weight)
+            else
+                self.fallback.prng.random().intRangeLessThan(u64, 0, runnable_count);
+            for (request.enabled) |candidate| {
+                if (isTimeAdvance(candidate.name)) continue;
+                const width: u64 = if (weighted) candidate.weight else 1;
+                if (ordinal < width) break :blk candidate.id;
+                ordinal -= width;
+            }
+            unreachable;
+        };
+        return self.noteSelection(request, selected_id);
+    }
+
+    fn noteSelection(self: *PrefixedCooperativeSeeded, request: Request, selected_id: ids.StableId) ids.StableId {
+        for (request.enabled) |candidate| {
+            if (candidate.id != selected_id) continue;
+            if (isTimeAdvance(candidate.name)) {
+                self.non_time_choices = 0;
+                self.preferred_actor = null;
+                return selected_id;
+            }
+            self.non_time_choices +|= 1;
+            if (std.mem.eql(u8, candidate.name, "sim-io.task_resume") or
+                std.mem.eql(u8, candidate.name, "sim-io.futex_wake") or
+                std.mem.eql(u8, candidate.name, "sim-io.external_wake"))
+                self.preferred_actor = candidate.actor_id;
+            break;
+        }
+        return selected_id;
+    }
+
+    fn isTimeAdvance(name: []const u8) bool {
+        return std.mem.eql(u8, name, "sim-io.time_advance") or
+            std.mem.eql(u8, name, "runtime.time_advance");
+    }
+
+    fn finish(ptr: *anyopaque) !void {
+        const self: *PrefixedCooperativeSeeded = @ptrCast(@alignCast(ptr));
+        if (self.cursor != self.prefix.len) return error.UnusedChoicePrefix;
+    }
+};
+
 /// Deterministic depth-first enumeration of a dynamic choice tree.
 ///
 /// Call `beginHistory` before each clean-world execution, run the scenario
@@ -345,6 +449,7 @@ pub const Enumerating = struct {
 pub const Replay = struct {
     records: []const trace.ChoiceRecord,
     cursor: usize = 0,
+    diagnostics: bool = true,
 
     pub fn source(self: *Replay) Source {
         return .{ .ptr = self, .choose_fn = choose, .finish_fn = finish };
@@ -355,12 +460,34 @@ pub const Replay = struct {
         if (self.cursor >= self.records.len) return error.ReplayChoiceExhausted;
         const record = self.records[self.cursor];
         if (record.site_id != request.site_id or !std.mem.eql(u8, record.site_name, request.site_name) or record.occurrence != request.occurrence) return error.ReplayChoiceSiteDiverged;
-        if (record.enabled_ids.len != request.enabled.len) return error.ReplayEnabledSetDiverged;
+        if (record.enabled_ids.len != request.enabled.len) {
+            if (self.diagnostics) logEnabledSetDivergence(self.cursor, record, request);
+            return error.ReplayEnabledSetDiverged;
+        }
         for (request.enabled, record.enabled_ids) |enabled, recorded_id| {
-            if (enabled.id != recorded_id) return error.ReplayEnabledSetDiverged;
+            if (enabled.id != recorded_id) {
+                if (self.diagnostics) logEnabledSetDivergence(self.cursor, record, request);
+                return error.ReplayEnabledSetDiverged;
+            }
         }
         self.cursor += 1;
         return record.selected_id;
+    }
+
+    fn logEnabledSetDivergence(index: usize, record: trace.ChoiceRecord, request: Request) void {
+        std.debug.print(
+            "exact replay enabled set diverged choice={d} site={s} occurrence={d} expected_count={d} actual_count={d}",
+            .{ index, request.site_name, request.occurrence, record.enabled_ids.len, request.enabled.len },
+        );
+        const diagnostic_limit = 32;
+        for (record.enabled_ids[0..@min(record.enabled_ids.len, diagnostic_limit)], 0..) |id, ordinal|
+            std.debug.print("\nexpected enabled[{d}]={d}", .{ ordinal, id });
+        for (request.enabled[0..@min(request.enabled.len, diagnostic_limit)], 0..) |enabled, ordinal|
+            std.debug.print(
+                "\nactual enabled[{d}]={d} name={s} actor={?d} resource={?d} parameter={d}",
+                .{ ordinal, enabled.id, enabled.name, enabled.actor_id, enabled.resource_id, enabled.parameter },
+            );
+        std.debug.print("\n", .{});
     }
 
     fn finish(ptr: *anyopaque) !void {
@@ -514,7 +641,7 @@ test "replay diagnoses enabled-set divergence" {
         .{ .id = 1, .name = "one", .kind = .workload },
         .{ .id = 3, .name = "three", .kind = .workload },
     };
-    var replay = Replay{ .records = &records };
+    var replay = Replay{ .records = &records, .diagnostics = false };
     try std.testing.expectError(error.ReplayEnabledSetDiverged, replay.source().choose(.{ .site_id = 7, .site_name = "site", .occurrence = 0, .enabled = &enabled }));
 }
 
@@ -617,6 +744,107 @@ test "prefixed fair seeded source postpones time while application work is runna
         .site_name = "prefixed-fair",
         .occurrence = 1,
         .enabled = &enabled,
+    }));
+    try source.finish();
+}
+
+test "prefixed cooperative source runs one fiber until it parks" {
+    const both = [_]transition.Transition{
+        .{ .id = 1, .name = "sim-io.time_advance", .kind = .scheduler },
+        .{ .id = 2, .name = "sim-io.task_resume", .kind = .scheduler, .actor_id = 20 },
+        .{ .id = 3, .name = "sim-io.task_resume", .kind = .scheduler, .actor_id = 30 },
+    };
+    var cooperative = PrefixedCooperativeSeeded.init(&.{1}, 23);
+    const source = cooperative.source();
+    try std.testing.expectEqual(@as(u64, 1), try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-cooperative",
+        .occurrence = 0,
+        .enabled = &both,
+    }));
+    const first_task = try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-cooperative",
+        .occurrence = 1,
+        .enabled = &both,
+    });
+    try std.testing.expect(first_task == 2 or first_task == 3);
+    try std.testing.expectEqual(first_task, try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-cooperative",
+        .occurrence = 2,
+        .enabled = &both,
+    }));
+
+    const other = if (first_task == 2) both[2] else both[1];
+    try std.testing.expectEqual(other.id, try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-cooperative",
+        .occurrence = 3,
+        .enabled = &.{other},
+    }));
+    try std.testing.expectEqual(other.id, try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-cooperative",
+        .occurrence = 4,
+        .enabled = &both,
+    }));
+    try source.finish();
+}
+
+test "prefixed cooperative source hands a selected wake to its waiter" {
+    const wake = transition.Transition{
+        .id = 2,
+        .name = "sim-io.external_wake",
+        .kind = .scheduler,
+        .actor_id = 20,
+    };
+    const unrelated = transition.Transition{
+        .id = 3,
+        .name = "sim-io.task_resume",
+        .kind = .scheduler,
+        .actor_id = 30,
+    };
+    const waiter = transition.Transition{
+        .id = 4,
+        .name = "sim-io.task_resume",
+        .kind = .scheduler,
+        .actor_id = 20,
+    };
+    var cooperative = PrefixedCooperativeSeeded.init(&.{wake.id}, 23);
+    const source = cooperative.source();
+    try std.testing.expectEqual(wake.id, try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-cooperative-wake",
+        .occurrence = 0,
+        .enabled = &.{ wake, unrelated },
+    }));
+    try std.testing.expectEqual(waiter.id, try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-cooperative-wake",
+        .occurrence = 1,
+        .enabled = &.{ unrelated, waiter },
+    }));
+    try source.finish();
+}
+
+test "prefixed cooperative source eventually advances time around runnable service work" {
+    const time = transition.Transition{ .id = 1, .name = "sim-io.time_advance", .kind = .scheduler };
+    const service = transition.Transition{ .id = 2, .name = "service.poll", .kind = .scheduler };
+    var cooperative = PrefixedCooperativeSeeded.init(&.{ service.id, service.id }, 23);
+    cooperative.max_non_time_choices = 2;
+    const source = cooperative.source();
+    for (0..2) |occurrence| try std.testing.expectEqual(service.id, try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-cooperative-time",
+        .occurrence = occurrence,
+        .enabled = &.{ time, service },
+    }));
+    try std.testing.expectEqual(time.id, try source.choose(.{
+        .site_id = 9,
+        .site_name = "prefixed-cooperative-time",
+        .occurrence = 2,
+        .enabled = &.{ time, service },
     }));
     try source.finish();
 }

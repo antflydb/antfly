@@ -470,6 +470,10 @@ pub const ManagedHttpHost = struct {
         self.http_host.stop();
     }
 
+    pub fn beginTransportShutdown(self: *ManagedHttpHost) void {
+        self.http_host.beginTransportShutdown();
+    }
+
     pub fn baseUri(self: *ManagedHttpHost, alloc: std.mem.Allocator) ![]u8 {
         return try self.http_host.baseUri(alloc);
     }

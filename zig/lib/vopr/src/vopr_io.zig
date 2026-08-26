@@ -25,7 +25,7 @@ const process_mod = @import("vopr_io_process.zig");
 const task_mod = @import("vopr_io_task.zig");
 const transition = @import("transition.zig");
 
-pub const model_version: u32 = 1;
+pub const model_version: u32 = 2;
 
 pub const Capability = enum(u6) {
     eager_async,
@@ -306,6 +306,80 @@ pub const VoprIo = struct {
         self.processes.deinit();
         self.instrumentation.deinit();
         self.* = undefined;
+    }
+
+    /// Post-history cleanup for a harness which owns unfinished VOPR fibers.
+    ///
+    /// This is deliberately outside canonical trace generation: it requests
+    /// cancellation for every task, then executes a deterministic cleanup
+    /// suffix so task defers release the production objects they own. Merely
+    /// destroying fiber stacks would leak those objects, while calling
+    /// `Future.cancel` from the harness fiber cannot await unfinished work.
+    pub fn cancelAndDrainTasksForTeardown(
+        self: *VoprIo,
+        allocator: std.mem.Allocator,
+        transition_budget: usize,
+    ) !usize {
+        if (transition_budget == 0) return error.InvalidVoprIoTeardownTransitionBudget;
+        var enabled: transition.List = .{};
+        defer enabled.deinit(allocator);
+        var sink: event.Sink = .{};
+        defer sink.deinit(allocator);
+
+        self.tasks.requestCancelAll();
+        var transitions_executed: usize = 0;
+        var last_task_actor: ?ids.StableId = null;
+        var task_resume_streak: usize = 0;
+        const max_task_resume_streak = 16;
+        while (!self.tasks.isQuiescent()) {
+            if (transitions_executed == transition_budget)
+                return error.VoprIoTeardownTransitionBudgetExceeded;
+            enabled.items.clearRetainingCapacity();
+            sink.deinit(allocator);
+            sink = .{};
+            try enumerateReady(self, &enabled, allocator);
+            try enabled.canonicalize();
+            if (enabled.items.items.len == 0) return error.VoprIoTeardownStalled;
+
+            // Cancellation cleanup is a dependency graph of its own. Always
+            // selecting the first canonical task lets one defer that yields
+            // while awaiting a sibling monopolize the entire teardown budget.
+            // Rotate through stable actor IDs and periodically service network,
+            // wake, or time transitions so every dependency can make progress.
+            var first_task: ?transition.Transition = null;
+            var next_task: ?transition.Transition = null;
+            var first_non_task: ?transition.Transition = null;
+            for (enabled.items.items) |candidate| {
+                if (std.mem.eql(u8, candidate.name, "sim-io.task_resume")) {
+                    const actor_id = candidate.actor_id orelse continue;
+                    if (first_task == null or actor_id < first_task.?.actor_id.?)
+                        first_task = candidate;
+                    if (last_task_actor) |last| {
+                        if (actor_id > last and
+                            (next_task == null or actor_id < next_task.?.actor_id.?))
+                            next_task = candidate;
+                    }
+                } else if (first_non_task == null) {
+                    first_non_task = candidate;
+                }
+            }
+            const selected = if (task_resume_streak >= max_task_resume_streak and first_non_task != null)
+                first_non_task.?
+            else
+                next_task orelse first_task orelse first_non_task.?;
+            if (std.mem.eql(u8, selected.name, "sim-io.task_resume")) {
+                last_task_actor = selected.actor_id.?;
+                task_resume_streak +|= 1;
+            } else {
+                task_resume_streak = 0;
+            }
+            try executeReady(self, selected.id, &sink, allocator);
+            transitions_executed += 1;
+            // Cleanup may create a dependent task. Publish cancellation to it
+            // before selecting the next deterministic teardown transition.
+            self.tasks.requestCancelAll();
+        }
+        return transitions_executed;
     }
 
     pub fn io(self: *VoprIo) std.Io {
@@ -591,9 +665,15 @@ fn networkWake(ptr: *anyopaque, resource_id: ids.StableId, max_waiters: u32) !vo
     return kernel.wakeExternal(resource_id, max_waiters);
 }
 
+fn networkReady(ptr: *anyopaque, resource_id: ids.StableId) !void {
+    const kernel: *task_mod.Kernel = @ptrCast(@alignCast(ptr));
+    return kernel.waitExternalReady(resource_id);
+}
+
 const network_wait_vtable: net_mod.WaitPort.VTable = .{
     .wait = networkWait,
     .wake = networkWake,
+    .ready = networkReady,
 };
 
 fn state(userdata: ?*anyopaque) *VoprIo {
@@ -657,7 +737,9 @@ fn groupCancel(userdata: ?*anyopaque, group: *std.Io.Group, token: *anyopaque) v
 
 fn recancel(userdata: ?*anyopaque) void {
     const self = state(userdata);
-    self.tasks.recancel() catch self.latch(.future_cancel);
+    self.tasks.recancel() catch {
+        self.latch(.future_cancel);
+    };
 }
 
 fn swapCancelProtection(userdata: ?*anyopaque, new: std.Io.CancelProtection) std.Io.CancelProtection {
@@ -1626,6 +1708,170 @@ test "VoprIo scheduler controls nested futures and virtual sleep" {
     try sim.ensureNoCapabilityViolation();
 }
 
+test "VoprIo teardown cancellation unwinds task ownership from the harness fiber" {
+    const Shared = struct {
+        io: std.Io,
+        child_started: bool = false,
+        child_cleaned: bool = false,
+        parent_cleaned: bool = false,
+
+        fn child(self: *@This()) void {
+            defer self.child_cleaned = true;
+            self.child_started = true;
+            self.io.sleep(.fromSeconds(60), .awake) catch return;
+        }
+
+        fn parent(self: *@This()) void {
+            defer self.parent_cleaned = true;
+            var child_future = self.io.async(child, .{self});
+            child_future.await(self.io);
+        }
+    };
+
+    var sim = try VoprIo.init(.{
+        .required = .of(&.{ .task_scheduling, .sleep, .clock_read }),
+    });
+    defer sim.deinit();
+    var shared = Shared{ .io = sim.io() };
+    var future = shared.io.async(Shared.parent, .{&shared});
+
+    var enabled: transition.List = .{};
+    defer enabled.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    while (!shared.child_started) {
+        enabled.items.clearRetainingCapacity();
+        sink.deinit(std.testing.allocator);
+        sink = .{};
+        try sim.scheduler().enumerateReady(&enabled, std.testing.allocator);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try sim.scheduler().executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+    }
+    try std.testing.expect(!shared.child_cleaned);
+    try std.testing.expect(!shared.parent_cleaned);
+
+    const cleanup_transitions = try sim.cancelAndDrainTasksForTeardown(std.testing.allocator, 8);
+    try std.testing.expect(cleanup_transitions != 0);
+    try std.testing.expect(shared.child_cleaned);
+    try std.testing.expect(shared.parent_cleaned);
+    future.cancel(sim.io());
+    try std.testing.expectEqual(@as(usize, 0), sim.resourceSnapshot().total_tasks);
+    try sim.ensureNoCapabilityViolation();
+}
+
+test "VoprIo teardown drain fairly resumes canceled sibling tasks" {
+    const Shared = struct {
+        sim: *VoprIo,
+        io: std.Io,
+        spinner_started: bool = false,
+        sibling_started: bool = false,
+        sibling_done: bool = false,
+
+        fn spinner(self: *@This()) void {
+            self.spinner_started = true;
+            const forever: std.Io.Timeout = .none;
+            forever.sleep(self.io) catch {};
+            while (!self.sibling_done)
+                self.sim.safepoint(ids.stable("vopr-io-teardown", "spinner")) catch {};
+        }
+
+        fn sibling(self: *@This()) void {
+            self.sibling_started = true;
+            const forever: std.Io.Timeout = .none;
+            forever.sleep(self.io) catch {};
+            self.sibling_done = true;
+        }
+    };
+
+    var sim = try VoprIo.init(.{
+        .required = .of(&.{ .task_scheduling, .sleep, .instrumentation }),
+        .instrumentation = .{ .enabled = true, .map_digest = 0x5445_4152 },
+    });
+    defer sim.deinit();
+    var shared = Shared{ .sim = &sim, .io = sim.io() };
+    var spinner = shared.io.async(Shared.spinner, .{&shared});
+    var sibling = shared.io.async(Shared.sibling, .{&shared});
+
+    var enabled: transition.List = .{};
+    defer enabled.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    while (!shared.spinner_started or !shared.sibling_started) {
+        enabled.items.clearRetainingCapacity();
+        sink.deinit(std.testing.allocator);
+        sink = .{};
+        try sim.scheduler().enumerateReady(&enabled, std.testing.allocator);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try sim.scheduler().executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+    }
+
+    const cleanup_transitions = try sim.cancelAndDrainTasksForTeardown(std.testing.allocator, 32);
+    try std.testing.expect(cleanup_transitions != 0);
+    try std.testing.expect(shared.sibling_done);
+    spinner.cancel(sim.io());
+    sibling.cancel(sim.io());
+    try std.testing.expectEqual(@as(usize, 0), sim.resourceSnapshot().total_tasks);
+    try sim.ensureNoCapabilityViolation();
+}
+
+test "VoprIo teardown preserves recancel after an acknowledged cleanup yield" {
+    const Shared = struct {
+        sim: *VoprIo,
+        io: std.Io,
+        cancellation_acknowledged: bool = false,
+        worker_cleaned: bool = false,
+
+        fn worker(self: *@This()) void {
+            defer self.worker_cleaned = true;
+            const forever: std.Io.Timeout = .none;
+            forever.sleep(self.io) catch |err| switch (err) {
+                error.Canceled => {
+                    self.cancellation_acknowledged = true;
+                    self.sim.safepoint(ids.stable("vopr-io-teardown", "before-recancel")) catch {};
+                    self.sim.safepoint(ids.stable("vopr-io-teardown", "still-before-recancel")) catch {};
+                    self.io.recancel();
+                },
+            };
+        }
+
+        fn parent(self: *@This()) void {
+            var worker_future = self.io.async(worker, .{self});
+            worker_future.cancel(self.io);
+        }
+    };
+
+    var sim = try VoprIo.init(.{
+        .required = .of(&.{ .task_scheduling, .sleep, .instrumentation }),
+        .instrumentation = .{ .enabled = true, .map_digest = 0x5245_4341 },
+    });
+    defer sim.deinit();
+    var shared = Shared{ .sim = &sim, .io = sim.io() };
+    var parent = shared.io.async(Shared.parent, .{&shared});
+
+    var enabled: transition.List = .{};
+    defer enabled.deinit(std.testing.allocator);
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    while (!shared.cancellation_acknowledged) {
+        enabled.items.clearRetainingCapacity();
+        sink.deinit(std.testing.allocator);
+        sink = .{};
+        try sim.scheduler().enumerateReady(&enabled, std.testing.allocator);
+        try enabled.canonicalize();
+        try std.testing.expect(enabled.items.items.len != 0);
+        try sim.scheduler().executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+    }
+
+    const cleanup_transitions = try sim.cancelAndDrainTasksForTeardown(std.testing.allocator, 16);
+    try std.testing.expect(cleanup_transitions != 0);
+    try std.testing.expect(shared.worker_cleaned);
+    parent.cancel(sim.io());
+    try std.testing.expectEqual(@as(usize, 0), sim.resourceSnapshot().total_tasks);
+    try sim.ensureNoCapabilityViolation();
+}
+
 test "VoprIo groups and futex wake ordering remain scheduler visible" {
     const Shared = struct {
         io: std.Io,
@@ -2036,6 +2282,76 @@ test "VoprIo stream sockets expose packet delivery and waiter wake choices" {
     try std.testing.expect(saw_packet_delivery);
     try std.testing.expect(saw_external_wake);
     try sim.ensureNoCapabilityViolation();
+}
+
+test "VoprIo accept readiness identity is independent of producer arrival order" {
+    const Case = struct {
+        fn run(connect_first: bool) !ids.StableId {
+            const Shared = struct {
+                io: std.Io,
+                server: *std.Io.net.Server,
+                accepted: bool = false,
+
+                fn serve(self: *@This()) void {
+                    const stream = self.server.accept(self.io) catch unreachable;
+                    stream.close(self.io);
+                    self.accepted = true;
+                }
+            };
+
+            var sim = try VoprIo.init(.{ .required = .of(&.{.sockets}) });
+            defer sim.deinit();
+            const io = sim.io();
+            const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(31_340) };
+            var server = try address.listen(io, .{});
+            defer server.deinit(io);
+            var client: ?std.Io.net.Stream = if (connect_first)
+                try address.connect(io, .{ .mode = .stream })
+            else
+                null;
+            defer if (client) |stream| stream.close(io);
+            var shared: Shared = .{ .io = io, .server = &server };
+            _ = io.async(Shared.serve, .{&shared});
+
+            const scheduler = sim.scheduler();
+            var enabled: transition.List = .{};
+            defer enabled.deinit(std.testing.allocator);
+            var sink: event.Sink = .{};
+            defer sink.deinit(std.testing.allocator);
+
+            try scheduler.enumerateReady(&enabled, std.testing.allocator);
+            try enabled.canonicalize();
+            const initial_task = for (enabled.items.items) |candidate| {
+                if (std.mem.eql(u8, candidate.name, "sim-io.task_resume")) break candidate;
+            } else return error.MissingAcceptTask;
+            try scheduler.executeReady(initial_task.id, &sink, std.testing.allocator);
+            if (!connect_first) client = try address.connect(io, .{ .mode = .stream });
+
+            enabled.items.clearRetainingCapacity();
+            sink.deinit(std.testing.allocator);
+            sink = .{};
+            try scheduler.enumerateReady(&enabled, std.testing.allocator);
+            try enabled.canonicalize();
+            const wake = for (enabled.items.items) |candidate| {
+                if (std.mem.eql(u8, candidate.name, "sim-io.external_wake")) break candidate;
+            } else return error.MissingAcceptWake;
+            try scheduler.executeReady(wake.id, &sink, std.testing.allocator);
+
+            while (!shared.accepted) {
+                enabled.items.clearRetainingCapacity();
+                sink.deinit(std.testing.allocator);
+                sink = .{};
+                try scheduler.enumerateReady(&enabled, std.testing.allocator);
+                try enabled.canonicalize();
+                try std.testing.expect(enabled.items.items.len != 0);
+                try scheduler.executeReady(enabled.items.items[0].id, &sink, std.testing.allocator);
+            }
+            try sim.ensureNoCapabilityViolation();
+            return wake.id;
+        }
+    };
+
+    try std.testing.expectEqual(try Case.run(true), try Case.run(false));
 }
 
 test "VoprIo datagrams preserve message boundaries and scheduler-visible delivery" {

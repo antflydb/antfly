@@ -63,6 +63,7 @@ fn percentEncodePathComponent(alloc: std.mem.Allocator, value: []const u8) ![]u8
 }
 
 pub const LookupResponse = struct {
+    status: u16 = 200,
     version: ?[]u8 = null,
     body: []u8,
 
@@ -319,6 +320,22 @@ pub const ApiHttpClient = struct {
         key: []const u8,
         fields: ?[]const u8,
     ) !LookupResponse {
+        var response = try self.fetchLookupResponse(base_uri, table_name, key, fields);
+        if (response.status == 200) return response;
+        response.deinit(self.alloc);
+        return error.UnexpectedHttpStatus;
+    }
+
+    /// Return the public lookup response without mapping non-200 statuses.
+    /// Composed deterministic histories retain the status and body as replay
+    /// evidence when an acknowledged write is not visible on another node.
+    pub fn fetchLookupResponse(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        key: []const u8,
+        fields: ?[]const u8,
+    ) !LookupResponse {
         const encoded_table_name = try percentEncodePathComponent(self.alloc, table_name);
         defer self.alloc.free(encoded_table_name);
         const encoded_key = try percentEncodePathComponent(self.alloc, key);
@@ -352,12 +369,11 @@ pub const ApiHttpClient = struct {
             .uri = uri,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 200) return error.UnexpectedHttpStatus;
-
         const version = for (resp.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Version")) break try self.alloc.dupe(u8, header.value);
         } else null;
         return .{
+            .status = resp.status,
             .version = version,
             .body = try self.alloc.dupe(u8, resp.body),
         };
@@ -1510,6 +1526,27 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !BatchResponse {
+        var response = try self.fetchBatchResponse(base_uri, table_name, body);
+        switch (response.status) {
+            201, 202 => return response,
+            else => {
+                const err = remotePublicBatchError(response.status, response.body);
+                response.deinit(self.alloc);
+                return err;
+            },
+        }
+    }
+
+    /// Return the public batch wire response without mapping non-success
+    /// statuses into an error. Deterministic and integration harnesses use the
+    /// status/body pair as first-class failure evidence; ordinary callers
+    /// should prefer `fetchBatch` for the stable error contract.
+    pub fn fetchBatchResponse(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        body: []const u8,
+    ) !BatchResponse {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -1526,10 +1563,6 @@ pub const ApiHttpClient = struct {
             .body = body,
         });
         defer resp.deinit(self.alloc);
-        switch (resp.status) {
-            201, 202 => {},
-            else => return remotePublicBatchError(resp.status, resp.body),
-        }
         return .{
             .status = resp.status,
             .body = try self.alloc.dupe(u8, resp.body),

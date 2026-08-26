@@ -78,4 +78,8 @@ pub const Runtime = struct {
         }
         self.* = undefined;
     }
+
+    pub fn requestStop(self: *Runtime) void {
+        self.listener_task.requestStop();
+    }
 };

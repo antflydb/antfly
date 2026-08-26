@@ -1923,6 +1923,20 @@ pub const RaftApplyStore = struct {
                     .destination_group_id = checkpoint.destination_group_id,
                     .delta_sequence = checkpoint.delta_sequence,
                 } });
+            } else {
+                // Destination checkpoints are the durable ownership record
+                // for the new Raft group. The document DB persists the same
+                // range, but topology observation and snapshot transfer read
+                // the apply store, so project it here in the identical log
+                // entry instead of leaving the group at the empty default.
+                const range_start = try alloc.dupe(u8, checkpoint.range_start);
+                errdefer alloc.free(range_start);
+                const range_end = try alloc.dupe(u8, checkpoint.range_end);
+                errdefer alloc.free(range_end);
+                try operations.append(alloc, .{ .set_range = .{
+                    .start = range_start,
+                    .end = range_end,
+                } });
             }
         }
         if (decoded.batch.req.merge_source_transition) |transition| {
@@ -2605,6 +2619,82 @@ test "data raft apply store persists split destination acknowledgements" {
     try std.testing.expectEqual(@as(u64, 201), acknowledgement.transition_id);
     try std.testing.expectEqual(@as(u64, 202), acknowledgement.destination_group_id);
     try std.testing.expectEqual(@as(u64, 1), acknowledgement.delta_sequence);
+}
+
+test "data raft apply store projects split destination checkpoint range" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-destination-range", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const namespace: @FieldType(db_types.SplitReplicationContext, "identity_namespace") = .{
+        .table_id = 7,
+        .shard_id = 202,
+        .range_id = 2020,
+    };
+    const begin = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_replication = .{
+            .transition_id = 201,
+            .attempt_epoch = 1,
+            .source_group_id = 201,
+            .destination_group_id = 202,
+            .identity_namespace = namespace,
+            .operation = .checkpoint,
+            .sequence = 0,
+            .bootstrap_sequence = 0,
+        },
+        .split_checkpoint = .{
+            .kind = .destination_begin,
+            .transition_id = 201,
+            .attempt_epoch = 1,
+            .source_group_id = 201,
+            .destination_group_id = 202,
+            .range_start = "doc:m",
+            .range_end = "doc:z",
+            .delta_sequence = 0,
+        },
+    });
+    defer std.testing.allocator.free(begin);
+    const complete = try data_raft_batch.encode(std.testing.allocator, "docs", .{
+        .split_replication = .{
+            .transition_id = 201,
+            .attempt_epoch = 1,
+            .source_group_id = 201,
+            .destination_group_id = 202,
+            .identity_namespace = namespace,
+            .operation = .checkpoint,
+            .sequence = 0,
+        },
+        .split_checkpoint = .{
+            .kind = .destination_complete,
+            .transition_id = 201,
+            .attempt_epoch = 1,
+            .source_group_id = 201,
+            .destination_group_id = 202,
+            .range_start = "doc:m",
+            .range_end = "doc:z",
+            .delta_sequence = 0,
+        },
+    });
+    defer std.testing.allocator.free(complete);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = begin },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = complete },
+    });
+    defer std.testing.allocator.free(entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 202,
+        .commit_index = 2,
+        .entries_bytes = entries,
+    });
+
+    const byte_range = try store.currentRange(std.testing.allocator, 202);
+    defer range_state.freeRange(std.testing.allocator, byte_range);
+    try std.testing.expectEqualStrings("doc:m", byte_range.start);
+    try std.testing.expectEqualStrings("doc:z", byte_range.end);
 }
 
 test "data raft merge source fence persists and transfers in snapshots" {

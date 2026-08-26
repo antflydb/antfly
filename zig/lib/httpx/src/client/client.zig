@@ -126,6 +126,11 @@ pub const RequestOptions = struct {
 pub const CancellationToken = struct {
     ptr: *const anyopaque,
     is_cancelled_fn: *const fn (*const anyopaque) bool,
+    /// Optional futex word whose value changes when cancellation is
+    /// published. Callback-only tokens remain supported through bounded
+    /// polling; coordinated owners can provide this word for an immediate
+    /// wake without coupling the client to their cancellation type.
+    wake_word: ?*const std.atomic.Value(u32) = null,
 
     pub fn fromAtomic(signal: *const std.atomic.Value(bool)) CancellationToken {
         return .{
@@ -200,12 +205,24 @@ fn waitForRequestCancellationOrTimeout(
         } else cancellation_poll_interval_ms;
         // A futex keeps the ordinary no-cancellation path parked until its
         // actual deadline, while request completion can wake it immediately.
-        // Callback-backed cancellation still gets the bounded poll interval.
+        // Coordinated cancellation sources may supply their own wake word;
+        // callback-only cancellation still gets the bounded poll interval.
+        const wait_word = if (cancellation) |signal|
+            signal.wake_word orelse stop
+        else
+            stop;
+        const expected = wait_word.load(.acquire);
+        // Close the observation-to-park race. A cancellation publisher may
+        // have changed the wake word after the checks at the top of the loop.
+        if (stop.load(.acquire) != 0) return .stopped;
+        if (cancellation) |signal| {
+            if (signal.isCancelled()) return .cancelled;
+        }
         Io.futexWaitTimeout(
             io,
             u32,
-            &stop.raw,
-            0,
+            &wait_word.raw,
+            expected,
             .{ .duration = .{
                 .clock = .awake,
                 .raw = .fromMilliseconds(@intCast(wait_ms)),
@@ -216,9 +233,18 @@ fn waitForRequestCancellationOrTimeout(
     }
 }
 
-fn stopRequestWatchdog(io: Io, stop: *std.atomic.Value(u32)) void {
+fn stopRequestWatchdog(
+    io: Io,
+    stop: *std.atomic.Value(u32),
+    cancellation: ?CancellationToken,
+) void {
     stop.store(1, .release);
     Io.futexWake(io, u32, &stop.raw, std.math.maxInt(u32));
+    if (cancellation) |signal| {
+        if (signal.wake_word) |wake_word| {
+            Io.futexWake(io, u32, &wake_word.raw, std.math.maxInt(u32));
+        }
+    }
 }
 
 fn shouldUseHttp2(config: ClientConfig) bool {
@@ -541,6 +567,7 @@ const RequestGate = struct {
     const count_mask: usize = closed_bit - 1;
 
     state: std.atomic.Value(usize) = .init(0),
+    shutdown_wake: std.atomic.Value(u32) = .init(0),
     drain_mutex: Io.Mutex = .init,
     drained: Io.Condition = .init,
 
@@ -569,7 +596,17 @@ const RequestGate = struct {
     }
 
     fn closeAndDrain(self: *RequestGate, io: Io) void {
+        self.close(io);
+        self.drain(io);
+    }
+
+    fn close(self: *RequestGate, io: Io) void {
         _ = self.state.fetchOr(closed_bit, .acq_rel);
+        self.shutdown_wake.store(1, .release);
+        Io.futexWake(io, u32, &self.shutdown_wake.raw, std.math.maxInt(u32));
+    }
+
+    fn drain(self: *RequestGate, io: Io) void {
         self.drain_mutex.lockUncancelable(io);
         defer self.drain_mutex.unlock(io);
         while (self.active() != 0) self.drained.waitUncancelable(io, &self.drain_mutex);
@@ -602,6 +639,7 @@ const CombinedCancellation = struct {
         return .{
             .ptr = self,
             .is_cancelled_fn = isCancelled,
+            .wake_word = &self.gate.shutdown_wake,
         };
     }
 
@@ -709,7 +747,27 @@ pub const Client = struct {
     /// Closes request admission and waits until all admitted requests return.
     /// Safe to call before provider state that borrows this client is destroyed.
     pub fn shutdown(self: *Self) void {
-        self.request_gate.closeAndDrain(self.io);
+        self.beginShutdown();
+        self.drainShutdown();
+    }
+
+    /// Publish shutdown and in-flight cancellation without waiting. Composite
+    /// owners use this on every dependent client before draining any one lane,
+    /// avoiding dependency cycles between nested HTTP requests.
+    pub fn beginShutdown(self: *Self) void {
+        self.request_gate.close(self.io);
+    }
+
+    /// Wait for all request leases after shutdown has been published.
+    pub fn drainShutdown(self: *Self) void {
+        self.request_gate.drain(self.io);
+    }
+
+    /// Number of requests that have committed admission and have not yet
+    /// returned their lifecycle lease. Owners use this to report shutdown
+    /// blockers before entering the unconditional drain in `shutdown`.
+    pub fn activeRequestCount(self: *const Self) usize {
+        return self.request_gate.active();
     }
 
     /// Adds an interceptor to the client.
@@ -997,7 +1055,7 @@ pub const Client = struct {
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
-                stopRequestWatchdog(self.io, &watchdog_stop);
+                stopRequestWatchdog(self.io, &watchdog_stop, null);
                 select.cancelDiscard();
                 return try request_result;
             },
@@ -1006,7 +1064,8 @@ pub const Client = struct {
                 while (select.cancel()) |late| Task.drainLateResult(late);
                 return switch (try watchdog_result) {
                     .timed_out => error.Timeout,
-                    .cancelled, .stopped => unreachable,
+                    .cancelled => unreachable,
+                    .stopped => error.Canceled,
                 };
             },
         }
@@ -1067,7 +1126,7 @@ pub const Client = struct {
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
-                stopRequestWatchdog(self.io, &watchdog_stop);
+                stopRequestWatchdog(self.io, &watchdog_stop, cancellation);
                 select.cancelDiscard();
                 if (cancellation.isCancelled()) {
                     if (request_result) |response_value| {
@@ -1084,7 +1143,7 @@ pub const Client = struct {
                 return switch (try watchdog_result) {
                     .cancelled => error.Cancelled,
                     .timed_out => error.Timeout,
-                    .stopped => unreachable,
+                    .stopped => if (cancellation.isCancelled()) error.Cancelled else error.Canceled,
                 };
             },
         }
@@ -1199,7 +1258,7 @@ pub const Client = struct {
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
-                stopRequestWatchdog(self.io, &watchdog_stop);
+                stopRequestWatchdog(self.io, &watchdog_stop, null);
                 select.cancelDiscard();
                 return try request_result;
             },
@@ -1208,7 +1267,8 @@ pub const Client = struct {
                 while (select.cancel()) |late| Task.drainLateResult(late);
                 return switch (try watchdog_result) {
                     .timed_out => error.Timeout,
-                    .cancelled, .stopped => unreachable,
+                    .cancelled => unreachable,
+                    .stopped => error.Canceled,
                 };
             },
         }
@@ -1269,7 +1329,7 @@ pub const Client = struct {
         const first = try select.await();
         switch (first) {
             .request => |request_result| {
-                stopRequestWatchdog(self.io, &watchdog_stop);
+                stopRequestWatchdog(self.io, &watchdog_stop, cancellation);
                 select.cancelDiscard();
                 if (cancellation.isCancelled()) {
                     if (request_result) |response_value| {
@@ -1286,7 +1346,7 @@ pub const Client = struct {
                 return switch (try watchdog_result) {
                     .cancelled => error.Cancelled,
                     .timed_out => error.Timeout,
-                    .stopped => unreachable,
+                    .stopped => if (cancellation.isCancelled()) error.Cancelled else error.Canceled,
                 };
             },
         }
@@ -4789,4 +4849,62 @@ test "request gate closes admission and drains a committed borrower" {
     lease.deinit();
     try group.await(io);
     try std.testing.expect(shutdown_done.load(.acquire));
+}
+
+test "request gate shutdown immediately wakes a cancellation watchdog" {
+    const io = std.testing.io;
+    var gate: RequestGate = .{};
+    var combined = CombinedCancellation{ .gate = &gate, .external = null };
+    const cancellation = combined.token();
+    var stop = std.atomic.Value(u32).init(0);
+    var started = std.atomic.Value(bool).init(false);
+    var outcome: RequestWatchdogOutcome = undefined;
+
+    const Task = struct {
+        fn watch(
+            signal: CancellationToken,
+            stop_signal: *const std.atomic.Value(u32),
+            has_started: *std.atomic.Value(bool),
+            result: *RequestWatchdogOutcome,
+        ) anyerror!void {
+            has_started.store(true, .release);
+            result.* = try waitForRequestCancellationOrTimeout(
+                std.testing.io,
+                stop_signal,
+                signal,
+                std.time.ms_per_hour,
+            );
+        }
+    };
+
+    var future = io.async(Task.watch, .{ cancellation, &stop, &started, &outcome });
+    while (!started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    gate.close(io);
+    try future.await(io);
+    try std.testing.expectEqual(RequestWatchdogOutcome.cancelled, outcome);
+}
+
+test "request watchdog reports parent task cancellation as stopped" {
+    const io = std.testing.io;
+    var stop = std.atomic.Value(u32).init(0);
+    var started = std.atomic.Value(bool).init(false);
+
+    const Task = struct {
+        fn watch(
+            stop_signal: *const std.atomic.Value(u32),
+            has_started: *std.atomic.Value(bool),
+        ) anyerror!RequestWatchdogOutcome {
+            has_started.store(true, .release);
+            return waitForRequestCancellationOrTimeout(
+                std.testing.io,
+                stop_signal,
+                null,
+                std.time.ms_per_hour,
+            );
+        }
+    };
+
+    var future = io.async(Task.watch, .{ &stop, &started });
+    while (!started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expectEqual(RequestWatchdogOutcome.stopped, try future.cancel(io));
 }

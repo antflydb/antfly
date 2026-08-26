@@ -152,6 +152,11 @@ pub const SplitReplicationContext = struct {
     operation: Operation = .bootstrap_chunk,
     /// Source split-delta sequence. Zero for bootstrap chunks.
     sequence: u64 = 0,
+    /// Exact destination watermark that must precede this delta. Source
+    /// watermarks are Raft indexes and may be sparse when intervening entries
+    /// do not mutate the split range. Null preserves the legacy consecutive-
+    /// sequence contract for already persisted requests.
+    previous_sequence: ?u64 = null,
 };
 
 pub const SplitTransitionMutation = struct {

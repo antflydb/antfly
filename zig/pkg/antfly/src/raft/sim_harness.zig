@@ -1430,6 +1430,10 @@ pub const ManagedHttpHostSimulation = struct {
         self.runtime.stop();
     }
 
+    pub fn disableTransitionOps(self: *ManagedHttpHostSimulation) void {
+        self.runtime.svc.disableTransitionOps();
+    }
+
     pub fn baseUri(self: *ManagedHttpHostSimulation, alloc: std.mem.Allocator) ![]u8 {
         if (self.virtual_base_uri) |uri| return try alloc.dupe(u8, uri);
         return try self.runtime.baseUri(alloc);

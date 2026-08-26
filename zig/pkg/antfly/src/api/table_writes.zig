@@ -1456,6 +1456,14 @@ pub const ProvisionedTableWriteCache = struct {
         self.* = undefined;
     }
 
+    /// Publish worker stop flags without joining. The caller must own a paused
+    /// borrowed scheduler, drain it, and only then call `deinit`.
+    pub fn beginTeardown(self: *ProvisionedTableWriteCache) void {
+        for (self.entries.items) |entry| entry.db.beginTeardown();
+        for (self.retired_entries.items) |entry| entry.db.beginTeardown();
+        for (self.closing_entries.items) |entry| entry.db.beginTeardown();
+    }
+
     /// Detach every callback whose context is owned by the write source.
     /// `setQueryVisibilityHook(null)` is a callback barrier, so once this
     /// returns cached DB workers can be drained after the source is destroyed
@@ -5608,8 +5616,9 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     /// Serializes source configuration with every cache container it can
-    /// mutate. The order matches request-time cache opens: cache-open locks by
-    /// address, then the source lock, then cache lifecycle locks by address.
+    /// mutate. The write-cache role always precedes the startup-cache role;
+    /// allocator addresses are deliberately excluded from lock ordering so a
+    /// clean VOPR replay cannot choose a different futex acquisition order.
     const WriteCacheTransitionLocks = struct {
         source: *ProvisionedTableWriteSource,
         first: ?*ProvisionedTableWriteCache,
@@ -5628,10 +5637,6 @@ pub const ProvisionedTableWriteSource = struct {
             if (first == null) {
                 first = second;
                 second = null;
-            } else if (second != null and @intFromPtr(first.?) > @intFromPtr(second.?)) {
-                const swap = first;
-                first = second;
-                second = swap;
             }
 
             if (first) |cache| lockAtomic(&cache.open_mutex);
@@ -5699,8 +5704,8 @@ pub const ProvisionedTableWriteSource = struct {
 
     /// Reclaim an idle lifetime-descriptor owner from either cache while no
     /// cache-open lock is held by the caller. Cross-cache reclamation is rare,
-    /// so use the full transition lock order here: both cache-open locks by
-    /// address, source state, then both lifecycle locks by address. This keeps
+    /// so use the full transition lock order here: write then startup cache-open
+    /// locks, source state, then write then startup lifecycle locks. This keeps
     /// descriptor pressure from introducing a lock inversion with cache
     /// rebinding, HA transitions, or startup-cache adoption.
     fn reclaimInactiveEntryAcrossWriteCachesForDescriptorPressure(
@@ -6183,6 +6188,17 @@ pub const ProvisionedTableWriteSource = struct {
         self.active_table_activities = .empty;
         self.table_activity_mutex.unlock(io);
         self.quiesced = true;
+    }
+
+    /// Publish cached DB worker shutdown before a borrowed deterministic
+    /// scheduler is drained. This deliberately does not await work groups or
+    /// destroy cache entries.
+    pub fn beginTeardown(self: *ProvisionedTableWriteSource) void {
+        self.restore_repair_shutdown.store(true, .release);
+        if (self.write_cache) |cache| cache.beginTeardown();
+        if (self.startup_write_cache) |cache| {
+            if (self.write_cache != cache) cache.beginTeardown();
+        }
     }
 
     pub fn deinit(self: *ProvisionedTableWriteSource) void {
@@ -11924,7 +11940,7 @@ pub const ProvisionedTableWriteSource = struct {
                         });
                     }
                     self.table_activity_threaded.io().sleep(Io.Duration.fromNanoseconds(replicated_apply_writer_open_retry_ns), .awake) catch |sleep_err| switch (sleep_err) {
-                        error.Canceled => Io.recancel(self.table_activity_threaded.io()),
+                        error.Canceled => return Io.recancel(self.table_activity_threaded.io()),
                     };
                     continue;
                 }
@@ -11966,7 +11982,7 @@ pub const ProvisionedTableWriteSource = struct {
                     if (platform_time.monotonicNs() -| start_ns >= timeout_ns)
                         return error.TableVisibilityTimeout;
                     self.table_activity_threaded.io().sleep(Io.Duration.fromMilliseconds(100), .awake) catch |sleep_err| switch (sleep_err) {
-                        error.Canceled => Io.recancel(self.table_activity_threaded.io()),
+                        error.Canceled => return Io.recancel(self.table_activity_threaded.io()),
                     };
                     continue;
                 },
@@ -25015,12 +25031,14 @@ test "replicated split destination seeds inherited doc identity before range pub
             .bootstrap_sequence = 0,
         },
     });
-    var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
-        return error.TestUnexpectedResult;
-    defer destination.deinit(alloc);
-    var after_late = (try destination.db.lookup(alloc, "doc:m", .{})) orelse return error.TestUnexpectedResult;
-    defer after_late.deinit(alloc);
-    try std.testing.expect(std.mem.indexOf(u8, after_late.json, "\"m\"") != null);
+    {
+        var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
+            return error.TestUnexpectedResult;
+        defer destination.deinit(alloc);
+        var after_late = (try destination.db.lookup(alloc, "doc:m", .{})) orelse return error.TestUnexpectedResult;
+        defer after_late.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, after_late.json, "\"m\"") != null);
+    }
 
     const delta_req = db_mod.types.BatchRequest{
         .writes = &.{.{ .key = "doc:m", .value = "{\"title\":\"delta-1\"}" }},
@@ -25036,13 +25054,41 @@ test "replicated split destination seeds inherited doc identity before range pub
     };
     _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", delta_req);
     _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", delta_req);
-    try std.testing.expectEqual(@as(u64, 1), try destination.db.getSplitDeltaFinalSeq(alloc));
+    {
+        var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
+            return error.TestUnexpectedResult;
+        defer destination.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 1), try destination.db.getSplitDeltaFinalSeq(alloc));
+    }
 
     var gap_req = delta_req;
     gap_req.split_replication.?.sequence = 3;
     try std.testing.expectError(
         error.SplitReplicationSequenceGap,
         source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", gap_req),
+    );
+
+    // Source watermarks are Raft indexes, so entries unrelated to the split
+    // range can create legitimate gaps. The explicit predecessor proves that
+    // no actual delta was omitted while preserving exact retry identity.
+    var sparse_req = delta_req;
+    sparse_req.split_replication.?.sequence = 7;
+    sparse_req.split_replication.?.previous_sequence = 1;
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", sparse_req);
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", sparse_req);
+    {
+        var destination = (try source.leaseCachedTransitionGroupWriter(alloc, 7002, "docs", namespace)) orelse
+            return error.TestUnexpectedResult;
+        defer destination.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 7), try destination.db.getSplitDeltaFinalSeq(alloc));
+    }
+
+    var omitted_req = delta_req;
+    omitted_req.split_replication.?.sequence = 9;
+    omitted_req.split_replication.?.previous_sequence = 1;
+    try std.testing.expectError(
+        error.SplitReplicationSequenceGap,
+        source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", omitted_req),
     );
 
     try std.testing.expectError(error.DocIdentityNamespaceMismatch, source.applyReplicatedBatchGroupLocal(alloc, 7002, "docs", .{
@@ -44320,6 +44366,29 @@ test "resident DB retry preparation waits outside admission for writer publicati
         .{ .read_activity_held = true },
     )).?;
     lease.release(alloc);
+}
+
+test "write cache transition locks use stable cache roles instead of addresses" {
+    const alloc = std.testing.allocator;
+    var caches = [_]ProvisionedTableWriteCache{
+        ProvisionedTableWriteCache.init(alloc),
+        ProvisionedTableWriteCache.init(alloc),
+    };
+    defer caches[1].deinit();
+    defer caches[0].deinit();
+
+    var source = ProvisionedTableWriteSource.init("stable-lock-order", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    // Deliberately put the write role at the higher array address. The former
+    // pointer sort inverted these roles and made clean replay allocator-layout
+    // dependent.
+    source.write_cache = &caches[1];
+    source.startup_write_cache = &caches[0];
+
+    var locks = ProvisionedTableWriteSource.WriteCacheTransitionLocks.init(&source, true, true);
+    defer locks.deinit();
+    try std.testing.expect(locks.first == &caches[1]);
+    try std.testing.expect(locks.second == &caches[0]);
 }
 
 test "admitted resident DB lease never waits for an in-flight writer publication" {

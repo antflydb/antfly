@@ -362,10 +362,15 @@ pub const Scenario = struct {
 
         pub fn stopPublicCatalog(self: *Fixture) void {
             if (!self.public_live) return;
+            // Publish ownership release before teardown. A parent VOPR future
+            // can be canceled while unwinding through this function, and the
+            // fixture owner may then call deinit as a second shutdown path.
+            // The second path must not touch a client already poisoned by its
+            // first deinit.
+            self.public_live = false;
             self.public_executor.deinit();
             self.public_runtime.deinit();
             self.public_status.deinit(self.alloc);
-            self.public_live = false;
         }
 
         pub fn observePublicCatalogForMode(self: *Fixture, mode: Mode) !bool {

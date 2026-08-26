@@ -117,6 +117,17 @@ pub const HttpFrameDriver = struct {
         self.* = undefined;
     }
 
+    /// Publish async-sender shutdown without awaiting or destroying workers.
+    /// Shared deterministic schedulers use this before driving their task set
+    /// to quiescence; `deinit` remains the sole join and destruction owner.
+    pub fn beginShutdown(self: *HttpFrameDriver) void {
+        if (self.workers.len == 0) return;
+        self.mutex.lockUncancelable(self.io);
+        self.closing = true;
+        self.cond.broadcast(self.io);
+        self.mutex.unlock(self.io);
+    }
+
     pub fn frameDriver(self: *HttpFrameDriver) raft_engine.runtime.FrameDriver {
         return .{
             .ptr = self,
@@ -204,10 +215,7 @@ pub const HttpFrameDriver = struct {
 
     fn stopAsyncSender(self: *HttpFrameDriver) void {
         if (self.workers.len == 0) return;
-        self.mutex.lockUncancelable(self.io);
-        self.closing = true;
-        self.cond.broadcast(self.io);
-        self.mutex.unlock(self.io);
+        self.beginShutdown();
         for (self.workers) |*worker| _ = worker.await(self.io);
         self.alloc.free(self.workers);
         self.workers = &.{};
@@ -667,4 +675,28 @@ test "http frame driver propagates isolated worker executor configuration" {
     try std.testing.expectEqual(executor_config.io_concurrent_limit, actual.io_concurrent_limit);
     try std.testing.expectEqual(executor_config.keep_alive, actual.keep_alive);
     try std.testing.expectEqual(executor_config.max_requests_per_connection, actual.max_requests_per_connection);
+}
+
+test "http frame driver split shutdown wakes idle senders before deinit" {
+    const UnusedExecutor = struct {
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.UnexpectedRequest;
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var unused = UnusedExecutor{};
+    var driver: HttpFrameDriver = undefined;
+    try driver.initAsyncInPlace(std.testing.allocator, .{
+        .async_send_worker_count = 1,
+    }, unused.iface(), io_impl.io());
+    driver.beginShutdown();
+    driver.beginShutdown();
+    try std.testing.expect(driver.closing);
+    driver.deinit();
 }

@@ -273,6 +273,16 @@ pub const ManagedHostService = struct {
         return registration;
     }
 
+    /// Retire this process's data-plane transition executor while preserving
+    /// metadata observation. Deployment-shaped compositions use this when
+    /// projected data groups are owned by external DataServers.
+    pub fn disableTransitionOps(self: *ManagedHostService) void {
+        if (self.transition_svc) |*transition_svc| transition_svc.deinit();
+        self.transition_svc = null;
+        self.local_transition_runtime = null;
+        self.syncTransitionMetrics();
+    }
+
     pub fn prepareEnrichmentRead(
         self: *ManagedHostService,
         group_id: u64,
@@ -571,6 +581,10 @@ pub const ManagedHttpHostService = struct {
         self.host.stop();
     }
 
+    pub fn beginTransportShutdown(self: *ManagedHttpHostService) void {
+        self.host.beginTransportShutdown();
+    }
+
     pub fn baseUri(self: *ManagedHttpHostService, alloc: std.mem.Allocator) ![]u8 {
         return try self.host.baseUri(alloc);
     }
@@ -611,6 +625,16 @@ pub const ManagedHttpHostService = struct {
         if (previous) |*transition_svc| transition_svc.deinit();
         self.syncTransitionMetrics();
         return registration;
+    }
+
+    /// Retire this process's data-plane transition executor while preserving
+    /// metadata observation. Deployment-shaped compositions use this when
+    /// projected data groups are owned by external DataServers.
+    pub fn disableTransitionOps(self: *ManagedHttpHostService) void {
+        if (self.transition_svc) |*transition_svc| transition_svc.deinit();
+        self.transition_svc = null;
+        self.local_transition_runtime = null;
+        self.syncTransitionMetrics();
     }
 
     pub fn submit(self: *ManagedHttpHostService, update: metadata_view.MetadataUpdate) !void {

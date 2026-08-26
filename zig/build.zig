@@ -3597,6 +3597,7 @@ pub fn build(b: *std.Build) void {
         "provisioned table write source drop table waits for active read cache lease",
         "provisioned table write source backup releases read cache exclusive before native snapshot copy",
         "write cache retirement is allocation-free after entry installation",
+        "write cache transition locks use stable cache roles instead of addresses",
         "backend runtime durable lane runs inline jobs",
         "backend runtime durable lane leaves inline failed jobs owned by caller",
         "backend runtime threaded durable lane rejects jobs after owner close",
@@ -6360,6 +6361,7 @@ pub fn build(b: *std.Build) void {
             "split transition auto bulk publication retries while a writer lease is active",
             "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",
+            "write cache transition locks use stable cache roles instead of addresses",
             "writer cache bulk transition fences only its table",
             "provisioned read cache retirement is allocation-free after entry installation",
             "provisioned group storage prunes stale visible root generations",
@@ -7131,6 +7133,39 @@ pub fn build(b: *std.Build) void {
     );
     full_cluster_vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
 
+    const production_cluster_baseline_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production data plane baseline exact replay"},
+    });
+    const run_production_cluster_baseline_vopr_tests = b.addRunArtifact(production_cluster_baseline_vopr_tests);
+    const production_cluster_bounded_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production data plane VOPR bounded cutoff exact replay"},
+    });
+    const run_production_cluster_bounded_vopr_tests = b.addRunArtifact(production_cluster_bounded_vopr_tests);
+    const production_cluster_deep_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production data plane VOPR active split exact replay"},
+    });
+    const run_production_cluster_deep_vopr_tests = b.addRunArtifact(production_cluster_deep_vopr_tests);
+    const production_cluster_vopr_smoke_test_step = b.step(
+        "production-cluster-vopr-smoke-test",
+        "Exact-replay the production DataServer deployment baseline and bounded lifecycle",
+    );
+    production_cluster_vopr_smoke_test_step.dependOn(&run_production_cluster_baseline_vopr_tests.step);
+    production_cluster_vopr_smoke_test_step.dependOn(&run_production_cluster_bounded_vopr_tests.step);
+    const production_cluster_vopr_deep_test_step = b.step(
+        "production-cluster-vopr-deep-test",
+        "Exact-replay the complete metadata-driven production DataServer split history",
+    );
+    production_cluster_vopr_deep_test_step.dependOn(&run_production_cluster_deep_vopr_tests.step);
+    const production_cluster_vopr_test_step = b.step(
+        "production-cluster-vopr-test",
+        "Run production DataServer deployment smoke and deep active-reconfiguration histories",
+    );
+    production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
+
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"generation and reranking chain VOPR exact replays"},
@@ -7456,6 +7491,7 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_composed_query_vopr_tests.step);
     vopr_test_step.dependOn(&run_query_embedding_cache_vopr_tests.step);
     vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
+    vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     vopr_test_step.dependOn(&run_generation_reranking_vopr_tests.step);
     vopr_test_step.dependOn(&run_distributed_query_vopr_tests.step);
     vopr_test_step.dependOn(&run_parquet_cache_vopr_tests.step);

@@ -32,6 +32,7 @@ const native_index_base_path = "__antfly_lite";
 const native_index_layout = "native_index_catalog_pages";
 const root_namespace_alias_catalog_key = "system/lite-root-namespace-alias";
 const artifact_profile_catalog_key = "system/lite-artifact-profile";
+const root_incarnation_catalog_prefix = "system/lite-root-incarnation/";
 const embedded_artifact_profile = "embedded-v1";
 const standalone_artifact_profile = "standalone-v1";
 
@@ -253,6 +254,8 @@ pub const Handle = struct {
                 opts.physical_root_mode = .external_backend;
             },
             .native_single_file => {
+                platform_sync.lockYielding(&self.namespace_mutex);
+                defer self.namespace_mutex.unlock();
                 if (opts.resource_manager == null) {
                     opts.resource_manager = self.native_docstore.?.resource_manager;
                 }
@@ -277,6 +280,7 @@ pub const Handle = struct {
                 opts.index_open_parallelism = 1;
                 opts.external_derived_checkpoints = false;
                 opts.physical_root_mode = .external_backend;
+                opts.external_root_incarnation = try self.durableRootIncarnationLocked("root");
             },
         }
     }
@@ -348,6 +352,39 @@ pub const Handle = struct {
         opts.index_open_parallelism = 1;
         opts.external_derived_checkpoints = false;
         opts.physical_root_mode = .external_backend;
+        opts.external_root_incarnation = try self.durableRootIncarnationLocked(canonical_namespace);
+    }
+
+    fn durableRootIncarnationLocked(self: *Handle, namespace: []const u8) !u128 {
+        std.debug.assert(self.engine == .native_single_file);
+        const store = self.native_docstore.?;
+        const key = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}{s}",
+            .{ root_incarnation_catalog_prefix, namespace },
+        );
+        defer self.allocator.free(key);
+
+        if (try store.file.getCatalogRecordAlloc(self.allocator, key)) |raw| {
+            defer self.allocator.free(raw);
+            if (raw.len != @sizeOf(u128)) return error.InvalidLiteRootIncarnation;
+            const incarnation = std.mem.readInt(u128, raw[0..@sizeOf(u128)], .little);
+            if (incarnation == 0) return error.InvalidLiteRootIncarnation;
+            return incarnation;
+        }
+        // A legacy artifact opened read-only cannot publish its identity yet.
+        // It remains unavailable until one writer performs the rolling-format
+        // upgrade; query-only opens must not invent a process-local token.
+        if (store.read_only) return 0;
+
+        var entropy: [@sizeOf(u128)]u8 = undefined;
+        try store.file.runtime().randomSecure(&entropy);
+        var incarnation = std.mem.readInt(u128, &entropy, .little);
+        if (incarnation == 0) incarnation = 1;
+        var encoded: [@sizeOf(u128)]u8 = undefined;
+        std.mem.writeInt(u128, &encoded, incarnation, .little);
+        try store.file.putCatalogRecord(key, &encoded);
+        return incarnation;
     }
 
     /// Permanently maps an existing embedded root database to a standalone
@@ -1029,11 +1066,13 @@ test "lite backend native engine creates and checks aflite file" {
         db_mod.OpenOptions.PhysicalRootMode.external_backend,
         db_opts.physical_root_mode,
     );
+    try std.testing.expect(db_opts.external_root_incarnation != 0);
 
+    const configured_report = try handle.check();
     const vacuumed = try handle.vacuum();
-    try std.testing.expectEqual(report.file_size, vacuumed.before_size);
-    try std.testing.expectEqual(report.file_size, vacuumed.after_size);
-    try std.testing.expectEqual(@as(u64, 0), vacuumed.reclaimed_bytes);
+    try std.testing.expectEqual(configured_report.file_size, vacuumed.before_size);
+    try std.testing.expectEqual(configured_report.compact_size, vacuumed.after_size);
+    try std.testing.expectEqual(vacuumed.before_size - vacuumed.after_size, vacuumed.reclaimed_bytes);
 }
 
 test "lite backend propagates no_sync to native engine" {
@@ -1293,6 +1332,7 @@ test "lite backend native engine can back db primary documents" {
 
     const path = try testPath(allocator, tmp, "native-db.aflite");
     defer allocator.free(path);
+    var durable_incarnation: u128 = 0;
 
     {
         var handle = try Handle.create(allocator, path, true);
@@ -1308,7 +1348,8 @@ test "lite backend native engine can back db primary documents" {
 
         var db = try db_mod.DB.open(allocator, path, db_opts);
         defer db.close();
-        try std.testing.expectError(error.DurableRootIncarnationUnavailable, db.durableRootIncarnation());
+        durable_incarnation = try db.durableRootIncarnation();
+        try std.testing.expect(durable_incarnation != 0);
 
         try db.batch(.{
             .writes = &.{.{
@@ -1340,6 +1381,7 @@ test "lite backend native engine can back db primary documents" {
 
         var db = try db_mod.DB.open(allocator, path, db_opts);
         defer db.close();
+        try std.testing.expectEqual(durable_incarnation, try db.durableRootIncarnation());
 
         const value = try db.get(allocator, "doc:lite-native") orelse return error.MissingNativeLiteDocument;
         defer allocator.free(value);

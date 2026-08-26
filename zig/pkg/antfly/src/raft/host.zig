@@ -1040,6 +1040,10 @@ pub const HttpHost = struct {
         if (self.listener) |listener| listener.stop();
     }
 
+    pub fn beginTransportShutdown(self: *HttpHost) void {
+        self.transport_stack.beginShutdown();
+    }
+
     pub fn baseUri(self: *const HttpHost, alloc: std.mem.Allocator) ![]u8 {
         const listener = self.listener orelse return error.HttpListenerDisabled;
         return try listener.baseUri(alloc);

@@ -393,6 +393,11 @@ pub const OpenOptions = struct {
     /// pins inside the same atomic storage generation as their indexes.
     index_repair_checkpoint_storage: ?lsm_backend_mod.Storage = null,
     physical_root_mode: PhysicalRootMode = .filesystem_managed,
+    /// Durable identity supplied by an externally owned physical backend.
+    /// Filesystem-managed roots persist their own checkpoint; container
+    /// backends such as Lite must bind the DB to the container generation and
+    /// logical namespace that actually owns its bytes.
+    external_root_incarnation: u128 = 0,
     /// Optional enrichment providers. `DB.open` takes ownership of every
     /// non-null provider when called, including when the open subsequently
     /// fails. A successfully opened DB releases them from `close`.
@@ -3540,6 +3545,8 @@ pub const DB = struct {
             {
                 const identity = try loadOrCreateDurableRootIdentity(alloc, db.backend_runtime, path);
                 db.root_incarnation = identity.incarnation;
+            } else if (opts.physical_root_mode == .external_backend) {
+                db.root_incarnation = opts.external_root_incarnation;
             }
             if (opts.schema_before_index_load) |table_schema| {
                 // This option is used by the metadata-authoritative local
@@ -4329,6 +4336,13 @@ pub const DB = struct {
         }
         if (self.text_merge_runtime) |runtime| try runtime.start();
         if (self.sparse_compaction_runtime) |runtime| try runtime.start();
+    }
+
+    /// Publish non-joining shutdown to optional workers before a borrowed
+    /// deterministic scheduler drains them. Destruction still happens through
+    /// the ordinary close path after the drain completes.
+    pub fn beginTeardown(self: *DB) void {
+        if (self.transaction_runtime) |runtime| runtime.beginTeardown();
     }
 
     pub fn ensureTransactionRecoveryRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
@@ -5516,7 +5530,12 @@ pub const DB = struct {
                     if (replication.sequence == 0) return error.InvalidBatchRequest;
                     const applied = try self.core.loadSplitDeltaFinalSeq(self.alloc);
                     if (replication.sequence <= applied) return false;
-                    if (replication.sequence != applied + 1) return error.SplitReplicationSequenceGap;
+                    if (replication.previous_sequence) |previous| {
+                        if (previous >= replication.sequence) return error.InvalidBatchRequest;
+                        if (previous != applied) return error.SplitReplicationSequenceGap;
+                    } else if (replication.sequence != applied + 1) {
+                        return error.SplitReplicationSequenceGap;
+                    }
                 },
                 .checkpoint => {
                     const checkpoint = req.split_checkpoint orelse return error.MissingSplitReplicationCheckpoint;

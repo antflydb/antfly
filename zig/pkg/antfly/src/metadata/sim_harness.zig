@@ -19,6 +19,7 @@ const metadata_control_loop = @import("control_loop.zig");
 const metadata_http_client = @import("http_client.zig");
 const metadata_http_server = @import("http_server.zig");
 const metadata_http_test_runtime = @import("http_test_runtime.zig");
+const metadata_node_operations = @import("node_operations.zig");
 const metadata_mod = @import("mod.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -46,6 +47,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_metadata_apply = @import("../raft/metadata_apply.zig");
 const raft_metadata_view = @import("../raft/metadata_view.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
+const raft_shard_ops = @import("../raft/shard_ops.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const peer_resolver = @import("../raft/peer_resolver.zig");
 const raft_sim = @import("../raft/sim_harness.zig");
@@ -1906,7 +1908,10 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
         for (&modeled_devices, &modeled_configurators) |*device, *configurator| {
             device.* = storage_sim.ModeledDevice.init(std.testing.allocator);
             modeled_device_count += 1;
-            configurator.* = .{ .device = device };
+            configurator.* = .{
+                .device = device,
+                .device_incarnation = modeled_device_count,
+            };
         }
     }
 
@@ -3414,19 +3419,28 @@ fn makeHostSimDepsWithTransportExecutor(
 
 const ModeledDbOpenConfigurator = struct {
     device: *storage_sim.ModeledDevice,
+    /// Stable identity of the modeled physical device. The DB path alone is
+    /// only a namespace: rebinding that namespace to a different device must
+    /// change the projection incarnation used by split/merge checkpoints.
+    device_incarnation: u64,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
 
     fn iface(self: *@This()) db_mod.background_runtime.DbOpenConfigurator {
         return .{ .ptr = self, .configure_fn = configure };
     }
 
-    fn configure(ptr: *anyopaque, _: []const u8, opaque_options: *anyopaque) !void {
+    fn configure(ptr: *anyopaque, path: []const u8, opaque_options: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const options: *db_mod.OpenOptions = @ptrCast(@alignCast(opaque_options));
         options.primary_backend = .{ .lsm = .{ .flush_threshold = 1 } };
         options.storage = self.device.storage();
         options.resource_manager = self.resource_manager;
         options.physical_root_mode = .external_backend;
+        const namespace_hash = std.hash.Wyhash.hash(0x6d6f6465_6c65642d, path);
+        options.external_root_incarnation =
+            (@as(u128, self.device_incarnation) << 64) | @as(u128, namespace_hash);
+        if (options.external_root_incarnation == 0)
+            options.external_root_incarnation = 1;
         options.index_backends = .{
             .text_main_backend = .lsm,
             .text_lsm_storage = self.device.storage(),
@@ -3437,6 +3451,33 @@ const ModeledDbOpenConfigurator = struct {
         };
     }
 };
+
+test "modeled DB configurator supplies stable physical-root incarnations" {
+    var device_a = storage_sim.ModeledDevice.init(std.testing.allocator);
+    defer device_a.deinit();
+    var device_b = storage_sim.ModeledDevice.init(std.testing.allocator);
+    defer device_b.deinit();
+
+    var configurator_a = ModeledDbOpenConfigurator{
+        .device = &device_a,
+        .device_incarnation = 11,
+    };
+    var configurator_b = ModeledDbOpenConfigurator{
+        .device = &device_b,
+        .device_incarnation = 12,
+    };
+    var first = db_mod.OpenOptions{};
+    var reopened = db_mod.OpenOptions{};
+    var rebound = db_mod.OpenOptions{};
+    try configurator_a.iface().configure("group-7/table-db", &first);
+    try configurator_a.iface().configure("group-7/table-db", &reopened);
+    try configurator_b.iface().configure("group-7/table-db", &rebound);
+
+    try std.testing.expectEqual(db_mod.OpenOptions.PhysicalRootMode.external_backend, first.physical_root_mode);
+    try std.testing.expect(first.external_root_incarnation != 0);
+    try std.testing.expectEqual(first.external_root_incarnation, reopened.external_root_incarnation);
+    try std.testing.expect(first.external_root_incarnation != rebound.external_root_incarnation);
+}
 
 pub const MetadataHttpNodeSimulation = struct {
     cluster: *MetadataHttpClusterSimulation,
@@ -3459,6 +3500,13 @@ pub const MetadataHttpNodeSimulation = struct {
         return self.sim().serviceMetrics();
     }
 
+    pub fn replaceTransitionOps(
+        self: MetadataHttpNodeSimulation,
+        ops: raft_shard_ops.ShardOperationAdapter,
+    ) !raft_shard_ops.OwnedShardOperationAdapter.Registration {
+        return try self.sim().runtime.svc.replaceTransitionOps(ops);
+    }
+
     pub fn metadataStatus(self: MetadataHttpNodeSimulation) !metadata_service.MetadataStatus {
         return try metadata_service.snapshotStatus(
             self.cluster.alloc,
@@ -3466,6 +3514,12 @@ pub const MetadataHttpNodeSimulation = struct {
             self,
             self.serviceMetrics(),
         );
+    }
+
+    pub fn metadataIncarnation(self: MetadataHttpNodeSimulation) !?metadata_api.MetadataClusterIncarnation {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse
+            return error.MissingMetadataStore;
+        return try store.getMetadataIncarnation(self.cluster.metadata_group_id);
     }
 
     pub fn adminSnapshot(self: MetadataHttpNodeSimulation) !metadata_api.AdminSnapshot {
@@ -3709,6 +3763,10 @@ pub const MetadataHttpNodeSimulation = struct {
 
     pub fn reportStoreStatus(self: MetadataHttpNodeSimulation, report: metadata_table_manager.StoreStatusReport) !void {
         _ = try self.reportStoreStatuses(&.{report});
+    }
+
+    pub fn upsertSchemaProgress(self: MetadataHttpNodeSimulation, record: metadata_table_manager.SchemaProgressRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_schema_progress = record });
     }
 
     pub fn reportStoreStatuses(self: MetadataHttpNodeSimulation, reports: []const metadata_table_manager.StoreStatusReport) !usize {
@@ -4242,6 +4300,10 @@ pub const MetadataHttpClusterSimulation = struct {
         self: *MetadataHttpClusterSimulation,
         ownership: DataPlaneOwnership,
     ) void {
+        if (ownership == .external and self.data_plane_ownership != .external) {
+            for (0..self.cluster.nodes.len) |index|
+                self.cluster.node(index).disableTransitionOps();
+        }
         self.data_plane_ownership = ownership;
         @memset(self.placement_intent_hash_valid, false);
     }
@@ -4362,7 +4424,7 @@ pub const MetadataHttpClusterSimulation = struct {
         return null;
     }
 
-    fn currentMetadataLeaderIndex(self: *MetadataHttpClusterSimulation) ?usize {
+    pub fn currentMetadataLeaderIndex(self: *MetadataHttpClusterSimulation) ?usize {
         return bestMetadataLeaderIndex(self);
     }
 
@@ -5773,13 +5835,16 @@ const PublicApiStatusSource = struct {
     }
 };
 
-const MetadataAdminSimSource = struct {
+pub const MetadataAdminSimSource = struct {
     node: MetadataHttpNodeSimulation,
 
-    fn iface(self: *@This()) metadata_http_server.AdminSource {
+    pub fn iface(self: *@This()) metadata_http_server.AdminSource {
         return .{
             .ptr = self,
             .vtable = &.{
+                .head = head,
+                .linearizable_head = linearizableHead,
+                .linearizable_snapshot = linearizableSnapshot,
                 .status = status,
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
@@ -5788,11 +5853,39 @@ const MetadataAdminSimSource = struct {
                 .cancel_node_shutdown = cancelNodeShutdown,
                 .finalize_node_shutdown = finalizeNodeShutdown,
                 .upsert_store = upsertStore,
+                .report_store_status = reportStoreStatus,
+                .upsert_schema_progress = upsertSchemaProgress,
                 .trigger_reallocate = triggerReallocate,
                 .request_split = requestSplit,
                 .request_merge = requestMerge,
             },
         };
+    }
+
+    fn head(ptr: *anyopaque) !metadata_api.MetadataHead {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const current = try self.node.metadataStatus();
+        return .{
+            .metadata_group_id = current.metadata_group_id,
+            .metadata_incarnation = current.metadata_incarnation,
+            .metadata_epoch = current.metadata_epoch,
+        };
+    }
+
+    fn linearizableHead(ptr: *anyopaque, request: api_operation.RequestContext) !metadata_api.MetadataHead {
+        try request.ensureActive();
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        if (target.index != self.node.index) return error.NotLeader;
+        return try head(ptr);
+    }
+
+    fn linearizableSnapshot(ptr: *anyopaque, request: api_operation.RequestContext) !metadata_api.AdminSnapshot {
+        try request.ensureActive();
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        if (target.index != self.node.index) return error.NotLeader;
+        return try target.adminSnapshot();
     }
 
     fn status(ptr: *anyopaque) !metadata_api.MetadataStatus {
@@ -5815,28 +5908,24 @@ const MetadataAdminSimSource = struct {
         defer metadata_table_manager.freeNode(alloc, record);
         const target = currentMetadataMutationNode(self.node);
         try target.registerNode(record);
-        try target.runRound();
     }
 
     fn requestNodeShutdown(ptr: *anyopaque, node_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const target = currentMetadataMutationNode(self.node);
         try target.requestNodeShutdown(node_id);
-        try target.runRound();
     }
 
     fn cancelNodeShutdown(ptr: *anyopaque, node_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const target = currentMetadataMutationNode(self.node);
         try target.cancelNodeShutdown(node_id);
-        try target.runRound();
     }
 
     fn finalizeNodeShutdown(ptr: *anyopaque, node_id: u64) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const target = currentMetadataMutationNode(self.node);
         try target.finalizeNodeShutdown(node_id);
-        try target.runRound();
     }
 
     fn upsertStore(ptr: *anyopaque, alloc: std.mem.Allocator, record: metadata_table_manager.StoreRecord) !void {
@@ -5844,14 +5933,33 @@ const MetadataAdminSimSource = struct {
         defer metadata_table_manager.freeStore(alloc, record);
         const target = currentMetadataMutationNode(self.node);
         try target.registerStore(record);
-        try target.runRound();
+    }
+
+    fn reportStoreStatus(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        report: metadata_table_manager.StoreStatusReport,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        defer metadata_node_operations.freeStoreStatusReport(alloc, report);
+        const target = currentMetadataMutationNode(self.node);
+        try target.reportStoreStatus(report);
+    }
+
+    fn upsertSchemaProgress(
+        ptr: *anyopaque,
+        _: std.mem.Allocator,
+        record: metadata_table_manager.SchemaProgressRecord,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const target = currentMetadataMutationNode(self.node);
+        try target.upsertSchemaProgress(record);
     }
 
     fn triggerReallocate(ptr: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const target = currentMetadataMutationNode(self.node);
         try target.requestReallocation(1);
-        try target.runRound();
     }
 
     fn requestSplit(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.SplitRequest) !void {
@@ -5872,7 +5980,6 @@ const MetadataAdminSimSource = struct {
             .destination_group_id = req.destination_group_id orelse deriveGroupId(table_name, req.split_key, 0x53504c47, source_group_id),
             .split_key = req.split_key,
         });
-        try target.runRound();
     }
 
     fn requestMerge(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: metadata_http_server.MergeRequest) !void {
@@ -5892,7 +5999,6 @@ const MetadataAdminSimSource = struct {
             .receiver_group_id = req.receiver_group_id,
             .allow_doc_identity_reassignment = req.allow_doc_identity_reassignment,
         });
-        try target.runRound();
     }
 };
 
@@ -6259,14 +6365,25 @@ fn PublicApiTestRig(comptime N: usize) type {
 /// explicit-step transport while every public listener, forwarding request,
 /// client, timeout, and shutdown task borrows the caller's single VoprIo.
 pub const VoprPublicClusterFixture = struct {
+    pub const BootstrapPhase = enum(u8) {
+        created,
+        local_resources_ready,
+        metadata_runtime_ready,
+        raft_wire_ready,
+        metadata_quorum_ready,
+        projected_tables_ready,
+        hosted_data_ready,
+        public_stack_ready,
+    };
+
     pub const FaultMode = enum { clean, metadata_partition, node_restart, graph_inflight_restart, graph_topology_churn, graph_transport_failure, partial_http_write, resource_pressure };
-    const node_count = 3;
-    const metadata_group_id: u64 = 6840;
-    const table_id: u64 = 6841;
-    const data_group_id: u64 = 6842;
-    const tenant_table_id: u64 = 6843;
-    const tenant_data_group_id: u64 = 6844;
-    const graph_data_group_id: u64 = 6845;
+    pub const node_count = 3;
+    pub const metadata_group_id: u64 = 6840;
+    pub const table_id: u64 = 6841;
+    pub const data_group_id: u64 = 6842;
+    pub const tenant_table_id: u64 = 6843;
+    pub const tenant_data_group_id: u64 = 6844;
+    pub const graph_data_group_id: u64 = 6845;
     const graph_index_name = "graph_idx";
     const graph_indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}";
 
@@ -6354,15 +6471,63 @@ pub const VoprPublicClusterFixture = struct {
     request_errors: u64 = 0,
     last_request_error_code: u64 = 0,
     complete: bool = false,
+    bootstrap_phase: BootstrapPhase = .created,
+    teardown_started: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*VoprPublicClusterFixture {
+        return initWithDataPlaneOwnership(alloc, sim, .co_located);
+    }
+
+    /// Construct the metadata quorum with projected data placements owned by
+    /// external production DataServers from the first reconciliation round.
+    /// This avoids materializing a shadow hosted data plane merely to tear it
+    /// down again before the production owners start.
+    pub fn initExternalDataPlane(
+        alloc: std.mem.Allocator,
+        sim: *vopr.vopr_io.VoprIo,
+    ) !*VoprPublicClusterFixture {
+        return initWithDataPlaneOwnership(alloc, sim, .external);
+    }
+
+    fn initWithDataPlaneOwnership(
+        alloc: std.mem.Allocator,
+        sim: *vopr.vopr_io.VoprIo,
+        data_plane_ownership: MetadataHttpClusterSimulation.DataPlaneOwnership,
+    ) !*VoprPublicClusterFixture {
+        const self = try create(alloc, sim);
+        errdefer self.deinit();
+        try self.bootstrapWithDataPlaneOwnership(data_plane_ownership);
+        return self;
+    }
+
+    pub fn create(
+        alloc: std.mem.Allocator,
+        sim: *vopr.vopr_io.VoprIo,
+    ) !*VoprPublicClusterFixture {
         const self = try alloc.create(VoprPublicClusterFixture);
         self.* = .{
             .alloc = alloc,
             .sim = sim,
             .tmp = std.testing.tmpDir(.{}), // vopr-audit: allow(host_filesystem) production DB differential roots remain node-local
         };
-        errdefer self.deinit();
+        return self;
+    }
+
+    pub fn bootstrap(self: *VoprPublicClusterFixture) !void {
+        return self.bootstrapWithDataPlaneOwnership(.co_located);
+    }
+
+    pub fn bootstrapExternalDataPlane(self: *VoprPublicClusterFixture) !void {
+        return self.bootstrapWithDataPlaneOwnership(.external);
+    }
+
+    fn bootstrapWithDataPlaneOwnership(
+        self: *VoprPublicClusterFixture,
+        data_plane_ownership: MetadataHttpClusterSimulation.DataPlaneOwnership,
+    ) !void {
+        if (self.bootstrap_phase != .created) return error.PublicClusterFixtureAlreadyBootstrapped;
+        const alloc = self.alloc;
+        const sim = self.sim;
 
         for (0..node_count) |index| {
             self.stores[index] = raft_engine.core.MemoryStorage.init(alloc);
@@ -6380,6 +6545,7 @@ pub const VoprPublicClusterFixture = struct {
             self.resource_manager_count += 1;
             self.modeled_configurators[index] = .{
                 .device = &self.modeled_devices[index],
+                .device_incarnation = index + 1,
                 .resource_manager = &self.resource_managers[index],
             };
             self.roots[index] = try std.fmt.allocPrint(
@@ -6409,6 +6575,7 @@ pub const VoprPublicClusterFixture = struct {
             self.factories[index].split_runtime.replica_root_dir = self.roots[index];
             self.factories[index].merge_runtime.replica_root_dir = self.roots[index];
         }
+        self.bootstrap_phase = .local_resources_ready;
 
         var configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
             makeHostSimConfig(1, metadata_group_id, self.roots[0], self.catalogs[0]),
@@ -6426,13 +6593,25 @@ pub const VoprPublicClusterFixture = struct {
         };
         self.cluster = try MetadataHttpClusterSimulation.init(alloc, metadata_group_id, &configs, &deps);
         self.cluster_live = true;
+        self.cluster.setDataPlaneOwnership(data_plane_ownership);
+        for (0..node_count) |index| self.catalog_sources[index] = .{
+            .node = self.cluster.node(index),
+            .metadata_snapshot_mode = .leader_backed,
+        };
         // startAll publishes the harness's default in-process routes. Do that
         // before replacing them with concrete httpx listener targets so the
         // wire routes remain authoritative throughout bootstrap.
         try self.cluster.startAll();
         self.cluster.virtual_network.useSerializedDrains();
+        self.bootstrap_phase = .metadata_runtime_ready;
         self.raft_wire_executor = io_http_executor.IoHttpExecutor.init(alloc, sim.io(), .{
-            .keep_alive = true,
+            // The metadata harness drains one serialized Raft delivery at a
+            // time. Use a fresh real HTTP/1 connection for each frame so a
+            // scheduler-controlled keep-alive expiry cannot turn the next
+            // non-idempotent POST into an ambiguous stale-socket reuse. The
+            // production data-Raft composition separately exercises pooled
+            // async delivery and retry ownership.
+            .keep_alive = false,
             .connect_timeout_ms = 0,
             .read_timeout_ms = 0,
             .write_timeout_ms = 0,
@@ -6458,6 +6637,7 @@ pub const VoprPublicClusterFixture = struct {
                 self.raft_wire_targets[index].executor(),
             );
         }
+        self.bootstrap_phase = .raft_wire_ready;
         for (0..node_count) |index| {
             self.cluster.backendRuntime(index).setDbOpenConfigurator(self.modeled_configurators[index].iface());
             self.factories[index].split_runtime.backend_runtime = self.cluster.backendRuntime(index);
@@ -6465,6 +6645,7 @@ pub const VoprPublicClusterFixture = struct {
         }
         self.metadata_leader_index = try finishBootstrappedMetadataCluster(&self.cluster, 48, true);
         self.cluster_started = true;
+        self.bootstrap_phase = .metadata_quorum_ready;
 
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
@@ -6482,6 +6663,12 @@ pub const VoprPublicClusterFixture = struct {
                 .end_key = null,
             },
         };
+        if (data_plane_ownership == .external) {
+            try self.initializeExternalProjectedTables(&workflow, &ranges);
+            self.bootstrap_phase = .projected_tables_ready;
+            return;
+        }
+
         try createActiveTableRanges(&workflow, &self.cluster, self.metadata_leader_index, .{
             .table_id = table_id,
             .name = "docs",
@@ -6592,6 +6779,7 @@ pub const VoprPublicClusterFixture = struct {
             api_tables.default_full_text_index_name,
             192,
         );
+        self.bootstrap_phase = .hosted_data_ready;
 
         const deterministic_http_config: io_http_executor.IoHttpExecutorConfig = .{
             .keep_alive = true,
@@ -6639,7 +6827,167 @@ pub const VoprPublicClusterFixture = struct {
         self.stack_live = true;
         self.client = api_http_client.ApiHttpClient.init(alloc, self.client_http_executor.executor());
         for (0..node_count) |index| try self.cluster.node(index).runRound();
-        return self;
+        self.bootstrap_phase = .public_stack_ready;
+    }
+
+    pub fn bootstrapPhaseOrdinal(self: *const VoprPublicClusterFixture) u8 {
+        return @intFromEnum(self.bootstrap_phase);
+    }
+
+    pub fn externalCatalogSource(
+        self: *VoprPublicClusterFixture,
+        index: usize,
+    ) !api_table_catalog.CatalogSource {
+        if (index >= node_count) return error.InvalidNodeIndex;
+        return self.catalog_sources[index].iface();
+    }
+
+    pub fn replaceExternalTransitionOps(
+        self: *VoprPublicClusterFixture,
+        index: usize,
+        ops: raft_shard_ops.ShardOperationAdapter,
+    ) !raft_shard_ops.OwnedShardOperationAdapter.Registration {
+        if (index >= node_count) return error.InvalidNodeIndex;
+        return try self.cluster.node(index).replaceTransitionOps(ops);
+    }
+
+    /// Admit a structural transition into the metadata quorum while real,
+    /// externally owned DataServers execute the data-plane commands. Keeping
+    /// this operation on the deployment-shaped fixture avoids teaching a
+    /// generic VOPR scenario about metadata's internal control-loop types.
+    pub fn requestExternalDataSplit(
+        self: *VoprPublicClusterFixture,
+        transition_id: u64,
+        source_group_id: u64,
+        destination_group_id: u64,
+        split_key: []const u8,
+    ) !void {
+        for (0..128) |round| {
+            const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse {
+                // Synchronous deterministic stepping can leave every healthy
+                // replica in a lock-step candidacy. A campaign is a real Raft
+                // input (not a fabricated leader response) and supplies the
+                // same symmetry break that production election jitter does.
+                if (round % 8 == 7)
+                    try self.cluster.node((round / 8) % node_count).campaignMetadataGroup();
+                try self.cluster.stepAll();
+                continue;
+            };
+            var workflow = metadata_table_workflow.TableWorkflow.init(self.alloc);
+            defer workflow.deinit();
+            const summary = workflow.requestSplit(&self.cluster.node(leader_index), .{
+                .transition_id = transition_id,
+                .table_id = table_id,
+                .source_group_id = source_group_id,
+                .destination_group_id = destination_group_id,
+                .split_key = split_key,
+            }) catch |err| switch (err) {
+                error.NotLeader => {
+                    if (round % 8 == 7)
+                        try self.cluster.node((round / 8) % node_count).campaignMetadataGroup();
+                    try self.cluster.stepAll();
+                    continue;
+                },
+                else => return err,
+            };
+            if (summary.split_admissions != 1)
+                return error.ExternalDataSplitAdmissionMismatch;
+            return;
+        }
+        return error.ExternalDataSplitAdmissionTimeout;
+    }
+
+    pub fn externalDataSplitFinalized(
+        self: *VoprPublicClusterFixture,
+        transition_id: u64,
+    ) !bool {
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return false;
+        const observation = try self.cluster.node(leader_index).observeSplitTransition(transition_id) orelse
+            return false;
+        return observation.status.phase == .finalized;
+    }
+
+    /// Publish the finalized transition marker, then atomically replace the
+    /// old range with its two post-split ranges and retire the marker. These
+    /// are deliberately separate reconcile commits: readers must never see
+    /// unfenced topology before the terminal transition is durable.
+    pub fn retireExternalDataSplit(
+        self: *VoprPublicClusterFixture,
+        transition_id: u64,
+    ) !void {
+        if (!try self.externalDataSplitFinalized(transition_id))
+            return error.ExternalDataSplitNotFinalized;
+        const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
+            return error.MetadataLeaderUnavailable;
+        var workflow = metadata_table_workflow.TableWorkflow.init(self.alloc);
+        defer workflow.deinit();
+        try workflow.bootstrapDesiredFromCommitted(&self.cluster.node(leader_index));
+
+        const terminal = try self.cluster.node(leader_index).reconcileOnceEnsuringLease(workflow.controlLoop());
+        if (terminal.split_upserts != 1 or terminal.split_removals != 0 or
+            terminal.range_upserts != 0 or terminal.range_removals != 0)
+            return error.ExternalDataSplitTerminalPublicationMismatch;
+        try self.cluster.stepAll();
+
+        const removal = try self.cluster.node(leader_index).reconcileOnceEnsuringLease(workflow.controlLoop());
+        if (removal.split_removals != 1 or removal.range_upserts != 2)
+            return error.ExternalDataSplitTopologyPublicationMismatch;
+        try self.cluster.stepAll();
+    }
+
+    fn initializeExternalProjectedTables(
+        self: *VoprPublicClusterFixture,
+        workflow: *metadata_table_workflow.TableWorkflow,
+        ranges: []const metadata_table_manager.RangeRecord,
+    ) !void {
+        const docs_summary = try workflow.createTableWithRanges(&self.cluster.node(self.metadata_leader_index), .{
+            .table_id = table_id,
+            .name = "docs",
+            .description = "full cluster VOPR documents",
+            .indexes_json = graph_indexes_json,
+            .desired_replica_count = 2,
+            .min_ranges = 1,
+        }, ranges);
+        if (docs_summary.placement_upserts != ranges.len * 2)
+            return error.ExternalDataPlanePlacementCountMismatch;
+        _ = try waitForFirstProjectedRange(
+            &self.cluster,
+            self.metadata_leader_index,
+            ranges.len,
+            0,
+            false,
+            192,
+        );
+        if (!try waitForProjectedTablePresenceOnAllNodes(&self.cluster, "docs", 192))
+            return error.ExternalDataPlaneProjectionTimeout;
+
+        const tenant_ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = tenant_data_group_id,
+            .table_id = tenant_table_id,
+            .start_key = "tenant:a",
+            .end_key = null,
+        }};
+        const tenant_summary = try workflow.createTableWithRanges(&self.cluster.node(self.metadata_leader_index), .{
+            .table_id = tenant_table_id,
+            .name = "tenant_b_docs",
+            .description = "full cluster VOPR tenant-isolation documents",
+            .indexes_json = api_tables.default_indexes_json,
+            .desired_replica_count = 2,
+            .min_ranges = 1,
+        }, &tenant_ranges);
+        if (tenant_summary.placement_upserts != 2)
+            return error.ExternalDataPlanePlacementCountMismatch;
+        _ = try waitForFirstProjectedRange(
+            &self.cluster,
+            self.metadata_leader_index,
+            ranges.len + tenant_ranges.len,
+            0,
+            false,
+            192,
+        );
+        if (!try waitForProjectedTablePresenceOnAllNodes(&self.cluster, "tenant_b_docs", 192))
+            return error.ExternalDataPlaneProjectionTimeout;
     }
 
     pub fn start(self: *VoprPublicClusterFixture, mode: FaultMode) !void {
@@ -6685,6 +7033,46 @@ pub const VoprPublicClusterFixture = struct {
         _ = self.sim.io().async(runTenantReader, .{self});
         _ = self.sim.io().async(runGraphReader, .{self});
         _ = self.sim.io().async(shutdownWhenComplete, .{self});
+    }
+
+    /// Retire the hosted public/data rig while preserving the live metadata
+    /// quorum, its concrete HTTP/Raft wire, projected catalog, node-local
+    /// resource owners, and roots. A deployment-shaped VOPR composition uses
+    /// this handoff before installing production DataServers so there can be
+    /// only one owner for each projected data replica identity.
+    pub fn detachHostedDataPlane(self: *VoprPublicClusterFixture) !void {
+        if (!self.cluster_live or !self.cluster_started) return error.MetadataClusterUnavailable;
+        if (!self.stack_live) return error.HostedDataPlaneAlreadyDetached;
+
+        deinitPublicApiStack(node_count, &self.listeners, &self.servers, &self.write_sources);
+        self.stack_live = false;
+        for (self.api_base_uris[0..self.uri_count]) |uri| self.alloc.free(uri);
+        self.uri_count = 0;
+        if (self.client_executor_live) {
+            self.client_http_executor.deinit();
+            self.client_executor_live = false;
+        }
+        if (self.forward_executor_live) {
+            self.forward_http_executor.deinit();
+            self.forward_executor_live = false;
+        }
+
+        self.cluster.setDataPlaneOwnership(.external);
+        for (0..64) |_| {
+            try self.cluster.stepAll();
+            var retired = true;
+            for (0..node_count) |index| {
+                if (self.cluster.node(index).status(data_group_id) != .absent or
+                    self.cluster.node(index).status(graph_data_group_id) != .absent or
+                    self.cluster.node(index).status(tenant_data_group_id) != .absent)
+                {
+                    retired = false;
+                    break;
+                }
+            }
+            if (retired) return;
+        }
+        return error.HostedDataPlaneRetirementTimeout;
     }
 
     fn runWriter(self: *VoprPublicClusterFixture) void {
@@ -7237,6 +7625,24 @@ pub const VoprPublicClusterFixture = struct {
         for (self.catalogs[0..self.catalog_count]) |catalog| self.alloc.free(catalog);
         self.tmp.cleanup();
         self.alloc.destroy(self);
+    }
+
+    /// Publish every long-lived owner stop before a shared VoprIo cleanup
+    /// suffix begins. Joining and destruction remain in `deinit`, after the
+    /// scheduler has allowed listener and connection fibers to unwind.
+    pub fn beginTeardown(self: *VoprPublicClusterFixture) void {
+        if (self.teardown_started) return;
+        self.teardown_started = true;
+        if (self.client_executor_live) self.client_http_executor.beginShutdown();
+        if (self.forward_executor_live) self.forward_http_executor.beginShutdown();
+        if (self.stack_live) for (self.listeners[0..self.uri_count]) |*listener|
+            listener.requestStop();
+        for (self.raft_wire_runtimes[0..self.raft_wire_runtime_count]) |*runtime|
+            runtime.requestStop();
+        if (self.cluster_started) {
+            self.cluster.stopAll();
+            self.cluster_started = false;
+        }
     }
 
     fn stopRaftWire(self: *VoprPublicClusterFixture) void {

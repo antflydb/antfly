@@ -8,12 +8,13 @@
 const std = @import("std");
 const vopr = @import("vopr");
 const metadata_sim = @import("../metadata/sim_harness.zig");
+const production_cluster = @import("production_cluster.zig");
 const serverless_workflow = @import("serverless_workflow.zig");
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 9;
+    pub const version: u32 = 12;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -64,10 +65,16 @@ pub const Scenario = struct {
         partial_http_write,
         serverless_stale_generation,
         resource_pressure,
+        production_data_plane_baseline,
+        production_data_plane,
+
+        fn isProduction(self: Mode) bool {
+            return self == .production_data_plane_baseline or self == .production_data_plane;
+        }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -95,6 +102,8 @@ pub const Scenario = struct {
         vopr.id.stable(name, "partial-http-write"),
         vopr.id.stable(name, "serverless-stale-generation"),
         vopr.id.stable(name, "resource-pressure"),
+        vopr.id.stable(name, "production-data-plane-baseline"),
+        vopr.id.stable(name, "production-data-plane"),
     };
     const mode_names = [_][]const u8{
         name ++ ".clean",
@@ -106,6 +115,8 @@ pub const Scenario = struct {
         name ++ ".partial-http-write",
         name ++ ".serverless-stale-generation",
         name ++ ".resource-pressure",
+        name ++ ".production-data-plane-baseline",
+        name ++ ".production-data-plane",
     };
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
@@ -170,16 +181,45 @@ pub const Scenario = struct {
         .links = &deployment_links,
     };
 
+    const ClusterHealth = struct {
+        hosts: usize = 0,
+        requests_ok: bool = false,
+        topology_ok: bool = false,
+        cleanup_ok: bool = false,
+        raft_wire_requests: u64 = 0,
+        node_resource_managers: usize = 0,
+        resource_denial_ok: bool = false,
+        resource_recovery_ok: bool = false,
+        resource_pressure_observed: bool = false,
+        resource_denial_error_code: u64 = 0,
+        graph_query_ok: bool = false,
+        graph_inflight_restart_observed: bool = false,
+        graph_inflight_restart_recovered: bool = false,
+        graph_topology_churn_observed: bool = false,
+        graph_topology_churn_finalized: bool = false,
+        graph_topology_churn_error_code: u64 = 0,
+        graph_topology_partial_rejected_sound: bool = false,
+        graph_transport_failure_injected: bool = false,
+        graph_transport_failure_observed: bool = false,
+        graph_transport_failure_error_code: u64 = 0,
+        graph_partial_rejected_sound: bool = false,
+    };
+
     const State = struct {
         owner_alloc: std.mem.Allocator,
         fixture_allocator: FixtureAllocator,
         sim: vopr.vopr_io.VoprIo,
         public_cluster: ?*metadata_sim.VoprPublicClusterFixture = null,
+        production_cluster: ?*production_cluster.Fixture = null,
         deployment: ?vopr.deployment.Composer = null,
         serverless: *serverless_workflow.Scenario.Fixture,
+        initialization_future: ?std.Io.Future(void) = null,
+        serverless_future: ?std.Io.Future(void) = null,
+        completion_future: ?std.Io.Future(void) = null,
         mode: ?Mode = null,
         initialization_done: bool = false,
         initialization_failed: bool = false,
+        initialization_error_code: u64 = 0,
         serverless_done: bool = false,
         serverless_sound: bool = false,
         serverless_public_sound: bool = false,
@@ -187,6 +227,7 @@ pub const Scenario = struct {
         shared_io_sound: bool = false,
         deployment_sound: bool = false,
         complete: bool = false,
+        tearing_down: bool = false,
 
         fn init(alloc: std.mem.Allocator) !*State {
             const self = try alloc.create(State);
@@ -211,9 +252,13 @@ pub const Scenario = struct {
             errdefer self.serverless.deinit();
             self.mode = null;
             self.public_cluster = null;
+            self.production_cluster = null;
             self.deployment = null;
+            self.serverless_future = null;
+            self.completion_future = null;
             self.initialization_done = false;
             self.initialization_failed = false;
+            self.initialization_error_code = 0;
             self.serverless_done = false;
             self.serverless_sound = false;
             self.serverless_public_sound = false;
@@ -221,14 +266,38 @@ pub const Scenario = struct {
             self.shared_io_sound = false;
             self.deployment_sound = false;
             self.complete = false;
-            _ = self.sim.io().async(initializeAndRun, .{self});
+            self.tearing_down = false;
+            self.initialization_future = self.sim.io().async(initializeAndRun, .{self});
             return self;
         }
 
         fn deinit(self: *State) void {
+            self.tearing_down = true;
+            if (self.production_cluster) |fixture| fixture.beginTeardown();
+            if (self.public_cluster) |fixture| fixture.beginTeardown();
+            _ = self.sim.cancelAndDrainTasksForTeardown(
+                self.fixture_allocator.allocator(),
+                100_000,
+            ) catch |err| std.debug.panic(
+                "full-cluster VOPR teardown could not drain canceled tasks: {s}",
+                .{@errorName(err)},
+            );
+            if (self.completion_future) |*future| {
+                future.cancel(self.sim.io());
+                self.completion_future = null;
+            }
+            if (self.serverless_future) |*future| {
+                future.cancel(self.sim.io());
+                self.serverless_future = null;
+            }
+            if (self.initialization_future) |*future| {
+                future.cancel(self.sim.io());
+                self.initialization_future = null;
+            }
             if (self.deployment) |*deployment| deployment.deinit();
             self.serverless.deinit();
             if (self.public_cluster) |fixture| fixture.deinit();
+            if (self.production_cluster) |fixture| fixture.deinit();
             self.sim.deinit();
             std.debug.assert(self.fixture_allocator.deinit() == .ok);
             self.owner_alloc.destroy(self);
@@ -238,6 +307,47 @@ pub const Scenario = struct {
             self.mode = mode;
         }
 
+        fn clusterHealth(self: *State) ?ClusterHealth {
+            if (self.production_cluster) |fixture| {
+                const snapshot = fixture.healthSnapshot();
+                return .{
+                    .hosts = snapshot.hosts,
+                    .requests_ok = snapshot.requests_ok,
+                    .topology_ok = snapshot.topology_ok,
+                    .cleanup_ok = snapshot.cleanup_ok,
+                    .raft_wire_requests = snapshot.raft_wire_requests,
+                    .node_resource_managers = snapshot.node_resource_managers,
+                };
+            }
+            if (self.public_cluster) |fixture| {
+                const snapshot = fixture.healthSnapshot();
+                return .{
+                    .hosts = snapshot.hosts,
+                    .requests_ok = snapshot.requests_ok,
+                    .topology_ok = snapshot.topology_ok,
+                    .cleanup_ok = snapshot.cleanup_ok,
+                    .raft_wire_requests = snapshot.raft_wire_requests,
+                    .node_resource_managers = snapshot.node_resource_managers,
+                    .resource_denial_ok = snapshot.resource_denial_ok,
+                    .resource_recovery_ok = snapshot.resource_recovery_ok,
+                    .resource_pressure_observed = snapshot.resource_pressure_observed,
+                    .resource_denial_error_code = snapshot.resource_denial_error_code,
+                    .graph_query_ok = snapshot.graph_query_ok,
+                    .graph_inflight_restart_observed = snapshot.graph_inflight_restart_observed,
+                    .graph_inflight_restart_recovered = snapshot.graph_inflight_restart_recovered,
+                    .graph_topology_churn_observed = snapshot.graph_topology_churn_observed,
+                    .graph_topology_churn_finalized = snapshot.graph_topology_churn_finalized,
+                    .graph_topology_churn_error_code = snapshot.graph_topology_churn_error_code,
+                    .graph_topology_partial_rejected_sound = snapshot.graph_topology_partial_rejected_sound,
+                    .graph_transport_failure_injected = snapshot.graph_transport_failure_injected,
+                    .graph_transport_failure_observed = snapshot.graph_transport_failure_observed,
+                    .graph_transport_failure_error_code = snapshot.graph_transport_failure_error_code,
+                    .graph_partial_rejected_sound = snapshot.graph_partial_rejected_sound,
+                };
+            }
+            return null;
+        }
+
         fn initializeAndRun(self: *State) void {
             const mode = self.mode orelse {
                 self.initialization_failed = true;
@@ -245,46 +355,88 @@ pub const Scenario = struct {
                 self.complete = true;
                 return;
             };
-            const fixture = metadata_sim.VoprPublicClusterFixture.init(
-                self.fixture_allocator.allocator(),
-                &self.sim,
-            ) catch {
-                self.initialization_failed = true;
-                self.initialization_done = true;
-                self.complete = true;
-                return;
-            };
-            self.public_cluster = fixture;
+            var public_fixture: ?*metadata_sim.VoprPublicClusterFixture = null;
+            if (mode.isProduction()) {
+                self.production_cluster = production_cluster.Fixture.create(
+                    self.fixture_allocator.allocator(),
+                    &self.sim,
+                ) catch |err| {
+                    std.log.err("production data-plane VOPR fixture creation failed: {s}", .{@errorName(err)});
+                    self.initialization_failed = true;
+                    self.initialization_error_code = @intFromError(err);
+                    self.initialization_done = true;
+                    self.complete = true;
+                    return;
+                };
+                self.production_cluster.?.setActiveSplitEnabled(mode == .production_data_plane);
+                self.production_cluster.?.bootstrap() catch |err| {
+                    const teardown_cancelled = blk: {
+                        std.Io.checkCancel(self.sim.io()) catch |cancel_err|
+                            break :blk cancel_err == error.Canceled;
+                        break :blk false;
+                    };
+                    if (err == error.Canceled or teardown_cancelled or self.tearing_down)
+                        std.log.debug("production data-plane VOPR bootstrap canceled by bounded history", .{})
+                    else {
+                        std.log.err("production data-plane VOPR bootstrap failed: {s}", .{@errorName(err)});
+                        if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+                    }
+                    self.initialization_failed = true;
+                    self.initialization_error_code = @intFromError(err);
+                    self.initialization_done = true;
+                    self.complete = true;
+                    return;
+                };
+            } else {
+                public_fixture = metadata_sim.VoprPublicClusterFixture.init(
+                    self.fixture_allocator.allocator(),
+                    &self.sim,
+                ) catch |err| {
+                    self.initialization_failed = true;
+                    self.initialization_error_code = @intFromError(err);
+                    self.initialization_done = true;
+                    self.complete = true;
+                    return;
+                };
+                self.public_cluster = public_fixture;
+            }
             self.deployment = vopr.deployment.Composer.init(
                 self.fixture_allocator.allocator(),
                 deployment_manifest,
-            ) catch {
+            ) catch |err| {
                 self.initialization_failed = true;
+                self.initialization_error_code = @intFromError(err);
                 self.initialization_done = true;
                 self.complete = true;
                 return;
             };
-            self.registerDeployment(mode, fixture) catch {
+            self.registerDeployment(mode, public_fixture) catch |err| {
                 self.initialization_failed = true;
+                self.initialization_error_code = @intFromError(err);
                 self.initialization_done = true;
                 self.complete = true;
                 return;
             };
-            self.serverless.startPublicCatalog() catch {
+            self.serverless.startPublicCatalog() catch |err| {
                 self.initialization_failed = true;
+                self.initialization_error_code = @intFromError(err);
                 self.initialization_done = true;
                 self.complete = true;
                 return;
             };
-            self.shared_io_sound = self.serverless.sim == &self.sim and fixture.sim == &self.sim;
-            fixture.start(mode.publicFault()) catch {
-                self.initialization_failed = true;
-                self.initialization_done = true;
-                self.complete = true;
-                return;
-            };
-            _ = self.sim.io().async(runServerless, .{self});
-            _ = self.sim.io().async(waitForCompletion, .{self});
+            self.shared_io_sound = self.serverless.sim == &self.sim and
+                if (self.production_cluster) |fixture| fixture.sim == &self.sim else public_fixture.?.sim == &self.sim;
+            if (self.production_cluster == null) {
+                public_fixture.?.start(mode.publicFault()) catch |err| {
+                    self.initialization_failed = true;
+                    self.initialization_error_code = @intFromError(err);
+                    self.initialization_done = true;
+                    self.complete = true;
+                    return;
+                };
+            }
+            self.serverless_future = self.sim.io().async(runServerless, .{self});
+            self.completion_future = self.sim.io().async(waitForCompletion, .{self});
             self.initialization_done = true;
         }
 
@@ -292,7 +444,10 @@ pub const Scenario = struct {
             defer {
                 self.serverless.stopPublicCatalog();
                 self.serverless_done = true;
-                if (self.public_cluster) |fixture| fixture.allowGraphFaultWorkload();
+                if (self.production_cluster) |fixture|
+                    fixture.start()
+                else if (self.public_cluster) |fixture|
+                    fixture.allowGraphFaultWorkload();
             }
             const serverless_mode = self.mode.?.serverlessMode();
             self.serverless.runMode(serverless_mode) catch return;
@@ -305,8 +460,14 @@ pub const Scenario = struct {
         }
 
         fn waitForCompletion(self: *State) void {
-            while (!self.public_cluster.?.complete or !self.serverless_done) {
-                self.sim.io().sleep(.fromNanoseconds(1), .awake) catch return;
+            while (!(if (self.production_cluster) |fixture| fixture.complete else self.public_cluster.?.complete) or
+                !self.serverless_done)
+            {
+                // Poll at the same logical cadence as the production Raft
+                // driver. A 1ns waiter becomes the globally earliest timer and
+                // can force hundreds of millions of recorded time choices
+                // before a 1ms service ticker is eligible.
+                self.sim.io().sleep(.fromMilliseconds(1), .awake) catch return;
             }
             self.finishDeployment() catch {
                 self.complete = true;
@@ -315,7 +476,11 @@ pub const Scenario = struct {
             self.complete = true;
         }
 
-        fn registerDeployment(self: *State, mode: Mode, fixture: *metadata_sim.VoprPublicClusterFixture) !void {
+        fn registerDeployment(
+            self: *State,
+            mode: Mode,
+            fixture: ?*metadata_sim.VoprPublicClusterFixture,
+        ) !void {
             const deployment = &self.deployment.?;
             for (deployment_node_ids) |node_id| try deployment.startNode(node_id);
             for (deployment_instances[0..3]) |instance| try deployment.publishReady(instance.id);
@@ -324,7 +489,7 @@ pub const Scenario = struct {
             switch (mode) {
                 .clean => {},
                 .metadata_partition => {
-                    const leader = fixture.metadata_leader_index;
+                    const leader = fixture.?.metadata_leader_index;
                     for (deployment_links, 0..) |link, index| {
                         if (link.from_node != deployment_node_ids[leader] and link.to_node != deployment_node_ids[leader]) continue;
                         try deployment.activateFault(vopr.id.derive("full-cluster.partition", link.id, index), .network, link.id);
@@ -333,12 +498,12 @@ pub const Scenario = struct {
                 .node_restart => try deployment.activateFault(
                     vopr.id.stable(name, "fault.node-restart"),
                     .node_pause,
-                    process_domains[fixture.client_index],
+                    process_domains[fixture.?.client_index],
                 ),
                 .graph_inflight_restart => try deployment.activateFault(
                     vopr.id.stable(name, "fault.graph-inflight-restart"),
                     .node_pause,
-                    process_domains[fixture.graph_restart_node_index],
+                    process_domains[fixture.?.graph_restart_node_index],
                 ),
                 // A range merge is an operator/workload transition, not an
                 // infrastructure fault domain. Its durable metadata and data
@@ -369,6 +534,7 @@ pub const Scenario = struct {
                     .resource,
                     domain_id,
                 ),
+                .production_data_plane_baseline, .production_data_plane => {},
             }
         }
 
@@ -377,7 +543,11 @@ pub const Scenario = struct {
             deployment.healAll();
             _ = try deployment.requestQuietSuffix();
             for (deployment_node_ids[0..3], 0..) |node_id, index| {
-                try deployment.observeResources(node_id, try self.public_cluster.?.deploymentResourceUsage(index));
+                const usage = if (self.production_cluster) |fixture|
+                    try fixture.deploymentResourceUsage(index)
+                else
+                    try self.public_cluster.?.deploymentResourceUsage(index);
+                try deployment.observeResources(node_id, usage);
                 try deployment.acknowledgeNodeQuiet(node_id);
             }
             try deployment.observeResources(deployment_node_ids[3], .{});
@@ -427,7 +597,7 @@ pub const Scenario = struct {
         } else {
             try state.sim.scheduler().executeReady(selected.id, events, allocator);
         }
-        const requests_ok = if (state.public_cluster) |fixture| fixture.healthSnapshot().requests_ok else false;
+        const requests_ok = if (state.clusterHealth()) |snapshot| snapshot.requests_ok else false;
         try events.emitNamed(allocator, .domain, selected.name, @intFromBool(requests_ok));
         return .applied();
     }
@@ -435,16 +605,56 @@ pub const Scenario = struct {
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         const state = world.state;
         const fixture = state.public_cluster;
-        const cluster = if (fixture) |public_cluster| public_cluster.healthSnapshot() else null;
+        const production = state.production_cluster;
+        const production_progress = if (production) |production_fixture| production_fixture.primaryGroupProgress() else null;
+        const cluster = state.clusterHealth();
         const resources = state.sim.resourceSnapshot();
         try builder.addNamed(allocator, name ++ ".mode", if (state.mode) |mode| @as(i64, @intFromEnum(mode)) + 1 else 0);
+        try builder.addNamed(allocator, name ++ ".production-phase", if (production) |production_fixture| production_fixture.phaseOrdinal() else 0);
+        try builder.addNamed(allocator, name ++ ".production-metadata-phase", if (production) |production_fixture| production_fixture.metadataBootstrapPhaseOrdinal() else 0);
+        try builder.addNamed(allocator, name ++ ".production-primary-commit", if (production_progress) |progress| @intCast(progress.commit_index) else 0);
+        try builder.addNamed(allocator, name ++ ".production-primary-applied", if (production_progress) |progress| @intCast(progress.applied_index) else 0);
+        try builder.addNamed(allocator, name ++ ".production-primary-last", if (production_progress) |progress| @intCast(progress.last_index) else 0);
+        try builder.addNamed(allocator, name ++ ".production-primary-leaders", if (production_progress) |progress| @intCast(progress.leaders) else 0);
+        try builder.addNamed(allocator, name ++ ".production-primary-peer-routes", if (production_progress) |progress| @intCast(progress.peer_routes) else 0);
+        try builder.addNamed(allocator, name ++ ".production-primary-frames-enqueued", if (production_progress) |progress| @intCast(progress.frames_enqueued) else 0);
+        try builder.addNamed(allocator, name ++ ".production-primary-frames-pending", if (production_progress) |progress| @intCast(progress.frames_pending) else 0);
+        try builder.addNamed(allocator, name ++ ".production-primary-frames-failed", if (production_progress) |progress| @intCast(progress.frames_failed) else 0);
+        try builder.addNamed(allocator, name ++ ".production-primary-frames-sent", if (production_progress) |progress| @intCast(progress.frames_sent) else 0);
+        try builder.addNamed(allocator, name ++ ".production-driver-rounds", if (production) |production_fixture| @intCast(production_fixture.driver_rounds) else 0);
+        try builder.addNamed(allocator, name ++ ".production-driver-done", @intFromBool(if (production) |production_fixture| production_fixture.driver_done else false));
+        try builder.addNamed(allocator, name ++ ".production-driver-error", if (production) |production_fixture| if (production_fixture.driver_failure) |err| @intFromError(err) else 0 else 0);
+        try builder.addNamed(allocator, name ++ ".production-left-write-status", if (production) |production_fixture| production_fixture.write_statuses[0] else 0);
+        try builder.addNamed(allocator, name ++ ".production-right-write-status", if (production) |production_fixture| production_fixture.write_statuses[1] else 0);
+        try builder.addNamed(allocator, name ++ ".production-tenant-write-status", if (production) |production_fixture| production_fixture.write_statuses[2] else 0);
+        // Observation values are signed, but digests are opaque 64-bit
+        // identities. Preserve every bit instead of trapping on hashes whose
+        // high bit is set.
+        try builder.addNamed(allocator, name ++ ".production-left-write-body", if (production) |production_fixture| @bitCast(production_fixture.write_body_digests[0]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-right-write-body", if (production) |production_fixture| @bitCast(production_fixture.write_body_digests[1]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-tenant-write-body", if (production) |production_fixture| @bitCast(production_fixture.write_body_digests[2]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-left-read-status", if (production) |production_fixture| production_fixture.read_statuses[0] else 0);
+        try builder.addNamed(allocator, name ++ ".production-right-read-status", if (production) |production_fixture| production_fixture.read_statuses[1] else 0);
+        try builder.addNamed(allocator, name ++ ".production-tenant-read-status", if (production) |production_fixture| production_fixture.read_statuses[2] else 0);
+        try builder.addNamed(allocator, name ++ ".production-post-split-read-status", if (production) |production_fixture| production_fixture.read_statuses[3] else 0);
+        try builder.addNamed(allocator, name ++ ".production-left-read-body", if (production) |production_fixture| @bitCast(production_fixture.read_body_digests[0]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-right-read-body", if (production) |production_fixture| @bitCast(production_fixture.read_body_digests[1]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-tenant-read-body", if (production) |production_fixture| @bitCast(production_fixture.read_body_digests[2]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-post-split-read-body", if (production) |production_fixture| @bitCast(production_fixture.read_body_digests[3]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-left-read-attempts", if (production) |production_fixture| production_fixture.read_attempts[0] else 0);
+        try builder.addNamed(allocator, name ++ ".production-right-read-attempts", if (production) |production_fixture| production_fixture.read_attempts[1] else 0);
+        try builder.addNamed(allocator, name ++ ".production-tenant-read-attempts", if (production) |production_fixture| production_fixture.read_attempts[2] else 0);
+        try builder.addNamed(allocator, name ++ ".production-post-split-read-attempts", if (production) |production_fixture| production_fixture.read_attempts[3] else 0);
+        try builder.addNamed(allocator, name ++ ".production-split-finalized", @intFromBool(if (production) |production_fixture| production_fixture.split_finalized else false));
+        try builder.addNamed(allocator, name ++ ".production-split-published", @intFromBool(if (production) |production_fixture| production_fixture.split_published else false));
+        try builder.addNamed(allocator, name ++ ".production-split-round-trip", @intFromBool(if (production) |production_fixture| production_fixture.split_sound else false));
         try builder.addNamed(allocator, name ++ ".data-hosts", if (cluster) |snapshot| @intCast(snapshot.hosts) else 0);
         try builder.addNamed(allocator, name ++ ".public-requests-ok", @intFromBool(if (cluster) |snapshot| snapshot.requests_ok else false));
-        try builder.addNamed(allocator, name ++ ".write-ok", @intFromBool(if (fixture) |public_cluster| public_cluster.write_sound else false));
-        try builder.addNamed(allocator, name ++ ".read-ok", @intFromBool(if (fixture) |public_cluster| public_cluster.read_sound else false));
-        try builder.addNamed(allocator, name ++ ".tenant-write-ok", @intFromBool(if (fixture) |public_cluster| public_cluster.tenant_write_sound else false));
-        try builder.addNamed(allocator, name ++ ".tenant-read-ok", @intFromBool(if (fixture) |public_cluster| public_cluster.tenant_read_sound else false));
-        try builder.addNamed(allocator, name ++ ".table-isolation-ok", @intFromBool(if (fixture) |public_cluster| public_cluster.table_isolation_sound else false));
+        try builder.addNamed(allocator, name ++ ".write-ok", @intFromBool(if (production) |value| value.write_sound else if (fixture) |public_cluster| public_cluster.write_sound else false));
+        try builder.addNamed(allocator, name ++ ".read-ok", @intFromBool(if (production) |value| value.read_sound else if (fixture) |public_cluster| public_cluster.read_sound else false));
+        try builder.addNamed(allocator, name ++ ".tenant-write-ok", @intFromBool(if (production) |value| value.tenant_sound else if (fixture) |public_cluster| public_cluster.tenant_write_sound else false));
+        try builder.addNamed(allocator, name ++ ".tenant-read-ok", @intFromBool(if (production) |value| value.tenant_sound else if (fixture) |public_cluster| public_cluster.tenant_read_sound else false));
+        try builder.addNamed(allocator, name ++ ".table-isolation-ok", @intFromBool(if (production) |value| value.tenant_sound else if (fixture) |public_cluster| public_cluster.table_isolation_sound else false));
         try builder.addNamed(allocator, name ++ ".public-cross-range-graph-query", @intFromBool(if (cluster) |snapshot| snapshot.graph_query_ok else false));
         try builder.addNamed(allocator, name ++ ".graph-inflight-restart-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_inflight_restart_observed else false));
         try builder.addNamed(allocator, name ++ ".graph-inflight-restart-recovered", @intFromBool(if (cluster) |snapshot| snapshot.graph_inflight_restart_recovered else false));
@@ -456,8 +666,8 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".graph-transport-failure-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_transport_failure_observed else false));
         try builder.addNamed(allocator, name ++ ".graph-transport-failure-error", if (cluster) |snapshot| @intCast(snapshot.graph_transport_failure_error_code) else 0);
         try builder.addNamed(allocator, name ++ ".graph-partial-result-rejected", @intFromBool(if (cluster) |snapshot| snapshot.graph_partial_rejected_sound else false));
-        try builder.addNamed(allocator, name ++ ".request-errors", if (fixture) |public_cluster| @intCast(public_cluster.request_errors) else 0);
-        try builder.addNamed(allocator, name ++ ".last-request-error", if (fixture) |public_cluster| @intCast(public_cluster.last_request_error_code) else 0);
+        try builder.addNamed(allocator, name ++ ".request-errors", if (production) |value| @intFromBool(value.failure != null) else if (fixture) |public_cluster| @intCast(public_cluster.request_errors) else 0);
+        try builder.addNamed(allocator, name ++ ".last-request-error", if (production) |value| if (value.failure) |err| @intFromError(err) else 0 else if (fixture) |public_cluster| @intCast(public_cluster.last_request_error_code) else 0);
         try builder.addNamed(allocator, name ++ ".serverless-visible", @intFromBool(state.serverless_sound));
         try builder.addNamed(allocator, name ++ ".serverless-public-http-visible", @intFromBool(state.serverless_public_sound));
         try builder.addNamed(allocator, name ++ ".serverless-public-http-error", @intCast(state.serverless_public_error_code));
@@ -469,6 +679,7 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".resource-denial-error", if (cluster) |snapshot| @intCast(snapshot.resource_denial_error_code) else 0);
         try builder.addNamed(allocator, name ++ ".deployment-quiet", @intFromBool(state.deployment_sound));
         try builder.addNamed(allocator, name ++ ".initialization-failed", @intFromBool(state.initialization_failed));
+        try builder.addNamed(allocator, name ++ ".initialization-error", @intCast(state.initialization_error_code));
         try builder.addNamed(allocator, name ++ ".open-sockets", @intCast(resources.open_sockets));
         try builder.addNamed(allocator, name ++ ".active-tasks", @intCast(resources.active_tasks));
         try builder.addNamed(allocator, name ++ ".complete", @intFromBool(state.complete));
@@ -477,13 +688,16 @@ pub const Scenario = struct {
     pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
         const state = world.state;
         const fixture = state.public_cluster;
-        const cluster = if (fixture) |public_cluster| public_cluster.healthSnapshot() else null;
+        const production = state.production_cluster;
+        const cluster = state.clusterHealth();
+        const production_mode = state.mode != null and state.mode.?.isProduction();
         const resources = state.sim.resourceSnapshot();
         try sink.check(allocator, acknowledged_id, !state.complete or (cluster != null and cluster.?.requests_ok));
         try sink.check(allocator, quorum_id, !state.complete or (cluster != null and cluster.?.topology_ok));
         try sink.check(allocator, routing_id, !state.complete or (cluster != null and cluster.?.hosts == 2));
-        try sink.check(allocator, isolation_id, !state.complete or (fixture != null and fixture.?.table_isolation_sound));
-        try sink.check(allocator, graph_query_id, !state.complete or (cluster != null and cluster.?.graph_query_ok));
+        try sink.check(allocator, isolation_id, !state.complete or
+            (if (production) |value| value.tenant_sound else fixture != null and fixture.?.table_isolation_sound));
+        try sink.check(allocator, graph_query_id, !state.complete or production_mode or (cluster != null and cluster.?.graph_query_ok));
         try sink.check(allocator, graph_restart_id, !state.complete or state.mode.? != .graph_inflight_restart or
             (cluster != null and cluster.?.graph_inflight_restart_observed and cluster.?.graph_inflight_restart_recovered and
                 cluster.?.graph_query_ok));
@@ -512,10 +726,11 @@ pub const Scenario = struct {
     pub fn healthSnapshot(world: *World) vopr.health.Snapshot {
         const state = world.state;
         const fixture = state.public_cluster;
-        const cluster = if (fixture) |public_cluster| public_cluster.healthSnapshot() else null;
+        const production = state.production_cluster;
+        const cluster = state.clusterHealth();
         return state.sim.healthSnapshot(.{
             .progress_expected = state.mode != null,
-            .progress_units = @as(u64, @intFromBool(if (fixture) |public_cluster| public_cluster.write_finished else false)) +
+            .progress_units = @as(u64, @intFromBool(if (production) |value| value.workload_done else if (fixture) |public_cluster| public_cluster.write_finished else false)) +
                 @as(u64, @intFromBool(if (fixture) |public_cluster| public_cluster.read_finished else false)) +
                 @as(u64, @intFromBool(if (fixture) |public_cluster| public_cluster.tenant_write_finished else false)) +
                 @as(u64, @intFromBool(if (fixture) |public_cluster| public_cluster.tenant_read_finished else false)) +
@@ -528,9 +743,100 @@ pub const Scenario = struct {
     }
 
     pub fn done(world: *World) bool {
-        return world.state.complete and world.state.sim.scheduler().quiescent();
+        // Initialization failures are terminal scenario outcomes. Their
+        // service owners are deliberately stopped and drained by State.deinit;
+        // waiting for pre-teardown quiescence here misclassifies a diagnosed
+        // bootstrap error as a harness deadlock.
+        return world.state.complete and
+            (world.state.initialization_failed or world.state.sim.scheduler().quiescent());
     }
 };
+
+const CompletionExpectation = enum {
+    complete,
+    bounded_lifecycle,
+};
+
+fn runExactMode(
+    history_alloc: std.mem.Allocator,
+    mode_id: vopr.id.StableId,
+    mode_ordinal: usize,
+    transition_budget: usize,
+    completion_expectation: CompletionExpectation,
+) !void {
+    const backend_ids = vopr.vopr_io.artifactBackendIds();
+    const active_split_mode = mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 1];
+    const production_mode = active_split_mode or
+        mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 2];
+    var fair_choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4655_4c4c + mode_ordinal);
+    var cooperative_choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{mode_id}, 0x4655_4c4c + mode_ordinal);
+    const choice_source = if (production_mode)
+        cooperative_choices.source()
+    else
+        fair_choices.source();
+    var recorded = try vopr.runner.run(Scenario, history_alloc, choice_source, .{
+        .system = "antfly",
+        .transition_budget = transition_budget,
+        .resource_budget = if (production_mode) 256 else 96,
+        .backend_ids = &backend_ids,
+        .source_revision = if (production_mode)
+            (if (mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 1]) "full-cluster-vopr-v12" else "full-cluster-vopr-v11")
+        else
+            "full-cluster-vopr-v9",
+        .target = "native",
+        .optimize = @tagName(@import("builtin").mode),
+    });
+    defer recorded.deinit();
+    if (completion_expectation == .complete and recorded.summary.?.property_failures != 0) {
+        for (recorded.failures.items) |failure| std.debug.print(
+            "full cluster mode={s} failure={s} class={s}\n",
+            .{ Scenario.mode_names[mode_ordinal], failure.identity, @tagName(failure.class) },
+        );
+        if (recorded.observations.items.len > 0) for (recorded.observations.items[recorded.observations.items.len - 1].features) |feature| {
+            std.debug.print("  {s}={d}\n", .{ feature.name, feature.value });
+            if (std.mem.eql(u8, feature.name, Scenario.name ++ ".last-request-error") and feature.value != 0) {
+                const request_error: anyerror = @errorFromInt(@as(u16, @intCast(feature.value)));
+                std.debug.print("  request-error-name={s}\n", .{@errorName(request_error)});
+            }
+            if (std.mem.eql(u8, feature.name, Scenario.name ++ ".serverless-public-http-error") and feature.value != 0) {
+                const request_error: anyerror = @errorFromInt(@as(u16, @intCast(feature.value)));
+                std.debug.print("  serverless-public-http-error-name={s}\n", .{@errorName(request_error)});
+            }
+        };
+    }
+    switch (completion_expectation) {
+        .complete => try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures),
+        .bounded_lifecycle => {
+            // This is deliberately not a completion proof. It retains a fast,
+            // exact-replayed regression for cancellation and owner unwinding
+            // while the production-sized composed witness is being phased.
+            try std.testing.expectEqual(@as(u64, 1), recorded.summary.?.property_failures);
+            try std.testing.expectEqual(@as(usize, 1), recorded.failures.items.len);
+            try std.testing.expectEqual(Scenario.complete_id, recorded.failures.items[0].property_id.?);
+            try std.testing.expectEqualStrings(Scenario.name ++ ".history-completes", recorded.failures.items[0].identity);
+            std.debug.print("production bounded lifecycle transitions={d} observations={d}\n", .{
+                recorded.summary.?.transitions,
+                recorded.observations.items.len,
+            });
+            const last_observation = recorded.observations.items[recorded.observations.items.len - 1];
+            for (last_observation.features) |feature| {
+                if (std.mem.eql(u8, feature.name, Scenario.name ++ ".production-phase") or
+                    std.mem.eql(u8, feature.name, Scenario.name ++ ".production-metadata-phase") or
+                    std.mem.startsWith(u8, feature.name, Scenario.name ++ ".production-primary-") or
+                    std.mem.startsWith(u8, feature.name, Scenario.name ++ ".production-driver-"))
+                    std.debug.print("production bounded lifecycle {s}={d}\n", .{ feature.name, feature.value });
+            }
+        },
+    }
+    var replayed = vopr.replay.exact(Scenario, history_alloc, &recorded) catch |err| {
+        std.debug.print("full cluster mode={s} exact replay failed: {s}\n", .{
+            Scenario.mode_names[mode_ordinal],
+            @errorName(err),
+        });
+        return err;
+    };
+    replayed.deinit();
+}
 
 test "full cluster VOPR exact replays metadata data serverless HTTP clients and recovery" {
     // Stackful fibers make host unwinding both expensive and unsafe. Preserve
@@ -539,44 +845,50 @@ test "full cluster VOPR exact replays metadata data serverless HTTP clients and 
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
     const history_alloc = history_allocator.allocator();
-    const backend_ids = vopr.vopr_io.artifactBackendIds();
-    for (Scenario.mode_ids, 0..) |mode_id, mode_ordinal| {
-        var choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4655_4c4c + mode_ordinal);
-        var recorded = try vopr.runner.run(Scenario, history_alloc, choices.source(), .{
-            .system = "antfly",
-            .transition_budget = 50_000,
-            .resource_budget = 96,
-            .backend_ids = &backend_ids,
-            .source_revision = "full-cluster-vopr-v9",
-            .target = "native",
-            .optimize = @tagName(@import("builtin").mode),
-        });
-        defer recorded.deinit();
-        if (recorded.summary.?.property_failures != 0) {
-            for (recorded.failures.items) |failure| std.debug.print(
-                "full cluster mode={s} failure={s} class={s}\n",
-                .{ Scenario.mode_names[mode_ordinal], failure.identity, @tagName(failure.class) },
-            );
-            if (recorded.observations.items.len > 0) for (recorded.observations.items[recorded.observations.items.len - 1].features) |feature| {
-                std.debug.print("  {s}={d}\n", .{ feature.name, feature.value });
-                if (std.mem.eql(u8, feature.name, Scenario.name ++ ".last-request-error") and feature.value != 0) {
-                    const request_error: anyerror = @errorFromInt(@as(u16, @intCast(feature.value)));
-                    std.debug.print("  request-error-name={s}\n", .{@errorName(request_error)});
-                }
-                if (std.mem.eql(u8, feature.name, Scenario.name ++ ".serverless-public-http-error") and feature.value != 0) {
-                    const request_error: anyerror = @errorFromInt(@as(u16, @intCast(feature.value)));
-                    std.debug.print("  serverless-public-http-error-name={s}\n", .{@errorName(request_error)});
-                }
-            };
-        }
-        try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures);
-        var replayed = vopr.replay.exact(Scenario, history_alloc, &recorded) catch |err| {
-            std.debug.print("full cluster mode={s} exact replay failed: {s}\n", .{
-                Scenario.mode_names[mode_ordinal],
-                @errorName(err),
-            });
-            return err;
-        };
-        replayed.deinit();
+    // Keep the promoted aggregate on its last green contract. Experimental
+    // modes receive a distinct focused gate and join this slice only after
+    // their recorded history and exact replay pass within the tier budget.
+    const promoted_mode_count = Scenario.mode_ids.len - 2;
+    for (Scenario.mode_ids[0..promoted_mode_count], 0..) |mode_id, mode_ordinal| {
+        try runExactMode(history_alloc, mode_id, mode_ordinal, 50_000, .complete);
     }
+}
+
+test "full cluster production data plane VOPR active split exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.mode_ids.len - 1;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        320_000,
+        .complete,
+    );
+}
+
+test "full cluster production data plane VOPR bounded cutoff exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.mode_ids.len - 1;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        2_000,
+        .bounded_lifecycle,
+    );
+}
+
+test "full cluster production data plane baseline exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.mode_ids.len - 2;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        30_000,
+        .complete,
+    );
 }

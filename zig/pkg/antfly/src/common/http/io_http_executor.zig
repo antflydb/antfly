@@ -60,6 +60,18 @@ pub const IoHttpExecutor = struct {
         self.* = undefined;
     }
 
+    pub fn activeRequestCount(self: *const IoHttpExecutor) usize {
+        return self.client.activeRequestCount();
+    }
+
+    pub fn beginShutdown(self: *IoHttpExecutor) void {
+        self.client.beginShutdown();
+    }
+
+    pub fn drainShutdown(self: *IoHttpExecutor) void {
+        self.client.drainShutdown();
+    }
+
     pub fn executor(self: *IoHttpExecutor) common.RequestExecutor {
         return .{
             .ptr = self,
