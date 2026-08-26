@@ -3070,10 +3070,11 @@ pub const DB = struct {
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
-    // Spawned at open only when the load left failures behind; exits once all
+    // Started after the DB reaches its final address; exits once all
     // quarantined indexes recover or the DB closes.
     quarantine_retry_thread: ?std.Thread = null,
     quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    quarantine_retry_start_address_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     artifact_repair_metadata_future: ?Io.Future(void) = null,
     artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shadow: ?ShadowState,
@@ -3644,9 +3645,6 @@ pub const DB = struct {
                 const start_optional_started_ns = monotonicTimeNs();
                 try db.startOptionalRuntimes();
                 profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
-            }
-            if (optional_runtime_workers_enabled and opts.open_mode == .writer) {
-                db.startQuarantineRetryWorkerIfNeeded();
             }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 // Cleanup jobs can call back into repair/coverage state. Submit
@@ -18681,12 +18679,21 @@ pub const DB = struct {
         }
     }
 
-    fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
-        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
+    /// Start only after the DB has reached its final address. The spawned
+    /// thread retains `self` after this call returns.
+    pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         // Tests drive retries deterministically via retryQuarantinedIndexLoads;
         // a background worker racing them turns every quarantine-shaped test
         // into a timing assumption.
-        if (comptime builtin.is_test) return;
+        if (comptime builtin.is_test) {
+            if (self.quarantine_retry_start_address_for_test == 0) {
+                self.quarantine_retry_start_address_for_test = @intFromPtr(self);
+            }
+            return;
+        }
+        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
+        if (!self.optional_runtime_workers_enabled or self.open_mode != .writer) return;
+        if (self.quarantine_retry_thread != null) return;
         if (!self.core.index_manager.hasLoadFailures()) return;
         self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {
             // Self-healing is best-effort: the quarantine still recovers on
@@ -18694,6 +18701,14 @@ pub const DB = struct {
             std.log.warn("quarantine retry worker spawn failed: {}", .{err});
             return;
         };
+    }
+
+    pub fn quarantineRetryWorkerStartedAtCurrentAddressForTest(self: *const DB) bool {
+        if (comptime builtin.is_test) {
+            return self.quarantine_retry_start_address_for_test == @intFromPtr(self);
+        } else {
+            return false;
+        }
     }
 
     fn stopQuarantineRetryWorker(self: *DB) void {

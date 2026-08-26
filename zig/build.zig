@@ -6229,6 +6229,7 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_production_regression_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
+            "provisioned writer cache starts DB workers after stable entry installation",
             "table write source restore acquires lifecycle unless caller reserves it",
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned create succeeds when post-commit runtime status is fenced",
