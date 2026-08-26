@@ -4820,7 +4820,7 @@ pub const DB = struct {
         return self.snapshotLsmMaintenanceStatsLocked();
     }
 
-    pub const LsmOwnerKind = enum { primary, full_text, dense_vector };
+    pub const LsmOwnerKind = background_runtime_mod.LsmOwnerKind;
 
     pub const LsmOwnerStats = struct {
         kind: LsmOwnerKind,
@@ -4833,10 +4833,7 @@ pub const DB = struct {
         }
     };
 
-    pub fn trySnapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) !?[]LsmOwnerStats {
-        if (!self.core.tryLockApplyShared()) return null;
-        defer self.core.unlockApplyShared();
-
+    fn snapshotLsmOwnerStatsLockedAlloc(self: *DB, alloc: Allocator) ![]LsmOwnerStats {
         var owners = std.ArrayListUnmanaged(LsmOwnerStats).empty;
         errdefer {
             for (owners.items) |*owner| owner.deinit(alloc);
@@ -4870,6 +4867,18 @@ pub const DB = struct {
             transferred += 1;
         }
         return try owners.toOwnedSlice(alloc);
+    }
+
+    pub fn snapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) ![]LsmOwnerStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.snapshotLsmOwnerStatsLockedAlloc(alloc);
+    }
+
+    pub fn trySnapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) !?[]LsmOwnerStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return try self.snapshotLsmOwnerStatsLockedAlloc(alloc);
     }
 
     pub fn trySnapshotLsmMaintenanceStats(self: *DB) ?lsm_backend_mod.Backend.MaintenanceStats {

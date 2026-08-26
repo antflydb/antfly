@@ -208,15 +208,9 @@ const RunSnapshotRefRegistry = struct {
 
 var run_snapshot_refs = RunSnapshotRefRegistry{};
 
-pub const MutableSnapshotReason = enum(u8) {
-    bound_read_txn,
-    namespace_read_txn,
-    current_scan,
-    other,
-    bulk_current_scan,
-};
+pub const MutableSnapshotReason = background_runtime_mod.LsmMutableSnapshotReason;
 
-pub const mutable_snapshot_reason_count = @typeInfo(MutableSnapshotReason).@"enum".fields.len;
+pub const mutable_snapshot_reason_count = background_runtime_mod.lsm_mutable_snapshot_reason_count;
 
 pub const ReaderPinKind = enum(u8) {
     bound_read_txn,
@@ -246,11 +240,7 @@ fn readerPinKindIndex(kind: ReaderPinKind) usize {
     return @intFromEnum(kind);
 }
 
-pub const MutableSnapshotCloneReasonStats = struct {
-    calls: u64 = 0,
-    bytes_total: u64 = 0,
-    peak_bytes: u64 = 0,
-};
+pub const MutableSnapshotCloneReasonStats = background_runtime_mod.LsmMutableSnapshotCloneReasonStats;
 
 const MutableSnapshotReaderRef = struct {
     state: *State,

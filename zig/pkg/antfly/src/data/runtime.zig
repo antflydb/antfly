@@ -1668,6 +1668,7 @@ pub const HealthSource = struct {
             self.data_server.alloc.free(lsm_owner_stats);
         }
         try writeLsmOwnerCloneMetrics(writer, lsm_owner_stats);
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_owner_clone_registry_dropped_total", "counter", "Retired LSM owner clone metric records dropped after the bounded runtime registry reached capacity", live_write_source.lsmOwnerCloneStatsDroppedTotal());
         try writeLsmWriteMetrics(writer, live_write_source.lsmWriteStatsBestEffort());
         try writeTextMergeMetrics(writer, live_write_source.textMergeStatsBestEffort());
         var async_indexing_stats = live_write_source.asyncIndexingStatsBestEffort();
@@ -2391,6 +2392,9 @@ fn resourceMetricValue(stats: resource_manager_mod.SliceStats, field: ResourceMe
 
 fn writeLsmCacheMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.CacheStats) !void {
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_used_bytes", "gauge", "Shared LSM cache bytes currently resident", @intCast(stats.used_bytes));
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_peak_used_bytes", "gauge", "Lifetime peak shared LSM cache resident bytes", @intCast(stats.peak_used_bytes));
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_data_block_used_bytes", "gauge", "Decoded and physical LSM data-block bytes currently resident", @intCast(stats.data_block_used_bytes));
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_data_block_peak_used_bytes", "gauge", "Lifetime peak decoded and physical LSM data-block bytes resident at the same instant", @intCast(stats.data_block_peak_used_bytes));
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_entries", "gauge", "Shared LSM cache entry count", @intCast(stats.entry_count));
     try writeLsmCacheKindMetricFamily(writer, stats, .hits, "antfly_lsm_cache_hits_total", "counter", "Shared LSM cache hits");
     try writeLsmCacheKindMetricFamily(writer, stats, .misses, "antfly_lsm_cache_misses_total", "counter", "Shared LSM cache misses");
@@ -2401,6 +2405,7 @@ fn writeLsmCacheMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.CacheStat
     try writeLsmCacheKindMetricFamily(writer, stats, .invalidations, "antfly_lsm_cache_invalidations_total", "counter", "Shared LSM cache invalidations");
     try writeLsmCacheKindMetricFamily(writer, stats, .waits, "antfly_lsm_cache_waits_total", "counter", "Shared LSM cache pending-load waits");
     try writeLsmCacheKindMetricFamily(writer, stats, .used_bytes, "antfly_lsm_cache_kind_used_bytes", "gauge", "Shared LSM cache resident bytes by entry kind");
+    try writeLsmCacheKindMetricFamily(writer, stats, .peak_used_bytes, "antfly_lsm_cache_kind_peak_used_bytes", "gauge", "Lifetime peak shared LSM cache resident bytes by entry kind");
 }
 
 fn writeLsmNativeStorageMetrics(writer: *std.Io.Writer, stats: ?lsm_backend_mod.NativeStorageStats) !void {
@@ -2454,6 +2459,7 @@ const LsmCacheMetricField = enum {
     invalidations,
     waits,
     used_bytes,
+    peak_used_bytes,
 };
 
 fn writeLsmCacheKindMetricFamily(
@@ -2495,6 +2501,7 @@ fn lsmCacheMetricValue(stats: lsm_backend_mod.CacheKindStats, field: LsmCacheMet
         .invalidations => stats.invalidations,
         .waits => stats.waits,
         .used_bytes => @intCast(stats.used_bytes),
+        .peak_used_bytes => @intCast(stats.peak_used_bytes),
     };
 }
 
@@ -25154,6 +25161,9 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_transient_serves_total{kind=\"run_table_block\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_policy_bypasses_total{kind=\"run_table_block\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_kind_used_bytes{kind=\"run_table_block\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_peak_used_bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_data_block_peak_used_bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_kind_peak_used_bytes{kind=\"run_table_block\"}") != null);
 
     const owner_stats = [_]antfly.public_api.table_writes.LsmOwnerMetricStats{.{
         .table_name = @constCast("docs"),

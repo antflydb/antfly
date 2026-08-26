@@ -161,6 +161,7 @@ const Summary = struct {
     dense_bulk_clone_peak_bytes: u64 = 0,
     lsm_cache_used_bytes: u64 = 0,
     lsm_data_block_cache_used_bytes: u64 = 0,
+    lsm_data_block_cache_peak_used_bytes: u64 = 0,
     lsm_data_block_cache_inserts: u64 = 0,
     lsm_data_block_cache_transient_serves: u64 = 0,
     lsm_data_block_cache_policy_bypasses: u64 = 0,
@@ -416,7 +417,8 @@ fn runProvisionedDenseIngest(
 
     const cache_stats = storage.lsm_cache.snapshotStats();
     summary.lsm_cache_used_bytes = @intCast(cache_stats.used_bytes);
-    summary.lsm_data_block_cache_used_bytes = @intCast(cache_stats.run_table_block.used_bytes +| cache_stats.run_table_physical_block.used_bytes);
+    summary.lsm_data_block_cache_used_bytes = @intCast(cache_stats.data_block_used_bytes);
+    summary.lsm_data_block_cache_peak_used_bytes = @intCast(cache_stats.data_block_peak_used_bytes);
     summary.lsm_data_block_cache_inserts = cache_stats.run_table_block.inserts +| cache_stats.run_table_physical_block.inserts;
     summary.lsm_data_block_cache_transient_serves = cache_stats.run_table_block.transient_serves +| cache_stats.run_table_physical_block.transient_serves;
     summary.lsm_data_block_cache_policy_bypasses = cache_stats.run_table_block.policy_bypasses +| cache_stats.run_table_physical_block.policy_bypasses;
@@ -577,10 +579,11 @@ fn printSummary(cfg: Config, summary: Summary) void {
         },
     );
     std.debug.print(
-        "  lsm_cache total_mb={d} data_block_mb={d} data_block_inserts={d} data_block_transient_serves={d} data_block_policy_bypasses={d}\n",
+        "  lsm_cache total_mb={d} data_block_mb={d} data_block_peak_mb={d} data_block_inserts={d} data_block_transient_serves={d} data_block_policy_bypasses={d}\n",
         .{
             @divTrunc(summary.lsm_cache_used_bytes, 1024 * 1024),
             @divTrunc(summary.lsm_data_block_cache_used_bytes, 1024 * 1024),
+            @divTrunc(summary.lsm_data_block_cache_peak_used_bytes, 1024 * 1024),
             summary.lsm_data_block_cache_inserts,
             summary.lsm_data_block_cache_transient_serves,
             summary.lsm_data_block_cache_policy_bypasses,
@@ -622,7 +625,7 @@ fn enforceGuardrails(cfg: Config, summary: Summary) !void {
         if (actual > max) return guardrailFailure("ingest_ms", actual, max);
     }
     if (cfg.max_data_block_cache_bytes) |max| {
-        if (summary.lsm_data_block_cache_used_bytes > max) return guardrailFailure("data_block_cache_bytes", summary.lsm_data_block_cache_used_bytes, max);
+        if (summary.lsm_data_block_cache_peak_used_bytes > max) return guardrailFailure("data_block_cache_peak_bytes", summary.lsm_data_block_cache_peak_used_bytes, max);
     }
     if (cfg.max_peak_footprint_bytes) |max| {
         if (summary.process_peak_footprint_bytes > max) return guardrailFailure("peak_footprint_bytes", summary.process_peak_footprint_bytes, max);

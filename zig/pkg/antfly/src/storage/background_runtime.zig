@@ -23,6 +23,175 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const AtomicU64 = platform.atomic.Value(u64);
 
+pub const LsmOwnerKind = enum { primary, full_text, dense_vector };
+
+pub const LsmMutableSnapshotReason = enum(u8) {
+    bound_read_txn,
+    namespace_read_txn,
+    current_scan,
+    other,
+    bulk_current_scan,
+};
+
+pub const lsm_mutable_snapshot_reason_count = @typeInfo(LsmMutableSnapshotReason).@"enum".fields.len;
+
+pub const LsmMutableSnapshotCloneReasonStats = struct {
+    calls: u64 = 0,
+    bytes_total: u64 = 0,
+    peak_bytes: u64 = 0,
+
+    fn accumulate(self: *@This(), other: @This()) void {
+        self.calls +|= other.calls;
+        self.bytes_total +|= other.bytes_total;
+        self.peak_bytes = @max(self.peak_bytes, other.peak_bytes);
+    }
+};
+
+pub const LsmOwnerCloneStats = struct {
+    calls: u64 = 0,
+    bytes_total: u64 = 0,
+    peak_bytes: u64 = 0,
+    bulk_current_scan_peak_active_bytes: u64 = 0,
+    by_reason: [lsm_mutable_snapshot_reason_count]LsmMutableSnapshotCloneReasonStats =
+        [_]LsmMutableSnapshotCloneReasonStats{.{}} ** lsm_mutable_snapshot_reason_count,
+
+    pub fn accumulate(self: *@This(), other: @This()) void {
+        self.calls +|= other.calls;
+        self.bytes_total +|= other.bytes_total;
+        self.peak_bytes = @max(self.peak_bytes, other.peak_bytes);
+        self.bulk_current_scan_peak_active_bytes = @max(
+            self.bulk_current_scan_peak_active_bytes,
+            other.bulk_current_scan_peak_active_bytes,
+        );
+        for (&self.by_reason, other.by_reason) |*dst, src| dst.accumulate(src);
+    }
+};
+
+pub const LsmOwnerCloneMetricSnapshot = struct {
+    table_name: []u8,
+    group_id: u64,
+    owner_kind: LsmOwnerKind,
+    owner_name: []u8,
+    stats: LsmOwnerCloneStats,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.owner_name);
+        self.* = undefined;
+    }
+};
+
+const LsmOwnerCloneRegistry = struct {
+    const max_entries: usize = 4096;
+
+    const Entry = struct {
+        table_name: []u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []u8,
+        stats: LsmOwnerCloneStats,
+
+        fn deinit(self: *Entry, alloc: Allocator) void {
+            alloc.free(self.table_name);
+            alloc.free(self.owner_name);
+            self.* = undefined;
+        }
+
+        fn matches(
+            self: *const Entry,
+            table_name: []const u8,
+            group_id: u64,
+            owner_kind: LsmOwnerKind,
+            owner_name: []const u8,
+        ) bool {
+            return self.group_id == group_id and
+                self.owner_kind == owner_kind and
+                std.mem.eql(u8, self.table_name, table_name) and
+                std.mem.eql(u8, self.owner_name, owner_name);
+        }
+    };
+
+    alloc: Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    dropped: u64 = 0,
+
+    fn init(alloc: Allocator) LsmOwnerCloneRegistry {
+        return .{ .alloc = alloc };
+    }
+
+    fn deinit(self: *LsmOwnerCloneRegistry) void {
+        for (self.entries.items) |*entry| entry.deinit(self.alloc);
+        self.entries.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn accumulate(
+        self: *LsmOwnerCloneRegistry,
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+        stats: LsmOwnerCloneStats,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        for (self.entries.items) |*entry| {
+            if (!entry.matches(table_name, group_id, owner_kind, owner_name)) continue;
+            entry.stats.accumulate(stats);
+            return;
+        }
+        if (self.entries.items.len >= max_entries) {
+            self.dropped +|= 1;
+            return;
+        }
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        errdefer self.alloc.free(owned_table_name);
+        const owned_owner_name = try self.alloc.dupe(u8, owner_name);
+        errdefer self.alloc.free(owned_owner_name);
+        try self.entries.append(self.alloc, .{
+            .table_name = owned_table_name,
+            .group_id = group_id,
+            .owner_kind = owner_kind,
+            .owner_name = owned_owner_name,
+            .stats = stats,
+        });
+    }
+
+    fn snapshotAlloc(self: *LsmOwnerCloneRegistry, alloc: Allocator) ![]LsmOwnerCloneMetricSnapshot {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const result = try alloc.alloc(LsmOwnerCloneMetricSnapshot, self.entries.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*entry| entry.deinit(alloc);
+            alloc.free(result);
+        }
+        for (self.entries.items, result) |entry, *snapshot| {
+            const table_name = try alloc.dupe(u8, entry.table_name);
+            const owner_name = alloc.dupe(u8, entry.owner_name) catch |err| {
+                alloc.free(table_name);
+                return err;
+            };
+            snapshot.* = .{
+                .table_name = table_name,
+                .group_id = entry.group_id,
+                .owner_kind = entry.owner_kind,
+                .owner_name = owner_name,
+                .stats = entry.stats,
+            };
+            initialized += 1;
+        }
+        return result;
+    }
+
+    fn droppedTotal(self: *LsmOwnerCloneRegistry) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.dropped;
+    }
+};
+
 pub const Backend = runtime_backend.Backend;
 pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.service;
@@ -287,6 +456,7 @@ pub const BackendRuntime = struct {
     retired_generation_cleanup_owner_id: u64,
     owner_registry: *OwnerRegistry,
     native_storage_pool: *storage_io.NativeStoragePool,
+    lsm_owner_clone_registry: LsmOwnerCloneRegistry,
     io_impl: ?*IoImpl = null,
     raft_inbound_io_impl: ?*IoImpl = null,
     raft_outbound_io_impl: ?*IoImpl = null,
@@ -331,6 +501,7 @@ pub const BackendRuntime = struct {
             .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
             .owner_registry = owner_registry,
             .native_storage_pool = native_storage_pool,
+            .lsm_owner_clone_registry = LsmOwnerCloneRegistry.init(alloc),
             .durable_jobs = undefined,
         };
         runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
@@ -416,6 +587,7 @@ pub const BackendRuntime = struct {
         }
         self.native_storage_pool.deinit();
         self.alloc.destroy(self.native_storage_pool);
+        self.lsm_owner_clone_registry.deinit();
         self.owner_registry.deinit();
         self.alloc.destroy(self.owner_registry);
         self.* = undefined;
@@ -432,6 +604,34 @@ pub const BackendRuntime = struct {
 
     pub fn snapshotNativeStorageStats(self: *const BackendRuntime) storage_io.NativeStorageStats {
         return self.native_storage_pool.snapshotStats();
+    }
+
+    pub fn accumulateRetiredLsmOwnerCloneStats(
+        self: *BackendRuntime,
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+        stats: LsmOwnerCloneStats,
+    ) !void {
+        try self.lsm_owner_clone_registry.accumulate(
+            table_name,
+            group_id,
+            owner_kind,
+            owner_name,
+            stats,
+        );
+    }
+
+    pub fn snapshotRetiredLsmOwnerCloneStatsAlloc(
+        self: *BackendRuntime,
+        alloc: Allocator,
+    ) ![]LsmOwnerCloneMetricSnapshot {
+        return try self.lsm_owner_clone_registry.snapshotAlloc(alloc);
+    }
+
+    pub fn retiredLsmOwnerCloneStatsDroppedTotal(self: *BackendRuntime) u64 {
+        return self.lsm_owner_clone_registry.droppedTotal();
     }
 
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {
@@ -1111,6 +1311,42 @@ test "backend runtime allocates stable nonzero owner ids" {
 
     try std.testing.expect(first != 0);
     try std.testing.expectEqual(first + 1, second);
+}
+
+test "backend runtime retains LSM owner clone counters across generations" {
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+
+    var first = LsmOwnerCloneStats{
+        .calls = 2,
+        .bytes_total = 1024,
+        .peak_bytes = 768,
+        .bulk_current_scan_peak_active_bytes = 512,
+    };
+    first.by_reason[@intFromEnum(LsmMutableSnapshotReason.bulk_current_scan)] = .{
+        .calls = 2,
+        .bytes_total = 1024,
+        .peak_bytes = 768,
+    };
+    try handle.ptr().accumulateRetiredLsmOwnerCloneStats("docs", 17, .dense_vector, "embedding", first);
+    try handle.ptr().accumulateRetiredLsmOwnerCloneStats("docs", 17, .dense_vector, "embedding", .{
+        .calls = 1,
+        .bytes_total = 256,
+        .peak_bytes = 256,
+    });
+
+    const snapshot = try handle.ptr().snapshotRetiredLsmOwnerCloneStatsAlloc(std.testing.allocator);
+    defer {
+        for (snapshot) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(snapshot);
+    }
+    try std.testing.expectEqual(@as(usize, 1), snapshot.len);
+    try std.testing.expectEqualStrings("docs", snapshot[0].table_name);
+    try std.testing.expectEqualStrings("embedding", snapshot[0].owner_name);
+    try std.testing.expectEqual(@as(u64, 3), snapshot[0].stats.calls);
+    try std.testing.expectEqual(@as(u64, 1280), snapshot[0].stats.bytes_total);
+    try std.testing.expectEqual(@as(u64, 768), snapshot[0].stats.peak_bytes);
+    try std.testing.expectEqual(@as(u64, 512), snapshot[0].stats.bulk_current_scan_peak_active_bytes);
 }
 
 test "backend runtime API lane leases expose and release the interface" {

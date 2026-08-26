@@ -6727,7 +6727,7 @@ pub const ApiHttpServer = struct {
             writer_lease_future.await(io);
             writer_lease_future_running = false;
             if (!cleanup_safe) {
-                std.log.err("table backup publication outcome ambiguous phase=commit class={s}; retaining fenced attempt", .{@errorName(err)});
+                std.log.warn("table backup publication outcome ambiguous phase=commit class={s}; retaining fenced attempt", .{@errorName(err)});
                 return error.BackupOutcomeAmbiguous;
             }
             backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
@@ -10915,7 +10915,7 @@ pub const ApiHttpServer = struct {
             lease_heartbeat.stop_event.set(backup_io);
             lease_future.await(backup_io);
             lease_future_running = false;
-            std.log.err("cluster backup contains an ambiguous table outcome; retaining attempt for reconciliation", .{});
+            std.log.warn("cluster backup contains an ambiguous table outcome; retaining attempt for reconciliation", .{});
         } else {
             trace.enter(.partial_cleanup);
             // A partial aggregate is not a restore candidate. Reclaim every
