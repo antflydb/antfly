@@ -15312,7 +15312,7 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             self.noteMetadataReadSuccess(index);
-            return status;
+            return stabilizeMetadataStatus(status);
         }
         return last_err;
     }
@@ -15866,28 +15866,70 @@ fn remoteGroupReadyForTableLifecycle(
 }
 
 fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_api.AdminSnapshot) !antfly.metadata_api.AdminSnapshot {
-    return .{
-        .status = snapshot.status,
+    var owned: antfly.metadata_api.AdminSnapshot = .{
+        .status = try cloneMetadataStatusOwned(alloc, snapshot.status),
         .reallocation_request = snapshot.reallocation_request,
-        .tables = try cloneTablesOwned(alloc, snapshot.tables),
-        .ranges = try cloneRangesOwned(alloc, snapshot.ranges),
-        .stores = try cloneStoresOwned(alloc, snapshot.stores),
-        .placement_intents = try clonePlacementIntentsOwned(alloc, snapshot.placement_intents),
-        .shuffle_join_leases = try cloneShuffleJoinLeasesOwned(alloc, snapshot.shuffle_join_leases),
-        .local_bootstrap_statuses = try cloneLocalBootstrapStatusesOwned(alloc, snapshot.local_bootstrap_statuses),
-        .restore_progresses = try cloneRestoreProgressesOwned(alloc, snapshot.restore_progresses),
-        .replication_source_statuses = try cloneReplicationSourceStatusesOwned(alloc, snapshot.replication_source_statuses),
-        .replication_source_action_hints = try cloneReplicationSourceActionHintsOwned(alloc, snapshot.replication_source_action_hints),
-        .extension_packages = try cloneExtensionPackagesOwned(alloc, snapshot.extension_packages),
-        .installed_extensions = try cloneInstalledExtensionsOwned(alloc, snapshot.installed_extensions),
-        .extension_members = try cloneExtensionMembersOwned(alloc, snapshot.extension_members),
-        .extension_dependencies = try cloneExtensionDependenciesOwned(alloc, snapshot.extension_dependencies),
-        .split_transitions = try cloneSplitTransitionsOwned(alloc, snapshot.split_transitions),
-        .merge_transitions = try cloneMergeTransitionsOwned(alloc, snapshot.merge_transitions),
-        .split_observations = try cloneSplitObservationsOwned(alloc, snapshot.split_observations),
-        .merge_observations = try cloneMergeObservationsOwned(alloc, snapshot.merge_observations),
-        .merged_group_statuses = try cloneMergedGroupStatusesOwned(alloc, snapshot.merged_group_statuses),
+        .tables = &.{},
+        .ranges = &.{},
+        .nodes = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
     };
+    errdefer freeAdminSnapshotOwned(alloc, &owned);
+    owned.tables = try cloneTablesOwned(alloc, snapshot.tables);
+    owned.ranges = try cloneRangesOwned(alloc, snapshot.ranges);
+    owned.nodes = try cloneNodesOwned(alloc, snapshot.nodes);
+    owned.stores = try cloneStoresOwned(alloc, snapshot.stores);
+    owned.placement_intents = try clonePlacementIntentsOwned(alloc, snapshot.placement_intents);
+    owned.shuffle_join_leases = try cloneShuffleJoinLeasesOwned(alloc, snapshot.shuffle_join_leases);
+    owned.local_bootstrap_statuses = try cloneLocalBootstrapStatusesOwned(alloc, snapshot.local_bootstrap_statuses);
+    owned.restore_progresses = try cloneRestoreProgressesOwned(alloc, snapshot.restore_progresses);
+    owned.replication_source_statuses = try cloneReplicationSourceStatusesOwned(alloc, snapshot.replication_source_statuses);
+    owned.replication_source_action_hints = try cloneReplicationSourceActionHintsOwned(alloc, snapshot.replication_source_action_hints);
+    owned.extension_packages = try cloneExtensionPackagesOwned(alloc, snapshot.extension_packages);
+    owned.installed_extensions = try cloneInstalledExtensionsOwned(alloc, snapshot.installed_extensions);
+    owned.extension_members = try cloneExtensionMembersOwned(alloc, snapshot.extension_members);
+    owned.extension_dependencies = try cloneExtensionDependenciesOwned(alloc, snapshot.extension_dependencies);
+    owned.split_transitions = try cloneSplitTransitionsOwned(alloc, snapshot.split_transitions);
+    owned.merge_transitions = try cloneMergeTransitionsOwned(alloc, snapshot.merge_transitions);
+    owned.split_observations = try cloneSplitObservationsOwned(alloc, snapshot.split_observations);
+    owned.merge_observations = try cloneMergeObservationsOwned(alloc, snapshot.merge_observations);
+    owned.merged_group_statuses = try cloneMergedGroupStatusesOwned(alloc, snapshot.merged_group_statuses);
+    return owned;
+}
+
+fn cloneMetadataStatusOwned(
+    alloc: std.mem.Allocator,
+    status: antfly.metadata_api.MetadataStatus,
+) !antfly.metadata_api.MetadataStatus {
+    var owned = status;
+    owned.metadata_raft_role = try alloc.dupe(u8, status.metadata_raft_role);
+    return owned;
+}
+
+fn stabilizeMetadataStatus(
+    status: antfly.metadata_api.MetadataStatus,
+) antfly.metadata_api.MetadataStatus {
+    var stable = status;
+    const stable_roles = [_][]const u8{
+        "absent",
+        "unknown",
+        "disabled",
+        "follower",
+        "pre_candidate",
+        "candidate",
+        "leader",
+    };
+    for (stable_roles) |role| {
+        if (std.mem.eql(u8, role, status.metadata_raft_role)) {
+            stable.metadata_raft_role = role;
+            return stable;
+        }
+    }
+    stable.metadata_raft_role = "unknown";
+    return stable;
 }
 
 fn retainCurrentReallocationRequestObservations(
@@ -17246,22 +17288,27 @@ fn freeStoreStatusReportOwned(alloc: std.mem.Allocator, report: *antfly.metadata
     report.* = undefined;
 }
 
+fn freeLocalBootstrapStatusOwned(alloc: std.mem.Allocator, record: antfly.raft.host.BootstrapStatus) void {
+    if (record.last_error) |value| alloc.free(value);
+    if (record.backup_id) |value| alloc.free(value);
+    if (record.snapshot_path) |value| alloc.free(value);
+}
+
 fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_api.AdminSnapshot) void {
+    alloc.free(snapshot.status.metadata_raft_role);
     for (snapshot.tables) |record| antfly.metadata.table_manager.freeTable(alloc, record);
     alloc.free(snapshot.tables);
     for (snapshot.ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
     alloc.free(snapshot.ranges);
+    for (snapshot.nodes) |record| antfly.metadata.table_manager.freeNode(alloc, record);
+    if (snapshot.nodes.len > 0) alloc.free(snapshot.nodes);
     for (snapshot.stores) |record| antfly.metadata.table_manager.freeStore(alloc, record);
     alloc.free(snapshot.stores);
-    for (snapshot.placement_intents) |intent| if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
+    for (snapshot.placement_intents) |intent| antfly.raft.reconciler.freeIntentOwned(alloc, intent);
     alloc.free(snapshot.placement_intents);
     for (snapshot.shuffle_join_leases) |record| antfly.metadata.table_manager.freeShuffleJoinLease(alloc, record);
     if (snapshot.shuffle_join_leases.len > 0) alloc.free(snapshot.shuffle_join_leases);
-    for (snapshot.local_bootstrap_statuses) |record| {
-        if (record.last_error) |value| alloc.free(value);
-        if (record.backup_id) |value| alloc.free(value);
-        if (record.snapshot_path) |value| alloc.free(value);
-    }
+    for (snapshot.local_bootstrap_statuses) |record| freeLocalBootstrapStatusOwned(alloc, record);
     if (snapshot.local_bootstrap_statuses.len > 0) alloc.free(snapshot.local_bootstrap_statuses);
     for (snapshot.restore_progresses) |record| antfly.metadata.table_manager.freeRestoreProgress(alloc, record);
     if (snapshot.restore_progresses.len > 0) alloc.free(snapshot.restore_progresses);
@@ -17300,9 +17347,7 @@ fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_a
     alloc.free(snapshot.merge_transitions);
     if (snapshot.split_observations.len > 0) alloc.free(snapshot.split_observations);
     if (snapshot.merge_observations.len > 0) alloc.free(snapshot.merge_observations);
-    if (snapshot.merged_group_statuses.len > 0) {
-        alloc.free(snapshot.merged_group_statuses);
-    }
+    freeMergedGroupStatusesOwned(alloc, snapshot.merged_group_statuses);
     snapshot.* = undefined;
 }
 
@@ -17323,20 +17368,37 @@ fn cloneLocalBootstrapStatusesOwned(
 ) ![]antfly.raft.host.BootstrapStatus {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.raft.host.BootstrapStatus, records.len);
-    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| freeLocalBootstrapStatusOwned(alloc, record);
+        alloc.free(out);
+    }
     for (records, 0..) |record, i| {
-        out[i] = .{
-            .group_id = record.group_id,
-            .kind = record.kind,
-            .phase = record.phase,
-            .attempts = record.attempts,
-            .last_updated_at_millis = record.last_updated_at_millis,
-            .last_error = if (record.last_error) |value| try alloc.dupe(u8, value) else null,
-            .backup_id = if (record.backup_id) |value| try alloc.dupe(u8, value) else null,
-            .snapshot_path = if (record.snapshot_path) |value| try alloc.dupe(u8, value) else null,
-        };
+        out[i] = try cloneLocalBootstrapStatusOwned(alloc, record);
+        initialized += 1;
     }
     return out;
+}
+
+fn cloneLocalBootstrapStatusOwned(
+    alloc: std.mem.Allocator,
+    record: antfly.raft.host.BootstrapStatus,
+) !antfly.raft.host.BootstrapStatus {
+    const last_error = if (record.last_error) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (last_error) |value| alloc.free(value);
+    const backup_id = if (record.backup_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (backup_id) |value| alloc.free(value);
+    const snapshot_path = if (record.snapshot_path) |value| try alloc.dupe(u8, value) else null;
+    return .{
+        .group_id = record.group_id,
+        .kind = record.kind,
+        .phase = record.phase,
+        .attempts = record.attempts,
+        .last_updated_at_millis = record.last_updated_at_millis,
+        .last_error = last_error,
+        .backup_id = backup_id,
+        .snapshot_path = snapshot_path,
+    };
 }
 
 fn cloneRestoreProgressesOwned(
@@ -17395,10 +17457,32 @@ fn cloneRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.t
     return out;
 }
 
+fn cloneNodesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.NodeRecord) ![]antfly.metadata.table_manager.NodeRecord {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.metadata.table_manager.NodeRecord, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeNode(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneNode(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
 fn cloneStoresOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.StoreRecord) ![]antfly.metadata.table_manager.StoreRecord {
     const out = try alloc.alloc(antfly.metadata.table_manager.StoreRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneStore(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeStore(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneStore(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
@@ -17420,12 +17504,27 @@ fn cloneMergedGroupStatusesOwned(
     alloc: std.mem.Allocator,
     statuses: []const antfly.metadata.reconciler.MergedGroupStatus,
 ) ![]antfly.metadata.reconciler.MergedGroupStatus {
+    if (statuses.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata.reconciler.MergedGroupStatus, statuses.len);
-    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |status| alloc.free(status.doc_identity_lifecycle);
+        alloc.free(out);
+    }
     for (statuses, 0..) |status, i| {
         out[i] = status;
+        out[i].doc_identity_lifecycle = try alloc.dupe(u8, status.doc_identity_lifecycle);
+        initialized += 1;
     }
     return out;
+}
+
+fn freeMergedGroupStatusesOwned(
+    alloc: std.mem.Allocator,
+    statuses: []const antfly.metadata.reconciler.MergedGroupStatus,
+) void {
+    for (statuses) |status| alloc.free(status.doc_identity_lifecycle);
+    if (statuses.len > 0) alloc.free(statuses);
 }
 
 fn cloneExtensionPackagesOwned(
@@ -25176,6 +25275,180 @@ test "data runtime remote admin snapshot clone preserves replication status surf
     try std.testing.expectEqualStrings("boom", cloned.local_bootstrap_statuses[0].last_error.?);
     try std.testing.expectEqual(@as(usize, 1), cloned.restore_progresses.len);
     try std.testing.expectEqualStrings("b1", cloned.restore_progresses[0].backup_id);
+}
+
+test "data runtime remote admin snapshot clone owns parser-backed slices" {
+    const alloc = std.testing.allocator;
+    const source_raft_role = try alloc.dupe(u8, "leader");
+    defer alloc.free(source_raft_role);
+    const source_node_role = try alloc.dupe(u8, "data");
+    defer alloc.free(source_node_role);
+    const source_node_lifecycle = try alloc.dupe(u8, "active");
+    defer alloc.free(source_node_lifecycle);
+    const source_lifecycle = try alloc.dupe(u8, "preserving");
+    defer alloc.free(source_lifecycle);
+    var nodes = [_]antfly.metadata.table_manager.NodeRecord{.{
+        .node_id = 3,
+        .role = source_node_role,
+        .lifecycle = source_node_lifecycle,
+    }};
+    var merged_group_statuses = [_]antfly.metadata.reconciler.MergedGroupStatus{.{
+        .group_id = 11,
+        .doc_identity_lifecycle = source_lifecycle,
+    }};
+    var placement_intents = [_]antfly.raft.reconciler.PlacementIntent{.{
+        .record = .{
+            .group_id = 11,
+            .replica_id = 3,
+            .local_node_id = 3,
+            .metadata_version = 7,
+            .backup_restore_bootstrap = .{
+                .backup_id = "backup-11",
+                .artifact_backup_id = "artifact-11",
+                .location = "s3://backup/antfly",
+                .snapshot_path = "backup-11/groups/11.afb",
+                .connection = "backup-store",
+                .artifact_size_bytes = 4096,
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            },
+        },
+        .store_id = 3,
+        .peer_node_ids = &.{ 1, 2, 3 },
+        .learner_node_ids = &.{4},
+    }};
+    const snapshot: antfly.metadata_api.AdminSnapshot = .{
+        .status = .{
+            .metadata_group_id = 1,
+            .metadata_raft_role = source_raft_role,
+            .metrics = .{},
+        },
+        .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+        .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+        .nodes = nodes[0..],
+        .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+        .placement_intents = placement_intents[0..],
+        .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+        .merged_group_statuses = merged_group_statuses[0..],
+    };
+
+    var cloned = try cloneAdminSnapshotOwned(alloc, snapshot);
+    defer freeAdminSnapshotOwned(alloc, &cloned);
+
+    try std.testing.expect(cloned.status.metadata_raft_role.ptr != source_raft_role.ptr);
+    try std.testing.expectEqual(@as(usize, 1), cloned.nodes.len);
+    try std.testing.expect(cloned.nodes[0].role.ptr != source_node_role.ptr);
+    try std.testing.expect(cloned.nodes[0].lifecycle.ptr != source_node_lifecycle.ptr);
+    try std.testing.expect(cloned.merged_group_statuses[0].doc_identity_lifecycle.ptr != source_lifecycle.ptr);
+    try std.testing.expect(cloned.placement_intents[0].peer_node_ids.ptr != placement_intents[0].peer_node_ids.ptr);
+    try std.testing.expect(cloned.placement_intents[0].learner_node_ids.ptr != placement_intents[0].learner_node_ids.ptr);
+    try std.testing.expect(cloned.placement_intents[0].record.backup_restore_bootstrap.?.snapshot_path.ptr != placement_intents[0].record.backup_restore_bootstrap.?.snapshot_path.ptr);
+    @memset(source_raft_role, 'x');
+    @memset(source_node_role, 'x');
+    @memset(source_node_lifecycle, 'x');
+    @memset(source_lifecycle, 'x');
+    try std.testing.expectEqualStrings("leader", cloned.status.metadata_raft_role);
+    try std.testing.expectEqualStrings("data", cloned.nodes[0].role);
+    try std.testing.expectEqualStrings("active", cloned.nodes[0].lifecycle);
+    try std.testing.expectEqualStrings("preserving", cloned.merged_group_statuses[0].doc_identity_lifecycle);
+
+    var data = try antfly.public_api.cluster.dataFromSnapshot(alloc, &cloned);
+    defer data.deinit(alloc);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, data, .{});
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_identity_lifecycle\":\"preserving\"") != null);
+}
+
+test "data runtime remote admin snapshot clone releases partial ownership" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var nodes = [_]antfly.metadata.table_manager.NodeRecord{.{
+                .node_id = 3,
+                .role = "data",
+                .lifecycle = "active",
+            }};
+            var merged_group_statuses = [_]antfly.metadata.reconciler.MergedGroupStatus{.{
+                .group_id = 11,
+                .doc_identity_lifecycle = "preserving",
+            }};
+            var stores = [_]antfly.metadata.table_manager.StoreRecord{
+                .{
+                    .store_id = 3,
+                    .node_id = 3,
+                    .api_url = "http://data-3",
+                    .raft_url = "http://data-3-raft",
+                    .failure_domain = "zone-a",
+                },
+                .{
+                    .store_id = 4,
+                    .node_id = 4,
+                    .api_url = "http://data-4",
+                    .raft_url = "http://data-4-raft",
+                    .failure_domain = "zone-b",
+                },
+            };
+            var local_bootstrap_statuses = [_]antfly.raft.host.BootstrapStatus{
+                .{
+                    .group_id = 11,
+                    .kind = .backup_db_snapshot_restore,
+                    .phase = .failed,
+                    .last_error = "first failed",
+                    .backup_id = "backup-11",
+                    .snapshot_path = "backup-11/groups/11.afb",
+                },
+                .{
+                    .group_id = 12,
+                    .kind = .backup_db_snapshot_restore,
+                    .phase = .failed,
+                    .last_error = "second failed",
+                    .backup_id = "backup-12",
+                    .snapshot_path = "backup-12/groups/12.afb",
+                },
+            };
+            const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metadata_raft_role = "leader",
+                    .metrics = .{},
+                },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .nodes = nodes[0..],
+                .stores = stores[0..],
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .local_bootstrap_statuses = local_bootstrap_statuses[0..],
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = merged_group_statuses[0..],
+            };
+            var cloned = try cloneAdminSnapshotOwned(alloc, snapshot);
+            defer freeAdminSnapshotOwned(alloc, &cloned);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "data runtime remote metadata status stabilizes parser-backed role" {
+    const alloc = std.testing.allocator;
+    const source_role = try alloc.dupe(u8, "leader");
+    defer alloc.free(source_role);
+    const status = stabilizeMetadataStatus(.{
+        .metadata_group_id = 1,
+        .metadata_raft_role = source_role,
+        .metrics = .{},
+    });
+
+    try std.testing.expect(status.metadata_raft_role.ptr != source_role.ptr);
+    @memset(source_role, 'x');
+    try std.testing.expectEqualStrings("leader", status.metadata_raft_role);
+    const future = stabilizeMetadataStatus(.{
+        .metadata_group_id = 1,
+        .metadata_raft_role = "future_role",
+        .metrics = .{},
+    });
+    try std.testing.expectEqualStrings("unknown", future.metadata_raft_role);
+    try std.testing.expect(future.metadata_raft_role.ptr != "future_role".ptr);
 }
 
 test "data runtime metrics use prometheus labels for resource and cache dimensions" {
