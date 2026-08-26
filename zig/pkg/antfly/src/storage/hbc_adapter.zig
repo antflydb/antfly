@@ -2149,6 +2149,7 @@ const CompleteCoverageFlight = struct {
     io: std.Io,
     ready: std.Io.Event = .unset,
     refs: usize = 1,
+    validated: bool = false,
     next: ?*CompleteCoverageFlight = null,
 };
 
@@ -2157,6 +2158,7 @@ const FlatCentroidBuildFlight = struct {
     io: std.Io,
     ready: std.Io.Event = .unset,
     refs: usize = 1,
+    directory: ?*vectorindex_spfresh_index.FlatCentroidDirectory = null,
     next: ?*FlatCentroidBuildFlight = null,
 };
 
@@ -3338,7 +3340,7 @@ pub const HBCIndex = struct {
         self: *HBCIndex,
         flight: *CompleteCoverageFlight,
         cancellation: ?vectorindex_search_types.CancellationToken,
-    ) !void {
+    ) !bool {
         defer self.releaseCompleteCoverageFlightRef(flight);
         while (!flight.ready.isSet()) {
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
@@ -3353,11 +3355,15 @@ pub const HBCIndex = struct {
             };
         }
         if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        lockAtomic(&self.complete_coverage_state_mu);
+        defer self.complete_coverage_state_mu.unlock();
+        return flight.validated;
     }
 
     /// Elects one validator per publication generation. Contending callers
-    /// sleep on a runtime event and recheck after either success or failure;
-    /// cancellation only removes that waiter and never cancels the producer.
+    /// sleep on a runtime event, consume its successful result, or re-elect
+    /// after failure; cancellation only removes that waiter and never cancels
+    /// the producer.
     pub fn beginCompleteCoverageValidation(
         self: *HBCIndex,
         generation: u64,
@@ -3377,7 +3383,7 @@ pub const HBCIndex = struct {
                 if (flight.generation != generation) continue;
                 flight.refs += 1;
                 self.complete_coverage_state_mu.unlock();
-                try self.waitForCompleteCoverageFlight(flight, cancellation);
+                if (try self.waitForCompleteCoverageFlight(flight, cancellation)) return false;
                 continue :election;
             }
 
@@ -3403,7 +3409,7 @@ pub const HBCIndex = struct {
                 flight.refs += 1;
                 self.complete_coverage_state_mu.unlock();
                 self.alloc.destroy(candidate);
-                try self.waitForCompleteCoverageFlight(flight, cancellation);
+                if (try self.waitForCompleteCoverageFlight(flight, cancellation)) return false;
                 continue :election;
             }
             candidate.next = self.complete_coverage_flight;
@@ -3423,6 +3429,7 @@ pub const HBCIndex = struct {
             }
             link = &candidate.next;
         } else unreachable;
+        flight.validated = validated;
         if (validated) {
             var current = self.complete_coverage_generation.load(.acquire);
             while (current == std.math.maxInt(u64) or generation > current) {
@@ -3447,15 +3454,19 @@ pub const HBCIndex = struct {
         std.debug.assert(flight.refs > 0);
         flight.refs -= 1;
         const destroy = flight.refs == 0;
+        const directory = if (destroy) flight.directory else null;
         self.flat_centroid_build_mu.unlock();
-        if (destroy) self.alloc.destroy(flight);
+        if (destroy) {
+            self.alloc.destroy(flight);
+            if (directory) |retained| retained.release(self.alloc);
+        }
     }
 
     fn waitForFlatCentroidBuildFlight(
         self: *HBCIndex,
         flight: *FlatCentroidBuildFlight,
         cancellation: ?vectorindex_search_types.CancellationToken,
-    ) !void {
+    ) !?*vectorindex_spfresh_index.FlatCentroidDirectory {
         defer self.releaseFlatCentroidBuildFlightRef(flight);
         while (!flight.ready.isSet()) {
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
@@ -3470,6 +3481,11 @@ pub const HBCIndex = struct {
             };
         }
         if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        lockAtomic(&self.flat_centroid_build_mu);
+        defer self.flat_centroid_build_mu.unlock();
+        const directory = flight.directory;
+        if (directory) |retained| retained.retain();
+        return directory;
     }
 
     /// Elect one cold directory builder per generation. Same-generation
@@ -3479,7 +3495,7 @@ pub const HBCIndex = struct {
         self: *HBCIndex,
         generation: u64,
         cancellation: ?vectorindex_search_types.CancellationToken,
-    ) !bool {
+    ) !vectorindex_spfresh_index.FlatCentroidBuildClaim {
         if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         lockAtomic(&self.flat_centroid_build_mu);
         var current_flight = self.flat_centroid_build_flight;
@@ -3487,8 +3503,10 @@ pub const HBCIndex = struct {
             if (flight.generation != generation) continue;
             flight.refs += 1;
             self.flat_centroid_build_mu.unlock();
-            try self.waitForFlatCentroidBuildFlight(flight, cancellation);
-            return false;
+            return if (try self.waitForFlatCentroidBuildFlight(flight, cancellation)) |directory|
+                .{ .ready = directory }
+            else
+                .retry;
         }
         self.flat_centroid_build_mu.unlock();
 
@@ -3506,16 +3524,22 @@ pub const HBCIndex = struct {
             flight.refs += 1;
             self.flat_centroid_build_mu.unlock();
             self.alloc.destroy(candidate);
-            try self.waitForFlatCentroidBuildFlight(flight, cancellation);
-            return false;
+            return if (try self.waitForFlatCentroidBuildFlight(flight, cancellation)) |directory|
+                .{ .ready = directory }
+            else
+                .retry;
         }
         candidate.next = self.flat_centroid_build_flight;
         self.flat_centroid_build_flight = candidate;
         self.flat_centroid_build_mu.unlock();
-        return true;
+        return .owner;
     }
 
-    pub fn finishFlatCentroidDirectoryBuild(self: *HBCIndex, generation: u64) void {
+    pub fn finishFlatCentroidDirectoryBuild(
+        self: *HBCIndex,
+        generation: u64,
+        directory: ?*vectorindex_spfresh_index.FlatCentroidDirectory,
+    ) void {
         lockAtomic(&self.flat_centroid_build_mu);
         var link = &self.flat_centroid_build_flight;
         const flight = while (link.*) |candidate| {
@@ -3525,6 +3549,10 @@ pub const HBCIndex = struct {
             }
             link = &candidate.next;
         } else unreachable;
+        if (directory) |retained| {
+            retained.retain();
+            flight.directory = retained;
+        }
         self.flat_centroid_build_mu.unlock();
         flight.ready.set(flight.io);
         self.releaseFlatCentroidBuildFlightRef(flight);
@@ -6169,10 +6197,16 @@ pub const HBCIndex = struct {
         const packed_value = try vectorindex_hbc.decodePackedNodeValue(packed_data);
         if (packed_value.centroid_bytes.len % @sizeOf(f32) != 0) return error.Corrupted;
         if (packed_value.ids_bytes.len % @sizeOf(u64) != 0) return error.Corrupted;
+        const max_centroid_bytes = std.math.mul(
+            usize,
+            @as(usize, @intCast(self.config.dims)),
+            @sizeOf(f32),
+        ) catch return error.Corrupted;
+        if (packed_value.centroid_bytes.len > max_centroid_bytes) return error.Corrupted;
         const centroid_len = packed_value.centroid_bytes.len;
         const ids_len = packed_value.ids_bytes.len;
         const ids_offset = std.mem.alignForward(usize, centroid_len, @alignOf(u64));
-        const total_len = ids_offset + ids_len;
+        const total_len = std.math.add(usize, ids_offset, ids_len) catch return error.Corrupted;
 
         var backing: []align(@alignOf(u64)) u8 = if (total_len > 0)
             try self.alloc.alignedAlloc(u8, std.mem.Alignment.of(u64), total_len)
@@ -6225,6 +6259,79 @@ pub const HBCIndex = struct {
         return try vectorindex_posting.decodeState(data);
     }
 
+    /// Decode only the fields needed to build the flat centroid directory.
+    /// Leaf membership can legitimately exceed `leaf_size` between bounded
+    /// bulk-finish publication windows, but the directory only needs to know
+    /// whether the posting is empty. Represent that fact with one marker id so
+    /// malformed or very large leaf payloads cannot bypass cold-build
+    /// admission by forcing a second full membership copy.
+    pub fn loadFlatCentroidDirectoryNodeFromStorage(self: *HBCIndex, txn: anytype, node_id: u64) !Node {
+        var key_buf: [12]u8 = undefined;
+
+        const packed_data = try self.getNamespacedCommitted(txn, .nodes, encodeNodeKey(&key_buf, node_id, .packed_node));
+        const packed_value = try vectorindex_hbc.decodePackedNodeValue(packed_data);
+        if (packed_value.centroid_bytes.len % @sizeOf(f32) != 0) return error.Corrupted;
+        if (packed_value.ids_bytes.len % @sizeOf(u64) != 0) return error.Corrupted;
+        const max_centroid_bytes = std.math.mul(
+            usize,
+            @as(usize, @intCast(self.config.dims)),
+            @sizeOf(f32),
+        ) catch return error.Corrupted;
+        if (packed_value.centroid_bytes.len > max_centroid_bytes) return error.Corrupted;
+        const stored_id_count = packed_value.ids_bytes.len / @sizeOf(u64);
+        if (!packed_value.header.is_leaf and stored_id_count > self.config.branching_factor)
+            return error.Corrupted;
+
+        const centroid_len = packed_value.centroid_bytes.len;
+        const decoded_ids_len: usize = if (packed_value.header.is_leaf)
+            if (stored_id_count == 0) 0 else @sizeOf(u64)
+        else
+            packed_value.ids_bytes.len;
+        const ids_offset = std.mem.alignForward(usize, centroid_len, @alignOf(u64));
+        const total_len = std.math.add(usize, ids_offset, decoded_ids_len) catch return error.Corrupted;
+
+        var backing: []align(@alignOf(u64)) u8 = if (total_len > 0)
+            try self.alloc.alignedAlloc(u8, std.mem.Alignment.of(u64), total_len)
+        else
+            &.{};
+        errdefer if (backing.len > 0) self.alloc.free(backing);
+
+        const centroid: []f32 = if (centroid_len > 0) blk: {
+            const dst: []align(@alignOf(f32)) u8 = @alignCast(backing[0..centroid_len]);
+            @memcpy(dst, packed_value.centroid_bytes);
+            break :blk @as([*]f32, @ptrCast(dst.ptr))[0 .. centroid_len / @sizeOf(f32)];
+        } else blk: {
+            break :blk &.{};
+        };
+
+        var children: []u64 = &.{};
+        var members: []u64 = &.{};
+        if (decoded_ids_len > 0) {
+            const dst: []u8 = backing[ids_offset .. ids_offset + decoded_ids_len];
+            const aligned_dst: []align(@alignOf(u64)) u8 = @alignCast(dst);
+            if (packed_value.header.is_leaf) {
+                std.mem.writeInt(u64, aligned_dst[0..@sizeOf(u64)], 0, .little);
+                members = std.mem.bytesAsSlice(u64, aligned_dst);
+            } else {
+                @memcpy(dst, packed_value.ids_bytes);
+                children = std.mem.bytesAsSlice(u64, aligned_dst);
+            }
+        }
+
+        return .{
+            .id = node_id,
+            .is_leaf = packed_value.header.is_leaf,
+            .level = packed_value.header.level,
+            .parent = packed_value.header.parent,
+            .centroid = centroid,
+            .covering_radius = packed_value.covering_radius,
+            .children = children,
+            .members = members,
+            .posting_state = .{},
+            .backing = backing,
+        };
+    }
+
     pub fn loadSearchNodeFromStorage(self: *HBCIndex, txn: anytype, node_id: u64) !Node {
         var key_buf: [12]u8 = undefined;
 
@@ -6232,6 +6339,12 @@ pub const HBCIndex = struct {
         const packed_value = try vectorindex_hbc.decodePackedNodeValue(packed_data);
         if (packed_value.centroid_bytes.len % @sizeOf(f32) != 0) return error.Corrupted;
         if (packed_value.ids_bytes.len % @sizeOf(u64) != 0) return error.Corrupted;
+        const max_centroid_bytes = std.math.mul(
+            usize,
+            @as(usize, @intCast(self.config.dims)),
+            @sizeOf(f32),
+        ) catch return error.Corrupted;
+        if (packed_value.centroid_bytes.len > max_centroid_bytes) return error.Corrupted;
         if (!packed_value.header.is_leaf and
             packed_value.ids_bytes.len / @sizeOf(u64) > self.config.branching_factor)
         {
@@ -6244,7 +6357,7 @@ pub const HBCIndex = struct {
         const centroid_len = packed_value.centroid_bytes.len;
         const ids_len = packed_value.ids_bytes.len;
         const ids_offset = std.mem.alignForward(usize, centroid_len, @alignOf(u64));
-        const total_len = ids_offset + ids_len;
+        const total_len = std.math.add(usize, ids_offset, ids_len) catch return error.Corrupted;
 
         var backing: []align(@alignOf(u64)) u8 = if (total_len > 0)
             try self.alloc.alignedAlloc(u8, std.mem.Alignment.of(u64), total_len)
@@ -9103,6 +9216,69 @@ test "search node loading rejects oversized published internal fanout" {
     var txn = try idx.beginReadTxn();
     defer txn.abort();
     try std.testing.expectError(error.Corrupted, idx.loadSearchNodeFromStorage(&txn, root_id));
+    try std.testing.expectError(error.Corrupted, idx.loadFlatCentroidDirectoryNodeFromStorage(&txn, root_id));
+}
+
+test "flat directory node loading bounds oversized leaf payloads and centroids" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const dims = 4;
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = dims,
+        .leaf_size = 4,
+        .branching_factor = 4,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+    });
+    defer idx.close();
+    try idx.insert(1, &.{ 0.1, 0.2, 0.3, 0.4 });
+
+    const root_id = idx.metadata.root_node;
+    {
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try idx.loadNode(&txn, root_id);
+        defer root.deinit(alloc);
+        try std.testing.expect(root.is_leaf);
+        try root.ensureUnbacked(alloc);
+        const oversized_members = try alloc.alloc(u64, 1024);
+        @memset(oversized_members, 1);
+        alloc.free(root.members);
+        root.members = oversized_members;
+        try idx.saveNodeBody(&txn, &root);
+        try txn.commit();
+    }
+
+    {
+        var txn = try idx.beginReadTxn();
+        defer txn.abort();
+        var directory_node = try idx.loadFlatCentroidDirectoryNodeFromStorage(&txn, root_id);
+        defer directory_node.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), directory_node.members.len);
+        try std.testing.expect(directory_node.backing.len <= dims * @sizeOf(f32) + @sizeOf(u64));
+    }
+
+    {
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try idx.loadNode(&txn, root_id);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        const oversized_centroid = try alloc.alloc(f32, dims + 1);
+        @memset(oversized_centroid, 0);
+        alloc.free(root.centroid);
+        root.centroid = oversized_centroid;
+        try idx.saveNodeBody(&txn, &root);
+        try txn.commit();
+    }
+
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expectError(error.Corrupted, idx.loadSearchNodeFromStorage(&txn, root_id));
+    try std.testing.expectError(error.Corrupted, idx.loadFlatCentroidDirectoryNodeFromStorage(&txn, root_id));
 }
 
 test "complete snapshot rejects orphaned reachable coverage and schedules generation repair" {
@@ -9305,6 +9481,48 @@ test "complete coverage validation waiter honors cancellation without canceling 
     try std.testing.expect(!try idx.beginCompleteCoverageValidation(generation, null));
 }
 
+test "complete coverage flight preserves older success after newer validation" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+    const older = idx.publishedGeneration();
+    const newer = older +| 2;
+
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(older, null));
+    lockAtomic(&idx.complete_coverage_state_mu);
+    const older_flight = idx.complete_coverage_flight orelse return error.TestUnexpectedResult;
+    older_flight.refs += 1;
+    idx.complete_coverage_state_mu.unlock();
+
+    idx.finishCompleteCoverageValidation(older, true);
+    try std.testing.expect(try idx.beginCompleteCoverageValidation(newer, null));
+    idx.finishCompleteCoverageValidation(newer, true);
+    try std.testing.expect(idx.completeCoverageAlreadyValidated(newer));
+
+    // A waiter retained the generation-keyed flight before the newer
+    // validation advanced the one-entry fast cache. It must consume the old
+    // successful outcome instead of electing another O(N) validator.
+    try std.testing.expect(try idx.waitForCompleteCoverageFlight(older_flight, null));
+}
+
+fn waitForFlatCentroidBuildWaiter(index: *HBCIndex, generation: u64, io: std.Io) !void {
+    for (0..5_000) |_| {
+        lockAtomic(&index.flat_centroid_build_mu);
+        var current = index.flat_centroid_build_flight;
+        const joined = while (current) |flight| : (current = flight.next) {
+            if (flight.generation == generation and flight.refs > 1) break true;
+        } else false;
+        index.flat_centroid_build_mu.unlock();
+        if (joined) return;
+        try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "flat centroid build single flight waits on backend runtime" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -9320,23 +9538,154 @@ test "flat centroid build single flight waits on backend runtime" {
     idx.setIo(io);
 
     const generation = idx.publishedGeneration();
-    try std.testing.expect(try idx.beginFlatCentroidDirectoryBuild(generation, null));
+    switch (try idx.beginFlatCentroidDirectoryBuild(generation, null)) {
+        .owner => {},
+        else => return error.TestUnexpectedResult,
+    }
     var owner_active = true;
-    defer if (owner_active) idx.finishFlatCentroidDirectoryBuild(generation);
+    defer if (owner_active) idx.finishFlatCentroidDirectoryBuild(generation, null);
 
     const Waiter = struct {
-        fn run(index: *HBCIndex, expected_generation: u64) !bool {
+        fn run(index: *HBCIndex, expected_generation: u64) !vectorindex_spfresh_index.FlatCentroidBuildClaim {
             return try index.beginFlatCentroidDirectoryBuild(expected_generation, null);
         }
     };
     var waiter = std.Io.async(io, Waiter.run, .{ &idx, generation });
-    try io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
-    idx.finishFlatCentroidDirectoryBuild(generation);
+    try waitForFlatCentroidBuildWaiter(&idx, generation, io);
+    idx.finishFlatCentroidDirectoryBuild(generation, null);
     owner_active = false;
-    try std.testing.expect(!try waiter.await(io));
+    switch (try waiter.await(io)) {
+        .retry => {},
+        else => return error.TestUnexpectedResult,
+    }
 
-    try std.testing.expect(try idx.beginFlatCentroidDirectoryBuild(generation, null));
-    idx.finishFlatCentroidDirectoryBuild(generation);
+    switch (try idx.beginFlatCentroidDirectoryBuild(generation, null)) {
+        .owner => {},
+        else => return error.TestUnexpectedResult,
+    }
+    idx.finishFlatCentroidDirectoryBuild(generation, null);
+}
+
+test "flat centroid build flight shares a completed stale generation result" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
+    defer idx.close();
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    idx.setIo(io);
+
+    const generation = idx.publishedGeneration();
+    switch (try idx.beginFlatCentroidDirectoryBuild(generation, null)) {
+        .owner => {},
+        else => return error.TestUnexpectedResult,
+    }
+    var owner_active = true;
+    defer if (owner_active) idx.finishFlatCentroidDirectoryBuild(generation, null);
+
+    const Waiter = struct {
+        fn run(index: *HBCIndex, expected_generation: u64) !vectorindex_spfresh_index.FlatCentroidBuildClaim {
+            return try index.beginFlatCentroidDirectoryBuild(expected_generation, null);
+        }
+    };
+    var waiter = std.Io.async(io, Waiter.run, .{ &idx, generation });
+    try waitForFlatCentroidBuildWaiter(&idx, generation, io);
+
+    const directory = try alloc.create(vectorindex_spfresh_index.FlatCentroidDirectory);
+    directory.* = .{ .publish_generation_snapshot = generation };
+    var directory_owned = true;
+    defer if (directory_owned) directory.release(alloc);
+    idx.finishFlatCentroidDirectoryBuild(generation, directory);
+    owner_active = false;
+
+    switch (try waiter.await(io)) {
+        .ready => |shared| {
+            try std.testing.expectEqual(directory, shared);
+            shared.release(alloc);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    directory.release(alloc);
+    directory_owned = false;
+}
+
+test "stale flat directory build preserves the current generation cache" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 4,
+        .leaf_size = 4,
+        .branching_factor = 4,
+        .use_quantization = true,
+        .centroid_directory_mode = .flat_rabitq,
+        .flat_centroid_block_size = 4,
+    });
+    defer idx.close();
+    var id: u64 = 1;
+    while (id <= 60) : (id += 1) {
+        const value: f32 = @floatFromInt(id);
+        try idx.insert(id, &.{ value, value / 2, value / 3, value / 4 });
+    }
+
+    const older_snapshot: vectorindex_spfresh_index.PublishedSnapshot = .{
+        .root_node = idx.publishedRootNode(),
+        .node_count = idx.publishedNodeCount(),
+        .publish_generation = idx.publishedGeneration(),
+    };
+    var older_txn = try idx.beginReadTxn();
+    defer older_txn.abort();
+
+    idx.refreshPublishedSearchState();
+    const current_generation = idx.publishedGeneration();
+    try std.testing.expect(current_generation > older_snapshot.publish_generation);
+    var current_results = try idx.searchWithRequest(.{
+        .query = &.{ 1, 1, 1, 1 },
+        .k = 5,
+        .load_metadata = false,
+    });
+    current_results.deinit();
+
+    lockAtomic(&idx.flat_centroid_mu);
+    const current_directory = idx.flat_centroid_directory orelse {
+        idx.flat_centroid_mu.unlock();
+        return error.TestUnexpectedResult;
+    };
+    const cached_generation = current_directory.publish_generation_snapshot;
+    idx.flat_centroid_mu.unlock();
+    try std.testing.expectEqual(current_generation, cached_generation);
+
+    var scratch_handle = try idx.acquireSearchScratch();
+    defer {
+        idx.refreshSearchScratchAccounting(&scratch_handle);
+        idx.releaseSearchScratch(&scratch_handle);
+    }
+    var profile: SearchProfile = .{};
+    const probes = try vectorindex_spfresh_index.selectFlatRabitqPostingsAlloc(
+        &idx,
+        &older_txn,
+        &.{ 1, 1, 1, 1 },
+        &scratch_handle,
+        &profile,
+        .complete_snapshot,
+        older_snapshot,
+        null,
+        nowNs,
+        elapsedSince,
+    );
+    try std.testing.expect(probes.len > 0);
+
+    lockAtomic(&idx.flat_centroid_mu);
+    defer idx.flat_centroid_mu.unlock();
+    try std.testing.expectEqual(current_directory, idx.flat_centroid_directory.?);
+    try std.testing.expectEqual(current_generation, idx.flat_centroid_directory.?.publish_generation_snapshot);
 }
 
 test "coverage and flat build flights do not block a newer generation" {
@@ -9356,10 +9705,16 @@ test "coverage and flat build flights do not block a newer generation" {
     idx.finishCompleteCoverageValidation(older, true);
     try std.testing.expect(idx.completeCoverageAlreadyValidated(newer));
 
-    try std.testing.expect(try idx.beginFlatCentroidDirectoryBuild(older, null));
-    try std.testing.expect(try idx.beginFlatCentroidDirectoryBuild(newer, null));
-    idx.finishFlatCentroidDirectoryBuild(older);
-    idx.finishFlatCentroidDirectoryBuild(newer);
+    switch (try idx.beginFlatCentroidDirectoryBuild(older, null)) {
+        .owner => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (try idx.beginFlatCentroidDirectoryBuild(newer, null)) {
+        .owner => {},
+        else => return error.TestUnexpectedResult,
+    }
+    idx.finishFlatCentroidDirectoryBuild(older, null);
+    idx.finishFlatCentroidDirectoryBuild(newer, null);
 }
 
 test "search publication wait uses runtime wakeups and honors cancellation" {

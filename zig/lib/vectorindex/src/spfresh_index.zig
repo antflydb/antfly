@@ -103,6 +103,12 @@ pub const FlatCentroidBuildReservation = struct {
     }
 };
 
+pub const FlatCentroidBuildClaim = union(enum) {
+    owner,
+    retry,
+    ready: *FlatCentroidDirectory,
+};
+
 /// Conservative peak allocation for a cold flat-directory build. It covers
 /// the retained RaBitQ output for the worst case (every published node is a
 /// leaf), traversal arrays, raw centroid blocks, and RaBitQ's normalization
@@ -469,6 +475,9 @@ fn loadStablePublishedSnapshot(
 
 fn loadPublishedNode(self: anytype, txn: anytype, node_id: u64) !types.Node {
     const Index = comptime @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "loadFlatCentroidDirectoryNodeFromStorage")) {
+        return try self.loadFlatCentroidDirectoryNodeFromStorage(txn, node_id);
+    }
     if (comptime @hasDecl(Index, "loadSearchNodeFromStorage")) {
         return try self.loadSearchNodeFromStorage(txn, node_id);
     }
@@ -489,10 +498,14 @@ fn snapshotStillPublished(self: anytype, snapshot: PublishedSnapshot) bool {
         publishedNodeCountSnapshot(self) == snapshot.node_count;
 }
 
-fn finishFlatCentroidBuildIfSupported(self: anytype, generation: u64) void {
+fn finishFlatCentroidBuildIfSupported(
+    self: anytype,
+    generation: u64,
+    directory: ?*FlatCentroidDirectory,
+) void {
     const Index = comptime @TypeOf(self.*);
     if (comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild")) {
-        self.finishFlatCentroidDirectoryBuild(generation);
+        self.finishFlatCentroidDirectoryBuild(generation, directory);
     }
 }
 
@@ -669,17 +682,28 @@ fn acquireFlatCentroidDirectory(
                 self.flat_centroid_mu.unlock();
                 return directory;
             }
-            stale = directory;
-            self.flat_centroid_directory = null;
         }
         self.flat_centroid_mu.unlock();
-        if (stale) |directory| directory.release(self.alloc);
 
         if (comptime @hasDecl(Index, "beginFlatCentroidDirectoryBuild")) {
-            if (!try self.beginFlatCentroidDirectoryBuild(snapshot.publish_generation, cancellation)) continue;
+            switch (try self.beginFlatCentroidDirectoryBuild(snapshot.publish_generation, cancellation)) {
+                .owner => {},
+                .retry => continue,
+                .ready => |directory| {
+                    // The adapter keys flights by generation, but retain the
+                    // full snapshot check at this generic boundary. This
+                    // keeps a buggy or wrapped generation from handing a
+                    // caller a directory for different topology.
+                    if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
+                        return directory;
+                    }
+                    directory.release(self.alloc);
+                    continue;
+                },
+            }
         }
         var build_flight_open = comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild");
-        defer if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation);
+        defer if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, null);
 
         var build_reservation: FlatCentroidBuildReservation = .{};
         if (comptime @hasDecl(Index, "reserveFlatCentroidDirectoryBuildBytes")) {
@@ -727,7 +751,7 @@ fn acquireFlatCentroidDirectory(
             {
                 built.deinit(self.alloc);
                 self.alloc.destroy(built);
-                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation);
+                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, null);
                 build_flight_open = false;
                 continue;
             }
@@ -736,7 +760,7 @@ fn acquireFlatCentroidDirectory(
         lockAtomicMutex(&self.flat_centroid_mu);
         if (expected_snapshot != null and !snapshotStillPublished(self, snapshot)) {
             self.flat_centroid_mu.unlock();
-            if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation);
+            if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, built);
             build_flight_open = false;
             return built;
         }
@@ -746,7 +770,7 @@ fn acquireFlatCentroidDirectory(
                 self.flat_centroid_mu.unlock();
                 built.deinit(self.alloc);
                 self.alloc.destroy(built);
-                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation);
+                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, directory);
                 build_flight_open = false;
                 return directory;
             }
@@ -759,7 +783,7 @@ fn acquireFlatCentroidDirectory(
         self.flat_centroid_directory = built;
         self.flat_centroid_mu.unlock();
         if (stale) |directory| directory.release(self.alloc);
-        if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation);
+        if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, built);
         build_flight_open = false;
         return built;
     }
