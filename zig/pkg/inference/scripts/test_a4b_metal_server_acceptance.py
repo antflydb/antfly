@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -19,15 +20,23 @@ GOOD_TELEMETRY = (
     "metal_a4b_server_request: scope=process_delta model=gemma-a4b "
     "route_select_attempts=120 route_select_successes=120 route_select_fallbacks=0 "
     "slot_lookup_attempts=120 slot_route_hits=880 slot_route_misses=80 "
-    "slot_all_hit_layers=70 slot_map_publications=120 slot_map_publish_failures=0 "
-    "slot_arena_attempts=0 slot_arena_successes=0 slot_arena_failures=0 "
-    "slot_uploads=0 slot_upload_bytes=0 "
+    "slot_all_hit_layers=70 slot_map_publications=30 slot_map_publish_failures=0 "
+    "slot_arena_attempts=30 slot_arena_successes=30 slot_arena_failures=0 "
+    "slot_upload_batches=30 slot_uploads=240 "
     "mapped_attempts=8 mapped_fallbacks=0 mapped_failures=0 "
     "linear_attempts=0 linear_successes=0 linear_fallbacks=0 "
     "pair_attempts=0 pair_successes=0 pair_fallbacks=0 "
     "scatter_attempts=0 scatter_successes=0 scatter_fallbacks=0 "
     "frame_begins=667 frame_submits=457 compute_encoders=2207 "
-    "blit_encoders=0 bootstrap_misses=0"
+    "blit_encoders=30 bootstrap_misses=0\n"
+    "metal_a4b_server_selected_page: scope=process_delta model=gemma-a4b "
+    "attempts=0 successes=0 failures=0 logical_bytes=0 mapped_bytes=0 allocations=0"
+)
+SELECTED_PAGE_TELEMETRY = (
+    GOOD_TELEMETRY.replace("attempts=0 successes=0", "attempts=120 successes=120")
+    .replace("logical_bytes=0", "logical_bytes=3211591680")
+    .replace("mapped_bytes=0", "mapped_bytes=3232235520")
+    .replace("allocations=0", "allocations=1920")
 )
 RUNTIME = (
     "gemma4_a4b_runtime: mode=streamed budget_mb=2048 kv_mb=512 "
@@ -36,6 +45,11 @@ RUNTIME = (
 GOOD_TIMING = (
     "generate_timing_ms: prompt_format=0 tokenize=0 runtime_prepare=1 "
     "prefill=2100 decode=1000 text_decode=1 total=3101"
+)
+SELECTED_PAGE_MOE = (
+    "metal_a4b_selected_page_moe: enabled=1 logical_bytes=26763264 "
+    "mapped_page_bytes=26935296 allocations=16 persistent_cache=0 "
+    "weight_copies=0 rollback=TERMITE_METAL_DISABLE_A4B_SELECTED_EXPERT_PAGE_MOE"
 )
 
 
@@ -153,6 +167,57 @@ class ResourceMonitorTests(unittest.TestCase):
 
 
 class ContractTests(unittest.TestCase):
+    def test_short_serial_oracle_never_self_promotes_to_release_ready(self) -> None:
+        qualification = acceptance.release_qualification(
+            semantic_oracle_attested=True
+        )
+        self.assertFalse(qualification["release_ready"])
+        self.assertTrue(qualification["semantic_oracle_attested"])
+        self.assertEqual("short_serial_acceptance", qualification["scope"])
+
+    def test_defaults_keep_streamed_residency_bounded_with_aggregate_headroom(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            binary = tmp / "antfly-inference"
+            binary.touch()
+            model_dir = tmp / "model"
+            model_dir.mkdir()
+            with mock.patch.object(acceptance.platform, "system", return_value="Darwin"):
+                args = acceptance.parse_args(
+                    [
+                        "--antfly-bin",
+                        str(binary),
+                        "--model-dir",
+                        str(model_dir),
+                    ]
+                )
+        self.assertEqual(2048, args.memory_budget_mb)
+        self.assertEqual(2304, args.backend_budget_mb)
+        self.assertEqual(4096, args.combined_budget_mb)
+
+    def test_cautious_gate_accepts_100_output_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            tmp = Path(raw_tmp)
+            binary = tmp / "antfly-inference"
+            binary.touch()
+            model_dir = tmp / "model"
+            model_dir.mkdir()
+            with mock.patch.object(acceptance.platform, "system", return_value="Darwin"):
+                args = acceptance.parse_args(
+                    [
+                        "--antfly-bin",
+                        str(binary),
+                        "--model-dir",
+                        str(model_dir),
+                        "--output-tokens",
+                        "100",
+                    ]
+                )
+        self.assertEqual(100, args.output_tokens)
+        self.assertEqual(6500, args.max_frame_submits)
+
     def test_server_environment_enables_only_requested_diagnostics(self) -> None:
         plain = acceptance.effective_server_environment()
         debug = acceptance.effective_server_environment(debug_metal_timing=True)
@@ -164,6 +229,9 @@ class ContractTests(unittest.TestCase):
         )
         host_routes = acceptance.effective_server_environment(
             disable_device_moe_route_select=True
+        )
+        selected_pages = acceptance.effective_server_environment(
+            selected_expert_page_moe=True
         )
         self.assertEqual("1", plain["TERMITE_SERVER_A4B_TELEMETRY"])
         self.assertEqual("1", plain["TERMITE_SERVER_GENERATE_TIMING"])
@@ -182,6 +250,11 @@ class ContractTests(unittest.TestCase):
         )
         self.assertEqual(
             "1", host_routes["TERMITE_METAL_DISABLE_DEVICE_MOE_ROUTE_SELECT"]
+        )
+        self.assertNotIn("TERMITE_METAL_ENABLE_A4B_SELECTED_EXPERT_PAGE_MOE", plain)
+        self.assertEqual(
+            "1",
+            selected_pages["TERMITE_METAL_ENABLE_A4B_SELECTED_EXPERT_PAGE_MOE"],
         )
 
     def test_server_environment_rejects_conflicting_attention_overrides(self) -> None:
@@ -311,6 +384,121 @@ class ContractTests(unittest.TestCase):
             7.0, result["generation_timings_ms"][0]["decode_tok_s"]
         )
 
+    def test_selected_page_moe_requires_bounded_no_copy_marker(self) -> None:
+        result = acceptance.validate_server_log(
+            RUNTIME
+            + "\n"
+            + SELECTED_PAGE_MOE
+            + "\n"
+            + GOOD_TIMING
+            + "\n"
+            + SELECTED_PAGE_TELEMETRY,
+            residency_mode="streamed",
+            memory_budget_mb=2048,
+            output_tokens=8,
+            request_count=1,
+            max_frame_submits=520,
+            require_selected_page_moe=True,
+        )
+        self.assertEqual(16, result["selected_page_moe"]["allocations"])
+        self.assertEqual(0, result["selected_page_moe"]["weight_copies"])
+        self.assertEqual(
+            120, result["measured_events"][0]["selected_page_successes"]
+        )
+
+    def test_selected_page_moe_requires_request_scoped_success(self) -> None:
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "selected-expert page MoE telemetry"
+        ):
+            acceptance.validate_server_log(
+                RUNTIME
+                + "\n"
+                + SELECTED_PAGE_MOE
+                + "\n"
+                + GOOD_TIMING
+                + "\n"
+                + GOOD_TELEMETRY,
+                residency_mode="streamed",
+                memory_budget_mb=2048,
+                output_tokens=8,
+                request_count=1,
+                max_frame_submits=520,
+                require_selected_page_moe=True,
+            )
+
+    def test_selected_page_moe_missing_request_telemetry_fails_closed(self) -> None:
+        base_telemetry = GOOD_TELEMETRY.splitlines()[0]
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError,
+            "measured selected-expert page MoE telemetry events",
+        ):
+            acceptance.validate_server_log(
+                RUNTIME
+                + "\n"
+                + SELECTED_PAGE_MOE
+                + "\n"
+                + GOOD_TIMING
+                + "\n"
+                + base_telemetry,
+                residency_mode="streamed",
+                memory_budget_mb=2048,
+                output_tokens=8,
+                request_count=1,
+                max_frame_submits=520,
+                require_selected_page_moe=True,
+            )
+
+    def test_selected_page_moe_rejects_request_accounting_mismatch(self) -> None:
+        bad = SELECTED_PAGE_TELEMETRY.replace(
+            "allocations=1920", "allocations=1919"
+        )
+        with self.assertRaisesRegex(
+            acceptance.AcceptanceError, "selected-expert page MoE telemetry"
+        ):
+            acceptance.validate_server_log(
+                RUNTIME + "\n" + SELECTED_PAGE_MOE + "\n" + GOOD_TIMING + "\n" + bad,
+                residency_mode="streamed",
+                memory_budget_mb=2048,
+                output_tokens=8,
+                request_count=1,
+                max_frame_submits=520,
+                require_selected_page_moe=True,
+            )
+
+    def test_unrequested_selected_page_request_telemetry_is_rejected(self) -> None:
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "explicit harness request"):
+            acceptance.validate_server_log(
+                RUNTIME + "\n" + GOOD_TIMING + "\n" + SELECTED_PAGE_TELEMETRY,
+                residency_mode="streamed",
+                memory_budget_mb=2048,
+                output_tokens=8,
+                request_count=1,
+                max_frame_submits=520,
+            )
+
+    def test_selected_page_moe_missing_marker_fails_closed(self) -> None:
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "marker is missing"):
+            acceptance.validate_server_log(
+                RUNTIME + "\n" + GOOD_TIMING + "\n" + GOOD_TELEMETRY,
+                residency_mode="streamed",
+                memory_budget_mb=2048,
+                output_tokens=8,
+                request_count=1,
+                max_frame_submits=520,
+                require_selected_page_moe=True,
+            )
+
+    def test_selected_page_moe_unrequested_marker_is_rejected(self) -> None:
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "explicit harness request"):
+            acceptance.validate_server_log(
+                RUNTIME + "\n" + SELECTED_PAGE_MOE + "\n" + GOOD_TIMING + "\n" + GOOD_TELEMETRY,
+                residency_mode="streamed",
+                memory_budget_mb=2048,
+                output_tokens=8,
+                request_count=1,
+                max_frame_submits=520,
+            )
+
     def test_any_route_fallback_is_rejected(self) -> None:
         bad = GOOD_TELEMETRY.replace("linear_fallbacks=0", "linear_fallbacks=1")
         with self.assertRaisesRegex(acceptance.AcceptanceError, "forbidden"):
@@ -322,6 +510,29 @@ class ContractTests(unittest.TestCase):
                 request_count=1,
                 max_frame_submits=520,
             )
+
+    def test_unattributed_blit_is_rejected(self) -> None:
+        bad = GOOD_TELEMETRY.replace("blit_encoders=30", "blit_encoders=31")
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "unattributed"):
+            acceptance.validate_server_log(
+                RUNTIME + "\n" + GOOD_TIMING + "\n" + bad,
+                residency_mode="streamed",
+                memory_budget_mb=2048,
+                output_tokens=8,
+                request_count=1,
+                max_frame_submits=520,
+            )
+
+    def test_attributed_slot_upload_blits_are_accepted(self) -> None:
+        result = acceptance.validate_server_log(
+            RUNTIME + "\n" + GOOD_TIMING + "\n" + GOOD_TELEMETRY,
+            residency_mode="streamed",
+            memory_budget_mb=2048,
+            output_tokens=8,
+            request_count=1,
+            max_frame_submits=520,
+        )
+        self.assertEqual(30, result["measured_events"][0]["slot_upload_batches"])
 
     def test_host_route_selection_rollback_is_attested(self) -> None:
         host_routes = (

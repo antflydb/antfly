@@ -360,6 +360,11 @@ pub fn build(b: *std.Build) void {
     }
 
     const quant_kernel_metal_runtime_check_step = b.step("quant-kernel-metal-runtime-check", "Run dev-only generated Metal quant kernel correctness check");
+    const a4b_metal_id_replay_step = b.step("a4b-metal-id-replay", "Replay exact Gemma4 26B-A4B Q4_0 MUL_MV_ID decode shapes on Metal");
+    const a4b_metal_common_q4_replay_step = b.step("a4b-metal-common-q4-replay", "Replay packed-layout candidates for Gemma4 26B-A4B common Q4_0 decode shapes on Metal");
+    const a4b_metal_route_select_replay_step = b.step("a4b-metal-route-select-replay", "Replay exact Gemma4 26B-A4B serial and SIMD-group route selection on Metal");
+    const a4b_metal_router_projection_replay_step = b.step("a4b-metal-router-projection-replay", "Replay exact Gemma4 26B-A4B scalar and SIMD-group router projection on Metal");
+    const a4b_metal_lm_head_replay_step = b.step("a4b-metal-lm-head-replay", "Replay the Gemma4 26B-A4B Q6_K LM-head odd-tail candidate on Metal");
     const metal_decode_gqa_split_routes_step = b.step("test-metal-decode-gqa-split-routes", "Run only the Metal split-GQA production-route tensor oracle");
     const quant_kernel_metal_v2_conformance_step = b.step("quant-kernel-metal-v2-conformance", "Run rendered v2 Metal quant kernels against the CPU reference on device");
     const quant_kernel_metal_sweep_step = b.step("quant-kernel-metal-sweep", "Sweep rendered Metal quant kernel schedule variants and report per-route winners");
@@ -370,6 +375,76 @@ pub fn build(b: *std.Build) void {
     const quant_kernel_metal_blocker_strict_step = b.step("quant-kernel-metal-blocker-strict-check", "Fail if saved Metal blocker evidence clears and needs promotion review");
     var quant_kernel_metal_production_regression_run_step: ?*std.Build.Step = null;
     if (target.result.os.tag == .macos) {
+        const a4b_metal_id_replay_exe = b.addExecutable(.{
+            .name = "antfly-a4b-metal-id-replay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/a4b_metal_id_replay.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, a4b_metal_id_replay_exe.root_module, target, true);
+        a4b_metal_id_replay_exe.root_module.link_libc = true;
+        const run_a4b_metal_id_replay = b.addRunArtifact(a4b_metal_id_replay_exe);
+        if (b.args) |args| run_a4b_metal_id_replay.addArgs(args);
+        a4b_metal_id_replay_step.dependOn(&run_a4b_metal_id_replay.step);
+
+        const a4b_metal_common_q4_replay_exe = b.addExecutable(.{
+            .name = "antfly-a4b-metal-common-q4-replay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/a4b_metal_common_q4_replay.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, a4b_metal_common_q4_replay_exe.root_module, target, true);
+        a4b_metal_common_q4_replay_exe.root_module.link_libc = true;
+        const run_a4b_metal_common_q4_replay = b.addRunArtifact(a4b_metal_common_q4_replay_exe);
+        if (b.args) |args| run_a4b_metal_common_q4_replay.addArgs(args);
+        a4b_metal_common_q4_replay_step.dependOn(&run_a4b_metal_common_q4_replay.step);
+
+        const a4b_metal_route_select_replay_exe = b.addExecutable(.{
+            .name = "antfly-a4b-metal-route-select-replay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/a4b_metal_route_select_replay.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, a4b_metal_route_select_replay_exe.root_module, target, true);
+        a4b_metal_route_select_replay_exe.root_module.link_libc = true;
+        const run_a4b_metal_route_select_replay = b.addRunArtifact(a4b_metal_route_select_replay_exe);
+        if (b.args) |args| run_a4b_metal_route_select_replay.addArgs(args);
+        a4b_metal_route_select_replay_step.dependOn(&run_a4b_metal_route_select_replay.step);
+
+        const a4b_metal_router_projection_replay_exe = b.addExecutable(.{
+            .name = "antfly-a4b-metal-router-projection-replay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/a4b_metal_router_projection_replay.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, a4b_metal_router_projection_replay_exe.root_module, target, true);
+        a4b_metal_router_projection_replay_exe.root_module.link_libc = true;
+        const run_a4b_metal_router_projection_replay = b.addRunArtifact(a4b_metal_router_projection_replay_exe);
+        if (b.args) |args| run_a4b_metal_router_projection_replay.addArgs(args);
+        a4b_metal_router_projection_replay_step.dependOn(&run_a4b_metal_router_projection_replay.step);
+
+        const a4b_metal_lm_head_replay_exe = b.addExecutable(.{
+            .name = "antfly-a4b-metal-lm-head-replay",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/a4b_metal_lm_head_replay.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        configureMetal(b, a4b_metal_lm_head_replay_exe.root_module, target, true);
+        a4b_metal_lm_head_replay_exe.root_module.link_libc = true;
+        const run_a4b_metal_lm_head_replay = b.addRunArtifact(a4b_metal_lm_head_replay_exe);
+        if (b.args) |args| run_a4b_metal_lm_head_replay.addArgs(args);
+        a4b_metal_lm_head_replay_step.dependOn(&run_a4b_metal_lm_head_replay.step);
+
         const quant_kernel_metal_runtime_check_exe = b.addExecutable(.{
             .name = "antfly-quant-kernel-metal-runtime-check",
             .root_module = b.createModule(.{
@@ -489,6 +564,11 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_blocker_strict_step.dependOn(&strict_quant_kernel_metal_blocker_evidence.step);
     } else {
         const metal_unavailable_step = quant_kernel_metal_unavailable_step orelse unreachable;
+        a4b_metal_id_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_common_q4_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_route_select_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_router_projection_replay_step.dependOn(metal_unavailable_step);
+        a4b_metal_lm_head_replay_step.dependOn(metal_unavailable_step);
         quant_kernel_metal_runtime_check_step.dependOn(metal_unavailable_step);
         metal_decode_gqa_split_routes_step.dependOn(metal_unavailable_step);
         quant_kernel_metal_v2_conformance_step.dependOn(metal_unavailable_step);

@@ -58,6 +58,17 @@ fn setWorkloadProfileRegime(cb: *const ComputeBackend, regime: ops.WorkloadRegim
     };
 }
 
+fn ordinaryMetalGemmaDraftNeedsContiguousState(
+    backend: ops.BackendKind,
+    config: gpt_mod.Config,
+    has_kv_storage: bool,
+) bool {
+    return backend == .metal and
+        config.family == .gemma and
+        !config.gemma4_mtp_assistant and
+        !has_kv_storage;
+}
+
 pub var gemma4_mtp_debug_override: bool = false;
 
 pub const Message = struct {
@@ -2741,6 +2752,26 @@ const BorrowedDecodeStateRuntime = struct {
     }
 };
 
+fn reserveSpeculativeTargetVerification(
+    decode_runtime: *BorrowedDecodeStateRuntime,
+    backend: ops.BackendKind,
+    target_config: gpt_mod.Config,
+    query_len: usize,
+    draft_count: usize,
+) !void {
+    // The qualified resident A4B Metal runtime owns qLen=1 decode only. A
+    // speculative verification pass is genuinely multi-row; do not mutate KV
+    // state or disguise sequential decode as batched verification until the
+    // backend exposes a qualified multi-row verify operation.
+    if (backend == .metal and
+        query_len > 1 and
+        gemma4_runtime.isQualifiedA4bArchitecture(target_config))
+    {
+        return error.Gemma4A4bMetalSpeculativeVerificationNotQualified;
+    }
+    _ = try decode_runtime.appendGeneratedTokens(draft_count);
+}
+
 fn retryDirectPrefillAfterMemoryBudgetExceeded(
     decode_runtime: *BorrowedDecodeStateRuntime,
     reserved_tokens: usize,
@@ -3115,6 +3146,27 @@ pub const NativeGenerationPipeline = struct {
             return NativeDecodeState.requiresDeepSeekV4CompressedCache(draft_config);
         }
         return false;
+    }
+
+    fn makeSpeculativeDraftPipeline(
+        self: *const NativeGenerationPipeline,
+        draft_cb: ComputeBackend,
+        draft_gpt_config: gpt_mod.Config,
+    ) NativeGenerationPipeline {
+        return .{
+            .allocator = self.allocator,
+            .cb = draft_cb,
+            .gpt_config = draft_gpt_config,
+            .tokenizer = self.tokenizer,
+            .artifact_dir = self.artifact_dir,
+            // Graph caches and compiled attachments are model-scoped. A draft
+            // model with different geometry must execute through its own
+            // backend rather than the target model's traced A4B graph.
+            .graph_cache = null,
+            .compiled_partition_backend = null,
+            .compiled_attachment_target = .partitioned,
+            .pjrt_client = null,
+        };
     }
 
     const PendingDecodeBatchWork = struct {
@@ -3749,23 +3801,23 @@ pub const NativeGenerationPipeline = struct {
             // Create a temporary draft pipeline (borrows self's allocator/tokenizer)
             var draft_fallback_state = NativeDecodeState.initContiguous(allocator);
             defer draft_fallback_state.deinit();
-            const draft_ds = self.draft_decode_state orelse &draft_fallback_state;
+            const attached_draft_state = self.draft_decode_state;
+            const use_contiguous_draft_state = ordinaryMetalGemmaDraftNeedsContiguousState(
+                draft_cb.kind(),
+                draft_gpt_config,
+                if (attached_draft_state) |state| state.kv_storage != null else false,
+            );
+            const draft_ds = if (use_contiguous_draft_state)
+                &draft_fallback_state
+            else
+                attached_draft_state orelse &draft_fallback_state;
             var draft_runtime = BorrowedDecodeStateRuntime.init(draft_ds);
             var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
 
             // Prefill draft model with the same prompt
             try draft_runtime.notePrefill(seq_len);
 
-            var draft_pipeline = NativeGenerationPipeline{
-                .allocator = allocator,
-                .cb = draft_cb,
-                .gpt_config = draft_gpt_config,
-                .tokenizer = self.tokenizer,
-                .artifact_dir = self.artifact_dir,
-                .graph_cache = self.graph_cache,
-                .compiled_partition_backend = self.compiled_partition_backend,
-                .pjrt_client = self.pjrt_client,
-            };
+            var draft_pipeline = self.makeSpeculativeDraftPipeline(draft_cb, draft_gpt_config);
             var mtp_activation = Gemma4MtpActivationState{
                 .allocator = allocator,
                 .draft_cb = &draft_pipeline.cb,
@@ -7726,10 +7778,16 @@ pub const NativeGenerationPipeline = struct {
         const verify_len = draft_count + 1; // +1 so we get logits for the last draft token too
         const verify_seq = seq_len.* + draft_count;
 
-        // Temporarily extend the target KV cache for verification
-        _ = try decode_runtime.appendGeneratedTokens(draft_count);
-
         const target_query_len: usize = if (decode_runtime.kvView() != null) verify_len else verify_seq;
+        // Validate the real batched shape before extending target KV. The A4B
+        // prepared decoder is currently qLen=1-only and must fail closed here.
+        try reserveSpeculativeTargetVerification(
+            &decode_runtime,
+            self.cb.kind(),
+            self.gpt_config,
+            target_query_len,
+            draft_count,
+        );
         const target_ctx = decode_runtime.makeDecodeContext(verify_seq, target_query_len);
         // Input: the last token before drafts + all draft tokens
         const verify_start = if (target_query_len == verify_seq) 0 else verify_seq - target_query_len;
@@ -12337,6 +12395,100 @@ test "native generation pipeline rejects speculative decoding when draft require
 
     pipeline.draft_gpt_config = null;
     try std.testing.expect(!pipeline.speculativeUsesDeepSeekV4CompressedCache());
+}
+
+test "speculative draft pipeline does not inherit target execution attachments" {
+    var target_graph_cache: graph_mod.cache.GraphCache = undefined;
+    var pjrt_sentinel: u8 = 0;
+    const draft_config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2048,
+        .num_hidden_layers = 26,
+    };
+    const target = NativeGenerationPipeline{
+        .allocator = std.testing.allocator,
+        .cb = undefined,
+        .gpt_config = .{
+            .family = .gemma,
+            .hidden_size = 2816,
+            .num_hidden_layers = 30,
+        },
+        .tokenizer = undefined,
+        .graph_cache = &target_graph_cache,
+        .compiled_partition_backend = .metal,
+        .compiled_attachment_target = .whole_model,
+        .pjrt_client = @ptrCast(&pjrt_sentinel),
+    };
+
+    const draft = target.makeSpeculativeDraftPipeline(undefined, draft_config);
+    try std.testing.expectEqual(@as(u32, 2048), draft.gpt_config.hidden_size);
+    try std.testing.expect(draft.graph_cache == null);
+    try std.testing.expect(draft.compiled_partition_backend == null);
+    try std.testing.expectEqual(
+        graph_mod.compiled_backend.AttachmentTarget.partitioned,
+        draft.compiled_attachment_target,
+    );
+    try std.testing.expect(draft.pjrt_client == null);
+}
+
+test "speculative draft Metal Gemma uses contiguous state until KV storage is attached" {
+    var config = gpt_mod.Config{ .family = .gemma };
+    try std.testing.expect(ordinaryMetalGemmaDraftNeedsContiguousState(.metal, config, false));
+    try std.testing.expect(!ordinaryMetalGemmaDraftNeedsContiguousState(.metal, config, true));
+    try std.testing.expect(!ordinaryMetalGemmaDraftNeedsContiguousState(.cuda, config, false));
+
+    config.gemma4_mtp_assistant = true;
+    try std.testing.expect(!ordinaryMetalGemmaDraftNeedsContiguousState(.metal, config, false));
+    config = .{ .family = .llama };
+    try std.testing.expect(!ordinaryMetalGemmaDraftNeedsContiguousState(.metal, config, false));
+}
+
+test "contiguous speculative draft state keeps full-recompute query shape in sync" {
+    var state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer state.deinit();
+    var draft_runtime = BorrowedDecodeStateRuntime.init(&state);
+
+    try draft_runtime.notePrefill(2);
+    const prefill_ctx = draft_runtime.makeDecodeContext(2, 2);
+    try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.full_recompute, prefill_ctx.attention_mode);
+    try std.testing.expectEqual(@as(usize, 2), prefill_ctx.query_sequence_len);
+    try std.testing.expect(prefill_ctx.kv_cache == null);
+
+    _ = try draft_runtime.appendGeneratedToken();
+    const next_ctx = draft_runtime.makeDecodeContext(3, 3);
+    try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.full_recompute, next_ctx.attention_mode);
+    try std.testing.expectEqual(@as(usize, 3), next_ctx.query_sequence_len);
+    try std.testing.expectEqual(@as(usize, 3), state.total_tokens);
+}
+
+test "speculative draft A4B multi-row verification fails before target state mutation" {
+    const a4b_config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+    try std.testing.expect(gemma4_runtime.isQualifiedA4bArchitecture(a4b_config));
+
+    var blocked_state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer blocked_state.deinit();
+    try blocked_state.notePrefill(2);
+    var blocked_runtime = BorrowedDecodeStateRuntime.init(&blocked_state);
+    try std.testing.expectError(
+        error.Gemma4A4bMetalSpeculativeVerificationNotQualified,
+        reserveSpeculativeTargetVerification(&blocked_runtime, .metal, a4b_config, 5, 4),
+    );
+    try std.testing.expectEqual(@as(usize, 2), blocked_state.total_tokens);
+
+    var allowed_state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer allowed_state.deinit();
+    try allowed_state.notePrefill(2);
+    var allowed_runtime = BorrowedDecodeStateRuntime.init(&allowed_state);
+    try reserveSpeculativeTargetVerification(&allowed_runtime, .cuda, a4b_config, 5, 4);
+    try std.testing.expectEqual(@as(usize, 6), allowed_state.total_tokens);
 }
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

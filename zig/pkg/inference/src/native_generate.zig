@@ -23,6 +23,7 @@ const decoder_gated_runtime = @import("backends/decoder_gated_runtime.zig");
 const debug_timing = @import("debug_timing.zig");
 const ops = @import("ops/ops.zig");
 const gpt_arch = @import("architectures/gpt.zig");
+const gemma4_runtime = @import("architectures/gemma4_runtime.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const generation = @import("pipelines/generation.zig");
 const graph_mod = @import("graph/root.zig");
@@ -788,7 +789,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         compiled_attachment_target == .whole_model and
         backend_kind == .metal and
         graph_mod.metal_executor.supportsSession(model.session);
-    const live_whole_model_route = liveWholeModelExecutorRequested(&opts) and
+    const live_whole_model_route = liveWholeModelExecutorRequested(&opts, gpt_config) and
         backend_kind == .metal and
         !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
         config.draft_model == null and
@@ -6254,16 +6255,29 @@ fn liveWholeModelDeclineError(err: anyerror) bool {
     };
 }
 
-fn liveWholeModelExecutorRequested(opts: *const Options) bool {
+fn liveWholeModelExecutorRequestedForPreparedA4b(
+    opts: *const Options,
+    prepared_a4b: bool,
+) bool {
     if (envFlagEnabled("TERMITE_METAL_DISABLE_LIVE_WHOLE_MODEL_EXECUTOR")) return false;
     const explicit_whole_model = opts.mode != null and opts.mode.? == .compiled and
         opts.compiled_target != null and opts.compiled_target.? == .whole_model;
-    if (explicit_whole_model) return false;
+    if (explicit_whole_model and !prepared_a4b) return false;
     if (!explicit_whole_model and opts.backend != .metal) return false;
     return switch (opts.backend) {
         .auto, .native, .metal => true,
         else => false,
     };
+}
+
+fn liveWholeModelExecutorRequested(
+    opts: *const Options,
+    gpt_config: gpt_mod.Config,
+) bool {
+    return liveWholeModelExecutorRequestedForPreparedA4b(
+        opts,
+        gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config),
+    );
 }
 
 fn liveWholeModelShouldStopOnEos(gpt_config: gpt_mod.Config, ignore_eos: bool, token_id: i32) bool {
@@ -6368,7 +6382,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     loaded_model_at: std.Io.Timestamp,
     encoded_prompt_at: std.Io.Timestamp,
 ) !bool {
-    if (!liveWholeModelExecutorRequested(opts)) return false;
+    if (!liveWholeModelExecutorRequested(opts, gpt_config)) return false;
     if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
     if (config.draft_model != null or config.speculation_requested) return false;
     if (opts.image_count > 0 or opts.audio_count > 0) return false;
@@ -9169,7 +9183,7 @@ test "server model name strips local models dir prefix" {
     ) == null);
 }
 
-test "explicit compiled whole model does not route through live executor" {
+test "only explicit prepared A4B may route compiled whole model through live executor" {
     const opts = Options{
         .model_dir = "/tmp/model",
         .prompt = "hello",
@@ -9177,7 +9191,8 @@ test "explicit compiled whole model does not route through live executor" {
         .mode = .compiled,
         .compiled_target = .whole_model,
     };
-    try std.testing.expect(!liveWholeModelExecutorRequested(&opts));
+    try std.testing.expect(!liveWholeModelExecutorRequestedForPreparedA4b(&opts, false));
+    try std.testing.expect(liveWholeModelExecutorRequestedForPreparedA4b(&opts, true));
 }
 
 test "live whole-model route uses the shared KV capacity policy" {

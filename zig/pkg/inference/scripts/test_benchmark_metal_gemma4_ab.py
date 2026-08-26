@@ -432,6 +432,8 @@ class HarnessTests(unittest.TestCase):
         environment["CANDIDATE_ONLY"] = "inherited-value"
         environment["TERMITE_METAL_DISABLE_SWA_SCAN_CLAMP"] = "1"
         environment["TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"] = "1"
+        environment["TERMITE_METAL_ENABLE_A4B_DAG_SCHEDULER"] = "1"
+        environment["TERMITE_METAL_STAGE_TIMING_ROOFLINE"] = "1"
         environment["TERMITE_METAL_QUANT_MODE"] = "eager"
         environment["TERMITE_METAL_DISABLE_GEMMA4_E4B_FAST_RESIDENCY"] = "1"
         environment["TERMITE_GPU_EAGER_DENSE_MAX_MB"] = "4096"
@@ -516,6 +518,16 @@ class HarnessTests(unittest.TestCase):
         self.assertIsNone(
             summary["metadata"]["effective_candidate_env"][
                 "TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"
+            ]
+        )
+        self.assertIsNone(
+            summary["metadata"]["effective_candidate_env"][
+                "TERMITE_METAL_ENABLE_A4B_DAG_SCHEDULER"
+            ]
+        )
+        self.assertIsNone(
+            summary["metadata"]["effective_candidate_env"][
+                "TERMITE_METAL_STAGE_TIMING_ROOFLINE"
             ]
         )
         self.assertEqual(summary["metadata"]["effective_candidate_env"]["CANDIDATE_ONLY"], "1")

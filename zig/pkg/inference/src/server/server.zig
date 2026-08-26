@@ -127,10 +127,17 @@ const ServerA4bTelemetry = struct {
     slot_arena_attempts: u64 = 0,
     slot_arena_successes: u64 = 0,
     slot_arena_failures: u64 = 0,
+    selected_page_attempts: u64 = 0,
+    selected_page_successes: u64 = 0,
+    selected_page_failures: u64 = 0,
+    selected_page_logical_bytes: u64 = 0,
+    selected_page_mapped_bytes: u64 = 0,
+    selected_page_allocations: u64 = 0,
     checkpoint_attempts: u64 = 0,
     checkpoint_all_hit_tokens: u64 = 0,
     checkpoint_miss_tokens: u64 = 0,
     checkpoint_replays: u64 = 0,
+    slot_upload_batches: u64 = 0,
     slot_uploads: u64 = 0,
     slot_upload_bytes: u64 = 0,
     mapped_attempts: u64 = 0,
@@ -181,10 +188,17 @@ fn serverA4bTelemetryDelta(
         .slot_arena_attempts = after.a4b_moe_slot_arena_attempts -| before.a4b_moe_slot_arena_attempts,
         .slot_arena_successes = after.a4b_moe_slot_arena_successes -| before.a4b_moe_slot_arena_successes,
         .slot_arena_failures = after.a4b_moe_slot_arena_failures -| before.a4b_moe_slot_arena_failures,
+        .selected_page_attempts = after.a4b_moe_selected_page_attempts -| before.a4b_moe_selected_page_attempts,
+        .selected_page_successes = after.a4b_moe_selected_page_successes -| before.a4b_moe_selected_page_successes,
+        .selected_page_failures = after.a4b_moe_selected_page_failures -| before.a4b_moe_selected_page_failures,
+        .selected_page_logical_bytes = after.a4b_moe_selected_page_logical_bytes -| before.a4b_moe_selected_page_logical_bytes,
+        .selected_page_mapped_bytes = after.a4b_moe_selected_page_mapped_bytes -| before.a4b_moe_selected_page_mapped_bytes,
+        .selected_page_allocations = after.a4b_moe_selected_page_allocations -| before.a4b_moe_selected_page_allocations,
         .checkpoint_attempts = after.a4b_moe_checkpoint_attempts -| before.a4b_moe_checkpoint_attempts,
         .checkpoint_all_hit_tokens = after.a4b_moe_checkpoint_all_hit_tokens -| before.a4b_moe_checkpoint_all_hit_tokens,
         .checkpoint_miss_tokens = after.a4b_moe_checkpoint_miss_tokens -| before.a4b_moe_checkpoint_miss_tokens,
         .checkpoint_replays = after.a4b_moe_checkpoint_replays -| before.a4b_moe_checkpoint_replays,
+        .slot_upload_batches = after.a4b_moe_slot_upload_batches -| before.a4b_moe_slot_upload_batches,
         .slot_uploads = after.a4b_moe_slot_uploads -| before.a4b_moe_slot_uploads,
         .slot_upload_bytes = after.a4b_moe_slot_upload_bytes -| before.a4b_moe_slot_upload_bytes,
         .mapped_attempts = after.metal_provider_quantized_runtime_mapped_attempts -| before.metal_provider_quantized_runtime_mapped_attempts,
@@ -231,7 +245,7 @@ fn logServerA4bTelemetry(
         return;
     }
     std.log.info(
-        "metal_a4b_server_request: scope=process_delta model={s} route_select_attempts={d} route_select_successes={d} route_select_fallbacks={d} slot_lookup_attempts={d} slot_route_hits={d} slot_route_misses={d} slot_all_hit_layers={d} slot_map_publications={d} slot_map_publish_failures={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} slot_uploads={d} slot_upload_bytes={d} mapped_attempts={d} mapped_fallbacks={d} mapped_failures={d} linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} frame_begins={d} frame_submits={d} compute_encoders={d} blit_encoders={d} bootstrap_misses={d}",
+        "metal_a4b_server_request: scope=process_delta model={s} route_select_attempts={d} route_select_successes={d} route_select_fallbacks={d} slot_lookup_attempts={d} slot_route_hits={d} slot_route_misses={d} slot_all_hit_layers={d} slot_map_publications={d} slot_map_publish_failures={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} slot_upload_batches={d} slot_uploads={d} mapped_attempts={d} mapped_fallbacks={d} mapped_failures={d} linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} frame_begins={d} frame_submits={d} compute_encoders={d} blit_encoders={d} bootstrap_misses={d}",
         .{
             model_name,
             delta.route_select_attempts,
@@ -246,8 +260,8 @@ fn logServerA4bTelemetry(
             delta.slot_arena_attempts,
             delta.slot_arena_successes,
             delta.slot_arena_failures,
+            delta.slot_upload_batches,
             delta.slot_uploads,
-            delta.slot_upload_bytes,
             delta.mapped_attempts,
             delta.mapped_fallbacks,
             delta.mapped_failures,
@@ -265,6 +279,18 @@ fn logServerA4bTelemetry(
             delta.compute_encoders,
             delta.blit_encoders,
             delta.bootstrap_misses,
+        },
+    );
+    std.log.info(
+        "metal_a4b_server_selected_page: scope=process_delta model={s} attempts={d} successes={d} failures={d} logical_bytes={d} mapped_bytes={d} allocations={d}",
+        .{
+            model_name,
+            delta.selected_page_attempts,
+            delta.selected_page_successes,
+            delta.selected_page_failures,
+            delta.selected_page_logical_bytes,
+            delta.selected_page_mapped_bytes,
+            delta.selected_page_allocations,
         },
     );
     std.log.info(
@@ -302,10 +328,16 @@ test "server A4B telemetry reports saturating request deltas" {
     after.a4b_moe_slot_arena_attempts = 120;
     after.a4b_moe_slot_arena_successes = 118;
     after.a4b_moe_slot_arena_failures = 2;
+    after.a4b_moe_selected_page_attempts = 120;
+    after.a4b_moe_selected_page_successes = 120;
+    after.a4b_moe_selected_page_logical_bytes = 3_211_591_680;
+    after.a4b_moe_selected_page_mapped_bytes = 3_232_235_520;
+    after.a4b_moe_selected_page_allocations = 1_920;
     after.a4b_moe_checkpoint_attempts = 3;
     after.a4b_moe_checkpoint_all_hit_tokens = 2;
     after.a4b_moe_checkpoint_miss_tokens = 1;
     after.a4b_moe_checkpoint_replays = 1;
+    after.a4b_moe_slot_upload_batches = 10;
     after.a4b_moe_slot_uploads = 80;
     after.a4b_moe_slot_upload_bytes = 268_697_600;
     after.a4b_packed_q4_0_linear_attempts = 810;
@@ -334,10 +366,17 @@ test "server A4B telemetry reports saturating request deltas" {
     try std.testing.expectEqual(@as(u64, 120), delta.slot_arena_attempts);
     try std.testing.expectEqual(@as(u64, 118), delta.slot_arena_successes);
     try std.testing.expectEqual(@as(u64, 2), delta.slot_arena_failures);
+    try std.testing.expectEqual(@as(u64, 120), delta.selected_page_attempts);
+    try std.testing.expectEqual(@as(u64, 120), delta.selected_page_successes);
+    try std.testing.expectEqual(@as(u64, 0), delta.selected_page_failures);
+    try std.testing.expectEqual(@as(u64, 3_211_591_680), delta.selected_page_logical_bytes);
+    try std.testing.expectEqual(@as(u64, 3_232_235_520), delta.selected_page_mapped_bytes);
+    try std.testing.expectEqual(@as(u64, 1_920), delta.selected_page_allocations);
     try std.testing.expectEqual(@as(u64, 3), delta.checkpoint_attempts);
     try std.testing.expectEqual(@as(u64, 2), delta.checkpoint_all_hit_tokens);
     try std.testing.expectEqual(@as(u64, 1), delta.checkpoint_miss_tokens);
     try std.testing.expectEqual(@as(u64, 1), delta.checkpoint_replays);
+    try std.testing.expectEqual(@as(u64, 10), delta.slot_upload_batches);
     try std.testing.expectEqual(@as(u64, 80), delta.slot_uploads);
     try std.testing.expectEqual(@as(u64, 268_697_600), delta.slot_upload_bytes);
     try std.testing.expectEqual(@as(u64, 720), delta.linear_attempts);

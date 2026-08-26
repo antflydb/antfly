@@ -40,10 +40,21 @@ import urllib.request
 
 SCHEMA = "antfly.gemma4_a4b_metal_server_acceptance.v1"
 POLICY_ENV_PREFIXES = ("TERMITE_", "ANTFLY_GEMMA4_", "ANTFLY_INFERENCE_")
+SELECTED_PAGE_LOGICAL_BYTES_PER_ATTEMPT = 26_763_264
+SELECTED_PAGE_ALLOCATIONS_PER_ATTEMPT = 16
+SELECTED_PAGE_MAX_MAPPED_BYTES_PER_ATTEMPT = 64 * 1024 * 1024
 RUNTIME_MARKER = re.compile(
     r"gemma4_a4b_runtime:\s+mode=(auto|streamed|resident)\s+"
     r"budget_mb=(\d+)\s+kv_mb=(\d+)\s+safety_mb=(\d+)\s+"
     r"expert_slots=(\d+)\b"
+)
+SELECTED_PAGE_MOE_MARKER = re.compile(
+    r"metal_a4b_selected_page_moe:\s+enabled=1\s+"
+    r"logical_bytes=(?P<logical_bytes>\d+)\s+"
+    r"mapped_page_bytes=(?P<mapped_page_bytes>\d+)\s+"
+    r"allocations=(?P<allocations>\d+)\s+"
+    r"persistent_cache=(?P<persistent_cache>\d+)\s+"
+    r"weight_copies=(?P<weight_copies>\d+)\b"
 )
 TELEMETRY_MARKER = re.compile(
     r"metal_a4b_server_request:\s+scope=process_delta\s+model=.*?\s+"
@@ -59,8 +70,8 @@ TELEMETRY_MARKER = re.compile(
     r"slot_arena_attempts=(?P<slot_arena_attempts>\d+)\s+"
     r"slot_arena_successes=(?P<slot_arena_successes>\d+)\s+"
     r"slot_arena_failures=(?P<slot_arena_failures>\d+)\s+"
+    r"slot_upload_batches=(?P<slot_upload_batches>\d+)\s+"
     r"slot_uploads=(?P<slot_uploads>\d+)\s+"
-    r"slot_upload_bytes=(?P<slot_upload_bytes>\d+)\s+"
     r"mapped_attempts=(?P<mapped_attempts>\d+)\s+"
     r"mapped_fallbacks=(?P<mapped_fallbacks>\d+)\s+"
     r"mapped_failures=(?P<mapped_failures>\d+)\s+"
@@ -78,6 +89,15 @@ TELEMETRY_MARKER = re.compile(
     r"compute_encoders=(?P<compute_encoders>\d+)\s+"
     r"blit_encoders=(?P<blit_encoders>\d+)\s+"
     r"bootstrap_misses=(?P<bootstrap_misses>\d+)"
+)
+SELECTED_PAGE_REQUEST_TELEMETRY_MARKER = re.compile(
+    r"metal_a4b_server_selected_page:\s+scope=process_delta\s+model=.*?\s+"
+    r"attempts=(?P<selected_page_attempts>\d+)\s+"
+    r"successes=(?P<selected_page_successes>\d+)\s+"
+    r"failures=(?P<selected_page_failures>\d+)\s+"
+    r"logical_bytes=(?P<selected_page_logical_bytes>\d+)\s+"
+    r"mapped_bytes=(?P<selected_page_mapped_bytes>\d+)\s+"
+    r"allocations=(?P<selected_page_allocations>\d+)"
 )
 GENERATION_TIMING_MARKER = re.compile(
     r"generate_timing_ms:\s+"
@@ -352,6 +372,7 @@ def effective_server_environment(
     active_paged_slot_attention_deferred: bool = False,
     disable_active_paged_slot_attention_deferred: bool = False,
     disable_device_moe_route_select: bool = False,
+    selected_expert_page_moe: bool = False,
 ) -> dict[str, str]:
     if (
         active_paged_slot_attention_deferred
@@ -373,6 +394,8 @@ def effective_server_environment(
         environment["TERMITE_METAL_DISABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"] = "1"
     if disable_device_moe_route_select:
         environment["TERMITE_METAL_DISABLE_DEVICE_MOE_ROUTE_SELECT"] = "1"
+    if selected_expert_page_moe:
+        environment["TERMITE_METAL_ENABLE_A4B_SELECTED_EXPERT_PAGE_MOE"] = "1"
     return environment
 
 
@@ -554,11 +577,38 @@ def parse_server_telemetry(log: str) -> list[dict[str, int]]:
     ]
 
 
+def parse_selected_page_request_telemetry(log: str) -> list[dict[str, int]]:
+    return [
+        {key: int(value) for key, value in match.groupdict().items()}
+        for match in SELECTED_PAGE_REQUEST_TELEMETRY_MARKER.finditer(log)
+    ]
+
+
+def parse_selected_page_moe_markers(log: str) -> list[dict[str, int]]:
+    return [
+        {key: int(value) for key, value in match.groupdict().items()}
+        for match in SELECTED_PAGE_MOE_MARKER.finditer(log)
+    ]
+
+
 def parse_generation_timings(log: str) -> list[dict[str, int]]:
     return [
         {key: int(value) for key, value in match.groupdict().items()}
         for match in GENERATION_TIMING_MARKER.finditer(log)
     ]
+
+
+def release_qualification(*, semantic_oracle_attested: bool) -> dict[str, Any]:
+    """Describe this cautious gate without promoting it to a release verdict."""
+    return {
+        "scope": "short_serial_acceptance",
+        "semantic_oracle_attested": semantic_oracle_attested,
+        "release_ready": False,
+        "reason": (
+            "long-output, concurrency, soak, and paired performance qualification "
+            "are separate promotion gates"
+        ),
+    }
 
 
 def validate_server_log(
@@ -572,6 +622,7 @@ def validate_server_log(
     min_decode_tok_s: float = 0.0,
     require_packed_moe: bool = False,
     require_device_route_select: bool = True,
+    require_selected_page_moe: bool = False,
     completion_token_counts: list[int] | None = None,
 ) -> dict[str, Any]:
     runtime_markers = parse_runtime_markers(log)
@@ -593,12 +644,48 @@ def validate_server_log(
     ):
         raise AcceptanceError(f"invalid bounded A4B runtime geometry: {runtime}")
 
+    selected_page_markers = parse_selected_page_moe_markers(log)
+    selected_page_moe = selected_page_markers[-1] if selected_page_markers else None
+    if require_selected_page_moe:
+        if selected_page_moe is None:
+            raise AcceptanceError("selected-expert page MoE marker is missing")
+        if (
+            selected_page_moe["logical_bytes"]
+            != SELECTED_PAGE_LOGICAL_BYTES_PER_ATTEMPT
+            or selected_page_moe["mapped_page_bytes"] < selected_page_moe["logical_bytes"]
+            or selected_page_moe["mapped_page_bytes"]
+            > SELECTED_PAGE_MAX_MAPPED_BYTES_PER_ATTEMPT
+            or selected_page_moe["allocations"]
+            != SELECTED_PAGE_ALLOCATIONS_PER_ATTEMPT
+            or selected_page_moe["persistent_cache"] != 0
+            or selected_page_moe["weight_copies"] != 0
+        ):
+            raise AcceptanceError(
+                f"invalid selected-expert page MoE contract: {selected_page_moe}"
+            )
+    elif selected_page_moe is not None:
+        raise AcceptanceError(
+            "selected-expert page MoE was enabled without an explicit harness request"
+        )
+
     events = parse_server_telemetry(log)
     if len(events) < request_count:
         raise AcceptanceError(
             f"found {len(events)} measured A4B telemetry events, expected {request_count}"
         )
+    selected_page_events = parse_selected_page_request_telemetry(log)
+    if len(selected_page_events) < request_count:
+        raise AcceptanceError(
+            "found "
+            f"{len(selected_page_events)} measured selected-expert page MoE telemetry "
+            f"events, expected {request_count}"
+        )
     measured = events[-request_count:]
+    measured_selected_page = selected_page_events[-request_count:]
+    for event, selected_page_event in zip(
+        measured, measured_selected_page, strict=True
+    ):
+        event.update(selected_page_event)
     for index, event in enumerate(measured, 1):
         forbidden = {
             key: event[key]
@@ -610,14 +697,61 @@ def validate_server_log(
                 "scatter_fallbacks",
                 "slot_map_publish_failures",
                 "slot_arena_failures",
-                "blit_encoders",
                 "bootstrap_misses",
             )
             if event[key] != 0
         }
         if forbidden:
             raise AcceptanceError(
-                f"request {index} reported forbidden A4B fallback/blit counters: {forbidden}"
+                f"request {index} reported forbidden A4B fallback counters: {forbidden}"
+            )
+        selected_page_counts = {
+            key: event[key]
+            for key in (
+                "selected_page_attempts",
+                "selected_page_successes",
+                "selected_page_failures",
+                "selected_page_logical_bytes",
+                "selected_page_mapped_bytes",
+                "selected_page_allocations",
+            )
+        }
+        if require_selected_page_moe:
+            selected_page_attempts = event["selected_page_attempts"]
+            expected_logical_bytes = (
+                selected_page_attempts * SELECTED_PAGE_LOGICAL_BYTES_PER_ATTEMPT
+            )
+            expected_allocations = (
+                selected_page_attempts * SELECTED_PAGE_ALLOCATIONS_PER_ATTEMPT
+            )
+            max_mapped_bytes = (
+                selected_page_attempts * SELECTED_PAGE_MAX_MAPPED_BYTES_PER_ATTEMPT
+            )
+            if (
+                selected_page_attempts == 0
+                or selected_page_attempts != event["selected_page_successes"]
+                or event["selected_page_failures"] != 0
+                or selected_page_attempts != event["route_select_attempts"]
+                or event["selected_page_logical_bytes"] != expected_logical_bytes
+                or event["selected_page_allocations"] != expected_allocations
+                or event["selected_page_mapped_bytes"]
+                < event["selected_page_logical_bytes"]
+                or event["selected_page_mapped_bytes"] > max_mapped_bytes
+            ):
+                raise AcceptanceError(
+                    f"request {index} has invalid selected-expert page MoE telemetry: "
+                    f"{selected_page_counts}"
+                )
+        elif any(selected_page_counts.values()):
+            raise AcceptanceError(
+                f"request {index} reported selected-expert page MoE telemetry "
+                f"without an explicit harness request: {selected_page_counts}"
+            )
+        if event["blit_encoders"] != event["slot_upload_batches"]:
+            raise AcceptanceError(
+                f"request {index} reported unattributed A4B blit encoders: "
+                f"blits={event['blit_encoders']} "
+                f"slot_upload_batches={event['slot_upload_batches']}"
             )
         if require_device_route_select:
             if (
@@ -727,6 +861,7 @@ def validate_server_log(
             )
     return {
         "runtime": runtime,
+        "selected_page_moe": selected_page_moe,
         "all_event_count": len(events),
         "measured_events": measured,
         "generation_timings_ms": measured_timings,
@@ -828,6 +963,7 @@ def run_acceptance(args: argparse.Namespace) -> dict[str, Any]:
             args.disable_active_paged_slot_attention_deferred
         ),
         disable_device_moe_route_select=args.disable_device_moe_route_select,
+        selected_expert_page_moe=args.selected_expert_page_moe,
     )
     responses: list[dict[str, Any]] = []
     process: subprocess.Popen[bytes] | None = None
@@ -914,6 +1050,7 @@ def run_acceptance(args: argparse.Namespace) -> dict[str, Any]:
         min_decode_tok_s=args.min_decode_tok_s,
         require_packed_moe=args.require_packed_moe,
         require_device_route_select=not args.disable_device_moe_route_select,
+        require_selected_page_moe=args.selected_expert_page_moe,
         completion_token_counts=[
             response["completion_tokens"] for response in responses
         ],
@@ -936,11 +1073,15 @@ def run_acceptance(args: argparse.Namespace) -> dict[str, Any]:
     if args.require_oracle and not args.expected_content_sha256:
         raise AcceptanceError("--require-oracle requires --expected-content-sha256")
 
+    qualification = release_qualification(
+        semantic_oracle_attested=bool(args.expected_content_sha256)
+    )
     result = {
         "schema": SCHEMA,
         "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "passed": True,
-        "release_ready": bool(args.expected_content_sha256),
+        "release_ready": qualification["release_ready"],
+        "qualification": qualification,
         "contract": {
             "serial_requests": args.requests,
             "output_tokens": args.output_tokens,
@@ -967,6 +1108,7 @@ def run_acceptance(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "require_packed_moe": args.require_packed_moe,
             "device_moe_route_select": not args.disable_device_moe_route_select,
+            "selected_expert_page_moe": args.selected_expert_page_moe,
             "enable_thinking": args.enable_thinking,
             "expected_substring": args.expected_substring,
             "expected_content_sha256": args.expected_content_sha256,
@@ -1031,10 +1173,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--memory-budget-mb", type=int, default=2048)
     parser.add_argument("--host-budget-mb", type=int, default=2048)
     # The resident A4B lease accounts the full 2 GiB model envelope. Leave a
-    # small, bounded margin for request-local KV/scratch admission; exact 2 GiB
-    # limits reject even the one-token startup warmup.
+    # small, bounded backend margin for request-local KV/scratch admission.
+    # The combined limit also includes the resident tokenizer and other host
+    # model state, so keep aggregate accounting separate from expert residency.
     parser.add_argument("--backend-budget-mb", type=int, default=2304)
-    parser.add_argument("--combined-budget-mb", type=int, default=2560)
+    parser.add_argument("--combined-budget-mb", type=int, default=4096)
     parser.add_argument("--kv-budget-mb", type=int, default=640)
     parser.add_argument("--scratch-budget-mb", type=int, default=384)
     parser.add_argument("--requests", type=int, default=2)
@@ -1058,6 +1201,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--require-packed-moe", action="store_true")
     parser.add_argument("--disable-device-moe-route-select", action="store_true")
+    parser.add_argument("--selected-expert-page-moe", action="store_true")
     parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument("--min-free-percent", type=int, default=20)
     parser.add_argument("--max-rss-mb", type=float, default=4096.0)
@@ -1076,8 +1220,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"models directory does not exist: {args.models_dir}")
     if not 1 <= args.requests <= 10:
         parser.error("--requests must be between 1 and 10")
-    if not 1 <= args.output_tokens <= 64:
-        parser.error("--output-tokens must be between 1 and 64 for this cautious gate")
+    if not 1 <= args.output_tokens <= 128:
+        parser.error("--output-tokens must be between 1 and 128 for this cautious gate")
     if not 2048 <= args.memory_budget_mb <= 4096:
         parser.error("--memory-budget-mb must be between 2048 and 4096")
     if not 1 <= args.min_free_percent <= 90:
