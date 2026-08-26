@@ -36,6 +36,18 @@ pub const DecodeLimits = struct {
             return error.InvalidPdfDecodeLimits;
     }
 };
+const jpeg2000_native_peak_rgba_multiple: usize = 8;
+
+fn jpeg2000NativeDecodeExceedsWorkingSet(rgba_bytes: usize, max_working_set_bytes: usize) bool {
+    const estimated_peak = std.math.mul(usize, rgba_bytes, jpeg2000_native_peak_rgba_multiple) catch return true;
+    return estimated_peak > max_working_set_bytes;
+}
+
+test "large JPEG 2000 images defer before native decoder budget exhaustion" {
+    try std.testing.expect(!jpeg2000NativeDecodeExceedsWorkingSet(12 * 1024 * 1024, 96 * 1024 * 1024));
+    try std.testing.expect(jpeg2000NativeDecodeExceedsWorkingSet(12 * 1024 * 1024 + 1, 96 * 1024 * 1024));
+    try std.testing.expect(jpeg2000NativeDecodeExceedsWorkingSet(std.math.maxInt(usize), 96 * 1024 * 1024));
+}
 
 const DecodeBudgetAllocator = struct {
     backing: Allocator,
@@ -3531,6 +3543,12 @@ pub const Reader = struct {
         const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedPdfRendering;
         if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
         const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
+        // The pure Zig JPEG 2000 path retains coefficient, wavelet, sample,
+        // and output planes concurrently. Defer large images to the platform
+        // renderer before allocator exhaustion so the caller's normal
+        // UnsupportedNativeDecode fallback remains available.
+        if (has_jpx and jpeg2000NativeDecodeExceedsWorkingSet(rgba_len, self.decode_limits.max_working_set_bytes))
+            return error.UnsupportedNativeDecode;
         if (has_ccitt) {
             const raw = try self.readRawStreamData(obj);
             defer self.alloc.free(raw);
