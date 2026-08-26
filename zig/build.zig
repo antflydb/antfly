@@ -4067,6 +4067,7 @@ pub fn build(b: *std.Build) void {
             "host records backup restore bootstrap failure when no handler is available",
             "file replica catalog persists backup restore bootstrap records across reopen",
             "replica catalog rejects invalid backup restore authority and integrity bindings",
+            "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
