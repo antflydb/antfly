@@ -504,7 +504,7 @@ rolling-upgrade wire spelling with the same behavior. The former public
 hierarchy controls `return_level`, `rollup`, `include`, and
 `max_children_per_parent` are compatibility-only, are not present in OpenAPI,
 and must not be emitted by new clients. Unit modes require every member to have
-a unit identity and are therefore rejected for mixed document/chunk indexes
+durable unit identity. Indexes containing any source without it are rejected
 with an actionable 422 response.
 `sources` cannot be combined with `external`, `field`, `template`, `chunker`, or
 the supported single-source artifact convenience forms.

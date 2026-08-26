@@ -8297,7 +8297,7 @@ pub const ApiHttpServer = struct {
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
-            error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
+            error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.Timeout => return error.ReadUnavailable,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
@@ -8475,7 +8475,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedExclusionQueryRequest,
                 => return err,
                 error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
-                error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
+                error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -8524,7 +8524,7 @@ pub const ApiHttpServer = struct {
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
-            error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
+            error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -8601,7 +8601,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExclusionQueryRequest,
             => return err,
             error.UnsupportedQueryRequest => return unsupportedPublicTableQueryDispatchError(alloc, body),
-            error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
+            error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
@@ -11918,7 +11918,7 @@ pub const ApiHttpServer = struct {
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
                 try contextualUnsupportedQueryResponse(self.alloc),
-            error.UnsupportedMixedSourceReturnMode => try contextualUnsupportedHierarchyGroupingResponse(self.alloc),
+            error.UnsupportedHierarchyGrouping => try contextualUnsupportedHierarchyGroupingResponse(self.alloc),
             error.IdentityReadGenerationChanged => try contextualRetryableTextResponse(self.alloc, 409, "identity read generation changed"),
             error.HierarchyCursorStale => try contextualHierarchyCursorStaleResponse(self.alloc),
             error.QueryCandidateBudgetExceeded => try contextualQueryCandidateBudgetExceededResponse(self.alloc),
@@ -18713,7 +18713,7 @@ test "api http stale hierarchy cursor response is actionable and machine readabl
     try std.testing.expect(!parsed.value.retryable);
 }
 
-test "api http mixed hierarchy grouping response uses the public contract" {
+test "api http unsupported hierarchy grouping response uses the public contract" {
     const alloc = std.testing.allocator;
     var resp = try contextualUnsupportedHierarchyGroupingResponse(alloc);
     defer resp.deinit(alloc);

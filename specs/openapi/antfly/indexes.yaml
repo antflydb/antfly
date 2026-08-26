@@ -465,7 +465,9 @@ components:
           description: "Maximum number of distinct visible edges materialized per document after source precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000). Independent aggregate reconciliation budgets bound work across overlapping source manifests."
         sources:
           type: array
+          minItems: 1
           maxItems: 64
+          uniqueItems: true
           items: { $ref: "#/components/schemas/CreatedGraphArtifactSourceConfig" }
         artifact: { $ref: "#/components/schemas/CreatedGraphArtifactProducerConfig" }
         algebraic_planning: { $ref: "#/components/schemas/GraphAlgebraicPlanningConfig" }

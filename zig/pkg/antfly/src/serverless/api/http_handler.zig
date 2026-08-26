@@ -386,7 +386,12 @@ pub const HttpHandler = struct {
     }
 
     fn handleStatus(self: *HttpHandler) !HttpResponse {
-        return try jsonResponse(self.alloc, 200, self.runtime_status.*);
+        var status = self.runtime_status.*;
+        // A runtime that has not validated readiness must not advertise the
+        // optimistic default as authoritative health. Preserve any explicit
+        // failure state supplied by the runtime owner.
+        if (!status.validated and status.health == .healthy) status.health = .unknown;
+        return try jsonResponse(self.alloc, 200, status);
     }
 
     fn handleMetrics(self: *HttpHandler) !HttpResponse {
@@ -1564,7 +1569,7 @@ pub const HttpHandler = struct {
             if (response.status == 200) return try self.alloc.dupe(u8, response.body);
             return switch (response.status) {
                 400 => error.InvalidQueryRequest,
-                422 => error.UnsupportedMixedSourceReturnMode,
+                422 => error.UnsupportedHierarchyGrouping,
                 404 => error.FileNotFound,
                 else => error.InternalQueryFailure,
             };
@@ -1585,7 +1590,7 @@ pub const HttpHandler = struct {
                     std.log.warn("serverless public table search rejected table={s} err={}", .{ table_name, err });
                     return error.InvalidQueryRequest;
                 },
-                error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
+                error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.FileNotFound,
                 error.VectorSegmentNotFound,
                 error.SparseSegmentNotFound,
@@ -2699,7 +2704,7 @@ pub const HttpHandler = struct {
                 error.VectorDimsMismatch,
                 error.SparseQueryRequired,
                 => return error.InvalidQueryRequest,
-                error.UnsupportedMixedSourceReturnMode => return try unsupportedMixedSourceReturnModeResponse(self.alloc),
+                error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
                 else => return err,
             };
             defer execution.deinit(self.alloc);
@@ -2792,7 +2797,7 @@ pub const HttpHandler = struct {
                     std.log.err("serverless query invalid namespace={s} err={}", .{ namespace, err });
                     return try textResponse(self.alloc, 400, "invalid query request");
                 },
-                error.UnsupportedMixedSourceReturnMode => return try unsupportedMixedSourceReturnModeResponse(self.alloc),
+                error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
                 error.FileNotFound => {
                     std.log.err("serverless query missing namespace={s} err={}", .{ namespace, err });
                     return try textResponse(self.alloc, 404, "not found");
@@ -2882,7 +2887,7 @@ pub const HttpHandler = struct {
             error.VectorDimsMismatch,
             error.SparseQueryRequired,
             => return try textResponse(self.alloc, 400, "invalid query request"),
-            error.UnsupportedMixedSourceReturnMode => return try unsupportedMixedSourceReturnModeResponse(self.alloc),
+            error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.VectorSegmentNotFound => return try textResponse(self.alloc, 404, "vector segment not found"),
             error.SparseSegmentNotFound => return try textResponse(self.alloc, 404, "sparse segment not found"),
@@ -2902,7 +2907,7 @@ pub const HttpHandler = struct {
                 error.UnsupportedAggregation,
                 error.InvalidAggregation,
                 => return try textResponse(self.alloc, 400, "invalid query request"),
-                error.UnsupportedMixedSourceReturnMode => return try unsupportedMixedSourceReturnModeResponse(self.alloc),
+                error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
                 else => {
                     std.log.err("table aggregations failed table={s} err={}", .{ table_name, err });
                     return try textResponse(self.alloc, 500, "query failed");
@@ -4594,7 +4599,7 @@ pub const HttpHandler = struct {
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
-            error.UnsupportedMixedSourceReturnMode => return error.UnsupportedMixedSourceReturnMode,
+            error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
@@ -6708,7 +6713,7 @@ fn textResponse(alloc: Allocator, status: u16, body: []const u8) !HttpResponse {
     };
 }
 
-fn unsupportedMixedSourceReturnModeResponse(alloc: Allocator) !HttpResponse {
+fn unsupportedHierarchyGroupingResponse(alloc: Allocator) !HttpResponse {
     return jsonResponse(alloc, 422, public_table_http.UnsupportedHierarchyGroupingError{});
 }
 
@@ -6736,9 +6741,9 @@ test "serverless artifact index capability response is structured and actionable
     try std.testing.expect(!parsed.value.retryable);
 }
 
-test "serverless mixed hierarchy grouping response uses the public contract" {
+test "serverless unsupported hierarchy grouping response uses the public contract" {
     const alloc = std.testing.allocator;
-    var response = try unsupportedMixedSourceReturnModeResponse(alloc);
+    var response = try unsupportedHierarchyGroupingResponse(alloc);
     defer response.deinit(alloc);
 
     try std.testing.expectEqual(@as(u16, 422), response.status);
@@ -6866,6 +6871,26 @@ test "serverless http handler serves internal namespace lifecycle, admission, an
     defer not_readyz.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 503), not_readyz.status);
     try std.testing.expect(std.mem.indexOf(u8, not_readyz.body, "\"status\":\"not_ready\"") != null);
+
+    var not_ready_status = try handler.handle(.{
+        .method = .get,
+        .path = "/status",
+    });
+    defer not_ready_status.deinit(alloc);
+    var parsed_not_ready_status = try parseJsonTestBody(api_types.RuntimeStatusResult, alloc, not_ready_status.body);
+    defer parsed_not_ready_status.deinit();
+    try std.testing.expectEqual(api_types.RuntimeHealth.unknown, parsed_not_ready_status.value.health);
+
+    runtime_status.health = .degraded;
+    var degraded_status = try handler.handle(.{
+        .method = .get,
+        .path = "/status",
+    });
+    defer degraded_status.deinit(alloc);
+    var parsed_degraded_status = try parseJsonTestBody(api_types.RuntimeStatusResult, alloc, degraded_status.body);
+    defer parsed_degraded_status.deinit();
+    try std.testing.expectEqual(api_types.RuntimeHealth.degraded, parsed_degraded_status.value.health);
+    runtime_status.health = .healthy;
     runtime_status.validated = true;
 
     var metrics = try handler.handle(.{

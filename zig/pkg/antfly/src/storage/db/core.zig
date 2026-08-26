@@ -768,6 +768,10 @@ pub const DBCore = struct {
         return try self.index_manager.textIndexIsChunkBacked(alloc, name);
     }
 
+    pub fn textIndexSupportsUnitGrouping(self: *DBCore, name: ?[]const u8) bool {
+        return self.index_manager.textIndexSupportsUnitGrouping(name);
+    }
+
     pub fn denseIndex(self: *DBCore, name: ?[]const u8) ?*index_manager_mod.IndexManager.DenseIndex {
         return self.index_manager.denseIndex(name);
     }

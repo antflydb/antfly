@@ -146,6 +146,10 @@ pub const SearchTextQueryExecutor = struct {
         alloc: Allocator,
         index_name: ?[]const u8,
     ) anyerror!bool,
+    text_index_supports_unit_grouping: ?*const fn (
+        ctx: ?*anyopaque,
+        index_name: ?[]const u8,
+    ) bool = null,
     search_match_all: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -11077,11 +11081,8 @@ pub fn shouldGroupChunkParents(req: types.SearchRequest, is_chunk_backed: bool) 
     return is_chunk_backed and req.return_mode != .member and req.return_mode != .chunk;
 }
 
-fn mixedSourceReturnModeSupported(return_mode: types.ReturnMode) bool {
-    return switch (return_mode) {
-        .parent, .parent_with_chunks, .member, .chunk => true,
-        .unit, .unit_with_chunks => false,
-    };
+fn returnModeRequiresUnitGrouping(return_mode: types.ReturnMode) bool {
+    return return_mode == .unit or return_mode == .unit_with_chunks;
 }
 
 pub fn searchText(
@@ -11527,6 +11528,13 @@ pub fn searchTextQuery(
     if (effective_req.index_name == null) effective_req.index_name = text_entry.config.name;
     const text_index = &text_entry.persistent;
     const chunk_backed = try executor.text_index_is_chunk_backed(executor.ctx, alloc, effective_req.index_name);
+    if (returnModeRequiresUnitGrouping(effective_req.return_mode)) {
+        const supports_unit_grouping = if (executor.text_index_supports_unit_grouping) |supports|
+            supports(executor.ctx, effective_req.index_name)
+        else
+            false;
+        if (!supports_unit_grouping) return error.UnsupportedHierarchyGrouping;
+    }
     const group_chunk_parents = shouldGroupChunkParents(effective_req, chunk_backed);
     const paging = componentPaging(effective_req);
     effective_req.full_text = text_query;
@@ -11849,6 +11857,9 @@ pub fn searchTextQuery(
                 };
                 var assigned = false;
                 errdefer if (!assigned) materialized.deinit(alloc);
+                if (chunk_backed and returnModeRequiresUnitGrouping(effective_req.return_mode)) {
+                    materialized.artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, stored.id);
+                }
                 materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
                 hits[i] = materialized;
                 assigned = true;
@@ -11865,6 +11876,9 @@ pub fn searchTextQuery(
             };
             var assigned = false;
             errdefer if (!assigned) materialized.deinit(alloc);
+            if (chunk_backed and returnModeRequiresUnitGrouping(effective_req.return_mode)) {
+                materialized.artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, id);
+            }
             materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
             materialized.stored_data = if (load_stored_in_search_engine and hit.stored_data != null)
                 try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
@@ -13010,9 +13024,8 @@ fn searchDenseInternal(
     const index_lookup_start = total_start;
     const entry = (try executor.dense_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
     profile.index_lookup_ns = platform_time.monotonicNs() - index_lookup_start;
-    if (entry.heterogeneous_source_levels and !mixedSourceReturnModeSupported(req.return_mode)) {
-        return error.UnsupportedMixedSourceReturnMode;
-    }
+    if (returnModeRequiresUnitGrouping(req.return_mode) and !entry.supports_unit_grouping)
+        return error.UnsupportedHierarchyGrouping;
 
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
@@ -14740,9 +14753,8 @@ pub fn searchSparse(
     var page_ns: u64 = 0;
     var projected_source_profile = ProjectedSourceLoadProfile{};
     const entry = (try executor.sparse_index(executor.ctx, req.index_name)) orelse return error.IndexNotFound;
-    if (entry.heterogeneous_source_levels and !mixedSourceReturnModeSupported(req.return_mode)) {
-        return error.UnsupportedMixedSourceReturnMode;
-    }
+    if (returnModeRequiresUnitGrouping(req.return_mode) and !entry.supports_unit_grouping)
+        return error.UnsupportedHierarchyGrouping;
     const chunk_backed = entry.chunk_name != null;
     const group_chunk_parents = shouldGroupChunkParents(req, chunk_backed);
     const multi_source_members = entry.embedding_names.len > 0;

@@ -364,8 +364,9 @@ pub fn reshapeChunkBackedResult(
 
     for (raw.hits, 0..) |chunk_hit, chunk_index| {
         var unit_identity = if (group_by_unit)
-            try resolveChunkUnitIdentity(
+            try resolveHitUnitIdentity(
                 alloc,
+                chunk_hit,
                 chunk_hit.stored_data orelse loaded_unit_chunk_payloads.?[chunk_index] orelse return error.StoredDocMissing,
             )
         else
@@ -491,25 +492,98 @@ const ChunkUnitIdentity = struct {
     }
 };
 
-fn resolveChunkUnitIdentity(
+fn resolveHitUnitIdentity(
     alloc: Allocator,
+    hit: types.SearchHit,
     stored: []const u8,
 ) !ChunkUnitIdentity {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidChunkArtifact;
-    const unit_key = parsed.value.object.get("_parent_unit_key") orelse return error.InvalidChunkArtifact;
-    if (unit_key != .string or !internal_keys.isDocumentUnitArtifactRecordKey(unit_key.string)) {
-        return error.InvalidChunkArtifact;
-    }
     const fingerprint = parsed.value.object.get(hierarchy_navigation.unit_fingerprint_field);
     if (fingerprint != null and (fingerprint.? != .string or fingerprint.?.string.len == 0)) {
         return error.InvalidChunkArtifact;
     }
+
+    const unit_key = if (parsed.value.object.get("_parent_unit_key")) |value| blk: {
+        if (value != .string or !internal_keys.isDocumentUnitArtifactRecordKey(value.string)) {
+            return error.InvalidChunkArtifact;
+        }
+        break :blk try alloc.dupe(u8, value.string);
+    } else if (hit.artifact_ref) |artifact_ref| blk: {
+        if (artifact_ref.kind == .asset) {
+            const unit_id = artifact_ref.unit_id orelse return error.UnsupportedHierarchyGrouping;
+            break :blk try internal_keys.documentUnitArtifactKeyAlloc(
+                alloc,
+                artifact_ref.document_id,
+                artifact_ref.name,
+                unit_id,
+            );
+        }
+        if (artifact_ref.source) |source| {
+            if (source.kind == .asset) {
+                const unit_id = source.unit_id orelse return error.UnsupportedHierarchyGrouping;
+                break :blk try internal_keys.documentUnitArtifactKeyAlloc(
+                    alloc,
+                    artifact_ref.document_id,
+                    source.name,
+                    unit_id,
+                );
+            }
+        }
+        return error.UnsupportedHierarchyGrouping;
+    } else return error.UnsupportedHierarchyGrouping;
+
+    errdefer alloc.free(unit_key);
     return .{
-        .key = try alloc.dupe(u8, unit_key.string),
+        .key = unit_key,
         .fingerprint = if (fingerprint) |value| try alloc.dupe(u8, value.string) else null,
     };
+}
+
+test "unit identity resolves direct document extraction unit artifacts" {
+    const alloc = std.testing.allocator;
+    const hit = types.SearchHit{
+        .id = @constCast("opaque"),
+        .artifact_ref = .{
+            .document_id = @constCast("doc:a"),
+            .name = @constCast("document_units_v1"),
+            .kind = .asset,
+            .unit_id = @constCast("page:000001"),
+        },
+    };
+    var identity = try resolveHitUnitIdentity(
+        alloc,
+        hit,
+        "{\"_artifact_unit_fingerprint\":\"fingerprint-v1\"}",
+    );
+    defer identity.deinit(alloc);
+
+    const expected = try internal_keys.documentUnitArtifactKeyAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "page:000001",
+    );
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, identity.key);
+    try std.testing.expectEqualStrings("fingerprint-v1", identity.fingerprint.?);
+}
+
+test "unit identity fails closed for ordinary chunks" {
+    const hit = types.SearchHit{
+        .id = @constCast("opaque"),
+        .artifact_ref = .{
+            .document_id = @constCast("doc:a"),
+            .name = @constCast("body_chunks_v1"),
+            .kind = .chunk,
+            .chunk_id = 0,
+        },
+    };
+    try std.testing.expectError(
+        error.UnsupportedHierarchyGrouping,
+        resolveHitUnitIdentity(std.testing.allocator, hit, "{\"_parent_doc_key\":\"doc:a\"}"),
+    );
 }
 
 fn groupedUnitRevisionEnvelopeAlloc(alloc: Allocator, fingerprint: []const u8) ![]u8 {

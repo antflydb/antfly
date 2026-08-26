@@ -2886,7 +2886,7 @@ export interface components {
              */
             retryable: false;
         };
-        /** @description A requested hierarchy grouping level cannot represent every member of the selected heterogeneous index. */
+        /** @description A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity. */
         UnsupportedHierarchyGroupingError: {
             /**
              * Format: int32
@@ -2904,14 +2904,14 @@ export interface components {
              * @description Stable reason the requested hierarchy level is unavailable.
              * @enum {string}
              */
-            reason: "mixed_document_chunk_sources";
+            reason: "unit_identity_unavailable";
             /**
              * @description Public request field that selected the unsupported grouping level.
              * @enum {string}
              */
             field: "hierarchy.group_by.level";
             /**
-             * @description Select source grouping, omit group_by for direct members, or use a homogeneous chunk-backed index.
+             * @description Select source grouping, omit group_by for direct members, or use an index whose every source is unit-backed.
              * @enum {string}
              */
             action: "use_source_grouping_or_direct_members";

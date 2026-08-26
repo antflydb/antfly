@@ -23671,6 +23671,7 @@ pub const DB = struct {
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
+            .text_index_supports_unit_grouping = textIndexSupportsUnitGroupingCallback,
             .search_match_all = searchMatchAllCallback,
             .project_stored_search = projectStoredBytesForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -23890,6 +23891,14 @@ pub const DB = struct {
     ) anyerror!bool {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return try self.core.textIndexIsChunkBacked(alloc, index_name);
+    }
+
+    fn textIndexSupportsUnitGroupingCallback(
+        ctx: ?*anyopaque,
+        index_name: ?[]const u8,
+    ) bool {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return false));
+        return self.core.textIndexSupportsUnitGrouping(index_name);
     }
 
     fn searchMatchAllCallback(
@@ -45807,7 +45816,7 @@ test "db vector indexes combine direct document and chunk-backed artifact source
     defer dense_chunk_alias.deinit();
     try std.testing.expectEqual(dense_members.hits.len, dense_chunk_alias.hits.len);
 
-    try std.testing.expectError(error.UnsupportedMixedSourceReturnMode, db.search(alloc, .{
+    try std.testing.expectError(error.UnsupportedHierarchyGrouping, db.search(alloc, .{
         .index_name = "mixed_dense",
         .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
         .limit = 2,
@@ -45847,7 +45856,7 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         sparse_has_chunk = sparse_has_chunk or std.mem.eql(u8, hit.id, "doc:chunk");
     }
     try std.testing.expect(sparse_has_direct and sparse_has_chunk);
-    try std.testing.expectError(error.UnsupportedMixedSourceReturnMode, db.search(alloc, .{
+    try std.testing.expectError(error.UnsupportedHierarchyGrouping, db.search(alloc, .{
         .index_name = "mixed_sparse",
         .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 2 } },
         .limit = 2,
@@ -57302,6 +57311,9 @@ test "db document extraction skips stable unit local rewrites without text consu
         .kind = .dense_vector,
         .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
     });
+    try std.testing.expect(db.core.textIndexSupportsUnitGrouping("ft_document_units"));
+    try std.testing.expect(db.core.textIndexSupportsUnitGrouping("ft_document_chunks"));
+    try std.testing.expect(db.core.index_manager.denseIndex("dv_document_chunks").?.supports_unit_grouping);
 
     try db.batch(.{
         .writes = &.{.{
@@ -60466,10 +60478,25 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     var unit_result = try db.search(alloc, .{
         .index_name = "ft_document_units",
         .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
-        .return_mode = .chunk,
+        .return_mode = .unit,
     });
     defer unit_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), unit_result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", unit_result.hits[0].artifact_ref.?.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", unit_result.hits[0].artifact_ref.?.name);
+    try std.testing.expectEqualStrings("document:000001", unit_result.hits[0].artifact_ref.?.unit_id.?);
+
+    var all_unit_members = try db.search(alloc, .{
+        .index_name = "ft_document_units",
+        .full_text = .{ .match_all = {} },
+        .return_mode = .chunk,
+    });
+    defer all_unit_members.deinit();
+    try std.testing.expectEqual(@as(u32, 2), all_unit_members.total_hits);
+    for (all_unit_members.hits) |hit| {
+        try std.testing.expectEqual(types.ArtifactKind.asset, hit.artifact_ref.?.kind);
+        try std.testing.expect(hit.artifact_ref.?.unit_id != null);
+    }
 
     // The artifact contains operational strings such as unit_type in addition
     // to text. A selective artifact index must not leak those fields into its
@@ -60489,6 +60516,17 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     });
     defer chunk_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), chunk_result.total_hits);
+
+    var chunk_unit_result = try db.search(alloc, .{
+        .index_name = "ft_document_chunks",
+        .full_text = .{ .match = .{ .field = "text", .text = "gamma" } },
+        .return_mode = .unit,
+    });
+    defer chunk_unit_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), chunk_unit_result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", chunk_unit_result.hits[0].artifact_ref.?.document_id);
+    try std.testing.expectEqualStrings("document_units_v1", chunk_unit_result.hits[0].artifact_ref.?.name);
+    try std.testing.expectEqualStrings("document:000001", chunk_unit_result.hits[0].artifact_ref.?.unit_id.?);
 }
 
 test "db document extraction chunks units through source artifact enrichment" {
@@ -67131,6 +67169,12 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     try std.testing.expectEqualStrings("doc:a", canonical_grouped.hits[0].id);
     try std.testing.expectEqual(@as(usize, 2), canonical_grouped.hits[0].chunk_hits.len);
     try std.testing.expectEqualStrings(top_chunk_id, canonical_grouped.hits[0].chunk_hits[0].id);
+    try std.testing.expect(!db.core.index_manager.denseIndex("dv_v1").?.supports_unit_grouping);
+    try std.testing.expectError(error.UnsupportedHierarchyGrouping, db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .unit,
+    }));
 
     const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
     defer alloc.free(doc_a_store_key);

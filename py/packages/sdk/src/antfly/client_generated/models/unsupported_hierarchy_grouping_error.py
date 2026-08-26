@@ -16,18 +16,19 @@ T = TypeVar("T", bound="UnsupportedHierarchyGroupingError")
 
 @_attrs_define
 class UnsupportedHierarchyGroupingError:
-    """A requested hierarchy grouping level cannot represent every member of the selected heterogeneous index.
+    """A requested hierarchy grouping level cannot represent every member because at least one selected source lacks
+    durable document-unit identity.
 
-    Attributes:
-        status (UnsupportedHierarchyGroupingErrorStatus):
-        error (UnsupportedHierarchyGroupingErrorError): Stable machine-readable error code.
-        message (str): Human-readable remediation using only public query fields.
-        reason (UnsupportedHierarchyGroupingErrorReason): Stable reason the requested hierarchy level is unavailable.
-        field (UnsupportedHierarchyGroupingErrorField): Public request field that selected the unsupported grouping
-            level.
-        action (UnsupportedHierarchyGroupingErrorAction): Select source grouping, omit group_by for direct members, or
-            use a homogeneous chunk-backed index.
-        retryable (bool): Retrying the same request cannot succeed without changing its hierarchy grouping.
+        Attributes:
+            status (UnsupportedHierarchyGroupingErrorStatus):
+            error (UnsupportedHierarchyGroupingErrorError): Stable machine-readable error code.
+            message (str): Human-readable remediation using only public query fields.
+            reason (UnsupportedHierarchyGroupingErrorReason): Stable reason the requested hierarchy level is unavailable.
+            field (UnsupportedHierarchyGroupingErrorField): Public request field that selected the unsupported grouping
+                level.
+            action (UnsupportedHierarchyGroupingErrorAction): Select source grouping, omit group_by for direct members, or
+                use an index whose every source is unit-backed.
+            retryable (bool): Retrying the same request cannot succeed without changing its hierarchy grouping.
     """
 
     status: UnsupportedHierarchyGroupingErrorStatus

@@ -469,7 +469,11 @@ pub const RuntimeStatusResult = struct {
 };
 
 pub const RuntimeHealth = enum {
+    unknown,
     healthy,
+    unhealthy,
+    degraded,
+    @"error",
 };
 
 pub const RuntimeDeploymentMode = enum {

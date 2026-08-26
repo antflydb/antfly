@@ -9706,7 +9706,7 @@ pub const TreeSearchConfig = struct {
     beam_width: ?i64 = null,
 };
 
-/// A requested hierarchy grouping level cannot represent every member of the selected heterogeneous index.
+/// A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity.
 pub const UnsupportedHierarchyGroupingError = struct {
     status: i32,
     /// Stable machine-readable error code.
@@ -9717,7 +9717,7 @@ pub const UnsupportedHierarchyGroupingError = struct {
     reason: []const u8,
     /// Public request field that selected the unsupported grouping level.
     field: []const u8,
-    /// Select source grouping, omit group_by for direct members, or use a homogeneous chunk-backed index.
+    /// Select source grouping, omit group_by for direct members, or use an index whose every source is unit-backed.
     action: []const u8,
     /// Retrying the same request cannot succeed without changing its hierarchy grouping.
     retryable: bool,

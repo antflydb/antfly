@@ -114,7 +114,7 @@ pub const TableApi = struct {
         InvalidExclusionQueryRequest,
         UnsupportedFilterQueryRequest,
         UnsupportedExclusionQueryRequest,
-        UnsupportedMixedSourceReturnMode,
+        UnsupportedHierarchyGrouping,
         NotFound,
         DocIdentityUnavailable,
         ReadRequiresPrimary,
@@ -700,13 +700,14 @@ pub fn hierarchyCursorStaleBody(alloc: std.mem.Allocator) ![]u8 {
 }
 
 /// Stable, non-retryable public error for hierarchy grouping that cannot be
-/// represented by a heterogeneous document/chunk vector index. Keep this in
+/// represented because at least one selected member lacks durable unit
+/// identity. Keep this in
 /// sync with UnsupportedHierarchyGroupingError in the public OpenAPI contract.
 pub const UnsupportedHierarchyGroupingError = struct {
     status: u16 = 422,
     @"error": []const u8 = "unsupported_hierarchy_grouping",
-    message: []const u8 = "mixed document/chunk vector indexes cannot group at hierarchy unit level; use hierarchy.group_by.level=source, omit hierarchy.group_by for direct members, or query a homogeneous chunk-backed index",
-    reason: []const u8 = "mixed_document_chunk_sources",
+    message: []const u8 = "the selected index contains members without durable unit identity; use hierarchy.group_by.level=source, omit hierarchy.group_by for direct members, or query an index whose every source is unit-backed",
+    reason: []const u8 = "unit_identity_unavailable",
     field: []const u8 = "hierarchy.group_by.level",
     action: []const u8 = "use_source_grouping_or_direct_members",
     retryable: bool = false,
@@ -927,7 +928,7 @@ pub fn handleTableQueryRequest(
                 "exclusion_query",
                 .unsupported,
             ),
-            error.UnsupportedMixedSourceReturnMode => return .{
+            error.UnsupportedHierarchyGrouping => return .{
                 .status = 422,
                 .body = try unsupportedHierarchyGroupingBody(alloc),
                 .json = true,
@@ -2705,7 +2706,7 @@ test "public table query handler maps doc identity unavailable errors" {
     );
 }
 
-test "public table query handler preserves structured filter and mixed-source diagnostics" {
+test "public table query handler preserves structured filter and hierarchy diagnostics" {
     const Backend = struct {
         err: TableApi.ExecuteQueryError,
 
@@ -2786,25 +2787,25 @@ test "public table query handler preserves structured filter and mixed-source di
         try std.testing.expect(!parsed.value.retryable);
     }
 
-    var mixed_backend = Backend{ .err = error.UnsupportedMixedSourceReturnMode };
-    var mixed_resp = try handleTableQueryRequest(
+    var hierarchy_backend = Backend{ .err = error.UnsupportedHierarchyGrouping };
+    var hierarchy_resp = try handleTableQueryRequest(
         std.testing.allocator,
         "docs",
         "{}",
         null,
-        mixed_backend.iface(),
+        hierarchy_backend.iface(),
     );
-    defer mixed_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 422), mixed_resp.status);
-    try std.testing.expect(mixed_resp.json);
-    var mixed_error = try std.json.parseFromSlice(UnsupportedHierarchyGroupingError, std.testing.allocator, mixed_resp.body, .{});
-    defer mixed_error.deinit();
-    try std.testing.expectEqualStrings("unsupported_hierarchy_grouping", mixed_error.value.@"error");
-    try std.testing.expectEqualStrings("mixed_document_chunk_sources", mixed_error.value.reason);
-    try std.testing.expectEqualStrings("hierarchy.group_by.level", mixed_error.value.field);
-    try std.testing.expectEqualStrings("use_source_grouping_or_direct_members", mixed_error.value.action);
-    try std.testing.expect(std.mem.indexOf(u8, mixed_error.value.message, "return_mode") == null);
-    try std.testing.expect(!mixed_error.value.retryable);
+    defer hierarchy_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), hierarchy_resp.status);
+    try std.testing.expect(hierarchy_resp.json);
+    var hierarchy_error = try std.json.parseFromSlice(UnsupportedHierarchyGroupingError, std.testing.allocator, hierarchy_resp.body, .{});
+    defer hierarchy_error.deinit();
+    try std.testing.expectEqualStrings("unsupported_hierarchy_grouping", hierarchy_error.value.@"error");
+    try std.testing.expectEqualStrings("unit_identity_unavailable", hierarchy_error.value.reason);
+    try std.testing.expectEqualStrings("hierarchy.group_by.level", hierarchy_error.value.field);
+    try std.testing.expectEqualStrings("use_source_grouping_or_direct_members", hierarchy_error.value.action);
+    try std.testing.expect(std.mem.indexOf(u8, hierarchy_error.value.message, "return_mode") == null);
+    try std.testing.expect(!hierarchy_error.value.retryable);
 }
 
 test "public table query handler preserves retryable failure status" {

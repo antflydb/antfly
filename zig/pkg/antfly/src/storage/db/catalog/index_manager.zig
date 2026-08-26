@@ -39,6 +39,7 @@ pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const enrichment_types = @import("../enrichment/enrichment_types.zig");
 const enrichment_artifact_codec = @import("../enrichment/artifact_codec.zig");
 const enrichment_config_validation = @import("../enrichment/config_validation.zig");
+const asset_producer_mod = @import("../enrichment/asset_producer.zig");
 const backfill_state_mod = @import("../backfill_state.zig");
 const db_config = @import("../config.zig");
 const persistent_mod = @import("../../persistent.zig");
@@ -1765,10 +1766,9 @@ pub const IndexManager = struct {
         /// Terminal embedding artifact streams unioned into this index. This
         /// is mutually exclusive with the single-source `embedding_name` form.
         embedding_names: [][]u8 = &.{},
-        /// True when the union contains both document-level and artifact-level
-        /// members. Parent-level results are well-defined for this shape, while
-        /// hierarchy-specific result modes require a homogeneous source level.
-        heterogeneous_source_levels: bool = false,
+        /// True only when every indexed member has a durable document-unit
+        /// identity. Source and parent grouping remain available independently.
+        supports_unit_grouping: bool = false,
         index: hbc_mod.HBCIndex,
         vector_loader_context: ?*DenseVectorLoadContext = null,
         ordinal_vector_ids: std.AutoHashMapUnmanaged(doc_identity.DocOrdinal, u64) = .empty,
@@ -2122,7 +2122,7 @@ pub const IndexManager = struct {
         chunk_name: ?[]u8,
         embedding_name: ?[]u8,
         embedding_names: [][]u8 = &.{},
-        heterogeneous_source_levels: bool = false,
+        supports_unit_grouping: bool = false,
         rebuild_root_path: []u8,
         index: sparse_mod.SparseIndex,
     };
@@ -7852,6 +7852,58 @@ pub const IndexManager = struct {
         return false;
     }
 
+    fn assetSourceSupportsUnitGrouping(self: *const IndexManager, artifact_name: []const u8) bool {
+        const asset_cfg = self.getEnrichment(.asset, artifact_name) orelse return false;
+        var producer = asset_producer_mod.parseProducerConfig(self.alloc, asset_cfg.producer_json) catch return false;
+        defer producer.deinit(self.alloc);
+        return producer.type == .document_extraction;
+    }
+
+    fn artifactSourceSupportsUnitGrouping(self: *const IndexManager, artifact_name: []const u8) bool {
+        if (self.getEnrichment(.chunk, artifact_name)) |chunk_cfg| {
+            return chunk_cfg.source_artifact_name.len > 0 and
+                self.assetSourceSupportsUnitGrouping(chunk_cfg.source_artifact_name);
+        }
+        return self.assetSourceSupportsUnitGrouping(artifact_name);
+    }
+
+    fn embeddingSourceSupportsUnitGrouping(self: *const IndexManager, embedding_cfg: *const enrichment_catalog.EnrichmentConfig) bool {
+        return embedding_cfg.source_artifact_name.len > 0 and
+            self.artifactSourceSupportsUnitGrouping(embedding_cfg.source_artifact_name);
+    }
+
+    fn textSourcesSupportUnitGrouping(
+        self: *const IndexManager,
+        source_artifact_name: ?[]const u8,
+        source_artifact_names: []const []const u8,
+    ) bool {
+        if (source_artifact_name) |artifact_name| {
+            return self.artifactSourceSupportsUnitGrouping(artifact_name);
+        }
+        if (source_artifact_names.len == 0) return false;
+        for (source_artifact_names) |artifact_name| {
+            if (!self.artifactSourceSupportsUnitGrouping(artifact_name)) return false;
+        }
+        return true;
+    }
+
+    pub fn textIndexSupportsUnitGrouping(self: *const IndexManager, name: ?[]const u8) bool {
+        const entry = if (name) |index_name| blk: {
+            for (self.text_indexes.items) |*text_entry| {
+                if (std.mem.eql(u8, text_entry.config.name, index_name)) break :blk text_entry;
+            }
+            break :blk null;
+        } else if (self.text_indexes.items.len == 1)
+            &self.text_indexes.items[0]
+        else
+            null;
+        const resolved = entry orelse return false;
+        return self.textSourcesSupportUnitGrouping(
+            resolved.chunk_name,
+            resolved.source_artifact_names,
+        );
+    }
+
     pub fn denseIndex(self: *IndexManager, name: ?[]const u8) ?*DenseIndex {
         if (name) |index_name| {
             for (self.dense_indexes.items) |*entry| {
@@ -11237,8 +11289,7 @@ pub const IndexManager = struct {
                     }
                 }
                 var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
-                var multi_source_has_document_level = false;
-                var multi_source_has_artifact_level = false;
+                var multi_source_supports_unit_grouping = dense_cfg.embedding_names.len > 0;
                 var multi_source_vector_space: ?[]const u8 = null;
                 var multi_source_has_implicit_vector_space = false;
                 var multi_source_implicit_producer: ?[]const u8 = null;
@@ -11265,11 +11316,8 @@ pub const IndexManager = struct {
                     if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
                         first_multi_source_embedding = embedding_cfg;
                     }
-                    if (embedding_cfg.source_artifact_name.len > 0) {
-                        multi_source_has_artifact_level = true;
-                    } else {
-                        multi_source_has_document_level = true;
-                    }
+                    multi_source_supports_unit_grouping = multi_source_supports_unit_grouping and
+                        self.embeddingSourceSupportsUnitGrouping(embedding_cfg);
                 }
                 // Compatibility is either fully automatic (all vector_space
                 // values omitted) or an explicit assertion shared by every
@@ -11368,7 +11416,12 @@ pub const IndexManager = struct {
                     else
                         null,
                     .embedding_names = try cloneOwnedStrings(self.alloc, dense_cfg.embedding_names),
-                    .heterogeneous_source_levels = multi_source_has_document_level and multi_source_has_artifact_level,
+                    .supports_unit_grouping = if (dense_cfg.embedding_names.len > 0)
+                        multi_source_supports_unit_grouping
+                    else if (referenced_embedding) |embedding_cfg|
+                        self.embeddingSourceSupportsUnitGrouping(embedding_cfg)
+                    else
+                        false,
                     .index = index,
                     .vector_loader_context = vector_loader_context,
                 };
@@ -11404,8 +11457,7 @@ pub const IndexManager = struct {
                 else
                     null;
                 var first_multi_source_embedding: ?*const enrichment_catalog.EnrichmentConfig = null;
-                var multi_source_has_document_level = false;
-                var multi_source_has_artifact_level = false;
+                var multi_source_supports_unit_grouping = sparse_cfg.embedding_names.len > 0;
                 var multi_source_vector_space: ?[]const u8 = null;
                 var multi_source_has_implicit_vector_space = false;
                 var multi_source_implicit_producer: ?[]const u8 = null;
@@ -11432,11 +11484,8 @@ pub const IndexManager = struct {
                     if (first_multi_source_embedding == null and embedding_cfg.source_artifact_name.len > 0) {
                         first_multi_source_embedding = embedding_cfg;
                     }
-                    if (embedding_cfg.source_artifact_name.len > 0) {
-                        multi_source_has_artifact_level = true;
-                    } else {
-                        multi_source_has_document_level = true;
-                    }
+                    multi_source_supports_unit_grouping = multi_source_supports_unit_grouping and
+                        self.embeddingSourceSupportsUnitGrouping(embedding_cfg);
                 }
                 if (multi_source_has_implicit_vector_space and multi_source_vector_space != null) return error.InvalidIndexConfig;
 
@@ -11485,7 +11534,12 @@ pub const IndexManager = struct {
                             try self.alloc.dupe(u8, cfg.name);
                     } else try self.alloc.dupe(u8, cfg.name),
                     .embedding_names = try cloneOwnedStrings(self.alloc, sparse_cfg.embedding_names),
-                    .heterogeneous_source_levels = multi_source_has_document_level and multi_source_has_artifact_level,
+                    .supports_unit_grouping = if (sparse_cfg.embedding_names.len > 0)
+                        multi_source_supports_unit_grouping
+                    else if (referenced_embedding) |embedding_cfg|
+                        self.embeddingSourceSupportsUnitGrouping(embedding_cfg)
+                    else
+                        false,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
                 };
@@ -18096,14 +18150,22 @@ fn isMetadataKey(key: []const u8) bool {
         internal_keys.isTtlKey(key);
 }
 
+fn textArtifactSourceMatches(self: *const IndexManager, key: []const u8, artifact_name: []const u8) bool {
+    if (internal_keys.matchesChunkArtifactName(key, artifact_name)) return true;
+    if (!internal_keys.matchesAssetArtifactName(key, artifact_name)) return false;
+    if (internal_keys.isDocumentUnitArtifactRecordKey(key)) return true;
+    // A document-extraction asset prefix contains both a control manifest and
+    // its durable unit records. The manifest is not a searchable source member
+    // and has no unit identity, so keep it out of the full-text stream.
+    return !self.assetSourceSupportsUnitGrouping(artifact_name);
+}
+
 fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
     if (entry.chunk_name) |artifact_name| {
-        return internal_keys.matchesChunkArtifactName(key, artifact_name) or
-            internal_keys.matchesAssetArtifactName(key, artifact_name);
+        return textArtifactSourceMatches(self, key, artifact_name);
     }
     for (entry.source_artifact_names) |artifact_name| {
-        if (internal_keys.matchesChunkArtifactName(key, artifact_name) or
-            internal_keys.matchesAssetArtifactName(key, artifact_name)) return true;
+        if (textArtifactSourceMatches(self, key, artifact_name)) return true;
     }
     if (entry.source_artifact_names.len > 0) return false;
     if (isPrimaryDocumentCandidate(key)) return true;
@@ -22544,6 +22606,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
     try manager.applyDenseEmbeddingWritesByName(&store, "document_vectors", &writes);
 
     const entry = manager.denseIndex("document_vectors") orelse return error.IndexNotFound;
+    try std.testing.expect(!entry.supports_unit_grouping);
     try std.testing.expectEqual(@as(u64, 2), entry.index.stats().active_count);
     const title_metadata = (try entry.index.getMetadata(deterministicDenseVectorId(title_artifact))) orelse return error.TestUnexpectedResult;
     defer alloc.free(title_metadata);
@@ -23449,6 +23512,75 @@ test "dense index manager accepts explicit embedding writes after addAllNoBackfi
 
     const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+}
+
+test "unit grouping capability requires durable document extraction ancestry" {
+    const alloc = std.testing.allocator;
+    var manager = try IndexManager.init(alloc, ".");
+    defer manager.deinit();
+
+    for ([_]enrichment_catalog.EnrichmentConfig{
+        .{
+            .name = "document_units_v1",
+            .kind = .asset,
+            .source_field = "url",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        },
+        .{
+            .name = "document_chunks_v1",
+            .kind = .chunk,
+            .source_field = "text",
+            .source_artifact_name = "document_units_v1",
+            .chunk_size = 64,
+        },
+        .{
+            .name = "body_chunks_v1",
+            .kind = .chunk,
+            .source_field = "body",
+            .chunk_size = 64,
+        },
+        .{
+            .name = "document_dense_v1",
+            .kind = .embedding,
+            .source_field = "text",
+            .source_artifact_name = "document_chunks_v1",
+            .expected_dims = 3,
+        },
+        .{
+            .name = "body_dense_v1",
+            .kind = .embedding,
+            .source_field = "text",
+            .source_artifact_name = "body_chunks_v1",
+            .expected_dims = 3,
+        },
+    }) |cfg| {
+        try manager.enrichments.append(alloc, try enrichment_catalog.EnrichmentConfig.clone(alloc, cfg));
+    }
+
+    try std.testing.expect(manager.artifactSourceSupportsUnitGrouping("document_units_v1"));
+    try std.testing.expect(manager.artifactSourceSupportsUnitGrouping("document_chunks_v1"));
+    try std.testing.expect(!manager.artifactSourceSupportsUnitGrouping("body_chunks_v1"));
+    try std.testing.expect(manager.embeddingSourceSupportsUnitGrouping(manager.getEnrichment(.embedding, "document_dense_v1").?));
+    try std.testing.expect(!manager.embeddingSourceSupportsUnitGrouping(manager.getEnrichment(.embedding, "body_dense_v1").?));
+    try std.testing.expect(manager.textSourcesSupportUnitGrouping(null, &.{ "document_units_v1", "document_chunks_v1" }));
+    try std.testing.expect(!manager.textSourcesSupportUnitGrouping(null, &.{ "document_units_v1", "body_chunks_v1" }));
+
+    const unit_manifest_key = try internal_keys.artifactNamedPrefixAlloc(
+        alloc,
+        "doc:a",
+        "asset",
+        "document_units_v1",
+    );
+    defer alloc.free(unit_manifest_key);
+    const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(
+        alloc,
+        "doc:a",
+        "document_units_v1",
+        "page:000001",
+    );
+    defer alloc.free(unit_key);
+    try std.testing.expect(!textArtifactSourceMatches(&manager, unit_manifest_key, "document_units_v1"));
+    try std.testing.expect(textArtifactSourceMatches(&manager, unit_key, "document_units_v1"));
 }
 
 test "index manager advertises typed tensor access paths for vector and graph indexes" {

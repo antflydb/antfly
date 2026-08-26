@@ -1741,7 +1741,7 @@ components:
     UnsupportedHierarchyGroupingError:
       type: object
       additionalProperties: false
-      description: A requested hierarchy grouping level cannot represent every member of the selected heterogeneous index.
+      description: A requested hierarchy grouping level cannot represent every member because at least one selected source lacks durable document-unit identity.
       required: [status, error, message, reason, field, action, retryable]
       properties:
         status:
@@ -1757,7 +1757,7 @@ components:
           description: Human-readable remediation using only public query fields.
         reason:
           type: string
-          enum: [mixed_document_chunk_sources]
+          enum: [unit_identity_unavailable]
           description: Stable reason the requested hierarchy level is unavailable.
         field:
           type: string
@@ -1766,7 +1766,7 @@ components:
         action:
           type: string
           enum: [use_source_grouping_or_direct_members]
-          description: Select source grouping, omit group_by for direct members, or use a homogeneous chunk-backed index.
+          description: Select source grouping, omit group_by for direct members, or use an index whose every source is unit-backed.
         retryable:
           type: boolean
           enum: [false]
