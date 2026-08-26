@@ -8,7 +8,7 @@ import (
 )
 
 func TestBuildRestoreJob_StandaloneStillUsesPublicAPIService(t *testing.T) {
-	r := &AntflyRestoreReconciler{}
+	r := &AntflyRestoreReconciler{ClusterDomain: "corp.internal"}
 	restore := &antflyv1.AntflyRestore{
 		ObjectMeta: metav1.ObjectMeta{Name: "standalone-restore", Namespace: "default"},
 		Spec: antflyv1.AntflyRestoreSpec{
@@ -63,7 +63,7 @@ func TestBuildRestoreJob_StandaloneStillUsesPublicAPIService(t *testing.T) {
 	if !foundConnection {
 		t.Fatalf("expected named restore connection in args: %#v", args)
 	}
-	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://standalone-cluster-public-api.default.svc.cluster.local" {
+	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://standalone-cluster-public-api.default.svc.corp.internal" {
 		t.Fatalf("expected restore URL to continue using public-api service in standalone mode, got: %q", got)
 	}
 }

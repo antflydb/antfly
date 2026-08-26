@@ -3071,8 +3071,23 @@ pub fn build(b: *std.Build) void {
         .root_module = image_test_mod,
     });
     const run_lib_image_tests = b.addRunArtifact(lib_image_tests);
+    const jpeg2000_decode_test_mod = b.createModule(.{
+        .root_source_file = b.path("lib/image/src/jpeg2000/decode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const jpeg2000_decode_tests = b.addTest(.{
+        .root_module = jpeg2000_decode_test_mod,
+    });
+    const run_jpeg2000_decode_tests = b.addRunArtifact(jpeg2000_decode_tests);
+    const jpeg2000_decode_test_step = b.step(
+        "lib-image-jpeg2000-test",
+        "Run direct JPEG 2000 decoder tests",
+    );
+    jpeg2000_decode_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
     lib_image_test_step.dependOn(&run_lib_image_tests.step);
+    lib_image_test_step.dependOn(&run_jpeg2000_decode_tests.step);
 
     const pdf_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/pdf/pdf_test_root.zig"),
@@ -3424,6 +3439,21 @@ pub fn build(b: *std.Build) void {
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
 
+    const lib_preload_model_spec_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "preload model spec parser categorizes registry variants and backends",
+            "inference runtime preload parser preserves registry variants and explicit backends",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_preload_model_spec_tests = addFilteredTestRunArtifact(b, lib_preload_model_spec_tests);
+    const lib_preload_model_spec_test_step = b.step("lib-preload-model-spec-test", "Run preload model CLI parser tests");
+    lib_preload_model_spec_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
+
     const lib_common_secrets_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{ "file secret store", "remote content runtime" },
@@ -3536,6 +3566,7 @@ pub fn build(b: *std.Build) void {
     };
     const unit_progress_skip_filters = root_test_skip_filters;
     const lib_unit_default_filters = [_][]const u8{
+        "bedrock provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
         "restore runtime store persists checkpoints and requeues interrupted work",
@@ -3920,6 +3951,18 @@ pub fn build(b: *std.Build) void {
     }
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
+
+    const lib_bedrock_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"bedrock provider request helpers"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_bedrock_tests = addFilteredTestRunArtifact(b, lib_bedrock_tests);
+    const lib_bedrock_test_step = b.step("lib-bedrock-test", "Run focused Bedrock provider tests");
+    lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
         "api http client round-trips public status and internal capability routes",
@@ -7082,6 +7125,7 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
             "parse cli accepts canonical host port and models dir flags",
+            "parse cli preserves registry variants and recognizes explicit preload backends",
             "parse cli accepts HA primary runtime flags",
             "parse cli accepts HA primary sync policy flags",
             "parse cli accepts HA standby runtime flags",
@@ -7170,6 +7214,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
+    unit_test_step.dependOn(&run_lib_preload_model_spec_tests.step);
     unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_httpx_transport_regression_tests.step);
     unit_test_step.dependOn(&run_api_http_runtime_tests.step);
@@ -7199,6 +7244,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_mcp_tests.step);
     unit_test_step.dependOn(&run_lib_a2a_tests.step);
     unit_test_step.dependOn(&run_lib_image_tests.step);
+    unit_test_step.dependOn(&run_jpeg2000_decode_tests.step);
     unit_test_step.dependOn(&run_lib_pdf_tests.step);
     unit_test_step.dependOn(&run_lib_scraping_tests.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);

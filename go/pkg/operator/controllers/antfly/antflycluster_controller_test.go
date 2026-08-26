@@ -15155,7 +15155,7 @@ func TestDataStatefulSetAdvertisesStablePodDNS(t *testing.T) {
 		},
 	}
 	client := newHAControllerTestClient(t, s, cluster)
-	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s}
+	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s, ClusterDomain: "corp.internal"}
 
 	g.Expect(reconciler.reconcileDataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce, internalServiceAuthKeyRolloutSteady)).To(Succeed())
 
@@ -15167,8 +15167,8 @@ func TestDataStatefulSetAdvertisesStablePodDNS(t *testing.T) {
 	args := sts.Spec.Template.Spec.Containers[0].Args[0]
 	g.Expect(args).To(ContainSubstring("--api-host ${POD_IP}"))
 	g.Expect(args).To(ContainSubstring("--raft-host ${POD_IP}"))
-	g.Expect(args).To(ContainSubstring("--api-advertise-url http://${HOSTNAME}.stable-routes-data.antfly-system.svc.cluster.local:12380"))
-	g.Expect(args).To(ContainSubstring("--raft-advertise-url http://${HOSTNAME}.stable-routes-data.antfly-system.svc.cluster.local:9021"))
+	g.Expect(args).To(ContainSubstring("--api-advertise-url http://${HOSTNAME}.stable-routes-data.antfly-system.svc.corp.internal:12380"))
+	g.Expect(args).To(ContainSubstring("--raft-advertise-url http://${HOSTNAME}.stable-routes-data.antfly-system.svc.corp.internal:9021"))
 }
 
 func TestUpdateStatus_Standalone(t *testing.T) {

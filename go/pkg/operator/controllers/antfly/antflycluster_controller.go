@@ -70,6 +70,7 @@ type AntflyClusterReconciler struct {
 	Recorder              events.EventRecorder
 	ManageInferencePools  bool
 	DefaultInferenceImage string
+	ClusterDomain         string
 	Now                   func() time.Time
 	// MonotonicNow is a test hook for process-local HA watchdog barriers. In
 	// production it is nil and time.Now retains its monotonic clock reading.
@@ -2038,8 +2039,9 @@ func (r *AntflyClusterReconciler) fetchMetadataRuntimeTopology(ctx context.Conte
 	// steady-state monitoring must not clone the projected catalog.
 	paths := [...]string{metadataRuntimeTopologyPath, metadataRuntimeStatusPath}
 	for pathIndex, requestPath := range paths {
-		url := fmt.Sprintf("http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d%s",
-			cluster.Name, ordinal, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port, requestPath)
+		podName := fmt.Sprintf("%s-metadata-%d", cluster.Name, ordinal)
+		host := statefulPodDNSName(podName, cluster.Name+"-metadata", cluster.Namespace, r.ClusterDomain)
+		url := fmt.Sprintf("http://%s:%d%s", host, cluster.Spec.MetadataNodes.MetadataAPI.Port, requestPath)
 		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
 		if err != nil {
 			return nil, fmt.Errorf("create metadata topology request: %w", err)
@@ -3539,7 +3541,7 @@ func managedInferencePoolName(cluster *antflyv1.AntflyCluster, managed antflyv1.
 	return fmt.Sprintf("%s-inference-%d", cluster.Name, index)
 }
 
-func configuredInferenceAPIURL(cluster *antflyv1.AntflyCluster) string {
+func (r *AntflyClusterReconciler) configuredInferenceAPIURL(cluster *antflyv1.AntflyCluster) string {
 	if cluster.Spec.Inference == nil {
 		return ""
 	}
@@ -3549,7 +3551,7 @@ func configuredInferenceAPIURL(cluster *antflyv1.AntflyCluster) string {
 		for i, managed := range inference.ManagedPools {
 			name := managedInferencePoolName(cluster, managed, len(inference.ManagedPools), i)
 			if strings.TrimSpace(name) != "" {
-				return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", name, cluster.Namespace, defaultManagedInferenceAPIPort)
+				return fmt.Sprintf("http://%s:%d", serviceDNSName(name, cluster.Namespace, r.ClusterDomain), defaultManagedInferenceAPIPort)
 			}
 		}
 	case antflyv1.AntflyInferenceModeSharedRef:
@@ -3781,8 +3783,9 @@ func (r *AntflyClusterReconciler) generateDistributedConfig(cluster *antflyv1.An
 
 	orchestrationURLs := make(map[string]string, metadataReplicas)
 	for i := uint64(1); i <= uint64(max(metadataReplicas, 0)); i++ { //nolint:gosec // G115: metadataReplicas is a small positive Kubernetes replica count
-		url := fmt.Sprintf("http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d",
-			cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port)
+		podName := fmt.Sprintf("%s-metadata-%d", cluster.Name, i-1)
+		host := statefulPodDNSName(podName, cluster.Name+"-metadata", cluster.Namespace, r.ClusterDomain)
+		url := fmt.Sprintf("http://%s:%d", host, cluster.Spec.MetadataNodes.MetadataAPI.Port)
 		s := strconv.FormatUint(i, 16)
 		orchestrationURLs[s] = url
 	}
@@ -3822,7 +3825,7 @@ func (r *AntflyClusterReconciler) generateDistributedConfig(cluster *antflyv1.An
 		},
 	}
 	completeConfig["storage"] = storageConfig
-	if apiURL := configuredInferenceAPIURL(cluster); apiURL != "" {
+	if apiURL := r.configuredInferenceAPIURL(cluster); apiURL != "" {
 		ensureInferenceAPIURL(completeConfig, apiURL)
 	}
 
@@ -3868,7 +3871,7 @@ func (r *AntflyClusterReconciler) generateStandaloneConfig(cluster *antflyv1.Ant
 	}
 
 	orchestrationURLs := map[string]string{
-		strconv.FormatInt(int64(standalone.NodeID), 16): fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", standaloneStatefulSetName(cluster), cluster.Namespace, standalone.MetadataAPI.Port),
+		strconv.FormatInt(int64(standalone.NodeID), 16): fmt.Sprintf("http://%s:%d", serviceDNSName(standaloneStatefulSetName(cluster), cluster.Namespace, r.ClusterDomain), standalone.MetadataAPI.Port),
 	}
 
 	completeConfig := map[string]any{
@@ -4785,12 +4788,14 @@ func (r *AntflyClusterReconciler) buildMetadataClusterConfig(cluster *antflyv1.A
 		if i > 1 {
 			config.WriteString(", ")
 		}
+		podName := fmt.Sprintf("%s-metadata-%d", cluster.Name, i-1)
+		host := statefulPodDNSName(podName, cluster.Name+"-metadata", cluster.Namespace, r.ClusterDomain)
 		fmt.Fprintf(
 			&config,
-			`"%d": {"raft_url":"http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d","orchestration_url":"http://%s-metadata-%d.%s-metadata.%s.svc.cluster.local:%d"}`,
+			`"%d": {"raft_url":"http://%s:%d","orchestration_url":"http://%s:%d"}`,
 			i,
-			cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataRaft.Port,
-			cluster.Name, i-1, cluster.Name, cluster.Namespace, cluster.Spec.MetadataNodes.MetadataAPI.Port,
+			host, cluster.Spec.MetadataNodes.MetadataRaft.Port,
+			host, cluster.Spec.MetadataNodes.MetadataAPI.Port,
 		)
 	}
 	config.WriteString(" }")
@@ -4799,6 +4804,7 @@ func (r *AntflyClusterReconciler) buildMetadataClusterConfig(cluster *antflyv1.A
 
 func (r *AntflyClusterReconciler) reconcileDataStatefulSet(ctx context.Context, cache *envFromCache, cluster *antflyv1.AntflyCluster, authMode internalServiceAuthRolloutMode, keyMode internalServiceAuthKeyRolloutMode) error {
 	replicas := effectiveDataNodeReplicas(cluster)
+	dataAdvertiseHost := "${HOSTNAME}." + serviceDNSName(cluster.Name+"-data", cluster.Namespace, r.ClusterDomain)
 
 	storageSize := "1Gi"
 	if cluster.Spec.Storage.DataStorage != "" {
@@ -4922,19 +4928,17 @@ ID=$((ORDINAL + 1))
 exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
   --api-host ${POD_IP} \
   --api-port %d \
-  --api-advertise-url http://${HOSTNAME}.%s-data.%s.svc.cluster.local:%d \
+  --api-advertise-url http://%s:%d \
   --raft-host ${POD_IP} \
   --raft-port %d \
-  --raft-advertise-url http://${HOSTNAME}.%s-data.%s.svc.cluster.local:%d \
+  --raft-advertise-url http://%s:%d \
   --health-port %d%s
 								`,
 								cluster.Spec.DataNodes.API.Port,
-								cluster.Name,
-								cluster.Namespace,
+								dataAdvertiseHost,
 								cluster.Spec.DataNodes.API.Port,
 								cluster.Spec.DataNodes.Raft.Port,
-								cluster.Name,
-								cluster.Namespace,
+								dataAdvertiseHost,
 								cluster.Spec.DataNodes.Raft.Port,
 								cluster.Spec.DataNodes.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
@@ -13633,6 +13637,9 @@ func hasAnyPrefix(name string, prefixes []string) bool {
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := normalizeClusterDomainField(&r.ClusterDomain); err != nil {
+		return fmt.Errorf("configure AntflyCluster controller: %w", err)
+	}
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("antflycluster-ha-lease-renewal").
 		WithOptions(controller.Options{MaxConcurrentReconciles: 16}).

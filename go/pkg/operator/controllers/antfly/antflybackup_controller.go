@@ -29,8 +29,9 @@ import (
 // AntflyBackupReconciler reconciles an AntflyBackup object
 type AntflyBackupReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
+	Scheme        *runtime.Scheme
+	Recorder      events.EventRecorder
+	ClusterDomain string
 }
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflybackups,verbs=get;list;watch;create;update;patch;delete
@@ -195,8 +196,7 @@ func (r *AntflyBackupReconciler) buildCronJobSpec(backup *antflyv1.AntflyBackup,
 	}
 
 	// Build the cluster API URL using the public-api service
-	clusterURL := fmt.Sprintf("http://%s-public-api.%s.svc.cluster.local",
-		cluster.Name, clusterNamespace)
+	clusterURL := "http://" + serviceDNSName(cluster.Name+"-public-api", clusterNamespace, r.ClusterDomain)
 
 	// Build shell command. All user-controlled values are shell-quoted to
 	// prevent injection. backup.Name is additionally safe because Kubernetes
@@ -537,6 +537,9 @@ func (r *AntflyBackupReconciler) setCondition(backup *antflyv1.AntflyBackup, con
 
 // SetupWithManager sets up the controller with the Manager
 func (r *AntflyBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := normalizeClusterDomainField(&r.ClusterDomain); err != nil {
+		return fmt.Errorf("configure AntflyBackup controller: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&antflyv1.AntflyBackup{}).
 		Owns(&batchv1.CronJob{}).

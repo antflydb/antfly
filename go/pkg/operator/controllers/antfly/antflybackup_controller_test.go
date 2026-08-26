@@ -296,7 +296,7 @@ func backupJob(name, namespace, backupName string, conditionType batchv1.JobCond
 }
 
 func TestBuildCronJobSpec_CommandStructure(t *testing.T) {
-	r := &AntflyBackupReconciler{}
+	r := &AntflyBackupReconciler{ClusterDomain: "corp.internal"}
 	backup := &antflyv1.AntflyBackup{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-backup", Namespace: "default"},
 		Spec: antflyv1.AntflyBackupSpec{
@@ -328,7 +328,7 @@ func TestBuildCronJobSpec_CommandStructure(t *testing.T) {
 		t.Errorf("command should not use stale --url flag: %s", cmd)
 	}
 
-	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://my-cluster-public-api.default.svc.cluster.local" {
+	if got := envValue(container.Env, "ANTFLY_URL"); got != "http://my-cluster-public-api.default.svc.corp.internal" {
 		t.Errorf("ANTFLY_URL = %q, want cluster public API URL", got)
 	}
 
