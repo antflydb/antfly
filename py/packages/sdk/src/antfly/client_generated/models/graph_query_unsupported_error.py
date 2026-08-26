@@ -5,34 +5,35 @@ from typing import Any, TypeVar
 
 from attrs import define as _attrs_define
 
-from ..models.graph_query_mode_unsupported_error_error import GraphQueryModeUnsupportedErrorError
-from ..models.graph_query_mode_unsupported_error_reason import GraphQueryModeUnsupportedErrorReason
-from ..models.graph_query_mode_unsupported_error_status import GraphQueryModeUnsupportedErrorStatus
+from ..models.graph_query_unsupported_error_error import GraphQueryUnsupportedErrorError
+from ..models.graph_query_unsupported_error_reason import GraphQueryUnsupportedErrorReason
+from ..models.graph_query_unsupported_error_status import GraphQueryUnsupportedErrorStatus
 
-T = TypeVar("T", bound="GraphQueryModeUnsupportedError")
+T = TypeVar("T", bound="GraphQueryUnsupportedError")
 
 
 @_attrs_define
-class GraphQueryModeUnsupportedError:
+class GraphQueryUnsupportedError:
     """
     Attributes:
-        status (GraphQueryModeUnsupportedErrorStatus):
-        error (GraphQueryModeUnsupportedErrorError):
+        status (GraphQueryUnsupportedErrorStatus):
+        error (GraphQueryUnsupportedErrorError):
         message (str):
         retryable (bool):
         operation (str): Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
-        mode (str): Graph operation mode, or the rejected graph request field for a request-wide constraint.
-        reason (GraphQueryModeUnsupportedErrorReason): Stable machine-readable constraint that prevents exact public
+        feature (str): Graph operation feature, such as `match` or `traverse`, or the rejected request feature, such as
+            `order_by`, when `operation` is `$request`.
+        reason (GraphQueryUnsupportedErrorReason): Stable machine-readable constraint that prevents exact public
             execution.
     """
 
-    status: GraphQueryModeUnsupportedErrorStatus
-    error: GraphQueryModeUnsupportedErrorError
+    status: GraphQueryUnsupportedErrorStatus
+    error: GraphQueryUnsupportedErrorError
     message: str
     retryable: bool
     operation: str
-    mode: str
-    reason: GraphQueryModeUnsupportedErrorReason
+    feature: str
+    reason: GraphQueryUnsupportedErrorReason
 
     def to_dict(self) -> dict[str, Any]:
         status = self.status.value
@@ -45,7 +46,7 @@ class GraphQueryModeUnsupportedError:
 
         operation = self.operation
 
-        mode = self.mode
+        feature = self.feature
 
         reason = self.reason.value
 
@@ -58,7 +59,7 @@ class GraphQueryModeUnsupportedError:
                 "message": message,
                 "retryable": retryable,
                 "operation": operation,
-                "mode": mode,
+                "feature": feature,
                 "reason": reason,
             }
         )
@@ -68,9 +69,9 @@ class GraphQueryModeUnsupportedError:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        status = GraphQueryModeUnsupportedErrorStatus(d.pop("status"))
+        status = GraphQueryUnsupportedErrorStatus(d.pop("status"))
 
-        error = GraphQueryModeUnsupportedErrorError(d.pop("error"))
+        error = GraphQueryUnsupportedErrorError(d.pop("error"))
 
         message = d.pop("message")
 
@@ -78,18 +79,18 @@ class GraphQueryModeUnsupportedError:
 
         operation = d.pop("operation")
 
-        mode = d.pop("mode")
+        feature = d.pop("feature")
 
-        reason = GraphQueryModeUnsupportedErrorReason(d.pop("reason"))
+        reason = GraphQueryUnsupportedErrorReason(d.pop("reason"))
 
-        graph_query_mode_unsupported_error = cls(
+        graph_query_unsupported_error = cls(
             status=status,
             error=error,
             message=message,
             retryable=retryable,
             operation=operation,
-            mode=mode,
+            feature=feature,
             reason=reason,
         )
 
-        return graph_query_mode_unsupported_error
+        return graph_query_unsupported_error

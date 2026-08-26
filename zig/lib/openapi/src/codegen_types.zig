@@ -538,11 +538,7 @@ pub const TypeGenerator = struct {
         if (allow_required) {
             for (schema.properties.keys(), schema.properties.values()) |prop_name, prop_sor| {
                 if (!required_fields.contains(prop_name)) continue;
-                const nullable = switch (prop_sor) {
-                    .schema => |property_schema| property_schema.isNullable(),
-                    .ref => false,
-                };
-                if (nullable) return true;
+                if (self.schemaOrRefAllowsNull(prop_sor)) return true;
             }
         }
 
@@ -551,6 +547,16 @@ pub const TypeGenerator = struct {
             if (self.schemaHasRequiredNullableFields(resolved, required_fields, allow_required)) return true;
         }
         return false;
+    }
+
+    /// Whether a property schema permits JSON null. OpenAPI represents this
+    /// through 3.0 `nullable`, a 3.1 type array, or a nullable composition.
+    /// Resolve component references here because request presence semantics
+    /// belong to the referenced wire schema, not to the spelling used by the
+    /// containing property.
+    fn schemaOrRefAllowsNull(self: *TypeGenerator, schema_or_ref: types.SchemaOrRef) bool {
+        const schema = self.resolver.resolveSchema(schema_or_ref) catch return false;
+        return schema.isNullable() or nullableOneOfInner(schema.one_of) != null;
     }
 
     /// Generate a union(enum) from oneOf with discriminator.
@@ -1284,6 +1290,12 @@ pub const TypeGenerator = struct {
     }
 
     fn nullableOneOfType(self: *TypeGenerator, members: []const types.SchemaOrRef) GenError!?[]const u8 {
+        const inner = nullableOneOfInner(members) orelse return null;
+        const inner_type = try self.zigTypeForSchemaOrRef(inner);
+        return inner_type;
+    }
+
+    fn nullableOneOfInner(members: []const types.SchemaOrRef) ?types.SchemaOrRef {
         if (members.len != 2) return null;
 
         var saw_null = false;
@@ -1303,9 +1315,8 @@ pub const TypeGenerator = struct {
                 inner = member;
             },
         };
-        if (!saw_null or inner == null) return null;
-        const inner_type = try self.zigTypeForSchemaOrRef(inner.?);
-        return inner_type;
+        if (!saw_null) return null;
+        return inner;
     }
 
     fn isNullOnlySchema(schema: types.Schema) bool {
@@ -1486,7 +1497,12 @@ test "required + nullable field codegen" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    // Build a schema with required+nullable (3.1 style) and optional fields
+    const nullable_string_members = try arena.alloc(types.SchemaOrRef, 2);
+    nullable_string_members[0] = .{ .schema = .{ .schema_type = .{ .single = "string" } } };
+    nullable_string_members[1] = .{ .schema = .{ .enum_has_null = true } };
+
+    // Build a schema with required+nullable fields in every supported spelling
+    // plus an ordinary optional field.
     var props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
     try props.put(arena, "name", types.SchemaOrRef{
         .schema = types.Schema{ .schema_type = .{ .single = "string" } },
@@ -1507,13 +1523,22 @@ test "required + nullable field codegen" {
             .nullable = true,
         },
     });
+    try props.put(arena, "one_of_tag", .{
+        .schema = .{ .one_of = nullable_string_members },
+    });
+    try props.put(arena, "referenced_tag", .{
+        .ref = .{ .ref_string = "#/components/schemas/NullableString" },
+    });
 
     var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "NullableString", .{
+        .schema = .{ .one_of = nullable_string_members },
+    });
     try schemas.put(arena, "Item", types.SchemaOrRef{
         .schema = types.Schema{
             .schema_type = .{ .single = "object" },
             .properties = props,
-            .required = &.{ "name", "tag", "old_tag" },
+            .required = &.{ "name", "tag", "old_tag", "one_of_tag", "referenced_tag" },
         },
     });
 
@@ -1539,12 +1564,20 @@ test "required + nullable field codegen" {
     // Required + nullable (3.0 style): `old_tag: ?[]const u8,` (no default)
     try std.testing.expect(std.mem.indexOf(u8, output, "old_tag: ?[]const u8,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "old_tag: ?[]const u8 = null") == null);
+    // Nullable oneOf fields already carry their optional marker in the Zig
+    // type, including through a named component reference.
+    try std.testing.expect(std.mem.indexOf(u8, output, "one_of_tag: ?[]const u8,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "referenced_tag: NullableString,") != null);
     // Doc comment from nullable field description
     try std.testing.expect(std.mem.indexOf(u8, output, "/// A nullable required tag") != null);
     // Request serialization must preserve required nulls while omitting absent
     // optional fields.
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.objectField(\"tag\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.tag);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.objectField(\"one_of_tag\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.one_of_tag);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.objectField(\"referenced_tag\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.referenced_tag);") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if (self.note) |value|") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "else if (jw.options.emit_null_optional_fields)") != null);
 }

@@ -3264,6 +3264,12 @@ components:
       type: object
       additionalProperties: false
       required: [edges]
+      description: >-
+        One correlated left-outer graph pattern. Optional groups are evaluated
+        in array order and must connect to an alias visible from the required
+        MATCH or an earlier optional group. Each input binding is extended by
+        every matching optional binding; when none match, exactly one binding
+        is retained with every alias introduced by this group set to null.
       properties:
         nodes:
           type: object
@@ -3310,10 +3316,15 @@ components:
           type: array
           maxItems: 64
           items: { $ref: '#/components/schemas/GraphOptionalMatch' }
+          description: >-
+            Ordered correlated left-outer patterns. Aliases introduced by an
+            earlier item are visible to later items, including as null.
     GraphRowCountTarget:
       type: string
       enum: ['*']
-      description: Count every complete graph binding.
+      description: >-
+        Count every complete graph binding, including a binding retained by an
+        unmatched optional group through null extension.
     GraphRowCountAggregate:
       type: object
       additionalProperties: false
@@ -3328,6 +3339,9 @@ components:
       properties:
         count:
           $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier'
+          description: >-
+            Count bindings in which this alias is non-null. An unmatched
+            optional alias does not increment the count.
         distinct:
           type: boolean
           default: false
@@ -3342,6 +3356,8 @@ components:
       description: >-
         Exact count(*) or count(alias). The distinct option exists only for
         alias counts, making distinct count(*) invalid by schema and at runtime.
+        count(*) includes null-extended optional rows; count(alias) counts only
+        bindings where that alias is non-null.
     GraphBindingsReturn:
       type: object
       additionalProperties: false

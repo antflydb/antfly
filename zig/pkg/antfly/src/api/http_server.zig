@@ -12087,7 +12087,7 @@ pub const ApiHttpServer = struct {
             ),
             error.GraphQueryModeUnsupported => contextual_operations.jsonWithStatus(
                 422,
-                try public_table_http.graphQueryModeUnsupportedBody(self.alloc, body),
+                try public_table_http.graphQueryUnsupportedBody(self.alloc, body),
                 false,
             ),
             error.GraphExternalAliasDocumentFilterUnsupported => contextual_operations.jsonWithStatus(

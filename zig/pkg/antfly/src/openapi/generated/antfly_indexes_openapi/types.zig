@@ -1316,6 +1316,7 @@ pub const GraphAlgebraicPlanningConfig = struct {
 };
 
 pub const GraphAliasCountAggregate = struct {
+    /// Count bindings in which this alias is non-null. An unmatched optional alias does not increment the count.
     count: antfly_graph_identifier_openapi.GraphIdentifier,
     /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
@@ -1403,7 +1404,7 @@ pub const GraphBoundedTraversalConfig = struct {
     law: []const u8,
 };
 
-/// Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid by schema and at runtime.
+/// Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid by schema and at runtime. count(*) includes null-extended optional rows; count(alias) counts only bindings where that alias is non-null.
 pub const GraphCountAggregate = union(enum) {
     graph_row_count_aggregate: *GraphRowCountAggregate,
     graph_alias_count_aggregate: *GraphAliasCountAggregate,
@@ -1882,6 +1883,7 @@ pub const GraphMatch = struct {
     nodes: std.json.ArrayHashMap(GraphMatchNode),
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,
+    /// Ordered correlated left-outer patterns. Aliases introduced by an earlier item are visible to later items, including as null.
     optional: ?[]const GraphOptionalMatch = null,
 };
 
@@ -1992,6 +1994,7 @@ pub const GraphNotExistsPattern = struct {
     edges: []const GraphMatchEdge,
 };
 
+/// One correlated left-outer graph pattern. Optional groups are evaluated in array order and must connect to an alias visible from the required MATCH or an earlier optional group. Each input binding is extended by every matching optional binding; when none match, exactly one binding is retained with every alias introduced by this group set to null.
 pub const GraphOptionalMatch = struct {
     /// Keys are GraphIdentifiers naming aliases introduced by this optional match.
     nodes: ?std.json.ArrayHashMap(GraphMatchNode) = null,
@@ -2463,7 +2466,7 @@ pub const GraphRowCountAggregate = struct {
     count: GraphRowCountTarget,
 };
 
-/// Count every complete graph binding.
+/// Count every complete graph binding, including a binding retained by an unmatched optional group through null extension.
 pub const GraphRowCountTarget = enum {
     @"*",
 

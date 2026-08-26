@@ -20,12 +20,16 @@ T = TypeVar("T", bound="GraphOptionalMatch")
 
 @_attrs_define
 class GraphOptionalMatch:
-    """
-    Attributes:
-        edges (list[GraphMatchEdge]):
-        nodes (GraphOptionalMatchNodes | Unset): Keys are GraphIdentifiers naming aliases introduced by this optional
-            match.
-        where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):
+    """One correlated left-outer graph pattern. Optional groups are evaluated in array order and must connect to an alias
+    visible from the required MATCH or an earlier optional group. Each input binding is extended by every matching
+    optional binding; when none match, exactly one binding is retained with every alias introduced by this group set to
+    null.
+
+        Attributes:
+            edges (list[GraphMatchEdge]):
+            nodes (GraphOptionalMatchNodes | Unset): Keys are GraphIdentifiers naming aliases introduced by this optional
+                match.
+            where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):
     """
 
     edges: list[GraphMatchEdge]

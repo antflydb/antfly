@@ -19,7 +19,7 @@ pub const Reason = enum {
 
 pub const Diagnostic = struct {
     operation: []const u8,
-    mode: []const u8,
+    feature: []const u8,
     reason: Reason,
 };
 
@@ -48,7 +48,7 @@ pub fn reasonForError(err: anyerror) ?Reason {
     };
 }
 
-pub fn mode(query: graph_query.GraphQuery) []const u8 {
+pub fn feature(query: graph_query.GraphQuery) []const u8 {
     return switch (query.query_type) {
         .neighbors => "neighbors",
         .traverse => "traverse",
@@ -58,7 +58,7 @@ pub fn mode(query: graph_query.GraphQuery) []const u8 {
     };
 }
 
-pub fn record(operation: []const u8, operation_mode: []const u8, reason: Reason) void {
+pub fn record(operation: []const u8, query_feature: []const u8, reason: Reason) void {
     // Admission guarantees this bound for public requests. Fail closed for an
     // internal caller that bypasses admission instead of emitting a truncated,
     // misleading operation name.
@@ -69,7 +69,7 @@ pub fn record(operation: []const u8, operation_mode: []const u8, reason: Reason)
     @memcpy(operation_buf[0..operation.len], operation);
     last_diagnostic = .{
         .operation = operation_buf[0..operation.len],
-        .mode = operation_mode,
+        .feature = query_feature,
         .reason = reason,
     };
 }
@@ -81,7 +81,7 @@ test "graph capability diagnostic owns operation name and clears on take" {
 
     const diagnostic = take() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("later", diagnostic.operation);
-    try std.testing.expectEqualStrings("match", diagnostic.mode);
+    try std.testing.expectEqualStrings("match", diagnostic.feature);
     try std.testing.expectEqual(Reason.external_alias_source_not_supported, diagnostic.reason);
     try std.testing.expect(take() == null);
 }

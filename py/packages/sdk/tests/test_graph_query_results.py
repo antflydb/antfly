@@ -1,8 +1,8 @@
-from antfly.client_generated.models.graph_query_mode_unsupported_error import (
-    GraphQueryModeUnsupportedError,
+from antfly.client_generated.models.graph_query_unsupported_error import (
+    GraphQueryUnsupportedError,
 )
-from antfly.client_generated.models.graph_query_mode_unsupported_error_reason import (
-    GraphQueryModeUnsupportedErrorReason,
+from antfly.client_generated.models.graph_query_unsupported_error_reason import (
+    GraphQueryUnsupportedErrorReason,
 )
 from antfly.client_generated.models.legacy_graph_query_result import LegacyGraphQueryResult
 from antfly.client_generated.models.query_result_graph_results import QueryResultGraphResults
@@ -26,34 +26,34 @@ def test_pre_discriminator_graph_result_decodes_as_legacy() -> None:
 
 
 def test_serverless_legacy_graph_rejection_decodes_as_typed_error() -> None:
-    error = GraphQueryModeUnsupportedError.from_dict(
+    error = GraphQueryUnsupportedError.from_dict(
         {
             "status": 422,
-            "error": "graph_query_mode_unsupported",
+            "error": "graph_query_unsupported",
             "message": "serverless graph queries require graph_queries",
             "retryable": False,
             "operation": "$request",
-            "mode": "graph_searches",
+            "feature": "graph_searches",
             "reason": "legacy_graph_searches_not_supported",
         }
     )
 
-    assert error.reason is GraphQueryModeUnsupportedErrorReason.LEGACY_GRAPH_SEARCHES_NOT_SUPPORTED
+    assert error.reason is GraphQueryUnsupportedErrorReason.LEGACY_GRAPH_SEARCHES_NOT_SUPPORTED
 
 
 def test_serverless_request_control_rejection_decodes_as_typed_error() -> None:
-    error = GraphQueryModeUnsupportedError.from_dict(
+    error = GraphQueryUnsupportedError.from_dict(
         {
             "status": 422,
-            "error": "graph_query_mode_unsupported",
+            "error": "graph_query_unsupported",
             "message": "this request control cannot be combined with exact graph execution",
             "retryable": False,
             "operation": "$request",
-            "mode": "order_by",
+            "feature": "order_by",
             "reason": "request_control_not_supported",
         }
     )
 
     assert error.operation == "$request"
-    assert error.mode == "order_by"
-    assert error.reason is GraphQueryModeUnsupportedErrorReason.REQUEST_CONTROL_NOT_SUPPORTED
+    assert error.feature == "order_by"
+    assert error.reason is GraphQueryUnsupportedErrorReason.REQUEST_CONTROL_NOT_SUPPORTED

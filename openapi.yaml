@@ -8551,7 +8551,7 @@ components:
           type: boolean
           enum:
             - false
-    GraphQueryModeUnsupportedError:
+    GraphQueryUnsupportedError:
       type: object
       additionalProperties: false
       required:
@@ -8560,7 +8560,7 @@ components:
         - message
         - retryable
         - operation
-        - mode
+        - feature
         - reason
       properties:
         status:
@@ -8571,7 +8571,7 @@ components:
         error:
           type: string
           enum:
-            - graph_query_mode_unsupported
+            - graph_query_unsupported
         message:
           type: string
         retryable:
@@ -8582,9 +8582,10 @@ components:
           type: string
           description: Named graph operation that cannot execute exactly, or `$request` for a request-wide
             constraint.
-        mode:
+        feature:
           type: string
-          description: Graph operation mode, or the rejected graph request field for a request-wide constraint.
+          description: Graph operation feature, such as `match` or `traverse`, or the rejected request
+            feature, such as `order_by`, when `operation` is `$request`.
         reason:
           type: string
           enum:
@@ -8646,7 +8647,7 @@ components:
         - $ref: '#/components/schemas/GraphWorkBudgetExceededError'
         - $ref: '#/components/schemas/GraphPathWeightDomainError'
         - $ref: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
-        - $ref: '#/components/schemas/GraphQueryModeUnsupportedError'
+        - $ref: '#/components/schemas/GraphQueryUnsupportedError'
         - $ref: '#/components/schemas/GraphMatchOperationLimitExceededError'
       discriminator:
         propertyName: error
@@ -8657,7 +8658,7 @@ components:
           graph_work_budget_exceeded: '#/components/schemas/GraphWorkBudgetExceededError'
           graph_path_weight_domain_error: '#/components/schemas/GraphPathWeightDomainError'
           graph_anchor_filter_requires_index: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
-          graph_query_mode_unsupported: '#/components/schemas/GraphQueryModeUnsupportedError'
+          graph_query_unsupported: '#/components/schemas/GraphQueryUnsupportedError'
           graph_match_operation_limit_exceeded: '#/components/schemas/GraphMatchOperationLimitExceededError'
     SortDirection:
       type: boolean
@@ -23043,6 +23044,10 @@ components:
       additionalProperties: false
       required:
         - edges
+      description: One correlated left-outer graph pattern. Optional groups are evaluated in array order
+        and must connect to an alias visible from the required MATCH or an earlier optional group. Each
+        input binding is extended by every matching optional binding; when none match, exactly one binding
+        is retained with every alias introduced by this group set to null.
       properties:
         nodes:
           type: object
@@ -23097,6 +23102,8 @@ components:
           maxItems: 64
           items:
             $ref: '#/components/schemas/GraphOptionalMatch'
+          description: Ordered correlated left-outer patterns. Aliases introduced by an earlier item are
+            visible to later items, including as null.
     GraphBindingsReturn:
       type: object
       additionalProperties: false
@@ -23132,7 +23139,8 @@ components:
       type: string
       enum:
         - '*'
-      description: Count every complete graph binding.
+      description: Count every complete graph binding, including a binding retained by an unmatched optional
+        group through null extension.
     GraphRowCountAggregate:
       type: object
       additionalProperties: false
@@ -23149,6 +23157,8 @@ components:
       properties:
         count:
           $ref: '#/components/schemas/GraphIdentifier'
+          description: Count bindings in which this alias is non-null. An unmatched optional alias does
+            not increment the count.
         distinct:
           type: boolean
           default: false
@@ -23159,7 +23169,8 @@ components:
         - $ref: '#/components/schemas/GraphRowCountAggregate'
         - $ref: '#/components/schemas/GraphAliasCountAggregate'
       description: Exact count(*) or count(alias). The distinct option exists only for alias counts, making
-        distinct count(*) invalid by schema and at runtime.
+        distinct count(*) invalid by schema and at runtime. count(*) includes null-extended optional rows;
+        count(alias) counts only bindings where that alias is non-null.
     GraphAggregatesReturn:
       type: object
       additionalProperties: false

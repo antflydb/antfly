@@ -14,7 +14,8 @@ T = TypeVar("T", bound="GraphRowCountAggregate")
 class GraphRowCountAggregate:
     """
     Attributes:
-        count (GraphRowCountTarget): Count every complete graph binding.
+        count (GraphRowCountTarget): Count every complete graph binding, including a binding retained by an unmatched
+            optional group through null extension.
     """
 
     count: GraphRowCountTarget

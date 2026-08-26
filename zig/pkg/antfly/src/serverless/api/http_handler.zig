@@ -3165,7 +3165,7 @@ pub const HttpHandler = struct {
             ) catch |err| {
                 std.log.warn(
                     "serverless public graph operation failed operation={s} mode={s} err={}",
-                    .{ named_query.name, graph_query_diagnostic.mode(named_query.query), err },
+                    .{ named_query.name, graph_query_diagnostic.feature(named_query.query), err },
                 );
                 if (graph_path_weight_diagnostic.isDomainError(err)) {
                     graph_path_weight_diagnostic.record(named_query.name, err);
@@ -3178,7 +3178,7 @@ pub const HttpHandler = struct {
                 if (graph_query_diagnostic.reasonForError(err)) |reason| {
                     graph_query_diagnostic.record(
                         named_query.name,
-                        graph_query_diagnostic.mode(named_query.query),
+                        graph_query_diagnostic.feature(named_query.query),
                         reason,
                     );
                 }
@@ -10842,13 +10842,13 @@ test "http handler serves published graph query endpoints" {
     defer legacy_pattern.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 422), legacy_pattern.status);
     var parsed_legacy_pattern = try parseJsonTestBody(
-        metadata_openapi.GraphQueryModeUnsupportedError,
+        metadata_openapi.GraphQueryUnsupportedError,
         alloc,
         legacy_pattern.body,
     );
     defer parsed_legacy_pattern.deinit();
     try std.testing.expectEqualStrings("$request", parsed_legacy_pattern.value.operation);
-    try std.testing.expectEqualStrings("graph_searches", parsed_legacy_pattern.value.mode);
+    try std.testing.expectEqualStrings("graph_searches", parsed_legacy_pattern.value.feature);
     try std.testing.expectEqualStrings(
         "legacy_graph_searches_not_supported",
         parsed_legacy_pattern.value.reason,
@@ -10864,13 +10864,13 @@ test "http handler serves published graph query endpoints" {
     defer unsupported_control.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 422), unsupported_control.status);
     var parsed_unsupported_control = try parseJsonTestBody(
-        metadata_openapi.GraphQueryModeUnsupportedError,
+        metadata_openapi.GraphQueryUnsupportedError,
         alloc,
         unsupported_control.body,
     );
     defer parsed_unsupported_control.deinit();
     try std.testing.expectEqualStrings("$request", parsed_unsupported_control.value.operation);
-    try std.testing.expectEqualStrings("order_by", parsed_unsupported_control.value.mode);
+    try std.testing.expectEqualStrings("order_by", parsed_unsupported_control.value.feature);
     try std.testing.expectEqualStrings(
         "request_control_not_supported",
         parsed_unsupported_control.value.reason,
@@ -11092,7 +11092,7 @@ test "serverless public graph query rejects exact sort controls" {
     ));
     const order_by_diagnostic = graph_query_diagnostic.take() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("$request", order_by_diagnostic.operation);
-    try std.testing.expectEqualStrings("order_by", order_by_diagnostic.mode);
+    try std.testing.expectEqualStrings("order_by", order_by_diagnostic.feature);
     try std.testing.expectEqual(
         graph_query_diagnostic.Reason.request_control_not_supported,
         order_by_diagnostic.reason,
@@ -11105,7 +11105,7 @@ test "serverless public graph query rejects exact sort controls" {
     ));
     const search_after_diagnostic = graph_query_diagnostic.take() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("$request", search_after_diagnostic.operation);
-    try std.testing.expectEqualStrings("search_after", search_after_diagnostic.mode);
+    try std.testing.expectEqualStrings("search_after", search_after_diagnostic.feature);
     try std.testing.expectEqual(
         graph_query_diagnostic.Reason.request_control_not_supported,
         search_after_diagnostic.reason,
@@ -11125,7 +11125,7 @@ test "serverless public graph query rejects exact sort controls" {
     ));
     const legacy_diagnostic = graph_query_diagnostic.take() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("$request", legacy_diagnostic.operation);
-    try std.testing.expectEqualStrings("graph_searches", legacy_diagnostic.mode);
+    try std.testing.expectEqualStrings("graph_searches", legacy_diagnostic.feature);
     try std.testing.expectEqual(
         graph_query_diagnostic.Reason.legacy_graph_searches_not_supported,
         legacy_diagnostic.reason,

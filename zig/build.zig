@@ -3923,7 +3923,7 @@ pub fn build(b: *std.Build) void {
         "db index repair streams graph artifact rebuild in batches",
         "api distributed graph cross-table hydrate enforces target authorization",
         "public table query handler maps exact graph execution failures",
-        "unsupported graph mode diagnostics identify the rejected operation constraint",
+        "unsupported graph diagnostics identify the rejected operation feature",
         "authenticated single-group graph queries require distributed coordination",
         "graph table queries have one fresh-topology retry",
         "generic shard query wire preserves admitted canonical graph operations",

@@ -272,6 +272,64 @@ unsigned Unix-nanosecond domain (1970-01-01 through 2554-07-21 UTC).
 }
 ```
 
+Optional groups are correlated left-outer patterns and run in array order. Each
+group must connect to an alias from the required pattern or an earlier optional
+group. A group with no match retains one row and exposes each alias introduced
+by that group as `null`. `where.not_exists` is the anti-join form: its edges may
+refer only to aliases already visible at that point and do not introduce aliases.
+
+For example, this forms authored-post bindings with optional replies. The
+anti-join excludes bindings where the author also has a `BLOCKED` relationship
+to that post:
+
+```jsonc
+{
+  "graph_queries": {
+    "post_activity": {
+      "index": "social_graph",
+      "match": {
+        "anchor": "author",
+        "nodes": {
+          "author": {},
+          "post": {"table": "messages"}
+        },
+        "edges": [
+          {"from": "author", "to": "post", "types": ["AUTHORED"]}
+        ],
+        "where": {
+          "not_exists": {
+            "edges": [
+              {"from": "author", "to": "post", "types": ["BLOCKED"]}
+            ]
+          }
+        },
+        "optional": [
+          {
+            "nodes": {"reply": {"table": "messages"}},
+            "edges": [
+              {"from": "reply", "to": "post", "types": ["REPLIES_TO"]}
+            ]
+          }
+        ]
+      },
+      "return": {
+        "aggregates": {
+          "rows": {"count": "*"},
+          "posts": {"count": "post", "distinct": true},
+          "replies": {"count": "reply"}
+        }
+      }
+    }
+  }
+}
+```
+
+`count(*)` includes the null-extended row produced when a post has no reply.
+`count(alias)` ignores rows where that alias is null, matching SQL count
+semantics. If several replies match one post, the row and reply counts observe
+each resulting binding; use `distinct: true` on an alias count when unique
+identities are required, as the `posts` aggregate does above.
+
 Use `CountGraphRows` and `CountGraphAlias` in Go, `countGraphRows` and
 `countGraphAlias` in TypeScript, or `count_graph_rows` and `count_graph_alias`
 in Python to construct validated count expressions. The alias helpers reject

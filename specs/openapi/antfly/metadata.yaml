@@ -1961,10 +1961,10 @@ components:
         retryable:
           type: boolean
           enum: [false]
-    GraphQueryModeUnsupportedError:
+    GraphQueryUnsupportedError:
       type: object
       additionalProperties: false
-      required: [status, error, message, retryable, operation, mode, reason]
+      required: [status, error, message, retryable, operation, feature, reason]
       properties:
         status:
           type: integer
@@ -1972,7 +1972,7 @@ components:
           enum: [422]
         error:
           type: string
-          enum: [graph_query_mode_unsupported]
+          enum: [graph_query_unsupported]
         message:
           type: string
         retryable:
@@ -1981,9 +1981,12 @@ components:
         operation:
           type: string
           description: Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
-        mode:
+        feature:
           type: string
-          description: Graph operation mode, or the rejected graph request field for a request-wide constraint.
+          description: >-
+            Graph operation feature, such as `match` or `traverse`, or the
+            rejected request feature, such as `order_by`, when `operation` is
+            `$request`.
         reason:
           type: string
           enum:
@@ -2036,7 +2039,7 @@ components:
         - $ref: '#/components/schemas/GraphWorkBudgetExceededError'
         - $ref: '#/components/schemas/GraphPathWeightDomainError'
         - $ref: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
-        - $ref: '#/components/schemas/GraphQueryModeUnsupportedError'
+        - $ref: '#/components/schemas/GraphQueryUnsupportedError'
         - $ref: '#/components/schemas/GraphMatchOperationLimitExceededError'
       discriminator:
         propertyName: error
@@ -2047,7 +2050,7 @@ components:
           graph_work_budget_exceeded: '#/components/schemas/GraphWorkBudgetExceededError'
           graph_path_weight_domain_error: '#/components/schemas/GraphPathWeightDomainError'
           graph_anchor_filter_requires_index: '#/components/schemas/GraphAnchorFilterRequiresIndexError'
-          graph_query_mode_unsupported: '#/components/schemas/GraphQueryModeUnsupportedError'
+          graph_query_unsupported: '#/components/schemas/GraphQueryUnsupportedError'
           graph_match_operation_limit_exceeded: '#/components/schemas/GraphMatchOperationLimitExceededError'
     SortDirection:
       $ref: "sort.yaml#/components/schemas/SortDirection"

@@ -4477,6 +4477,7 @@ pub const GraphAlgebraicPlanningConfig = struct {
 };
 
 pub const GraphAliasCountAggregate = struct {
+    /// Count bindings in which this alias is non-null. An unmatched optional alias does not increment the count.
     count: GraphIdentifier,
     /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
@@ -4571,7 +4572,7 @@ pub const GraphBoundedTraversalConfig = struct {
     law: []const u8,
 };
 
-/// Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid by schema and at runtime.
+/// Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid by schema and at runtime. count(*) includes null-extended optional rows; count(alias) counts only bindings where that alias is non-null.
 pub const GraphCountAggregate = union(enum) {
     graph_row_count_aggregate: *GraphRowCountAggregate,
     graph_alias_count_aggregate: *GraphAliasCountAggregate,
@@ -5064,6 +5065,7 @@ pub const GraphMatch = struct {
     nodes: std.json.ArrayHashMap(GraphMatchNode),
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,
+    /// Ordered correlated left-outer patterns. Aliases introduced by an earlier item are visible to later items, including as null.
     optional: ?[]const GraphOptionalMatch = null,
 };
 
@@ -5185,6 +5187,7 @@ pub const GraphNotExistsPattern = struct {
     edges: []const GraphMatchEdge,
 };
 
+/// One correlated left-outer graph pattern. Optional groups are evaluated in array order and must connect to an alias visible from the required MATCH or an earlier optional group. Each input binding is extended by every matching optional binding; when none match, exactly one binding is retained with every alias introduced by this group set to null.
 pub const GraphOptionalMatch = struct {
     /// Keys are GraphIdentifiers naming aliases introduced by this optional match.
     nodes: ?std.json.ArrayHashMap(GraphMatchNode) = null,
@@ -5302,19 +5305,6 @@ pub const GraphQuery = union(enum) {
             .graph_traverse_query => |v| try jw.write(v.*),
         }
     }
-};
-
-pub const GraphQueryModeUnsupportedError = struct {
-    status: i32,
-    @"error": []const u8,
-    message: []const u8,
-    retryable: bool,
-    /// Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
-    operation: []const u8,
-    /// Graph operation mode, or the rejected graph request field for a request-wide constraint.
-    mode: []const u8,
-    /// Stable machine-readable constraint that prevents exact public execution.
-    reason: []const u8,
 };
 
 /// Deprecated graph_searches traversal and path parameters.
@@ -5468,6 +5458,19 @@ pub const GraphQueryType = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+pub const GraphQueryUnsupportedError = struct {
+    status: i32,
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+    /// Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint.
+    operation: []const u8,
+    /// Graph operation feature, such as `match` or `traverse`, or the rejected request feature, such as `order_by`, when `operation` is `$request`.
+    feature: []const u8,
+    /// Stable machine-readable constraint that prevents exact public execution.
+    reason: []const u8,
 };
 
 /// Versioned entity resolver attached to an artifact-backed graph index.
@@ -5683,7 +5686,7 @@ pub const GraphRowCountAggregate = struct {
     count: GraphRowCountTarget,
 };
 
-/// Count every complete graph binding.
+/// Count every complete graph binding, including a binding retained by an unmatched optional group through null extension.
 pub const GraphRowCountTarget = enum {
     @"*",
 
@@ -9361,7 +9364,7 @@ pub const QueryUnprocessableError = union(enum) {
     graph_work_budget_exceeded_error: GraphWorkBudgetExceededError,
     graph_path_weight_domain_error: GraphPathWeightDomainError,
     graph_anchor_filter_requires_index_error: GraphAnchorFilterRequiresIndexError,
-    graph_query_mode_unsupported_error: GraphQueryModeUnsupportedError,
+    graph_query_unsupported_error: GraphQueryUnsupportedError,
     graph_match_operation_limit_exceeded_error: GraphMatchOperationLimitExceededError,
 
     pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
@@ -9400,8 +9403,8 @@ pub const QueryUnprocessableError = union(enum) {
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromSliceLeaky(GraphAnchorFilterRequiresIndexError, allocator, input, options) };
         }
-        if (std.mem.eql(u8, disc_str, "graph_query_mode_unsupported")) {
-            return .{ .graph_query_mode_unsupported_error = try std.json.parseFromSliceLeaky(GraphQueryModeUnsupportedError, allocator, input, options) };
+        if (std.mem.eql(u8, disc_str, "graph_query_unsupported")) {
+            return .{ .graph_query_unsupported_error = try std.json.parseFromSliceLeaky(GraphQueryUnsupportedError, allocator, input, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
             return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromSliceLeaky(GraphMatchOperationLimitExceededError, allocator, input, options) };
@@ -9441,8 +9444,8 @@ pub const QueryUnprocessableError = union(enum) {
         if (std.mem.eql(u8, disc_str, "graph_anchor_filter_requires_index")) {
             return .{ .graph_anchor_filter_requires_index_error = try std.json.parseFromValueLeaky(GraphAnchorFilterRequiresIndexError, allocator, source, options) };
         }
-        if (std.mem.eql(u8, disc_str, "graph_query_mode_unsupported")) {
-            return .{ .graph_query_mode_unsupported_error = try std.json.parseFromValueLeaky(GraphQueryModeUnsupportedError, allocator, source, options) };
+        if (std.mem.eql(u8, disc_str, "graph_query_unsupported")) {
+            return .{ .graph_query_unsupported_error = try std.json.parseFromValueLeaky(GraphQueryUnsupportedError, allocator, source, options) };
         }
         if (std.mem.eql(u8, disc_str, "graph_match_operation_limit_exceeded")) {
             return .{ .graph_match_operation_limit_exceeded_error = try std.json.parseFromValueLeaky(GraphMatchOperationLimitExceededError, allocator, source, options) };
@@ -9458,7 +9461,7 @@ pub const QueryUnprocessableError = union(enum) {
             .graph_work_budget_exceeded_error => |v| try jw.write(v),
             .graph_path_weight_domain_error => |v| try jw.write(v),
             .graph_anchor_filter_requires_index_error => |v| try jw.write(v),
-            .graph_query_mode_unsupported_error => |v| try jw.write(v),
+            .graph_query_unsupported_error => |v| try jw.write(v),
             .graph_match_operation_limit_exceeded_error => |v| try jw.write(v),
         }
     }

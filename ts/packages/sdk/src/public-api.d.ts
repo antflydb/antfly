@@ -3076,7 +3076,7 @@ export interface components {
             /** @enum {boolean} */
             retryable: false;
         };
-        GraphQueryModeUnsupportedError: {
+        GraphQueryUnsupportedError: {
             /**
              * Format: int32
              * @enum {integer}
@@ -3086,14 +3086,14 @@ export interface components {
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
              */
-            error: "graph_query_mode_unsupported";
+            error: "graph_query_unsupported";
             message: string;
             /** @enum {boolean} */
             retryable: false;
             /** @description Named graph operation that cannot execute exactly, or `$request` for a request-wide constraint. */
             operation: string;
-            /** @description Graph operation mode, or the rejected graph request field for a request-wide constraint. */
-            mode: string;
+            /** @description Graph operation feature, such as `match` or `traverse`, or the rejected request feature, such as `order_by`, when `operation` is `$request`. */
+            feature: string;
             /**
              * @description Stable machine-readable constraint that prevents exact public execution.
              * @enum {string}
@@ -3125,7 +3125,7 @@ export interface components {
              */
             actual: number;
         };
-        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphWorkBudgetExceededError"] | components["schemas"]["GraphPathWeightDomainError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryModeUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
+        QueryUnprocessableError: components["schemas"]["ExactSortError"] | components["schemas"]["QueryCandidateBudgetExceededError"] | components["schemas"]["GraphDistinctBudgetExceededError"] | components["schemas"]["GraphWorkBudgetExceededError"] | components["schemas"]["GraphPathWeightDomainError"] | components["schemas"]["GraphAnchorFilterRequiresIndexError"] | components["schemas"]["GraphQueryUnsupportedError"] | components["schemas"]["GraphMatchOperationLimitExceededError"];
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -12086,6 +12086,7 @@ export interface components {
             not_exists: components["schemas"]["GraphNotExistsPattern"];
         };
         GraphWhereExpression: components["schemas"]["GraphWhereAnd"] | components["schemas"]["GraphWhereNotEqual"] | components["schemas"]["GraphWhereNotExists"];
+        /** @description One correlated left-outer graph pattern. Optional groups are evaluated in array order and must connect to an alias visible from the required MATCH or an earlier optional group. Each input binding is extended by every matching optional binding; when none match, exactly one binding is retained with every alias introduced by this group set to null. */
         GraphOptionalMatch: {
             /** @description Keys are GraphIdentifiers naming aliases introduced by this optional match. */
             nodes?: {
@@ -12103,6 +12104,7 @@ export interface components {
             };
             edges: components["schemas"]["GraphMatchEdge"][];
             where?: components["schemas"]["GraphWhereExpression"];
+            /** @description Ordered correlated left-outer patterns. Aliases introduced by an earlier item are visible to later items, including as null. */
             optional?: components["schemas"]["GraphOptionalMatch"][];
         };
         GraphBindingsReturn: {
@@ -12118,7 +12120,7 @@ export interface components {
             fields?: string[];
         };
         /**
-         * @description Count every complete graph binding.
+         * @description Count every complete graph binding, including a binding retained by an unmatched optional group through null extension.
          * @enum {string}
          */
         GraphRowCountTarget: "*";
@@ -12126,6 +12128,7 @@ export interface components {
             count: components["schemas"]["GraphRowCountTarget"];
         };
         GraphAliasCountAggregate: {
+            /** @description Count bindings in which this alias is non-null. An unmatched optional alias does not increment the count. */
             count: components["schemas"]["GraphIdentifier"];
             /**
              * @description Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
@@ -12133,7 +12136,7 @@ export interface components {
              */
             distinct?: boolean;
         };
-        /** @description Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid by schema and at runtime. */
+        /** @description Exact count(*) or count(alias). The distinct option exists only for alias counts, making distinct count(*) invalid by schema and at runtime. count(*) includes null-extended optional rows; count(alias) counts only bindings where that alias is non-null. */
         GraphCountAggregate: components["schemas"]["GraphRowCountAggregate"] | components["schemas"]["GraphAliasCountAggregate"];
         GraphAggregatesReturn: {
             /** @description Keys are GraphIdentifiers naming aggregate results. */

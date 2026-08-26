@@ -35,7 +35,8 @@ class GraphMatch:
             nodes (GraphMatchNodes): Keys are GraphIdentifiers naming aliases in the required match.
             edges (list[GraphMatchEdge]):
             where (GraphWhereAnd | GraphWhereNotEqual | GraphWhereNotExists | Unset):
-            optional (list[GraphOptionalMatch] | Unset):
+            optional (list[GraphOptionalMatch] | Unset): Ordered correlated left-outer patterns. Aliases introduced by an
+                earlier item are visible to later items, including as null.
     """
 
     anchor: str

@@ -395,14 +395,14 @@ from .graph_path_weight_domain_error import GraphPathWeightDomainError
 from .graph_path_weight_domain_error_error import GraphPathWeightDomainErrorError
 from .graph_path_weight_domain_error_mode import GraphPathWeightDomainErrorMode
 from .graph_path_weight_domain_error_status import GraphPathWeightDomainErrorStatus
-from .graph_query_mode_unsupported_error import GraphQueryModeUnsupportedError
-from .graph_query_mode_unsupported_error_error import GraphQueryModeUnsupportedErrorError
-from .graph_query_mode_unsupported_error_reason import GraphQueryModeUnsupportedErrorReason
-from .graph_query_mode_unsupported_error_status import GraphQueryModeUnsupportedErrorStatus
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
 from .graph_query_stats import GraphQueryStats
 from .graph_query_type import GraphQueryType
+from .graph_query_unsupported_error import GraphQueryUnsupportedError
+from .graph_query_unsupported_error_error import GraphQueryUnsupportedErrorError
+from .graph_query_unsupported_error_reason import GraphQueryUnsupportedErrorReason
+from .graph_query_unsupported_error_status import GraphQueryUnsupportedErrorStatus
 from .graph_resolver_config import GraphResolverConfig
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
 from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
@@ -1325,14 +1325,14 @@ __all__ = (
     "GraphPathWeightDomainErrorError",
     "GraphPathWeightDomainErrorMode",
     "GraphPathWeightDomainErrorStatus",
-    "GraphQueryModeUnsupportedError",
-    "GraphQueryModeUnsupportedErrorError",
-    "GraphQueryModeUnsupportedErrorReason",
-    "GraphQueryModeUnsupportedErrorStatus",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
     "GraphQueryStats",
     "GraphQueryType",
+    "GraphQueryUnsupportedError",
+    "GraphQueryUnsupportedErrorError",
+    "GraphQueryUnsupportedErrorReason",
+    "GraphQueryUnsupportedErrorStatus",
     "GraphResolverConfig",
     "GraphResolverConfigCandidateSearch",
     "GraphResolverConfigFusionCombine",

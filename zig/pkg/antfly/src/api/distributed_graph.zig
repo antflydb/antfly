@@ -1037,7 +1037,7 @@ fn executeCrossRangeOnce(
             if (graph_query_diagnostic.reasonForError(err)) |reason| {
                 graph_query_diagnostic.record(
                     graph_query.name,
-                    graph_query_diagnostic.mode(graph_query.query),
+                    graph_query_diagnostic.feature(graph_query.query),
                     reason,
                 );
             }

@@ -1,7 +1,7 @@
 from enum import Enum
 
 
-class GraphQueryModeUnsupportedErrorReason(str, Enum):
+class GraphQueryUnsupportedErrorReason(str, Enum):
     DEDUPLICATE_NODES_MUST_BE_TRUE = "deduplicate_nodes_must_be_true"
     DIRECTION_MUST_BE_OUT = "direction_must_be_out"
     EXPAND_STRATEGY_NOT_SUPPORTED = "expand_strategy_not_supported"

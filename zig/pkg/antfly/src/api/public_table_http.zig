@@ -849,24 +849,24 @@ pub fn graphAnchorFilterRequiresIndexBody(alloc: std.mem.Allocator) ![]u8 {
     }, .{});
 }
 
-const GraphQueryModeDiagnostic = struct {
+const GraphQueryUnsupportedDiagnostic = struct {
     operation: []const u8 = "$request",
-    mode: []const u8 = "graph_queries",
+    feature: []const u8 = "graph_queries",
     reason: []const u8 = "unsupported_mode",
 };
 
-pub fn graphQueryModeUnsupportedBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+pub fn graphQueryUnsupportedBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
     defer if (parsed) |*value| value.deinit();
-    var diagnostic = if (parsed) |value| graphQueryModeDiagnostic(value.value) else GraphQueryModeDiagnostic{};
+    var diagnostic = if (parsed) |value| graphQueryUnsupportedDiagnostic(value.value) else GraphQueryUnsupportedDiagnostic{};
     if (graph_query_diagnostic.take()) |recorded| {
         diagnostic = .{
             .operation = recorded.operation,
-            .mode = recorded.mode,
+            .feature = recorded.feature,
             .reason = @tagName(recorded.reason),
         };
     }
-    return try graphQueryModeUnsupportedBodyForDiagnostic(alloc, diagnostic);
+    return try graphQueryUnsupportedBodyForDiagnostic(alloc, diagnostic);
 }
 
 pub fn graphQueryCapabilityUnsupportedBody(
@@ -876,13 +876,13 @@ pub fn graphQueryCapabilityUnsupportedBody(
 ) ![]u8 {
     var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
     defer if (parsed) |*value| value.deinit();
-    var diagnostic = if (parsed) |value| graphQueryModeDiagnostic(value.value) else GraphQueryModeDiagnostic{};
+    var diagnostic = if (parsed) |value| graphQueryUnsupportedDiagnostic(value.value) else GraphQueryUnsupportedDiagnostic{};
     if (reason) |value| {
         if (graph_query_diagnostic.take()) |recorded| {
             if (std.mem.eql(u8, value, @tagName(recorded.reason))) {
                 diagnostic = .{
                     .operation = recorded.operation,
-                    .mode = recorded.mode,
+                    .feature = recorded.feature,
                     .reason = value,
                 };
             } else {
@@ -892,25 +892,25 @@ pub fn graphQueryCapabilityUnsupportedBody(
             diagnostic.reason = value;
         }
     }
-    return try graphQueryModeUnsupportedBodyForDiagnostic(alloc, diagnostic);
+    return try graphQueryUnsupportedBodyForDiagnostic(alloc, diagnostic);
 }
 
-fn graphQueryModeUnsupportedBodyForDiagnostic(
+fn graphQueryUnsupportedBodyForDiagnostic(
     alloc: std.mem.Allocator,
-    diagnostic: GraphQueryModeDiagnostic,
+    diagnostic: GraphQueryUnsupportedDiagnostic,
 ) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, .{
         .status = @as(u16, 422),
-        .@"error" = "graph_query_mode_unsupported",
-        .message = graphQueryModeUnsupportedMessage(diagnostic.reason),
+        .@"error" = "graph_query_unsupported",
+        .message = graphQueryUnsupportedMessage(diagnostic.reason),
         .retryable = false,
         .operation = diagnostic.operation,
-        .mode = diagnostic.mode,
+        .feature = diagnostic.feature,
         .reason = diagnostic.reason,
     }, .{});
 }
 
-fn graphQueryModeUnsupportedMessage(reason: []const u8) []const u8 {
+fn graphQueryUnsupportedMessage(reason: []const u8) []const u8 {
     if (std.mem.eql(u8, reason, "legacy_graph_searches_not_supported"))
         return "serverless graph queries require graph_queries; graph_searches is available only on stateful/provisioned Antfly during its compatibility window";
     if (std.mem.eql(u8, reason, "request_control_not_supported"))
@@ -924,49 +924,49 @@ fn graphQueryModeUnsupportedMessage(reason: []const u8) []const u8 {
     return "this graph query mode is not supported by exact public execution; use graph_queries with outgoing, deduplicated traversal semantics";
 }
 
-fn graphQueryModeDiagnostic(root: std.json.Value) GraphQueryModeDiagnostic {
+fn graphQueryUnsupportedDiagnostic(root: std.json.Value) GraphQueryUnsupportedDiagnostic {
     if (root != .object) return .{};
     if (root.object.get("expand_strategy")) |value| {
         if (value != .null) return .{ .reason = "expand_strategy_not_supported" };
     }
     if (root.object.get("graph_queries")) |queries| {
-        if (queries == .object) return canonicalGraphModeDiagnostic(queries.object);
+        if (queries == .object) return canonicalGraphUnsupportedDiagnostic(queries.object);
     }
     if (root.object.get("graph_searches")) |queries| {
-        if (queries == .object) return legacyGraphModeDiagnostic(queries.object);
+        if (queries == .object) return legacyGraphUnsupportedDiagnostic(queries.object);
     }
     return .{};
 }
 
-fn canonicalGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagnostic {
-    var fallback: ?GraphQueryModeDiagnostic = null;
+fn canonicalGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUnsupportedDiagnostic {
+    var fallback: ?GraphQueryUnsupportedDiagnostic = null;
     var it = queries.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         const operation_name = entry.key_ptr.*;
         const value = entry.value_ptr.object;
         const mode = canonicalGraphMode(value) orelse "unknown";
-        if (fallback == null) fallback = .{ .operation = operation_name, .mode = mode };
+        if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
         const params = value.get(mode) orelse continue;
         if (params != .object) continue;
         if (jsonString(params.object, "direction")) |direction| {
             if (!std.mem.eql(u8, direction, "out")) return .{
                 .operation = operation_name,
-                .mode = mode,
+                .feature = mode,
                 .reason = "direction_must_be_out",
             };
         }
         if (std.mem.eql(u8, mode, "traverse") and jsonBool(params.object, "deduplicate_nodes") == false) {
             return .{
                 .operation = operation_name,
-                .mode = mode,
+                .feature = mode,
                 .reason = "deduplicate_nodes_must_be_true",
             };
         }
         if (params.object.get("start")) |selector| {
             if (selectorRefUnsupported(selector)) return .{
                 .operation = operation_name,
-                .mode = mode,
+                .feature = mode,
                 .reason = "start_selector_not_supported",
             };
         }
@@ -974,27 +974,27 @@ fn canonicalGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagn
     return fallback orelse .{};
 }
 
-fn legacyGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagnostic {
-    var fallback: ?GraphQueryModeDiagnostic = null;
+fn legacyGraphUnsupportedDiagnostic(queries: std.json.ObjectMap) GraphQueryUnsupportedDiagnostic {
+    var fallback: ?GraphQueryUnsupportedDiagnostic = null;
     var it = queries.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) continue;
         const operation_name = entry.key_ptr.*;
         const value = entry.value_ptr.object;
         const mode = jsonString(value, "type") orelse "unknown";
-        if (fallback == null) fallback = .{ .operation = operation_name, .mode = mode };
+        if (fallback == null) fallback = .{ .operation = operation_name, .feature = mode };
         if (value.get("params")) |params| {
             if (params == .object) {
                 if (jsonString(params.object, "direction")) |direction| {
                     if (!std.mem.eql(u8, direction, "out")) return .{
                         .operation = operation_name,
-                        .mode = mode,
+                        .feature = mode,
                         .reason = "direction_must_be_out",
                     };
                 }
                 if (jsonBool(params.object, "deduplicate_nodes") == false) return .{
                     .operation = operation_name,
-                    .mode = mode,
+                    .feature = mode,
                     .reason = "deduplicate_nodes_must_be_true",
                 };
             }
@@ -1002,14 +1002,14 @@ fn legacyGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagnost
         if (value.get("start_nodes")) |selector| {
             if (selectorRefUnsupported(selector)) return .{
                 .operation = operation_name,
-                .mode = mode,
+                .feature = mode,
                 .reason = "start_selector_not_supported",
             };
         }
         if (value.get("target_nodes")) |selector| {
             if (selectorRefUnsupported(selector)) return .{
                 .operation = operation_name,
-                .mode = mode,
+                .feature = mode,
                 .reason = "target_selector_not_supported",
             };
         }
@@ -1019,7 +1019,7 @@ fn legacyGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagnost
                     if (jsonString(params.object, "weight_mode")) |weight_mode| {
                         if (!std.mem.eql(u8, weight_mode, "min_hops")) return .{
                             .operation = operation_name,
-                            .mode = mode,
+                            .feature = mode,
                             .reason = "weight_mode_must_be_min_hops",
                         };
                     }
@@ -1028,7 +1028,7 @@ fn legacyGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagnost
                     if (jsonInteger(params.object, "k")) |k| {
                         if (k != 1) return .{
                             .operation = operation_name,
-                            .mode = mode,
+                            .feature = mode,
                             .reason = "k_must_equal_one",
                         };
                     }
@@ -1038,13 +1038,13 @@ fn legacyGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagnost
         if ((std.mem.eql(u8, mode, "shortest_path") or std.mem.eql(u8, mode, "k_shortest_paths")) and
             value.get("target_nodes") == null)
         {
-            return .{ .operation = operation_name, .mode = mode, .reason = "target_required" };
+            return .{ .operation = operation_name, .feature = mode, .reason = "target_required" };
         }
         if (std.mem.eql(u8, mode, "pattern")) {
             const pattern = value.get("pattern");
             if (pattern == null or pattern.? != .array or pattern.?.array.items.len == 0) return .{
                 .operation = operation_name,
-                .mode = mode,
+                .feature = mode,
                 .reason = "pattern_required",
             };
             for (pattern.?.array.items) |step| {
@@ -1054,7 +1054,7 @@ fn legacyGraphModeDiagnostic(queries: std.json.ObjectMap) GraphQueryModeDiagnost
                 if (jsonString(edge.object, "direction")) |direction| {
                     if (!std.mem.eql(u8, direction, "out")) return .{
                         .operation = operation_name,
-                        .mode = mode,
+                        .feature = mode,
                         .reason = "direction_must_be_out",
                     };
                 }
@@ -1317,7 +1317,7 @@ pub fn handleTableQueryRequest(
             },
             error.GraphQueryModeUnsupported => {
                 std.log.warn("public table graph mode lacks exact public execution table={s}", .{table_name});
-                return .{ .status = 422, .body = try graphQueryModeUnsupportedBody(alloc, body), .json = true };
+                return .{ .status = 422, .body = try graphQueryUnsupportedBody(alloc, body), .json = true };
             },
             error.GraphExternalAliasDocumentFilterUnsupported => {
                 std.log.warn("public table graph external alias filter lacks exact runtime support table={s}", .{table_name});
@@ -3824,12 +3824,12 @@ test "public table query handler maps exact graph execution failures" {
     );
     defer graph_mode.deinit();
     const graph_mode_error = switch (graph_mode.value) {
-        .graph_query_mode_unsupported_error => |value| value,
+        .graph_query_unsupported_error => |value| value,
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expect(!graph_mode_error.retryable);
     try std.testing.expectEqualStrings("incoming", graph_mode_error.operation);
-    try std.testing.expectEqualStrings("traverse", graph_mode_error.mode);
+    try std.testing.expectEqualStrings("traverse", graph_mode_error.feature);
     try std.testing.expectEqualStrings("direction_must_be_out", graph_mode_error.reason);
 
     const CapabilityCase = struct { kind: Kind, reason: []const u8 };
@@ -3857,12 +3857,12 @@ test "public table query handler maps exact graph execution failures" {
         );
         defer capability.deinit();
         const capability_error = switch (capability.value) {
-            .graph_query_mode_unsupported_error => |value| value,
+            .graph_query_unsupported_error => |value| value,
             else => return error.TestUnexpectedResult,
         };
         try std.testing.expectEqualStrings(case.reason, capability_error.reason);
         try std.testing.expectEqualStrings("pattern", capability_error.operation);
-        try std.testing.expectEqualStrings("match", capability_error.mode);
+        try std.testing.expectEqualStrings("match", capability_error.feature);
     }
 
     kind = .topology_changed;
@@ -3900,82 +3900,82 @@ test "public table query handler maps exact graph execution failures" {
     try std.testing.expectEqual(@as(i64, 2), legacy_limit_error.actual);
 }
 
-test "unsupported graph mode diagnostics identify the rejected operation constraint" {
+test "unsupported graph diagnostics identify the rejected operation feature" {
     const Case = struct {
         body: []const u8,
         operation: []const u8,
-        mode: []const u8,
+        feature: []const u8,
         reason: []const u8,
     };
     const cases = [_]Case{
         .{
             .body = "{\"expand_strategy\":\"union\",\"graph_queries\":{}}",
             .operation = "$request",
-            .mode = "graph_queries",
+            .feature = "graph_queries",
             .reason = "expand_strategy_not_supported",
         },
         .{
             .body = "{\"graph_searches\":{\"walk\":{\"type\":\"traverse\",\"params\":{\"deduplicate_nodes\":false}}}}",
             .operation = "walk",
-            .mode = "traverse",
+            .feature = "traverse",
             .reason = "deduplicate_nodes_must_be_true",
         },
         .{
             .body = "{\"graph_searches\":{\"walk\":{\"type\":\"traverse\",\"start_nodes\":{\"result_ref\":\"$full_text_results\"}}}}",
             .operation = "walk",
-            .mode = "traverse",
+            .feature = "traverse",
             .reason = "start_selector_not_supported",
         },
         .{
             .body = "{\"graph_searches\":{\"path\":{\"type\":\"shortest_path\",\"start_nodes\":{\"keys\":[\"a\"]},\"target_nodes\":{\"result_ref\":\"$embeddings_results\"}}}}",
             .operation = "path",
-            .mode = "shortest_path",
+            .feature = "shortest_path",
             .reason = "target_selector_not_supported",
         },
         .{
             .body = "{\"graph_searches\":{\"walk\":{\"type\":\"neighbors\",\"params\":{\"weight_mode\":\"min_weight\"}}}}",
             .operation = "walk",
-            .mode = "neighbors",
+            .feature = "neighbors",
             .reason = "weight_mode_must_be_min_hops",
         },
         .{
             .body = "{\"graph_searches\":{\"path\":{\"type\":\"shortest_path\",\"target_nodes\":{\"keys\":[\"b\"]},\"params\":{\"k\":2}}}}",
             .operation = "path",
-            .mode = "shortest_path",
+            .feature = "shortest_path",
             .reason = "k_must_equal_one",
         },
         .{
             .body = "{\"graph_searches\":{\"path\":{\"type\":\"shortest_path\"}}}",
             .operation = "path",
-            .mode = "shortest_path",
+            .feature = "shortest_path",
             .reason = "target_required",
         },
         .{
             .body = "{\"graph_searches\":{\"match\":{\"type\":\"pattern\"}}}",
             .operation = "match",
-            .mode = "pattern",
+            .feature = "pattern",
             .reason = "pattern_required",
         },
         .{
             .body = "{\"graph_searches\":{\"match\":{\"type\":\"pattern\",\"pattern\":[{\"alias\":\"a\"},{\"alias\":\"b\",\"edge\":{\"direction\":\"both\"}}]}}}",
             .operation = "match",
-            .mode = "pattern",
+            .feature = "pattern",
             .reason = "direction_must_be_out",
         },
     };
 
     for (cases) |case| {
-        const body = try graphQueryModeUnsupportedBody(std.testing.allocator, case.body);
+        const body = try graphQueryUnsupportedBody(std.testing.allocator, case.body);
         defer std.testing.allocator.free(body);
         var parsed = try ant_json.parseFromSlice(
-            metadata_openapi.GraphQueryModeUnsupportedError,
+            metadata_openapi.GraphQueryUnsupportedError,
             std.testing.allocator,
             body,
             .{},
         );
         defer parsed.deinit();
         try std.testing.expectEqualStrings(case.operation, parsed.value.operation);
-        try std.testing.expectEqualStrings(case.mode, parsed.value.mode);
+        try std.testing.expectEqualStrings(case.feature, parsed.value.feature);
         try std.testing.expectEqualStrings(case.reason, parsed.value.reason);
     }
 }
@@ -3994,18 +3994,18 @@ test "runtime graph capability diagnostics preserve the failing named operation"
     );
     defer std.testing.allocator.free(body);
     var parsed = try ant_json.parseFromSlice(
-        metadata_openapi.GraphQueryModeUnsupportedError,
+        metadata_openapi.GraphQueryUnsupportedError,
         std.testing.allocator,
         body,
         .{},
     );
     defer parsed.deinit();
     try std.testing.expectEqualStrings("later_match", parsed.value.operation);
-    try std.testing.expectEqualStrings("match", parsed.value.mode);
+    try std.testing.expectEqualStrings("match", parsed.value.feature);
     try std.testing.expectEqualStrings("external_alias_source_not_supported", parsed.value.reason);
 }
 
-test "recorded graph mode diagnostics explain serverless legacy rejection" {
+test "recorded graph diagnostics explain serverless legacy rejection" {
     graph_query_diagnostic.reset();
     defer graph_query_diagnostic.reset();
     graph_query_diagnostic.record(
@@ -4014,13 +4014,13 @@ test "recorded graph mode diagnostics explain serverless legacy rejection" {
         .legacy_graph_searches_not_supported,
     );
 
-    const body = try graphQueryModeUnsupportedBody(
+    const body = try graphQueryUnsupportedBody(
         std.testing.allocator,
         "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\"}}}",
     );
     defer std.testing.allocator.free(body);
     var parsed = try ant_json.parseFromSlice(
-        metadata_openapi.GraphQueryModeUnsupportedError,
+        metadata_openapi.GraphQueryUnsupportedError,
         std.testing.allocator,
         body,
         .{},
@@ -4028,7 +4028,7 @@ test "recorded graph mode diagnostics explain serverless legacy rejection" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("$request", parsed.value.operation);
-    try std.testing.expectEqualStrings("graph_searches", parsed.value.mode);
+    try std.testing.expectEqualStrings("graph_searches", parsed.value.feature);
     try std.testing.expectEqualStrings(
         "legacy_graph_searches_not_supported",
         parsed.value.reason,
@@ -4039,7 +4039,7 @@ test "recorded graph mode diagnostics explain serverless legacy rejection" {
     );
 }
 
-test "recorded graph mode diagnostics identify unsupported request controls" {
+test "recorded graph diagnostics identify unsupported request controls" {
     graph_query_diagnostic.reset();
     defer graph_query_diagnostic.reset();
     graph_query_diagnostic.record(
@@ -4048,13 +4048,13 @@ test "recorded graph mode diagnostics identify unsupported request controls" {
         .request_control_not_supported,
     );
 
-    const body = try graphQueryModeUnsupportedBody(
+    const body = try graphQueryUnsupportedBody(
         std.testing.allocator,
         "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"match\":{}}},\"order_by\":[{\"field\":\"created_at\"}]}",
     );
     defer std.testing.allocator.free(body);
     var parsed = try ant_json.parseFromSlice(
-        metadata_openapi.GraphQueryModeUnsupportedError,
+        metadata_openapi.GraphQueryUnsupportedError,
         std.testing.allocator,
         body,
         .{},
@@ -4062,7 +4062,7 @@ test "recorded graph mode diagnostics identify unsupported request controls" {
     defer parsed.deinit();
 
     try std.testing.expectEqualStrings("$request", parsed.value.operation);
-    try std.testing.expectEqualStrings("order_by", parsed.value.mode);
+    try std.testing.expectEqualStrings("order_by", parsed.value.feature);
     try std.testing.expectEqualStrings("request_control_not_supported", parsed.value.reason);
     try std.testing.expectEqualStrings(
         "this request control cannot be combined with exact graph execution in this runtime; remove the field or run the graph query separately",
