@@ -22319,8 +22319,12 @@ fn overlayRuntimeStatusReplayTargetFromDb(
     status: *runtime_status.LocalTableRuntimeStatus,
     db: *db_mod.DB,
 ) void {
-    const async_stats = db.snapshotAsyncIndexingStats();
-    status.stats.async_indexing = async_stats;
+    // Cold/query-only recovery has no producer runtime of its own. If a live
+    // writer is resident, overlay its lock-free lifecycle snapshot together
+    // with replay watermarks so a just-recovered status cannot transiently
+    // report a ready managed index with `enrichment_runtime.enabled=false`.
+    db.overlayRuntimeStatusRuntimeBestEffort(&status.stats);
+    const async_stats = status.stats.async_indexing;
     for (status.stats.indexes) |*item| {
         const prior_backfill_active = item.backfill_active;
         const prior_backfill_progress = item.backfill_progress;
