@@ -397,6 +397,50 @@ func TestGraphDocumentFilterNormalizesAndBoundsDateRangeInstants(t *testing.T) {
 	}
 }
 
+func TestGraphOpaqueUnionValidationRejectsUnknownMembers(t *testing.T) {
+	t.Run("query", func(t *testing.T) {
+		var query GraphQuery
+		if err := json.Unmarshal([]byte(`{"traverse":{},"unexpected":true}`), &query); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "unexpected") {
+			t.Fatalf("expected unknown graph query member error, got %v", err)
+		}
+	})
+
+	for name, encoded := range map[string]string{
+		"unknown":         `{"keys":["doc:a"],"unexpected":true}`,
+		"variant field":   `{"keys":["doc:a"],"limit":1}`,
+		"null binding":    `{"result_ref":"$graph_results.prior","binding":null}`,
+		"null limit":      `{"result_ref":"$graph_results.prior","limit":null}`,
+		"null result ref": `{"result_ref":null}`,
+	} {
+		t.Run("selector "+name, func(t *testing.T) {
+			var selector GraphNodeSelector
+			if err := json.Unmarshal([]byte(encoded), &selector); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateGraphSelector(selector); err == nil {
+				t.Fatalf("expected invalid selector %s to fail", encoded)
+			}
+		})
+	}
+
+	t.Run("where", func(t *testing.T) {
+		var where GraphWhereExpression
+		if err := json.Unmarshal([]byte(
+			`{"not_equal":{"left":{"alias":"a"},"right":{"alias":"b"}},"unexpected":true}`,
+		), &where); err != nil {
+			t.Fatal(err)
+		}
+		complexity := graphMatchComplexity{}
+		aliases := map[string]struct{}{"a": {}, "b": {}}
+		if err := validateGraphWhereExpression(where, aliases, &complexity, 0); err == nil || !strings.Contains(err.Error(), "unexpected") {
+			t.Fatalf("expected unknown graph where member error, got %v", err)
+		}
+	})
+}
+
 func TestGraphDocumentFilterRejectsFullTextDateParser(t *testing.T) {
 	start := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 	if _, err := NewGraphDocumentFilter(querydsl.DateRangeStringQuery{

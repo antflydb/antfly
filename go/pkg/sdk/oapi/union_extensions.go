@@ -144,6 +144,11 @@ func decodeJSONShapeValue(decoder *json.Decoder, shape *requiredJSONShape, desti
 			if !shape.nullable {
 				return fmt.Errorf("%s must not be null", shape.name)
 			}
+			switch destination.Kind() {
+			case reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+			default:
+				return fmt.Errorf("%s cannot represent null in %s", shape.name, destination.Type())
+			}
 			destination.SetZero()
 			return nil
 		}
@@ -174,6 +179,10 @@ func decodeJSONScalar(decoder *json.Decoder, shape *requiredJSONShape, destinati
 	if err != nil {
 		return err
 	}
+	return decodeJSONScalarToken(shape, destination, token)
+}
+
+func decodeJSONScalarToken(shape *requiredJSONShape, destination reflect.Value, token json.Token) error {
 	if token == nil {
 		return fmt.Errorf("%s must not be null", shape.name)
 	}
@@ -311,7 +320,7 @@ func decodeJSONShapeToken(
 		}
 		return decodeJSONArray(decoder, shape, indirectJSONDestination(destination))
 	}
-	return fmt.Errorf("%s has an invalid generated decoding shape", shape.name)
+	return decodeJSONScalarToken(shape, destination, token)
 }
 
 func indirectJSONDestination(destination reflect.Value) reflect.Value {

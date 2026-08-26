@@ -133,6 +133,18 @@ func (v TermRangeQuery) ToQuery() Query {
 
 // ToQuery creates a Query from a DateRangeStringQuery. Panics on error.
 func (v DateRangeStringQuery) ToQuery() Query {
+	// time.Time's RFC 3339 encoding can only represent whole-minute UTC
+	// offsets. Normalize before the generated union serializer sees the value so
+	// historical and fixed zones with sub-minute offsets preserve the instant
+	// instead of silently truncating offset seconds.
+	if v.Start != nil {
+		start := v.Start.UTC()
+		v.Start = &start
+	}
+	if v.End != nil {
+		end := v.End.UTC()
+		v.End = &end
+	}
 	var q Query
 	if err := q.FromDateRangeStringQuery(v); err != nil {
 		panic(err)

@@ -234,27 +234,59 @@ def reject_composition_siblings(
         )
 
 
-def nullable_branch(schema: dict[str, Any]) -> dict[str, Any] | None:
+def is_null_alternative(schema: dict[str, Any], name: str) -> bool:
+    marker: str | None = None
+    if schema.get("enum") == [None]:
+        marker = "enum"
+    if schema.get("type") == "null":
+        if marker is not None:
+            raise ValueError(
+                f"null alternative in result schema {name!r} must use exactly one "
+                "canonical null encoding"
+            )
+        marker = "type"
+    if marker is None:
+        return False
+    siblings = sorted(
+        key
+        for key in schema
+        if key != marker
+        and key not in COMPOSITION_ANNOTATION_KEYS
+        and not key.startswith("x-")
+    )
+    if siblings:
+        raise ValueError(
+            f"unsupported validation siblings on null alternative in result "
+            f"schema {name!r}: {siblings!r}"
+        )
+    return True
+
+
+def nullable_branch(schema: dict[str, Any], name: str) -> dict[str, Any] | None:
     alternatives = schema.get("oneOf")
     if not isinstance(alternatives, list):
         return None
     concrete: list[dict[str, Any]] = []
-    has_null = False
+    null_count = 0
     for alternative in alternatives:
         if not isinstance(alternative, dict):
             raise ValueError("oneOf alternatives must be schema objects")
-        if alternative.get("enum") == [None] or alternative.get("type") == "null":
-            has_null = True
+        if is_null_alternative(alternative, name):
+            null_count += 1
         else:
             concrete.append(alternative)
-    if has_null and len(concrete) == 1:
+    if null_count > 1:
+        raise ValueError(
+            f"result schema {name!r} contains multiple null alternatives"
+        )
+    if null_count == 1 and len(concrete) == 1:
         return concrete[0]
     return None
 
 
 def render_shape(schema: dict[str, Any], name: str, indent: str = "") -> str:
     validate_shape_keywords(schema, name)
-    nullable = nullable_branch(schema)
+    nullable = nullable_branch(schema, name)
     if nullable is not None:
         reject_composition_siblings(schema, name, "oneOf")
         return (

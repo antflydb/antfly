@@ -65,18 +65,27 @@ func validateGraphQuery(query GraphQuery) error {
 	if err != nil {
 		return fmt.Errorf("invalid graph query: %w", err)
 	}
-	var shape struct {
-		Match          json.RawMessage `json:"match"`
-		Traverse       json.RawMessage `json:"traverse"`
-		ShortestPath   json.RawMessage `json:"shortest_path"`
-		KShortestPaths json.RawMessage `json:"k_shortest_paths"`
-	}
-	if err := json.Unmarshal(encoded, &shape); err != nil {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &members); err != nil {
 		return fmt.Errorf("invalid graph query: %w", err)
 	}
+	if err := rejectUnknownGraphFields(
+		"graph query",
+		members,
+		"match",
+		"traverse",
+		"shortest_path",
+		"k_shortest_paths",
+	); err != nil {
+		return err
+	}
+	match, hasMatch := members["match"]
+	traverse, hasTraverse := members["traverse"]
+	shortestPath, hasShortestPath := members["shortest_path"]
+	kShortestPaths, hasKShortestPaths := members["k_shortest_paths"]
 	variants := 0
-	for _, value := range []json.RawMessage{shape.Match, shape.Traverse, shape.ShortestPath, shape.KShortestPaths} {
-		if value != nil {
+	for _, present := range []bool{hasMatch, hasTraverse, hasShortestPath, hasKShortestPaths} {
+		if present {
 			variants++
 		}
 	}
@@ -84,25 +93,37 @@ func validateGraphQuery(query GraphQuery) error {
 		return fmt.Errorf("graph query must contain exactly one of match, traverse, shortest_path, or k_shortest_paths")
 	}
 	switch {
-	case shape.Match != nil:
+	case hasMatch:
+		if isNullGraphJSON(match) {
+			return fmt.Errorf("graph query match must not be null")
+		}
 		value, err := query.AsGraphMatchQuery()
 		if err != nil {
 			return err
 		}
 		return validateGraphMatchQuery(value)
-	case shape.Traverse != nil:
+	case hasTraverse:
+		if isNullGraphJSON(traverse) {
+			return fmt.Errorf("graph query traverse must not be null")
+		}
 		value, err := query.AsGraphTraverseQuery()
 		if err != nil {
 			return err
 		}
 		return validateGraphTraverseQuery(value)
-	case shape.ShortestPath != nil:
+	case hasShortestPath:
+		if isNullGraphJSON(shortestPath) {
+			return fmt.Errorf("graph query shortest_path must not be null")
+		}
 		value, err := query.AsGraphShortestPathQuery()
 		if err != nil {
 			return err
 		}
 		return validateGraphPathQuery(value.Index, value.ShortestPath.From, value.ShortestPath.To, value.ShortestPath.EdgeTypes, value.ShortestPath.MaxDepth, value.ShortestPath.MinWeight, value.ShortestPath.MaxWeight, value.ShortestPath.IncludeDocuments, value.ShortestPath.Fields)
 	default:
+		if isNullGraphJSON(kShortestPaths) {
+			return fmt.Errorf("graph query k_shortest_paths must not be null")
+		}
 		value, err := query.AsGraphKShortestPathsQuery()
 		if err != nil {
 			return err
@@ -1304,6 +1325,13 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
 		return nil
 	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &members); err != nil {
+		return err
+	}
+	if err := rejectUnknownGraphFields("graph where expression", members, "and", "not_equal", "not_exists"); err != nil {
+		return err
+	}
 	type whereJSON struct {
 		And       []json.RawMessage       `json:"and"`
 		NotEqual  *GraphNotEqualPredicate `json:"not_equal"`
@@ -1313,9 +1341,25 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 	if err := json.Unmarshal(encoded, &value); err != nil {
 		return err
 	}
+	_, hasAnd := members["and"]
+	_, hasNotEqual := members["not_equal"]
+	_, hasNotExists := members["not_exists"]
 	forms := 0
-	if len(value.And) > 0 {
-		forms++
+	for _, present := range []bool{hasAnd, hasNotEqual, hasNotExists} {
+		if present {
+			forms++
+		}
+	}
+	if forms != 1 {
+		return fmt.Errorf("antfly: graph where expression must contain exactly one predicate form")
+	}
+	if hasAnd {
+		if err := rejectUnknownGraphFields("graph where-and", members, "and"); err != nil {
+			return err
+		}
+		if len(value.And) == 0 {
+			return fmt.Errorf("antfly: graph where-and must not be empty")
+		}
 		if len(value.And) > maxGraphMatchPredicates {
 			return fmt.Errorf("antfly: graph where-and exceeds %d expressions", maxGraphMatchPredicates)
 		}
@@ -1329,8 +1373,13 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 			}
 		}
 	}
-	if value.NotEqual != nil {
-		forms++
+	if hasNotEqual {
+		if err := rejectUnknownGraphFields("graph where not_equal", members, "not_equal"); err != nil {
+			return err
+		}
+		if value.NotEqual == nil {
+			return fmt.Errorf("antfly: graph where not_equal must not be null")
+		}
 		if err := complexity.addPredicate(); err != nil {
 			return err
 		}
@@ -1341,8 +1390,13 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 			return fmt.Errorf("antfly: graph predicate references unknown alias %q", value.NotEqual.Right.Alias)
 		}
 	}
-	if value.NotExists != nil {
-		forms++
+	if hasNotExists {
+		if err := rejectUnknownGraphFields("graph where not_exists", members, "not_exists"); err != nil {
+			return err
+		}
+		if value.NotExists == nil {
+			return fmt.Errorf("antfly: graph where not_exists must not be null")
+		}
 		if err := complexity.addPredicate(); err != nil {
 			return err
 		}
@@ -1357,9 +1411,6 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 				return err
 			}
 		}
-	}
-	if forms != 1 {
-		return fmt.Errorf("antfly: graph where expression must contain exactly one predicate form")
 	}
 	return nil
 }
@@ -1436,6 +1487,10 @@ func rejectUnknownGraphFields(context string, members map[string]json.RawMessage
 	}
 	sort.Strings(unknown)
 	return fmt.Errorf("antfly: %s contains unknown field %q", context, unknown[0])
+}
+
+func isNullGraphJSON(value json.RawMessage) bool {
+	return strings.TrimSpace(string(value)) == "null"
 }
 
 func validateGraphAggregates(aggregates map[string]GraphCountAggregate, aliases map[string]struct{}) error {
@@ -1609,6 +1664,13 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 	if err != nil {
 		return err
 	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &members); err != nil {
+		return err
+	}
+	if err := rejectUnknownGraphFields("graph selector", members, "keys", "identities", "result_ref", "binding", "limit"); err != nil {
+		return err
+	}
 	var value struct {
 		Keys       []string            `json:"keys"`
 		Identities []GraphPathEndpoint `json:"identities"`
@@ -1619,9 +1681,22 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 	if err := json.Unmarshal(encoded, &value); err != nil {
 		return err
 	}
+	_, hasKeys := members["keys"]
+	_, hasIdentities := members["identities"]
+	_, hasResultRef := members["result_ref"]
 	forms := 0
-	if len(value.Keys) > 0 {
-		forms++
+	for _, present := range []bool{hasKeys, hasIdentities, hasResultRef} {
+		if present {
+			forms++
+		}
+	}
+	if forms != 1 {
+		return fmt.Errorf("antfly: graph selector must contain exactly one selector form")
+	}
+	if hasKeys {
+		if err := rejectUnknownGraphFields("graph key selector", members, "keys"); err != nil {
+			return err
+		}
 		if len(value.Keys) > 10_000 {
 			return fmt.Errorf("antfly: graph keys must contain at most 10000 entries")
 		}
@@ -1629,14 +1704,27 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 			return err
 		}
 	}
-	if len(value.Identities) > 0 {
-		forms++
+	if hasIdentities {
+		if err := rejectUnknownGraphFields("graph identity selector", members, "identities"); err != nil {
+			return err
+		}
 		if err := validateGraphIdentities(value.Identities); err != nil {
 			return err
 		}
 	}
-	if value.ResultRef != "" {
-		forms++
+	if hasResultRef {
+		if err := rejectUnknownGraphFields("graph result selector", members, "result_ref", "binding", "limit"); err != nil {
+			return err
+		}
+		if isNullGraphJSON(members["result_ref"]) {
+			return fmt.Errorf("antfly: graph result reference must not be null")
+		}
+		if binding, present := members["binding"]; present && isNullGraphJSON(binding) {
+			return fmt.Errorf("antfly: graph result binding must not be null")
+		}
+		if limit, present := members["limit"]; present && isNullGraphJSON(limit) {
+			return fmt.Errorf("antfly: graph result reference limit must not be null")
+		}
 		if !validGraphResultRef(value.ResultRef) {
 			return fmt.Errorf("antfly: unsupported graph result reference %q", value.ResultRef)
 		}
@@ -1649,9 +1737,6 @@ func validateGraphSelector(selector GraphNodeSelector) error {
 		if value.Binding != "" && !validGraphIdentifier(value.Binding) {
 			return fmt.Errorf("antfly: graph result binding is invalid")
 		}
-	}
-	if forms != 1 {
-		return fmt.Errorf("antfly: graph selector must contain exactly one selector form")
 	}
 	return nil
 }

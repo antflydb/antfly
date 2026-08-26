@@ -71,12 +71,45 @@ class GoGraphResultShapesTest(unittest.TestCase):
             },
             {"allOf": [{"type": "string"}], "pattern": "^[0-9]+$"},
             {"oneOf": ["not-a-schema", {"enum": [None]}]},
+            {
+                "oneOf": [
+                    {"type": "object"},
+                    {"type": "string", "enum": [None]},
+                ]
+            },
+            {
+                "oneOf": [
+                    {"type": "object"},
+                    {"enum": [None], "maxLength": 1},
+                ]
+            },
+            {
+                "oneOf": [
+                    {"type": "object"},
+                    {"enum": [None]},
+                    {"type": "null"},
+                ]
+            },
             {"$ref": None},
             {"allOf": ["not-a-schema"]},
             {"allOf": None},
         ):
             with self.subTest(schema=schema), self.assertRaises(ValueError):
                 generator.render_shape(schema, "Unsupported")
+
+    def test_nullable_scalar_shape_is_supported(self) -> None:
+        for null_alternative in ({"enum": [None]}, {"type": "null"}):
+            generated = generator.render_shape(
+                {
+                    "oneOf": [
+                        {"type": "string", "minLength": 1},
+                        null_alternative,
+                    ]
+                },
+                "OptionalLabel",
+            )
+            self.assertIn("nullable: true", generated)
+            self.assertIn("minLength: 1", generated)
 
     def test_unsupported_or_misplaced_constraints_fail_generation(self) -> None:
         for schema in (
