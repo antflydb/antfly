@@ -23,11 +23,12 @@ const portable_backup = antfly.portable_backup;
 
 const default_restore_wait_timeout_ms: u64 = 30 * 60 * 1000;
 const restore_poll_interval_ms: u64 = 1000;
+const restore_poll_ambiguous_grace_polls: u64 = 5;
 const max_restore_tables: usize = 256;
 const default_backup_list_limit: usize = 100;
 const max_backup_list_limit: usize = 1000;
 
-const RestorePollDisposition = enum { use_data, retry, invalid };
+const RestorePollDisposition = enum { retry, invalid };
 
 const BackupArgs = struct {
     help: bool = false,
@@ -255,22 +256,21 @@ pub fn waitForRestoreJob(
 ) !antfly_client.openapi.ApiResponse(antfly_client.types.RestoreJob) {
     const started_ns = platform_time.monotonicNs();
     const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+    var poll_index: u64 = 0;
     while (true) {
-        var response = try client.getRestoreJob(job_id);
+        var response = try client.getRestoreJobResponse(job_id);
         if (response.data) |*data| {
             if (isTerminalRestorePhase(data.value.phase)) return response;
-        } else if (classifyRestorePollResponse(response.status_code, false) == .invalid) {
+        } else if (classifyRestorePollResponse(response.status_code, poll_index) == .invalid) {
             cli.expectHttpSuccess(response);
             response.deinit();
             return error.InvalidRestoreResponse;
         } else {
-            // A distributed metadata follower can legitimately lag the
-            // replicated restore catalog for a short period. The endpoint's
-            // 503 contract is explicitly retryable; keep the canonical CLI
-            // usable behind a non-sticky load balancer instead of turning
-            // normal Raft propagation into a terminal restore failure.
+            // Followers can lag the replicated catalog, and load balancers or
+            // upstreams can fail transiently while the restore remains live.
         }
         response.deinit();
+        poll_index +|= 1;
         const elapsed_ns = platform_time.monotonicNs() -| started_ns;
         if (elapsed_ns >= timeout_ns) return error.RestoreWaitTimeout;
         const poll_ns = restore_poll_interval_ms * std.time.ns_per_ms;
@@ -279,9 +279,12 @@ pub fn waitForRestoreJob(
     }
 }
 
-fn classifyRestorePollResponse(status_code: u16, has_data: bool) RestorePollDisposition {
-    if (has_data) return .use_data;
-    return if (status_code == 503) .retry else .invalid;
+fn classifyRestorePollResponse(status_code: u16, poll_index: u64) RestorePollDisposition {
+    return switch (status_code) {
+        408, 429, 502, 503, 504 => .retry,
+        404, 500 => if (poll_index < restore_poll_ambiguous_grace_polls) .retry else .invalid,
+        else => .invalid,
+    };
 }
 
 pub fn isTerminalRestorePhase(phase: []const u8) bool {
@@ -768,11 +771,37 @@ test "restore cli validation rejects unsupported input extension" {
     try std.testing.expectError(error.InvalidRestoreInputPath, validateRestoreArgs(opts));
 }
 
-test "restore polling response classification retries only service unavailable" {
-    try std.testing.expectEqual(RestorePollDisposition.use_data, classifyRestorePollResponse(200, true));
-    try std.testing.expectEqual(RestorePollDisposition.retry, classifyRestorePollResponse(503, false));
-    try std.testing.expectEqual(RestorePollDisposition.invalid, classifyRestorePollResponse(404, false));
-    try std.testing.expectEqual(RestorePollDisposition.invalid, classifyRestorePollResponse(500, false));
+test "restore polling response classification retries transient statuses" {
+    var raw_status: u32 = 0;
+    while (raw_status <= std.math.maxInt(u16)) : (raw_status += 1) {
+        const status: u16 = @intCast(raw_status);
+        const initial_expected: RestorePollDisposition = switch (status) {
+            404, 408, 429, 500, 502, 503, 504 => .retry,
+            else => .invalid,
+        };
+        const after_grace_expected: RestorePollDisposition = switch (status) {
+            408, 429, 502, 503, 504 => .retry,
+            else => .invalid,
+        };
+        try std.testing.expectEqual(initial_expected, classifyRestorePollResponse(status, 0));
+        try std.testing.expectEqual(after_grace_expected, classifyRestorePollResponse(status, restore_poll_ambiguous_grace_polls));
+    }
+}
+
+test "restore polling response classification bounds ambiguous status grace" {
+    for ([_]u16{ 404, 500 }) |status| {
+        try std.testing.expectEqual(.retry, classifyRestorePollResponse(status, restore_poll_ambiguous_grace_polls - 1));
+        try std.testing.expectEqual(.invalid, classifyRestorePollResponse(status, restore_poll_ambiguous_grace_polls));
+        try std.testing.expectEqual(.invalid, classifyRestorePollResponse(status, std.math.maxInt(u64)));
+    }
+    for ([_]u16{ 408, 429, 502, 503, 504 }) |status| {
+        try std.testing.expectEqual(.retry, classifyRestorePollResponse(status, restore_poll_ambiguous_grace_polls));
+        try std.testing.expectEqual(.retry, classifyRestorePollResponse(status, std.math.maxInt(u64)));
+    }
+    for ([_]u16{ 400, 401, 403 }) |status| {
+        try std.testing.expectEqual(.invalid, classifyRestorePollResponse(status, 0));
+        try std.testing.expectEqual(.invalid, classifyRestorePollResponse(status, std.math.maxInt(u64)));
+    }
 }
 
 test "restore cli parser rejects unknown arguments" {
