@@ -1428,8 +1428,8 @@ pub const GraphDocumentBoolFieldFilter = struct {
     path: []const u8,
 };
 
-/// At least one of start or end is required and enforced by the server.
-pub const GraphDocumentDateRangeFilter = struct {
+/// At least one of start or end is required and enforced by every Antfly execution boundary.
+pub const GraphDocumentDateRangeBody = struct {
     /// RFC 6901 JSON Pointer to the stored-document value.
     path: []const u8,
     start: ?[]const u8 = null,
@@ -1438,9 +1438,12 @@ pub const GraphDocumentDateRangeFilter = struct {
     inclusive_end: ?bool = null,
 };
 
-/// A non-scoring stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Fuzzy predicates require an explicit fuzziness, range predicates use numeric_range or term_range wrappers, and every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates belong in GraphMatch.where.
+pub const GraphDocumentDateRangeFilter = struct {
+    date_range: GraphDocumentDateRangeBody,
+};
+
+/// A non-scoring stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string. Fuzzy predicates require an explicit fuzziness. Range predicates use numeric_range, term_range, or date_range wrappers, and every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates belong in GraphMatch.where.
 pub const GraphDocumentFilter = union(enum) {
-    graph_document_date_range_filter: *GraphDocumentDateRangeFilter,
     graph_document_filter_boolean: *GraphDocumentFilterBoolean,
     graph_document_fuzzy_filter: *GraphDocumentFuzzyFilter,
     graph_document_bool_field_filter: *GraphDocumentBoolFieldFilter,
@@ -1449,6 +1452,7 @@ pub const GraphDocumentFilter = union(enum) {
     graph_document_regexp_filter: *GraphDocumentRegexpFilter,
     graph_document_term_filter: *GraphDocumentTermFilter,
     graph_document_wildcard_filter: *GraphDocumentWildcardFilter,
+    graph_document_date_range_filter: *GraphDocumentDateRangeFilter,
     graph_document_filter_conjunction: *GraphDocumentFilterConjunction,
     graph_document_ids_filter: *GraphDocumentIdsFilter,
     graph_document_match_all_filter: *GraphDocumentMatchAllFilter,
@@ -1480,15 +1484,6 @@ pub const GraphDocumentFilter = union(enum) {
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
-        if (objectHasAnyKey(source.object, &.{
-            "path",
-            "start",
-            "end",
-            "inclusive_start",
-            "inclusive_end",
-        })) {
-            if (try parseStructuralVariant(GraphDocumentDateRangeFilter, allocator, source, options)) |parsed| return .{ .graph_document_date_range_filter = parsed };
-        }
         if (objectHasAnyKey(source.object, &.{
             "must",
             "should",
@@ -1542,6 +1537,11 @@ pub const GraphDocumentFilter = union(enum) {
             if (try parseStructuralVariant(GraphDocumentWildcardFilter, allocator, source, options)) |parsed| return .{ .graph_document_wildcard_filter = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "date_range",
+        })) {
+            if (try parseStructuralVariant(GraphDocumentDateRangeFilter, allocator, source, options)) |parsed| return .{ .graph_document_date_range_filter = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
             "conjuncts",
         })) {
             if (try parseStructuralVariant(GraphDocumentFilterConjunction, allocator, source, options)) |parsed| return .{ .graph_document_filter_conjunction = parsed };
@@ -1576,7 +1576,6 @@ pub const GraphDocumentFilter = union(enum) {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
-            .graph_document_date_range_filter => |v| try jw.write(v.*),
             .graph_document_filter_boolean => |v| try jw.write(v.*),
             .graph_document_fuzzy_filter => |v| try jw.write(v.*),
             .graph_document_bool_field_filter => |v| try jw.write(v.*),
@@ -1585,6 +1584,7 @@ pub const GraphDocumentFilter = union(enum) {
             .graph_document_regexp_filter => |v| try jw.write(v.*),
             .graph_document_term_filter => |v| try jw.write(v.*),
             .graph_document_wildcard_filter => |v| try jw.write(v.*),
+            .graph_document_date_range_filter => |v| try jw.write(v.*),
             .graph_document_filter_conjunction => |v| try jw.write(v.*),
             .graph_document_ids_filter => |v| try jw.write(v.*),
             .graph_document_match_all_filter => |v| try jw.write(v.*),
@@ -1633,7 +1633,7 @@ pub const GraphDocumentMatchNoneFilter = struct {
     match_none: std.json.Value,
 };
 
-/// At least one of min or max is required and enforced by the server.
+/// At least one of min or max is required and enforced by every Antfly execution boundary.
 pub const GraphDocumentNumericRangeBody = struct {
     /// RFC 6901 JSON Pointer to the stored-document value.
     path: []const u8,
@@ -1665,7 +1665,7 @@ pub const GraphDocumentTermFilter = struct {
     path: []const u8,
 };
 
-/// At least one of min or max is required and enforced by the server.
+/// At least one of min or max is required and enforced by every Antfly execution boundary.
 pub const GraphDocumentTermRangeBody = struct {
     /// RFC 6901 JSON Pointer to the stored-document value.
     path: []const u8,

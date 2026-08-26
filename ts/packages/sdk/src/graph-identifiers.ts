@@ -7,7 +7,7 @@
 //     http://www.apache.org/licenses/LICENSE-2.0
 
 import { isValidGraphIdentifier } from "./graph-identifier-policy.generated.js";
-import type { GraphCountAggregate } from "./types.js";
+import type { GraphCountAggregate, GraphDocumentFilter } from "./types.js";
 
 type JSONObject = Record<string, unknown>;
 
@@ -24,6 +24,111 @@ function requireIdentifier(value: unknown, path: string): asserts value is strin
         "(1-128 Unicode code points; no reserved, boundary-space, non-ASCII whitespace, control, or format characters)"
     );
   }
+}
+
+function requireGraphDocumentPath(path: string): void {
+  if (!path.startsWith("/") || /~(?:[^01]|$)/.test(path)) {
+    throw new TypeError("graph document filter path must be a valid RFC 6901 JSON Pointer");
+  }
+}
+
+function requireRfc3339DateTime(value: string, path: string): void {
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(
+      value
+    );
+  if (!match) {
+    throw new TypeError(`${path} must be an RFC 3339 date-time with a UTC offset`);
+  }
+
+  const [
+    ,
+    yearText,
+    monthText,
+    dayText,
+    hourText,
+    minuteText,
+    secondText,
+    offsetHourText,
+    offsetMinuteText,
+  ] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  const valid =
+    month >= 1 &&
+    month <= 12 &&
+    day >= 1 &&
+    day <= (daysInMonth[month - 1] ?? 0) &&
+    Number(hourText) <= 23 &&
+    Number(minuteText) <= 59 &&
+    Number(secondText) <= 59 &&
+    (offsetHourText === undefined || Number(offsetHourText) <= 23) &&
+    (offsetMinuteText === undefined || Number(offsetMinuteText) <= 59);
+  if (!valid) {
+    throw new TypeError(`${path} must be a valid RFC 3339 date-time`);
+  }
+}
+
+/** Construct a validated non-scoring numeric range predicate for a graph node. */
+export function graphNumericRangeFilter(
+  path: string,
+  options: {
+    min?: number;
+    max?: number;
+    inclusive_min?: boolean;
+    inclusive_max?: boolean;
+  }
+): GraphDocumentFilter {
+  requireGraphDocumentPath(path);
+  if (options.min === undefined && options.max === undefined) {
+    throw new TypeError("graph numeric range requires min or max");
+  }
+  if (
+    (options.min !== undefined && !Number.isFinite(options.min)) ||
+    (options.max !== undefined && !Number.isFinite(options.max))
+  ) {
+    throw new TypeError("graph numeric range bounds must be finite numbers");
+  }
+  return { numeric_range: { path, ...options } };
+}
+
+/** Construct a validated non-scoring lexical range predicate for a graph node. */
+export function graphTermRangeFilter(
+  path: string,
+  options: {
+    min?: string;
+    max?: string;
+    inclusive_min?: boolean;
+    inclusive_max?: boolean;
+  }
+): GraphDocumentFilter {
+  requireGraphDocumentPath(path);
+  if (options.min === undefined && options.max === undefined) {
+    throw new TypeError("graph term range requires min or max");
+  }
+  return { term_range: { path, ...options } };
+}
+
+/** Construct a validated non-scoring RFC 3339 date range predicate for a graph node. */
+export function graphDateRangeFilter(
+  path: string,
+  options: {
+    start?: string;
+    end?: string;
+    inclusive_start?: boolean;
+    inclusive_end?: boolean;
+  }
+): GraphDocumentFilter {
+  requireGraphDocumentPath(path);
+  if (options.start === undefined && options.end === undefined) {
+    throw new TypeError("graph date range requires start or end");
+  }
+  if (options.start !== undefined) requireRfc3339DateTime(options.start, "graph date range start");
+  if (options.end !== undefined) requireRfc3339DateTime(options.end, "graph date range end");
+  return { date_range: { path, ...options } };
 }
 
 function validateEdges(value: unknown, path: string): void {

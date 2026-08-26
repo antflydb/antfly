@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, Mock, patch
 
 import httpx
@@ -18,6 +19,9 @@ from antfly import (  # noqa: E402
     antfly_embedder,
     count_graph_alias,
     count_graph_rows,
+    graph_date_range_filter,
+    graph_numeric_range_filter,
+    graph_term_range_filter,
 )
 from antfly.client import normalize_base_url  # noqa: E402
 from antfly.client_generated.models.batch_request import BatchRequest  # noqa: E402
@@ -466,6 +470,21 @@ class TestAntflyClient:
         }
         with pytest.raises(AntflyException, match="graph count alias"):
             count_graph_alias("*")
+
+    def test_graph_range_helpers_are_validated_and_operation_keyed(self) -> None:
+        assert graph_numeric_range_filter("/score", min_value=0, inclusive_min=True).to_dict() == {
+            "numeric_range": {"path": "/score", "min": 0, "inclusive_min": True}
+        }
+        assert graph_term_range_filter("/status", max_value="z").to_dict() == {
+            "term_range": {"path": "/status", "max": "z"}
+        }
+        assert graph_date_range_filter("/created_at", start=datetime(2026, 1, 1, tzinfo=UTC)).to_dict() == {
+            "date_range": {"path": "/created_at", "start": "2026-01-01T00:00:00+00:00"}
+        }
+        with pytest.raises(AntflyException, match="requires min_value or max_value"):
+            graph_numeric_range_filter("/score")
+        with pytest.raises(AntflyException, match="RFC 6901"):
+            graph_term_range_filter("score", min_value="a")
 
     @pytest.mark.parametrize("distinct", [False, True])
     def test_query_rejects_distinct_presence_on_row_count(self, distinct: bool) -> None:

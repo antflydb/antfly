@@ -2780,7 +2780,8 @@ components:
       type: object
       additionalProperties: false
       required: [path]
-      description: At least one of min or max is required and enforced by the server.
+      minProperties: 2
+      description: At least one of min or max is required and enforced by every Antfly execution boundary.
       properties:
         path:
           type: string
@@ -2813,7 +2814,8 @@ components:
       type: object
       additionalProperties: false
       required: [path]
-      description: At least one of min or max is required and enforced by the server.
+      minProperties: 2
+      description: At least one of min or max is required and enforced by every Antfly execution boundary.
       properties:
         path:
           type: string
@@ -2840,11 +2842,12 @@ components:
       required: [term_range]
       properties:
         term_range: { $ref: '#/components/schemas/GraphDocumentTermRangeBody' }
-    GraphDocumentDateRangeFilter:
+    GraphDocumentDateRangeBody:
       type: object
       additionalProperties: false
       required: [path]
-      description: At least one of start or end is required and enforced by the server.
+      minProperties: 2
+      description: At least one of start or end is required and enforced by every Antfly execution boundary.
       properties:
         path:
           type: string
@@ -2867,6 +2870,12 @@ components:
           type: boolean
           default: false
           x-go-type-skip-optional-pointer: false
+    GraphDocumentDateRangeFilter:
+      type: object
+      additionalProperties: false
+      required: [date_range]
+      properties:
+        date_range: { $ref: '#/components/schemas/GraphDocumentDateRangeBody' }
     GraphDocumentMatchAllFilter:
       type: object
       additionalProperties: false
@@ -2963,7 +2972,8 @@ components:
         uses structurally distinct stored-field predicates and deliberately
         excludes analyzer-backed full-text clauses such as match, phrase,
         multi_match, and query_string. Fuzzy predicates require an explicit
-        fuzziness, range predicates use numeric_range or term_range wrappers,
+        fuzziness. Range predicates use numeric_range, term_range, or date_range
+        wrappers,
         and every stored value is addressed by an RFC 6901 JSON Pointer in `path`.
         Alias-to-alias predicates belong in GraphMatch.where.
     GraphTraversal:

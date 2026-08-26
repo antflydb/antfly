@@ -16,7 +16,8 @@ T = TypeVar("T", bound="GraphDocumentTermRangeFilter")
 class GraphDocumentTermRangeFilter:
     """
     Attributes:
-        term_range (GraphDocumentTermRangeBody): At least one of min or max is required and enforced by the server.
+        term_range (GraphDocumentTermRangeBody): At least one of min or max is required and enforced by every Antfly
+            execution boundary.
     """
 
     term_range: GraphDocumentTermRangeBody

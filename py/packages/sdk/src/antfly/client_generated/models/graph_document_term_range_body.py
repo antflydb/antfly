@@ -12,7 +12,7 @@ T = TypeVar("T", bound="GraphDocumentTermRangeBody")
 
 @_attrs_define
 class GraphDocumentTermRangeBody:
-    """At least one of min or max is required and enforced by the server.
+    """At least one of min or max is required and enforced by every Antfly execution boundary.
 
     Attributes:
         path (str): RFC 6901 JSON Pointer to the stored-document value.

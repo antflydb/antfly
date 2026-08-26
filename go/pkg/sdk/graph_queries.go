@@ -573,8 +573,10 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 		}
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentDateRangeFilter(oapi.GraphDocumentDateRangeFilter{
-			Start: value.Start, End: value.End, InclusiveStart: value.InclusiveStart,
-			InclusiveEnd: value.InclusiveEnd, Path: path,
+			DateRange: oapi.GraphDocumentDateRangeBody{
+				Start: value.Start, End: value.End, InclusiveStart: value.InclusiveStart,
+				InclusiveEnd: value.InclusiveEnd, Path: path,
+			},
 		})
 		return out, err
 	case graphQueryMemberPresent(members, "ids"):

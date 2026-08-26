@@ -16,8 +16,8 @@ T = TypeVar("T", bound="GraphDocumentNumericRangeFilter")
 class GraphDocumentNumericRangeFilter:
     """
     Attributes:
-        numeric_range (GraphDocumentNumericRangeBody): At least one of min or max is required and enforced by the
-            server.
+        numeric_range (GraphDocumentNumericRangeBody): At least one of min or max is required and enforced by every
+            Antfly execution boundary.
     """
 
     numeric_range: GraphDocumentNumericRangeBody

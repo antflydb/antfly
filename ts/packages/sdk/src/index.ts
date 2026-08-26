@@ -56,6 +56,9 @@ export {
 export {
   countGraphAlias,
   countGraphRows,
+  graphDateRangeFilter,
+  graphNumericRangeFilter,
+  graphTermRangeFilter,
   validateGraphQueryIdentifiers,
 } from "./graph-identifiers.js";
 export {

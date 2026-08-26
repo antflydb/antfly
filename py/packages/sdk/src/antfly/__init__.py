@@ -44,7 +44,14 @@ from .graph_identifier_policy_generated import (
     GRAPH_IDENTIFIER_UNICODE_VERSION,
     is_valid_graph_identifier,
 )
-from .graph_queries import GraphCountAggregate, count_graph_alias, count_graph_rows
+from .graph_queries import (
+    GraphCountAggregate,
+    count_graph_alias,
+    count_graph_rows,
+    graph_date_range_filter,
+    graph_numeric_range_filter,
+    graph_term_range_filter,
+)
 
 __version__ = "0.1.0"
 
@@ -84,6 +91,9 @@ __all__ = [
     "GraphCountAggregate",
     "count_graph_alias",
     "count_graph_rows",
+    "graph_date_range_filter",
+    "graph_numeric_range_filter",
+    "graph_term_range_filter",
     "SparseEmbedding",
     "PackedSparseEmbedding",
     "__version__",

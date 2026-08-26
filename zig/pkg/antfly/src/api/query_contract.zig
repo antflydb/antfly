@@ -9928,6 +9928,26 @@ test "graph date filters accept RFC3339 offsets and reject normalized invalid da
     try std.testing.expect((try parseDateTimeOptionalToNs("2026-04-31")) == null);
 }
 
+test "canonical graph date filters are operation keyed and require a bound" {
+    const alloc = std.testing.allocator;
+    var owned = try parseQueryRequest(alloc, null, "docs",
+        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"date_range":{"path":"/created_at","start":"2026-01-01T00:00:00Z"}}}}}}
+    );
+    defer owned.deinit(alloc);
+
+    const filter_json = owned.req.graph_queries[0].query.params.node_filter.filter_query_json.?;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("date_range") != null);
+
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"path":"/created_at","start":"2026-01-01T00:00:00Z"}}}}}}
+    ));
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"date_range":{"path":"/created_at"}}}}}}
+    ));
+}
+
 test "canonical graph path endpoints reject empty identities before allocation" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{

@@ -57,6 +57,7 @@ pub const GraphBindingsReturn = types.GraphBindingsReturn;
 pub const GraphBoundedTraversalConfig = types.GraphBoundedTraversalConfig;
 pub const GraphCountAggregate = types.GraphCountAggregate;
 pub const GraphDocumentBoolFieldFilter = types.GraphDocumentBoolFieldFilter;
+pub const GraphDocumentDateRangeBody = types.GraphDocumentDateRangeBody;
 pub const GraphDocumentDateRangeFilter = types.GraphDocumentDateRangeFilter;
 pub const GraphDocumentFilter = types.GraphDocumentFilter;
 pub const GraphDocumentFilterBoolean = types.GraphDocumentFilterBoolean;

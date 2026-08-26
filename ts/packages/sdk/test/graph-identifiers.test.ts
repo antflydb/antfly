@@ -14,6 +14,9 @@ import {
 import {
   countGraphAlias,
   countGraphRows,
+  graphDateRangeFilter,
+  graphNumericRangeFilter,
+  graphTermRangeFilter,
   validateGraphQueryIdentifiers,
 } from "../src/graph-identifiers.js";
 
@@ -97,5 +100,28 @@ describe("graph identifier policy", () => {
     expect(countGraphAlias("person")).toEqual({ count: "person" });
     expect(countGraphAlias("person", true)).toEqual({ count: "person", distinct: true });
     expect(() => countGraphAlias("*")).toThrow("graph count alias");
+  });
+
+  it("constructs operation-keyed graph range filters", () => {
+    expect(graphNumericRangeFilter("/score", { min: 0, inclusive_min: true })).toEqual({
+      numeric_range: { path: "/score", min: 0, inclusive_min: true },
+    });
+    expect(graphTermRangeFilter("/status", { max: "z" })).toEqual({
+      term_range: { path: "/status", max: "z" },
+    });
+    expect(graphDateRangeFilter("/created_at", { start: "2026-01-01T00:00:00Z" })).toEqual({
+      date_range: { path: "/created_at", start: "2026-01-01T00:00:00Z" },
+    });
+    expect(() => graphNumericRangeFilter("/score", {})).toThrow("requires min or max");
+    expect(() => graphTermRangeFilter("score", { min: "a" })).toThrow("RFC 6901");
+    expect(() => graphDateRangeFilter("/created~2at", { end: "2026-01-01T00:00:00Z" })).toThrow(
+      "RFC 6901"
+    );
+    expect(() => graphDateRangeFilter("/created_at", { start: "2026-02-29T00:00:00Z" })).toThrow(
+      "valid RFC 3339"
+    );
+    expect(() => graphDateRangeFilter("/created_at", { start: "2026-01-01T00:00:00" })).toThrow(
+      "with a UTC offset"
+    );
   });
 });

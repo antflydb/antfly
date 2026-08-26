@@ -97,6 +97,10 @@ def render_shape(schema: dict[str, Any], name: str, indent: str = "") -> str:
             f"&requiredJSONShape{{name: {go_string(name)}, nullable: true, "
             f"reference: {render_shape(nullable, name, indent)}}}"
         )
+    if "oneOf" in schema:
+        raise ValueError(f"unsupported non-nullable oneOf in result schema {name!r}")
+    if "anyOf" in schema:
+        raise ValueError(f"unsupported anyOf in result schema {name!r}")
 
     ref = schema.get("$ref")
     if isinstance(ref, str):
@@ -105,8 +109,10 @@ def render_shape(schema: dict[str, Any], name: str, indent: str = "") -> str:
         return go_identifier(ref[len(REF_PREFIX) :])
 
     all_of = schema.get("allOf")
-    if isinstance(all_of, list) and len(all_of) == 1:
-        return render_shape(all_of[0], name, indent)
+    if all_of is not None:
+        if isinstance(all_of, list) and len(all_of) == 1:
+            return render_shape(all_of[0], name, indent)
+        raise ValueError(f"unsupported allOf in result schema {name!r}")
 
     schema_type = schema.get("type")
     if schema_type == "array":
@@ -120,12 +126,18 @@ def render_shape(schema: dict[str, Any], name: str, indent: str = "") -> str:
         or "properties" in schema
         or "additionalProperties" in schema
     ):
-        fields = [f"name: {go_string(name)}", "object: true"]
         required = schema.get("required", [])
+        properties = schema.get("properties", {})
+        additional = schema.get("additionalProperties", True)
+        if not required and not properties and additional is True:
+            return (
+                f"&requiredJSONShape{{name: {go_string(name)}, opaqueObject: true}}"
+            )
+
+        fields = [f"name: {go_string(name)}", "object: true"]
         if required:
             values = ", ".join(go_string(value) for value in required)
             fields.append(f"required: []string{{{values}}}")
-        properties = schema.get("properties", {})
         if properties:
             entries = []
             for key in sorted(properties):
@@ -134,7 +146,6 @@ def render_shape(schema: dict[str, Any], name: str, indent: str = "") -> str:
             fields.append(
                 "properties: map[string]*requiredJSONShape{" + ", ".join(entries) + "}"
             )
-        additional = schema.get("additionalProperties", True)
         if additional is not False:
             fields.append("allowAdditionalProperties: true")
             if isinstance(additional, dict):

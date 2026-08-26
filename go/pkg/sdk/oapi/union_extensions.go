@@ -95,6 +95,7 @@ func requireJSONEOF(decoder *json.Decoder) error {
 type requiredJSONShape struct {
 	name                      string
 	object                    bool
+	opaqueObject              bool
 	array                     bool
 	nullable                  bool
 	nonEmptyString            bool
@@ -111,6 +112,9 @@ var jsonStructFieldCache sync.Map // map[reflect.Type]map[string]int
 func decodeJSONShapeValue(decoder *json.Decoder, shape *requiredJSONShape, destination reflect.Value) error {
 	if shape == nil {
 		return decoder.Decode(destination.Addr().Interface())
+	}
+	if shape.opaqueObject {
+		return decodeOpaqueJSONObject(decoder, shape, destination)
 	}
 	if shape.reference != nil && !shape.nullable {
 		return decodeJSONShapeValue(decoder, shape.reference, destination)
@@ -133,6 +137,20 @@ func decodeJSONShapeValue(decoder *json.Decoder, shape *requiredJSONShape, desti
 		return decodeJSONShapeToken(decoder, shape, destination, token)
 	}
 	return decodeJSONScalar(decoder, shape, destination)
+}
+
+func decodeOpaqueJSONObject(decoder *json.Decoder, shape *requiredJSONShape, destination reflect.Value) error {
+	destination = indirectJSONDestination(destination)
+	if destination.Kind() != reflect.Map {
+		return fmt.Errorf("%s cannot decode into %s", shape.name, destination.Type())
+	}
+	if err := decoder.Decode(destination.Addr().Interface()); err != nil {
+		return fmt.Errorf("%s must be an object: %w", shape.name, err)
+	}
+	if destination.IsNil() {
+		return fmt.Errorf("%s must not be null", shape.name)
+	}
+	return nil
 }
 
 func decodeJSONScalar(decoder *json.Decoder, shape *requiredJSONShape, destination reflect.Value) error {

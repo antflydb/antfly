@@ -339,6 +339,29 @@ func TestGraphDocumentFilterUsesDiscriminatedRangeWireShape(t *testing.T) {
 	}
 }
 
+func TestGraphDocumentFilterUsesDiscriminatedDateRangeWireShape(t *testing.T) {
+	start := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	filter, err := NewGraphDocumentFilter(querydsl.DateRangeStringQuery{
+		Field: "created_at",
+		Start: &start,
+	}.ToQuery())
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		t.Fatal(err)
+	}
+	body, ok := value["date_range"].(map[string]any)
+	if !ok || body["path"] != "/created_at" || body["start"] != "2026-01-01T00:00:00Z" {
+		t.Fatalf("unexpected graph date range filter: %#v", value)
+	}
+}
+
 func TestGraphDocumentFilterRejectsFullTextDateParser(t *testing.T) {
 	start := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 	if _, err := NewGraphDocumentFilter(querydsl.DateRangeStringQuery{
@@ -470,6 +493,25 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 	}
 }
 
+func TestCanonicalGraphResultPreservesOpaqueHydratedJSON(t *testing.T) {
+	var canonical GraphQueryResult
+	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"title":"alpha","nested":{"values":[1,true,null]}},"evidence":{"source":"edge"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`), &canonical); err != nil {
+		t.Fatal(err)
+	}
+	value, err := DecodeGraphQueryResult(canonical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodes := value.(GraphNodesResult)
+	if nodes.Nodes[0].Document["title"] != "alpha" {
+		t.Fatalf("unexpected hydrated document: %#v", nodes.Nodes[0].Document)
+	}
+	nested, ok := nodes.Nodes[0].Document["nested"].(map[string]any)
+	if !ok || len(nested["values"].([]any)) != 3 || nodes.Nodes[0].Evidence["source"] != "edge" {
+		t.Fatalf("opaque JSON was not preserved: document=%#v evidence=%#v", nodes.Nodes[0].Document, nodes.Nodes[0].Evidence)
+	}
+}
+
 func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 	malformed := []string{
 		`{"kind":"nodes"}`,
@@ -488,6 +530,7 @@ func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 		`{"kind":"nodes","kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false,"unexpected":true}}`,
 		`{"kind":"nodes","nodes":[{"key":"a","depth":0,"unexpected":true}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":null}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{"a":{}}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":false}},"stats":{"returned_items":1,"truncated":false}}`,

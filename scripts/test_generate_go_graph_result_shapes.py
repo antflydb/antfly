@@ -29,6 +29,9 @@ class GoGraphResultShapesTest(unittest.TestCase):
         self.assertIn("generatedGraphPathEndpointShape", generated)
         self.assertIn("nullable: true", generated)
         self.assertIn("allowAdditionalProperties: true", generated)
+        self.assertIn(
+            'name: "GraphBindingNode.document", opaqueObject: true', generated
+        )
 
     def test_all_canonical_roots_and_dependencies_are_reachable(self) -> None:
         schemas = generator.load_schemas()
@@ -43,6 +46,15 @@ class GoGraphResultShapesTest(unittest.TestCase):
                 "GraphQueryStats",
             }.issubset(reachable)
         )
+
+    def test_unsupported_compositions_fail_generation(self) -> None:
+        for schema in (
+            {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+            {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            {"allOf": [{"type": "object"}, {"type": "object"}]},
+        ):
+            with self.subTest(schema=schema), self.assertRaises(ValueError):
+                generator.render_shape(schema, "Unsupported")
 
 
 if __name__ == "__main__":
