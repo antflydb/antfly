@@ -546,7 +546,6 @@ fn buildFlatCentroidDirectory(
     defer self.alloc.free(covering_radii);
     var pending = std.ArrayListUnmanaged(u64).empty;
     defer pending.deinit(self.alloc);
-    try pending.append(self.alloc, root_node);
     // Published node ids are bounded by node_count. A dense bitset is exact,
     // has predictable resource use, and avoids an O(nodes) hash-table peak on
     // cold large-index directory construction.
@@ -562,28 +561,22 @@ fn buildFlatCentroidDirectory(
     var missing_node_count: usize = 0;
     var invalid_posting_count: usize = 0;
 
+    if (root_node == 0 or root_node > node_count) {
+        invalid_posting_count += 1;
+    } else {
+        const zero_based = root_node - 1;
+        const visited_word_index: usize = @intCast(zero_based / visited_word_bits);
+        const visited_bit_index: std.math.Log2Int(usize) = @intCast(zero_based % visited_word_bits);
+        visited_words[visited_word_index] |= @as(usize, 1) << visited_bit_index;
+        try pending.append(self.alloc, root_node);
+    }
+
     var cursor: usize = 0;
     while (cursor < pending.items.len) : (cursor += 1) {
         const node_id = pending.items[cursor];
         if (cursor % 64 == 0) {
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
         }
-        if (node_id == 0 or node_id > node_count) {
-            invalid_posting_count += 1;
-            continue;
-        }
-        const zero_based = node_id - 1;
-        const visited_word_index: usize = @intCast(zero_based / visited_word_bits);
-        const visited_bit_index: std.math.Log2Int(usize) = @intCast(zero_based % visited_word_bits);
-        const visited_mask = @as(usize, 1) << visited_bit_index;
-        if (visited_words[visited_word_index] & visited_mask != 0) {
-            // A valid HBC topology is a strict tree. Reaching a node twice is
-            // either a cycle or shared-child corruption; count it as invalid
-            // and do not enqueue its descendants again.
-            invalid_posting_count += 1;
-            continue;
-        }
-        visited_words[visited_word_index] |= visited_mask;
         var node = loadPublishedNode(self, txn, node_id) catch |err| {
             if (isNotFoundGeneric(err)) {
                 missing_node_count += 1;
@@ -593,7 +586,25 @@ fn buildFlatCentroidDirectory(
         };
         defer node.deinit(self.alloc);
         if (!node.is_leaf) {
-            for (node.children) |child_id| try pending.append(self.alloc, child_id);
+            for (node.children) |child_id| {
+                if (child_id == 0 or child_id > node_count) {
+                    invalid_posting_count += 1;
+                    continue;
+                }
+                const zero_based = child_id - 1;
+                const visited_word_index: usize = @intCast(zero_based / visited_word_bits);
+                const visited_bit_index: std.math.Log2Int(usize) = @intCast(zero_based % visited_word_bits);
+                const visited_mask = @as(usize, 1) << visited_bit_index;
+                if (visited_words[visited_word_index] & visited_mask != 0) {
+                    // A valid HBC topology is a strict tree. Mark children when
+                    // they are scheduled so corrupt duplicate edges and cycles
+                    // cannot grow the traversal queue beyond node_count.
+                    invalid_posting_count += 1;
+                    continue;
+                }
+                visited_words[visited_word_index] |= visited_mask;
+                try pending.append(self.alloc, child_id);
+            }
             continue;
         }
         if (node.members.len == 0) continue;
@@ -699,7 +710,7 @@ fn acquireFlatCentroidDirectory(
         }
         errdefer built.deinit(self.alloc);
         if (comptime @hasDecl(Index, "accountFlatCentroidDirectory")) {
-            self.accountFlatCentroidDirectory(built, build_reservation);
+            try self.accountFlatCentroidDirectory(built, build_reservation);
             build_reservation_open = false;
         } else if (comptime @hasDecl(Index, "releaseFlatCentroidDirectoryBuildBytes")) {
             if (build_reservation_open) {

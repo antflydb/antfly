@@ -1910,6 +1910,108 @@ pub const ResourceManager = struct {
         };
     }
 
+    /// Atomically moves accounting between two observer-owned contributions in
+    /// the same slice. This is the ownership handoff used when a pre-admitted
+    /// retained reservation becomes a live cache object: the allocation is
+    /// never invisible, but it is also never double-counted in pressure or peak
+    /// telemetry. The destination identity may be created on this fallible path
+    /// before the object is published.
+    pub fn transferUsage(
+        self: *ResourceManager,
+        slice: Slice,
+        source: *u64,
+        source_next: u64,
+        destination: *u64,
+        destination_next: u64,
+    ) !void {
+        if (source == destination) return error.InvalidArgument;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const source_key = ObserverKey{ .slice = slice, .identity = @intFromPtr(source) };
+        const destination_key = ObserverKey{ .slice = slice, .identity = @intFromPtr(destination) };
+        const source_owned = self.observer_identities.get(source_key) orelse {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        };
+        if (source_owned.current != source.* or source_next > source_owned.current) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        const destination_previous = if (self.observer_identities.get(destination_key)) |owned| blk: {
+            if (owned.current != destination.*) {
+                self.memory.accounting_errors +|= 1;
+                return error.ResourceAccountingMismatch;
+            }
+            break :blk owned.current;
+        } else blk: {
+            if (destination.* != 0) {
+                self.memory.accounting_errors +|= 1;
+                return error.ResourceAccountingMismatch;
+            }
+            break :blk 0;
+        };
+
+        var inserted_destination = false;
+        if (destination_previous == 0 and destination_next != 0 and
+            !self.observer_identities.contains(destination_key))
+        {
+            const entry = try self.observer_identities.getOrPut(self.identity_allocator, destination_key);
+            entry.value_ptr.* = .{ .current = 0 };
+            inserted_destination = true;
+        }
+        errdefer {
+            if (inserted_destination) _ = self.observer_identities.remove(destination_key);
+        }
+
+        const previous_total = std.math.add(u64, source_owned.current, destination_previous) catch {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        };
+        const next_total = std.math.add(u64, source_next, destination_next) catch
+            return error.ResourceBudgetExceeded;
+        const state = &self.slices[sliceIndex(slice)];
+        if (previous_total > state.used_bytes or previous_total > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        const slice_next = std.math.add(u64, state.used_bytes - previous_total, next_total) catch
+            return error.ResourceBudgetExceeded;
+        const memory_next = std.math.add(u64, self.memory.used_bytes - previous_total, next_total) catch
+            return error.ResourceBudgetExceeded;
+        if (next_total > previous_total and
+            ((state.budget.hard_limit_bytes > 0 and slice_next > state.budget.hard_limit_bytes) or
+                (self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)))
+        {
+            state.hard_limit_rejections +|= 1;
+            if (self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
+                self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        }
+
+        if (source_next == 0) {
+            _ = self.observer_identities.remove(source_key);
+        } else {
+            self.observer_identities.getPtr(source_key).?.current = source_next;
+        }
+        if (destination_next == 0) {
+            _ = self.observer_identities.remove(destination_key);
+        } else {
+            self.observer_identities.getPtr(destination_key).?.current = destination_next;
+        }
+        source.* = source_next;
+        destination.* = destination_next;
+        state.used_bytes = slice_next;
+        self.memory.used_bytes = memory_next;
+        state.peak_bytes = @max(state.peak_bytes, slice_next);
+        self.memory.peak_bytes = @max(self.memory.peak_bytes, memory_next);
+        if (state.budget.soft_limit_bytes > 0 and slice_next > state.budget.soft_limit_bytes)
+            state.soft_limit_events +|= 1;
+        if (self.memory.budget.soft_limit_bytes > 0 and memory_next > self.memory.budget.soft_limit_bytes)
+            self.memory.soft_limit_events +|= 1;
+        self.pressure_change.advance();
+    }
+
     fn adjustUsageOnce(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
@@ -3334,6 +3436,32 @@ test "HBC admission reclaims retained metadata from its own slice" {
     try std.testing.expectEqual(@as(u64, 70), retained.accounted);
     try std.testing.expectEqual(@as(u64, 30), active);
     try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+}
+
+test "resource manager atomically transfers retained observer ownership" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .hard_limit_bytes = 80 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+
+    var reservation: u64 = 0;
+    var directory: u64 = 0;
+    try manager.adjustUsage(.hbc_node_metadata_cache, &reservation, 80);
+    try manager.transferUsage(
+        .hbc_node_metadata_cache,
+        &reservation,
+        0,
+        &directory,
+        60,
+    );
+
+    const stats = manager.sliceStats(.hbc_node_metadata_cache);
+    try std.testing.expectEqual(@as(u64, 0), reservation);
+    try std.testing.expectEqual(@as(u64, 60), directory);
+    try std.testing.expectEqual(@as(u64, 60), stats.used_bytes);
+    try std.testing.expectEqual(@as(u64, 80), stats.peak_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.hard_limit_rejections);
+    manager.observeUsage(.hbc_node_metadata_cache, &directory, 0);
 }
 
 test "resource manager apportions reclaim across weighted cache owners" {
