@@ -4683,7 +4683,12 @@ pub const DataServer = struct {
     // fixed cadence and retries quickly only while repairs are landing.
     const dense_posting_maintenance_idle_interval_ns = 30 * std.time.ns_per_s;
     const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
-    const ha_replication_default_max_records_per_apply = 256;
+    // Applying a fetched batch holds ha_state_mutex so promotion cannot consume
+    // the standby while records are in flight. Keep that safety-critical window
+    // short enough that admin/fencing status remains responsive during a dense
+    // catch-up. Durable apply dominates the cost, so the additional internal
+    // fetches are preferable to multi-second control-plane starvation.
+    const ha_replication_default_max_records_per_apply = 64;
     const ha_replication_default_max_encoded_bytes_per_apply = 4 * 1024 * 1024;
     const ha_replication_default_max_response_bytes = 8 * 1024 * 1024;
     const ha_standby_replication_retry_interval_ns = 1 * std.time.ns_per_s;
@@ -28936,6 +28941,11 @@ test "data runtime HA replication HTTP budget covers base64 apply envelope" {
     try std.testing.expect(!cfg.cache_resolved_addresses);
     try std.testing.expectEqual(@as(u32, 10_000), cfg.connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 0), cfg.request_timeout_ms);
+}
+
+test "data runtime HA apply window remains bounded for control-plane liveness" {
+    try std.testing.expect(DataServer.ha_replication_default_max_records_per_apply > 0);
+    try std.testing.expect(DataServer.ha_replication_default_max_records_per_apply <= 64);
 }
 
 test "data runtime records HA standby apply failures without stopping run round" {
