@@ -197,14 +197,8 @@ pub const ReplicatedPersistence = extern struct {
                 .delete_many = Self.deleteMany,
             };
 
-            fn fail(comptime operation: []const u8, err: anyerror) runtime_error_abi.Status {
-                if (!runtime_error_abi.errorHasStableDetail(err)) {
-                    std.log.err("replicated restore persistence callback failed operation={s} err={s}", .{ operation, @errorName(err) });
-                }
-                return runtime_error_abi.statusFromErrorWithFallback(
-                    err,
-                    error.RestoreJobPersistenceUnavailable,
-                );
+            fn fail(err: anyerror) runtime_error_abi.Status {
+                return runtime_error_abi.statusFromError(err);
             }
 
             fn load(
@@ -213,12 +207,12 @@ pub const ReplicatedPersistence = extern struct {
                 out: *AbiRows,
             ) callconv(.c) runtime_error_abi.Status {
                 if (!allocator.valid())
-                    return fail("load", error.UnsupportedVersion);
+                    return fail(error.UnsupportedVersion);
                 const alloc = allocator.asStd();
-                const rows = local.load(ptr, alloc) catch |err| return fail("load", err);
+                const rows = local.load(ptr, alloc) catch |err| return fail(err);
                 const abi_rows = alloc.alloc(AbiRow, rows.len) catch |err| {
                     freeRows(alloc, rows);
-                    return fail("load", err);
+                    return fail(err);
                 };
                 for (rows, 0..) |row, index| {
                     abi_rows[index] = .{
@@ -241,8 +235,8 @@ pub const ReplicatedPersistence = extern struct {
                 out: *runtime_memory_abi.OptionalOwnedBytes,
             ) callconv(.c) runtime_error_abi.Status {
                 if (!allocator.valid())
-                    return fail("get", error.UnsupportedVersion);
-                const value = local.get(ptr, allocator.asStd(), key.slice()) catch |err| return fail("get", err);
+                    return fail(error.UnsupportedVersion);
+                const value = local.get(ptr, allocator.asStd(), key.slice()) catch |err| return fail(err);
                 out.* = if (value) |bytes| .{
                     .bytes = .{ .ptr = bytes.ptr, .len = bytes.len },
                     .present = 1,
@@ -255,7 +249,7 @@ pub const ReplicatedPersistence = extern struct {
                 key: runtime_memory_abi.Bytes,
                 value: runtime_memory_abi.Bytes,
             ) callconv(.c) runtime_error_abi.Status {
-                local.put(ptr, key.slice(), value.slice()) catch |err| return fail("put", err);
+                local.put(ptr, key.slice(), value.slice()) catch |err| return fail(err);
                 return .ok;
             }
 
@@ -263,7 +257,7 @@ pub const ReplicatedPersistence = extern struct {
                 ptr: *anyopaque,
                 key: runtime_memory_abi.Bytes,
             ) callconv(.c) runtime_error_abi.Status {
-                local.delete(ptr, key.slice()) catch |err| return fail("delete", err);
+                local.delete(ptr, key.slice()) catch |err| return fail(err);
                 return .ok;
             }
 
@@ -274,13 +268,13 @@ pub const ReplicatedPersistence = extern struct {
                 key_count: usize,
             ) callconv(.c) runtime_error_abi.Status {
                 if (!allocator.valid())
-                    return fail("delete_many", error.UnsupportedVersion);
+                    return fail(error.UnsupportedVersion);
                 const alloc = allocator.asStd();
-                const keys = alloc.alloc([]const u8, key_count) catch |err| return fail("delete_many", err);
+                const keys = alloc.alloc([]const u8, key_count) catch |err| return fail(err);
                 defer alloc.free(keys);
                 const abi_keys = if (key_count == 0) &.{} else keys_ptr.?[0..key_count];
                 for (abi_keys, 0..) |key, index| keys[index] = key.slice();
-                local.delete_many(ptr, keys) catch |err| return fail("delete_many", err);
+                local.delete_many(ptr, keys) catch |err| return fail(err);
                 return .ok;
             }
         };
@@ -2042,8 +2036,6 @@ const TestReplicatedPersistence = struct {
     // 0 = open, 1 = pause the next point read after snapshotting, 2 = paused,
     // 3 = released. Tests use this to deterministically model a delayed read.
     get_gate: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    fail_load_private: bool = false,
-    fail_put_private: bool = false,
     fail_delete_many: bool = false,
 
     fn init(alloc: std.mem.Allocator) TestReplicatedPersistence {
@@ -2071,7 +2063,6 @@ const TestReplicatedPersistence = struct {
 
     fn load(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicatedPersistence.OwnedRow {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
-        if (self.fail_load_private) return error.TestRestoreJobLoadPrivateFailure;
         const out = try alloc.alloc(ReplicatedPersistence.OwnedRow, self.rows.count());
         var initialized: usize = 0;
         errdefer {
@@ -2104,7 +2095,6 @@ const TestReplicatedPersistence = struct {
 
     fn put(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
-        if (self.fail_put_private) return error.TestRestoreJobPutPrivateFailure;
         const owned_value = try self.alloc.dupe(u8, value);
         errdefer self.alloc.free(owned_value);
         if (self.rows.getPtr(key)) |existing| {
@@ -2202,24 +2192,6 @@ test "failed destination authorization refresh reuses the idempotent restore job
     var changed = adopted_request;
     changed.backup_id = "different";
     try std.testing.expectError(error.IdempotencyConflict, store.start(alloc, changed));
-}
-
-test "replicated restore persistence maps private callback errors to stable unavailability" {
-    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
-    defer persistence.deinit();
-    const replicated = persistence.persistence();
-
-    persistence.fail_load_private = true;
-    try std.testing.expectError(
-        error.RestoreJobPersistenceUnavailable,
-        replicated.load(std.testing.allocator),
-    );
-    persistence.fail_load_private = false;
-    persistence.fail_put_private = true;
-    try std.testing.expectError(
-        error.RestoreJobPersistenceUnavailable,
-        replicated.put("restore/jobs/1", "{}"),
-    );
 }
 
 test "delayed replicated restore refresh cannot regress a running job" {

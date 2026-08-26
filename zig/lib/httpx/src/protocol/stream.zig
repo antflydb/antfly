@@ -158,15 +158,14 @@ pub const Stream = struct {
         };
     }
 
-    /// Returns an error that must prevent local writes. Request-body admission
-    /// failures are inbound terminal errors, but a server must still be able
-    /// to send its explicit 413/429 response before resetting the remote half
-    /// of the stream. Client-side response overflow and peer/protocol errors
-    /// remain hard write barriers.
-    pub fn responseWriteError(self: *const Self, is_server: bool) ?anyerror {
+    /// Returns an error that must prevent local response writes. Aggregate
+    /// request-body admission is an inbound terminal error, but the server
+    /// must still be able to send its explicit 429 response before resetting
+    /// the remote half of the stream. Peer resets and protocol errors remain
+    /// hard write barriers.
+    pub fn responseWriteError(self: *const Self) ?anyerror {
         const err = self.stream_error orelse return null;
-        return if (err == error.BodyCapacityExceeded or
-            (is_server and err == error.StreamDataOverflow)) null else err;
+        return if (err == error.BodyCapacityExceeded) null else err;
     }
 
     /// Transitions state after sending END_STREAM.

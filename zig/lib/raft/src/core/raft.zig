@@ -130,9 +130,21 @@ pub const Raft = struct {
             return error.LeaseBasedReadRequiresCheckQuorum;
         }
 
-        var peers = try alloc.dupe(types.NodeId, normalized_cfg.peers);
+        const peers = try alloc.dupe(types.NodeId, normalized_cfg.peers);
         errdefer alloc.free(peers);
         if (peerIndex(peers, normalized_cfg.id) == null) return error.LocalNodeNotInPeerSet;
+
+        const votes = try alloc.alloc(VoteState, peers.len);
+        errdefer alloc.free(votes);
+        @memset(votes, .unknown);
+
+        const progress = try alloc.alloc(types.Progress, peers.len);
+        errdefer alloc.free(progress);
+        @memset(progress, .{});
+
+        const inflights = try alloc.alloc(std.ArrayListUnmanaged(Inflight), peers.len);
+        errdefer alloc.free(inflights);
+        for (inflights) |*queue| queue.* = .empty;
 
         var raft_log = try log_mod.RaftLog.init(alloc, storage);
         errdefer raft_log.deinit();
@@ -189,35 +201,6 @@ pub const Raft = struct {
                 }
             }
         }
-
-        const persisted_targets = [_][]const types.NodeId{
-            conf_state.voters,
-            conf_state.voters_outgoing,
-            conf_state.learners,
-            conf_state.learners_next,
-        };
-        for (persisted_targets) |targets| {
-            for (targets) |node_id| {
-                if (peerIndex(peers, node_id) != null) continue;
-                const expanded = try alloc.alloc(types.NodeId, peers.len + 1);
-                @memcpy(expanded[0..peers.len], peers);
-                expanded[peers.len] = node_id;
-                alloc.free(peers);
-                peers = expanded;
-            }
-        }
-
-        const votes = try alloc.alloc(VoteState, peers.len);
-        errdefer alloc.free(votes);
-        @memset(votes, .unknown);
-
-        const progress = try alloc.alloc(types.Progress, peers.len);
-        errdefer alloc.free(progress);
-        @memset(progress, .{});
-
-        const inflights = try alloc.alloc(std.ArrayListUnmanaged(Inflight), peers.len);
-        errdefer alloc.free(inflights);
-        for (inflights) |*queue| queue.* = .empty;
 
         if (normalized_cfg.applied > raft_log.applied and normalized_cfg.applied > hard_state.commit_index) {
             return error.InvalidApplied;

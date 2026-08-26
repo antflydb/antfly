@@ -319,14 +319,17 @@ func (r *InferencePoolReconciler) generateCompleteConfig(pool *antflyaiv1alpha1.
 	// ANTFLY_INFERENCE_PREFERRED_BACKEND.
 	preload := make([]map[string]any, 0, len(pool.Spec.Models.Preload))
 	for _, model := range pool.Spec.Models.Preload {
-		modelStrategy := effectiveInferenceLoadingStrategy(model.Strategy, loadingStrategy)
+		modelStrategy := model.Strategy
+		if modelStrategy == "" {
+			modelStrategy = loadingStrategy
+		}
 		if modelStrategy != antflyaiv1alpha1.LoadingStrategyEager {
 			continue
 		}
 
 		entry := map[string]any{
 			"kind": zigWarmModelKind(model.Tasks),
-			"name": inferenceWarmModelName(model.Name),
+			"name": model.Name,
 		}
 		if format, quantization, ok := inferenceArtifactSelection(model.Name); ok {
 			entry["format"] = format
@@ -393,16 +396,6 @@ func inferenceKeepAliveMillis(pool *antflyaiv1alpha1.InferencePool) (uint64, err
 	return uint64(milliseconds), nil
 }
 
-func effectiveInferenceLoadingStrategy(modelStrategy, poolStrategy antflyaiv1alpha1.LoadingStrategy) antflyaiv1alpha1.LoadingStrategy {
-	if modelStrategy != "" {
-		return modelStrategy
-	}
-	if poolStrategy != "" {
-		return poolStrategy
-	}
-	return antflyaiv1alpha1.LoadingStrategyEager
-}
-
 func isTPUAccelerator(accelerator string) bool {
 	return strings.Contains(strings.ToLower(accelerator), "tpu")
 }
@@ -459,10 +452,6 @@ func zigWarmModelKind(tasks []string) string {
 	}
 	// Preserve the Zig CLI's historical default for untyped model refs.
 	return "generator"
-}
-
-func inferenceWarmModelName(modelRef string) string {
-	return strings.TrimPrefix(modelRef, "hf:")
 }
 
 // inferenceArtifactSelection recognizes only runtime artifact-family suffixes.
@@ -544,14 +533,6 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 		})
 	}
 
-	inferenceArgs := []string{
-		"inference", "run",
-		"--host", "0.0.0.0",
-		"--port", strconv.Itoa(InferenceAPIPort),
-		"--config", "/config/config.json",
-		"--allow-insecure-public-bind",
-	}
-
 	inferenceVolumeMounts := []corev1.VolumeMount{
 		{Name: "models", MountPath: "/models"},
 		{Name: "config", MountPath: "/config", ReadOnly: true},
@@ -612,7 +593,13 @@ func (r *InferencePoolReconciler) reconcileStatefulSet(ctx context.Context, pool
 							Name:    "inference",
 							Image:   image,
 							Command: []string{"/antfly"},
-							Args:    inferenceArgs,
+							Args: []string{
+								"inference", "run",
+								"--host", "0.0.0.0",
+								"--port", strconv.Itoa(InferenceAPIPort),
+								"--config", "/config/config.json",
+								"--allow-insecure-public-bind",
+							},
 							Ports: []corev1.ContainerPort{
 								{Name: "http", ContainerPort: InferenceAPIPort, Protocol: corev1.ProtocolTCP},
 							},
