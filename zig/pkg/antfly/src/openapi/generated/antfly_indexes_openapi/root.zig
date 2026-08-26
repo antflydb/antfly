@@ -98,6 +98,7 @@ pub const GraphQueryResult = types.GraphQueryResult;
 pub const GraphQueryStats = types.GraphQueryStats;
 pub const GraphQueryType = types.GraphQueryType;
 pub const GraphResolverConfig = types.GraphResolverConfig;
+pub const GraphResult = types.GraphResult;
 pub const GraphResultBinding = types.GraphResultBinding;
 pub const GraphResultNode = types.GraphResultNode;
 pub const GraphResultRefNodeSelector = types.GraphResultRefNodeSelector;

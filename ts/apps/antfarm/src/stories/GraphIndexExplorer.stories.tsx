@@ -1,4 +1,4 @@
-import type { AntflyClient, GraphQueryResult, IndexStatus, QueryRequest } from "@antfly/sdk";
+import type { AntflyClient, GraphQueryResult, GraphResult, IndexStatus, QueryRequest } from "@antfly/sdk";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { GraphIndexExplorer } from "../components/GraphIndexExplorer";
 import { ApiConfigContext } from "../contexts/api-config-context";
@@ -65,7 +65,6 @@ const traversalResult: GraphQueryResult = {
     {
       key: "paper:vector-db",
       depth: 1,
-      distance: 0.92,
       document: documents["paper:vector-db"],
       path: [{ key: "paper:graph-rag" }, { key: "paper:vector-db" }],
       path_edges: [
@@ -80,7 +79,6 @@ const traversalResult: GraphQueryResult = {
     {
       key: "paper:path-ranking",
       depth: 2,
-      distance: 1.7,
       document: documents["paper:path-ranking"],
       path: [{ key: "paper:graph-rag" }, { key: "paper:vector-db" }, { key: "paper:path-ranking" }],
       path_edges: [
@@ -101,7 +99,6 @@ const traversalResult: GraphQueryResult = {
     {
       key: "paper:agent-memory",
       depth: 1,
-      distance: 0.88,
       document: documents["paper:agent-memory"],
       path: [{ key: "paper:graph-rag" }, { key: "paper:agent-memory" }],
       path_edges: [
@@ -116,7 +113,6 @@ const traversalResult: GraphQueryResult = {
     {
       key: "paper:entity-links",
       depth: 2,
-      distance: 1.6,
       document: documents["paper:entity-links"],
       path: [
         { key: "paper:graph-rag" },
@@ -176,7 +172,7 @@ const shortestPathResult: GraphQueryResult = {
   stats: { returned_items: 1, truncated: false },
 };
 
-function graphResultFor(request: QueryRequest): GraphQueryResult {
+function graphResultFor(request: QueryRequest): GraphResult {
   const query = request.graph_queries?.explorer;
   if (query && "shortest_path" in query) return shortestPathResult;
   return traversalResult;

@@ -2111,7 +2111,7 @@ fn deriveNativeDocIdConstraintsArena(
 }
 
 fn compilePatternFilterOptional(alloc: Allocator, value: std.json.Value) !?graph_exec.CompiledPatternFilter {
-    return graph_exec.compilePatternFilter(alloc, value) catch |err| switch (err) {
+    return graph_exec.tryCompilePatternFilter(alloc, value) catch |err| switch (err) {
         error.InvalidArgument => null,
         else => return err,
     };

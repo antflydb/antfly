@@ -261,6 +261,7 @@ export type {
   GraphQueryResult,
   GraphQueryStats,
   GraphQueryType,
+  GraphResult,
   GraphResultBinding,
   GraphResultNode,
   GraphResultRefNodeSelector,

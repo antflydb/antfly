@@ -6339,7 +6339,7 @@ test "public api e2e supports graph queries" {
     try std.testing.expectEqual(@as(usize, 2), traverse.nodes.len);
     try std.testing.expectEqualStrings("doc-b", traverse.nodes[0].key);
     try std.testing.expectEqualStrings("doc-c", traverse.nodes[1].key);
-    try std.testing.expectEqual(@as(i64, 2), traverse.nodes[1].depth.?);
+    try std.testing.expectEqual(@as(i64, 2), traverse.nodes[1].depth);
     try std.testing.expectEqual(@as(usize, 3), traverse.nodes[1].path.?.len);
     try std.testing.expectEqualStrings("doc-a", traverse.nodes[1].path.?[0].key);
     try std.testing.expectEqualStrings("doc-b", traverse.nodes[1].path.?[1].key);
@@ -6363,7 +6363,7 @@ test "public api e2e supports graph queries" {
     const shortest = try expectSingleGraphResult.get(parsed_shortest.value, "shortest");
     try std.testing.expectEqual(@as(usize, 1), shortest.nodes.len);
     try std.testing.expectEqualStrings("doc-c", shortest.nodes[0].key);
-    try std.testing.expectEqual(@as(i64, 2), shortest.nodes[0].depth.?);
+    try std.testing.expectEqual(@as(i64, 2), shortest.nodes[0].depth);
     try std.testing.expectEqual(@as(usize, 3), shortest.nodes[0].path.?.len);
     try std.testing.expectEqualStrings("doc-a", shortest.nodes[0].path.?[0].key);
     try std.testing.expectEqualStrings("doc-b", shortest.nodes[0].path.?[1].key);

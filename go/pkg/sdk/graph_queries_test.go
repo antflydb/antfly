@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
 )
@@ -150,6 +151,14 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 	}
 	if _, err := NewGraphDocumentFilter(querydsl.TermQuery{Term: "beta", Field: "title", Boost: 2}.ToQuery()); err == nil {
 		t.Fatal("expected scoring graph filter to fail")
+	}
+	if _, err := NewGraphDocumentFilter(querydsl.ConjunctionQuery{Conjuncts: []querydsl.Query{
+		querydsl.TermQuery{Term: "beta", Field: "title", Boost: 2}.ToQuery(),
+	}}.ToQuery()); err == nil {
+		t.Fatal("expected nested scoring graph filter to fail")
+	}
+	if _, err := NewGraphDocumentFilter(querydsl.DocIdQuery{Ids: []string{"doc:a", "doc:a"}}.ToQuery()); err == nil {
+		t.Fatal("expected duplicate graph ids to fail")
 	}
 	if _, err := NewGraphDocumentFilter(querydsl.NumericRangeQuery{Field: "score"}.ToQuery()); err == nil {
 		t.Fatal("expected boundless graph range filter to fail")
@@ -330,6 +339,17 @@ func TestGraphDocumentFilterUsesDiscriminatedRangeWireShape(t *testing.T) {
 	}
 }
 
+func TestGraphDocumentFilterRejectsFullTextDateParser(t *testing.T) {
+	start := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := NewGraphDocumentFilter(querydsl.DateRangeStringQuery{
+		Field:          "created_at",
+		Start:          &start,
+		DatetimeParser: "2006/01/02",
+	}.ToQuery()); err == nil {
+		t.Fatal("expected graph date filter to reject the full-text datetime parser")
+	}
+}
+
 func TestGraphDocumentFilterCanonicalizesNestedAndEscapedPaths(t *testing.T) {
 	filter, err := NewGraphDocumentFilter(querydsl.TermQuery{Term: "beta", Field: "author.display/name~raw"}.ToQuery())
 	if err != nil {
@@ -395,12 +415,12 @@ func TestGraphIdentifiersReserveControlTokens(t *testing.T) {
 }
 
 func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
-	var result GraphQueryResult
-	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`), &result); err != nil {
+	var canonical GraphQueryResult
+	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`), &canonical); err != nil {
 		t.Fatal(err)
 	}
 
-	value, err := DecodeGraphQueryResult(result)
+	value, err := DecodeGraphQueryResult(canonical)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,10 +432,11 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 		t.Fatalf("nodes kind = %q, want nodes", nodes.Kind)
 	}
 
+	var result GraphResult
 	if err := json.Unmarshal([]byte(`{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":1}`), &result); err != nil {
 		t.Fatal(err)
 	}
-	value, err = DecodeGraphQueryResult(result)
+	value, err = DecodeGraphResult(result)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +457,7 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 		if err := json.Unmarshal([]byte(malformed), &result); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := DecodeGraphQueryResult(result); err == nil {
+		if _, err := DecodeGraphResult(result); err == nil {
 			t.Fatalf("expected malformed legacy graph result to fail: %s", malformed)
 		}
 	}
@@ -444,7 +465,7 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"kind":"unknown"}`), &result); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DecodeGraphQueryResult(result); err == nil {
+	if _, err := DecodeGraphResult(result); err == nil {
 		t.Fatal("expected unknown graph result kind to fail")
 	}
 }

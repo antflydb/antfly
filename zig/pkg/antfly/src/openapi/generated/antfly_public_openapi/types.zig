@@ -2646,8 +2646,8 @@ pub const QueryResult = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
     /// Analysis results like PCA and t-SNE per index embeddings.
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
-    /// Results from declarative graph queries.
-    graph_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQueryResult) = null,
+    /// Results from canonical graph_queries or deprecated graph_searches.
+    graph_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.

@@ -5292,8 +5292,165 @@ pub const GraphQueryParams = struct {
     algorithm_params: ?std.json.Value = null,
 };
 
-/// A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path results cannot be confused with the deprecated graph_searches envelope.
+/// A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators.
 pub const GraphQueryResult = union(enum) {
+    graph_nodes_result: *GraphNodesResult,
+    graph_aggregates_result: *GraphAggregatesResult,
+    graph_bindings_result: *GraphBindingsResult,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { kind: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        switch (probe.kind) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return error.MissingField;
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("kind") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "nodes")) {
+            const parsed = try parseStructuralVariant(GraphNodesResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_nodes_result = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "aggregates")) {
+            const parsed = try parseStructuralVariant(GraphAggregatesResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_aggregates_result = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "bindings")) {
+            const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_bindings_result = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .graph_nodes_result => |v| try jw.write(v.*),
+            .graph_aggregates_result => |v| try jw.write(v.*),
+            .graph_bindings_result => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const GraphQueryStats = struct {
+    /// Number of primary result items returned (nodes, paths, rows, or aggregates).
+    returned_items: i64,
+    /// True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
+    truncated: bool,
+};
+
+/// Deprecated discriminator used by LegacyGraphQuery.
+pub const GraphQueryType = enum {
+    traverse,
+    neighbors,
+    shortest_path,
+    k_shortest_paths,
+    pattern,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .traverse => "traverse",
+            .neighbors => "neighbors",
+            .shortest_path => "shortest_path",
+            .k_shortest_paths => "k_shortest_paths",
+            .pattern => "pattern",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "traverse", .traverse },
+            .{ "neighbors", .neighbors },
+            .{ "shortest_path", .shortest_path },
+            .{ "k_shortest_paths", .k_shortest_paths },
+            .{ "pattern", .pattern },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Versioned entity resolver attached to an artifact-backed graph index.
+pub const GraphResolverConfig = struct {
+    name: []const u8,
+    table: []const u8,
+    source_artifact: []const u8,
+    source_artifact_kind: ?[]const u8 = null,
+    resolution_artifact: []const u8,
+    key_template: []const u8,
+    type_must_match: ?bool = null,
+    scorer_json: ?[]const u8 = null,
+    candidate_search: ?[]const u8 = null,
+    candidate_ann_index: ?[]const u8 = null,
+    candidate_limit: ?i64 = null,
+    name_embedding: ?[]const u8 = null,
+    name_embedding_dims: ?i64 = null,
+    fusion_combine: ?[]const u8 = null,
+    fusion_trust: ?f64 = null,
+    fusion_prior: ?f64 = null,
+    fusion_prior_weight: ?f64 = null,
+    config_generation: ?i64 = null,
+};
+
+/// Result value stored in QueryResult.graph_results. Canonical graph_queries results are GraphQueryResult variants; the deprecated legacy shape remains accepted only for graph_searches during its compatibility window.
+pub const GraphResult = union(enum) {
     graph_nodes_result: *GraphNodesResult,
     graph_aggregates_result: *GraphAggregatesResult,
     graph_bindings_result: *GraphBindingsResult,
@@ -5393,70 +5550,6 @@ pub const GraphQueryResult = union(enum) {
     }
 };
 
-pub const GraphQueryStats = struct {
-    /// Number of primary result items returned (nodes, paths, rows, or aggregates).
-    returned_items: i64,
-    /// True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
-    truncated: bool,
-};
-
-/// Deprecated discriminator used by LegacyGraphQuery.
-pub const GraphQueryType = enum {
-    traverse,
-    neighbors,
-    shortest_path,
-    k_shortest_paths,
-    pattern,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .traverse => "traverse",
-            .neighbors => "neighbors",
-            .shortest_path => "shortest_path",
-            .k_shortest_paths => "k_shortest_paths",
-            .pattern => "pattern",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "traverse", .traverse },
-            .{ "neighbors", .neighbors },
-            .{ "shortest_path", .shortest_path },
-            .{ "k_shortest_paths", .k_shortest_paths },
-            .{ "pattern", .pattern },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Versioned entity resolver attached to an artifact-backed graph index.
-pub const GraphResolverConfig = struct {
-    name: []const u8,
-    table: []const u8,
-    source_artifact: []const u8,
-    source_artifact_kind: ?[]const u8 = null,
-    resolution_artifact: []const u8,
-    key_template: []const u8,
-    type_must_match: ?bool = null,
-    scorer_json: ?[]const u8 = null,
-    candidate_search: ?[]const u8 = null,
-    candidate_ann_index: ?[]const u8 = null,
-    candidate_limit: ?i64 = null,
-    name_embedding: ?[]const u8 = null,
-    name_embedding_dims: ?i64 = null,
-    fusion_combine: ?[]const u8 = null,
-    fusion_trust: ?f64 = null,
-    fusion_prior: ?f64 = null,
-    fusion_prior_weight: ?f64 = null,
-    config_generation: ?i64 = null,
-};
-
 pub const GraphResultBinding = ?GraphBindingNode;
 
 /// A node in graph query results
@@ -5465,10 +5558,8 @@ pub const GraphResultNode = struct {
     key: []const u8,
     /// Owning table for a cross-table node; omitted for nodes in the queried table
     table: ?[]const u8 = null,
-    /// Distance from start node
-    depth: ?i64 = null,
-    /// Hop distance for traversal results, or the selected edge-weight cost for path results
-    distance: ?f64 = null,
+    /// Hop count from the start node
+    depth: i64,
     /// Full document (if include_documents=true)
     document: ?std.json.Value = null,
     /// Exact ordered node identities in the path from the start node to this node
@@ -9159,8 +9250,8 @@ pub const QueryResult = struct {
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
     /// Analysis results like PCA and t-SNE per index embeddings.
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
-    /// Results from declarative graph queries.
-    graph_results: ?std.json.ArrayHashMap(GraphQueryResult) = null,
+    /// Results from canonical graph_queries or deprecated graph_searches.
+    graph_results: ?std.json.ArrayHashMap(GraphResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.
@@ -9331,7 +9422,247 @@ pub const QueryUnprocessableError = union(enum) {
 };
 
 /// A validated Antfly query retained as raw JSON by Go servers and clients.
-pub const RawQuery = std.json.Value;
+pub const RawQuery = union(enum) {
+    date_range_string_query: *DateRangeStringQuery,
+    boolean_query: *BooleanQuery,
+    geo_bounding_box_query: *GeoBoundingBoxQuery,
+    numeric_range_query: *NumericRangeQuery,
+    term_range_query: *TermRangeQuery,
+    fuzzy_query: *FuzzyQuery,
+    match_phrase_query: *MatchPhraseQuery,
+    disjunction_query: *DisjunctionQuery,
+    geo_distance_query: *GeoDistanceQuery,
+    match_query: *MatchQuery,
+    multi_phrase_query: *MultiPhraseQuery,
+    phrase_query: *PhraseQuery,
+    bool_field_query: *BoolFieldQuery,
+    conjunction_query: *ConjunctionQuery,
+    doc_id_query: *DocIdQuery,
+    geo_bounding_polygon_query: *GeoBoundingPolygonQuery,
+    geo_shape_query: *GeoShapeQuery,
+    ip_range_query: *IPRangeQuery,
+    match_all_query: *MatchAllQuery,
+    match_none_query: *MatchNoneQuery,
+    multi_match_query: *MultiMatchQuery,
+    prefix_query: *PrefixQuery,
+    query_string_query: *QueryStringQuery,
+    regexp_query: *RegexpQuery,
+    term_query: *TermQuery,
+    wildcard_query: *WildcardQuery,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "start",
+            "end",
+            "inclusive_start",
+            "inclusive_end",
+            "datetime_parser",
+        })) {
+            if (try parseStructuralVariant(DateRangeStringQuery, allocator, source, options)) |parsed| return .{ .date_range_string_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "must",
+            "should",
+            "must_not",
+            "filter",
+        })) {
+            if (try parseStructuralVariant(BooleanQuery, allocator, source, options)) |parsed| return .{ .boolean_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min_lat",
+            "min_lon",
+            "max_lat",
+            "max_lon",
+        })) {
+            if (try parseStructuralVariant(GeoBoundingBoxQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_box_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+        })) {
+            if (try parseStructuralVariant(NumericRangeQuery, allocator, source, options)) |parsed| return .{ .numeric_range_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+        })) {
+            if (try parseStructuralVariant(TermRangeQuery, allocator, source, options)) |parsed| return .{ .term_range_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "term",
+            "prefix_length",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(FuzzyQuery, allocator, source, options)) |parsed| return .{ .fuzzy_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match_phrase",
+            "analyzer",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(MatchPhraseQuery, allocator, source, options)) |parsed| return .{ .match_phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "disjuncts",
+            "min",
+        })) {
+            if (try parseStructuralVariant(DisjunctionQuery, allocator, source, options)) |parsed| return .{ .disjunction_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "location",
+            "distance",
+        })) {
+            if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match",
+            "analyzer",
+        })) {
+            if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "terms",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(MultiPhraseQuery, allocator, source, options)) |parsed| return .{ .multi_phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "terms",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(PhraseQuery, allocator, source, options)) |parsed| return .{ .phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "bool",
+        })) {
+            if (try parseStructuralVariant(BoolFieldQuery, allocator, source, options)) |parsed| return .{ .bool_field_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "conjuncts",
+        })) {
+            if (try parseStructuralVariant(ConjunctionQuery, allocator, source, options)) |parsed| return .{ .conjunction_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ids",
+        })) {
+            if (try parseStructuralVariant(DocIdQuery, allocator, source, options)) |parsed| return .{ .doc_id_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "polygon_points",
+        })) {
+            if (try parseStructuralVariant(GeoBoundingPolygonQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_polygon_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "geometry",
+        })) {
+            if (try parseStructuralVariant(GeoShapeQuery, allocator, source, options)) |parsed| return .{ .geo_shape_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "cidr",
+        })) {
+            if (try parseStructuralVariant(IPRangeQuery, allocator, source, options)) |parsed| return .{ .ip_range_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match_all",
+        })) {
+            if (try parseStructuralVariant(MatchAllQuery, allocator, source, options)) |parsed| return .{ .match_all_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "match_none",
+        })) {
+            if (try parseStructuralVariant(MatchNoneQuery, allocator, source, options)) |parsed| return .{ .match_none_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "multi_match",
+        })) {
+            if (try parseStructuralVariant(MultiMatchQuery, allocator, source, options)) |parsed| return .{ .multi_match_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "prefix",
+        })) {
+            if (try parseStructuralVariant(PrefixQuery, allocator, source, options)) |parsed| return .{ .prefix_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "query",
+        })) {
+            if (try parseStructuralVariant(QueryStringQuery, allocator, source, options)) |parsed| return .{ .query_string_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "regexp",
+        })) {
+            if (try parseStructuralVariant(RegexpQuery, allocator, source, options)) |parsed| return .{ .regexp_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "term",
+        })) {
+            if (try parseStructuralVariant(TermQuery, allocator, source, options)) |parsed| return .{ .term_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "wildcard",
+        })) {
+            if (try parseStructuralVariant(WildcardQuery, allocator, source, options)) |parsed| return .{ .wildcard_query = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .date_range_string_query => |v| try jw.write(v.*),
+            .boolean_query => |v| try jw.write(v.*),
+            .geo_bounding_box_query => |v| try jw.write(v.*),
+            .numeric_range_query => |v| try jw.write(v.*),
+            .term_range_query => |v| try jw.write(v.*),
+            .fuzzy_query => |v| try jw.write(v.*),
+            .match_phrase_query => |v| try jw.write(v.*),
+            .disjunction_query => |v| try jw.write(v.*),
+            .geo_distance_query => |v| try jw.write(v.*),
+            .match_query => |v| try jw.write(v.*),
+            .multi_phrase_query => |v| try jw.write(v.*),
+            .phrase_query => |v| try jw.write(v.*),
+            .bool_field_query => |v| try jw.write(v.*),
+            .conjunction_query => |v| try jw.write(v.*),
+            .doc_id_query => |v| try jw.write(v.*),
+            .geo_bounding_polygon_query => |v| try jw.write(v.*),
+            .geo_shape_query => |v| try jw.write(v.*),
+            .ip_range_query => |v| try jw.write(v.*),
+            .match_all_query => |v| try jw.write(v.*),
+            .match_none_query => |v| try jw.write(v.*),
+            .multi_match_query => |v| try jw.write(v.*),
+            .prefix_query => |v| try jw.write(v.*),
+            .query_string_query => |v| try jw.write(v.*),
+            .regexp_query => |v| try jw.write(v.*),
+            .term_query => |v| try jw.write(v.*),
+            .wildcard_query => |v| try jw.write(v.*),
+        }
+    }
+};
 
 pub const RegexpQuery = struct {
     regexp: []const u8,

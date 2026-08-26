@@ -3445,12 +3445,16 @@ fn executeDistributedKShortestPaths(
     if (start_nodes.len != 1 or target_nodes.len != 1)
         return error.UnsupportedQueryRequest;
 
+    var results_lease = try graph_work_budget.RetainedLease.init(request_work_budget, 0);
+    defer results_lease.deinit();
     var results = std.ArrayListUnmanaged(BudgetedGraphPath).empty;
     defer results.deinit(alloc);
     errdefer {
         for (results.items) |*path| path.deinit(alloc);
     }
 
+    var seen_paths_lease = try graph_work_budget.RetainedLease.init(request_work_budget, 0);
+    defer seen_paths_lease.deinit();
     var seen_paths = std.StringHashMapUnmanaged(void).empty;
     defer {
         var it = seen_paths.keyIterator();
@@ -3471,19 +3475,29 @@ fn executeDistributedKShortestPaths(
     var first_result = first.?;
     var first_result_owned = true;
     defer if (first_result_owned) first_result.deinit(alloc);
-    const first_key = try graphPathToKey(alloc, first_result.path);
     var first_path = first_result.take();
     first_result_owned = false;
-    results.ensureTotalCapacityPrecise(alloc, 1) catch |err| {
+    ensureBudgetedPathListCapacity(
+        alloc,
+        &results,
+        &results_lease,
+        request_work_budget,
+    ) catch |err| {
         first_path.deinit(alloc);
         return err;
     };
     results.appendAssumeCapacity(first_path);
-    seen_paths.put(alloc, first_key, {}) catch |err| {
-        alloc.free(first_key);
-        return err;
-    };
+    const first_identity_inserted = try insertGraphPathIdentity(
+        alloc,
+        &seen_paths,
+        &seen_paths_lease,
+        first_path.path,
+        request_work_budget,
+    );
+    if (!first_identity_inserted) return error.InvalidQueryResult;
 
+    var candidates_lease = try graph_work_budget.RetainedLease.init(request_work_budget, 0);
+    defer candidates_lease.deinit();
     var candidates = std.ArrayListUnmanaged(BudgetedGraphPath).empty;
     defer {
         for (candidates.items) |*path| path.deinit(alloc);
@@ -3496,6 +3510,8 @@ fn executeDistributedKShortestPaths(
         if (prev_path.nodes.len <= 1) break;
 
         for (0..prev_path.nodes.len - 1) |spur_idx| {
+            var excluded_edges_lease = try graph_work_budget.RetainedLease.init(request_work_budget, 0);
+            defer excluded_edges_lease.deinit();
             var excluded_edges = std.StringHashMapUnmanaged(void).empty;
             defer {
                 var eit = excluded_edges.keyIterator();
@@ -3503,6 +3519,8 @@ fn executeDistributedKShortestPaths(
                 excluded_edges.deinit(alloc);
             }
 
+            var excluded_nodes_lease = try graph_work_budget.RetainedLease.init(request_work_budget, 0);
+            defer excluded_nodes_lease.deinit();
             var excluded_nodes = graph_node_identity.Map(void){};
             defer excluded_nodes.deinit(alloc);
 
@@ -3511,32 +3529,29 @@ fn executeDistributedKShortestPaths(
                 if (result_path.nodes.len <= spur_idx + 1) continue;
                 if (!rootPathMatches(prev_path.*, result_path, spur_idx)) continue;
 
-                const edge_key = try allocEdgeExclusionKey(
+                _ = try insertExcludedEdgeIdentity(
                     alloc,
+                    &excluded_edges,
+                    &excluded_edges_lease,
+                    request_work_budget,
                     graphPathNodeTable(result_path, spur_idx) orelse table_name,
                     result_path.nodes[spur_idx],
                     result_path.nodes[spur_idx + 1],
                     if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].edge_type else "",
                 );
-                if (!excluded_edges.contains(edge_key)) {
-                    excluded_edges.put(alloc, edge_key, {}) catch |err| {
-                        alloc.free(edge_key);
-                        return err;
-                    };
-                } else {
-                    alloc.free(edge_key);
-                }
             }
 
             for (0..spur_idx) |i| {
                 const node_key = prev_path.nodes[i];
-                _ = try excluded_nodes.putIfAbsent(
+                _ = try insertExcludedNodeIdentity(
                     alloc,
+                    &excluded_nodes,
+                    &excluded_nodes_lease,
+                    request_work_budget,
                     .{
                         .table = graphPathNodeTable(prev_path.*, i),
                         .key = node_key,
                     },
-                    {},
                 );
             }
 
@@ -3590,24 +3605,24 @@ fn executeDistributedKShortestPaths(
                 total_path_owned = false;
                 continue;
             }
-            const pkey = try graphPathToKey(alloc, total_path.path);
-            if (!seen_paths.contains(pkey)) {
-                seen_paths.put(alloc, pkey, {}) catch |err| {
-                    alloc.free(pkey);
-                    return err;
-                };
-                if (candidates.capacity == candidates.items.len) candidates.ensureTotalCapacityPrecise(
+            if (try insertGraphPathIdentity(
+                alloc,
+                &seen_paths,
+                &seen_paths_lease,
+                total_path.path,
+                request_work_budget,
+            )) {
+                ensureBudgetedPathListCapacity(
                     alloc,
-                    candidates.items.len + 1,
+                    &candidates,
+                    &candidates_lease,
+                    request_work_budget,
                 ) catch |err| {
-                    _ = seen_paths.remove(pkey);
-                    alloc.free(pkey);
                     return err;
                 };
                 candidates.appendAssumeCapacity(total_path);
                 total_path_owned = false;
             } else {
-                alloc.free(pkey);
                 total_path.deinit(alloc);
                 total_path_owned = false;
             }
@@ -3616,9 +3631,11 @@ fn executeDistributedKShortestPaths(
         if (candidates.items.len == 0) break;
         const best_idx = bestBudgetedPathIndex(candidates.items, graph_query.query.params.weight_mode);
         var best = candidates.swapRemove(best_idx);
-        if (results.capacity == results.items.len) results.ensureTotalCapacityPrecise(
+        ensureBudgetedPathListCapacity(
             alloc,
-            results.items.len + 1,
+            &results,
+            &results_lease,
+            request_work_budget,
         ) catch |err| {
             best.deinit(alloc);
             return err;
@@ -3715,6 +3732,238 @@ const BudgetedGraphPath = struct {
         self.* = undefined;
     }
 };
+
+const retained_hash_entry_overhead = 3 * @sizeOf(usize);
+
+fn growRetainedLease(
+    lease: *graph_work_budget.RetainedLease,
+    added_bytes: usize,
+    budget: *graph_pattern_mod.WorkBudget,
+) !usize {
+    const previous = lease.bytes;
+    const next = std.math.add(usize, previous, added_bytes) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    try lease.resize(next);
+    return previous;
+}
+
+fn restoreRetainedLease(
+    lease: *graph_work_budget.RetainedLease,
+    previous: usize,
+) void {
+    lease.resize(previous) catch unreachable;
+}
+
+fn ensureBudgetedPathListCapacity(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(BudgetedGraphPath),
+    lease: *graph_work_budget.RetainedLease,
+    budget: *graph_pattern_mod.WorkBudget,
+) !void {
+    if (list.items.len < list.capacity) return;
+    const next_capacity = std.math.add(usize, list.items.len, 1) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const retained_bytes = std.math.mul(usize, next_capacity, @sizeOf(BudgetedGraphPath)) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const previous = lease.bytes;
+    try lease.resize(retained_bytes);
+    list.ensureTotalCapacityPrecise(alloc, next_capacity) catch |err| {
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+}
+
+fn insertGraphPathIdentity(
+    alloc: std.mem.Allocator,
+    set: *std.StringHashMapUnmanaged(void),
+    lease: *graph_work_budget.RetainedLease,
+    path: db_mod.types.GraphPath,
+    budget: *graph_pattern_mod.WorkBudget,
+) !bool {
+    const key_len = try graphPathIdentityEncodedLen(path);
+    const retained_bytes = std.math.add(
+        usize,
+        key_len,
+        @sizeOf([]const u8) + retained_hash_entry_overhead,
+    ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const previous = try growRetainedLease(lease, retained_bytes, budget);
+    const key = graphPathToKey(alloc, path) catch |err| {
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    if (set.contains(key)) {
+        alloc.free(key);
+        restoreRetainedLease(lease, previous);
+        return false;
+    }
+    set.put(alloc, key, {}) catch |err| {
+        alloc.free(key);
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    return true;
+}
+
+fn insertExcludedNodeIdentity(
+    alloc: std.mem.Allocator,
+    set: *graph_node_identity.Map(void),
+    lease: *graph_work_budget.RetainedLease,
+    budget: *graph_pattern_mod.WorkBudget,
+    identity: graph_node_identity.Ref,
+) !bool {
+    if (set.contains(identity)) return false;
+    var retained_bytes = std.math.add(
+        usize,
+        @sizeOf(graph_node_identity.Key) + retained_hash_entry_overhead,
+        identity.key.len,
+    ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    if (identity.table) |table| retained_bytes = std.math.add(usize, retained_bytes, table.len) catch
+        return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const previous = try growRetainedLease(lease, retained_bytes, budget);
+    const inserted = set.putIfAbsent(alloc, identity, {}) catch |err| {
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    if (!inserted) restoreRetainedLease(lease, previous);
+    return inserted;
+}
+
+fn insertExcludedEdgeIdentity(
+    alloc: std.mem.Allocator,
+    set: *std.StringHashMapUnmanaged(void),
+    lease: *graph_work_budget.RetainedLease,
+    budget: *graph_pattern_mod.WorkBudget,
+    table: []const u8,
+    src: []const u8,
+    tgt: []const u8,
+    edge_type: []const u8,
+) !bool {
+    const parts = [_][]const u8{ table, src, tgt, edge_type };
+    const key_len = try compositeIdentityEncodedLen(&parts);
+    const retained_bytes = std.math.add(
+        usize,
+        key_len,
+        @sizeOf([]const u8) + retained_hash_entry_overhead,
+    ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    const previous = try growRetainedLease(lease, retained_bytes, budget);
+    const key = compositeIdentityAlloc(alloc, &parts) catch |err| {
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    if (set.contains(key)) {
+        alloc.free(key);
+        restoreRetainedLease(lease, previous);
+        return false;
+    }
+    set.put(alloc, key, {}) catch |err| {
+        alloc.free(key);
+        restoreRetainedLease(lease, previous);
+        return err;
+    };
+    return true;
+}
+
+test "Yen scratch reservations fail before allocation and release exactly" {
+    const alloc = std.testing.allocator;
+    var path_nodes = [_][]const u8{ "a", "b" };
+    const path = db_mod.types.GraphPath{
+        .nodes = &path_nodes,
+        .edges = &.{},
+        .total_weight = 0,
+        .length = 1,
+    };
+
+    var budget = graph_pattern_mod.WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 1;
+    {
+        var paths_lease = try graph_work_budget.RetainedLease.init(&budget, 0);
+        defer paths_lease.deinit();
+        var paths = std.ArrayListUnmanaged(BudgetedGraphPath).empty;
+        defer paths.deinit(alloc);
+        try std.testing.expectError(
+            error.GraphWorkBudgetExceeded,
+            ensureBudgetedPathListCapacity(alloc, &paths, &paths_lease, &budget),
+        );
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+
+        var seen_lease = try graph_work_budget.RetainedLease.init(&budget, 0);
+        defer seen_lease.deinit();
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = seen.keyIterator();
+            while (it.next()) |key| alloc.free(key.*);
+            seen.deinit(alloc);
+        }
+        try std.testing.expectError(
+            error.GraphWorkBudgetExceeded,
+            insertGraphPathIdentity(alloc, &seen, &seen_lease, path, &budget),
+        );
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+        try std.testing.expectEqual(@as(usize, 0), seen.count());
+
+        budget.max_retained_state_bytes = graph_pattern_mod.default_max_retained_state_bytes;
+        try ensureBudgetedPathListCapacity(alloc, &paths, &paths_lease, &budget);
+        try std.testing.expect(paths_lease.bytes >= @sizeOf(BudgetedGraphPath));
+        try std.testing.expect(try insertGraphPathIdentity(alloc, &seen, &seen_lease, path, &budget));
+        const seen_bytes = budget.retained_state_bytes;
+        try std.testing.expect(seen_bytes > 0);
+        try std.testing.expect(!try insertGraphPathIdentity(alloc, &seen, &seen_lease, path, &budget));
+        try std.testing.expectEqual(seen_bytes, budget.retained_state_bytes);
+
+        var excluded_nodes_lease = try graph_work_budget.RetainedLease.init(&budget, 0);
+        defer excluded_nodes_lease.deinit();
+        var excluded_nodes = graph_node_identity.Map(void){};
+        defer excluded_nodes.deinit(alloc);
+        try std.testing.expect(try insertExcludedNodeIdentity(
+            alloc,
+            &excluded_nodes,
+            &excluded_nodes_lease,
+            &budget,
+            .{ .table = "docs", .key = "a" },
+        ));
+        const node_bytes = budget.retained_state_bytes;
+        try std.testing.expect(!try insertExcludedNodeIdentity(
+            alloc,
+            &excluded_nodes,
+            &excluded_nodes_lease,
+            &budget,
+            .{ .table = "docs", .key = "a" },
+        ));
+        try std.testing.expectEqual(node_bytes, budget.retained_state_bytes);
+
+        var excluded_edges_lease = try graph_work_budget.RetainedLease.init(&budget, 0);
+        defer excluded_edges_lease.deinit();
+        var excluded_edges = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = excluded_edges.keyIterator();
+            while (it.next()) |key| alloc.free(key.*);
+            excluded_edges.deinit(alloc);
+        }
+        try std.testing.expect(try insertExcludedEdgeIdentity(
+            alloc,
+            &excluded_edges,
+            &excluded_edges_lease,
+            &budget,
+            "docs",
+            "a",
+            "b",
+            "links",
+        ));
+        const edge_bytes = budget.retained_state_bytes;
+        try std.testing.expect(!try insertExcludedEdgeIdentity(
+            alloc,
+            &excluded_edges,
+            &excluded_edges_lease,
+            &budget,
+            "docs",
+            "a",
+            "b",
+            "links",
+        ));
+        try std.testing.expectEqual(edge_bytes, budget.retained_state_bytes);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
 
 fn findDistributedShortestPath(
     alloc: std.mem.Allocator,
@@ -3831,6 +4080,21 @@ fn findDistributedShortestPath(
             table_state.topology_epoch,
         )) orelse return error.TableNotFound;
         const frontier_ids = [_]u32{0};
+        // The caller-facing slices and GraphExpandRequest each own one copy of
+        // every exclusion. Reserve both peaks before the first allocation.
+        const exclusion_copy_bytes = excludedIdentityCopiesRetainedBytes(
+            excluded_nodes,
+            excluded_edges,
+            2,
+        ) catch return request_work_budget.exhaust(
+            .retained_state_bytes,
+            request_work_budget.max_retained_state_bytes,
+        );
+        var exclusion_copies_lease = try graph_work_budget.RetainedLease.init(
+            request_work_budget,
+            exclusion_copy_bytes,
+        );
+        defer exclusion_copies_lease.deinit();
         const exclude_node_refs = try collectExcludedNodes(alloc, excluded_nodes);
         defer {
             for (exclude_node_refs) |*identity| identity.deinit(alloc);
@@ -4103,6 +4367,40 @@ fn collectSeenNodes(
         i += 1;
     }
     return out;
+}
+
+fn excludedIdentityCopiesRetainedBytes(
+    excluded_nodes: ?*graph_node_identity.Map(void),
+    excluded_edges: ?*const std.StringHashMapUnmanaged(void),
+    copies: usize,
+) !usize {
+    var one_copy: usize = 0;
+    if (excluded_nodes) |set| {
+        one_copy = try std.math.add(
+            usize,
+            one_copy,
+            try std.math.mul(usize, set.count(), @sizeOf(GraphNodeIdentity)),
+        );
+        var node_it = set.iterator();
+        while (node_it.next()) |entry| {
+            one_copy = try std.math.add(usize, one_copy, entry.key_ptr.key().len);
+            if (entry.key_ptr.table()) |table| {
+                one_copy = try std.math.add(usize, one_copy, table.len);
+            }
+        }
+    }
+    if (excluded_edges) |set| {
+        one_copy = try std.math.add(
+            usize,
+            one_copy,
+            try std.math.mul(usize, set.count(), @sizeOf([]u8)),
+        );
+        var edge_it = set.keyIterator();
+        while (edge_it.next()) |key| {
+            one_copy = try std.math.add(usize, one_copy, key.*.len);
+        }
+    }
+    return try std.math.mul(usize, one_copy, copies);
 }
 
 fn collectExcludedNodes(
@@ -5288,7 +5586,7 @@ fn dupPathEdgesFromGraphPath(
     return out;
 }
 
-fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 {
+fn graphPathIdentityEncodedLen(path: db_mod.types.GraphPath) !usize {
     var total_len: usize = 0;
     for (path.nodes, 0..) |node, i| {
         const table = graphPathNodeTable(path, i);
@@ -5311,7 +5609,11 @@ fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 
                 return error.PathIdentityTooLarge;
         }
     }
+    return total_len;
+}
 
+fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 {
+    const total_len = try graphPathIdentityEncodedLen(path);
     const out = try alloc.alloc(u8, total_len);
     var pos: usize = 0;
     for (path.nodes, 0..) |node, i| {
@@ -5655,13 +5957,7 @@ fn compositeIdentityAlloc(
     alloc: std.mem.Allocator,
     parts: []const []const u8,
 ) ![]u8 {
-    var encoded_len: usize = 0;
-    for (parts) |part| {
-        encoded_len = std.math.add(usize, encoded_len, @sizeOf(u64)) catch
-            return error.GraphIdentityTooLarge;
-        encoded_len = std.math.add(usize, encoded_len, part.len) catch
-            return error.GraphIdentityTooLarge;
-    }
+    const encoded_len = try compositeIdentityEncodedLen(parts);
 
     const encoded = try alloc.alloc(u8, encoded_len);
     var cursor: usize = 0;
@@ -5672,6 +5968,17 @@ fn compositeIdentityAlloc(
         cursor += part.len;
     }
     return encoded;
+}
+
+fn compositeIdentityEncodedLen(parts: []const []const u8) !usize {
+    var encoded_len: usize = 0;
+    for (parts) |part| {
+        encoded_len = std.math.add(usize, encoded_len, @sizeOf(u64)) catch
+            return error.GraphIdentityTooLarge;
+        encoded_len = std.math.add(usize, encoded_len, part.len) catch
+            return error.GraphIdentityTooLarge;
+    }
+    return encoded_len;
 }
 
 test "distributed graph identities are length framed" {

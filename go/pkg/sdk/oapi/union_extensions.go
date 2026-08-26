@@ -15,9 +15,15 @@ package oapi
 
 import "encoding/json"
 
-// DecodeInto decodes the retained GraphQueryResult JSON directly into value.
+// DecodeInto decodes the retained GraphResult JSON directly into value.
 // It lets SDK adapters inspect a small discriminator probe without first
 // marshaling and copying a potentially large result payload.
+func (t GraphResult) DecodeInto(value any) error {
+	return json.Unmarshal(t.union, value)
+}
+
+// DecodeInto decodes a canonical GraphQueryResult without copying it through
+// an intermediate JSON map.
 func (t GraphQueryResult) DecodeInto(value any) error {
 	return json.Unmarshal(t.union, value)
 }

@@ -3415,6 +3415,7 @@ components:
       description: "A node in graph query results"
       required:
         - key
+        - depth
       properties:
         key:
           x-go-type-skip-optional-pointer: true
@@ -3431,13 +3432,7 @@ components:
           type: integer
           minimum: 0
           maximum: 64
-          description: "Distance from start node"
-        distance:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          minimum: 0
-          description: "Hop distance for traversal results, or the selected edge-weight cost for path results"
+          description: "Hop count from the start node"
         document:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -3679,13 +3674,20 @@ components:
           description: "Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field."
     GraphQueryResult:
       description: >-
-        A structurally distinct graph result. Canonical bindings, exact
-        aggregates, and node/path results cannot be confused with the
-        deprecated graph_searches envelope.
+        A canonical result produced by graph_queries. Bindings, exact
+        aggregates, and node/path results use required stable discriminators.
       oneOf:
         - $ref: '#/components/schemas/GraphBindingsResult'
         - $ref: '#/components/schemas/GraphAggregatesResult'
         - $ref: '#/components/schemas/GraphNodesResult'
+    GraphResult:
+      description: >-
+        Result value stored in QueryResult.graph_results. Canonical
+        graph_queries results are GraphQueryResult variants; the deprecated
+        legacy shape remains accepted only for graph_searches during its
+        compatibility window.
+      oneOf:
+        - $ref: '#/components/schemas/GraphQueryResult'
         - $ref: '#/components/schemas/LegacyGraphQueryResult'
     GraphBindingNode:
       type: object

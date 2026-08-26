@@ -29,7 +29,7 @@ import type {
   GraphPathEdge,
   GraphPathEndpoint,
   GraphQuery,
-  GraphQueryResult,
+  GraphResult,
   IndexStatus,
   LegacyGraphQueryResult,
   PathWeightMode,
@@ -46,7 +46,6 @@ type ExplorerNodeMeta = {
   key: string;
   table?: string;
   depth?: number;
-  distance?: number;
   document?: Record<string, unknown>;
   path?: GraphPathEndpoint[];
   resultCount?: number;
@@ -218,7 +217,7 @@ function addNode(
 }
 
 function graphVisualizationResult(
-  result: GraphQueryResult | null
+  result: GraphResult | null
 ): GraphVisualizationWireResult | null {
   if (!result) return null;
   if (result.kind === "nodes" || result.kind === "legacy" || result.kind === undefined)
@@ -226,7 +225,7 @@ function graphVisualizationResult(
   return null;
 }
 
-function buildGraph(result: GraphQueryResult | null, startKey: string): ExplorerGraph {
+function buildGraph(result: GraphResult | null, startKey: string): ExplorerGraph {
   const nodes = new Map<string, GraphNode<ExplorerNodeMeta>>();
   const edges = new Map<string, ExplorerEdge>();
 
@@ -248,7 +247,6 @@ function buildGraph(result: GraphQueryResult | null, startKey: string): Explorer
       }) ?? [];
     addNode(nodes, nodeIdentity, {
       depth: node.depth,
-      distance: node.distance,
       document: node.document as Record<string, unknown> | undefined,
       path: pathNodes,
       resultCount: 1,
@@ -320,7 +318,7 @@ function nodeTypeColors() {
   };
 }
 
-function resultSummary(result: GraphQueryResult | null) {
+function resultSummary(result: GraphResult | null) {
   if (!result) return { total: 0, paths: 0 };
   if (result.kind === undefined) {
     return {
@@ -367,7 +365,7 @@ export function GraphIndexExplorer({
   initialMode?: GraphMode;
   initialStartKey?: string;
   initialTargetKey?: string;
-  initialResult?: GraphQueryResult | null;
+  initialResult?: GraphResult | null;
 }) {
   const api = useApi();
   const graphIndexes = useMemo(() => graphIndexesOnly(indexes), [indexes]);
@@ -386,7 +384,7 @@ export function GraphIndexExplorer({
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingKeys, setIsLoadingKeys] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<GraphQueryResult | null>(initialResult);
+  const [result, setResult] = useState<GraphResult | null>(initialResult);
   const [sampleKeys, setSampleKeys] = useState<string[]>([]);
   const [selectedNode, setSelectedNode] = useState<GraphNode<ExplorerNodeMeta> | null>(null);
 
@@ -794,17 +792,9 @@ export function GraphIndexExplorer({
                   <div className="text-xs text-muted-foreground">Key</div>
                   <div className="break-all font-mono text-sm">{selectedNode.metadata?.key}</div>
                 </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <div className="text-xs text-muted-foreground">Depth</div>
-                    <div className="font-medium">{selectedNode.metadata?.depth ?? "-"}</div>
-                  </div>
-                  <div>
-                    <div className="text-xs text-muted-foreground">Distance</div>
-                    <div className="font-medium">
-                      {formatNumber(selectedNode.metadata?.distance)}
-                    </div>
-                  </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Depth</div>
+                  <div className="font-medium">{selectedNode.metadata?.depth ?? "-"}</div>
                 </div>
                 {selectedNode.metadata?.path && selectedNode.metadata.path.length > 0 && (
                   <div>

@@ -23,9 +23,8 @@ class GraphResultNode:
 
     Attributes:
         key (str): Document key
+        depth (int): Hop count from the start node
         table (str | Unset): Owning table for a cross-table node; omitted for nodes in the queried table
-        depth (int | Unset): Distance from start node
-        distance (float | Unset): Hop distance for traversal results, or the selected edge-weight cost for path results
         document (GraphResultNodeDocument | Unset): Full document (if include_documents=true)
         path (list[GraphPathEndpoint] | Unset): Exact ordered node identities in the path from the start node to this
             node
@@ -36,9 +35,8 @@ class GraphResultNode:
     """
 
     key: str
+    depth: int
     table: str | Unset = UNSET
-    depth: int | Unset = UNSET
-    distance: float | Unset = UNSET
     document: GraphResultNodeDocument | Unset = UNSET
     path: list[GraphPathEndpoint] | Unset = UNSET
     path_edges: list[GraphPathEdge] | Unset = UNSET
@@ -48,11 +46,9 @@ class GraphResultNode:
     def to_dict(self) -> dict[str, Any]:
         key = self.key
 
-        table = self.table
-
         depth = self.depth
 
-        distance = self.distance
+        table = self.table
 
         document: dict[str, Any] | Unset = UNSET
         if not isinstance(self.document, Unset):
@@ -85,14 +81,11 @@ class GraphResultNode:
         field_dict.update(
             {
                 "key": key,
+                "depth": depth,
             }
         )
         if table is not UNSET:
             field_dict["table"] = table
-        if depth is not UNSET:
-            field_dict["depth"] = depth
-        if distance is not UNSET:
-            field_dict["distance"] = distance
         if document is not UNSET:
             field_dict["document"] = document
         if path is not UNSET:
@@ -116,11 +109,9 @@ class GraphResultNode:
         d = dict(src_dict)
         key = d.pop("key")
 
+        depth = d.pop("depth")
+
         table = d.pop("table", UNSET)
-
-        depth = d.pop("depth", UNSET)
-
-        distance = d.pop("distance", UNSET)
 
         _document = d.pop("document", UNSET)
         document: GraphResultNodeDocument | Unset
@@ -158,9 +149,8 @@ class GraphResultNode:
 
         graph_result_node = cls(
             key=key,
-            table=table,
             depth=depth,
-            distance=distance,
+            table=table,
             document=document,
             path=path,
             path_edges=path_edges,

@@ -6083,12 +6083,7 @@ fn extractTreeHits(
                     null;
                 try hits.append(alloc, .{
                     ._id = node.key,
-                    ._score = if (node.depth) |depth|
-                        1.0 / (1.0 + @as(f32, @floatFromInt(depth)))
-                    else if (node.distance) |distance|
-                        @floatCast(distance)
-                    else
-                        1.0,
+                    ._score = 1.0 / (1.0 + @as(f32, @floatFromInt(node.depth))),
                     ._source = source,
                 });
             }
@@ -6180,8 +6175,8 @@ fn annotateTreeDocument(
     var tree_meta = std.json.ObjectMap.empty;
     errdefer tree_meta.deinit(alloc);
     try tree_meta.put(alloc, "search", .{ .string = try alloc.dupe(u8, search_name) });
-    const depth = node.depth orelse 0;
-    if (node.depth) |node_depth| try tree_meta.put(alloc, "depth", .{ .integer = @intCast(node_depth) });
+    const depth = node.depth;
+    try tree_meta.put(alloc, "depth", .{ .integer = @intCast(depth) });
     var has_path = false;
     if (bestTreePathPrefixForNode(graph_paths, node.key)) |path| {
         const branch = bestTreeBranchPathForNode(graph_paths, node.key) orelse &.{};

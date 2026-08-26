@@ -18173,7 +18173,7 @@ test "parseRemoteSearchResult preserves typed graph rows and hydrated documents"
 test "parseRemoteSearchResult preserves canonical graph path table identities" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}],"length":1,"weight_mode":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","depth":1,"path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}],"length":1,"weight_mode":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
@@ -18191,7 +18191,7 @@ test "parseRemoteSearchResult preserves canonical graph path table identities" {
 
 fn parseRemoteGraphResults(
     alloc: std.mem.Allocator,
-    value: std.json.ArrayHashMap(indexes_openapi.GraphQueryResult),
+    value: std.json.ArrayHashMap(indexes_openapi.GraphResult),
 ) ![]db_mod.types.GraphSearchResult {
     if (value.map.count() > graph_query_mod.max_named_queries)
         return error.InvalidRemoteResponse;
@@ -18489,10 +18489,9 @@ fn parseRemoteGraphNodeWithKey(
     item: indexes_openapi.GraphResultNode,
 ) !graph_query_mod.GraphResultNode {
     try validateRemoteCanonicalGraphIdentity(key, item.table);
-    const depth = std.math.cast(u32, item.depth orelse 0) orelse return error.InvalidRemoteResponse;
+    const depth = std.math.cast(u32, item.depth) orelse return error.InvalidRemoteResponse;
     if (depth > graph_pattern_mod.max_pattern_hops) return error.InvalidRemoteResponse;
-    const distance = item.distance orelse 0;
-    if (!std.math.isFinite(distance) or distance < 0) return error.InvalidRemoteResponse;
+    const distance: f64 = @floatFromInt(depth);
     if (item.path) |path| {
         try validateRemoteCanonicalGraphPathNodes(path);
     }
@@ -19116,7 +19115,7 @@ test "remote canonical graph result stats and aggregate exactness fail closed" {
         \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"counted":{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}},"took":0,"status":200,"table":"docs"}]}
     ));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a"},{"key":"extra"}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a","depth":0},{"key":"extra","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
     ));
 }
 

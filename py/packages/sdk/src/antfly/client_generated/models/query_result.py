@@ -31,7 +31,8 @@ class QueryResult:
             from the request.
             Contains computed metrics or buckets depending on the aggregation type.
         analyses (QueryResultAnalyses | Unset): Analysis results like PCA and t-SNE per index embeddings.
-        graph_results (QueryResultGraphResults | Unset): Results from declarative graph queries.
+        graph_results (QueryResultGraphResults | Unset): Results from canonical graph_queries or deprecated
+            graph_searches.
         profile (QueryProfile | Unset): Detailed execution profiling for a query. Present in the response
             when the request sets `profile: true`.
         error (str | Unset): Error message if the query failed.

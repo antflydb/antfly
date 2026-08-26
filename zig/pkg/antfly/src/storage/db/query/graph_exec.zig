@@ -2930,6 +2930,19 @@ pub fn compilePatternFilter(alloc: Allocator, filter_query: std.json.Value) anye
     );
 }
 
+/// Probe the stored-document compiler from an optional optimization path.
+/// Unsupported query families are a normal negative result here, while
+/// malformed supported predicates and allocation failures remain errors.
+pub fn tryCompilePatternFilter(
+    alloc: Allocator,
+    filter_query: std.json.Value,
+) anyerror!?CompiledPatternFilter {
+    return compilePatternFilter(alloc, filter_query) catch |err| switch (err) {
+        error.UnsupportedQueryRequest => null,
+        else => return err,
+    };
+}
+
 fn compilePatternFilterBounded(
     alloc: Allocator,
     filter_query: std.json.Value,

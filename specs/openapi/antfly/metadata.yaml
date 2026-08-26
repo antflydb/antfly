@@ -8367,8 +8367,8 @@ components:
         graph_results:
           type: object
           additionalProperties:
-            $ref: "indexes.yaml#/components/schemas/GraphQueryResult"
-          description: Results from declarative graph queries.
+            $ref: "indexes.yaml#/components/schemas/GraphResult"
+          description: Results from canonical graph_queries or deprecated graph_searches.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:

@@ -680,14 +680,37 @@ pub const TypeGenerator = struct {
 
     fn canGenerateStructuralUnion(self: *TypeGenerator, schema: types.Schema) !bool {
         for (schema.one_of) |member| {
-            const resolved = self.resolver.resolveSchema(member) catch return false;
-            if (resolved.primaryType()) |primary_type| {
-                if (!std.mem.eql(u8, primary_type, "object")) return false;
-            } else if (resolved.properties.count() == 0) {
-                return false;
-            }
+            if (!try self.canCollectStructuralVariants(member, 0)) return false;
         }
         return schema.one_of.len > 0;
+    }
+
+    /// A named oneOf is a transparent composition boundary for structural
+    /// unions. Flattening it preserves concrete leaf types instead of reducing
+    /// a perfectly typed nested union to std.json.Value. Only property-free
+    /// oneOf wrappers are transparent; schemas with their own object surface
+    /// remain ordinary variants.
+    fn canCollectStructuralVariants(
+        self: *TypeGenerator,
+        member: types.SchemaOrRef,
+        depth: usize,
+    ) !bool {
+        if (depth >= 32) return false;
+        const resolved = self.resolver.resolveSchema(member) catch return false;
+        if (isTransparentStructuralUnion(resolved)) {
+            for (resolved.one_of) |nested| {
+                if (!try self.canCollectStructuralVariants(nested, depth + 1)) return false;
+            }
+            return resolved.one_of.len > 0;
+        }
+        return try self.collectStructuralVariant(member) != null;
+    }
+
+    fn isTransparentStructuralUnion(schema: types.Schema) bool {
+        return schema.one_of.len > 0 and
+            schema.any_of.len == 0 and
+            schema.all_of.len == 0 and
+            schema.properties.count() == 0;
     }
 
     const StructuralVariant = struct {
@@ -751,6 +774,27 @@ pub const TypeGenerator = struct {
         };
     }
 
+    fn collectStructuralVariants(
+        self: *TypeGenerator,
+        member: types.SchemaOrRef,
+        variants: *std.ArrayListUnmanaged(StructuralVariant),
+        depth: usize,
+    ) !void {
+        if (depth >= 32) return error.InvalidOpenApiSchema;
+        const resolved = self.resolver.resolveSchema(member) catch return;
+        if (isTransparentStructuralUnion(resolved)) {
+            for (resolved.one_of) |nested| {
+                try self.collectStructuralVariants(nested, variants, depth + 1);
+            }
+            return;
+        }
+        const variant = try self.collectStructuralVariant(member) orelse return;
+        for (variants.items) |existing| {
+            if (std.mem.eql(u8, existing.ref_name, variant.ref_name)) return;
+        }
+        try variants.append(self.arena, variant);
+    }
+
     /// Infer a discriminator only when every structural variant declares the
     /// same singleton string-enum property with a unique value. One variant may
     /// omit that property; it becomes the compatibility fallback. This keeps
@@ -802,8 +846,7 @@ pub const TypeGenerator = struct {
 
         var variants = std.ArrayListUnmanaged(StructuralVariant).empty;
         for (schema.one_of) |member| {
-            const variant = try self.collectStructuralVariant(member) orelse continue;
-            try variants.append(self.arena, variant);
+            try self.collectStructuralVariants(member, &variants, 0);
         }
 
         // Sort: required singleton-enum selectors are strongest, followed by
@@ -1654,6 +1697,76 @@ test "undiscriminated recursive oneOf generates structural union" {
     try std.testing.expect(std.mem.indexOf(u8, output, "boolean_query: *BooleanQuery,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "pub fn jsonParse(allocator: std.mem.Allocator, source: anytype") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if (objectHasAnyKey(source.object, &.{") != null);
+}
+
+test "structural union flattens transparent nested oneOf refs" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var nodes_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try nodes_props.put(arena, "kind", .{ .schema = .{
+        .schema_type = .{ .single = "string" },
+        .enum_values = &.{"nodes"},
+    } });
+    var bindings_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try bindings_props.put(arena, "kind", .{ .schema = .{
+        .schema_type = .{ .single = "string" },
+        .enum_values = &.{"bindings"},
+    } });
+    var legacy_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try legacy_props.put(arena, "kind", .{ .schema = .{
+        .schema_type = .{ .single = "string" },
+        .enum_values = &.{"legacy"},
+    } });
+    try legacy_props.put(arena, "type", .{ .schema = .{ .schema_type = .{ .single = "string" } } });
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "Nodes", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = nodes_props,
+        .required = &.{"kind"},
+    } });
+    try schemas.put(arena, "Bindings", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = bindings_props,
+        .required = &.{"kind"},
+    } });
+    try schemas.put(arena, "Canonical", .{ .schema = .{
+        .one_of = &.{
+            .{ .ref = .{ .ref_string = "#/components/schemas/Nodes" } },
+            .{ .ref = .{ .ref_string = "#/components/schemas/Bindings" } },
+        },
+    } });
+    try schemas.put(arena, "Legacy", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = legacy_props,
+        .required = &.{"type"},
+    } });
+    try schemas.put(arena, "Result", .{ .schema = .{
+        .one_of = &.{
+            .{ .ref = .{ .ref_string = "#/components/schemas/Canonical" } },
+            .{ .ref = .{ .ref_string = "#/components/schemas/Legacy" } },
+        },
+    } });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+    const output = w.toSlice();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const Result = union(enum) {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "nodes: *Nodes,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "bindings: *Bindings,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "legacy: *Legacy,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const Result = std.json.Value;") == null);
 }
 
 test "structural union infers allocation-light enum selector with legacy fallback" {

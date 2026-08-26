@@ -2729,7 +2729,118 @@ pub const ContainerResource = struct {
 };
 
 /// Multi-modal input and output contents.
-pub const Content = std.json.Value;
+pub const Content = union(enum) {
+    input_file_content: *InputFileContent,
+    input_image_content: *InputImageContent,
+    output_text_content: *OutputTextContent,
+    input_text_content: *InputTextContent,
+    reasoning_text_content: *ReasoningTextContent,
+    refusal_content: *RefusalContent,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { type: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        switch (probe.type) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "input_file")) return .{ .input_file_content = try parseStructuralVariantFromSlice(InputFileContent, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "input_image")) return .{ .input_image_content = try parseStructuralVariantFromSlice(InputImageContent, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "output_text")) return .{ .output_text_content = try parseStructuralVariantFromSlice(OutputTextContent, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "input_text")) return .{ .input_text_content = try parseStructuralVariantFromSlice(InputTextContent, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "reasoning_text")) return .{ .reasoning_text_content = try parseStructuralVariantFromSlice(ReasoningTextContent, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "refusal")) return .{ .refusal_content = try parseStructuralVariantFromSlice(RefusalContent, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return error.MissingField;
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("type") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "input_file")) {
+            const parsed = try parseStructuralVariant(InputFileContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .input_file_content = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "input_image")) {
+            const parsed = try parseStructuralVariant(InputImageContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .input_image_content = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "output_text")) {
+            const parsed = try parseStructuralVariant(OutputTextContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .output_text_content = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "input_text")) {
+            const parsed = try parseStructuralVariant(InputTextContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .input_text_content = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "reasoning_text")) {
+            const parsed = try parseStructuralVariant(ReasoningTextContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .reasoning_text_content = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "refusal")) {
+            const parsed = try parseStructuralVariant(RefusalContent, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .refusal_content = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .input_file_content => |v| try jw.write(v.*),
+            .input_image_content => |v| try jw.write(v.*),
+            .output_text_content => |v| try jw.write(v.*),
+            .input_text_content => |v| try jw.write(v.*),
+            .reasoning_text_content => |v| try jw.write(v.*),
+            .refusal_content => |v| try jw.write(v.*),
+        }
+    }
+};
 
 pub const ContextManagementParam = struct {
     /// The context management entry type. Currently only 'compaction' is supported.
@@ -3297,84 +3408,7 @@ pub const CreateEvalCustomDataSourceConfig = struct {
 };
 
 /// A chat message that makes up the prompt or context. May include variable references to the `item` namespace, ie {{item.name}}.
-pub const CreateEvalItem = union(enum) {
-    eval_item: *EvalItem,
-
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
-        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const DiscriminatorProbe = union(enum) {
-            missing,
-            value: []const u8,
-            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
-                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
-            }
-        };
-        const Probe = struct { type: DiscriminatorProbe = .missing };
-        var probe_options = options;
-        probe_options.ignore_unknown_fields = true;
-        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        switch (probe.type) {
-            .value => |disc_str| {
-                if (std.mem.eql(u8, disc_str, "message")) return .{ .eval_item = try parseStructuralVariantFromSlice(EvalItem, allocator, input, options) };
-                return error.UnexpectedToken;
-            },
-            .missing => {
-                return .{ .eval_item = try parseStructuralVariantFromSlice(EvalItem, allocator, input, options) };
-            },
-        }
-    }
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("type") orelse {
-            const parsed = try parseStructuralVariant(EvalItem, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .eval_item = parsed };
-        };
-        const disc_str = switch (disc_val) {
-            .string => |value| value,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "message")) {
-            const parsed = try parseStructuralVariant(EvalItem, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .eval_item = parsed };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .eval_item => |v| try jw.write(v.*),
-        }
-    }
-};
+pub const CreateEvalItem = std.json.Value;
 
 /// A JsonlRunDataSource object with that specifies a JSONL file that matches the eval
 pub const CreateEvalJsonlRunDataSource = struct {
@@ -7754,31 +7788,7 @@ pub const MessageStatus = enum {
     }
 };
 
-pub const MessageStreamEvent = union(enum) {
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(_: @This(), _: anytype) !void {}
-};
+pub const MessageStreamEvent = std.json.Value;
 
 pub const Metadata = std.json.Value;
 
@@ -11938,57 +11948,9 @@ pub const RunStepObject = struct {
     usage: RunStepCompletionUsage,
 };
 
-pub const RunStepStreamEvent = union(enum) {
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
+pub const RunStepStreamEvent = std.json.Value;
 
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(_: @This(), _: anytype) !void {}
-};
-
-pub const RunStreamEvent = union(enum) {
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(_: @This(), _: anytype) !void {}
-};
+pub const RunStreamEvent = std.json.Value;
 
 /// Tool call objects
 pub const RunToolCallObject = struct {
@@ -12535,31 +12497,7 @@ pub const ThreadResource = struct {
     user: []const u8,
 };
 
-pub const ThreadStreamEvent = union(enum) {
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(_: @This(), _: anytype) !void {}
-};
+pub const ThreadStreamEvent = std.json.Value;
 
 pub const ToggleCertificatesRequest = struct {
     certificate_ids: []const []const u8,

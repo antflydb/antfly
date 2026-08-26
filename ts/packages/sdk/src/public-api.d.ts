@@ -7678,9 +7678,9 @@ export interface components {
             analyses?: {
                 [key: string]: components["schemas"]["AnalysesResult"];
             };
-            /** @description Results from declarative graph queries. */
+            /** @description Results from canonical graph_queries or deprecated graph_searches. */
             graph_results?: {
-                [key: string]: components["schemas"]["GraphQueryResult"];
+                [key: string]: components["schemas"]["GraphResult"];
             };
             /** @description Detailed execution profile (present when `profile: true` in request). */
             profile?: components["schemas"]["QueryProfile"];
@@ -12480,13 +12480,8 @@ export interface components {
             key: string;
             /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
             table?: string;
-            /** @description Distance from start node */
-            depth?: number;
-            /**
-             * Format: double
-             * @description Hop distance for traversal results, or the selected edge-weight cost for path results
-             */
-            distance?: number;
+            /** @description Hop count from the start node */
+            depth: number;
             /** @description Full document (if include_documents=true) */
             document?: {
                 [key: string]: unknown;
@@ -12534,6 +12529,8 @@ export interface components {
             paths: components["schemas"]["GraphPath"][];
             stats: components["schemas"]["GraphQueryStats"];
         };
+        /** @description A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators. */
+        GraphQueryResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"];
         /**
          * @deprecated
          * @description Deprecated graph_searches node response with an unqualified string path.
@@ -12610,8 +12607,8 @@ export interface components {
              */
             took?: number;
         };
-        /** @description A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path results cannot be confused with the deprecated graph_searches envelope. */
-        GraphQueryResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"] | components["schemas"]["LegacyGraphQueryResult"];
+        /** @description Result value stored in QueryResult.graph_results. Canonical graph_queries results are GraphQueryResult variants; the deprecated legacy shape remains accepted only for graph_searches during its compatibility window. */
+        GraphResult: components["schemas"]["GraphQueryResult"] | components["schemas"]["LegacyGraphQueryResult"];
         /**
          * @description Standalone evaluation request for POST /eval endpoint.
          *     Useful for testing evaluators without running a query.

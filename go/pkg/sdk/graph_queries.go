@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
 )
 
@@ -117,37 +118,15 @@ func validateGraphQuery(query GraphQuery) error {
 // locally because evaluating them against stored JSON would change both their
 // semantics and cost model.
 func NewGraphDocumentFilter(filter querydsl.Query) (GraphDocumentFilter, error) {
-	encoded, err := json.Marshal(filter)
-	if err != nil {
-		return GraphDocumentFilter{}, err
-	}
-	if err := validateGraphDocumentFilterJSON(encoded); err != nil {
-		return GraphDocumentFilter{}, err
-	}
-	var decoded any
-	if err := json.Unmarshal(encoded, &decoded); err != nil {
-		return GraphDocumentFilter{}, err
-	}
-	decoded, err = normalizeGraphDocumentFilter(decoded)
-	if err != nil {
-		return GraphDocumentFilter{}, err
-	}
-	encoded, err = json.Marshal(decoded)
-	if err != nil {
-		return GraphDocumentFilter{}, err
-	}
-	var result GraphDocumentFilter
-	if err := json.Unmarshal(encoded, &result); err != nil {
-		return GraphDocumentFilter{}, err
-	}
-	return result, nil
+	visited := 0
+	return convertGraphDocumentFilter(filter, 0, &visited)
 }
 
-// DecodeGraphQueryResult returns the concrete result selected by its stable
-// discriminator. During the v0.2 compatibility window, a response without a
-// discriminator is decoded as the only structural variant that permits one to
-// be absent: LegacyGraphQueryResult.
-func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
+// DecodeGraphResult returns the concrete response result selected by its
+// stable discriminator. During the v0.2 compatibility window, a response
+// without a discriminator is decoded as the only structural variant that
+// permits one to be absent: LegacyGraphQueryResult.
+func DecodeGraphResult(result GraphResult) (any, error) {
 	// Probe only the small control fields. Decoding into a RawMessage map would
 	// copy every top-level value, including result rows, paths, and hydrated
 	// documents, before the selected variant decodes the payload a second time.
@@ -162,11 +141,23 @@ func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
 		}
 		switch *kind {
 		case string(GraphBindingsResultKindBindings):
-			return result.AsGraphBindingsResult()
+			var value GraphBindingsResult
+			if err := result.DecodeInto(&value); err != nil {
+				return nil, err
+			}
+			return value, nil
 		case string(GraphAggregatesResultKindAggregates):
-			return result.AsGraphAggregatesResult()
+			var value GraphAggregatesResult
+			if err := result.DecodeInto(&value); err != nil {
+				return nil, err
+			}
+			return value, nil
 		case string(GraphNodesResultKindNodes):
-			return result.AsGraphNodesResult()
+			var value GraphNodesResult
+			if err := result.DecodeInto(&value); err != nil {
+				return nil, err
+			}
+			return value, nil
 		case string(LegacyGraphQueryResultKindLegacy):
 			return decodeLegacyGraphQueryResult(result, envelope)
 		default:
@@ -176,13 +167,39 @@ func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
 	return decodeLegacyGraphQueryResult(result, envelope)
 }
 
+// DecodeGraphQueryResult decodes a canonical graph_queries result. Legacy
+// compatibility is intentionally absent from this API.
+func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
+	var envelope graphQueryResultEnvelope
+	if err := result.DecodeInto(&envelope); err != nil {
+		return nil, err
+	}
+	if envelope.Kind == nil {
+		return nil, fmt.Errorf("antfly: canonical graph result requires a discriminator")
+	}
+	var kind *string
+	if err := json.Unmarshal(envelope.Kind, &kind); err != nil || kind == nil {
+		return nil, fmt.Errorf("antfly: graph result has an invalid discriminator")
+	}
+	switch *kind {
+	case string(GraphBindingsResultKindBindings):
+		return result.AsGraphBindingsResult()
+	case string(GraphAggregatesResultKindAggregates):
+		return result.AsGraphAggregatesResult()
+	case string(GraphNodesResultKindNodes):
+		return result.AsGraphNodesResult()
+	default:
+		return nil, fmt.Errorf("antfly: unknown canonical graph result discriminator %q", *kind)
+	}
+}
+
 type graphQueryResultEnvelope struct {
 	Kind  json.RawMessage `json:"kind"`
 	Type  json.RawMessage `json:"type"`
 	Total json.RawMessage `json:"total"`
 }
 
-func decodeLegacyGraphQueryResult(result GraphQueryResult, envelope graphQueryResultEnvelope) (LegacyGraphQueryResult, error) {
+func decodeLegacyGraphQueryResult(result GraphResult, envelope graphQueryResultEnvelope) (LegacyGraphQueryResult, error) {
 	if envelope.Type == nil || envelope.Total == nil {
 		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: legacy graph result requires type and total")
 	}
@@ -213,89 +230,378 @@ func decodeLegacyGraphQueryResult(result GraphQueryResult, envelope graphQueryRe
 	return legacy, nil
 }
 
-// Range query variants share the same flat full-text shape, which makes an
-// OpenAPI oneOf impossible to discriminate reliably. Graph filters use
-// explicit numeric_range and term_range operator wrappers on the wire and
-// canonical JSON Pointers rather than full-text field names.
-func normalizeGraphDocumentFilter(value any) (any, error) {
-	switch current := value.(type) {
-	case map[string]any:
-		if fieldValue, ok := current["field"]; ok {
-			if _, hasPath := current["path"]; hasPath {
-				return nil, fmt.Errorf("antfly: graph document filter cannot contain both field and path")
-			}
-			field, ok := fieldValue.(string)
-			if !ok {
-				return nil, fmt.Errorf("antfly: graph document filter field must be a string")
-			}
-			path, err := graphDocumentPathFromQueryField(field)
-			if err != nil {
-				return nil, err
-			}
-			delete(current, "field")
-			current["path"] = path
-		}
-		if pathValue, ok := current["path"]; ok {
-			path, ok := pathValue.(string)
-			if !ok || !validGraphDocumentJSONPointer(path) {
-				return nil, fmt.Errorf("antfly: graph document filter path must be an RFC 6901 JSON Pointer")
-			}
-		}
-
-		_, isNumericRange := current["numeric_range"]
-		_, isTermRange := current["term_range"]
-		_, hasPath := current["path"]
-		min, hasMin := current["min"]
-		max, hasMax := current["max"]
-		if !isNumericRange && !isTermRange && hasPath && (hasMin || hasMax) {
-			kind := ""
-			for _, bound := range []struct {
-				value any
-				set   bool
-			}{{min, hasMin}, {max, hasMax}} {
-				if !bound.set {
-					continue
-				}
-				switch bound.value.(type) {
-				case string:
-					if kind == "numeric_range" {
-						return nil, fmt.Errorf("antfly: graph range bounds must have one scalar type")
-					}
-					kind = "term_range"
-				case float64:
-					if kind == "term_range" {
-						return nil, fmt.Errorf("antfly: graph range bounds must have one scalar type")
-					}
-					kind = "numeric_range"
-				default:
-					return nil, fmt.Errorf("antfly: graph range bounds must be strings or numbers")
-				}
-			}
-			if kind == "" {
-				return nil, fmt.Errorf("antfly: graph range requires min or max")
-			}
-			return map[string]any{kind: current}, nil
-		}
-		for key, child := range current {
-			normalized, err := normalizeGraphDocumentFilter(child)
-			if err != nil {
-				return nil, err
-			}
-			current[key] = normalized
-		}
-		return current, nil
-	case []any:
-		for i, child := range current {
-			normalized, err := normalizeGraphDocumentFilter(child)
-			if err != nil {
-				return nil, err
-			}
-			current[i] = normalized
-		}
-		return current, nil
-	default:
-		return value, nil
+// convertGraphDocumentFilter is a closed-world adapter. It classifies only the
+// explicitly supported query variants, converts them to graph-specific wire
+// types, and recursively rejects every scoring or index-only option. This
+// keeps future additions to the full-text DSL from silently changing graph
+// semantics.
+func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) (GraphDocumentFilter, error) {
+	(*visited)++
+	if depth > 64 || *visited > 16_384 {
+		return GraphDocumentFilter{}, fmt.Errorf("antfly: graph document filter exceeds the query complexity budget")
 	}
+	encoded, err := json.Marshal(filter)
+	if err != nil {
+		return GraphDocumentFilter{}, err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &members); err != nil || len(members) == 0 {
+		return GraphDocumentFilter{}, fmt.Errorf("antfly: graph document filter must be a query object")
+	}
+
+	switch {
+	case graphQueryMemberPresent(members, "term"):
+		if graphQueryMemberPresent(members, "fuzziness") {
+			if err := requireGraphQueryMembers(members, "term", "field", "fuzziness", "prefix_length"); err != nil {
+				return GraphDocumentFilter{}, err
+			}
+			value, err := filter.AsFuzzyQuery()
+			if err != nil {
+				return GraphDocumentFilter{}, err
+			}
+			path, err := graphDocumentPathFromQueryField(value.Field)
+			if err != nil {
+				return GraphDocumentFilter{}, err
+			}
+			fuzziness, err := graphDocumentFuzziness(value.Fuzziness)
+			if err != nil {
+				return GraphDocumentFilter{}, err
+			}
+			var out GraphDocumentFilter
+			err = out.FromGraphDocumentFuzzyFilter(oapi.GraphDocumentFuzzyFilter{
+				Term: value.Term, Path: path, Fuzziness: fuzziness, PrefixLength: value.PrefixLength,
+			})
+			return out, err
+		}
+		if err := requireGraphQueryMembers(members, "term", "field"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsTermQuery()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		path, err := graphDocumentPathFromQueryField(value.Field)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentTermFilter(oapi.GraphDocumentTermFilter{Term: value.Term, Path: path})
+		return out, err
+	case graphQueryMemberPresent(members, "prefix"):
+		if err := requireGraphQueryMembers(members, "prefix", "field"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsPrefixQuery()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		path, err := graphDocumentPathFromQueryField(value.Field)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentPrefixFilter(oapi.GraphDocumentPrefixFilter{Prefix: value.Prefix, Path: path})
+		return out, err
+	case graphQueryMemberPresent(members, "regexp"):
+		if err := requireGraphQueryMembers(members, "regexp", "field"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsRegexpQuery()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		path, err := graphDocumentPathFromQueryField(value.Field)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentRegexpFilter(oapi.GraphDocumentRegexpFilter{Regexp: value.Regexp, Path: path})
+		return out, err
+	case graphQueryMemberPresent(members, "wildcard"):
+		if err := requireGraphQueryMembers(members, "wildcard", "field"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsWildcardQuery()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		path, err := graphDocumentPathFromQueryField(value.Field)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentWildcardFilter(oapi.GraphDocumentWildcardFilter{Wildcard: value.Wildcard, Path: path})
+		return out, err
+	case graphQueryMemberPresent(members, "min") || graphQueryMemberPresent(members, "max"):
+		return convertGraphRangeFilter(filter, members)
+	case graphQueryMemberPresent(members, "start") || graphQueryMemberPresent(members, "end"):
+		if err := requireGraphQueryMembers(members, "start", "end", "inclusive_start", "inclusive_end", "field"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsDateRangeStringQuery()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		if value.Start == nil && value.End == nil {
+			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph date range requires start or end")
+		}
+		path, err := graphDocumentPathFromQueryField(value.Field)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentDateRangeFilter(oapi.GraphDocumentDateRangeFilter{
+			Start: value.Start, End: value.End, InclusiveStart: value.InclusiveStart,
+			InclusiveEnd: value.InclusiveEnd, Path: path,
+		})
+		return out, err
+	case graphQueryMemberPresent(members, "ids"):
+		if err := requireGraphQueryMembers(members, "ids"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsDocIdQuery()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		if len(value.Ids) == 0 || len(value.Ids) > 10_000 {
+			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph ids must contain between 1 and 10000 values")
+		}
+		if err := validateNonEmptyUnique("graph id", value.Ids); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentIdsFilter(oapi.GraphDocumentIdsFilter{Ids: value.Ids})
+		return out, err
+	case graphQueryMemberPresent(members, "bool"):
+		if err := requireGraphQueryMembers(members, "bool", "field"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsBoolFieldQuery()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		path, err := graphDocumentPathFromQueryField(value.Field)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentBoolFieldFilter(oapi.GraphDocumentBoolFieldFilter{Bool: value.Bool, Path: path})
+		return out, err
+	case graphQueryMemberPresent(members, "match_all"):
+		if err := requireGraphQueryMembers(members, "match_all"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsMatchAllQuery()
+		if err != nil || len(value.MatchAll) != 0 {
+			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph match_all body must be empty")
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentMatchAllFilter(oapi.GraphDocumentMatchAllFilter{MatchAll: value.MatchAll})
+		return out, err
+	case graphQueryMemberPresent(members, "match_none"):
+		if err := requireGraphQueryMembers(members, "match_none"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsMatchNoneQuery()
+		if err != nil || len(value.MatchNone) != 0 {
+			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph match_none body must be empty")
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentMatchNoneFilter(oapi.GraphDocumentMatchNoneFilter{MatchNone: value.MatchNone})
+		return out, err
+	case graphQueryMemberPresent(members, "conjuncts"):
+		if err := requireGraphQueryMembers(members, "conjuncts"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsConjunctionQuery()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		items, err := convertGraphFilterItems(value.Conjuncts, depth, visited)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentFilterConjunction(oapi.GraphDocumentFilterConjunction{Conjuncts: items})
+		return out, err
+	case graphQueryMemberPresent(members, "disjuncts"):
+		if err := requireGraphQueryMembers(members, "disjuncts", "min"); err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		value, err := filter.AsDisjunctionQuery()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		items, err := convertGraphFilterItems(value.Disjuncts, depth, visited)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		if value.Min != nil && *value.Min > uint32(len(items)) {
+			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph disjunction min exceeds its number of clauses")
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentFilterDisjunction(oapi.GraphDocumentFilterDisjunction{Disjuncts: items, Min: value.Min})
+		return out, err
+	case graphQueryMemberPresent(members, "must") || graphQueryMemberPresent(members, "should") ||
+		graphQueryMemberPresent(members, "must_not") || graphQueryMemberPresent(members, "filter"):
+		return convertGraphBooleanFilter(members, depth, visited)
+	default:
+		return GraphDocumentFilter{}, fmt.Errorf("antfly: query variant is not supported by graph document filters")
+	}
+}
+
+func graphQueryMemberPresent(members map[string]json.RawMessage, name string) bool {
+	raw, ok := members[name]
+	return ok && string(raw) != "null"
+}
+
+func requireGraphQueryMembers(members map[string]json.RawMessage, allowed ...string) error {
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, name := range allowed {
+		allowedSet[name] = struct{}{}
+	}
+	for name := range members {
+		if _, ok := allowedSet[name]; !ok {
+			return fmt.Errorf("antfly: graph document filters do not support query option %q", name)
+		}
+	}
+	return nil
+}
+
+func graphDocumentFuzziness(value querydsl.Fuzziness) (oapi.Fuzziness, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return oapi.Fuzziness{}, err
+	}
+	var out oapi.Fuzziness
+	if err := json.Unmarshal(encoded, &out); err != nil {
+		return oapi.Fuzziness{}, err
+	}
+	return out, nil
+}
+
+func convertGraphRangeFilter(filter querydsl.Query, members map[string]json.RawMessage) (GraphDocumentFilter, error) {
+	if err := requireGraphQueryMembers(members, "min", "max", "inclusive_min", "inclusive_max", "field"); err != nil {
+		return GraphDocumentFilter{}, err
+	}
+	bound := members["min"]
+	if !graphQueryMemberPresent(members, "min") {
+		bound = members["max"]
+	}
+	if len(bound) == 0 {
+		return GraphDocumentFilter{}, fmt.Errorf("antfly: graph range requires min or max")
+	}
+	if bound[0] == '"' {
+		value, err := filter.AsTermRangeQuery()
+		if err != nil || value.Min == nil && value.Max == nil {
+			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph term range requires min or max")
+		}
+		path, err := graphDocumentPathFromQueryField(value.Field)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		var out GraphDocumentFilter
+		err = out.FromGraphDocumentTermRangeFilter(oapi.GraphDocumentTermRangeFilter{TermRange: oapi.GraphDocumentTermRangeBody{
+			Min: value.Min, Max: value.Max, InclusiveMin: value.InclusiveMin,
+			InclusiveMax: value.InclusiveMax, Path: path,
+		}})
+		return out, err
+	}
+	value, err := filter.AsNumericRangeQuery()
+	if err != nil || value.Min == nil && value.Max == nil {
+		return GraphDocumentFilter{}, fmt.Errorf("antfly: graph numeric range requires min or max")
+	}
+	path, err := graphDocumentPathFromQueryField(value.Field)
+	if err != nil {
+		return GraphDocumentFilter{}, err
+	}
+	var out GraphDocumentFilter
+	err = out.FromGraphDocumentNumericRangeFilter(oapi.GraphDocumentNumericRangeFilter{NumericRange: oapi.GraphDocumentNumericRangeBody{
+		Min: value.Min, Max: value.Max, InclusiveMin: value.InclusiveMin,
+		InclusiveMax: value.InclusiveMax, Path: path,
+	}})
+	return out, err
+}
+
+func convertGraphFilterItems(items []querydsl.Query, depth int, visited *int) ([]GraphDocumentFilter, error) {
+	if len(items) == 0 || len(items) > 64 {
+		return nil, fmt.Errorf("antfly: graph filter clause arrays must contain between 1 and 64 entries")
+	}
+	out := make([]GraphDocumentFilter, len(items))
+	for i, item := range items {
+		converted, err := convertGraphDocumentFilter(item, depth+1, visited)
+		if err != nil {
+			return nil, fmt.Errorf("antfly: graph filter clause %d: %w", i, err)
+		}
+		out[i] = converted
+	}
+	return out, nil
+}
+
+func graphQueryFromRaw(raw json.RawMessage) (querydsl.Query, error) {
+	var query querydsl.Query
+	if err := json.Unmarshal(raw, &query); err != nil {
+		return querydsl.Query{}, err
+	}
+	return query, nil
+}
+
+func convertGraphBooleanFilter(members map[string]json.RawMessage, depth int, visited *int) (GraphDocumentFilter, error) {
+	if err := requireGraphQueryMembers(members, "must", "should", "must_not", "filter"); err != nil {
+		return GraphDocumentFilter{}, err
+	}
+	var body oapi.GraphDocumentFilterBoolean
+	if raw, ok := members["filter"]; ok && string(raw) != "null" {
+		query, err := graphQueryFromRaw(raw)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		body.Filter, err = convertGraphDocumentFilter(query, depth+1, visited)
+		if err != nil {
+			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph bool filter: %w", err)
+		}
+	}
+	for _, clause := range []struct {
+		name        string
+		destination *oapi.GraphDocumentFilterDisjunction
+	}{
+		{name: "should", destination: &body.Should},
+		{name: "must_not", destination: &body.MustNot},
+	} {
+		raw, ok := members[clause.name]
+		if !ok || string(raw) == "null" {
+			continue
+		}
+		query, err := graphQueryFromRaw(raw)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		converted, err := convertGraphDocumentFilter(query, depth+1, visited)
+		if err != nil {
+			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph bool %s: %w", clause.name, err)
+		}
+		*clause.destination, err = converted.AsGraphDocumentFilterDisjunction()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+	}
+	if raw, ok := members["must"]; ok && string(raw) != "null" {
+		query, err := graphQueryFromRaw(raw)
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+		converted, err := convertGraphDocumentFilter(query, depth+1, visited)
+		if err != nil {
+			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph bool must: %w", err)
+		}
+		body.Must, err = converted.AsGraphDocumentFilterConjunction()
+		if err != nil {
+			return GraphDocumentFilter{}, err
+		}
+	}
+	var out GraphDocumentFilter
+	err := out.FromGraphDocumentFilterBoolean(body)
+	return out, err
 }
 
 func graphDocumentPathFromQueryField(field string) (string, error) {
@@ -332,65 +638,6 @@ func validGraphDocumentJSONPointer(path string) bool {
 		i++
 	}
 	return true
-}
-
-func validateGraphDocumentFilterJSON(encoded []byte) error {
-	var value any
-	if err := json.Unmarshal(encoded, &value); err != nil {
-		return err
-	}
-	type entry struct {
-		value any
-		depth int
-	}
-	pending := []entry{{value: value}}
-	visited := 0
-	unsupported := map[string]struct{}{
-		"match": {}, "multi_match": {}, "match_phrase": {}, "terms": {},
-		"query": {}, "polygon_points": {}, "location": {}, "geometry": {}, "cidr": {},
-		"min_lat": {}, "min_lon": {}, "max_lat": {}, "max_lon": {},
-		"boost": {},
-	}
-	for len(pending) > 0 {
-		item := pending[len(pending)-1]
-		pending = pending[:len(pending)-1]
-		visited++
-		if item.depth > 64 || visited > 16_384 {
-			return fmt.Errorf("antfly: graph document filter exceeds the query complexity budget")
-		}
-		switch current := item.value.(type) {
-		case map[string]any:
-			_, hasField := current["field"]
-			hasScalarOperator := false
-			for _, key := range []string{"term", "prefix", "regexp", "wildcard", "bool"} {
-				if _, ok := current[key]; ok {
-					hasScalarOperator = true
-					break
-				}
-			}
-			if hasScalarOperator && !hasField {
-				return fmt.Errorf("antfly: graph document scalar filters require a field")
-			}
-			_, hasMin := current["min"]
-			_, hasMax := current["max"]
-			_, hasStart := current["start"]
-			_, hasEnd := current["end"]
-			if hasField && !hasScalarOperator && !hasMin && !hasMax && !hasStart && !hasEnd {
-				return fmt.Errorf("antfly: graph document range filters require a bound")
-			}
-			for key, child := range current {
-				if _, blocked := unsupported[key]; blocked {
-					return fmt.Errorf("antfly: graph document filters do not support analyzer-backed or index-only clause %q", key)
-				}
-				pending = append(pending, entry{value: child, depth: item.depth + 1})
-			}
-		case []any:
-			for _, child := range current {
-				pending = append(pending, entry{value: child, depth: item.depth + 1})
-			}
-		}
-	}
-	return nil
 }
 
 // NewGraphMatchQuery wraps a MATCH query in the canonical GraphQuery union.

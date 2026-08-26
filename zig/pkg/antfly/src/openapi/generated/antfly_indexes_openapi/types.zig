@@ -2076,8 +2076,165 @@ pub const GraphQueryParams = struct {
     algorithm_params: ?std.json.Value = null,
 };
 
-/// A structurally distinct graph result. Canonical bindings, exact aggregates, and node/path results cannot be confused with the deprecated graph_searches envelope.
+/// A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators.
 pub const GraphQueryResult = union(enum) {
+    graph_nodes_result: *GraphNodesResult,
+    graph_aggregates_result: *GraphAggregatesResult,
+    graph_bindings_result: *GraphBindingsResult,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { kind: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        switch (probe.kind) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return error.MissingField;
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("kind") orelse {
+            return error.MissingField;
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "nodes")) {
+            const parsed = try parseStructuralVariant(GraphNodesResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_nodes_result = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "aggregates")) {
+            const parsed = try parseStructuralVariant(GraphAggregatesResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_aggregates_result = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "bindings")) {
+            const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_bindings_result = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .graph_nodes_result => |v| try jw.write(v.*),
+            .graph_aggregates_result => |v| try jw.write(v.*),
+            .graph_bindings_result => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const GraphQueryStats = struct {
+    /// Number of primary result items returned (nodes, paths, rows, or aggregates).
+    returned_items: i64,
+    /// True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
+    truncated: bool,
+};
+
+/// Deprecated discriminator used by LegacyGraphQuery.
+pub const GraphQueryType = enum {
+    traverse,
+    neighbors,
+    shortest_path,
+    k_shortest_paths,
+    pattern,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .traverse => "traverse",
+            .neighbors => "neighbors",
+            .shortest_path => "shortest_path",
+            .k_shortest_paths => "k_shortest_paths",
+            .pattern => "pattern",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "traverse", .traverse },
+            .{ "neighbors", .neighbors },
+            .{ "shortest_path", .shortest_path },
+            .{ "k_shortest_paths", .k_shortest_paths },
+            .{ "pattern", .pattern },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Versioned entity resolver attached to an artifact-backed graph index.
+pub const GraphResolverConfig = struct {
+    name: []const u8,
+    table: []const u8,
+    source_artifact: []const u8,
+    source_artifact_kind: ?[]const u8 = null,
+    resolution_artifact: []const u8,
+    key_template: []const u8,
+    type_must_match: ?bool = null,
+    scorer_json: ?[]const u8 = null,
+    candidate_search: ?[]const u8 = null,
+    candidate_ann_index: ?[]const u8 = null,
+    candidate_limit: ?i64 = null,
+    name_embedding: ?[]const u8 = null,
+    name_embedding_dims: ?i64 = null,
+    fusion_combine: ?[]const u8 = null,
+    fusion_trust: ?f64 = null,
+    fusion_prior: ?f64 = null,
+    fusion_prior_weight: ?f64 = null,
+    config_generation: ?i64 = null,
+};
+
+/// Result value stored in QueryResult.graph_results. Canonical graph_queries results are GraphQueryResult variants; the deprecated legacy shape remains accepted only for graph_searches during its compatibility window.
+pub const GraphResult = union(enum) {
     graph_nodes_result: *GraphNodesResult,
     graph_aggregates_result: *GraphAggregatesResult,
     graph_bindings_result: *GraphBindingsResult,
@@ -2177,70 +2334,6 @@ pub const GraphQueryResult = union(enum) {
     }
 };
 
-pub const GraphQueryStats = struct {
-    /// Number of primary result items returned (nodes, paths, rows, or aggregates).
-    returned_items: i64,
-    /// True when execution stopped before exhaustive enumeration; an unbounded result reference rejects truncated input.
-    truncated: bool,
-};
-
-/// Deprecated discriminator used by LegacyGraphQuery.
-pub const GraphQueryType = enum {
-    traverse,
-    neighbors,
-    shortest_path,
-    k_shortest_paths,
-    pattern,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .traverse => "traverse",
-            .neighbors => "neighbors",
-            .shortest_path => "shortest_path",
-            .k_shortest_paths => "k_shortest_paths",
-            .pattern => "pattern",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "traverse", .traverse },
-            .{ "neighbors", .neighbors },
-            .{ "shortest_path", .shortest_path },
-            .{ "k_shortest_paths", .k_shortest_paths },
-            .{ "pattern", .pattern },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Versioned entity resolver attached to an artifact-backed graph index.
-pub const GraphResolverConfig = struct {
-    name: []const u8,
-    table: []const u8,
-    source_artifact: []const u8,
-    source_artifact_kind: ?[]const u8 = null,
-    resolution_artifact: []const u8,
-    key_template: []const u8,
-    type_must_match: ?bool = null,
-    scorer_json: ?[]const u8 = null,
-    candidate_search: ?[]const u8 = null,
-    candidate_ann_index: ?[]const u8 = null,
-    candidate_limit: ?i64 = null,
-    name_embedding: ?[]const u8 = null,
-    name_embedding_dims: ?i64 = null,
-    fusion_combine: ?[]const u8 = null,
-    fusion_trust: ?f64 = null,
-    fusion_prior: ?f64 = null,
-    fusion_prior_weight: ?f64 = null,
-    config_generation: ?i64 = null,
-};
-
 pub const GraphResultBinding = ?GraphBindingNode;
 
 /// A node in graph query results
@@ -2249,10 +2342,8 @@ pub const GraphResultNode = struct {
     key: []const u8,
     /// Owning table for a cross-table node; omitted for nodes in the queried table
     table: ?[]const u8 = null,
-    /// Distance from start node
-    depth: ?i64 = null,
-    /// Hop distance for traversal results, or the selected edge-weight cost for path results
-    distance: ?f64 = null,
+    /// Hop count from the start node
+    depth: i64,
     /// Full document (if include_documents=true)
     document: ?std.json.Value = null,
     /// Exact ordered node identities in the path from the start node to this node

@@ -305,6 +305,7 @@ type (
 	PatternStep                    = oapi.PatternStep
 	PatternEdgeStep                = oapi.PatternEdgeStep
 	PatternMatch                   = oapi.PatternMatch
+	GraphResult                    = oapi.GraphResult
 	GraphQueryResult               = oapi.GraphQueryResult
 	GraphBindingsResult            = oapi.GraphBindingsResult
 	GraphBindingsResultKind        = oapi.GraphBindingsResultKind

@@ -18,7 +18,7 @@ T = TypeVar("T", bound="QueryResultGraphResults")
 
 @_attrs_define
 class QueryResultGraphResults:
-    """Results from declarative graph queries."""
+    """Results from canonical graph_queries or deprecated graph_searches."""
 
     additional_properties: dict[
         str, GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphQueryResult
@@ -84,9 +84,9 @@ class QueryResultGraphResults:
                     pass
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_query_result_type_3 = LegacyGraphQueryResult.from_dict(data)
+                componentsschemas_graph_result_type_1 = LegacyGraphQueryResult.from_dict(data)
 
-                return componentsschemas_graph_query_result_type_3
+                return componentsschemas_graph_result_type_1
 
             additional_property = _parse_additional_property(prop_dict)
 

@@ -218,6 +218,7 @@ export type GraphQueryParams = components["schemas"]["GraphQueryParams"];
 export type PatternStep = components["schemas"]["PatternStep"];
 /** @deprecated Compatibility type for legacy graph result matches. */
 export type PatternMatch = components["schemas"]["PatternMatch"];
+export type GraphResult = components["schemas"]["GraphResult"];
 export type GraphQueryResult = components["schemas"]["GraphQueryResult"];
 export type GraphBindingsResult = components["schemas"]["GraphBindingsResult"];
 export type GraphAggregatesResult = components["schemas"]["GraphAggregatesResult"];

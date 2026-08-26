@@ -1,4 +1,4 @@
-import type { GraphQueryResult, IndexStatus } from "@antfly/sdk";
+import type { GraphResult, IndexStatus } from "@antfly/sdk";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GraphIndexExplorer } from "./GraphIndexExplorer";
@@ -132,7 +132,7 @@ describe("GraphIndexExplorer", () => {
         tableName="papers"
         indexes={[graphIndex]}
         onRefreshIndexes={() => undefined}
-        initialResult={{ type: "neighbors", total: 12 } as unknown as GraphQueryResult}
+        initialResult={{ type: "neighbors", total: 12 } as unknown as GraphResult}
       />
     );
 
@@ -158,7 +158,7 @@ describe("GraphIndexExplorer", () => {
                 path_edges: [{ source: "alice", target: "bob", type: "cites", weight: 0.8 }],
               },
             ],
-          } as GraphQueryResult
+          } as GraphResult
         }
       />
     );

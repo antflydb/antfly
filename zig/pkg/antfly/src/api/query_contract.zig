@@ -5294,8 +5294,8 @@ fn buildGraphQueryResults(
     req: db_mod.types.SearchRequest,
     meta: QueryResponseMeta,
     result: db_mod.types.SearchResult,
-) !std.json.ArrayHashMap(indexes_openapi.GraphQueryResult) {
-    var out: std.json.ArrayHashMap(indexes_openapi.GraphQueryResult) = .{};
+) !std.json.ArrayHashMap(indexes_openapi.GraphResult) {
+    var out: std.json.ArrayHashMap(indexes_openapi.GraphResult) = .{};
     errdefer out.deinit(alloc);
     const response_format = graphResponseFormat(req);
 
@@ -5310,7 +5310,7 @@ fn buildGraphQueryResults(
     for (result.graph_results) |graph_result| {
         const graph_query = findGraphQuery(req.graph_queries, graph_result.name) orelse
             return error.InvalidRemoteResponse;
-        const converted = toOpenApiGraphQueryResultWithFormat(
+        const converted = toOpenApiGraphResultWithFormat(
             alloc,
             graph_query.query,
             meta,
@@ -5404,16 +5404,22 @@ fn toOpenApiGraphQueryResult(
     meta: QueryResponseMeta,
     graph_result: db_mod.types.GraphSearchResult,
 ) !indexes_openapi.GraphQueryResult {
-    return toOpenApiGraphQueryResultWithFormat(alloc, query, meta, graph_result, .canonical);
+    const result = try toOpenApiGraphResultWithFormat(alloc, query, meta, graph_result, .canonical);
+    return switch (result) {
+        .graph_nodes_result => |value| .{ .graph_nodes_result = value },
+        .graph_aggregates_result => |value| .{ .graph_aggregates_result = value },
+        .graph_bindings_result => |value| .{ .graph_bindings_result = value },
+        .legacy_graph_query_result => unreachable,
+    };
 }
 
-fn toOpenApiGraphQueryResultWithFormat(
+fn toOpenApiGraphResultWithFormat(
     alloc: std.mem.Allocator,
     query: graph_query_mod.GraphQuery,
     meta: QueryResponseMeta,
     graph_result: db_mod.types.GraphSearchResult,
     response_format: GraphResponseFormat,
-) !indexes_openapi.GraphQueryResult {
+) !indexes_openapi.GraphResult {
     var document_lookup = try GraphDocumentLookup.init(
         alloc,
         graph_result.hits,
@@ -5819,7 +5825,7 @@ test "deprecated graph search preserves its response envelope" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const result = try toOpenApiGraphQueryResultWithFormat(
+    const result = try toOpenApiGraphResultWithFormat(
         alloc,
         .{
             .query_type = .neighbors,
@@ -5951,7 +5957,7 @@ test "canonical graph paths preserve table-qualified node identities" {
     try std.testing.expectEqual(@as(f64, 1), canonical.graph_nodes_result.paths[0].weight_sum);
     try std.testing.expectEqual(@as(f64, 1), canonical.graph_nodes_result.paths[0].objective_value);
 
-    const legacy = try toOpenApiGraphQueryResultWithFormat(alloc, query, .{}, graph_result, .legacy);
+    const legacy = try toOpenApiGraphResultWithFormat(alloc, query, .{}, graph_result, .legacy);
     try std.testing.expect(legacy == .legacy_graph_query_result);
     try std.testing.expectEqualStrings("shared", legacy.legacy_graph_query_result.paths.?[0].nodes.?[1]);
 }
@@ -5977,7 +5983,7 @@ test "generated graph result union decodes pre-discriminator legacy responses" {
     ;
 
     var stdlib_parsed = try std.json.parseFromSlice(
-        indexes_openapi.GraphQueryResult,
+        indexes_openapi.GraphResult,
         std.testing.allocator,
         raw,
         .{},
@@ -5987,7 +5993,7 @@ test "generated graph result union decodes pre-discriminator legacy responses" {
     try std.testing.expectEqual(@as(i64, 12), stdlib_parsed.value.legacy_graph_query_result.total);
 
     var simd_parsed = try ant_json.parseFromSlice(
-        indexes_openapi.GraphQueryResult,
+        indexes_openapi.GraphResult,
         std.testing.allocator,
         raw,
         .{},
@@ -6003,13 +6009,13 @@ test "generated graph result union rejects an explicit null discriminator" {
     ;
 
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(
-        indexes_openapi.GraphQueryResult,
+        indexes_openapi.GraphResult,
         std.testing.allocator,
         raw,
         .{},
     ));
     try std.testing.expectError(error.UnexpectedToken, ant_json.parseFromSlice(
-        indexes_openapi.GraphQueryResult,
+        indexes_openapi.GraphResult,
         std.testing.allocator,
         raw,
         .{},
@@ -6030,7 +6036,6 @@ fn toOpenApiGraphNodes(
             .key = node.key,
             .table = node.table,
             .depth = @intCast(node.depth),
-            .distance = node.distance,
             .document = try document_lookup.document(node.key, node.table),
             .path = try toOpenApiGraphNodePath(alloc, node),
             .path_edges = try toOpenApiOptionalGraphPathEdges(alloc, node),
@@ -6483,8 +6488,7 @@ test "api query contract preserves algebraic graph path provenance" {
 
     try std.testing.expectEqual(@as(usize, 1), encoded.len);
     try std.testing.expectEqualStrings("C", encoded[0].key);
-    try std.testing.expectEqual(@as(i64, 2), encoded[0].depth.?);
-    try std.testing.expectEqual(@as(f64, 2.0), encoded[0].distance.?);
+    try std.testing.expectEqual(@as(i64, 2), encoded[0].depth);
     try std.testing.expectEqualStrings("A", encoded[0].path.?[0].key);
     try std.testing.expect(encoded[0].path.?[0].table == null);
     try std.testing.expectEqualStrings("C", encoded[0].path.?[2].key);
