@@ -308,7 +308,10 @@ fn lockApplyExclusiveCancellable(runtime: *SparseCompactionRuntime) bool {
         io_impl.io(),
         @as(?Cancellation, .{ .runtime = runtime }),
     ) catch |err| switch (err) {
-        error.Cancelled => return false,
+        // Either the component stop token or cancellation of its backend task
+        // means this optional pass must not begin. Keep both spellings explicit
+        // here rather than collapsing them in the shared lock primitive.
+        error.Cancelled, error.Canceled => return false,
     };
     return true;
 }

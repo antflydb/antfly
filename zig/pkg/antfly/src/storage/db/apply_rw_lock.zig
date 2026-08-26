@@ -115,9 +115,10 @@ pub const ApplyRwLock = struct {
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             if (self.tryLockSharedQueued(priority)) break;
             contended = true;
-            io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake) catch |err| switch (err) {
-                error.Canceled => return error.Cancelled,
-            };
+            // `std.Io` cancellation is a backend/task lifetime signal. Keep
+            // it distinct from the request token's `error.Cancelled` above so
+            // callers can make the correct retry or shutdown decision.
+            try io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake);
             delay_us = @min(delay_us * 2, 1_000);
         }
         if (contended) {
@@ -146,9 +147,7 @@ pub const ApplyRwLock = struct {
         while (self.priority_shared_waiters.load(.acquire) > 0) {
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             contended = true;
-            io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake) catch |err| switch (err) {
-                error.Canceled => return error.Cancelled,
-            };
+            try io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake);
             delay_us = @min(delay_us * 2, 1_000);
         }
 
@@ -158,9 +157,7 @@ pub const ApplyRwLock = struct {
         while (!self.reader_gate.tryLock()) {
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             contended = true;
-            io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake) catch |err| switch (err) {
-                error.Canceled => return error.Cancelled,
-            };
+            try io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake);
             delay_us = @min(delay_us * 2, 1_000);
         }
         errdefer self.reader_gate.unlock();
@@ -168,9 +165,7 @@ pub const ApplyRwLock = struct {
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             if (self.resource_mutex.tryLock()) break;
             contended = true;
-            io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake) catch |err| switch (err) {
-                error.Canceled => return error.Cancelled,
-            };
+            try io.sleep(std.Io.Duration.fromMicroseconds(delay_us), .awake);
             delay_us = @min(delay_us * 2, 1_000);
         }
         if (contended) {
@@ -427,6 +422,86 @@ test "apply rw lock runtime writer cancellation clears intent and reader gate" {
 
     // Cancellation after reserving the reader gate must release it as well as
     // writer intent, otherwise every later reader and writer would wedge.
+    try std.testing.expect(lock.tryLockShared());
+    lock.unlockShared();
+    try std.testing.expect(lock.tryLockExclusive());
+    lock.unlockExclusive();
+}
+
+test "apply rw lock preserves backend task cancellation" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const NeverCancelled = struct {
+        fn isCancelled(_: @This()) bool {
+            return false;
+        }
+    };
+    const Waiter = struct {
+        fn shared(lock: *ApplyRwLock, io: std.Io) !void {
+            try lock.lockSharedIo(io, @as(?NeverCancelled, null));
+            lock.unlockShared();
+        }
+
+        fn exclusive(lock: *ApplyRwLock, io: std.Io) !void {
+            try lock.lockExclusiveIo(io, @as(?NeverCancelled, null));
+            lock.unlockExclusive();
+        }
+    };
+
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var lock: ApplyRwLock = .{};
+
+    lock.lockExclusive();
+    var exclusive_held = true;
+    defer if (exclusive_held) lock.unlockExclusive();
+    var shared_waiter = std.Io.async(io, Waiter.shared, .{ &lock, io });
+    var shared_waiter_active = true;
+    defer if (shared_waiter_active) {
+        _ = shared_waiter.cancel(io) catch {};
+    };
+    var shared_joined = false;
+    for (0..5_000) |_| {
+        if (lock.priority_shared_waiters.load(.acquire) != 0) {
+            shared_joined = true;
+            break;
+        }
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(shared_joined);
+    const shared_result = shared_waiter.cancel(io);
+    shared_waiter_active = false;
+    try std.testing.expectError(error.Canceled, shared_result);
+    try std.testing.expectEqual(@as(u64, 0), lock.priority_shared_waiters.load(.acquire));
+    lock.unlockExclusive();
+    exclusive_held = false;
+
+    lock.lockShared();
+    var shared_held = true;
+    defer if (shared_held) lock.unlockShared();
+    var exclusive_waiter = std.Io.async(io, Waiter.exclusive, .{ &lock, io });
+    var exclusive_waiter_active = true;
+    defer if (exclusive_waiter_active) {
+        _ = exclusive_waiter.cancel(io) catch {};
+    };
+    var exclusive_joined = false;
+    for (0..5_000) |_| {
+        if (lock.exclusive_waiters.load(.acquire) != 0) {
+            exclusive_joined = true;
+            break;
+        }
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(exclusive_joined);
+    const exclusive_result = exclusive_waiter.cancel(io);
+    exclusive_waiter_active = false;
+    try std.testing.expectError(error.Canceled, exclusive_result);
+    try std.testing.expectEqual(@as(u64, 0), lock.exclusive_waiters.load(.acquire));
+    lock.unlockShared();
+    shared_held = false;
+
+    // Both canceled paths must leave the lock immediately reusable.
     try std.testing.expect(lock.tryLockShared());
     lock.unlockShared();
     try std.testing.expect(lock.tryLockExclusive());
