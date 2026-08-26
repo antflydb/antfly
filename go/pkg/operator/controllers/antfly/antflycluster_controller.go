@@ -4516,11 +4516,19 @@ ID=$((ORDINAL + 1))
 exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
   --api-host ${POD_IP} \
   --api-port %d \
+  --api-advertise-url http://${HOSTNAME}.%s-data.%s.svc.cluster.local:%d \
   --raft-host ${POD_IP} \
   --raft-port %d \
+  --raft-advertise-url http://${HOSTNAME}.%s-data.%s.svc.cluster.local:%d \
   --health-port %d%s
 								`,
 								cluster.Spec.DataNodes.API.Port,
+								cluster.Name,
+								cluster.Namespace,
+								cluster.Spec.DataNodes.API.Port,
+								cluster.Spec.DataNodes.Raft.Port,
+								cluster.Name,
+								cluster.Namespace,
 								cluster.Spec.DataNodes.Raft.Port,
 								cluster.Spec.DataNodes.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
@@ -11848,16 +11856,16 @@ func haSeedArtifactPVCStorage(name string, pvc *antflyv1.HASeedArtifactPVCSpec, 
 		return nil, nil
 	}
 	return []corev1.VolumeMount{{
-			Name:      name,
-			MountPath: pvc.MountPath,
+		Name:      name,
+		MountPath: pvc.MountPath,
+		ReadOnly:  readOnly,
+	}}, []corev1.Volume{{
+		Name: name,
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: pvc.ClaimName,
 			ReadOnly:  readOnly,
-		}}, []corev1.Volume{{
-			Name: name,
-			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-				ClaimName: pvc.ClaimName,
-				ReadOnly:  readOnly,
-			}},
-		}}
+		}},
+	}}
 }
 
 func haSeedArtifactForAction(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactSpec {
