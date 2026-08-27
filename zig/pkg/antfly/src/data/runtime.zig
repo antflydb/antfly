@@ -570,6 +570,7 @@ const IndexRepairScheduleCandidate = struct {
     identity_range_id: u64 = 0,
     estimated_bytes: u64,
     queued: bool,
+    queue_wake_generation: ?u64 = null,
     cursor_distance: usize,
 };
 
@@ -590,6 +591,10 @@ test "index repair queue retains debt while leadership is temporarily unknown" {
 
 const IndexRepairQueueEntry = struct {
     first_seen_ms: u64,
+    // Assigned from the queue-wide generation. Scheduler retention preserves
+    // this value, while external/durable wakes replace it, so an older
+    // completion cannot delete a newer edge even after remove/recreate (ABA).
+    wake_generation: u64,
     next_retry_at_ms: u64 = 0,
     transient_failure_count: u32 = 0,
     immediate_wake_pending: bool = false,
@@ -605,6 +610,32 @@ const IndexRepairQueueEntry = struct {
 const IndexRepairQueueWake = enum {
     immediate,
     retained,
+};
+
+const IndexRepairQueueMutationGuard = union(enum) {
+    unguarded,
+    /// Apply a scheduler-derived mutation only to the wake selected by that
+    /// pass. A null generation means fallback discovery selected no queue
+    /// entry, so any entry now present is causally newer.
+    selected: ?u64,
+
+    fn allowsExisting(self: @This(), wake_generation: u64) bool {
+        return switch (self) {
+            .unguarded => true,
+            .selected => |expected| expected != null and expected.? == wake_generation,
+        };
+    }
+
+    fn allowsMissing(self: @This()) bool {
+        return switch (self) {
+            .unguarded => true,
+            // A null selection is fallback discovery: it proved durable debt
+            // without selecting a queue owner and may materialize that route.
+            // A concrete selection is an outcome from an older queue owner and
+            // must never resurrect an entry removed by destructive lifecycle.
+            .selected => |expected| expected == null,
+        };
+    }
 };
 
 const IndexRepairRoute = struct {
@@ -4821,6 +4852,9 @@ pub const DataServer = struct {
     provisioned_index_repair_queue_head: ?u64 = null,
     provisioned_index_repair_queue_tail: ?u64 = null,
     provisioned_index_repair_queue_cursor: ?u64 = null,
+    // Protected by provisioned_index_repair_queue_mutex. Zero is reserved for
+    // uninitialized state and skipped on the practically unreachable wrap.
+    provisioned_index_repair_next_wake_generation: u64 = 1,
     // Immutable between repair passes and rebuilt only when the metadata epoch
     // changes. This keeps fixed-window reconciliation independent of the size
     // of the administrative snapshot on the steady-state hot path.
@@ -4956,13 +4990,14 @@ pub const DataServer = struct {
         return stats.earliest_retry_at_ms;
     }
 
-    fn accountDelegatedIndexRepair(
+    fn accountParkedIndexRepair(
         stats: *ProvisionedStartupCatchUpStats,
         result: antfly.public_api.ProvisionedTableWriteSource.StartupCatchUpResult,
     ) bool {
-        if (!result.index_repair_pending) return false;
-        // This is observed startup debt, but it is parked on the durable index
-        // repair queue and must not keep the startup scheduler runnable.
+        if (!result.index_repair_pending and !result.index_repair_paused) return false;
+        // Runnable repair is parked on the durable queue; operator-paused
+        // repair is parked solely in its durable intent. Neither should keep
+        // startup catch-up runnable or feed its zero-progress quarantine.
         stats.groups_with_debt += 1;
         return true;
     }
@@ -12253,13 +12288,23 @@ pub const DataServer = struct {
         self.provisioned_index_repair_not_before_ms.store(if (runnable) 0 else next_retry_at_ms, .monotonic);
     }
 
+    fn nextProvisionedIndexRepairWakeGenerationLocked(self: *DataServer) u64 {
+        const generation = self.provisioned_index_repair_next_wake_generation;
+        self.provisioned_index_repair_next_wake_generation +%= 1;
+        if (self.provisioned_index_repair_next_wake_generation == 0) {
+            self.provisioned_index_repair_next_wake_generation = 1;
+        }
+        return generation;
+    }
+
     fn enqueueProvisionedIndexRepairWithRetryForTable(
         self: *DataServer,
         table_name: ?[]const u8,
         group_id: u64,
         next_retry_at_realtime_ms: u64,
         wake: IndexRepairQueueWake,
-    ) !void {
+        mutation_guard: IndexRepairQueueMutationGuard,
+    ) !bool {
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         const next_retry_at_ms = indexRepairMonotonicDeadlineMs(
             next_retry_at_realtime_ms,
@@ -12274,6 +12319,13 @@ pub const DataServer = struct {
         lockAtomic(&self.provisioned_index_repair_queue_mutex);
         if (self.provisioned_index_repair_group_ages.getPtr(group_id)) |entry| {
             if (entry.table_name != null or table_name == null) {
+                if (!mutation_guard.allowsExisting(entry.wake_generation)) {
+                    self.provisioned_index_repair_queue_mutex.unlock();
+                    return false;
+                }
+                if (wake == .immediate) {
+                    entry.wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked();
+                }
                 entry.transient_failure_count = 0;
                 entry.next_retry_at_ms = next_retry_at_ms;
                 if (wake == .immediate and !entry.immediate_wake_pending) {
@@ -12283,8 +12335,12 @@ pub const DataServer = struct {
                 self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
                 self.provisioned_index_repair_dirty.store(true, .release);
                 self.provisioned_index_repair_queue_mutex.unlock();
-                return;
+                return true;
             }
+        }
+        if (!self.provisioned_index_repair_group_ages.contains(group_id) and !mutation_guard.allowsMissing()) {
+            self.provisioned_index_repair_queue_mutex.unlock();
+            return false;
         }
         self.provisioned_index_repair_queue_mutex.unlock();
 
@@ -12296,11 +12352,18 @@ pub const DataServer = struct {
         defer if (owned_table_name) |name| self.alloc.free(name);
         lockAtomic(&self.provisioned_index_repair_queue_mutex);
         defer self.provisioned_index_repair_queue_mutex.unlock();
+        if (!self.provisioned_index_repair_group_ages.contains(group_id) and !mutation_guard.allowsMissing()) {
+            return false;
+        }
         const gop = try self.provisioned_index_repair_group_ages.getOrPut(self.alloc, group_id);
+        if (gop.found_existing and !mutation_guard.allowsExisting(gop.value_ptr.wake_generation)) {
+            return false;
+        }
         if (!gop.found_existing) {
             const previous = self.provisioned_index_repair_queue_tail;
             gop.value_ptr.* = .{
                 .first_seen_ms = now_ms,
+                .wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked(),
                 .previous_group_id = previous,
                 .table_name = owned_table_name,
             };
@@ -12319,6 +12382,9 @@ pub const DataServer = struct {
             gop.value_ptr.table_name = owned_table_name;
             owned_table_name = null;
         }
+        if (gop.found_existing and wake == .immediate) {
+            gop.value_ptr.wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked();
+        }
         gop.value_ptr.transient_failure_count = 0;
         gop.value_ptr.next_retry_at_ms = next_retry_at_ms;
         if (wake == .immediate and !gop.value_ptr.immediate_wake_pending) {
@@ -12327,23 +12393,81 @@ pub const DataServer = struct {
         }
         self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
         self.provisioned_index_repair_dirty.store(true, .release);
+        return true;
+    }
+
+    const IndexRepairFailureDeferral = struct {
+        applied: bool,
+        retry_at_ms: u64,
+    };
+
+    fn applyProvisionedIndexRepairFailureDeferralLocked(
+        self: *DataServer,
+        group_id: u64,
+        entry: *IndexRepairQueueEntry,
+        now_ms: u64,
+    ) IndexRepairFailureDeferral {
+        entry.transient_failure_count +|= 1;
+        const retry_at_ms = now_ms +| indexRepairSchedulerRetryDelayMs(group_id, entry.transient_failure_count);
+        // Preserve a later durable deadline if one was already observed.
+        entry.next_retry_at_ms = @max(entry.next_retry_at_ms, retry_at_ms);
+        self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
+        self.provisioned_index_repair_dirty.store(true, .release);
+        return .{
+            .applied = true,
+            .retry_at_ms = entry.next_retry_at_ms,
+        };
     }
 
     fn deferProvisionedIndexRepairAfterFailureForTable(
         self: *DataServer,
         table_name: []const u8,
         group_id: u64,
-    ) !u64 {
+        expected_wake_generation: ?u64,
+    ) !IndexRepairFailureDeferral {
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+
+        // A queued candidate already carries its route. Resolve the common
+        // case, including rejection of a stale outcome, without allocating.
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        if (self.provisioned_index_repair_group_ages.getPtr(group_id)) |entry| {
+            if (!(IndexRepairQueueMutationGuard{ .selected = expected_wake_generation }).allowsExisting(entry.wake_generation)) {
+                const retry_at_ms = entry.next_retry_at_ms;
+                self.provisioned_index_repair_queue_mutex.unlock();
+                return .{ .applied = false, .retry_at_ms = retry_at_ms };
+            }
+            if (entry.table_name != null) {
+                const result = self.applyProvisionedIndexRepairFailureDeferralLocked(group_id, entry, now_ms);
+                self.provisioned_index_repair_queue_mutex.unlock();
+                return result;
+            }
+        }
+        const mutation_guard = IndexRepairQueueMutationGuard{ .selected = expected_wake_generation };
+        if (!self.provisioned_index_repair_group_ages.contains(group_id) and !mutation_guard.allowsMissing()) {
+            self.provisioned_index_repair_queue_mutex.unlock();
+            return .{ .applied = false, .retry_at_ms = 0 };
+        }
+        self.provisioned_index_repair_queue_mutex.unlock();
+
         var owned_table_name: ?[]u8 = try self.alloc.dupe(u8, table_name);
         defer if (owned_table_name) |name| self.alloc.free(name);
         lockAtomic(&self.provisioned_index_repair_queue_mutex);
         defer self.provisioned_index_repair_queue_mutex.unlock();
+        if (!self.provisioned_index_repair_group_ages.contains(group_id) and !mutation_guard.allowsMissing()) {
+            return .{ .applied = false, .retry_at_ms = 0 };
+        }
         const gop = try self.provisioned_index_repair_group_ages.getOrPut(self.alloc, group_id);
+        if (gop.found_existing and !mutation_guard.allowsExisting(gop.value_ptr.wake_generation)) {
+            return .{
+                .applied = false,
+                .retry_at_ms = gop.value_ptr.next_retry_at_ms,
+            };
+        }
         if (!gop.found_existing) {
             const previous = self.provisioned_index_repair_queue_tail;
             gop.value_ptr.* = .{
                 .first_seen_ms = now_ms,
+                .wake_generation = self.nextProvisionedIndexRepairWakeGenerationLocked(),
                 .previous_group_id = previous,
                 .table_name = owned_table_name,
             };
@@ -12362,13 +12486,7 @@ pub const DataServer = struct {
             owned_table_name = null;
         }
         const entry = gop.value_ptr;
-        entry.transient_failure_count +|= 1;
-        const retry_at_ms = now_ms +| indexRepairSchedulerRetryDelayMs(group_id, entry.transient_failure_count);
-        // Preserve a later durable deadline if one was already observed.
-        entry.next_retry_at_ms = @max(entry.next_retry_at_ms, retry_at_ms);
-        self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
-        self.provisioned_index_repair_dirty.store(true, .release);
-        return entry.next_retry_at_ms;
+        return self.applyProvisionedIndexRepairFailureDeferralLocked(group_id, entry, now_ms);
     }
 
     fn recordProvisionedIndexRepairSchedulerFailure(self: *DataServer, now_ms: u64) void {
@@ -12402,21 +12520,18 @@ pub const DataServer = struct {
     }
 
     fn enqueueProvisionedIndexRepair(self: *DataServer, group_id: u64) !void {
-        try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, 0, .immediate);
+        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, 0, .immediate, .unguarded);
     }
 
     fn enqueueProvisionedIndexRepairForTable(self: *DataServer, table_name: []const u8, group_id: u64) !void {
-        try self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, 0, .immediate);
+        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, 0, .immediate, .unguarded);
     }
 
     fn enqueueProvisionedIndexRepairWithRetry(self: *DataServer, group_id: u64, next_retry_at_ms: u64) !void {
-        try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, next_retry_at_ms, .retained);
+        _ = try self.enqueueProvisionedIndexRepairWithRetryForTable(null, group_id, next_retry_at_ms, .retained, .unguarded);
     }
 
-    fn removeProvisionedIndexRepair(self: *DataServer, group_id: u64) void {
-        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        lockAtomic(&self.provisioned_index_repair_queue_mutex);
-        defer self.provisioned_index_repair_queue_mutex.unlock();
+    fn removeProvisionedIndexRepairLocked(self: *DataServer, group_id: u64, now_ms: u64) void {
         const removed = self.provisioned_index_repair_group_ages.get(group_id) orelse return;
         if (removed.previous_group_id) |previous| {
             self.provisioned_index_repair_group_ages.getPtr(previous).?.next_group_id = removed.next_group_id;
@@ -12444,13 +12559,41 @@ pub const DataServer = struct {
         self.refreshProvisionedIndexRepairQueueMetricsLocked(now_ms);
     }
 
-    fn consumeProvisionedIndexRepairImmediateWake(self: *DataServer, group_id: u64) void {
+    fn removeProvisionedIndexRepair(self: *DataServer, group_id: u64) void {
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         lockAtomic(&self.provisioned_index_repair_queue_mutex);
         defer self.provisioned_index_repair_queue_mutex.unlock();
-        const entry = self.provisioned_index_repair_group_ages.getPtr(group_id) orelse return;
-        if (!entry.immediate_wake_pending) return;
+        self.removeProvisionedIndexRepairLocked(group_id, now_ms);
+    }
+
+    fn removeProvisionedIndexRepairIfUnchanged(
+        self: *DataServer,
+        group_id: u64,
+        expected_wake_generation: ?u64,
+    ) bool {
+        const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        defer self.provisioned_index_repair_queue_mutex.unlock();
+        const current = self.provisioned_index_repair_group_ages.get(group_id) orelse return true;
+        const expected = expected_wake_generation orelse return false;
+        if (current.wake_generation != expected) return false;
+        self.removeProvisionedIndexRepairLocked(group_id, now_ms);
+        return true;
+    }
+
+    fn consumeProvisionedIndexRepairImmediateWakeIfUnchanged(
+        self: *DataServer,
+        group_id: u64,
+        expected_wake_generation: u64,
+    ) bool {
+        lockAtomic(&self.provisioned_index_repair_queue_mutex);
+        defer self.provisioned_index_repair_queue_mutex.unlock();
+        const entry = self.provisioned_index_repair_group_ages.getPtr(group_id) orelse return true;
+        if (entry.wake_generation != expected_wake_generation) return false;
+        if (!entry.immediate_wake_pending) return true;
         entry.immediate_wake_pending = false;
         _ = self.provisioned_index_repair_immediate_wake_count.fetchSub(1, .release);
+        return true;
     }
 
     fn requestProvisionedIndexRepairCancellation(self: *DataServer, group_id: u64) !void {
@@ -12778,13 +12921,11 @@ pub const DataServer = struct {
                         antfly.metadata.table_manager.rangeDocIdentityShardId(range),
                         antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
                     );
-                    // The durable repair queue now owns progress, retries, and
-                    // crash recovery for this debt. Do not keep startup
-                    // catch-up dirty or feed its zero-progress quarantine;
-                    // doing so competes for the same group operation and can
-                    // starve the bounded owner-side repair pass.
-                    if (accountDelegatedIndexRepair(&stats, result)) continue;
                 }
+                // Runnable repair is delegated to its durable queue, while an
+                // operator-paused intent is deliberately parked without one.
+                // Neither belongs in startup catch-up's retry/quarantine loop.
+                if (accountParkedIndexRepair(&stats, result)) continue;
                 if (result.busy) {
                     stats.busy_groups += 1;
                     if (self.runtime_status_dirty.load(.acquire) or self.runtime_status_refresh_active.load(.acquire)) {
@@ -12880,10 +13021,15 @@ pub const DataServer = struct {
             }
             schedule_candidates.deinit(self.alloc);
         }
-        var stale_queued_groups = std.ArrayListUnmanaged(u64).empty;
+        const StaleQueuedRepair = struct {
+            group_id: u64,
+            wake_generation: u64,
+        };
+        var stale_queued_groups = std.ArrayListUnmanaged(StaleQueuedRepair).empty;
         defer stale_queued_groups.deinit(self.alloc);
         const QueuedRepair = struct {
             group_id: u64,
+            wake_generation: u64,
             next_retry_at_ms: u64,
             table_name: ?[]u8,
             immediate_wake_pending: bool,
@@ -12919,6 +13065,7 @@ pub const DataServer = struct {
                 null;
             queued_repairs.append(self.alloc, .{
                 .group_id = group_id,
+                .wake_generation = entry.wake_generation,
                 .next_retry_at_ms = entry.next_retry_at_ms,
                 .table_name = queued_table_name,
                 .immediate_wake_pending = entry.immediate_wake_pending,
@@ -12949,12 +13096,17 @@ pub const DataServer = struct {
                 // local Raft view converge. Keep durable debt queued while the
                 // independent fallback cursor continues discovering other debt.
                 .retain => {
-                    if (queued.immediate_wake_pending) self.consumeProvisionedIndexRepairImmediateWake(group_id);
+                    if (queued.immediate_wake_pending) {
+                        _ = self.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(group_id, queued.wake_generation);
+                    }
                     found_pending = true;
                     continue;
                 },
                 .remove => {
-                    stale_queued_groups.append(self.alloc, group_id) catch continue;
+                    stale_queued_groups.append(self.alloc, .{
+                        .group_id = group_id,
+                        .wake_generation = queued.wake_generation,
+                    }) catch continue;
                     continue;
                 },
             }
@@ -12977,6 +13129,7 @@ pub const DataServer = struct {
                 // single bounded repair slot.
                 .estimated_bytes = 1,
                 .queued = true,
+                .queue_wake_generation = queued.wake_generation,
                 .cursor_distance = 0,
             }) catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -12984,13 +13137,19 @@ pub const DataServer = struct {
                 std.log.warn("provisioned index repair candidate allocation failed err={s}", .{@errorName(err)});
                 return;
             };
-            if (queued.immediate_wake_pending) self.consumeProvisionedIndexRepairImmediateWake(group_id);
+            if (queued.immediate_wake_pending) {
+                _ = self.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(group_id, queued.wake_generation);
+            }
             // One runnable queued group is sufficient: the executor admits at
             // most one repair, and the linked cursor provides round-robin
             // fairness across subsequent passes.
             break;
         }
-        for (stale_queued_groups.items) |group_id| self.removeProvisionedIndexRepair(group_id);
+        for (stale_queued_groups.items) |stale| {
+            if (!self.removeProvisionedIndexRepairIfUnchanged(stale.group_id, stale.wake_generation)) {
+                found_pending = true;
+            }
+        }
 
         // Reconciliation uses a compact node-local routing index. Refreshing
         // that index may clone metadata once per epoch, but steady-state repair
@@ -13149,7 +13308,11 @@ pub const DataServer = struct {
             }) catch |err| {
                 _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                 found_pending = true;
-                const retry_at_ms = self.deferProvisionedIndexRepairAfterFailureForTable(table_name, group_id) catch |queue_err| {
+                const deferral = self.deferProvisionedIndexRepairAfterFailureForTable(
+                    table_name,
+                    group_id,
+                    candidate.queue_wake_generation,
+                ) catch |queue_err| {
                     self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                     if (!candidate.queued) self.retainProvisionedIndexRepairFallbackForRetry(now_ms);
                     std.log.warn(
@@ -13159,8 +13322,8 @@ pub const DataServer = struct {
                     return;
                 };
                 std.log.warn(
-                    "provisioned index repair group pass failed group={} table={s} duration_ms={} retry_at_monotonic_ms={} err={s}",
-                    .{ group_id, table_name, (platform_time.monotonicNs() -| attempt_started_ns) / std.time.ns_per_ms, retry_at_ms, @errorName(err) },
+                    "provisioned index repair group pass failed group={} table={s} duration_ms={} retry_applied={} retry_at_monotonic_ms={} err={s}",
+                    .{ group_id, table_name, (platform_time.monotonicNs() -| attempt_started_ns) / std.time.ns_per_ms, deferral.applied, deferral.retry_at_ms, @errorName(err) },
                 );
                 continue;
             };
@@ -13183,7 +13346,13 @@ pub const DataServer = struct {
                 _ = self.provisioned_index_repair_disk_waits.fetchAdd(1, .monotonic);
             }
             if (result.index_repair_pending) {
-                self.enqueueProvisionedIndexRepairWithRetryForTable(table_name, group_id, result.index_repair_retry_at_ms, .retained) catch |err| {
+                _ = self.enqueueProvisionedIndexRepairWithRetryForTable(
+                    table_name,
+                    group_id,
+                    result.index_repair_retry_at_ms,
+                    .retained,
+                    .{ .selected = candidate.queue_wake_generation },
+                ) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
                     self.recordProvisionedIndexRepairSchedulerFailure(now_ms);
                     if (!candidate.queued) {
@@ -13199,7 +13368,13 @@ pub const DataServer = struct {
                     return;
                 };
             } else {
-                self.removeProvisionedIndexRepair(group_id);
+                // The result owns only the wake that selected this attempt.
+                // A callback may enqueue newer repair debt while DB/status
+                // observation is finishing; never let the older completion
+                // remove that causally later edge.
+                if (!self.removeProvisionedIndexRepairIfUnchanged(group_id, candidate.queue_wake_generation)) {
+                    found_pending = true;
+                }
             }
             // A fallback route is consumed only after its durable outcome was
             // completed or its exact group was successfully retained in the
@@ -17695,6 +17870,16 @@ fn freeLocalBootstrapStatusOwned(alloc: std.mem.Allocator, record: antfly.raft.h
     if (record.snapshot_path) |value| alloc.free(value);
 }
 
+fn freeReplicationSourceActionHintOwned(
+    alloc: std.mem.Allocator,
+    record: antfly.metadata_api.ReplicationSourceActionHint,
+) void {
+    alloc.free(record.table_name);
+    alloc.free(record.action);
+    alloc.free(record.reason);
+    alloc.free(record.reseed_exact_cutover_path);
+}
+
 fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_api.AdminSnapshot) void {
     alloc.free(snapshot.status.metadata_raft_role);
     for (snapshot.tables) |record| antfly.metadata.table_manager.freeTable(alloc, record);
@@ -17715,12 +17900,7 @@ fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_a
     if (snapshot.restore_progresses.len > 0) alloc.free(snapshot.restore_progresses);
     for (snapshot.replication_source_statuses) |record| antfly.metadata.table_manager.freeReplicationSourceStatus(alloc, record);
     if (snapshot.replication_source_statuses.len > 0) alloc.free(snapshot.replication_source_statuses);
-    for (snapshot.replication_source_action_hints) |record| {
-        alloc.free(record.table_name);
-        alloc.free(record.action);
-        alloc.free(record.reason);
-        alloc.free(record.reseed_exact_cutover_path);
-    }
+    for (snapshot.replication_source_action_hints) |record| freeReplicationSourceActionHintOwned(alloc, record);
     if (snapshot.replication_source_action_hints.len > 0) alloc.free(snapshot.replication_source_action_hints);
     for (snapshot.extension_packages) |record| {
         var owned = record;
@@ -17808,8 +17988,15 @@ fn cloneRestoreProgressesOwned(
 ) ![]antfly.metadata.table_manager.RestoreProgressRecord {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata.table_manager.RestoreProgressRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneRestoreProgress(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeRestoreProgress(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneRestoreProgress(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
@@ -17819,9 +18006,37 @@ fn cloneReplicationSourceStatusesOwned(
 ) ![]antfly.metadata.table_manager.ReplicationSourceStatusRecord {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata.table_manager.ReplicationSourceStatusRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneReplicationSourceStatus(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeReplicationSourceStatus(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneReplicationSourceStatus(alloc, record);
+        initialized += 1;
+    }
     return out;
+}
+
+fn cloneReplicationSourceActionHintOwned(
+    alloc: std.mem.Allocator,
+    record: antfly.metadata_api.ReplicationSourceActionHint,
+) !antfly.metadata_api.ReplicationSourceActionHint {
+    const table_name = try alloc.dupe(u8, record.table_name);
+    errdefer alloc.free(table_name);
+    const action = try alloc.dupe(u8, record.action);
+    errdefer alloc.free(action);
+    const reason = try alloc.dupe(u8, record.reason);
+    errdefer alloc.free(reason);
+    const reseed_exact_cutover_path = try alloc.dupe(u8, record.reseed_exact_cutover_path);
+    return .{
+        .table_id = record.table_id,
+        .table_name = table_name,
+        .source_ordinal = record.source_ordinal,
+        .action = action,
+        .reason = reason,
+        .reseed_exact_cutover_path = reseed_exact_cutover_path,
+    };
 }
 
 fn cloneReplicationSourceActionHintsOwned(
@@ -17830,31 +18045,43 @@ fn cloneReplicationSourceActionHintsOwned(
 ) ![]antfly.metadata_api.ReplicationSourceActionHint {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata_api.ReplicationSourceActionHint, records.len);
-    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| freeReplicationSourceActionHintOwned(alloc, record);
+        alloc.free(out);
+    }
     for (records, 0..) |record, i| {
-        out[i] = .{
-            .table_id = record.table_id,
-            .table_name = try alloc.dupe(u8, record.table_name),
-            .source_ordinal = record.source_ordinal,
-            .action = try alloc.dupe(u8, record.action),
-            .reason = try alloc.dupe(u8, record.reason),
-            .reseed_exact_cutover_path = try alloc.dupe(u8, record.reseed_exact_cutover_path),
-        };
+        out[i] = try cloneReplicationSourceActionHintOwned(alloc, record);
+        initialized += 1;
     }
     return out;
 }
 
 fn cloneTablesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.TableRecord) ![]antfly.metadata.table_manager.TableRecord {
     const out = try alloc.alloc(antfly.metadata.table_manager.TableRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneTable(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeTable(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneTable(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
 fn cloneRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.RangeRecord) ![]antfly.metadata.table_manager.RangeRecord {
     const out = try alloc.alloc(antfly.metadata.table_manager.RangeRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneRange(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeRange(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneRange(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
@@ -23573,11 +23800,16 @@ test "data runtime startup catch-up parks scheduler when only quarantined debt r
     try std.testing.expectEqual(@as(u64, 0), stale.not_before_ms);
 
     var delegated_stats = DataServer.ProvisionedStartupCatchUpStats{};
-    try std.testing.expect(DataServer.accountDelegatedIndexRepair(&delegated_stats, .{
+    try std.testing.expect(DataServer.accountParkedIndexRepair(&delegated_stats, .{
         .had_debt = true,
         .index_repair_pending = true,
     }));
     try std.testing.expectEqual(@as(u64, 1), delegated_stats.groups_with_debt);
+    try std.testing.expect(DataServer.accountParkedIndexRepair(&delegated_stats, .{
+        .had_debt = true,
+        .index_repair_paused = true,
+    }));
+    try std.testing.expectEqual(@as(u64, 2), delegated_stats.groups_with_debt);
     const delegated = DataServer.startupCatchUpCompletion(delegated_stats, true, 7, 7);
     try std.testing.expect(!delegated.dirty);
     try std.testing.expectEqual(@as(u64, 0), delegated.not_before_ms);
@@ -24656,6 +24888,10 @@ test "data runtime repair debt hook targets the affected group queue" {
 
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .cancel);
     try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
+    // A visibility clear is an aggregate audit enqueue, not a destructive
+    // lifecycle remove, and cannot consume another owner's cancellation.
+    DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .enqueue);
+    try std.testing.expect(server.provisionedIndexRepairCancellationRequested(7001));
     DataServer.onLocalIndexRepairDebtChanged(&server, "docs", 7001, .clear_cancel);
     try std.testing.expect(!server.provisionedIndexRepairCancellationRequested(7001));
 
@@ -24700,9 +24936,11 @@ test "data runtime repair failures preserve durable backoff and increase retry d
 
     try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
     const entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
+    const selected_generation = entry.wake_generation;
     entry.next_retry_at_ms = std.math.maxInt(u64);
-    const retry_at_ms = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001);
-    try std.testing.expectEqual(std.math.maxInt(u64), retry_at_ms);
+    const deferral = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001, selected_generation);
+    try std.testing.expect(deferral.applied);
+    try std.testing.expectEqual(std.math.maxInt(u64), deferral.retry_at_ms);
     try std.testing.expectEqual(@as(u32, 1), entry.transient_failure_count);
 
     // An explicit/durable wake replaces node-local failure state rather than
@@ -24728,13 +24966,62 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     defer server.provisioned_index_repair_group_ages.deinit(alloc);
 
     try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    const selected_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
     failing.fail_index = failing.alloc_index;
     server.alloc = failing.allocator();
 
     // Retaining an existing exact wake must not allocate, even when its durable
     // retry deadline changes after a cooperative repair slice.
-    try server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7001, 1234, .retained);
+    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+        "docs",
+        7001,
+        1234,
+        .retained,
+        .{ .selected = selected_generation },
+    ));
+    try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
+    try std.testing.expectEqual(selected_generation, server.provisioned_index_repair_group_ages.get(7001).?.wake_generation);
+
+    // A newer external wake is allocation-free too, but advances ownership.
+    // Completion of the selected generation cannot remove that later edge;
+    // fallback work selected without a queue entry cannot remove it either.
+    // Retry and failure outcomes are fenced by the same ownership token, so
+    // they cannot restore stale backoff over the immediate wake either.
+    try server.enqueueProvisionedIndexRepairForTable("docs", 7001);
+    const newer_entry = server.provisioned_index_repair_group_ages.getPtr(7001).?;
+    const newer_generation = newer_entry.wake_generation;
+    try std.testing.expect(newer_generation != selected_generation);
+    try std.testing.expect(!server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(7001, selected_generation));
+    try std.testing.expect(newer_entry.immediate_wake_pending);
+    try std.testing.expectEqual(@as(u64, 1), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
+    try std.testing.expect(server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(7001, newer_generation));
+    try std.testing.expect(!newer_entry.immediate_wake_pending);
+    try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), newer_entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 0), newer_entry.transient_failure_count);
+    try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
+        "docs",
+        7001,
+        std.math.maxInt(u64),
+        .retained,
+        .{ .selected = selected_generation },
+    ));
+    const stale_deferral = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001, selected_generation);
+    try std.testing.expect(!stale_deferral.applied);
+    try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
+        "docs",
+        7001,
+        std.math.maxInt(u64),
+        .retained,
+        .{ .selected = null },
+    ));
+    const stale_fallback_deferral = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001, null);
+    try std.testing.expect(!stale_fallback_deferral.applied);
+    try std.testing.expectEqual(@as(u64, 0), newer_entry.next_retry_at_ms);
+    try std.testing.expectEqual(@as(u32, 0), newer_entry.transient_failure_count);
+    try std.testing.expect(!server.removeProvisionedIndexRepairIfUnchanged(7001, selected_generation));
+    try std.testing.expect(!server.removeProvisionedIndexRepairIfUnchanged(7001, null));
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
 
     // A fallback-discovered group does require queue storage. Failure must be
@@ -24742,12 +25029,42 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     // mistaken for retained exact debt.
     try std.testing.expectError(
         error.OutOfMemory,
-        server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7002, 0, .retained),
+        server.enqueueProvisionedIndexRepairWithRetryForTable("docs", 7002, 0, .retained, .{ .selected = null }),
     );
     try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7002));
 
+    const current_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
+    try std.testing.expect(server.removeProvisionedIndexRepairIfUnchanged(7001, current_generation));
+    try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7001));
+
+    // Destructive lifecycle removal is terminal for every scheduler outcome
+    // selected before it. Neither a pending result nor its failure path may
+    // recreate the removed route after the group-operation barrier is released.
+    try std.testing.expect(!try server.enqueueProvisionedIndexRepairWithRetryForTable(
+        "docs",
+        7001,
+        0,
+        .retained,
+        .{ .selected = current_generation },
+    ));
+    const stale_failure = try server.deferProvisionedIndexRepairAfterFailureForTable("docs", 7001, current_generation);
+    try std.testing.expect(!stale_failure.applied);
+    try std.testing.expectEqual(@as(u64, 0), stale_failure.retry_at_ms);
+    try std.testing.expect(!server.provisioned_index_repair_group_ages.contains(7001));
+
+    // Fallback discovery selected no queue owner and independently proved
+    // durable debt, so it remains authorized to materialize an absent route.
     server.alloc = alloc;
-    server.removeProvisionedIndexRepair(7001);
+    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+        "docs",
+        7001,
+        0,
+        .retained,
+        .{ .selected = null },
+    ));
+    const fallback_generation = server.provisioned_index_repair_group_ages.get(7001).?.wake_generation;
+    try std.testing.expect(fallback_generation != current_generation);
+    try std.testing.expect(server.removeProvisionedIndexRepairIfUnchanged(7001, fallback_generation));
 }
 
 test "data runtime repair queue links and removes debt in constant time" {
@@ -24774,7 +25091,8 @@ test "data runtime repair queue links and removes debt in constant time" {
     try std.testing.expectEqual(@as(u64, 0), server.provisioned_index_repair_not_before_ms.load(.monotonic));
 
     server.provisioned_index_repair_queue_cursor = 20;
-    server.consumeProvisionedIndexRepairImmediateWake(20);
+    const selected_generation = server.provisioned_index_repair_group_ages.get(20).?.wake_generation;
+    try std.testing.expect(server.consumeProvisionedIndexRepairImmediateWakeIfUnchanged(20, selected_generation));
     try std.testing.expectEqual(@as(u64, 40), server.provisioned_index_repair_immediate_wake_count.load(.acquire));
     server.removeProvisionedIndexRepair(1);
     server.removeProvisionedIndexRepair(20);
@@ -26140,18 +26458,41 @@ test "data runtime remote admin snapshot clone releases partial ownership" {
                     .snapshot_path = "backup-12/groups/12.afb",
                 },
             };
+            var tables = [_]antfly.metadata.table_manager.TableRecord{
+                .{ .table_id = 7, .name = "docs", .description = "documents", .schema_json = "{}" },
+                .{ .table_id = 8, .name = "events", .description = "events", .schema_json = "{}" },
+            };
+            var ranges = [_]antfly.metadata.table_manager.RangeRecord{
+                .{ .group_id = 11, .table_id = 7, .start_key = "a", .end_key = "m", .restore_backup_id = "backup-11" },
+                .{ .group_id = 12, .table_id = 8, .start_key = "m", .end_key = "z", .restore_backup_id = "backup-12" },
+            };
+            var restore_progresses = [_]antfly.metadata.table_manager.RestoreProgressRecord{
+                .{ .table_id = 7, .node_id = 3, .group_id = 11, .backup_id = "backup-11", .location = "s3://backups", .phase = "repairing" },
+                .{ .table_id = 8, .node_id = 4, .group_id = 12, .backup_id = "backup-12", .location = "s3://backups", .phase = "complete" },
+            };
+            var replication_source_statuses = [_]antfly.metadata.table_manager.ReplicationSourceStatusRecord{
+                .{ .table_id = 7, .source_ordinal = 0, .source_kind = "postgres", .external_table = "docs", .phase = "streaming" },
+                .{ .table_id = 8, .source_ordinal = 1, .source_kind = "postgres", .external_table = "events", .phase = "snapshot" },
+            };
+            var replication_source_action_hints = [_]antfly.metadata_api.ReplicationSourceActionHint{
+                .{ .table_id = 7, .table_name = @constCast("docs"), .source_ordinal = 0, .action = "reseed", .reason = "slot mismatch", .reseed_exact_cutover_path = @constCast("/tables/docs/reseed") },
+                .{ .table_id = 8, .table_name = @constCast("events"), .source_ordinal = 1, .action = "reseed", .reason = "publication mismatch", .reseed_exact_cutover_path = @constCast("/tables/events/reseed") },
+            };
             const snapshot: antfly.metadata_api.AdminSnapshot = .{
                 .status = .{
                     .metadata_group_id = 1,
                     .metadata_raft_role = "leader",
                     .metrics = .{},
                 },
-                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
-                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .tables = tables[0..],
+                .ranges = ranges[0..],
                 .nodes = nodes[0..],
                 .stores = stores[0..],
                 .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
                 .local_bootstrap_statuses = local_bootstrap_statuses[0..],
+                .restore_progresses = restore_progresses[0..],
+                .replication_source_statuses = replication_source_statuses[0..],
+                .replication_source_action_hints = replication_source_action_hints[0..],
                 .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
                 .merged_group_statuses = merged_group_statuses[0..],

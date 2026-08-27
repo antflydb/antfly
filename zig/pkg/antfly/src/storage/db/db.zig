@@ -3304,6 +3304,11 @@ pub const DB = struct {
         .run_until_idle = maintenanceDriverRunUntilIdle,
     };
 
+    /// Low-level value-returning open. A returned value may move before its
+    /// owner installs it, so this function cannot safely launch workers that
+    /// retain `self`. Long-lived public owners should use `openOwned`; internal
+    /// containers must call `startQuarantineRetryWorkerIfNeeded` only after
+    /// installing the value at its final address.
     pub fn open(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
         return blk: {
             var opts = requested_opts;
@@ -3664,6 +3669,24 @@ pub const DB = struct {
         if (self.closed) return;
         self.closed = true;
         self.deinitWrapperState(true);
+    }
+
+    /// Opens a DB in stable allocator-owned storage. Callers that retain the DB
+    /// should prefer this form whenever background workers are enabled: worker
+    /// callbacks may retain the DB address until `closeOwned` joins them.
+    pub fn openOwned(alloc: Allocator, path: []const u8, opts: OpenOptions) !*DB {
+        const owned = try alloc.create(DB);
+        errdefer alloc.destroy(owned);
+        owned.* = try open(alloc, path, opts);
+        errdefer owned.close();
+        owned.startQuarantineRetryWorkerIfNeeded();
+        return owned;
+    }
+
+    pub fn closeOwned(self: *DB) void {
+        const owner_alloc = self.alloc;
+        self.close();
+        owner_alloc.destroy(self);
     }
 
     pub fn isClosed(self: *const DB) bool {
@@ -26948,6 +26971,18 @@ fn resolvedDocSetFromSearchHitOrdinalsAlloc(alloc: Allocator, hits: []const type
         ordinals[i] = hit.doc_ordinal orelse return null;
     }
     return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+}
+
+test "owned DB open starts self-retaining workers at the stable allocation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owned-db-worker", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const db = try DB.openOwned(alloc, path, .{});
+    defer db.closeOwned();
+    try std.testing.expect(db.quarantineRetryWorkerStartedAtCurrentAddressForTest());
 }
 
 test "resolved doc set from search hits uses complete hit ordinals" {

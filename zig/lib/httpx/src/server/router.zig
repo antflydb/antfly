@@ -59,6 +59,8 @@ pub const Router = struct {
     allocator: Allocator,
     /// Per-method route lists indexed by @intFromEnum(method).
     method_routes: [method_count]std.ArrayListUnmanaged(Route) = [_]std.ArrayListUnmanaged(Route){.empty} ** method_count,
+    body_limited_route_count: usize = 0,
+    body_limited_route_counts: [method_count]usize = [_]usize{0} ** method_count,
     const Self = @This();
 
     /// Creates a new router.
@@ -115,6 +117,10 @@ pub const Router = struct {
             .data = data,
             .max_body_size = max_body_size,
         });
+        if (max_body_size != null) {
+            self.body_limited_route_count += 1;
+            self.body_limited_route_counts[@intFromEnum(method)] += 1;
+        }
     }
 
     /// Adds a route with an owned (duped) pattern string.
@@ -205,11 +211,20 @@ pub const Router = struct {
     }
 
     pub fn bodySizeLimit(self: *const Self, method: types.Method, path: []const u8) ?usize {
+        if (!self.hasBodyLimitsForMethod(method)) return null;
         var params_buf: [16]RouteParam = undefined;
         for (self.routesForConst(method)) |route| {
             if (self.matchRoute(route, path, &params_buf) != null) return route.max_body_size;
         }
         return null;
+    }
+
+    pub fn hasBodyLimits(self: *const Self) bool {
+        return self.body_limited_route_count != 0;
+    }
+
+    pub fn hasBodyLimitsForMethod(self: *const Self, method: types.Method) bool {
+        return self.body_limited_route_counts[@intFromEnum(method)] != 0;
     }
 
     /// Returns the list of allowed methods for a given path.
@@ -387,8 +402,17 @@ test "Router exposes route-specific body limits" {
 
     try router.addWithBodyLimit(.POST, "/bounded/:id", handler, 64 * 1024);
     try router.add(.POST, "/unbounded", handler);
+    try router.add(.PUT, "/overlap/:id", handler);
+    try router.addWithBodyLimit(.PUT, "/overlap/*", handler, 1024);
+    try std.testing.expect(router.hasBodyLimits());
+    try std.testing.expect(router.hasBodyLimitsForMethod(.POST));
+    try std.testing.expect(router.hasBodyLimitsForMethod(.PUT));
+    try std.testing.expect(!router.hasBodyLimitsForMethod(.GET));
     try std.testing.expectEqual(@as(?usize, 64 * 1024), router.bodySizeLimit(.POST, "/bounded/7"));
     try std.testing.expectEqual(@as(?usize, null), router.bodySizeLimit(.POST, "/unbounded"));
+    // Body-limit resolution must preserve normal route precedence: the first
+    // matching route is unbounded even though a later limited route also matches.
+    try std.testing.expectEqual(@as(?usize, null), router.bodySizeLimit(.PUT, "/overlap/7"));
     try std.testing.expectEqual(@as(?usize, null), router.bodySizeLimit(.GET, "/bounded/7"));
 }
 

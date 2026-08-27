@@ -2954,6 +2954,7 @@ pub fn build(b: *std.Build) void {
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
+            "replicated restore persistence maps private callback errors to stable unavailability",
             "failed destination authorization refresh reuses the idempotent restore job",
             "delayed replicated restore refresh cannot regress a running job",
             "restore job store is idempotent and fenced",
@@ -4394,6 +4395,7 @@ pub fn build(b: *std.Build) void {
         "data runtime repair debt hook targets the affected group queue",
         "data runtime repair failures preserve durable backoff and increase retry delay",
         "index repair fallback backoff never blocks an exact durable wake",
+        "data runtime exact repair requeue is allocation-free and failed new enqueue is atomic",
         "data runtime repair queue links and removes debt in constant time",
         "data runtime startup catch-up parks scheduler when only quarantined debt remains",
         "data runtime raft status changes force immediate store status publication",
@@ -6347,6 +6349,8 @@ pub fn build(b: *std.Build) void {
             "structural reconcile publishes durable index repair debt once per group",
             "structural repair handoff keeps status fenced through final shard visibility",
             "repair handoff status settles after authoritative cached publication",
+            "live repair final audit excludes concurrent group mutation through publication",
+            "terminal repair publication settles handoff or retains one fenced retry",
             "managed create publication handoff releases on converged owner publication",
             "managed dense publication handoff releases when its incarnation is superseded",
             "resident DB retry preparation waits outside admission for writer publication",
@@ -6363,6 +6367,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up marks FileNotFound index open terminal degraded",
             "managed startup catch-up preserves restore repair debt while index load is terminal",
             "managed startup catch-up allocation failure preserves bounded retry",
+            "managed startup catch-up quarantines repeated zero progress with bounded backoff",
             "standby HA replay reconciles managed indexes without opening the public write gate",
             "cold replicated apply preserves declared full text projection across retained reopen",
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
