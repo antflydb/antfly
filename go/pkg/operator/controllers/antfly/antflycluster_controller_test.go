@@ -15521,6 +15521,47 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)), "a receipt from a future or incomparable boundary must fail closed")
 }
 
+func TestFormerPrimaryIsolationReleaseRequiresExactActivatedStandby(t *testing.T) {
+	g := NewWithT(t)
+	cluster := startupGatedStandaloneControllerCluster(true)
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+		Name: "standby-a-data", Namespace: "default", UID: types.UID("pvc-uid-1"),
+	}}
+	digest := func(value string) string { return strings.Repeat(value, 64) }
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = "pvc-uid-1"
+	cluster.Status.HAStatus = &antflyv1.HAStatus{StartupGate: &antflyv1.HAStartupGateStatus{
+		RuntimeEligible: true,
+		ActivationReceipt: &antflyv1.HASeedActivationReceiptStatus{
+			TopologyID: "test-standalone", TopologyGeneration: 3,
+			NodeID: "standby-a", SlotName: "standby-a", Generation: "prod-standby-a-10",
+			TargetPVCName: "standby-a-data", TargetPVCUID: "pvc-uid-1",
+			ClusterID: 100, TimelineID: 1, Epoch: 1,
+			ManifestSHA256: digest("a"), AggregateSHA256: digest("b"), SeedReceiptSHA256: digest("c"),
+			CaptureReceiptSHA256: digest("d"), MaterializedReceiptSHA256: digest("e"),
+			MaterializedAggregateSHA256: digest("f"), TargetLocalNodeID: 1, TargetReplicaID: 1,
+			GenerationPath: "live-generations/prod-standby-a-10", RawGenerationPath: "generations/prod-standby-a-10",
+		},
+	}}
+
+	g.Expect(haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, pvc)).To(BeTrue())
+
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
+	g.Expect(haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, pvc)).To(BeFalse(),
+		"an exact seed receipt must never release the old-writer hold")
+	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRoleStandby
+	pvc.UID = types.UID("replacement-pvc-uid")
+	g.Expect(haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, pvc)).To(BeFalse(),
+		"a replacement PVC must never inherit the old activation authority")
+	pvc.UID = types.UID("pvc-uid-1")
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TopologyGeneration = 2
+	g.Expect(haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, pvc)).To(BeFalse(),
+		"a stale topology receipt must never release physical isolation")
+	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TopologyGeneration = 3
+	cluster.Spec.HighAvailability.Runtime.StartupGate.RuntimeEligible = false
+	g.Expect(haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, pvc)).To(BeFalse(),
+		"the observed receipt cannot override Colony's declarative suspension")
+}
+
 func TestUpdateHAStartupGateStatusUsesOnlyObservedActivationJobAndPVC(t *testing.T) {
 	g := NewWithT(t)
 	s := runtime.NewScheme()

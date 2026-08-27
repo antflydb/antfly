@@ -469,6 +469,24 @@ func haStartupGateRuntimeEligible(cluster *antflyv1.AntflyCluster, pvc *corev1.P
 	return haStartupGateActivationReceiptMatches(cluster, pvc, cluster.Status.HAStatus.StartupGate.ActivationReceipt)
 }
 
+// Physical isolation is an irreversible writer fence, not a permanent process
+// tombstone. Release its availability hold only after Colony has rewritten the
+// former primary as a standby and both the declarative and observed startup
+// gates prove the exact activated generation on the exact retained PVC.
+func haFormerPrimaryIsolationReleasedByActivatedStandby(cluster *antflyv1.AntflyCluster, pvc *corev1.PersistentVolumeClaim) bool {
+	if cluster == nil || cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Runtime == nil ||
+		cluster.Spec.HighAvailability.Runtime.Role != antflyv1.HARuntimeRoleStandby {
+		return false
+	}
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed ||
+		gate.ReceiptMatchPolicy != antflyv1.HAReceiptMatchPolicyExact || gate.RequiredReceipt == nil {
+		return false
+	}
+	eligible, _ := haStartupGateRuntimeEligible(cluster, pvc)
+	return eligible
+}
+
 func haStartupGateActivationReceiptMatches(
 	cluster *antflyv1.AntflyCluster,
 	pvc *corev1.PersistentVolumeClaim,
@@ -4317,13 +4335,6 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 	if replicas == 0 {
 		replicas = 1
 	}
-	if haFormerPrimaryIsolationActive(cluster) {
-		// A completed Kubernetes physical fence remains an availability hold
-		// until Colony rewrites this runtime as a standby with an exact startup
-		// gate. Never let ordinary StatefulSet reconciliation resurrect the old
-		// writer after ownership has moved to another Lease holder.
-		replicas = 0
-	}
 	storageSize := chooseStandaloneStorageSize(cluster)
 	startupGate := haRuntimeStartupGate(cluster)
 	activatedSeedGate := startupGate != nil && startupGate.Policy == antflyv1.HAStartupGatePolicyRequireActivatedSeed && startupGate.RequiredReceipt != nil
@@ -4352,6 +4363,12 @@ func (r *AntflyClusterReconciler) reconcileStandaloneStatefulSet(ctx context.Con
 				return nil
 			}
 		}
+	}
+	if haFormerPrimaryIsolationActive(cluster) && !haFormerPrimaryIsolationReleasedByActivatedStandby(cluster, startupPVC) {
+		// Never let ordinary StatefulSet reconciliation resurrect the old writer
+		// after ownership has moved. The only release path is the exact, PVC-bound
+		// standby activation proof above.
+		replicas = 0
 	}
 
 	var storageClassName *string
