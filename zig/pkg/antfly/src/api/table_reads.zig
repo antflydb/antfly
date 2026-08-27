@@ -58,6 +58,7 @@ const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
+const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const public_limits = @import("public_limits.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
@@ -17038,23 +17039,18 @@ fn appendGraphQueriesField(
     graph_queries_proxy_json: []const u8,
 ) !void {
     if (graph_queries.len == 0) return;
-    const wire = std.mem.trim(u8, graph_queries_proxy_json, &std.ascii.whitespace);
-    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, wire, .{}) catch
-        return error.UnsupportedQueryRequest;
+    var parsed = graph_wire_envelope.parseEnvelopeAlloc(
+        alloc,
+        graph_queries_proxy_json,
+        graph_queries,
+    ) catch return error.UnsupportedQueryRequest;
     defer parsed.deinit();
-    if (parsed.value != .object or parsed.value.object.count() != 1)
-        return error.UnsupportedQueryRequest;
-    const canonical = parsed.value.object.get("graph_queries");
-    const legacy = parsed.value.object.get("graph_searches");
-    if ((canonical == null) == (legacy == null)) return error.UnsupportedQueryRequest;
-    const operations = canonical orelse legacy.?;
-    if (operations != .object or operations.object.count() != graph_queries.len)
-        return error.UnsupportedQueryRequest;
-    for (graph_queries) |named| {
-        if (operations.object.get(named.name) == null) return error.UnsupportedQueryRequest;
-    }
+    const operations = parsed.operations();
 
-    try appendJsonFieldName(alloc, out, first, if (legacy != null) "graph_searches" else "graph_queries");
+    try appendJsonFieldName(alloc, out, first, switch (parsed.dialect) {
+        .canonical => "graph_queries",
+        .legacy => "graph_searches",
+    });
     const encoded_operations = try std.json.Stringify.valueAlloc(alloc, operations, .{});
     defer alloc.free(encoded_operations);
     try out.appendSlice(alloc, encoded_operations);

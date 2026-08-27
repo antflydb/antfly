@@ -15737,6 +15737,13 @@ export interface operations {
             /** @description Query successful */
             200: {
                 headers: {
+                    /**
+                     * @description RFC 9745 structured deprecation date. Stateful Antfly emits
+                     *     this header when a successful request used the deprecated
+                     *     `graph_searches` field; canonical requests and canonical-only
+                     *     serverless surfaces omit it.
+                     */
+                    Deprecation?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16031,6 +16038,13 @@ export interface operations {
             /** @description Query successful */
             200: {
                 headers: {
+                    /**
+                     * @description RFC 9745 structured deprecation date. Stateful Antfly emits
+                     *     this header when a successful request used the deprecated
+                     *     `graph_searches` field; canonical requests and canonical-only
+                     *     serverless surfaces omit it.
+                     */
+                    Deprecation?: string;
                     [name: string]: unknown;
                 };
                 content: {

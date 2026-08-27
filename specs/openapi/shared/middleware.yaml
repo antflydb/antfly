@@ -54,12 +54,13 @@ components:
             - "Authorization"
         exposed_headers:
           type: array
-          description: "Headers exposed to the client. Useful if your API returns custom headers that the frontend needs to read. ['*'] is rejected when credentials are enabled because browsers treat it as a literal header name."
+          description: "Headers exposed to the client. Supplying this field replaces the defaults, so include `Deprecation` if browser clients must observe legacy API migration signals. ['*'] is rejected when credentials are enabled because browsers treat it as a literal header name."
           items:
             type: string
           default:
             - "X-Request-ID"
             - "Retry-After"
+            - "Deprecation"
             - "X-RateLimit-Limit"
             - "X-RateLimit-Remaining"
             - "X-RateLimit-Reset"

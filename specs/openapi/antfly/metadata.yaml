@@ -10040,6 +10040,17 @@ paths:
       responses:
         "200":
           description: Query successful
+          headers:
+            Deprecation:
+              description: |
+                RFC 9745 structured deprecation date. Stateful Antfly emits
+                this header when a successful request used the deprecated
+                `graph_searches` field; canonical requests and canonical-only
+                serverless surfaces omit it.
+              schema:
+                type: string
+                pattern: '^@[0-9]+$'
+                example: '@1787702400'
           content:
             application/json:
               schema:
@@ -10438,6 +10449,17 @@ paths:
       responses:
         "200":
           description: Query successful
+          headers:
+            Deprecation:
+              description: |
+                RFC 9745 structured deprecation date. Stateful Antfly emits
+                this header when a successful request used the deprecated
+                `graph_searches` field; canonical requests and canonical-only
+                serverless surfaces omit it.
+              schema:
+                type: string
+                pattern: '^@[0-9]+$'
+                example: '@1787702400'
           content:
             application/json:
               schema:

@@ -32,6 +32,7 @@ const public_search_request_mod = @import("public_search_request.zig");
 const public_text_query_mod = @import("public_text_query.zig");
 const public_query_string_mod = @import("public_query_string.zig");
 const public_limits = @import("public_limits.zig");
+const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const query_openapi = @import("antfly_query_openapi");
@@ -423,29 +424,19 @@ pub const QueryResponseMeta = struct {
 
 /// Transitional public response shaping. This remains API-local; graph
 /// executors and storage graph plans always use the canonical IR.
-const GraphResponseFormat = enum { canonical, legacy };
+const GraphResponseFormat = graph_wire_envelope.Dialect;
 
 fn graphResponseFormat(
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
 ) !GraphResponseFormat {
-    const envelope = std.mem.trim(u8, req.graph_queries_proxy_json, &std.ascii.whitespace);
-    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, envelope, .{}) catch
-        return error.InvalidRemoteResponse;
+    var parsed = graph_wire_envelope.parseEnvelopeAlloc(
+        alloc,
+        req.graph_queries_proxy_json,
+        req.graph_queries,
+    ) catch return error.InvalidRemoteResponse;
     defer parsed.deinit();
-    if (parsed.value != .object or parsed.value.object.count() != 1)
-        return error.InvalidRemoteResponse;
-
-    const canonical = parsed.value.object.get("graph_queries");
-    const legacy = parsed.value.object.get("graph_searches");
-    if ((canonical == null) == (legacy == null)) return error.InvalidRemoteResponse;
-    const operations = canonical orelse legacy.?;
-    if (operations != .object or operations.object.count() != req.graph_queries.len)
-        return error.InvalidRemoteResponse;
-    for (req.graph_queries) |query| {
-        if (operations.object.get(query.name) == null) return error.InvalidRemoteResponse;
-    }
-    return if (legacy != null) .legacy else .canonical;
+    return parsed.dialect;
 }
 
 test "graph response format classifies the admitted envelope structurally" {
@@ -10501,24 +10492,10 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
 /// proxying. This stays independent of generated OpenAPI representation details
 /// and avoids a reverse serializer that would have to evolve with the DSL.
 fn captureGraphQueriesProxyEnvelopeAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
-        return error.InvalidQueryRequest;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidQueryRequest;
-    const canonical_value = parsed.value.object.get("graph_queries");
-    const legacy_value = parsed.value.object.get("graph_searches");
-    // Generated serializers emit nullable optional fields as explicit nulls.
-    // Treat those exactly like omission, matching the typed request contract,
-    // while still rejecting two simultaneously populated graph dialects.
-    const canonical = if (canonical_value != null and canonical_value.? != .null) canonical_value else null;
-    const legacy = if (legacy_value != null and legacy_value.? != .null) legacy_value else null;
-    if (canonical != null and legacy != null) return error.InvalidQueryRequest;
-    const value = canonical orelse legacy orelse return error.InvalidQueryRequest;
-    if (value != .object) return error.InvalidQueryRequest;
-    var envelope = std.json.ObjectMap.empty;
-    defer envelope.deinit(alloc);
-    try envelope.put(alloc, if (canonical != null) "graph_queries" else "graph_searches", value);
-    return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = envelope }, .{});
+    return graph_wire_envelope.captureRequestEnvelopeAlloc(alloc, body) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidQueryRequest,
+    };
 }
 
 fn freeNamedDocFilterBindings(alloc: std.mem.Allocator, bindings: []const db_mod.types.NamedDocFilterBinding) void {

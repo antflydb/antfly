@@ -58,6 +58,7 @@ const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-
 const cors_default_exposed_headers = [_][]const u8{
     "X-Request-ID",
     "Retry-After",
+    "Deprecation",
     "X-RateLimit-Limit",
     "X-RateLimit-Remaining",
     "X-RateLimit-Reset",
@@ -5821,7 +5822,7 @@ test "standalone CORS middleware enforces dynamic configuration" {
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
         try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
         try std.testing.expectEqualStrings(
-            "X-Request-ID, Retry-After, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset",
+            "X-Request-ID, Retry-After, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset",
             response.headers.get("Access-Control-Expose-Headers").?,
         );
     }

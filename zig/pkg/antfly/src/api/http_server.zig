@@ -31,6 +31,7 @@ const batch_api = @import("batch.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
+const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
 const indexes_api = @import("indexes.zig");
@@ -218,7 +219,12 @@ fn markLegacyGraphSearchResponse(
     // RFC 9745 requires an RFC 9651 Structured Field Date, not a boolean.
     // This is the UTC date on which the canonical replacement contract was
     // published for migration.
-    try appendOwnedResponseHeader(alloc, response, "Deprecation", "@1787702400");
+    try appendOwnedResponseHeader(
+        alloc,
+        response,
+        graph_wire_envelope.deprecation_header_name,
+        graph_wire_envelope.deprecation_header_value,
+    );
     // Deliberately omit table, operation, and query values. The stable message
     // is a low-cardinality fleet signal that log aggregation can count without
     // exposing request data or creating unbounded metric labels.
@@ -252,8 +258,8 @@ test "legacy graph search responses carry an owned deprecation signal" {
     defer response.deinit(alloc);
     try markLegacyGraphSearchResponse(alloc, &response);
     try std.testing.expectEqual(@as(usize, 1), response.headers.len);
-    try std.testing.expectEqualStrings("Deprecation", response.headers[0].name);
-    try std.testing.expectEqualStrings("@1787702400", response.headers[0].value);
+    try std.testing.expectEqualStrings(graph_wire_envelope.deprecation_header_name, response.headers[0].name);
+    try std.testing.expectEqualStrings(graph_wire_envelope.deprecation_header_value, response.headers[0].value);
 }
 
 fn mcpSampleDocumentsJsonAlloc(alloc: std.mem.Allocator, ndjson: []const u8) ![]u8 {

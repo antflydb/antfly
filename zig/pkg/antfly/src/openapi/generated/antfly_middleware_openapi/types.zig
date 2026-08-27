@@ -12,7 +12,7 @@ pub const CORSConfig = struct {
     allowed_methods: ?[]const []const u8 = null,
     /// Headers that can be used in CORS requests. ['*'] allows any valid requested header; when credentials are enabled, the server reflects the validated requested header names because browsers treat '*' as a literal name in credentialed CORS.
     allowed_headers: ?[]const []const u8 = null,
-    /// Headers exposed to the client. Useful if your API returns custom headers that the frontend needs to read. ['*'] is rejected when credentials are enabled because browsers treat it as a literal header name.
+    /// Headers exposed to the client. Supplying this field replaces the defaults, so include `Deprecation` if browser clients must observe legacy API migration signals. ['*'] is rejected when credentials are enabled because browsers treat it as a literal header name.
     exposed_headers: ?[]const []const u8 = null,
     /// Indicates whether credentials (cookies, auth headers) are allowed. Note: If true, allowed_origins cannot be ['*'].
     allow_credentials: ?bool = null,
