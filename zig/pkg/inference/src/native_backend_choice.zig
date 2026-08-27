@@ -102,6 +102,33 @@ pub fn compiledPartitionBackendForMode(choice: Choice, compiled_mode_requested: 
     return compiledPartitionBackend(choice);
 }
 
+pub fn validateRequiredCompiledBackend(
+    session_manager: *const backends.SessionManager,
+    compiled_backend: ?ops.BackendKind,
+) !void {
+    try session_manager.validateRequiredBackendPolicy();
+    const backend = switch (compiled_backend orelse return) {
+        .native => backends.BackendType.native,
+        .metal => backends.BackendType.metal,
+        .onnx => backends.BackendType.onnx,
+        .pjrt => backends.BackendType.pjrt,
+        .cuda => backends.BackendType.cuda,
+        .wasm, .webgpu => backends.BackendType.wasm,
+        .graph => {
+            if (session_manager.required_backend_invalid) return error.InvalidRequiredBackend;
+            if (session_manager.required_backend != null) return error.RequiredBackendUnavailable;
+            return;
+        },
+    };
+    if (!try session_manager.allowsBackend(backend)) return error.RequiredBackendUnavailable;
+}
+
+pub fn compiledArtifactBackend(name: []const u8) !ops.BackendKind {
+    if (std.mem.eql(u8, name, "onnx")) return .onnx;
+    if (std.mem.eql(u8, name, "xla")) return .pjrt;
+    return error.UnsupportedCompileBackend;
+}
+
 pub fn forcesGraphMode(choice: Choice) bool {
     return compiledPartitionBackend(choice) != null;
 }
@@ -147,6 +174,49 @@ test "compiledPartitionBackend maps explicit compiled backends" {
         try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.webgpu, true));
     }
     try std.testing.expectEqual(@as(?ops.BackendKind, null), compiledPartitionBackendForMode(.webgpu, false));
+}
+
+test "required backend gates compiled backend execution" {
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    manager.required_backend = .native;
+    manager.required_backend_invalid = false;
+    try validateRequiredCompiledBackend(&manager, null);
+    try validateRequiredCompiledBackend(&manager, .native);
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        validateRequiredCompiledBackend(&manager, .onnx),
+    );
+
+    manager.required_backend = .pjrt;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        validateRequiredCompiledBackend(&manager, .pjrt),
+    );
+
+    manager.required_backend = null;
+    manager.required_backend_invalid = true;
+    try std.testing.expectError(
+        error.InvalidRequiredBackend,
+        validateRequiredCompiledBackend(&manager, .onnx),
+    );
+    try std.testing.expectError(
+        error.InvalidRequiredBackend,
+        validateRequiredCompiledBackend(&manager, .graph),
+    );
+}
+
+test "compiled artifact backend names share required policy validation" {
+    try std.testing.expectEqual(ops.BackendKind.onnx, try compiledArtifactBackend("onnx"));
+    try std.testing.expectEqual(ops.BackendKind.pjrt, try compiledArtifactBackend("xla"));
+    try std.testing.expectError(error.UnsupportedCompileBackend, compiledArtifactBackend("cuda"));
+
+    var manager = backends.SessionManager.init(std.testing.allocator);
+    manager.required_backend = .native;
+    manager.required_backend_invalid = false;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        validateRequiredCompiledBackend(&manager, try compiledArtifactBackend("onnx")),
+    );
 }
 
 test "explicit session preferences never silently fall back" {

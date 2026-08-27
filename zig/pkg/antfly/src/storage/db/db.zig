@@ -3134,10 +3134,11 @@ pub const DB = struct {
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
-    // Spawned at open only when the load left failures behind; exits once all
+    // Started after the DB reaches its final address; exits once all
     // quarantined indexes recover or the DB closes.
     quarantine_retry_thread: ?std.Thread = null,
     quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    quarantine_retry_start_address_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     artifact_repair_metadata_future: ?Io.Future(void) = null,
     artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shadow: ?ShadowState,
@@ -3367,6 +3368,11 @@ pub const DB = struct {
         .run_until_idle = maintenanceDriverRunUntilIdle,
     };
 
+    /// Low-level value-returning open. A returned value may move before its
+    /// owner installs it, so this function cannot safely launch workers that
+    /// retain `self`. Long-lived public owners should use `openOwned`; internal
+    /// containers must call `startQuarantineRetryWorkerIfNeeded` only after
+    /// installing the value at its final address.
     pub fn open(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
         return blk: {
             var opts = requested_opts;
@@ -3709,9 +3715,6 @@ pub const DB = struct {
                 try db.startOptionalRuntimes();
                 profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
             }
-            if (optional_runtime_workers_enabled and opts.open_mode == .writer) {
-                db.startQuarantineRetryWorkerIfNeeded();
-            }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 // Cleanup jobs can call back into repair/coverage state. Submit
                 // them only after startup replay and optional runtimes have
@@ -3730,6 +3733,24 @@ pub const DB = struct {
         if (self.closed) return;
         self.closed = true;
         self.deinitWrapperState(true);
+    }
+
+    /// Opens a DB in stable allocator-owned storage. Callers that retain the DB
+    /// should prefer this form whenever background workers are enabled: worker
+    /// callbacks may retain the DB address until `closeOwned` joins them.
+    pub fn openOwned(alloc: Allocator, path: []const u8, opts: OpenOptions) !*DB {
+        const owned = try alloc.create(DB);
+        errdefer alloc.destroy(owned);
+        owned.* = try open(alloc, path, opts);
+        errdefer owned.close();
+        owned.startQuarantineRetryWorkerIfNeeded();
+        return owned;
+    }
+
+    pub fn closeOwned(self: *DB) void {
+        const owner_alloc = self.alloc;
+        self.close();
+        owner_alloc.destroy(self);
     }
 
     pub fn isClosed(self: *const DB) bool {
@@ -18763,12 +18784,21 @@ pub const DB = struct {
         }
     }
 
-    fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
-        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
+    /// Start only after the DB has reached its final address. The spawned
+    /// thread retains `self` after this call returns.
+    pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         // Tests drive retries deterministically via retryQuarantinedIndexLoads;
         // a background worker racing them turns every quarantine-shaped test
         // into a timing assumption.
-        if (comptime builtin.is_test) return;
+        if (comptime builtin.is_test) {
+            if (self.quarantine_retry_start_address_for_test == 0) {
+                self.quarantine_retry_start_address_for_test = @intFromPtr(self);
+            }
+            return;
+        }
+        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
+        if (!self.optional_runtime_workers_enabled or self.open_mode != .writer) return;
+        if (self.quarantine_retry_thread != null) return;
         if (!self.core.index_manager.hasLoadFailures()) return;
         self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {
             // Self-healing is best-effort: the quarantine still recovers on
@@ -18776,6 +18806,14 @@ pub const DB = struct {
             std.log.warn("quarantine retry worker spawn failed: {}", .{err});
             return;
         };
+    }
+
+    pub fn quarantineRetryWorkerStartedAtCurrentAddressForTest(self: *const DB) bool {
+        if (comptime builtin.is_test) {
+            return self.quarantine_retry_start_address_for_test == @intFromPtr(self);
+        } else {
+            return false;
+        }
     }
 
     fn stopQuarantineRetryWorker(self: *DB) void {
@@ -20936,10 +20974,16 @@ pub const DB = struct {
             item.index_repair_phase,
             item.index_repair_wait_reason,
         );
-        // Keep status available when the optional bounded proof cannot be
+        // Keep status available when either optional bounded proof cannot be
         // read; query admission independently retries it and remains closed.
-        item.index_repair_active_generation_serviceable =
-            self.managedAdmissionGenerationIsQueryable(alloc, intent) catch false;
+        // A complete active generation makes managed-admission repair debt
+        // redundant even before its scheduler quantum removes the intent.
+        // Preserve degradation for merely queryable progressive generations:
+        // their physical artifact count can still be advancing.
+        const active_generation_complete =
+            self.managedAdmissionGenerationIsServiceable(alloc, intent) catch false;
+        item.index_repair_active_generation_serviceable = active_generation_complete or
+            (self.managedAdmissionGenerationIsQueryable(alloc, intent) catch false);
         switch (intent.trigger) {
             .incomplete_bulk_publish,
             .root_generation_rebuild,
@@ -20963,6 +21007,7 @@ pub const DB = struct {
                     intent.phase == .terminal;
             },
         }
+        if (active_generation_complete) item.repair_degraded = false;
     }
 
     fn durableGenerationBuildActive(item: *const types.DBIndexStats) bool {
@@ -21458,6 +21503,14 @@ pub const DB = struct {
         else
             fallback;
         const desired = self.async_context.enrichment_desired_running.load(.acquire);
+        // `desired` is the lock-free source of truth for whether this DB owns
+        // an enrichment producer. A retained query-only snapshot may have
+        // `enabled=false`, and lifecycle contention prevents us from replacing
+        // it with runtime.stats(). Never let that observation gap turn a live
+        // or restarting producer into a disabled one: public readiness treats
+        // enabled + retrying as transient debt and remains fail-closed until a
+        // later poll can observe the worker directly.
+        if (desired) enrichment_status.enabled = true;
         const started = if (lifecycle_locked)
             if (self.async_context.enrichment_runtime) |runtime| runtime.isStarted() else false
         else
@@ -21473,7 +21526,10 @@ pub const DB = struct {
         return enrichment_status;
     }
 
-    fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
+    /// Refresh lock-free worker diagnostics on a retained status snapshot.
+    /// Callers that only need runtime lifecycle facts can use this without
+    /// contending on the index apply lock or replacing durable coverage data.
+    pub fn overlayRuntimeStatusRuntimeBestEffort(self: *DB, runtime_stats: *types.DBStats) void {
         runtime_stats.async_indexing = self.snapshotAsyncIndexingStats();
         runtime_stats.enrichment = self.enrichmentStatsWithSupervisorState(runtime_stats.enrichment);
         runtime_stats.resolution = self.resolutionStageStats();
@@ -21692,12 +21748,12 @@ pub const DB = struct {
     }
 
     pub fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) void {
-        self.overlayRuntimeStatusRuntimeOnly(runtime_stats);
+        self.overlayRuntimeStatusRuntimeBestEffort(runtime_stats);
         self.overlayRuntimeStatusIndexesAssumeApplyLockHeld(stats_alloc, runtime_stats);
     }
 
     pub fn overlayRuntimeStatusConsistent(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) !void {
-        self.overlayRuntimeStatusRuntimeOnly(runtime_stats);
+        self.overlayRuntimeStatusRuntimeBestEffort(runtime_stats);
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
         try self.overlayRuntimeStatusIndexesLocked(stats_alloc, runtime_stats);
@@ -26997,6 +27053,18 @@ fn resolvedDocSetFromSearchHitOrdinalsAlloc(alloc: Allocator, hits: []const type
         ordinals[i] = hit.doc_ordinal orelse return null;
     }
     return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+}
+
+test "owned DB open starts self-retaining workers at the stable allocation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owned-db-worker", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const db = try DB.openOwned(alloc, path, .{});
+    defer db.closeOwned();
+    try std.testing.expect(db.quarantineRetryWorkerStartedAtCurrentAddressForTest());
 }
 
 test "resolved doc set from search hits uses complete hit ordinals" {
@@ -46705,7 +46773,6 @@ test "db enrichment status does not wait for lifecycle mutation" {
 
     lockAtomicWithBackoff(&db.async_context.enrichment_lifecycle_mutex);
     const fallback = types.EnrichmentStats{
-        .enabled = true,
         .target_sequence = 41,
         .applied_sequence = 37,
     };
@@ -46717,6 +46784,27 @@ test "db enrichment status does not wait for lifecycle mutation" {
     try std.testing.expectEqual(@as(u64, 37), status.applied_sequence);
     try std.testing.expect(status.retrying);
     try std.testing.expect(!status.worker_failed);
+}
+
+test "db runtime-only status overlay preserves a resident enrichment worker" {
+    const alloc = std.testing.allocator;
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+
+    // Model a durable/query-only recovery snapshot. A resident writer overlay
+    // must replace its absent producer diagnostics immediately rather than
+    // waiting for the periodic full status refresh.
+    var recovered: types.DBStats = .{};
+    db.overlayRuntimeStatusRuntimeBestEffort(&recovered);
+    try std.testing.expect(recovered.enrichment.enabled);
+    try std.testing.expect(recovered.enrichment.worker_started);
 }
 
 test "db ttl cleanup enabled requires backend runtime io" {
@@ -74296,6 +74384,15 @@ test "db progressive managed admission serves a checkpointed partial generation"
     });
     try std.testing.expect(try db.managedAdmissionGenerationIsQueryable(alloc, repair.intent));
     try std.testing.expect(!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
+    const partial_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, partial_stats);
+    var saw_partial_repair_degraded = false;
+    for (partial_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
+        try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
+        saw_partial_repair_degraded = index_stats.repair_degraded;
+    }
+    try std.testing.expect(saw_partial_repair_degraded);
     try db.failIfIndexQuarantined(cfg.name);
 
     var partial = try db.search(alloc, .{
@@ -74463,11 +74560,14 @@ test "db completed partial managed admission serves and retires redundant repair
     const runtime_stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, runtime_stats);
     var saw_serviceable_generation = false;
+    var saw_redundant_repair_degraded = true;
     for (runtime_stats.indexes) |index_stats| {
         if (!std.mem.eql(u8, index_stats.name, cfg.name)) continue;
         saw_serviceable_generation = index_stats.index_repair_active_generation_serviceable;
+        saw_redundant_repair_degraded = index_stats.repair_degraded;
     }
     try std.testing.expect(saw_serviceable_generation);
+    try std.testing.expect(!saw_redundant_repair_degraded);
 
     // Query admission may prove the pinned active generation independently of
     // the background scheduler, while the next scheduler quantum durably

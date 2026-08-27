@@ -2,6 +2,7 @@ package v1
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/robfig/cron/v3"
@@ -14,7 +15,10 @@ var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month 
 // ValidateCreate validates the backup configuration when creating a new backup.
 // Called by controller fallback when webhooks are disabled.
 func (r *AntflyBackup) ValidateCreate() error {
-	return r.ValidateAntflyBackup()
+	if err := r.ValidateAntflyBackup(); err != nil {
+		return err
+	}
+	return r.ValidateBackupConnection()
 }
 
 // ValidateUpdate validates the backup configuration when updating an existing backup.
@@ -28,7 +32,27 @@ func (r *AntflyBackup) ValidateUpdate(old runtime.Object) error {
 	if err := r.ValidateBackupImmutability(oldBackup); err != nil {
 		return err
 	}
-	return r.ValidateAntflyBackup()
+	if err := r.ValidateAntflyBackup(); err != nil {
+		return err
+	}
+	if r.Spec.Destination.Connection == "" && oldBackup.Spec.Destination.Connection == "" &&
+		reflect.DeepEqual(r.Spec, oldBackup.Spec) {
+		return nil
+	}
+	return r.ValidateBackupConnection()
+}
+
+// ValidateBackupConnection enforces the network API's named-connection
+// contract without making the CRD structurally incompatible with existing
+// resources during an operator upgrade.
+func (r *AntflyBackup) ValidateBackupConnection() error {
+	if strings.TrimSpace(r.Spec.Destination.Connection) == "" {
+		return fmt.Errorf("spec.destination.connection is required; configure an external_io connection with backup.write and migrate any legacy credentialsSecret before enabling this schedule")
+	}
+	if r.Spec.Destination.CredentialsSecret != nil {
+		return fmt.Errorf("spec.destination.credentialsSecret is deprecated and cannot be used with network backups; configure credentials on spec.destination.connection")
+	}
+	return nil
 }
 
 // ValidateAntflyBackup performs all validation checks
@@ -116,12 +140,9 @@ in your credentials secret.`, location)
 	if r.Spec.Destination.Connection != "" && r.Spec.Destination.CredentialsSecret != nil {
 		return fmt.Errorf("spec.destination.connection and spec.destination.credentialsSecret are mutually exclusive")
 	}
-	if r.Spec.Destination.Connection != "" && !strings.HasPrefix(location, "s3://") {
-		return fmt.Errorf("spec.destination.connection requires an s3:// location")
-	}
-
-	// S3 destinations should have credentials (warn if missing, don't error)
-	// The controller will handle credential validation at runtime
+	// Both object and filesystem locations are authorized by the named
+	// external_io connection; the runtime performs the protocol-specific scope
+	// check.
 
 	return nil
 }

@@ -3947,6 +3947,63 @@ func baseCluster() *AntflyCluster {
 	}
 }
 
+func TestValidateInternalServiceAuthDistributedContract(t *testing.T) {
+	cluster := baseCluster()
+	cluster.Spec.Mode = ClusterModeDistributed
+
+	err := cluster.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "spec.internalServiceAuth is required in Distributed mode") {
+		t.Fatalf("expected missing internal service auth to fail closed, got: %v", err)
+	}
+
+	optional := false
+	cluster.Spec.InternalServiceAuth = &InternalServiceAuthSpec{SecretKeyRef: corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "cluster-internal-service-auth"},
+		Key:                  "secret",
+		Optional:             &optional,
+	}}
+	if err := cluster.ValidateCreate(); err != nil {
+		t.Fatalf("expected a required namespaced Secret selector to be valid, got: %v", err)
+	}
+
+	optional = true
+	err = cluster.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "optional must be false") {
+		t.Fatalf("expected an optional signing key to be rejected, got: %v", err)
+	}
+}
+
+func TestValidateInternalServiceAuthRotationTransition(t *testing.T) {
+	old := baseCluster()
+	old.Spec.Mode = ClusterModeDistributed
+	old.Spec.InternalServiceAuth = &InternalServiceAuthSpec{SecretKeyRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "key-v1"}, Key: "secret"}}
+	next := corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "key-v2"}, Key: "secret"}
+	old.Spec.InternalServiceAuth.NextSecretKeyRef = &next
+
+	promoted := old.DeepCopy()
+	promoted.Spec.InternalServiceAuth.SecretKeyRef = next
+	promoted.Spec.InternalServiceAuth.NextSecretKeyRef = nil
+	if err := promoted.ValidateUpdate(old); err == nil || !strings.Contains(err.Error(), "cannot advance") {
+		t.Fatalf("early promotion error = %v, want rotation gate", err)
+	}
+	old.Status.InternalServiceAuthRotation = &InternalServiceAuthRotationStatus{Phase: InternalServiceAuthRotationSwitched, TargetSecretName: next.Name, TargetSecretKey: next.Key}
+	if err := promoted.ValidateUpdate(old); err != nil {
+		t.Fatalf("completed atomic promotion rejected: %v", err)
+	}
+}
+
+func TestValidateInternalServiceAuthForbiddenForStandalone(t *testing.T) {
+	cluster := baseStandaloneCluster()
+	cluster.Spec.InternalServiceAuth = &InternalServiceAuthSpec{SecretKeyRef: corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "unused"},
+		Key:                  "secret",
+	}}
+	err := cluster.ValidateCreate()
+	if err == nil || !strings.Contains(err.Error(), "must be omitted in Standalone mode") {
+		t.Fatalf("expected standalone internal service auth to be rejected, got: %v", err)
+	}
+}
+
 func baseStandaloneCluster() *AntflyCluster {
 	return &AntflyCluster{
 		ObjectMeta: metav1.ObjectMeta{

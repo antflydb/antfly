@@ -2903,6 +2903,37 @@ spec:
                       type: object
                     type: array
                 type: object
+              internalServiceAuth:
+                properties:
+                  nextSecretKeyRef:
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        default: ""
+                        type: string
+                      optional:
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  secretKeyRef:
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        default: ""
+                        type: string
+                      optional:
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - secretKeyRef
+                type: object
               metadataNodes:
                 properties:
                   affinity:
@@ -6116,6 +6147,19 @@ spec:
                   unhealthyStandbyCount:
                     format: int32
                     type: integer
+                type: object
+              internalServiceAuthRotation:
+                properties:
+                  phase:
+                    type: string
+                  targetSecretKey:
+                    type: string
+                  targetSecretName:
+                    type: string
+                required:
+                - phase
+                - targetSecretKey
+                - targetSecretName
                 type: object
               metadataNodesReady:
                 format: int32

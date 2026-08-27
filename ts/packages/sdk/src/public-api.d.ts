@@ -8472,15 +8472,25 @@ export interface components {
          * @example {
          *       "provider": "bedrock",
          *       "model": "cohere.embed-v4",
+         *       "request_format": "cohere_v4",
          *       "region": "us-east-1"
          *     }
          */
         BedrockEmbedderConfig: {
             /**
-             * @description The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
+             * @description The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
              * @example cohere.embed-v4
              */
             model: string;
+            /**
+             * @description Bedrock provider request schema. `auto` recognizes direct foundation-model IDs,
+             *     foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
+             *     for application inference profiles, provisioned throughput, custom models, and
+             *     other aliases whose invocation target does not identify the underlying model.
+             * @default auto
+             * @enum {string}
+             */
+            request_format?: "auto" | "titan_text" | "titan_multimodal" | "cohere_v3" | "cohere_v4";
             /**
              * @description The AWS region for the Bedrock service (e.g., 'us-east-1').
              * @example us-east-1

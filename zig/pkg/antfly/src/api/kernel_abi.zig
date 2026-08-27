@@ -115,6 +115,23 @@ pub const HttpHandleContext = extern struct {
     out_response: *HttpResponseView,
 };
 
+/// Evaluates the API kernel's internal-service ingress policy for routes that
+/// are registered by the host runtime rather than emitted by the kernel route
+/// manifest. A null response handle means admission succeeded. The legacy bit
+/// asks the host to mark the eventual application response during the bounded
+/// rolling-upgrade compatibility phase.
+pub const InternalServiceAuthContext = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
+    handler_handle: *anyopaque,
+    request: *const HttpRequestView,
+    /// Request-scoped host executor. It must not be retained after the call.
+    executor: native_abi.IoBorrow,
+    out_response_handle: *?*anyopaque,
+    out_response: *HttpResponseView,
+    out_legacy_accepted: *u8,
+};
+
 pub const RouteManifestEntry = extern struct {
     route_handle: *anyopaque,
     method: HttpMethod,
@@ -157,6 +174,7 @@ pub const Capability = struct {
     pub const core: u64 = 1 << 0;
     pub const route_manifest: u64 = 1 << 3;
     pub const inference_admission_stats: u64 = 1 << 4;
+    pub const internal_service_ingress: u64 = 1 << 5;
 };
 
 /// The sole discovery point for the API-kernel ABI. Keeping the table itself
@@ -191,6 +209,7 @@ pub const FunctionTable = extern struct {
     handler_destroy_http_response: *const fn (*anyopaque) callconv(.c) void,
     handler_destroy: *const fn (*anyopaque) callconv(.c) void,
     inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
+    handler_authorize_internal_service: *const fn (*const InternalServiceAuthContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -211,7 +230,8 @@ fn functionTableFieldEnd(comptime field_name: []const u8) u32 {
 pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
     const known = Capability.core |
         Capability.route_manifest |
-        Capability.inference_admission_stats;
+        Capability.inference_admission_stats |
+        Capability.internal_service_ingress;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
@@ -220,6 +240,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("handler_route_manifest"));
     if (required_capabilities & Capability.inference_admission_stats != 0)
         required = @max(required, functionTableFieldEnd("inference_admission_stats"));
+    if (required_capabilities & Capability.internal_service_ingress != 0)
+        required = @max(required, functionTableFieldEnd("handler_authorize_internal_service"));
     return required;
 }
 
@@ -230,6 +252,7 @@ test "API kernel control contexts retain C layout" {
     try std.testing.expectEqual(.@"extern", @typeInfo(HandlerCreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(RouteManifestContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(AuthorizeInferenceContext).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(InternalServiceAuthContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(native_abi.TypeContract).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(memory_abi.Allocator).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(FunctionTable).@"struct".layout);
@@ -250,6 +273,7 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     try std.testing.expect(validFunctionTable(&table, Capability.core));
     try std.testing.expect(!validFunctionTable(&table, Capability.route_manifest));
     try std.testing.expect(!validFunctionTable(&table, Capability.inference_admission_stats));
+    try std.testing.expect(!validFunctionTable(&table, Capability.internal_service_ingress));
     table.struct_size = requiredFunctionTableSize(Capability.core).? - 1;
     try std.testing.expect(!validFunctionTable(&table, Capability.core));
     table.struct_size = requiredFunctionTableSize(Capability.core).?;
