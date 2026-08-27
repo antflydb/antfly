@@ -2044,7 +2044,7 @@ test "fullNativeDecodeSupport accepts XRsiz/YRsiz > 1" {
     try std.testing.expectEqual(NativeDecodeSupport.supported, support);
 }
 
-test "fullNativeDecodeSupport rejects subsampled MCT inputs" {
+test "fullNativeDecodeSupport accepts equal subsampled MCT inputs and rejects mismatches" {
     const allocator = std.testing.allocator;
     var pixels: [4 * 4 * 3]u8 = undefined;
     for (&pixels, 0..) |*sample, index| sample.* = @intCast(index * 5);
@@ -2079,10 +2079,28 @@ test "fullNativeDecodeSupport rejects subsampled MCT inputs" {
     const encoded = try allocator.dupe(u8, encoded_const);
     defer allocator.free(encoded);
 
-    // RCT/ICT is defined over corresponding, unsubsampled samples. Declaring
-    // even identical 2:2 factors for all participating components must fail at
-    // the support gate; reconstruction must never silently skip inverse MCT.
+    // RCT/ICT operates over corresponding samples on a shared component grid.
+    // Identical 2:2 sampling is valid: inverse MCT runs on the 4x4 component
+    // planes before they are upsampled to the 8x8 reference grid.
     try rewriteSizForSubsampling(encoded, 8, 8, 8, 8, 2, 2);
+    try std.testing.expectEqual(
+        NativeDecodeSupport.supported,
+        try nativeDecodeSupportBytes(allocator, encoded),
+    );
+    var decoded = try decodeU8Bytes(allocator, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 8), decoded.width);
+    try std.testing.expectEqual(@as(u32, 8), decoded.height);
+    try std.testing.expectEqual(@as(u8, 3), decoded.components);
+
+    // A different sampling factor on any participating component no longer
+    // provides corresponding samples and must fail before reconstruction.
+    var siz_offset: usize = 0;
+    while (siz_offset + 1 < encoded.len) : (siz_offset += 1) {
+        if (encoded[siz_offset] == 0xff and encoded[siz_offset + 1] == 0x51) break;
+    }
+    try std.testing.expect(siz_offset + 46 <= encoded.len);
+    encoded[siz_offset + 44] = 1; // Component 1 XRsiz.
     try std.testing.expectEqual(
         NativeDecodeSupport.unsupported_multi_component_transform,
         try nativeDecodeSupportBytes(allocator, encoded),

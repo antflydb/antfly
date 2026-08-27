@@ -646,6 +646,21 @@ const Dictionary = struct {
 
 const StoredSegment = struct { number: u32, dictionary: ?Dictionary = null };
 
+fn validateExtension(payload: []const u8) !void {
+    if (payload.len < @sizeOf(u32)) return error.TruncatedJbig2Extension;
+    const extension_type = std.mem.readInt(u32, payload[0..4], .big);
+    // T.88 defines these as non-necessary comment extensions. Their contents
+    // do not affect the decoded page bitmap, so the image decoder may ignore
+    // them without allocating or parsing their descriptive payload.
+    if (extension_type == 0x20000000 or extension_type == 0x20000002) return;
+    // Bit 31 marks an extension as necessary to reproduce the intended page.
+    // Unknown non-necessary metadata remains safely ignorable, but returning a
+    // partial bitmap for an unknown necessary extension would violate the
+    // decoder's fail-closed contract.
+    if ((extension_type & 0x80000000) != 0)
+        return error.UnsupportedJbig2NecessaryExtension;
+}
+
 const Decoder = struct {
     alloc: Allocator,
     work: *DecodeWorkBudget,
@@ -704,7 +719,8 @@ const Decoder = struct {
                 6, 7 => try self.decodeText(payload, refs[0..ref_count]),
                 38, 39 => try self.decodeGeneric(payload),
                 48 => try self.decodePageInformation(payload),
-                49, 50, 51, 52, 62 => {},
+                49, 50, 51, 52 => {},
+                62 => try validateExtension(payload),
                 else => return error.UnsupportedJbig2Segment,
             }
             self.segments.appendAssumeCapacity(stored);
@@ -1101,6 +1117,41 @@ test "decoder enforces cumulative working set" {
     };
     try std.testing.expectError(error.Jbig2WorkingSetTooLarge, decodeAlloc(std.testing.allocator, null, &page, 1024, 1, 1_000_000, null));
     try std.testing.expectError(error.Jbig2DimensionMismatch, decodeAlloc(std.testing.allocator, null, &page, 1024, 128 * 1024, 1_000_000, .{ .width = 2, .height = 1 }));
+}
+
+test "extension segments ignore metadata and reject necessary content" {
+    const comment = [_]u8{
+        0, 0, 0, 1, // Segment number.
+        62, // Extension segment, one-byte page association.
+        0, // No referred-to segments.
+        0, // Global page association.
+        0, 0, 0, 4, // Payload length.
+        0x20, 0, 0, 0, // Single-byte coded comment extension.
+    };
+    const unknown_metadata = [_]u8{
+        0,    0, 0, 2, 62, 0, 0, 0, 0, 0, 4,
+        0x00, 0, 0, 1,
+    };
+    const necessary = [_]u8{
+        0,    0, 0, 3, 62, 0, 0, 0, 0, 0, 4,
+        0xa0, 0, 0, 1,
+    };
+    const truncated = [_]u8{
+        0,    0, 0, 4, 62, 0, 0, 0, 0, 0, 3,
+        0x20, 0, 0,
+    };
+
+    var work = DecodeWorkBudget{ .remaining = 10_000 };
+    var decoder = Decoder{
+        .alloc = std.testing.allocator,
+        .work = &work,
+        .max_bytes = 1024,
+    };
+    defer decoder.deinit();
+    try decoder.decodeStream(&comment);
+    try decoder.decodeStream(&unknown_metadata);
+    try std.testing.expectError(error.UnsupportedJbig2NecessaryExtension, decoder.decodeStream(&necessary));
+    try std.testing.expectError(error.TruncatedJbig2Extension, decoder.decodeStream(&truncated));
 }
 
 test "Treasury mask decodes refinement aggregation and text region" {

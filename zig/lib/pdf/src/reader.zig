@@ -6044,6 +6044,7 @@ fn normalizeJbig2DecodeError(err: anyerror) anyerror {
         error.UnsupportedJbig2DictionaryProfile,
         error.UnsupportedJbig2GenericProfile,
         error.UnsupportedJbig2LongReferences,
+        error.UnsupportedJbig2NecessaryExtension,
         error.UnsupportedJbig2Segment,
         error.UnsupportedJbig2TextProfile,
         error.UnsupportedJbig2UnknownLength,
@@ -15218,6 +15219,7 @@ test "image decode preflights RGBA working set before JBIG2 codec work" {
 
 test "unsupported JBIG2 profiles normalize to renderer fallback" {
     try std.testing.expectEqual(error.UnsupportedPdfRendering, normalizeJbig2DecodeError(error.UnsupportedJbig2DictionaryProfile));
+    try std.testing.expectEqual(error.UnsupportedPdfRendering, normalizeJbig2DecodeError(error.UnsupportedJbig2NecessaryExtension));
     try std.testing.expectEqual(error.TruncatedJbig2Stream, normalizeJbig2DecodeError(error.TruncatedJbig2Stream));
 }
 

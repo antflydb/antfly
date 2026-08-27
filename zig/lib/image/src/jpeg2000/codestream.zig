@@ -336,20 +336,22 @@ pub const State = struct {
 
     /// Part-1 RCT/ICT and the compact pixel-wise custom MCT supported here
     /// operate on corresponding samples from components 0, 1, and 2. Those
-    /// components therefore need identical precision and signedness, must be
-    /// present on the unsubsampled reference grid, and must use the transform
-    /// kernel selected by COD. Reject incompatible COC overrides at the
-    /// capability boundary instead of allowing reconstruction to omit MCT and
-    /// return plausible but color-corrupted pixels.
+    /// components therefore need identical sampling parameters, precision, and
+    /// signedness, and must use the transform kernel selected by COD. Equal
+    /// subsampling is valid because MCT runs on the shared component grid before
+    /// the result is upsampled to the reference grid. Reject incompatible SIZ or
+    /// COC overrides at the capability boundary instead of allowing
+    /// reconstruction to omit MCT and return plausible but color-corrupted
+    /// pixels.
     pub fn hasSupportedMctInputs(self: *const State) bool {
         const default_style = self.coding_style orelse return false;
         if (!default_style.multiple_component_transform) return true;
         if (self.header.components.len < 3) return false;
 
         const first = self.header.components[0];
-        if (first.xrsiz != 1 or first.yrsiz != 1) return false;
+        if (first.xrsiz == 0 or first.yrsiz == 0) return false;
         for (self.header.components[0..3], 0..) |component, component_index| {
-            if (component.xrsiz != 1 or component.yrsiz != 1 or
+            if (component.xrsiz != first.xrsiz or component.yrsiz != first.yrsiz or
                 component.bits_per_component != first.bits_per_component or
                 component.is_signed != first.is_signed)
             {
