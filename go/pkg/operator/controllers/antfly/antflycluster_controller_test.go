@@ -15453,6 +15453,8 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	container := sts.Spec.Template.Spec.Containers[0]
 	g.Expect(container.Env).To(ContainElement(haPodUIDEnv()[0]))
 	runtimeArgs := container.Args[0]
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-standby-log '/antflydb/ha/standby-generations/prod-standby-a-10/receive.wal'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-standby-progress '/antflydb/ha/standby-generations/prod-standby-a-10/progress.wal'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-target-root '/antflydb/.antfly-ha/active'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-topology-id 'test-standalone'`))
 	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-startup-topology-generation '3'`))
@@ -15801,13 +15803,37 @@ func TestStandaloneHAArgsOmitsRequiredForAllSyncPolicy(t *testing.T) {
 			Selection:    antflyv1.HAStandbySelectionAll,
 			StandbyNames: []string{"standby-a", "standby-b"},
 		},
-	})
+	}, "")
 
 	g.Expect(args).To(ContainSubstring(`--ha-sync-mode 'remote-apply'`))
 	g.Expect(args).To(ContainSubstring(`--ha-sync-selection 'all'`))
 	g.Expect(args).To(ContainSubstring(`--ha-sync-standby 'standby-a'`))
 	g.Expect(args).To(ContainSubstring(`--ha-sync-standby 'standby-b'`))
 	g.Expect(args).NotTo(ContainSubstring(`--ha-sync-required`))
+}
+
+func TestStandaloneHAArgsScopesDefaultStandbyProgressToActivatedGeneration(t *testing.T) {
+	g := NewWithT(t)
+	ha := &antflyv1.HighAvailabilitySpec{
+		Mode: antflyv1.HAModeHotStandby,
+		Identity: &antflyv1.HAReplicationIdentitySpec{
+			ClusterID: 100, TimelineID: 2, Epoch: 2, CurrentPrimaryID: "primary-a",
+		},
+		Runtime: &antflyv1.HARuntimeSpec{
+			Role: antflyv1.HARuntimeRoleStandby, NodeID: "standby-a",
+			Standby: &antflyv1.HAStandbyRuntimeSpec{UpstreamURL: "http://primary:8080", SlotName: "standby-a"},
+		},
+	}
+
+	args := standaloneHAArgs(ha, "reseed-standby-a-topology-2")
+	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/ha/standby-generations/reseed-standby-a-topology-2/receive.wal'`))
+	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/ha/standby-generations/reseed-standby-a-topology-2/progress.wal'`))
+
+	ha.Runtime.Standby.LogPath = "/antflydb/custom/receive.wal"
+	ha.Runtime.Standby.ProgressPath = "/antflydb/custom/progress.wal"
+	args = standaloneHAArgs(ha, "reseed-standby-a-topology-2")
+	g.Expect(args).To(ContainSubstring(`--ha-standby-log '/antflydb/custom/receive.wal'`))
+	g.Expect(args).To(ContainSubstring(`--ha-standby-progress '/antflydb/custom/progress.wal'`))
 }
 
 func TestStandaloneHAArgsShellQuotesRuntimeValues(t *testing.T) {
@@ -15830,7 +15856,7 @@ func TestStandaloneHAArgsShellQuotesRuntimeValues(t *testing.T) {
 			Mode:         antflyv1.HADurabilityModeRemoteWrite,
 			StandbyNames: []string{"standby-$(touch /tmp/pwned)"},
 		},
-	})
+	}, "")
 
 	g.Expect(args).To(ContainSubstring(`--ha-primary-node-id 'primary-$(touch /tmp/pwned)` + "`" + `x` + "`" + `'`))
 	g.Expect(args).To(ContainSubstring(`--ha-former-primary-log '/antflydb/ha/'\''former.wal'`))

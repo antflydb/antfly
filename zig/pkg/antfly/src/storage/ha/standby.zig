@@ -418,6 +418,34 @@ pub const Standby = struct {
         self.publishState(self.identity_state, next);
     }
 
+    /// Proves that an already-open receive stream was bootstrapped from the
+    /// exact same activated seed generation. LSN comparison alone is
+    /// insufficient: progress from a different materialized snapshot can be
+    /// numerically ahead while referring to data this runtime never opened.
+    pub fn verifyBootstrapCheckpoint(self: *Standby, checkpoint_lsn: u64, payload: []const u8) !void {
+        try self.lockExclusive();
+        defer self.unlockExclusive();
+        if (checkpoint_lsn == 0) return error.InvalidCheckpointLsn;
+        const entry = (try self.receive_log.entryAt(self.alloc, checkpoint_lsn)) orelse
+            return error.StandbyBootstrapCheckpointMissing;
+        defer {
+            var owned = entry;
+            owned.deinit(self.alloc);
+        }
+        const record = entry.record;
+        if (record.kind != .checkpoint or record.payload_codec != .json or
+            record.cluster_id != self.identity_state.cluster_id or
+            record.shard_id != self.identity_state.shard_id or
+            record.table_id != self.identity_state.table_id or
+            record.timeline_id != self.identity_state.timeline_id or
+            record.epoch != self.identity_state.epoch or
+            record.lsn != checkpoint_lsn or record.previous_lsn != checkpoint_lsn - 1 or
+            !std.mem.eql(u8, record.payload, payload))
+        {
+            return error.StandbyBootstrapCheckpointMismatch;
+        }
+    }
+
     pub fn applyAvailable(self: *Standby, ctx: *anyopaque, apply_fn: ApplyFn) !usize {
         try self.lockExclusive();
         defer self.unlockExclusive();

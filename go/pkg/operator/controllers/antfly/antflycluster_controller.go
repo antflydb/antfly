@@ -601,7 +601,7 @@ func haStandaloneRuntimeSeedIdentityAnnotations(cluster *antflyv1.AntflyCluster)
 	return annotations
 }
 
-func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
+func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec, startupGeneration string) string {
 	if ha == nil || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil || ha.Identity == nil {
 		return ""
 	}
@@ -671,6 +671,15 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 		standby := runtime.Standby
 		logPath := defaultHAStandbyLogPath
 		progressPath := defaultHAStandbyProgressPath
+		// A materialized seed snapshot supersedes all receive/apply state from
+		// prior topologies. Keep operator-default standby WALs generation-scoped
+		// so an exact reseed starts from its validated checkpoint while ordinary
+		// restarts of that same generation retain their progress.
+		if generation := strings.TrimSpace(startupGeneration); generation != "" {
+			generationRoot := path.Join("/antflydb/ha/standby-generations", generation)
+			logPath = path.Join(generationRoot, "receive.wal")
+			progressPath = path.Join(generationRoot, "progress.wal")
+		}
 		if standby != nil {
 			if value := strings.TrimSpace(standby.LogPath); value != "" {
 				logPath = value
@@ -712,6 +721,19 @@ func standaloneHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
 	appendHAUint("--ha-timeline-id", identity.TimelineID)
 	appendHAUint("--ha-epoch", identity.Epoch)
 	return args.String()
+}
+
+func standaloneHAStartupGeneration(cluster *antflyv1.AntflyCluster) string {
+	if cluster == nil {
+		return ""
+	}
+	gate := haRuntimeStartupGate(cluster)
+	if gate == nil || gate.Policy != antflyv1.HAStartupGatePolicyRequireActivatedSeed ||
+		cluster.Status.HAStatus == nil || cluster.Status.HAStatus.StartupGate == nil ||
+		!cluster.Status.HAStatus.StartupGate.RuntimeEligible || cluster.Status.HAStatus.StartupGate.ActivationReceipt == nil {
+		return ""
+	}
+	return strings.TrimSpace(cluster.Status.HAStatus.StartupGate.ActivationReceipt.Generation)
 }
 
 func standaloneHAStartupArgs(cluster *antflyv1.AntflyCluster) string {
@@ -4559,7 +4581,7 @@ exec /antfly standalone --id %d --config /config/config.json \
 								standalone.MetadataAPI.Port,
 								standalone.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
-								standaloneHAArgs(cluster.Spec.HighAvailability),
+								standaloneHAArgs(cluster.Spec.HighAvailability, standaloneHAStartupGeneration(cluster)),
 								standaloneHAStartupArgs(cluster),
 							),
 						},

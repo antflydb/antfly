@@ -736,7 +736,16 @@ fn mapStatus(status: u16, body: []const u8) !void {
         return error.InternalReplicationEndpointNotFound;
     }
     if (status == 405) return error.UnsupportedOperation;
-    if (status == 409) return error.InternalReplicationConflict;
+    if (status == 409) {
+        const reason = std.mem.trim(u8, body, " \t\r\n");
+        if (std.mem.eql(u8, reason, "PrimaryUnavailable") or std.mem.eql(u8, reason, "primary unavailable")) return error.PrimaryUnavailable;
+        if (std.mem.eql(u8, reason, "SlotAlreadyExists")) return error.SlotAlreadyExists;
+        if (std.mem.eql(u8, reason, "SlotSeeding")) return error.SlotSeeding;
+        if (std.mem.eql(u8, reason, "SlotInactive")) return error.SlotInactive;
+        if (std.mem.eql(u8, reason, "SlotRequiresReseed")) return error.SlotRequiresReseed;
+        if (std.mem.eql(u8, reason, "WalNoLongerRetained")) return error.WalNoLongerRetained;
+        return error.InternalReplicationConflict;
+    }
     if (status == 503) return error.InternalReplicationEndpointNotReady;
     return error.UnexpectedHttpStatus;
 }
@@ -744,6 +753,13 @@ fn mapStatus(status: u16, body: []const u8) !void {
 test "http replication status distinguishes missing slots from missing routes" {
     try std.testing.expectError(error.SlotNotFound, mapStatus(404, "SlotNotFound"));
     try std.testing.expectError(error.InternalReplicationEndpointNotFound, mapStatus(404, "not found"));
+}
+
+test "http replication status preserves exact conflict reason" {
+    try std.testing.expectError(error.WalNoLongerRetained, mapStatus(409, "WalNoLongerRetained\n"));
+    try std.testing.expectError(error.SlotInactive, mapStatus(409, "SlotInactive"));
+    try std.testing.expectError(error.PrimaryUnavailable, mapStatus(409, "primary unavailable"));
+    try std.testing.expectError(error.InternalReplicationConflict, mapStatus(409, "future-conflict"));
 }
 
 const TestPaths = struct {

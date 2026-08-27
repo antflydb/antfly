@@ -2096,6 +2096,21 @@ pub fn runFromIterator(
         return err;
     };
     defer if (ha_standby) |*standby| standby.close();
+    if (ha_standby) |*standby| {
+        if (ha_startup_checkpoint_lsn) |checkpoint_lsn| {
+            const expectation = ha_startup_expectation orelse unreachable;
+            bootstrapHAStandbyAtActivatedCheckpoint(
+                alloc,
+                standby,
+                expectation.expected.generation,
+                expectation.expected.slot_name,
+                checkpoint_lsn,
+            ) catch |err| {
+                std.log.err("standalone startup failed step=bootstrap_ha_standby_checkpoint err={}", .{err});
+                return err;
+            };
+        }
+    }
     var ha_fence_store = openHAFenceStoreFromCli(alloc, setup_io.io(), cli) catch |err| {
         std.log.err("standalone startup failed step=open_ha_fence err={}", .{err});
         return err;
@@ -4420,6 +4435,41 @@ fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
     defer alloc.free(progress_z);
 
     return try antfly.ha.standby.Standby.open(alloc, log_z.ptr, progress_z.ptr, try haStandbyIdentity(cli), .{});
+}
+
+/// The activated storage snapshot already contains every mutation through the
+/// receipt checkpoint. Bind an empty standby receive stream to that exact
+/// boundary before its first upstream fetch so it starts at checkpoint + 1.
+/// Existing progress is accepted only when it is at least as durable as the
+/// same validated snapshot; silently combining older receive state with newer
+/// materialized data would make both safe-read and promotion LSNs untrustworthy.
+fn bootstrapHAStandbyAtActivatedCheckpoint(
+    alloc: std.mem.Allocator,
+    standby: *antfly.ha.standby.Standby,
+    generation: []const u8,
+    slot_name: []const u8,
+    checkpoint_lsn: u64,
+) !void {
+    const progress = standby.currentProgress();
+    const payload = try std.json.Stringify.valueAlloc(alloc, .{
+        .schema_version = @as(u16, 1),
+        .kind = "activated-seed-checkpoint",
+        .generation = generation,
+        .slot_name = slot_name,
+        .checkpoint_lsn = checkpoint_lsn,
+    }, .{});
+    defer alloc.free(payload);
+    if (progress.received_lsn == 0 and progress.applied_lsn == 0 and progress.safe_read_lsn == 0) {
+        try standby.bootstrapCheckpoint(checkpoint_lsn, payload);
+        return;
+    }
+    try standby.verifyBootstrapCheckpoint(checkpoint_lsn, payload);
+    if (progress.received_lsn < checkpoint_lsn or
+        progress.applied_lsn < checkpoint_lsn or
+        progress.safe_read_lsn < checkpoint_lsn)
+    {
+        return error.HAStartupStandbyProgressBehindCheckpoint;
+    }
 }
 
 fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?antfly.ha.fencing.Store {
@@ -7030,6 +7080,48 @@ test "standalone HA runtime requires HA paths under resolved data root" {
         .ha_timeline_id = 3,
         .ha_epoch = 4,
     }, root));
+}
+
+test "standalone activated seed bootstraps exact standby checkpoint and rejects older progress" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const receive_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/standby.wal", .{tmp.sub_path}, 0);
+    defer alloc.free(receive_path);
+    const progress_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/standby-progress.wal", .{tmp.sub_path}, 0);
+    defer alloc.free(progress_path);
+    const identity = antfly.ha.standby.Identity{
+        .cluster_id = 101,
+        .shard_id = 202,
+        .table_id = 303,
+        .timeline_id = 4,
+        .epoch = 5,
+    };
+
+    {
+        var standby = try antfly.ha.standby.Standby.open(alloc, receive_path.ptr, progress_path.ptr, identity, .{});
+        defer standby.close();
+        try bootstrapHAStandbyAtActivatedCheckpoint(alloc, &standby, "seed-generation-7", "standby-a", 41);
+        const progress = standby.currentProgress();
+        try std.testing.expectEqual(@as(u64, 41), progress.received_lsn);
+        try std.testing.expectEqual(@as(u64, 41), progress.applied_lsn);
+        try std.testing.expectEqual(@as(u64, 41), progress.safe_read_lsn);
+        try std.testing.expectEqual(@as(u64, 42), standby.nextReceiveLsn());
+        try bootstrapHAStandbyAtActivatedCheckpoint(alloc, &standby, "seed-generation-7", "standby-a", 41);
+        try std.testing.expectError(
+            error.StandbyBootstrapCheckpointMismatch,
+            bootstrapHAStandbyAtActivatedCheckpoint(alloc, &standby, "seed-generation-other", "standby-a", 41),
+        );
+        try std.testing.expectError(
+            error.StandbyBootstrapCheckpointMissing,
+            bootstrapHAStandbyAtActivatedCheckpoint(alloc, &standby, "seed-generation-8", "standby-a", 42),
+        );
+    }
+
+    var reopened = try antfly.ha.standby.Standby.open(alloc, receive_path.ptr, progress_path.ptr, identity, .{});
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 42), reopened.nextReceiveLsn());
 }
 
 test "standalone HA runtime validates bearer token env name before lookup" {
