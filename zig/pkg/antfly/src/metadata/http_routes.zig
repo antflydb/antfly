@@ -14,6 +14,15 @@
 
 const std = @import("std");
 
+pub const ForwardedCreateTableMutation = struct {
+    table_name: []const u8,
+    definition_json: []const u8,
+};
+
+pub const ForwardedDropTableMutation = struct {
+    table_name: []const u8,
+};
+
 pub const Routes = struct {
     pub const health = "/metadata/v1/health";
     pub const head = "/metadata/v1/head";
@@ -35,6 +44,7 @@ pub const Routes = struct {
     pub const internal_node_shutdown_suffix = "/shutdown";
     pub const internal_node_status_suffix = "/status";
     pub const internal_schema_progress = "/internal/v1/schema-progress";
+    pub const internal_restore_progress = "/internal/v1/restore-progress";
     pub const internal_extensions_prefix = "/internal/v1/extensions/";
     pub const internal_extension_restore = "/internal/v1/extensions/restore";
     pub const internal_extension_update_suffix = "/update";
@@ -42,6 +52,10 @@ pub const Routes = struct {
     pub const internal_extension_enable_suffix = "/enable";
     pub const internal_extension_disable_suffix = "/disable";
     pub const internal_extension_config_suffix = "/config";
+    pub const table_mutation_protocol_header = "X-Antfly-Metadata-Table-Mutation-Protocol";
+    pub const table_mutation_protocol_value = "2";
+    pub const internal_forwarded_table_create = "/internal/v1/table-mutations/create";
+    pub const internal_forwarded_table_drop = "/internal/v1/table-mutations/drop";
     pub const internal_tables_prefix = "/internal/v1/tables/";
     pub const internal_table_restore_suffix = "/restore";
     pub const internal_table_definition_suffix = "/definition";
