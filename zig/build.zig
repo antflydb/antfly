@@ -6582,6 +6582,26 @@ pub fn build(b: *std.Build) void {
     const lib_storage_test_step = b.step("lib-storage-test", "Run root-module storage tests only");
     lib_storage_test_step.dependOn(&run_lib_storage_tests.step);
 
+    const hbc_cache_contention_tests = b.addTest(.{
+        .name = "hbc-cache-contention-experiment-tests",
+        .root_module = lib_test_mod,
+        .filters = &.{
+            "hbc shared",
+            "resource manager derives elastic HBC cache-class policy from pressure",
+        },
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+        .max_rss = 8 * 1024 * 1024 * 1024,
+    });
+    const run_hbc_cache_contention_tests = b.addRunArtifact(hbc_cache_contention_tests);
+    const hbc_cache_contention_step = b.step(
+        "hbc-cache-contention-experiment",
+        "Run the focused shared HBC cache concurrency experiment",
+    );
+    hbc_cache_contention_step.dependOn(&run_hbc_cache_contention_tests.step);
+
     const ha_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"storage.ha"},
