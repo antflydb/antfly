@@ -5962,12 +5962,24 @@ pub const DB = struct {
             );
             if (!intent_snapshot.has_intents) {
                 // Validate the requested decision while still avoiding mapper
-                // and index preparation on an idempotent resolve retry.
+                // and index preparation on an idempotent resolve retry. Intent
+                // resolution does not advance the prepare revision, so another
+                // resolver can legitimately remove the intents between the
+                // optimistic collection and this apply fence. The replicated
+                // receipt and coordinator acknowledgement must still commit in
+                // the same terminal batch before Raft advances this entry.
+                var raft_marker_value_buf: [raft_applied_entry_value_len]u8 = undefined;
+                const completion_writes: []const docstore_mod.KVPair = if (opts.raft_applied_entry_marker) |identity|
+                    &.{raftAppliedEntryWrite(identity, &raft_marker_value_buf)}
+                else
+                    &.{};
                 const outcome = try self.core.resolveTransactionIntentsWithExtraBatch(
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
                     .{
+                        .completion_writes = completion_writes,
+                        .resolved_participant = resolution.resolved_participant,
                         .expected_intent_revision = resolution.expected_intent_revision,
                         .known_intent_keys = resolution.intent_keys,
                     },
@@ -88432,6 +88444,66 @@ test "db replicated transaction commits each raft receipt atomically" {
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"newer\"}", raw);
     try std.testing.expectEqual(@as(u64, 16_000), try db.getTimestamp(alloc, "doc:receipt"));
+}
+
+test "db raced replicated transaction completion persists receipt and participant acknowledgement" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const txn_id: transactions_mod.TxnId = .{0x6b} ** 16;
+    const participant = "table:receipts:group:8";
+    _ = try db.beginReplicatedTransactionAtRaftEntry(
+        txn_id,
+        20_000,
+        20_000,
+        &.{participant},
+        true,
+        true,
+        .{ .term = 4, .index = 21 },
+    );
+    try db.writeReplicatedTransactionAtRaftEntry(txn_id, .{
+        .writes = &.{.{ .key = "doc:raced-receipt", .value = "{\"title\":\"transaction\"}" }},
+    }, .{ .term = 4, .index = 22 });
+
+    var collected = try db.core.collectTransactionIntentBatch(alloc, txn_id);
+    defer collected.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), collected.writes.len);
+
+    // Model the production race: collection happened outside the apply fence,
+    // then recovery resolved the intents before the replicated entry acquired
+    // the lock. Resolution deliberately preserves intent_revision.
+    try db.resolveTransactionIntents(txn_id, .committed, 25_000);
+    const unresolved_before = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
+    defer transactions_mod.freeParticipantList(alloc, unresolved_before);
+    try std.testing.expectEqual(@as(usize, 1), unresolved_before.len);
+
+    const resolve_entry: RaftAppliedEntryIdentity = .{ .term = 4, .index = 23 };
+    try db.batchInternal(.{
+        .writes = &.{.{ .key = "doc:raced-receipt", .value = "{\"title\":\"transaction\"}" }},
+        .timestamp_ns = 25_000,
+        .sync_level = .write,
+    }, null, .{
+        .bypass_ha_write_gate = true,
+        .raft_applied_entry_marker = resolve_entry,
+        .transaction_resolution = .{
+            .txn_id = txn_id,
+            .status = .committed,
+            .commit_version = 25_000,
+            .expected_intent_revision = collected.revision,
+            .intent_keys = &.{"doc:raced-receipt"},
+            .resolved_participant = participant,
+        },
+    });
+
+    try std.testing.expectEqualDeep(resolve_entry, (try db.raftAppliedEntry()).?);
+    const unresolved_after = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
+    defer transactions_mod.freeParticipantList(alloc, unresolved_after);
+    try std.testing.expectEqual(@as(usize, 0), unresolved_after.len);
 }
 
 test "db transaction repeated committed resolve cannot overwrite a newer write" {

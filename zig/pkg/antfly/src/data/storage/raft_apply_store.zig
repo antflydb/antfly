@@ -1472,11 +1472,23 @@ pub const RaftApplyStore = struct {
         commit_index: u64,
         entries_bytes: []const u8,
     ) !void {
+        const decoded_entries = raft_state_machine.decodeCommittedEntries(self.alloc, entries_bytes) catch |err| switch (err) {
+            error.InvalidCommittedEntriesEncoding => return error.ConflictingDataApplyBatch,
+            else => return err,
+        };
+        defer self.alloc.free(decoded_entries);
+        if (decoded_entries.len == 0 or
+            !entriesAreContiguous(decoded_entries) or
+            decoded_entries[decoded_entries.len - 1].index != commit_index)
+        {
+            return error.ConflictingDataApplyBatch;
+        }
+
         const existing_batch = try self.ensureLoaded(shard, group_id);
         if (existing_batch) |existing| {
             // The durable state can be ahead when another state machine's applied watermark lags.
             if (commit_index <= existing.commit_index) {
-                try self.verifyPersistedBatch(group_id, commit_index, entries_bytes);
+                try self.verifyPersistedBatch(group_id, commit_index, entries_bytes, decoded_entries);
                 return;
             }
         } else {
@@ -1485,19 +1497,35 @@ pub const RaftApplyStore = struct {
             try shard.batches.ensureUnusedCapacity(self.alloc, 1);
         }
         const group_store = try self.writableGroupStoreLocked(shard, group_id);
-        _ = try ensureEntryIdentityCoverageStart(
+        const identity_coverage_start = try ensureEntryIdentityCoverageStart(
             &group_store.store,
             self.alloc,
             group_id,
             if (existing_batch) |existing| existing.last_entry_index else 0,
         );
+        if (existing_batch) |existing| {
+            // The effects for this prefix are already durable. Verify their
+            // exact Raft identities before accepting and applying the suffix;
+            // filtering first would silently bless a conflicting recovery
+            // window and move the durable watermark beyond it.
+            for (decoded_entries) |entry| {
+                if (entry.index > existing.last_entry_index) break;
+                if (!try persistedEntryIdentityMatches(
+                    &group_store.store,
+                    self.alloc,
+                    group_id,
+                    identity_coverage_start,
+                    entry,
+                )) return error.ConflictingDataApplyBatch;
+            }
+        }
         // A failed sibling state machine can leave this store ahead of Raft's
         // shared applied watermark. Raft then legitimately presents an
         // overlapping committed prefix. Apply effects only for entries newer
         // than this store's own durable watermark.
-        const metadata = try describeEntries(
+        const metadata = try describeDecodedEntries(
             self.alloc,
-            entries_bytes,
+            decoded_entries,
             if (existing_batch) |existing| existing.last_entry_index else 0,
         );
         defer freeEntryMetadata(self.alloc, metadata);
@@ -1559,7 +1587,13 @@ pub const RaftApplyStore = struct {
         shard.batches.putAssumeCapacity(group_id, summary);
     }
 
-    fn verifyPersistedBatch(self: *RaftApplyStore, group_id: u64, commit_index: u64, entries_bytes: []const u8) !void {
+    fn verifyPersistedBatch(
+        self: *RaftApplyStore,
+        group_id: u64,
+        commit_index: u64,
+        entries_bytes: []const u8,
+        replay_entries: []const raft_state_machine.DecodedCommittedEntry,
+    ) !void {
         const shard = self.batchShard(group_id);
         const group_store = (try self.groupStoreLocked(shard, group_id, false)) orelse return error.InvalidDataApplyBatch;
         var key_buf: [128]u8 = undefined;
@@ -1588,17 +1622,6 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
         defer self.alloc.free(persisted_entries);
-        const replay_entries = raft_state_machine.decodeCommittedEntries(self.alloc, entries_bytes) catch |err| switch (err) {
-            error.InvalidCommittedEntriesEncoding => return error.ConflictingDataApplyBatch,
-            else => return err,
-        };
-        defer self.alloc.free(replay_entries);
-        if (replay_entries.len == 0 or
-            !entriesAreContiguous(replay_entries) or
-            replay_entries[replay_entries.len - 1].index != commit_index)
-        {
-            return error.ConflictingDataApplyBatch;
-        }
         if (persisted_entries.len > 0 and
             (!entriesAreContiguous(persisted_entries) or
                 persisted_entries[persisted_entries.len - 1].index != persisted_commit_index))
@@ -1789,6 +1812,14 @@ pub const RaftApplyStore = struct {
     fn describeEntries(alloc: std.mem.Allocator, entries_bytes: []const u8, after_index: u64) !EntryMetadata {
         const decoded = try raft_state_machine.decodeCommittedEntries(alloc, entries_bytes);
         defer alloc.free(decoded);
+        return try describeDecodedEntries(alloc, decoded, after_index);
+    }
+
+    fn describeDecodedEntries(
+        alloc: std.mem.Allocator,
+        decoded: []const raft_state_machine.DecodedCommittedEntry,
+        after_index: u64,
+    ) !EntryMetadata {
         var normal_entry_count: usize = 0;
         var admin_entry_count: usize = 0;
         var normal_entries = std.ArrayListUnmanaged(AppliedNormalEntry).empty;
@@ -2415,6 +2446,88 @@ test "data raft apply store accepts equivalent restart replay with different bat
         try std.testing.expectEqualStrings("2", group_state[1].value);
         try std.testing.expectEqualStrings("3", group_state[2].value);
     }
+}
+
+test "data raft apply store rejects conflicting and malformed advancing overlap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-forward-overlap", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const initial = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("put:a=1") },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:b=2") },
+    });
+    defer std.testing.allocator.free(initial);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 36,
+        .commit_index = 2,
+        .entries_bytes = initial,
+    });
+
+    const conflicting_overlap = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 2, .index = 2, .entry_type = .normal, .data = @constCast("put:b=wrong") },
+        .{ .term = 2, .index = 3, .entry_type = .normal, .data = @constCast("put:c=3") },
+    });
+    defer std.testing.allocator.free(conflicting_overlap);
+    try std.testing.expectError(error.ConflictingDataApplyBatch, store.snapshotBuilder().applyBatch(.{
+        .group_id = 36,
+        .commit_index = 3,
+        .entries_bytes = conflicting_overlap,
+    }));
+
+    const discontinuous_overlap = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:b=2") },
+        .{ .term = 2, .index = 4, .entry_type = .normal, .data = @constCast("put:d=4") },
+    });
+    defer std.testing.allocator.free(discontinuous_overlap);
+    try std.testing.expectError(error.ConflictingDataApplyBatch, store.snapshotBuilder().applyBatch(.{
+        .group_id = 36,
+        .commit_index = 4,
+        .entries_bytes = discontinuous_overlap,
+    }));
+
+    const wrong_commit = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{.{
+        .term = 2,
+        .index = 3,
+        .entry_type = .normal,
+        .data = @constCast("put:c=3"),
+    }});
+    defer std.testing.allocator.free(wrong_commit);
+    try std.testing.expectError(error.ConflictingDataApplyBatch, store.snapshotBuilder().applyBatch(.{
+        .group_id = 36,
+        .commit_index = 4,
+        .entries_bytes = wrong_commit,
+    }));
+
+    const valid_overlap = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:b=2") },
+        .{ .term = 2, .index = 3, .entry_type = .normal, .data = @constCast("put:c=3") },
+    });
+    defer std.testing.allocator.free(valid_overlap);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 36,
+        .commit_index = 3,
+        .entries_bytes = valid_overlap,
+    });
+
+    const batch = (try store.latestBatch(36)) orelse return error.MissingDataBatch;
+    try std.testing.expectEqual(@as(u64, 3), batch.commit_index);
+    const group_state = try store.groupState(std.testing.allocator, 36);
+    defer {
+        for (group_state) |entry| {
+            std.testing.allocator.free(entry.key);
+            std.testing.allocator.free(entry.value);
+        }
+        std.testing.allocator.free(group_state);
+    }
+    try std.testing.expectEqual(@as(usize, 3), group_state.len);
+    try std.testing.expectEqualStrings("1", group_state[0].value);
+    try std.testing.expectEqualStrings("2", group_state[1].value);
+    try std.testing.expectEqualStrings("3", group_state[2].value);
 }
 
 test "data raft apply store accepts restart replay split below the durable watermark" {
