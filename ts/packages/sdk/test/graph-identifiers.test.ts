@@ -84,6 +84,25 @@ describe("graph identifier policy", () => {
     );
   });
 
+  it.each([
+    [["bad\ud800"], "valid UTF-8"],
+    [["links", "links"], "duplicate edge types"],
+    [["文".repeat(Math.floor(65_536 / 3) + 1)], "at most 65536 UTF-8 bytes"],
+  ])("rejects edge types outside the durable wire policy", (types, message) => {
+    expect(() =>
+      validateGraphQueryIdentifiers({
+        people: {
+          match: {
+            anchor: "person",
+            nodes: { person: {}, author: {} },
+            edges: [{ from: "person", to: "author", types }],
+          },
+          return: { bindings: ["person"] },
+        },
+      })
+    ).toThrow(message);
+  });
+
   it.each([false, true])("rejects distinct presence on count(*) (%s)", (distinct) => {
     expect(() =>
       validateGraphQueryIdentifiers({

@@ -16245,10 +16245,7 @@ components:
           description: Base64-encoded target document key
         type:
           x-go-type-skip-optional-pointer: true
-          type: string
-          minLength: 1
-          maxLength: 65536
-          description: Edge type encoded as at most 64 KiB of UTF-8 (e.g., "cites", "similar_to", "authored_by")
+          $ref: '#/components/schemas/GraphEdgeType'
         weight:
           x-go-type-skip-optional-pointer: true
           type: number
@@ -18597,15 +18594,20 @@ components:
               type: string
               enum:
                 - embeddings
+    GraphEdgeType:
+      type: string
+      minLength: 1
+      maxLength: 65536
+      x-antfly-max-utf8-bytes: 65536
+      description: Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength`
+        is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte
+        limit.
     EdgeTypeConfig:
       type: object
       description: Configuration for a specific edge type
       properties:
         name:
-          type: string
-          minLength: 1
-          maxLength: 65536
-          description: Edge type name encoded as at most 64 KiB of UTF-8 (e.g., 'cites', 'similar_to')
+          $ref: '#/components/schemas/GraphEdgeType'
         field:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -18676,10 +18678,7 @@ components:
             - extraction_graph
           default: extraction_relation
         mention_edge_type:
-          type: string
-          minLength: 1
-          maxLength: 65536
-          description: Edge type encoded as at most 64 KiB of UTF-8.
+          $ref: '#/components/schemas/GraphEdgeType'
     GraphArtifactProducerSourceConfig:
       type: object
       additionalProperties: false
@@ -22985,9 +22984,7 @@ components:
           maxItems: 64
           uniqueItems: true
           items:
-            type: string
-            minLength: 1
-            maxLength: 65536
+            $ref: '#/components/schemas/GraphEdgeType'
           description: Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
             at most 64 KiB.
         min_hops:
@@ -23274,6 +23271,7 @@ components:
           type: string
           minLength: 1
         table:
+          x-go-type-skip-optional-pointer: false
           type: string
           minLength: 1
           description: Optional table qualifier for an exact cross-table node identity. Omit for the query
@@ -23336,9 +23334,7 @@ components:
           maxItems: 64
           uniqueItems: true
           items:
-            type: string
-            minLength: 1
-            maxLength: 65536
+            $ref: '#/components/schemas/GraphEdgeType'
           description: At most 64 unique edge types totaling at most 64 KiB.
         max_depth:
           type: integer
@@ -23419,9 +23415,7 @@ components:
           maxItems: 64
           uniqueItems: true
           items:
-            type: string
-            minLength: 1
-            maxLength: 65536
+            $ref: '#/components/schemas/GraphEdgeType'
           description: At most 64 unique edge types totaling at most 64 KiB.
         max_depth:
           type: integer
@@ -23485,9 +23479,7 @@ components:
           maxItems: 64
           uniqueItems: true
           items:
-            type: string
-            minLength: 1
-            maxLength: 65536
+            $ref: '#/components/schemas/GraphEdgeType'
           description: At most 64 unique edge types totaling at most 64 KiB.
         max_depth:
           type: integer
@@ -23614,9 +23606,7 @@ components:
           maxItems: 64
           uniqueItems: true
           items:
-            type: string
-            minLength: 1
-            maxLength: 65536
+            $ref: '#/components/schemas/GraphEdgeType'
           description: At most 64 unique edge types totaling at most 64 KiB.
         direction:
           $ref: '#/components/schemas/EdgeDirection'
@@ -23672,9 +23662,7 @@ components:
           maxItems: 64
           uniqueItems: true
           items:
-            type: string
-            minLength: 1
-            maxLength: 65536
+            $ref: '#/components/schemas/GraphEdgeType'
           description: Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
             at most 64 KiB.
         direction:
@@ -23828,6 +23816,7 @@ components:
           minLength: 1
           description: Exact document key.
         table:
+          x-go-type-skip-optional-pointer: false
           type: string
           minLength: 1
           description: Owning table for a cross-table binding; omitted for the queried table.
@@ -23945,10 +23934,7 @@ components:
         to:
           $ref: '#/components/schemas/GraphPathEndpoint'
         type:
-          type: string
-          minLength: 1
-          maxLength: 65536
-          description: Edge type encoded as at most 64 KiB of UTF-8.
+          $ref: '#/components/schemas/GraphEdgeType'
         weight:
           type: number
           format: double
@@ -23972,7 +23958,7 @@ components:
           minLength: 1
           description: Document key
         table:
-          x-go-type-skip-optional-pointer: true
+          x-go-type-skip-optional-pointer: false
           type: string
           minLength: 1
           description: Owning table for a cross-table node; omitted for nodes in the queried table

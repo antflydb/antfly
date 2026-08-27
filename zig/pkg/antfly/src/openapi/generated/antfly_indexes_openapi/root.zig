@@ -75,6 +75,7 @@ pub const GraphDocumentTermFilter = types.GraphDocumentTermFilter;
 pub const GraphDocumentTermRangeBody = types.GraphDocumentTermRangeBody;
 pub const GraphDocumentTermRangeFilter = types.GraphDocumentTermRangeFilter;
 pub const GraphDocumentWildcardFilter = types.GraphDocumentWildcardFilter;
+pub const GraphEdgeType = types.GraphEdgeType;
 pub const GraphIdentityNodeSelector = types.GraphIdentityNodeSelector;
 pub const GraphIndexConfig = types.GraphIndexConfig;
 pub const GraphIndexStats = types.GraphIndexStats;

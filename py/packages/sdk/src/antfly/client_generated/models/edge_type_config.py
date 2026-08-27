@@ -17,7 +17,8 @@ class EdgeTypeConfig:
     """Configuration for a specific edge type
 
     Attributes:
-        name (str): Edge type name encoded as at most 64 KiB of UTF-8 (e.g., 'cites', 'similar_to')
+        name (str): Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the
+            standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit.
         field (str | Unset): Document field containing target node key(s) for automatic edge creation.
             Supports string (single target) or array of strings (multiple targets).
             When omitted, edges must be provided explicitly via _edges.

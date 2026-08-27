@@ -863,8 +863,7 @@ pub const Edge = struct {
     source: []const u8,
     /// Base64-encoded target document key
     target: []const u8,
-    /// Edge type encoded as at most 64 KiB of UTF-8 (e.g., "cites", "similar_to", "authored_by")
-    type: []const u8,
+    type: GraphEdgeType,
     /// Finite non-negative edge cost or confidence. The max_weight path mode additionally requires values in [0,1].
     weight: f64,
     /// When the edge was created
@@ -906,8 +905,7 @@ pub const EdgeDirection = enum {
 
 /// Configuration for a specific edge type
 pub const EdgeTypeConfig = struct {
-    /// Edge type name encoded as at most 64 KiB of UTF-8 (e.g., 'cites', 'similar_to')
-    name: []const u8,
+    name: GraphEdgeType,
     /// Document field containing target node key(s) for automatic edge creation. Supports string (single target) or array of strings (multiple targets). When omitted, edges must be provided explicitly via _edges.
     field: ?[]const u8 = null,
     /// Topology constraint for this edge type: - tree: Single parent per node, no cycles - graph: No constraints (default)
@@ -1390,8 +1388,7 @@ pub const GraphArtifactSourceConfig = struct {
     artifact: []const u8,
     path: ?[]const u8 = null,
     format: ?[]const u8 = null,
-    /// Edge type encoded as at most 64 KiB of UTF-8.
-    mention_edge_type: ?[]const u8 = null,
+    mention_edge_type: ?GraphEdgeType = null,
 };
 
 /// One exact node identity projected from a MATCH binding. Conjunctive bindings deliberately do not expose traversal depth, distance, or path: those values are not uniquely defined for branched patterns and may depend on execution order.
@@ -1765,6 +1762,9 @@ pub const GraphDocumentWildcardFilter = struct {
     path: []const u8,
 };
 
+/// Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit.
+pub const GraphEdgeType = []const u8;
+
 pub const GraphIdentityNodeSelector = struct {
     /// Exact node identities. Omitted table means the query table.
     identities: []const GraphPathEndpoint,
@@ -1893,7 +1893,7 @@ pub const GraphKShortestPaths = struct {
     to: GraphPathEndpoint,
     k: i64,
     /// At most 64 unique edge types totaling at most 64 KiB.
-    edge_types: ?[]const []const u8 = null,
+    edge_types: ?[]const GraphEdgeType = null,
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
@@ -1957,7 +1957,7 @@ pub const GraphMatchEdge = struct {
     from: antfly_graph_identifier_openapi.GraphIdentifier,
     to: antfly_graph_identifier_openapi.GraphIdentifier,
     /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
-    types: ?[]const []const u8 = null,
+    types: ?[]const GraphEdgeType = null,
     min_hops: ?i64 = null,
     max_hops: ?i64 = null,
     min_weight: ?f64 = null,
@@ -2129,8 +2129,7 @@ pub const GraphPath = struct {
 pub const GraphPathEdge = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
-    /// Edge type encoded as at most 64 KiB of UTF-8.
-    type: []const u8,
+    type: GraphEdgeType,
     /// Finite durable edge weight. max_weight paths further require values in [0,1].
     weight: f64,
     metadata: ?std.json.Value = null,
@@ -2213,7 +2212,7 @@ pub const GraphQuery = union(enum) {
 /// Deprecated graph_searches traversal and path parameters.
 pub const GraphQueryParams = struct {
     /// At most 64 unique edge types totaling at most 64 KiB.
-    edge_types: ?[]const []const u8 = null,
+    edge_types: ?[]const GraphEdgeType = null,
     direction: ?EdgeDirection = null,
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
@@ -2604,7 +2603,7 @@ pub const GraphShortestPath = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     /// At most 64 unique edge types totaling at most 64 KiB.
-    edge_types: ?[]const []const u8 = null,
+    edge_types: ?[]const GraphEdgeType = null,
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
@@ -2629,7 +2628,7 @@ pub const GraphTemplateValue = std.json.Value;
 pub const GraphTraversal = struct {
     start: GraphNodeSelector,
     /// At most 64 unique edge types totaling at most 64 KiB.
-    edge_types: ?[]const []const u8 = null,
+    edge_types: ?[]const GraphEdgeType = null,
     /// Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
     max_depth: ?i64 = null,
     min_weight: ?f64 = null,
@@ -3339,7 +3338,7 @@ pub const PathWeightMode = enum {
 /// Deprecated linear graph_searches pattern edge.
 pub const PatternEdgeStep = struct {
     /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
-    types: ?[]const []const u8 = null,
+    types: ?[]const GraphEdgeType = null,
     direction: ?EdgeDirection = null,
     min_hops: ?i64 = null,
     max_hops: ?i64 = null,

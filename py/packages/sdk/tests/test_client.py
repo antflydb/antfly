@@ -556,6 +556,28 @@ class TestAntflyClient:
             client.query(table="docs", graph_queries={"people": query})
 
     @pytest.mark.parametrize(
+        ("edge_types", "error"),
+        [
+            (["bad\ud800"], "valid UTF-8"),
+            (["links", "links"], "duplicate edge types"),
+            (["文" * (65_536 // 3 + 1)], "at most 65536 UTF-8 bytes"),
+        ],
+    )
+    def test_query_rejects_edge_types_outside_wire_policy(self, edge_types: list[str], error: str) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        query = {
+            "match": {
+                "anchor": "person",
+                "nodes": {"person": {}, "author": {}},
+                "edges": [{"from": "person", "to": "author", "types": edge_types}],
+            },
+            "return": {"bindings": ["person"]},
+        }
+
+        with pytest.raises(AntflyException, match=error):
+            client.query(table="docs", graph_queries={"people": query})
+
+    @pytest.mark.parametrize(
         ("start", "error"),
         [
             ({"result_ref": "$graph_results.bad\u200bname"}, "result_ref query name"),

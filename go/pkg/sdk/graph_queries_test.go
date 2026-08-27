@@ -172,10 +172,11 @@ func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
 	if _, err := NewGraphKeySelector("doc:a", "doc:a"); err == nil {
 		t.Fatal("expected duplicate key error")
 	}
-	if _, err := NewGraphIdentitySelector(
-		GraphPathEndpoint{Table: "docs", Key: "doc:a"},
-		GraphPathEndpoint{Table: "docs", Key: "doc:a"},
-	); err == nil {
+	identity, err := NewGraphIdentity("doc:a", "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewGraphIdentitySelector(identity, identity); err == nil {
 		t.Fatal("expected duplicate identity error")
 	}
 	if _, err := NewGraphBindingsReturn([]string{"a"}, GraphBindingsOptions{Fields: []string{"title"}}); err == nil {
@@ -637,7 +638,10 @@ func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":null,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[{"key":"a","table":"","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"bindings","rows":[{"a":{"key":"a","table":""}}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops"}],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a","table":""}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"wrong","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"a","table":"entities","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"b","depth":0,"path":[{"key":"a"},{"key":"b"}]}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
@@ -789,6 +793,12 @@ func TestGraphMatchEdgeValidationMatchesServerDefaultsAndBudgets(t *testing.T) {
 	}
 	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Types: []string{""}}); err == nil {
 		t.Fatal("expected empty graph edge type to fail")
+	}
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Types: []string{"bad\xff"}}); err == nil {
+		t.Fatal("expected invalid UTF-8 graph edge type to fail")
+	}
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Types: []string{strings.Repeat("文", maxGraphEdgeTypeBytes/3+1)}}); err == nil {
+		t.Fatal("expected encoded graph edge type byte limit to fail")
 	}
 }
 

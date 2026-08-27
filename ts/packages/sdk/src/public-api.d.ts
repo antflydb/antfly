@@ -7821,8 +7821,7 @@ export interface components {
              * @description Base64-encoded target document key
              */
             target: string;
-            /** @description Edge type encoded as at most 64 KiB of UTF-8 (e.g., "cites", "similar_to", "authored_by") */
-            type: string;
+            type: components["schemas"]["GraphEdgeType"];
             /**
              * Format: double
              * @description Finite non-negative edge cost or confidence. The max_weight path mode additionally requires values in [0,1].
@@ -9503,10 +9502,11 @@ export interface components {
              */
             type: "embeddings";
         };
+        /** @description Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit. */
+        GraphEdgeType: string;
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
-            /** @description Edge type name encoded as at most 64 KiB of UTF-8 (e.g., 'cites', 'similar_to') */
-            name: string;
+            name: components["schemas"]["GraphEdgeType"];
             /**
              * @description Document field containing target node key(s) for automatic edge creation.
              *     Supports string (single target) or array of strings (multiple targets).
@@ -9552,8 +9552,7 @@ export interface components {
              * @enum {string}
              */
             format?: "extraction_relation" | "extraction_graph";
-            /** @description Edge type encoded as at most 64 KiB of UTF-8. */
-            mention_edge_type?: string;
+            mention_edge_type?: components["schemas"]["GraphEdgeType"];
         };
         /** @description Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template. */
         GraphArtifactProducerSourceConfig: {
@@ -12056,7 +12055,7 @@ export interface components {
             from: components["schemas"]["GraphIdentifier"];
             to: components["schemas"]["GraphIdentifier"];
             /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
-            types?: string[];
+            types?: components["schemas"]["GraphEdgeType"][];
             /** @default 1 */
             min_hops?: number;
             /** @default 1 */
@@ -12180,7 +12179,7 @@ export interface components {
         GraphTraversal: {
             start: components["schemas"]["GraphNodeSelector"];
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
-            edge_types?: string[];
+            edge_types?: components["schemas"]["GraphEdgeType"][];
             /**
              * @description Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
              * @default 1
@@ -12221,7 +12220,7 @@ export interface components {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
-            edge_types?: string[];
+            edge_types?: components["schemas"]["GraphEdgeType"][];
             /** @default 10 */
             max_depth?: number;
             /** Format: double */
@@ -12249,7 +12248,7 @@ export interface components {
             to: components["schemas"]["GraphPathEndpoint"];
             k: number;
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
-            edge_types?: string[];
+            edge_types?: components["schemas"]["GraphEdgeType"][];
             /** @default 10 */
             max_depth?: number;
             /** Format: double */
@@ -12316,7 +12315,7 @@ export interface components {
          */
         GraphQueryParams: {
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
-            edge_types?: string[];
+            edge_types?: components["schemas"]["GraphEdgeType"][];
             direction?: components["schemas"]["EdgeDirection"];
             max_depth?: number;
             /** Format: double */
@@ -12340,7 +12339,7 @@ export interface components {
          */
         PatternEdgeStep: {
             /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
-            types?: string[];
+            types?: components["schemas"]["GraphEdgeType"][];
             direction?: components["schemas"]["EdgeDirection"];
             /** @default 1 */
             min_hops?: number;
@@ -12481,8 +12480,7 @@ export interface components {
         GraphPathEdge: {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
-            /** @description Edge type encoded as at most 64 KiB of UTF-8. */
-            type: string;
+            type: components["schemas"]["GraphEdgeType"];
             /**
              * Format: double
              * @description Finite durable edge weight. max_weight paths further require values in [0,1].

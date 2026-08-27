@@ -22,7 +22,9 @@ class GraphArtifactSourceConfig:
         path (str | Unset):
         format_ (GraphArtifactSourceConfigFormat | Unset):  Default:
             GraphArtifactSourceConfigFormat.EXTRACTION_RELATION.
-        mention_edge_type (str | Unset): Edge type encoded as at most 64 KiB of UTF-8.
+        mention_edge_type (str | Unset): Durable graph edge type. Values must be valid UTF-8 and encode to at most 64
+            KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-
+            byte limit.
     """
 
     kind: GraphArtifactSourceConfigKind

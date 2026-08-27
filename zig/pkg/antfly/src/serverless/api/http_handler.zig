@@ -43,6 +43,7 @@ const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const graph_work_budget_mod = @import("../../graph/work_budget.zig");
 const graph_node_admission = @import("../../graph/node_admission.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
 const graph_paths = @import("../../graph/paths.zig");
@@ -3138,7 +3139,7 @@ pub const HttpHandler = struct {
             .cancellation = session.cancellation,
             .work_budget = &request_work_budget,
         };
-        var request_cache = PublicGraphRequestCache.init(self, session);
+        var request_cache = PublicGraphRequestCache.init(self, session, &request_work_budget);
         defer request_cache.deinit();
 
         var available_sets = std.ArrayListUnmanaged(GraphResultSet).empty;
@@ -3527,7 +3528,7 @@ pub const HttpHandler = struct {
         // Canonical MATCH needs the complete published document relation both
         // to enumerate its selected anchor and to evaluate alias filters.
         const need_docs = conjunctive_pattern != null or named_query.query.include_documents or patternRequiresDocumentFilter(named_query.query.pattern);
-        const docs: []const query_materializer.Document = if (need_docs) try request_cache.documents() else &.{};
+        const docs: []const PublicDocumentRef = if (need_docs) try request_cache.documents() else &.{};
 
         var filter_ctx = PatternDocumentFilterContext{
             .alloc = self.alloc,
@@ -3562,6 +3563,7 @@ pub const HttpHandler = struct {
             .evaluator = if (need_docs) .{
                 .ctx = @ptrCast(&filter_ctx),
                 .func = publishedPatternNodeFilterEvaluator,
+                .batch_func = publishedPatternNodeFilterBatchEvaluator,
             } else null,
             .work_budget = request_work_budget,
             .distinct_budget = request_distinct_budget,
@@ -4488,22 +4490,14 @@ pub const HttpHandler = struct {
     }
 
     fn allocSessionMutationOverlayAlloc(self: *HttpHandler, session: *query_mod.QuerySession) ![]query_materializer.Mutation {
-        var total_entries: usize = 0;
-        for (0..session.artifactCount()) |artifact_index| {
-            const artifact_ref = session.artifactRef(artifact_index) orelse continue;
-            if (artifact_ref.kind != .mutation_segment) continue;
-            const contents = try session.fetchArtifactAlloc(artifact_index);
-            defer self.alloc.free(contents);
-            const entries = try segment_mod.decodeAlloc(self.alloc, contents);
-            defer segment_mod.freeEntries(self.alloc, entries);
-            total_entries += entries.len;
+        var mutations = std.ArrayListUnmanaged(query_materializer.Mutation).empty;
+        errdefer {
+            for (mutations.items) |mutation| {
+                self.alloc.free(@constCast(mutation.doc_id));
+                if (mutation.body) |body| self.alloc.free(@constCast(body));
+            }
+            mutations.deinit(self.alloc);
         }
-        if (total_entries == 0) return try self.alloc.alloc(query_materializer.Mutation, 0);
-
-        const mutations = try self.alloc.alloc(query_materializer.Mutation, total_entries);
-        errdefer self.alloc.free(mutations);
-        var initialized: usize = 0;
-        errdefer freeMaterializerMutations(self.alloc, mutations[0..initialized]);
 
         for (0..session.artifactCount()) |artifact_index| {
             const artifact_ref = session.artifactRef(artifact_index) orelse continue;
@@ -4513,17 +4507,20 @@ pub const HttpHandler = struct {
             const entries = try segment_mod.decodeAlloc(self.alloc, contents);
             defer segment_mod.freeEntries(self.alloc, entries);
             for (entries) |entry| {
-                mutations[initialized] = .{
+                const doc_id = try self.alloc.dupe(u8, entry.doc_id);
+                errdefer self.alloc.free(doc_id);
+                const body = if (entry.body) |value| try self.alloc.dupe(u8, value) else null;
+                errdefer if (body) |value| self.alloc.free(value);
+                try mutations.append(self.alloc, .{
                     .lsn = entry.lsn,
                     .timestamp_ns = entry.timestamp_ns,
                     .kind = entry.kind,
-                    .doc_id = try self.alloc.dupe(u8, entry.doc_id),
-                    .body = if (entry.body) |body| try self.alloc.dupe(u8, body) else null,
-                };
-                initialized += 1;
+                    .doc_id = doc_id,
+                    .body = body,
+                });
             }
         }
-        return mutations;
+        return try mutations.toOwnedSlice(self.alloc);
     }
 
     fn allocArtifactMutations(self: *HttpHandler, session: *query_mod.QuerySession, artifact_index: usize) ![]query_types.QueryMutation {
@@ -5175,21 +5172,74 @@ const CachedPublicGraphSegment = struct {
     }
 };
 
+const PublicDocumentArtifactBody = struct {
+    artifact_index: usize,
+    offset: u64,
+    len: u32,
+};
+
+const PublicDocumentBody = union(enum) {
+    artifact: PublicDocumentArtifactBody,
+    owned: []u8,
+    cached: []const u8,
+    deleted,
+    moved,
+};
+
+/// Request-owned identity plus a lazy body locator. The exact anchor relation
+/// retains IDs and locations, not every stored document body.
+const PublicDocumentRef = struct {
+    doc_id: []u8,
+    body: PublicDocumentBody,
+    last_lsn: u64,
+    last_timestamp_ns: u64,
+
+    fn deinit(self: *PublicDocumentRef, alloc: Allocator) void {
+        switch (self.body) {
+            .owned => |body| {
+                alloc.free(self.doc_id);
+                alloc.free(body);
+            },
+            .artifact, .cached, .deleted => alloc.free(self.doc_id),
+            .moved => {},
+        }
+        self.* = undefined;
+    }
+};
+
+fn freePublicDocumentRefs(alloc: Allocator, docs: []PublicDocumentRef) void {
+    for (docs) |*doc| doc.deinit(alloc);
+    alloc.free(docs);
+}
+
+fn lessPublicDocumentRef(_: void, lhs: PublicDocumentRef, rhs: PublicDocumentRef) bool {
+    return std.mem.order(u8, lhs.doc_id, rhs.doc_id) == .lt;
+}
+
 /// Immutable published data and compiled node filters are request resources.
 /// Keep one copy per source snapshot/index so named MATCH operations share
 /// decoding and materialization costs while their execution remains ordered.
 const PublicGraphRequestCache = struct {
     handler: *HttpHandler,
     session: *query_mod.QuerySession,
-    published_documents: ?[]query_materializer.Document = null,
+    work_budget: *graph_pattern_mod.WorkBudget,
+    retained_lease: graph_work_budget_mod.RetainedLease,
+    published_documents: ?[]PublicDocumentRef = null,
     published_document_index: std.StringHashMapUnmanaged(usize) = .empty,
+    published_body_blocks: std.ArrayListUnmanaged([]u8) = .empty,
     segments: std.ArrayListUnmanaged(CachedPublicGraphSegment) = .empty,
     filter_cache: db_query_graph.PreparedPatternFilterCache,
 
-    fn init(handler: *HttpHandler, session: *query_mod.QuerySession) PublicGraphRequestCache {
+    fn init(
+        handler: *HttpHandler,
+        session: *query_mod.QuerySession,
+        work_budget: *graph_pattern_mod.WorkBudget,
+    ) PublicGraphRequestCache {
         return .{
             .handler = handler,
             .session = session,
+            .work_budget = work_budget,
+            .retained_lease = .{ .budget = work_budget },
             .filter_cache = db_query_graph.PreparedPatternFilterCache.init(handler.alloc),
         };
     }
@@ -5197,7 +5247,9 @@ const PublicGraphRequestCache = struct {
     fn deinit(self: *PublicGraphRequestCache) void {
         self.filter_cache.deinit();
         self.published_document_index.deinit(self.handler.alloc);
-        if (self.published_documents) |docs| query_materializer.freeDocuments(self.handler.alloc, docs);
+        if (self.published_documents) |docs| freePublicDocumentRefs(self.handler.alloc, docs);
+        for (self.published_body_blocks.items) |block| self.handler.alloc.free(block);
+        self.published_body_blocks.deinit(self.handler.alloc);
         for (self.segments.items) |*entry| {
             self.handler.alloc.free(entry.index_name);
             entry.adjacency_index.deinit(self.handler.alloc);
@@ -5207,15 +5259,29 @@ const PublicGraphRequestCache = struct {
             graph_segment_mod.freeSegment(self.handler.alloc, &entry.segment);
         }
         self.segments.deinit(self.handler.alloc);
+        self.retained_lease.deinit();
         self.* = undefined;
     }
 
-    fn documents(self: *PublicGraphRequestCache) ![]const query_materializer.Document {
+    fn reserveRetained(self: *PublicGraphRequestCache, additional: usize) !void {
+        const total = std.math.add(usize, self.retained_lease.bytes, additional) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        try self.retained_lease.resize(total);
+    }
+
+    fn documents(self: *PublicGraphRequestCache) ![]const PublicDocumentRef {
         if (self.published_documents == null) {
-            self.published_documents = try self.handler.allocPublishedDocumentsAlloc(self.session);
+            self.published_documents = try self.allocPublishedDocumentRefs();
             const docs = self.published_documents.?;
             const capacity = std.math.cast(std.StringHashMapUnmanaged(usize).Size, docs.len) orelse
                 return error.QueryCandidateBudgetExceeded;
+            const map_capacity = graph_work_budget_mod.hashMapCapacityForCount(
+                docs.len,
+                std.hash_map.default_max_load_percentage,
+            ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            const map_bytes = graph_work_budget_mod.hashMapRetainedBytes([]const u8, usize, map_capacity) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            try self.reserveRetained(map_bytes);
             try self.published_document_index.ensureTotalCapacity(self.handler.alloc, capacity);
             for (docs, 0..) |doc, idx| {
                 const gop = self.published_document_index.getOrPutAssumeCapacity(doc.doc_id);
@@ -5227,9 +5293,277 @@ const PublicGraphRequestCache = struct {
     }
 
     fn documentBody(self: *PublicGraphRequestCache, doc_id: []const u8) !?[]const u8 {
-        const docs = try self.documents();
+        _ = try self.documents();
         const idx = self.published_document_index.get(doc_id) orelse return null;
-        return docs[idx].body;
+        const doc = &self.published_documents.?[idx];
+        switch (doc.body) {
+            .owned => |body| return body,
+            .cached => |body| return body,
+            .deleted, .moved => return null,
+            .artifact => |locator| {
+                try self.reserveRetained(locator.len);
+                const body = self.session.fetchArtifactRangeAlloc(
+                    locator.artifact_index,
+                    locator.offset,
+                    locator.len,
+                ) catch |err| {
+                    self.retained_lease.resize(self.retained_lease.bytes - locator.len) catch unreachable;
+                    return err;
+                };
+                if (body.len != locator.len) {
+                    self.handler.alloc.free(body);
+                    self.retained_lease.resize(self.retained_lease.bytes - locator.len) catch unreachable;
+                    return error.InvalidDocumentSegment;
+                }
+                doc.body = .{ .owned = body };
+                return body;
+            },
+        }
+    }
+
+    fn prefetchDocumentBodies(self: *PublicGraphRequestCache, docs: []const PublicDocumentRef) !void {
+        const max_coalesced_bytes: usize = 4 * 1024 * 1024;
+        const max_gap_bytes: u64 = 64 * 1024;
+        var cursor: usize = 0;
+        while (cursor < docs.len) {
+            const first_idx = self.published_document_index.get(docs[cursor].doc_id) orelse {
+                cursor += 1;
+                continue;
+            };
+            const first = &self.published_documents.?[first_idx];
+            const first_locator = switch (first.body) {
+                .artifact => |locator| locator,
+                .owned, .cached, .deleted, .moved => {
+                    cursor += 1;
+                    continue;
+                },
+            };
+            var end_cursor = cursor + 1;
+            var range_end = std.math.add(u64, first_locator.offset, first_locator.len) catch
+                return error.InvalidDocumentSegment;
+            while (end_cursor < docs.len) : (end_cursor += 1) {
+                const next_idx = self.published_document_index.get(docs[end_cursor].doc_id) orelse break;
+                const next_locator = switch (self.published_documents.?[next_idx].body) {
+                    .artifact => |locator| locator,
+                    .owned, .cached, .deleted, .moved => break,
+                };
+                if (next_locator.artifact_index != first_locator.artifact_index or next_locator.offset < range_end) break;
+                const gap = next_locator.offset - range_end;
+                const next_end = std.math.add(u64, next_locator.offset, next_locator.len) catch
+                    return error.InvalidDocumentSegment;
+                const total_len = next_end - first_locator.offset;
+                if (gap > max_gap_bytes or total_len > max_coalesced_bytes) break;
+                range_end = next_end;
+            }
+            const range_len_u64 = range_end - first_locator.offset;
+            const range_len = std.math.cast(usize, range_len_u64) orelse return error.InvalidDocumentSegment;
+            if (self.published_body_blocks.items.len == self.published_body_blocks.capacity) {
+                const metadata_bytes = @sizeOf([]u8);
+                try self.reserveRetained(metadata_bytes);
+                self.published_body_blocks.ensureTotalCapacityPrecise(
+                    self.handler.alloc,
+                    self.published_body_blocks.items.len + 1,
+                ) catch |err| {
+                    self.retained_lease.resize(self.retained_lease.bytes - metadata_bytes) catch unreachable;
+                    return err;
+                };
+            }
+            try self.reserveRetained(range_len);
+            const block = self.session.fetchArtifactRangeAlloc(
+                first_locator.artifact_index,
+                first_locator.offset,
+                range_len,
+            ) catch |err| {
+                self.retained_lease.resize(self.retained_lease.bytes - range_len) catch unreachable;
+                return err;
+            };
+            if (block.len != range_len) {
+                self.handler.alloc.free(block);
+                self.retained_lease.resize(self.retained_lease.bytes - range_len) catch unreachable;
+                return error.InvalidDocumentSegment;
+            }
+            self.published_body_blocks.appendAssumeCapacity(block);
+            for (docs[cursor..end_cursor]) |candidate| {
+                const doc_idx = self.published_document_index.get(candidate.doc_id) orelse continue;
+                const doc = &self.published_documents.?[doc_idx];
+                const locator = switch (doc.body) {
+                    .artifact => |value| value,
+                    .owned, .cached, .deleted, .moved => continue,
+                };
+                if (locator.artifact_index != first_locator.artifact_index or locator.offset < first_locator.offset)
+                    continue;
+                const local_start = std.math.cast(usize, locator.offset - first_locator.offset) orelse
+                    return error.InvalidDocumentSegment;
+                const local_end = std.math.add(usize, local_start, locator.len) catch
+                    return error.InvalidDocumentSegment;
+                if (local_end > block.len) return error.InvalidDocumentSegment;
+                doc.body = .{ .cached = block[local_start..local_end] };
+            }
+            cursor = end_cursor;
+        }
+    }
+
+    fn allocPublishedDocumentRefs(self: *PublicGraphRequestCache) ![]PublicDocumentRef {
+        var base = blk: {
+            for (0..self.session.artifactCount()) |artifact_index| {
+                const artifact_ref = self.session.artifactRef(artifact_index) orelse continue;
+                if (artifact_ref.kind != .document_segment) continue;
+                break :blk try self.allocDocumentArtifactRefs(artifact_index, artifact_ref);
+            }
+            break :blk try self.handler.alloc.alloc(PublicDocumentRef, 0);
+        };
+        errdefer freePublicDocumentRefs(self.handler.alloc, base);
+
+        const mutations = try self.handler.allocSessionMutationOverlayAlloc(self.session);
+        defer freeMaterializerMutations(self.handler.alloc, mutations);
+        if (mutations.len == 0) {
+            try self.reserveDocumentRefs(base);
+            return base;
+        }
+
+        var slots = std.ArrayListUnmanaged(PublicDocumentRef){ .items = base, .capacity = base.len };
+        base = &.{};
+        defer {
+            for (slots.items) |*slot| slot.deinit(self.handler.alloc);
+            slots.deinit(self.handler.alloc);
+        }
+        var slot_by_id = std.StringHashMapUnmanaged(usize).empty;
+        defer slot_by_id.deinit(self.handler.alloc);
+        const slot_capacity = std.math.add(usize, slots.items.len, mutations.len) catch
+            return error.QueryCandidateBudgetExceeded;
+        try slot_by_id.ensureTotalCapacity(self.handler.alloc, @intCast(slot_capacity));
+        for (slots.items, 0..) |slot, idx| {
+            const gop = slot_by_id.getOrPutAssumeCapacity(slot.doc_id);
+            if (gop.found_existing) return error.InvalidDocumentSegment;
+            gop.value_ptr.* = idx;
+        }
+
+        for (mutations) |mutation| {
+            const idx = slot_by_id.get(mutation.doc_id) orelse blk: {
+                const doc_id = try self.handler.alloc.dupe(u8, mutation.doc_id);
+                errdefer self.handler.alloc.free(doc_id);
+                try slots.append(self.handler.alloc, .{
+                    .doc_id = doc_id,
+                    .body = .deleted,
+                    .last_lsn = 0,
+                    .last_timestamp_ns = 0,
+                });
+                const new_idx = slots.items.len - 1;
+                try slot_by_id.put(self.handler.alloc, slots.items[new_idx].doc_id, new_idx);
+                break :blk new_idx;
+            };
+            var slot = &slots.items[idx];
+            if (mutation.lsn < slot.last_lsn or
+                (mutation.lsn == slot.last_lsn and mutation.timestamp_ns < slot.last_timestamp_ns)) continue;
+            switch (slot.body) {
+                .owned => |body| self.handler.alloc.free(body),
+                .artifact, .cached, .deleted, .moved => {},
+            }
+            slot.body = switch (mutation.kind) {
+                .upsert => .{ .owned = try self.handler.alloc.dupe(u8, mutation.body orelse "") },
+                .delete => .deleted,
+            };
+            slot.last_lsn = mutation.lsn;
+            slot.last_timestamp_ns = mutation.timestamp_ns;
+        }
+
+        var live_count: usize = 0;
+        for (slots.items) |slot| switch (slot.body) {
+            .deleted, .moved => {},
+            .artifact, .owned, .cached => live_count += 1,
+        };
+        const out = try self.handler.alloc.alloc(PublicDocumentRef, live_count);
+        var out_idx: usize = 0;
+        errdefer {
+            for (out[0..out_idx]) |*doc| doc.deinit(self.handler.alloc);
+            self.handler.alloc.free(out);
+        }
+        for (slots.items) |*slot| {
+            switch (slot.body) {
+                .deleted, .moved => continue,
+                .artifact, .owned, .cached => {},
+            }
+            out[out_idx] = slot.*;
+            slot.body = .moved;
+            out_idx += 1;
+        }
+        std.mem.sort(PublicDocumentRef, out, {}, lessPublicDocumentRef);
+        try self.reserveDocumentRefs(out);
+        return out;
+    }
+
+    fn allocDocumentArtifactRefs(
+        self: *PublicGraphRequestCache,
+        artifact_index: usize,
+        artifact_ref: manifest_mod.ArtifactRef,
+    ) ![]PublicDocumentRef {
+        if (artifact_ref.byte_len < 12) return error.InvalidDocumentSegment;
+        const initial_len: usize = @intCast(@min(artifact_ref.byte_len, document_segment_mod.header_len));
+        var header_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, initial_len);
+        defer header_lease.deinit();
+        const header_bytes = try self.session.fetchArtifactRangeAlloc(artifact_index, 0, initial_len);
+        defer self.handler.alloc.free(header_bytes);
+        const header = try document_segment_mod.decodeHeader(header_bytes);
+
+        const directory_len = try header.indexedBytes();
+        if (@as(u64, directory_len) > artifact_ref.byte_len) return error.InvalidDocumentSegment;
+        const identity_bytes = header.identityBytes() catch return error.InvalidDocumentSegment;
+        const transient_bytes = std.math.add(
+            usize,
+            directory_len,
+            std.math.add(
+                usize,
+                std.math.mul(
+                    usize,
+                    header.count,
+                    @sizeOf(document_segment_mod.IndexEntry) + @sizeOf(PublicDocumentRef),
+                ) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                std.math.mul(usize, identity_bytes, 2) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+            ) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        var directory_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, transient_bytes);
+        defer directory_lease.deinit();
+        const directory = try self.session.fetchArtifactRangeAlloc(artifact_index, 0, directory_len);
+        defer self.handler.alloc.free(directory);
+        const index = try document_segment_mod.decodeIndexAlloc(self.handler.alloc, directory, artifact_ref.byte_len);
+        defer document_segment_mod.freeIndexEntries(self.handler.alloc, index);
+
+        const refs = try self.handler.alloc.alloc(PublicDocumentRef, index.len);
+        errdefer self.handler.alloc.free(refs);
+        var initialized: usize = 0;
+        errdefer for (refs[0..initialized]) |*entry| entry.deinit(self.handler.alloc);
+        for (index, refs) |entry, *ref| {
+            ref.* = .{
+                .doc_id = try self.handler.alloc.dupe(u8, entry.doc_id),
+                .body = .{ .artifact = .{
+                    .artifact_index = artifact_index,
+                    .offset = entry.body_offset,
+                    .len = entry.body_len,
+                } },
+                .last_lsn = entry.last_lsn,
+                .last_timestamp_ns = entry.last_timestamp_ns,
+            };
+            initialized += 1;
+        }
+        return refs;
+    }
+
+    fn reserveDocumentRefs(self: *PublicGraphRequestCache, docs: []const PublicDocumentRef) !void {
+        var bytes = std.math.mul(usize, docs.len, @sizeOf(PublicDocumentRef)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        for (docs) |doc| {
+            bytes = std.math.add(usize, bytes, doc.doc_id.len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            switch (doc.body) {
+                .owned => |body| bytes = std.math.add(usize, bytes, body.len) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                .artifact, .cached, .deleted, .moved => {},
+            }
+        }
+        try self.reserveRetained(bytes);
     }
 
     fn graphSegment(self: *PublicGraphRequestCache, index_name: []const u8) !*const CachedPublicGraphSegment {
@@ -5631,7 +5965,7 @@ fn clonePublicSegmentEdge(
 }
 
 fn nextConjunctiveAnchorPage(
-    docs: []const query_materializer.Document,
+    docs: []const PublicDocumentRef,
     cursor: *usize,
     buffer: [][]const u8,
     pattern: graph_pattern_mod.ConjunctivePattern,
@@ -5641,16 +5975,21 @@ fn nextConjunctiveAnchorPage(
     const anchor = graph_pattern_mod.selectConjunctiveAnchor(pattern) orelse return error.InvalidQueryRequest;
     var page_len: usize = 0;
     while (cursor.* < docs.len and page_len < buffer.len) {
-        const doc = docs[cursor.*];
-        cursor.* += 1;
-        try work_budget.consumeAnchors(1);
-        if (!try publishedPatternNodeFilterEvaluator(
-            @ptrCast(filter_ctx),
-            .{ .table = null, .key = doc.doc_id },
-            anchor.filter,
-        )) continue;
-        buffer[page_len] = doc.doc_id;
-        page_len += 1;
+        const raw_end = @min(docs.len, cursor.* + (buffer.len - page_len));
+        if (anchor.filter.filter_query_json != null)
+            try filter_ctx.documents.prefetchDocumentBodies(docs[cursor.*..raw_end]);
+        while (cursor.* < raw_end) {
+            const doc = docs[cursor.*];
+            cursor.* += 1;
+            try work_budget.consumeAnchors(1);
+            if (!try publishedPatternNodeFilterEvaluator(
+                @ptrCast(filter_ctx),
+                .{ .table = null, .key = doc.doc_id },
+                anchor.filter,
+            )) continue;
+            buffer[page_len] = doc.doc_id;
+            page_len += 1;
+        }
     }
     return buffer[0..page_len];
 }
@@ -5736,12 +6075,58 @@ fn publishedPatternNodeFilterEvaluator(ctx: ?*anyopaque, node: graph_node_identi
     return try prepared.matchesStored(active.alloc, node.key, body);
 }
 
+fn publishedPatternNodeFilterBatchEvaluator(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    nodes: []const graph_node_identity.Ref,
+    filter: graph_pattern_mod.NodeFilter,
+) anyerror![]bool {
+    const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
+    const refs = try alloc.alloc(PublicDocumentRef, nodes.len);
+    defer alloc.free(refs);
+    var refs_len: usize = 0;
+    if (filter.filter_query_json != null) {
+        _ = try active.documents.documents();
+        for (nodes) |node| {
+            if (node.table) |table| {
+                if (!std.mem.eql(u8, table, active.source_table)) continue;
+            }
+            const idx = active.documents.published_document_index.get(node.key) orelse continue;
+            refs[refs_len] = active.documents.published_documents.?[idx];
+            refs_len += 1;
+        }
+        try active.documents.prefetchDocumentBodies(refs[0..refs_len]);
+    }
+    const decisions = try alloc.alloc(bool, nodes.len);
+    errdefer alloc.free(decisions);
+    for (nodes, 0..) |node, idx| {
+        decisions[idx] = try publishedPatternNodeFilterEvaluator(ctx, node, filter);
+    }
+    return decisions;
+}
+
 fn serverlessGraphNodeAdmission(
     ctx: ?*anyopaque,
     alloc: Allocator,
     nodes: []const graph_node_admission.NodeRef,
 ) anyerror![]bool {
     const active: *ServerlessGraphAdmissionContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
+    const refs = try alloc.alloc(PublicDocumentRef, nodes.len);
+    defer alloc.free(refs);
+    var refs_len: usize = 0;
+    if (active.filter.filter_query_json != null) {
+        _ = try active.filter_ctx.documents.documents();
+        for (nodes) |node| {
+            if (node.external and if (node.table) |table|
+                !std.mem.eql(u8, table, active.filter_ctx.source_table)
+            else
+                false) continue;
+            const idx = active.filter_ctx.documents.published_document_index.get(node.key) orelse continue;
+            refs[refs_len] = active.filter_ctx.documents.published_documents.?[idx];
+            refs_len += 1;
+        }
+        try active.filter_ctx.documents.prefetchDocumentBodies(refs[0..refs_len]);
+    }
     const admitted = try alloc.alloc(bool, nodes.len);
     errdefer alloc.free(admitted);
     for (nodes, 0..) |node, i| {
@@ -11392,12 +11777,12 @@ test "serverless public graph reader preserves qualified endpoint identity" {
 }
 
 test "serverless conjunctive anchors are enumerated in borrowed bounded pages" {
-    const docs = [_]query_materializer.Document{
-        .{ .doc_id = @constCast("a"), .body = @constCast("{}"), .last_lsn = 1, .last_timestamp_ns = 1 },
-        .{ .doc_id = @constCast("b"), .body = @constCast("{}"), .last_lsn = 1, .last_timestamp_ns = 1 },
-        .{ .doc_id = @constCast("c"), .body = @constCast("{}"), .last_lsn = 1, .last_timestamp_ns = 1 },
-        .{ .doc_id = @constCast("d"), .body = @constCast("{}"), .last_lsn = 1, .last_timestamp_ns = 1 },
-        .{ .doc_id = @constCast("e"), .body = @constCast("{}"), .last_lsn = 1, .last_timestamp_ns = 1 },
+    const docs = [_]PublicDocumentRef{
+        .{ .doc_id = @constCast("a"), .body = .deleted, .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("b"), .body = .deleted, .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("c"), .body = .deleted, .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("d"), .body = .deleted, .last_lsn = 1, .last_timestamp_ns = 1 },
+        .{ .doc_id = @constCast("e"), .body = .deleted, .last_lsn = 1, .last_timestamp_ns = 1 },
     };
     const nodes = [_]graph_pattern_mod.MatchNode{.{ .alias = "anchor" }};
     const pattern = graph_pattern_mod.ConjunctivePattern{

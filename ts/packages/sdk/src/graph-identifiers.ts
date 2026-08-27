@@ -12,6 +12,8 @@ import type { GraphCountAggregate, GraphDocumentFilter } from "./types.js";
 type JSONObject = Record<string, unknown>;
 const MAX_ANTFLY_UNIX_NS = (1n << 64n) - 1n;
 const NS_PER_SECOND = 1_000_000_000n;
+const MAX_GRAPH_EDGE_TYPES = 64;
+const MAX_GRAPH_EDGE_TYPE_UTF8_BYTES = 64 * 1024;
 
 function object(value: unknown): JSONObject | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -26,6 +28,49 @@ function requireIdentifier(value: unknown, path: string): asserts value is strin
         "(1-128 Unicode code points; no reserved, boundary-space, non-ASCII whitespace, control, or format characters)"
     );
   }
+}
+
+function validUtf8ByteLength(value: string): number | undefined {
+  let bytes = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit <= 0x7f) bytes += 1;
+    else if (unit <= 0x7ff) bytes += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const low = value.charCodeAt(index + 1);
+      if (!(low >= 0xdc00 && low <= 0xdfff)) return undefined;
+      bytes += 4;
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) return undefined;
+    else bytes += 3;
+  }
+  return bytes;
+}
+
+function validateEdgeTypes(value: unknown, path: string): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value) || value.length > MAX_GRAPH_EDGE_TYPES) {
+    throw new TypeError(`${path} must contain at most ${MAX_GRAPH_EDGE_TYPES} edge types`);
+  }
+  const seen = new Set<string>();
+  let totalBytes = 0;
+  value.forEach((candidate, index) => {
+    if (typeof candidate !== "string" || candidate.length === 0) {
+      throw new TypeError(`${path}[${index}] must be a non-empty valid UTF-8 string`);
+    }
+    const bytes = validUtf8ByteLength(candidate);
+    if (bytes === undefined) {
+      throw new TypeError(`${path}[${index}] must be a non-empty valid UTF-8 string`);
+    }
+    if (seen.has(candidate)) throw new TypeError(`${path} must not contain duplicate edge types`);
+    seen.add(candidate);
+    totalBytes += bytes;
+    if (totalBytes > MAX_GRAPH_EDGE_TYPE_UTF8_BYTES) {
+      throw new TypeError(
+        `${path} must encode to at most ${MAX_GRAPH_EDGE_TYPE_UTF8_BYTES} UTF-8 bytes`
+      );
+    }
+  });
 }
 
 function requireGraphDocumentPath(path: unknown): asserts path is string {
@@ -106,11 +151,7 @@ function daysFromCivil(year: number, month: number, day: number): bigint {
   return era * 146_097n + dayOfEra - 719_468n;
 }
 
-function requireRangeOptions(
-  value: unknown,
-  name: string,
-  allowedKeys: readonly string[]
-): void {
+function requireRangeOptions(value: unknown, name: string, allowedKeys: readonly string[]): void {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new TypeError(`${name} options must be an object`);
   }
@@ -249,6 +290,7 @@ function validateEdges(value: unknown, path: string): void {
     if (!edge) return;
     requireIdentifier(edge.from, `${path}[${index}].from`);
     requireIdentifier(edge.to, `${path}[${index}].to`);
+    validateEdgeTypes(edge.types, `${path}[${index}].types`);
   });
 }
 
@@ -355,6 +397,7 @@ export function countGraphAlias(alias: string, distinct = false): GraphCountAggr
 
 function validateTraverse(query: JSONObject, path: string): void {
   const traverse = object(query.traverse);
+  validateEdgeTypes(traverse?.edge_types, `${path}.traverse.edge_types`);
   const start = object(traverse?.start);
   if (!start || !("result_ref" in start)) return;
 
@@ -379,6 +422,13 @@ function validateTraverse(query: JSONObject, path: string): void {
   }
 }
 
+function validatePathEdgeTypes(query: JSONObject, path: string): void {
+  for (const operation of ["shortest_path", "k_shortest_paths"] as const) {
+    const body = object(query[operation]);
+    validateEdgeTypes(body?.edge_types, `${path}.${operation}.edge_types`);
+  }
+}
+
 /** Validate every identifier carried by canonical named graph operations. */
 export function validateGraphQueryIdentifiers(graphQueries: unknown): void {
   const operations = object(graphQueries);
@@ -394,6 +444,7 @@ export function validateGraphQueryIdentifiers(graphQueries: unknown): void {
       const path = `graph_queries[${JSON.stringify(name)}]`;
       validateMatch(query, path);
       validateTraverse(query, path);
+      validatePathEdgeTypes(query, path);
     }
   }
 }

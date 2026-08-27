@@ -51,6 +51,8 @@ MAX_INFERENCE_ERROR_BYTES = 1 << 20
 MAX_GENERATION_RESPONSE_BYTES = 16 << 20
 MAX_GENERATION_SSE_EVENT_BYTES = 16 << 20
 MAX_GENERATION_SSE_LINE_BYTES = 16 << 20
+MAX_GRAPH_EDGE_TYPES = 64
+MAX_GRAPH_EDGE_TYPE_UTF8_BYTES = 64 << 10
 
 CreateIndexRequest: TypeAlias = (
     CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
@@ -70,6 +72,28 @@ _CREATED_INDEX_TYPES = {
     "graph": CreatedGraphIndex,
     "algebraic": CreatedAlgebraicIndex,
 }
+
+
+def _require_graph_edge_types(value: object, path: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, list) or len(value) > MAX_GRAPH_EDGE_TYPES:
+        raise AntflyException(f"{path} must contain at most {MAX_GRAPH_EDGE_TYPES} edge types")
+    seen: set[str] = set()
+    total_bytes = 0
+    for index, edge_type in enumerate(value):
+        if not isinstance(edge_type, str) or not edge_type:
+            raise AntflyException(f"{path}[{index}] must be a non-empty valid UTF-8 string")
+        try:
+            encoded_len = len(edge_type.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise AntflyException(f"{path}[{index}] must be a non-empty valid UTF-8 string") from exc
+        if edge_type in seen:
+            raise AntflyException(f"{path} must not contain duplicate edge types")
+        seen.add(edge_type)
+        total_bytes += encoded_len
+        if total_bytes > MAX_GRAPH_EDGE_TYPE_UTF8_BYTES:
+            raise AntflyException(f"{path} must encode to at most {MAX_GRAPH_EDGE_TYPE_UTF8_BYTES} UTF-8 bytes")
 
 
 def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, path: str) -> None:
@@ -103,6 +127,7 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
                 continue
             _require_graph_identifier(edge.get("from"), f"{edges_path}[{index}].from")
             _require_graph_identifier(edge.get("to"), f"{edges_path}[{index}].to")
+            _require_graph_edge_types(edge.get("types"), f"{edges_path}[{index}].types")
 
     while where_groups:
         where, where_path, depth = where_groups.pop()
@@ -132,6 +157,7 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
                         continue
                     _require_graph_identifier(edge.get("from"), f"{edges_path}[{index}].from")
                     _require_graph_identifier(edge.get("to"), f"{edges_path}[{index}].to")
+                    _require_graph_edge_types(edge.get("types"), f"{edges_path}[{index}].types")
 
     if not isinstance(result, Mapping):
         return
@@ -174,6 +200,7 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
             _validate_graph_match_identifiers(match, encoded_query.get("return"), f"graph_queries[{name!r}]")
         traverse = encoded_query.get("traverse")
         if isinstance(traverse, Mapping):
+            _require_graph_edge_types(traverse.get("edge_types"), f"graph_queries[{name!r}].traverse.edge_types")
             start = traverse.get("start")
             if isinstance(start, Mapping) and "result_ref" in start:
                 path = f"graph_queries[{name!r}].traverse.start"
@@ -190,6 +217,13 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
                     if result_ref == "$query_results":
                         raise AntflyException(f"{path}.binding requires a $graph_results.<query-name> reference")
                     _require_graph_identifier(binding, f"{path}.binding")
+        for operation in ("shortest_path", "k_shortest_paths"):
+            path_query = encoded_query.get(operation)
+            if isinstance(path_query, Mapping):
+                _require_graph_edge_types(
+                    path_query.get("edge_types"),
+                    f"graph_queries[{name!r}].{operation}.edge_types",
+                )
         encoded[name] = encoded_query
     return encoded
 

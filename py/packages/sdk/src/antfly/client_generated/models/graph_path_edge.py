@@ -23,7 +23,8 @@ class GraphPathEdge:
         Attributes:
             from_ (GraphPathEndpoint):
             to (GraphPathEndpoint):
-            type_ (str): Edge type encoded as at most 64 KiB of UTF-8.
+            type_ (str): Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is
+                the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit.
             weight (float): Finite durable edge weight. max_weight paths further require values in [0,1].
             metadata (GraphPathEdgeMetadata | Unset):
     """

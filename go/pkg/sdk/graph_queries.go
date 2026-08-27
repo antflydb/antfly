@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	querydsl "github.com/antflydb/antfly/go/pkg/sdk/query"
@@ -309,14 +310,13 @@ func validateDecodedGraphStats(envelope graphQueryResultEnvelope, itemCount int,
 	return nil
 }
 
-func validateDecodedGraphIdentity(key, table string) error {
+func validateDecodedGraphIdentity(key string, table *string) error {
 	if key == "" {
 		return fmt.Errorf("graph node key must not be empty")
 	}
-	// Empty is the only representation for an omitted table in generated Go
-	// models, so no additional table check is possible without changing the
-	// generated public type to a pointer.
-	_ = table
+	if table != nil && *table == "" {
+		return fmt.Errorf("graph node table must be omitted or non-empty")
+	}
 	return nil
 }
 
@@ -404,7 +404,7 @@ func validateDecodedGraphPath(path GraphPath) error {
 }
 
 func validateDecodedGraphPathEdge(edge GraphPathEdge, from, to GraphPathEndpoint, maxWeightMode bool) error {
-	if edge.Type == "" || len(edge.Type) > maxGraphEdgeTypeBytes {
+	if edge.Type == "" || len(edge.Type) > maxGraphEdgeTypeBytes || !utf8.ValidString(edge.Type) {
 		return fmt.Errorf("graph path edge type must encode to between 1 and %d UTF-8 bytes", maxGraphEdgeTypeBytes)
 	}
 	if !sameDecodedGraphEndpoint(edge.From, from) || !sameDecodedGraphEndpoint(edge.To, to) {
@@ -417,7 +417,10 @@ func validateDecodedGraphPathEdge(edge GraphPathEdge, from, to GraphPathEndpoint
 }
 
 func sameDecodedGraphEndpoint(left, right GraphPathEndpoint) bool {
-	return left.Key == right.Key && left.Table == right.Table
+	if left.Key != right.Key || (left.Table == nil) != (right.Table == nil) {
+		return false
+	}
+	return left.Table == nil || *left.Table == *right.Table
 }
 
 func finiteNonNegative(value float64) bool {
@@ -1225,6 +1228,26 @@ func NewGraphIdentitySelector(identities ...GraphPathEndpoint) (GraphNodeSelecto
 	return result, err
 }
 
+// NewGraphIdentity constructs an exact graph identity without requiring callers
+// to manage the generated optional-table pointer. Omit table for the queried
+// table; provide exactly one non-empty value for a cross-table identity.
+func NewGraphIdentity(key string, table ...string) (GraphPathEndpoint, error) {
+	if key == "" {
+		return GraphPathEndpoint{}, fmt.Errorf("antfly: graph identity key must not be empty")
+	}
+	if len(table) > 1 {
+		return GraphPathEndpoint{}, fmt.Errorf("antfly: graph identity accepts at most one table")
+	}
+	result := GraphPathEndpoint{Key: key}
+	if len(table) == 1 {
+		if strings.TrimSpace(table[0]) == "" {
+			return GraphPathEndpoint{}, fmt.Errorf("antfly: graph identity table must not be empty")
+		}
+		result.Table = &table[0]
+	}
+	return result, nil
+}
+
 // NewGraphResultRefSelector selects a prior complete result set. A zero limit
 // means unbounded and is accepted only when the referenced result is complete.
 func NewGraphResultRefSelector(resultRef string, limit int) (GraphNodeSelector, error) {
@@ -1989,7 +2012,14 @@ func validateGraphIdentities(identities []GraphPathEndpoint) error {
 		if identity.Key == "" {
 			return fmt.Errorf("antfly: graph identity key must not be empty")
 		}
-		identityKey := identity.Table + "\x00" + identity.Key
+		if identity.Table != nil && strings.TrimSpace(*identity.Table) == "" {
+			return fmt.Errorf("antfly: graph identity table must not be empty")
+		}
+		table := ""
+		if identity.Table != nil {
+			table = *identity.Table
+		}
+		identityKey := table + "\x00" + identity.Key
 		if _, ok := seen[identityKey]; ok {
 			return fmt.Errorf("antfly: duplicate graph identity %q", identity.Key)
 		}
@@ -2030,8 +2060,8 @@ func validateGraphEdgeTypes(edgeTypes []string) error {
 	seen := make(map[string]struct{}, len(edgeTypes))
 	totalBytes := 0
 	for _, edgeType := range edgeTypes {
-		if edgeType == "" {
-			return fmt.Errorf("antfly: graph edge type must not be empty")
+		if edgeType == "" || !utf8.ValidString(edgeType) {
+			return fmt.Errorf("antfly: graph edge type must be non-empty valid UTF-8")
 		}
 		if _, exists := seen[edgeType]; exists {
 			return fmt.Errorf("antfly: duplicate graph edge type %q", edgeType)
