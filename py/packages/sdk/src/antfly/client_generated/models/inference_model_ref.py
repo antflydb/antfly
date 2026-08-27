@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.inference_a4b_residency_mode import InferenceA4BResidencyMode
 from ..models.inference_model_backend import InferenceModelBackend
 from ..models.inference_model_format import InferenceModelFormat
 from ..models.inference_model_kind import InferenceModelKind
@@ -32,6 +33,10 @@ class InferenceModelRef:
             `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
         format_ (InferenceModelFormat | Unset): Optional artifact format preference for loading a model.
         quantization (InferenceModelQuantization | Unset): Optional quantization preference for loading a model.
+        residency_mode (InferenceA4BResidencyMode | Unset): Load-time residency policy for the qualified Gemma 4 26B-A4B
+            Q4_0 Metal runtime.
+        memory_budget_mb (int | Unset): Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB
+            streamed floor; explicit smaller values fail model load. Other model geometries reject this field. Default: 0.
     """
 
     kind: InferenceModelKind
@@ -39,6 +44,8 @@ class InferenceModelRef:
     backend: InferenceModelBackend | Unset = UNSET
     format_: InferenceModelFormat | Unset = UNSET
     quantization: InferenceModelQuantization | Unset = UNSET
+    residency_mode: InferenceA4BResidencyMode | Unset = UNSET
+    memory_budget_mb: int | Unset = 0
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -58,6 +65,12 @@ class InferenceModelRef:
         if not isinstance(self.quantization, Unset):
             quantization = self.quantization.value
 
+        residency_mode: str | Unset = UNSET
+        if not isinstance(self.residency_mode, Unset):
+            residency_mode = self.residency_mode.value
+
+        memory_budget_mb = self.memory_budget_mb
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -72,6 +85,10 @@ class InferenceModelRef:
             field_dict["format"] = format_
         if quantization is not UNSET:
             field_dict["quantization"] = quantization
+        if residency_mode is not UNSET:
+            field_dict["residency_mode"] = residency_mode
+        if memory_budget_mb is not UNSET:
+            field_dict["memory_budget_mb"] = memory_budget_mb
 
         return field_dict
 
@@ -103,12 +120,23 @@ class InferenceModelRef:
         else:
             quantization = InferenceModelQuantization(_quantization)
 
+        _residency_mode = d.pop("residency_mode", UNSET)
+        residency_mode: InferenceA4BResidencyMode | Unset
+        if isinstance(_residency_mode, Unset):
+            residency_mode = UNSET
+        else:
+            residency_mode = InferenceA4BResidencyMode(_residency_mode)
+
+        memory_budget_mb = d.pop("memory_budget_mb", UNSET)
+
         inference_model_ref = cls(
             kind=kind,
             name=name,
             backend=backend,
             format_=format_,
             quantization=quantization,
+            residency_mode=residency_mode,
+            memory_budget_mb=memory_budget_mb,
         )
 
         inference_model_ref.additional_properties = d

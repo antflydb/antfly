@@ -33,7 +33,7 @@ requests.
 Run the rollout gate with:
 
 ```sh
-zig/pkg/inference/scripts/benchmark_gemma4_cuda_batching.py \
+zig/pkg/inference/scripts/gemma4/benchmark_gemma4_cuda_batching.py \
   --tokens 256 --concurrency 1 2 4 --max-step-items 2 \
   --min-c2-speedup 1.50
 ```

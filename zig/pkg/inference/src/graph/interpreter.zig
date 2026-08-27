@@ -2586,10 +2586,12 @@ pub fn executeNode(
         .fused_moe_select_routes => |attrs| {
             const alloc = std.heap.page_allocator;
             const sel = (try cb.moeSelectRoutes(
+                attrs.layer_index,
                 V.get(ins[0]),
                 attrs.rows,
                 attrs.num_experts,
                 attrs.top_k,
+                1.0,
                 alloc,
             )) orelse return error.MissingRuntimeInput;
             // Free previous layer's routing state if any.
@@ -4028,7 +4030,8 @@ const TestCompute = struct {
         return self.makeBuf(try self.allocator.dupe(f32, testGetData(Q)), true);
     }
 
-    fn moeSelectRoutesOp(_: *anyopaque, logits: CT, rows: usize, num_experts: usize, top_k: usize, allocator: std.mem.Allocator) anyerror!?ops_mod.MoeRouteSelection {
+    fn moeSelectRoutesOp(_: *anyopaque, _: usize, logits: CT, rows: usize, num_experts: usize, top_k: usize, logit_scale: f32, allocator: std.mem.Allocator) anyerror!?ops_mod.MoeRouteSelection {
+        _ = logit_scale;
         // Simple routing: assign rows round-robin across experts
         const total = rows * top_k;
         const expert_ids = try allocator.alloc(u32, total);
@@ -5051,7 +5054,7 @@ test "MoE round-trip: trace grouped path → interpret with live routing" {
     const t_router_logits = try cb_t.linearNoBias(t_input, t_rw, total, hidden, num_experts);
 
     // moeSelectRoutes now returns dummy routing during tracing
-    const t_routes = (try cb_t.moeSelectRoutes(t_router_logits, total, num_experts, top_k, allocator)).?;
+    const t_routes = (try cb_t.moeSelectRoutes(0, t_router_logits, total, num_experts, top_k, 1.0, allocator)).?;
     defer allocator.free(t_routes.expert_ids);
     defer allocator.free(t_routes.route_weights);
 

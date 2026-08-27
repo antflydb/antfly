@@ -15157,7 +15157,13 @@ func TestDataStatefulSetAdvertisesStablePodDNS(t *testing.T) {
 	client := newHAControllerTestClient(t, s, cluster)
 	reconciler := &AntflyClusterReconciler{Client: client, Scheme: s, ClusterDomain: "corp.internal"}
 
-	g.Expect(reconciler.reconcileDataStatefulSet(context.Background(), &envFromCache{}, cluster, internalServiceAuthRolloutEnforce, internalServiceAuthKeyRolloutSteady)).To(Succeed())
+	g.Expect(reconciler.reconcileDataStatefulSet(
+		context.Background(),
+		&envFromCache{},
+		cluster,
+		internalServiceAuthRolloutEnforce,
+		internalServiceAuthKeyRolloutSteady,
+	)).To(Succeed())
 
 	sts := &appsv1.StatefulSet{}
 	g.Expect(client.Get(context.Background(), types.NamespacedName{

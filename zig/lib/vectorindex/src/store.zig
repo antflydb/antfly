@@ -110,6 +110,11 @@ pub const NamespaceReadTxn = struct {
     allocator: Allocator,
     ptr: *anyopaque,
     vtable: *const VTable,
+    /// Optional owner-defined epoch captured immediately before this snapshot
+    /// opened. HBC uses it to reject cache fills when publication advanced
+    /// after the transaction was created; storage backends remain unaware of
+    /// its meaning.
+    cache_fill_epoch: ?u64 = null,
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,

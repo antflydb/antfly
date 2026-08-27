@@ -15,9 +15,11 @@
 pub const runtime = @import("runtime.zig");
 pub const shared = @import("shared.zig");
 pub const residency = @import("residency.zig");
+pub const expert_slot_arena = @import("expert_slot_arena.zig");
 
 test {
     _ = runtime;
     _ = shared;
     _ = residency;
+    _ = expert_slot_arena;
 }
