@@ -79,8 +79,9 @@ concurrent = os.environ.get("TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH") 
 if concurrent and os.environ.get("TERMITE_METAL_DISABLE_CONCURRENT_PLANNED_DISPATCH") == "1":
     raise SystemExit("concurrent dispatch simultaneously enabled and disabled")
 
-decode_frames = tokens - 1
+decode_frames = tokens
 attention = 42 * decode_frames
+gqa_split_schedule = os.environ.get("TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE") == "1"
 gqa_swa_calls = 35 * decode_frames
 gqa_global_calls = 7 * decode_frames
 
@@ -219,16 +220,16 @@ payload = {
     "speculative": None,
     "draft_cuda": None,
     "draft_cuda_generate": None,
-    "runtime": {"decode_greedy_calls": decode_frames},
-    "generation_decoder_runtime": {"forward_attempts": decode_frames},
+    "runtime": {"decode_greedy_calls": max(tokens - 1, 0)},
+    "generation_decoder_runtime": {"forward_attempts": max(tokens - 1, 0)},
     "metal": {
         "device": "Apple M4",
         "device_registry_id": 123456,
         "native_quant_null": False,
         "runtime_command_operators": {"fallback": 0},
         "attention_dispatch": {
-            "paged_1x": 0,
-            "decode_gqa_split": attention,
+            "paged_1x": 0 if gqa_split_schedule else attention,
+            "decode_gqa_split": attention if gqa_split_schedule else 0,
             "generated_flash_prefill": 35,
             "generated_flash_prefill_hd512": 7,
             "prefill_direct_kv": 0,
@@ -252,7 +253,9 @@ print("gen_debug: executePrefill whole-model fast path seq_len=20")
 print("prompt_token_ids:", " ".join(str(index) for index in range(20)))
 print("token_ids:", " ".join(str(index) for index in range(tokens)))
 print(
-    f"metal_attention_dispatch: paged_1x=0 decode_gqa_split={attention} "
+    "metal_attention_dispatch: "
+    f"paged_1x={0 if gqa_split_schedule else attention} "
+    f"decode_gqa_split={attention if gqa_split_schedule else 0} "
     "generated_decode_1x=0 generated_flash_prefill=35 "
     "generated_flash_prefill_hd512=7 prefill_direct_kv=0 prefill_paged_kv=42 "
     "generated_rms_norm=0"
@@ -284,7 +287,7 @@ if os.environ.get("TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE") == "1":
         "fallbacks=0 invalid_overrides=0"
     )
 print(f"metal_prepared_frame: fast_path={decode_frames} fallback=0")
-print("metal_runtime_memory: frame_retained_mb=0")
+print("metal_runtime_memory: total_mb=5718 frame_retained_mb=209")
 print(
     f"metal_q4_0_dispatch: linear_reduce_rows={q4_row_one}/0/0/{q4_row_65} "
     f"pair_act_reduce={decode_pairs + prefill_pairs}"
@@ -316,7 +319,7 @@ print(
     f"mm_m32_n64_aligned=0 mm_m32_n64_tail={prefill_pairs} "
     "mm_m32_n32_aligned=0 mm_m32_n32_tail=0 mm_variant_fallbacks=0"
 )
-print(f"metal_q4_q6_k_dispatch: q6_linear_reduce_rows={tokens}/0/0/0")
+print(f"metal_q4_q6_k_dispatch: q6_linear_reduce_rows={tokens + 1}/0/0/0")
 p = stage["prefill"]
 d = stage["decode"]
 print(
@@ -337,15 +340,15 @@ class RouteFormulaTests(unittest.TestCase):
         for tokens in (4, 128, 300):
             with self.subTest(tokens=tokens):
                 split = _route_expectations("split_ffn", tokens)
-                self.assertEqual(split["q4_row_one"], 210 * (tokens - 1))
+                self.assertEqual(split["q4_row_one"], 210 * tokens)
                 self.assertEqual(split["decode_pairs"], 0)
                 self.assertEqual(split["q4_row_65_plus"], 342)
                 gqa = _route_expectations("gqa_split_schedule", tokens)
-                self.assertEqual(gqa["attention"], 42 * (tokens - 1))
+                self.assertEqual(gqa["attention"], 42 * tokens)
                 self.assertEqual(gqa["decode_pairs"], 0)
                 paired = _route_expectations("pair_decode_prefill", tokens)
-                self.assertEqual(paired["q4_row_one"], 126 * (tokens - 1))
-                self.assertEqual(paired["decode_pairs"], 42 * (tokens - 1))
+                self.assertEqual(paired["q4_row_one"], 126 * tokens)
+                self.assertEqual(paired["decode_pairs"], 42 * tokens)
                 self.assertEqual(paired["q4_row_65_plus"], 258)
                 self.assertEqual(paired["prefill_pairs"], 42)
                 self.assertEqual(
@@ -459,7 +462,7 @@ class HarnessTests(unittest.TestCase):
         completed = self.run_paired(out)
         self.assertIn("passed=True", completed.stdout)
         summary = json.loads((out / "summary.json").read_text())
-        self.assertEqual(summary["schema"], "antfly.gemma4_metal_ab.v3")
+        self.assertEqual(summary["schema"], "antfly.gemma4_metal_ab.v5")
         self.assertTrue(summary["passed"])
         self.assertEqual(len(summary["performance_samples"]), 4)
         self.assertEqual(len(summary["stage_timing_samples"]), 2)
@@ -576,12 +579,12 @@ class HarnessTests(unittest.TestCase):
         }
         baseline = by_variant["baseline"]["routes"]["gqa_split_schedule"]
         candidate = by_variant["candidate"]["routes"]["gqa_split_schedule"]
-        self.assertEqual(baseline["legacy_total"], 42 * (OUTPUT_TOKENS - 1))
-        self.assertEqual(baseline["swa_s32"], 35 * (OUTPUT_TOKENS - 1))
-        self.assertEqual(baseline["global_s32"], 7 * (OUTPUT_TOKENS - 1))
+        self.assertEqual(baseline["legacy_total"], 42 * OUTPUT_TOKENS)
+        self.assertEqual(baseline["swa_s32"], 35 * OUTPUT_TOKENS)
+        self.assertEqual(baseline["global_s32"], 7 * OUTPUT_TOKENS)
         self.assertEqual(baseline["expected_variants"], {"global": "s32", "swa": "s32"})
-        self.assertEqual(candidate["swa_s8"], 35 * (OUTPUT_TOKENS - 1))
-        self.assertEqual(candidate["global_s24"], 7 * (OUTPUT_TOKENS - 1))
+        self.assertEqual(candidate["swa_s8"], 35 * OUTPUT_TOKENS)
+        self.assertEqual(candidate["global_s24"], 7 * OUTPUT_TOKENS)
         self.assertEqual(candidate["expected_variants"], {"global": "s24", "swa": "s8"})
         metadata = summary["metadata"]
         self.assertEqual(
@@ -599,7 +602,7 @@ class HarnessTests(unittest.TestCase):
 
         log_path = out / "performance-candidate-01.log"
         original_log = log_path.read_text()
-        expected_swa = 35 * (OUTPUT_TOKENS - 1)
+        expected_swa = 35 * OUTPUT_TOKENS
         log_path.write_text(
             original_log.replace(f"swa_s8={expected_swa}", f"swa_s8={expected_swa - 1}")
         )
@@ -693,15 +696,15 @@ class HarnessTests(unittest.TestCase):
             if sample["variant"] == "candidate"
         )
         routes = candidate["routes"]
-        self.assertEqual(routes["q4_linear_reduce_rows"], [16_002, 0, 0, 258])
-        self.assertEqual(routes["q4_pair_activation_decode"], 5_334)
+        self.assertEqual(routes["q4_linear_reduce_rows"], [16_128, 0, 0, 258])
+        self.assertEqual(routes["q4_pair_activation_decode"], 5_376)
         self.assertEqual(
-            routes["q4_pair_activation_policy"]["mmv_nr4_nsg2"], 5_334
+            routes["q4_pair_activation_policy"]["mmv_nr4_nsg2"], 5_376
         )
         self.assertEqual(
             routes["q4_pair_activation_policy"]["mm_m32_n64_tail"], 42
         )
-        self.assertEqual(routes["q4_pair_activation_total"], 5_376)
+        self.assertEqual(routes["q4_pair_activation_total"], 5_418)
 
     def test_q4_mmv_workload_profile_proves_role_specific_override(self) -> None:
         out = self.tmp / "q4-mmv-workload"
@@ -733,7 +736,7 @@ class HarnessTests(unittest.TestCase):
             if sample["variant"] == "candidate"
         )
         routes = candidate["routes"]
-        self.assertEqual(routes["q4_mmv_variants"], [21_336, 0, 0, 5_334])
+        self.assertEqual(routes["q4_mmv_variants"], [21_504, 0, 0, 5_376])
         policy = routes["q4_mmv_workload_policy"]
         self.assertEqual(policy["attention"]["selected"], "nr4-nsg2")
         self.assertEqual(policy["ffn_gate_up"]["selected"], "nr4-nsg2")
@@ -772,7 +775,7 @@ class HarnessTests(unittest.TestCase):
             if sample["variant"] == "candidate"
         )
         routes = candidate["routes"]
-        decode_frames = OUTPUT_TOKENS - 1
+        decode_frames = OUTPUT_TOKENS
         self.assertEqual(
             routes["q4_mmv_variants"],
             [60 * decode_frames, 0, 0, 150 * decode_frames],
@@ -978,8 +981,8 @@ class HarnessTests(unittest.TestCase):
         )
         for sample in summary["determinism_samples"]:
             schedule = sample["routes"]["gqa_split_schedule"]
-            self.assertEqual(schedule["swa_s16"], 35 * 63)
-            self.assertEqual(schedule["global_s8"], 7 * 63)
+            self.assertEqual(schedule["swa_s16"], 35 * 64)
+            self.assertEqual(schedule["global_s8"], 7 * 64)
 
     def test_stage_only_mode_has_no_performance_statistics(self) -> None:
         out = self.tmp / "stage-only"

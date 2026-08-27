@@ -868,12 +868,25 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_ab_benchmark_contract_test_step.dependOn(&metal_gemma4_ab_benchmark_contract_test.step);
 
+    const metal_gemma4_lm_head_repack_quality_contract_test = b.addSystemCommand(&.{
+        "python3",
+        "scripts/test_benchmark_metal_gemma4_lm_head_repack_quality.py",
+    });
+    const metal_gemma4_lm_head_repack_quality_contract_test_step = b.step(
+        "test-metal-gemma4-lm-head-repack-quality",
+        "Test the fail-closed Gemma4 Metal LM-head repack quality contract",
+    );
+    metal_gemma4_lm_head_repack_quality_contract_test_step.dependOn(
+        &metal_gemma4_lm_head_repack_quality_contract_test.step,
+    );
+
     const metal_gemma4_benchmark_contracts_test_step = b.step(
         "test-metal-gemma4-benchmark-contracts",
-        "Test the Gemma4 Metal comparator and baseline/candidate benchmark contracts",
+        "Test the Gemma4 Metal comparison, A/B, and LM-head quality contracts",
     );
     metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_long_output_benchmark_contract_test_step);
     metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_ab_benchmark_contract_test_step);
+    metal_gemma4_benchmark_contracts_test_step.dependOn(metal_gemma4_lm_head_repack_quality_contract_test_step);
 
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",

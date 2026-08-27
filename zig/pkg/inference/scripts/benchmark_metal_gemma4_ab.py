@@ -46,9 +46,10 @@ from gemma4_metal_long_output import (  # noqa: E402
 )
 
 
-METADATA_SCHEMA = "antfly.gemma4_metal_ab.metadata.v3"
-SUMMARY_SCHEMA = "antfly.gemma4_metal_ab.v3"
+METADATA_SCHEMA = "antfly.gemma4_metal_ab.metadata.v5"
+SUMMARY_SCHEMA = "antfly.gemma4_metal_ab.v5"
 SHARED_PARSER = SCRIPT_DIR / "gemma4_metal_long_output.py"
+MAX_PIPELINED_FRAME_RETAINED_MB = 256
 ROUTE_PROFILES = (
     "split_ffn",
     "q4_mmv_workload",
@@ -540,7 +541,11 @@ def _invocation_plan(
 def _route_expectations(profile: str, output_tokens: int) -> dict[str, Any]:
     if profile not in ROUTE_PROFILES:
         raise BenchmarkContractError(f"unsupported route profile: {profile}")
-    decode_frames = output_tokens - 1
+    # The compiled whole-model path submits one device frame for every emitted
+    # token, including the token selected from the prefill result.  Keep this
+    # tied to the live `metal_prepared_frame.fast_path` contract: using N-1
+    # silently rejects current production runs and shifts every route census.
+    decode_frames = output_tokens
     decode_pairs = 42 * decode_frames if profile in ("pair_decode", "pair_decode_prefill") else 0
     prefill_pairs = 42 if profile in ("pair_prefill", "pair_decode_prefill") else 0
     return {
@@ -910,7 +915,15 @@ def parse_antfly_sample(
         log_path,
     )
     attention_values = tuple(int(attention_match.group(index)) for index in range(1, 7))
-    expected_attention = (0, expected["attention"], 35, 7, 0, 42)
+    # Short-context production profiles stay on paged_1x. Only the dedicated
+    # gqa_split_schedule experiment promises the split-GQA route and its
+    # per-shape variant census. Treating every profile as split-GQA rejects
+    # otherwise valid short-context A/Bs after all samples have completed.
+    expected_attention = (
+        (0, expected["attention"], 35, 7, 0, 42)
+        if route_profile == "gqa_split_schedule"
+        else (expected["attention"], 0, 35, 7, 0, 42)
+    )
     if attention_values != expected_attention:
         raise BenchmarkContractError(
             f"attention routes={attention_values}, expected {expected_attention}: {log_path}"
@@ -937,12 +950,22 @@ def parse_antfly_sample(
 
     memory_match = _last_match(
         log,
-        r"^metal_runtime_memory:.*\bframe_retained_mb=(\d+)",
+        r"^metal_runtime_memory:.*\btotal_mb=(\d+).*\bframe_retained_mb=(\d+)",
         "Metal runtime memory counters",
         log_path,
     )
-    if int(memory_match.group(1)) != 0:
-        raise BenchmarkContractError(f"compiled decoder retained a speculative frame: {log_path}")
+    runtime_total_mb = int(memory_match.group(1))
+    frame_retained_mb = int(memory_match.group(2))
+    if not 1 <= frame_retained_mb <= MAX_PIPELINED_FRAME_RETAINED_MB:
+        raise BenchmarkContractError(
+            f"pipelined frame retention={frame_retained_mb}MiB, expected 1.."
+            f"{MAX_PIPELINED_FRAME_RETAINED_MB}MiB: {log_path}"
+        )
+    if frame_retained_mb > runtime_total_mb:
+        raise BenchmarkContractError(
+            f"pipelined frame retention={frame_retained_mb}MiB exceeds runtime total="
+            f"{runtime_total_mb}MiB: {log_path}"
+        )
 
     q4_match = _last_match(
         log,
@@ -1046,18 +1069,27 @@ def parse_antfly_sample(
         log_path,
     )
     q6_rows = tuple(int(q6_match.group(index)) for index in range(1, 5))
-    if q6_rows != (output_tokens, 0, 0, 0):
+    # The Q6_K lm_head runs once for prefill and once in each submitted
+    # pipelined decode frame. The compiled path submits N frames for N emitted
+    # tokens, so its cumulative tail census is N+1 even though the prepared
+    # frame census itself is exactly N.
+    expected_q6_rows = (output_tokens + 1, 0, 0, 0)
+    if q6_rows != expected_q6_rows:
         raise BenchmarkContractError(
-            f"Q6_K routes={q6_rows}, expected {(output_tokens, 0, 0, 0)}: {log_path}"
+            f"Q6_K routes={q6_rows}, expected {expected_q6_rows}: {log_path}"
         )
 
     runtime = _mapping(payload.get("runtime"), "runtime counters", json_path)
     decoder = _mapping(payload.get("generation_decoder_runtime"), "decoder counters", json_path)
-    _exact_int(runtime, "decode_greedy_calls", expected["decode_frames"], "runtime", json_path)
+    # Token 1 is selected from prefill. The ordinary greedy-decode API is
+    # entered for the remaining N-1 tokens even though pipelining submits N
+    # prepared frames (the final frame is launched before the length stop).
+    decode_api_calls = max(output_tokens - 1, 0)
+    _exact_int(runtime, "decode_greedy_calls", decode_api_calls, "runtime", json_path)
     _exact_int(
         decoder,
         "forward_attempts",
-        expected["decode_frames"],
+        decode_api_calls,
         "generation_decoder_runtime",
         json_path,
     )
@@ -1151,7 +1183,8 @@ def parse_antfly_sample(
             "q4_mmv_variant_fallbacks": q4_policy_values[4],
             "q4_pair_activation_policy": pair_policy,
             "q6_linear_reduce_rows": list(q6_rows),
-            "frame_retained_mb": 0,
+            "runtime_total_mb": runtime_total_mb,
+            "frame_retained_mb": frame_retained_mb,
         },
         "stage_timing_ns": profile,
         "exact_token_contract_passed": True,

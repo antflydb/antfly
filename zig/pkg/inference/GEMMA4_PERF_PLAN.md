@@ -216,3 +216,112 @@ Pinned identities:
 5. **Evidence durability/CI remains open:** current comparison and server artifacts live under `/private/tmp`; promotion requires retained artifacts plus hosted CI/repetition on a clean machine.
 
 The competitive priority is now unambiguous: short-context GPU/frame efficiency, especially E2B, not host encode. Long-context split-GQA already closes E4B to 87.7% of llama.cpp. The next performance round should therefore use the M4 Pro dispatch census to localize the remaining short-frame gap, then qualify command-plan reuse/concurrent dispatch and the A3 Q4_0 scales-plane/interleave relayout behind exact-output and watchdog gates.
+
+## 14. Release-blocker closure: MTP, LM-head repack, and competitive target (2026-08-27)
+
+This round starts from the user's committed `a3c645c6f130601a039341a7bb5b9db9f5cce51a` and leaves all follow-up source and evidence changes uncommitted. The reference machine is a Mac mini `Mac16,11`, Apple M4 Pro, 24 GiB. The final hardened executable used by the current MTP HTTP, LM-head quality, and Antfly-versus-llama.cpp campaigns has Metal ReleaseFast SHA-256 `690224e4c9f7a7f855eeb03270ecd9a2e1d478ea9bc61b458d58f575924b8619`. The Q6_K scheduling experiments below used the earlier `d527a813e01633d7de7521f99389192734ec4c928260507a27989643950b6db5` binary; the immediately preceding performance-only rerun used `f1601dd27fb17e7163ba1faca07723b7c32fdcd1d6b1918a8f84b4dc57ebf6f0`.
+
+### 14.1 MTP assistants and server correctness
+
+The official BF16 assistants are installed as matching sibling models:
+
+- E2B: `/Users/tim/.antfly/inference/models/google/gemma-4-E2B-it-qat-q4_0-unquantized-assistant/mtp-gemma-4-E2B-it-BF16.gguf`, 162 MiB, SHA-256 `72d948683dbd8b4da9c9a1714406a2dc6db3bd7c94afd59b65389605015d5db6`.
+- E4B: `/Users/tim/.antfly/inference/models/google/gemma-4-E4B-it-qat-q4_0-unquantized-assistant/mtp-gemma-4-E4B-it-BF16.gguf`, 164 MiB, SHA-256 `cb70f7a55c900e01911deb881c742d752cd63e047002da95750a99bf13c41516`.
+- Source repositories: `https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/tree/main/MTP` and `https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF/tree/main/MTP`; sibling repository identities match Google's `gemma-4-E2B-it-qat-q4_0-unquantized-assistant` / `gemma-4-E4B-it-qat-q4_0-unquantized-assistant` naming contract.
+
+Both inspect as `gemma4-assistant` with four layers, hidden size 256, the expected backbone identity, and a full-vocabulary projection. The E4B projector-metadata server failure reported on the smaller laptop did not reproduce.
+
+The live server exposed one production defect: automatic Metal selection promoted requests to compiled whole-model execution before speculation was resolved, but MTP needs the target's final hidden rows and the compiled contract exposes only logits/tokens. The server now treats `speculation_requested` as a whole-model auto-promotion exclusion and keeps speculative requests on the qualified eager decoder-runtime path. Auto-discovered AUTO/NONE requests are also upgraded to probe calibration before validation/admission so they cannot enter the uncalibrated fallback. Focused tests cover both contracts.
+
+Final hardening also derives `speculation_requested` from the *effective* drafter after policy resolution. A request that names `draft_model` with `speculation_policy=off` therefore remains a normal request instead of silently losing compiled-path eligibility. The final binary revalidated the current-source HTTP path with nonempty visible output and exact 192-token length accounting:
+
+| Model / policy | HTTP | Completion | Decision | Visible output |
+|---|---:|---:|---|---|
+| E2B policy off | 200 | 192, length | no speculation status | 286 bytes |
+| E2B auto + Metal probe | 200 | 192, length | `disabled_slow` / `mtp_auto_cost_probe_slow` | exact versus policy off |
+| E4B auto + Metal probe | 200 | 192, length | `disabled_slow` / `mtp_auto_cost_probe_slow` | 377 bytes |
+
+Final response artifacts and SHA-256 identities:
+
+- `/private/tmp/antfly-gemma4-prready-6902-mtp-policy-off-e2b-192.json`: `6ea07329b0efe1bc2e1f11c8e83a9000de881851aa50ea94187daf0d955911af`.
+- `/private/tmp/antfly-gemma4-prready-6902-mtp-auto-metal-e2b-192.json`: `90c17900a1c811218d1f74a29385de5b2d164c9c16b80c4558d3a7ff9e13a81e`.
+- `/private/tmp/antfly-gemma4-prready-6902-mtp-auto-metal-e4b-192.json`: `56093a53bd7a6880f770eb7273c25a80015e7ea1f1843deb81c150df16357352`.
+
+Post-fix HTTP qualification used explicit two-model host/backend budgets and produced valid responses:
+
+| Model / policy | HTTP | Completion | Decision | Visible-output parity |
+|---|---:|---:|---|---|
+| E2B auto + Metal probe | 200 | 191, stop | `disabled_slow` / `mtp_auto_cost_probe_slow` | exact versus force K=2 |
+| E2B force K=2 | 200 | 191, stop | `forced` | exact versus auto |
+| E4B auto + Metal probe | 200 | 94, stop | `disabled_slow` / `mtp_auto_cost_probe_slow` | exact versus force K=2 |
+| E4B force K=2 | 200 | 94, stop | `forced` | exact versus auto |
+
+Response artifacts and SHA-256 identities:
+
+- `/private/tmp/antfly-gemma4-d527-mtp-e2b-auto-metal-192.json`: `0ba7cf3e8d0e9908bdb4ac50f1c963f45c6ef754e474a0bd104f7a8a41560180`.
+- `/private/tmp/antfly-gemma4-d527-mtp-e2b-force-k2-192.json`: `6ebf7caca7208fc4adc6bba5c455a99522a240bb5f61898c4cd8fbdd429af0a2`.
+- `/private/tmp/antfly-gemma4-d527-mtp-e4b-auto-metal-192.json`: `df9e38ba012bcc8323995920867661a0c28405e5f6c54cbece172031d5c6f9e8`.
+- `/private/tmp/antfly-gemma4-d527-mtp-e4b-force-k2-192.json`: `cdd624bc5e874c554905d18b5b0be33d311c6ec9cc8f9c20d4b006d2f25f59a0`.
+
+The automatic default memory envelope also rejected a plain, non-speculative E2B control with the same 507 `MEMORY_BUDGET_EXCEEDED`, proving that this is conservative capacity policy rather than an MTP unwind defect (diagnostic SHA-256 `5230f22605fe6ba962425cc8c9c69dd87de875c7dd2a060d83c932097314ec8c`). The current server error names all six applicable controls (host, backend, combined, KV, scratch, and process), and `run --help` documents every accepted memory-budget override; focused and CLI-root tests enforce both contracts.
+
+An earlier standalone CLI pilot explains the auto decision; treat its throughput as directional because its JSON did not record a binary identity. E2B target-only measured 75.919 tok/s over 128 tokens; BF16 MTP auto K=2 measured 63.682 tok/s, accepted 16/25 drafts (64%), and disabled itself after the 16-round cost probe. E4B target-only measured 54.983 tok/s over 64 tokens; forced BF16 K=2 measured 30.118 tok/s at 63.4% draft match. Q4 and Q8 assistant variants were also slower. **Decision: MTP correctness/fallback PASS; Metal-auto performance FAIL.** Discovery and Metal-auto remain separate default-off gates; forced MTP remains available for diagnostics.
+
+### 14.2 LM-head Q4_K repack quality gate
+
+Token probes were replaced with a pinned live-logit campaign. The fail-closed harness dumps the exact 262,144-way F32 host logits from the production Metal runtime and teacher-forces 146 continuation tokens across 13 cases (factual, arithmetic, reasoning, science, sequence, Python, Zig, JSON, tools, multilingual, safety, and production chat). It runs two alternating AB/BA repetitions, checks determinism and full-history/ring-prefill identity, and evaluates perplexity, KL, top-10 overlap, and top-1 agreement. The final hardening requires the paired logit dump whenever teacher forcing is present, rejects any teacher sequence that would be truncated, reads the diagnostic environment once per generation, requires a new evidence directory outside the source tree, pins binary/model/suite/script/source identities at both campaign boundaries, fixes the reviewed Gemma 4 vocabulary and repetition floor, and permits thresholds to become stricter but never looser. The reviewed suite SHA-256 is `f9f9240bbb6ec8ce0f0284053ac210f156711ff1fd050e7f019484ffbae52393`; the final harness SHA-256 is `d1b87d058f68b1c3ae0c2c8e85d5fea874fa3ff850a80932c720f083feb6d6e8`.
+
+| Model | Top-1 agreement | PPL ratio | Mean / max KL | Mean top-10 overlap | Result |
+|---|---:|---:|---:|---:|---|
+| E2B | 144/146 = 98.630% | 1.006927 | 0.005443 / 0.029011 | 94.247% | FAIL `< 99%` |
+| E4B | 142/146 = 97.260% | 0.992010 | 0.003910 / 0.031328 | 94.658% | FAIL `< 99%` |
+
+Every other threshold passed, both repetitions were deterministic, and the ring/full-history prefill logits were byte-identical. The failures are nevertheless real argmax changes, including production-chat/safety cases; lower perplexity on E4B does not waive the top-1 contract. Evidence:
+
+- E2B summary `/private/tmp/antfly-gemma4-prready-6902-repack-quality-e2b-v4/summary.json`, SHA-256 `900379ff90785914ec5495b7798c693b0f3b099ba358ebd9b71e13fb2769e0e5`.
+- E4B summary `/private/tmp/antfly-gemma4-prready-6902-repack-quality-e4b-v3/summary.json`, SHA-256 `cdeeb8611325d98e17409d08d47e2001fe7fcb2ecb45b4a2c3708fd56c25d8b6`.
+
+Both summaries report deterministic repetitions, byte-identical ring/full-history prefill logits, and stable campaign identities. The final build graph includes this contract under `test-metal-gemma4-lm-head-repack-quality` and the aggregate `test-metal-gemma4-benchmark-contracts` step.
+
+**Decision: do not promote Q4_K LM-head repack.** It remains an explicit diagnostic opt-in despite its approximately 3-5% decode benefit. A future default requires a reviewed threshold change justified by an external semantic/perplexity evaluation, not a smaller token probe.
+
+### 14.3 Competitive Q6_K target
+
+The M4 Pro A/B harness was corrected to the production frame contract (N prepared frames for N emitted tokens, N+1 Q6 tail calls including prefill, N-1 public decode API entries), short-context paged-attention routing, and bounded pipelined-frame retention. Schema v5 tests pass 17/17.
+
+Six-pair exact-token E4B comparisons tested the alternate Q6_K tail schedules against the current NSG2 default:
+
+| Candidate | Baseline tok/s | Candidate tok/s | Paired throughput ratio | Wins | Result |
+|---|---:|---:|---:|---:|---|
+| NSG4 | 47.478 | 47.495 | 1.000185 (+0.0185%) | 3/6 | FAIL 1% floor |
+| NSG8 | 47.381 | 47.416 | 1.000741 (+0.0741%) | 6/6 | FAIL 1% floor |
+
+Tokens and required routes were exact and CVs were below 0.2%, so the null result is stable rather than noisy. NSG4 summary SHA-256: `91e954828be3b8827adf0e85efdfb9137c8188241c497b279d0d66bebab46bc3`; NSG8: `5463e7b02f46dd049cc33c1a7ba4b1f4716d36606c7cb2e925ee621e41fd18e4`. **Decision: retain NSG2 AUTO; do not promote NSG4/NSG8.** The competitive next target moves to short-frame command-plan/dispatch efficiency and the A3 Q4_0 scales-plane/interleave relayout.
+
+### 14.4 Final Antfly versus llama.cpp measurement
+
+Protocol is identical to §13.1: fresh process per sample; five interleaved samples per engine; two-second cooldown; greedy, F16 KV, EOS ignored; strict 255/127 decode-evaluation accounting. All Antfly outputs remained exact versus the prior campaign and every route contract passed. All 40 measured engine runs had zero page-out, swap-in, swap-out, and swap-used deltas; the whole campaign also had zero deltas.
+
+| Model / prompt | Antfly median tok/s | CV | llama.cpp median tok/s | CV | Antfly / llama.cpp | Gap |
+|---|---:|---:|---:|---:|---:|---:|
+| E2B short (23 + 256) | 71.609 | 0.406% | 108.670 | 0.218% | 65.90% | -34.10% |
+| E4B short (23 + 256) | 47.407 | 0.096% | 62.950 | 0.199% | 75.31% | -24.69% |
+| E2B long (2,334 + 128) | 84.498 | 0.152% | 104.190 | 0.147% | 81.10% | -18.90% |
+| E4B long (2,334 + 128) | 53.632 | 0.095% | 61.010 | 0.148% | 87.91% | -12.09% |
+
+The final PR-candidate rerun is performance-neutral versus the immediately preceding `f160` campaign within variance: E2B short +0.225%, E4B short +0.204%, E2B long -0.067%, and E4B long +0.042%. Machine-readable summary: `/private/tmp/antfly-gemma4-prready-6902-vs-llama-v1/benchmark-summary.json`, SHA-256 `8c01f5e592ef2e089ec71b8d17c4daa007313add31564ee30738bcf1dca6d0ff`. Comparator identity remains llama.cpp v10342 (`38278078c`), SHA-256 `92dcad3c204b0574c99611af7a1f64d69ad0506c3abeba56bef8e4ec57fa0bc8`.
+
+### 14.5 Final verification and release decision
+
+- Pinned Zig 0.16.0 ReleaseFast Metal build/link passed; final executable-evidence binary SHA-256 `690224e4c9f7a7f855eeb03270ecd9a2e1d478ea9bc61b458d58f575924b8619`. The exact current source also passed a Metal-disabled build/link in an isolated prefix; binary SHA-256 `45e62a68de8936f695502a4c1fa09aad26707971c98df17f52ba96a1ac5809be`.
+- Aggregate ReleaseFast Metal gate: **3,169 selected; 3,150 passed; 19 intentional skips**. The final CLI root passed 12/12 after the help-contract hardening; combined focused server/native regressions passed 5/5. The aggregate benchmark-contract step passed 42 long-output, 17 A/B, and 12 LM-head quality-harness tests; all modified/new Python scripts compile.
+- Production hardening is fail-closed: teacher forcing requires paired logit evidence and cannot truncate; quality thresholds cannot be loosened; reviewed campaign dimensions and identities are pinned; policy-off drafts do not alter backend selection; speculative requests cannot auto-promote into an incompatible compiled contract; and all six memory-budget controls are tested in both help and failure output.
+- On-device split-GQA oracle passed all schedules, defaults, boundaries, ring wrap, invalid-override fallback, and disable rollback with maximum absolute error `1.1e-6`. Pair-activation default/portfolio/rollback paths produced exact output hashes.
+- `git diff --check` passed after the final ledger update; the final process-table audit found no inference server, llama.cpp, or benchmark process running.
+
+**PR-candidate code qualification: PASS. Full performance-plan release promotion: BLOCKED.** The blockers are explicit and safe: MTP and repack remain default-off because their respective performance/quality gates failed, while the normal Metal path is build-clean, broadly tested, deterministic, and HTTP-qualified. Remaining full-release gates are:
+
+1. Re-run from a truly pristine zero-swap boot. This final benchmark had zero VM deltas in all 40 samples and across the campaign, but the machine began with 933.19 MiB already allocated swap, so the strict pristine-zero-swap provenance gate is not satisfied.
+2. Resolve the existing exact-v1 E2B free-form fixture mismatch from §13.4 (164 observed words versus the reviewed 180-word floor) or change model behavior; do not waive it implicitly.
+3. Retain raw evidence outside `/private/tmp` and reproduce the gates in hosted M-series CI.
+4. Close the measured short-context llama.cpp gaps. The next bounded experiment is command-plan reuse/concurrent dispatch; the next kernel/layout workstream is A3 Q4_0 scales-plane/interleave. Both require the existing watchdog, exact-token, route, and quality gates.

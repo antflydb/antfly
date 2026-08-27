@@ -347,24 +347,44 @@ pub fn runFromArgs(
     }
 }
 
+const run_usage_options =
+    \\options:
+    \\  --host <address>                    Listen address (default: 127.0.0.1)
+    \\  --port <port>                       Listen port (default: 8090)
+    \\  --models-dir <path>                 AI model directory
+    \\  --ml-dir <path>                     Predictor model directory
+    \\  --config <path>                     JSON run configuration
+    \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
+    \\  --max-concurrent-requests <count>    Request concurrency limit
+    \\  --process-memory-budget-mb <n>       Whole-process/container memory envelope
+    \\  --host-budget-mb <n>                 Host-memory admission override (MiB)
+    \\  --backend-budget-mb <n>              Device-memory admission override (MiB)
+    \\  --combined-budget-mb <n>             Combined-memory admission override (MiB)
+    \\  --kv-budget-mb <n>                   KV-cache admission override (MiB)
+    \\  --scratch-budget-mb <n>              Scratch-memory admission override (MiB)
+    \\  --kernel-jit-mode <mode>             off, shadow, on, or required
+    \\  --preload-model <spec>               Warm a model at startup; repeatable
+    \\  --allow-insecure-public-bind         Permit a non-loopback listener without built-in auth/TLS
+    \\  --allow-unknown-models               Allow models absent from the registry
+    \\  -h, --help                           Show this help and exit
+    \\
+;
+
 fn printRunUsage(usage_name: []const u8) void {
-    print(
-        \\usage: {s} run [options]
-        \\
-        \\options:
-        \\  --host <address>                    Listen address (default: 127.0.0.1)
-        \\  --port <port>                       Listen port (default: 8090)
-        \\  --models-dir <path>                 AI model directory
-        \\  --ml-dir <path>                     Predictor model directory
-        \\  --config <path>                     JSON run configuration
-        \\  --max-loaded-models <count>          Residency limit; 0 means unlimited
-        \\  --max-concurrent-requests <count>    Request concurrency limit
-        \\  --process-memory-budget-mb <n>       Whole-process/container memory envelope
-        \\  --preload-model <spec>               Warm a model at startup; repeatable
-        \\  --allow-unknown-models               Allow models absent from the registry
-        \\  -h, --help                           Show this help and exit
-        \\
-    , .{usage_name});
+    print("usage: {s} run [options]\n\n{s}", .{ usage_name, run_usage_options });
+}
+
+test "run help documents every accepted memory budget override" {
+    for ([_][]const u8{
+        "--process-memory-budget-mb",
+        "--host-budget-mb",
+        "--backend-budget-mb",
+        "--combined-budget-mb",
+        "--kv-budget-mb",
+        "--scratch-budget-mb",
+    }) |option| {
+        try std.testing.expect(std.mem.indexOf(u8, run_usage_options, option) != null);
+    }
 }
 
 const ProcessMemoryBudgetSource = enum {

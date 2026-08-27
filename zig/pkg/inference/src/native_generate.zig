@@ -5725,6 +5725,66 @@ fn traceGenerateTopLogitsEnabled() bool {
     return envFlagEnabled("TERMITE_METAL_TRACE_GENERATE_TOP_LOGITS");
 }
 
+fn dumpGenerateLogitsPath() ?[]const u8 {
+    const path = platform.env.getenv("TERMITE_METAL_DUMP_GENERATE_LOGITS_F32") orelse return null;
+    return if (path.len == 0) null else path;
+}
+
+fn parseTeacherForceTokenIdsValue(allocator: std.mem.Allocator, raw: []const u8) ![]i32 {
+    var ids = std.ArrayListUnmanaged(i32).empty;
+    errdefer ids.deinit(allocator);
+    var tokens = std.mem.tokenizeAny(u8, raw, ", \t\r\n");
+    while (tokens.next()) |token| {
+        const id = std.fmt.parseInt(i32, token, 10) catch return error.InvalidTeacherForceTokenIds;
+        try ids.append(allocator, id);
+    }
+    if (ids.items.len == 0) return error.InvalidTeacherForceTokenIds;
+    return ids.toOwnedSlice(allocator);
+}
+
+fn teacherForceTokenIds(allocator: std.mem.Allocator) !?[]i32 {
+    const raw = platform.env.getenv("TERMITE_METAL_TEACHER_FORCE_TOKEN_IDS") orelse return null;
+    return try parseTeacherForceTokenIdsValue(allocator, raw);
+}
+
+fn diagnosticGenerateTokenLimit(
+    configured_max_tokens: usize,
+    teacher_force_token_ids: ?[]const i32,
+    dump_logits_path: ?[]const u8,
+) !usize {
+    const ids = teacher_force_token_ids orelse return configured_max_tokens;
+    // Teacher forcing changes model output, so require the paired raw-logit
+    // evidence path instead of allowing a stray environment variable to alter
+    // an ordinary CLI or server request silently.
+    if (dump_logits_path == null) return error.TeacherForceRequiresLogitDump;
+    // Never truncate a requested teacher sequence: a partial quality record can
+    // otherwise look complete while comparing fewer tokens than the fixture.
+    if (configured_max_tokens == 0 or ids.len > configured_max_tokens)
+        return error.TeacherForceTokenCountExceedsMaxTokens;
+    return ids.len;
+}
+
+/// Write the exact host logits produced by the live generation runtime. The
+/// opt-in path is treated as a basename so multi-step diagnostics cannot
+/// silently overwrite earlier records.
+fn dumpGenerateLogits(
+    allocator: std.mem.Allocator,
+    base_path: ?[]const u8,
+    label: []const u8,
+    step: usize,
+    logits: []const f32,
+) !void {
+    const base = base_path orelse return;
+    const path = try std.fmt.allocPrint(allocator, "{s}.{d}.{s}.f32", .{ base, step, label });
+    defer allocator.free(path);
+    const bytes = std.mem.sliceAsBytes(logits);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = bytes });
+    std.debug.print(
+        "generate_logits_dump step={d} label={s} count={d} bytes={d} format=f32-native path={s}\n",
+        .{ step, label, logits.len, bytes.len, path },
+    );
+}
+
 fn traceGenerateTopLogits(label: []const u8, step: usize, logits: []const f32) void {
     if (!traceGenerateTopLogitsEnabled()) return;
     var top_ids = [_]usize{0} ** 8;
@@ -6024,7 +6084,20 @@ fn tryRunLiveWholeModelExecutorGenerate(
     defer generated_token_ids.deinit(allocator);
 
     var finish_reason: []const u8 = "length";
-    const max_tokens: usize = if (opts.max_tokens > 0) @intCast(opts.max_tokens) else 0;
+    const configured_max_tokens: usize = if (opts.max_tokens > 0) @intCast(opts.max_tokens) else 0;
+    const dump_generate_logits_path = dumpGenerateLogitsPath();
+    const teacher_force_token_ids = try teacherForceTokenIds(allocator);
+    defer if (teacher_force_token_ids) |ids| allocator.free(ids);
+    if (teacher_force_token_ids) |ids| {
+        for (ids) |id| {
+            if (id < 0 or @as(usize, @intCast(id)) >= gpt_config.vocab_size) return error.InvalidTeacherForceTokenIds;
+        }
+    }
+    const max_tokens = try diagnosticGenerateTokenLimit(
+        configured_max_tokens,
+        teacher_force_token_ids,
+        dump_generate_logits_path,
+    );
     const sampling_config: graph_mod.model_runtime.SamplingConfig = .{
         .temperature = config.temperature,
         .top_p = config.top_p,
@@ -6034,7 +6107,10 @@ fn tryRunLiveWholeModelExecutorGenerate(
         .frequency_penalty = config.frequency_penalty,
         .presence_penalty = config.presence_penalty,
     };
-    const use_runtime_token_decode = runtimeTokenDecodeEnabled();
+    // A raw-logit evidence run must consume the same ModelOutput tensors as
+    // sampling instead of the device-only greedy/sample shortcut.
+    const diagnostic_host_logits = dump_generate_logits_path != null or teacher_force_token_ids != null;
+    const use_runtime_token_decode = runtimeTokenDecodeEnabled() and !diagnostic_host_logits;
     const use_greedy_decode = use_runtime_token_decode and runtime_caps.supports_greedy_decode and isPureGreedyConfig(config);
     const use_sample_decode = use_runtime_token_decode and runtime_caps.supports_sample_decode and !use_greedy_decode;
     const prefer_prefill_greedy_token = prefillGreedyTokenEnabled() and use_greedy_decode;
@@ -6073,12 +6149,13 @@ fn tryRunLiveWholeModelExecutorGenerate(
     var generated: usize = 0;
     var first_token_at: ?std.Io.Timestamp = null;
     while (generated < max_tokens) {
-        const next_token_i32: i32 = if (generated == 0) blk: {
+        const sampled_token_i32: i32 = if (generated == 0) blk: {
             if (use_greedy_decode) {
                 break :blk @intCast(try output.greedyToken(allocator, gpt_config.vocab_size));
             }
             const output_logits = try output.hostLogits(allocator);
             traceGenerateTopLogits("prefill", generated, output_logits);
+            try dumpGenerateLogits(allocator, dump_generate_logits_path, "prefill", generated, output_logits);
             break :blk @intCast(generation.sampleTokenFromLogits(
                 allocator,
                 output_logits,
@@ -6106,6 +6183,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         } else blk: {
             const output_logits = try output.hostLogits(allocator);
             traceGenerateTopLogits("decode", generated, output_logits);
+            try dumpGenerateLogits(allocator, dump_generate_logits_path, "decode", generated, output_logits);
             break :blk @intCast(generation.sampleTokenFromLogits(
                 allocator,
                 output_logits,
@@ -6113,6 +6191,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 all_token_ids.items,
             ));
         };
+        const next_token_i32 = if (teacher_force_token_ids) |ids| ids[generated] else sampled_token_i32;
         const next_token_i64: i64 = next_token_i32;
         if (liveWholeModelShouldStopOnEos(gpt_config, config.ignore_eos, next_token_i32)) {
             finish_reason = "stop";
@@ -8747,6 +8826,43 @@ test "live whole-model generation excludes all EOS tokens unless ignored" {
     try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, false, 4));
     try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, true, 7));
     try std.testing.expect(!liveWholeModelShouldStopOnEos(gpt_config, false, -1));
+}
+
+test "teacher-force token IDs accept delimiters and reject malformed input" {
+    const allocator = std.testing.allocator;
+    const ids = try parseTeacherForceTokenIdsValue(allocator, "1, 2\t3\n4");
+    defer allocator.free(ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4 }, ids);
+
+    try std.testing.expectError(
+        error.InvalidTeacherForceTokenIds,
+        parseTeacherForceTokenIdsValue(allocator, ""),
+    );
+    try std.testing.expectError(
+        error.InvalidTeacherForceTokenIds,
+        parseTeacherForceTokenIdsValue(allocator, "1,nope,3"),
+    );
+}
+
+test "teacher forcing requires a dump path and never truncates its token contract" {
+    const ids = [_]i32{ 1, 2, 3 };
+    try std.testing.expectEqual(@as(usize, 7), try diagnosticGenerateTokenLimit(7, null, null));
+    try std.testing.expectError(
+        error.TeacherForceRequiresLogitDump,
+        diagnosticGenerateTokenLimit(3, &ids, null),
+    );
+    try std.testing.expectError(
+        error.TeacherForceTokenCountExceedsMaxTokens,
+        diagnosticGenerateTokenLimit(2, &ids, "/tmp/logits"),
+    );
+    try std.testing.expectError(
+        error.TeacherForceTokenCountExceedsMaxTokens,
+        diagnosticGenerateTokenLimit(0, &ids, "/tmp/logits"),
+    );
+    try std.testing.expectEqual(
+        @as(usize, ids.len),
+        try diagnosticGenerateTokenLimit(8, &ids, "/tmp/logits"),
+    );
 }
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

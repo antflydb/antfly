@@ -306,6 +306,20 @@ fn effectiveDraftModelName(requested: ?[]const u8, policy: generation.Speculatio
     return if (shouldResolveDraftModel(policy)) requested else null;
 }
 
+fn generationSpeculationRequested(effective_draft: ?[]const u8, auto_discovered_draft: ?[]const u8) bool {
+    return effective_draft != null or auto_discovered_draft != null;
+}
+
+fn qualifyAutoDiscoveredDraftSpeculation(options: *GenerateSpeculationOptions) void {
+    // A client cannot name calibration controls without an explicit drafter at
+    // the HTTP trust boundary. Once the server discovers its own best-effort
+    // MTP companion, AUTO therefore has to opt into the bounded cost probe or
+    // the drafter is loaded and admitted only to be disabled as uncalibrated.
+    if (options.policy == .auto and options.calibration == .none) {
+        options.calibration = .probe;
+    }
+}
+
 /// Opt-in: when a request carries no draft_model and the speculation policy is
 /// auto, discover the Gemma4 MTP assistant artifact sitting next to the target
 /// model dir. Kept fail-closed until Metal auto-MTP qualifies as a default.
@@ -1009,6 +1023,7 @@ fn shouldAutoUseMetalWholeModelGenerate(
     metal_executor_supported: bool,
     deepseek_compressed_cache: bool,
     prompt_cache_requested: bool,
+    speculation_requested: bool,
     selection: GenerateBackendSelection,
 ) bool {
     if (!build_options.enable_metal) return false;
@@ -1016,6 +1031,14 @@ fn shouldAutoUseMetalWholeModelGenerate(
     // auto-selecting whole-model compiled execution would ignore an explicit
     // prompt_cache_key and make the opt-in cache appear enabled but inert.
     if (prompt_cache_requested) return false;
+    // Gemma4 MTP and ordinary speculative decoding both need model-specific
+    // draft state, while MTP additionally taps the target's final hidden rows.
+    // The whole-model compiled contract currently exposes logits/tokens only;
+    // selecting it here turns an otherwise supported eager request into a
+    // late MissingGraphCacheForCompiledPartitionBackend failure. Keep draft
+    // requests on the qualified eager decoder-runtime route until compiled
+    // speculation has an explicit two-model graph and hidden-output contract.
+    if (speculation_requested) return false;
     if (selection.eager_mode_requested) return false;
     if (selection.compiled_partition_backend != null) return false;
     if (selection.native_choice == .native) return false;
@@ -6036,7 +6059,7 @@ pub const Node = struct {
                 .message = "draft_model must not be empty",
             });
         }
-        const speculation = parseGenerateSpeculationOptions(
+        var speculation = parseGenerateSpeculationOptions(
             requested_draft_model_name != null,
             body.speculative_k,
             body.speculation_policy,
@@ -6070,6 +6093,7 @@ pub const Node = struct {
             }
         }
         if (auto_draft_sibling != null) {
+            qualifyAutoDiscoveredDraftSpeculation(&speculation);
             // The discovered drafter loads a second model backend; reserve the
             // same speculation admission a client-requested draft would get.
             // A discovered drafter is an optimization, not a client
@@ -6157,7 +6181,7 @@ pub const Node = struct {
             .frequency_penalty = sampling.frequency_penalty,
             .presence_penalty = sampling.presence_penalty,
             .speculative_k = speculation.k,
-            .speculation_requested = requested_draft_model_name != null or auto_draft_sibling != null,
+            .speculation_requested = generationSpeculationRequested(effective_draft_model_name, auto_draft_sibling),
             .speculation_policy = speculation.policy,
             .speculation_calibration = speculation.calibration,
             .prefill_chunk_size = 0,
@@ -6536,6 +6560,7 @@ pub const Node = struct {
             graph_mod.metal_executor.supportsSession(model.session),
             generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config),
             config.prompt_cache_enabled,
+            config.speculation_requested,
             backend_selection,
         );
         const effective_compiled_partition_backend: ?ops.BackendKind = if (auto_metal_whole_model)
@@ -13012,11 +13037,25 @@ test "generate speculation options validate the HTTP trust boundary" {
     try std.testing.expectEqual(@as(u32, 4), defaults.k);
     try std.testing.expectEqual(generation.SpeculationPolicy.auto, defaults.policy);
     try std.testing.expectEqual(generation.SpeculationCalibration.none, defaults.calibration);
+    var discovered = defaults;
+    qualifyAutoDiscoveredDraftSpeculation(&discovered);
+    try std.testing.expectEqual(generation.SpeculationCalibration.probe, discovered.calibration);
     const probing = try parseGenerateSpeculationOptions(true, null, null, "probe");
     try std.testing.expectEqual(generation.SpeculationCalibration.probe, probing.calibration);
-    const forced = try parseGenerateSpeculationOptions(true, null, "force", null);
+    var forced = try parseGenerateSpeculationOptions(true, null, "force", null);
+    try std.testing.expectEqual(generation.SpeculationCalibration.none, forced.calibration);
+    qualifyAutoDiscoveredDraftSpeculation(&forced);
     try std.testing.expectEqual(generation.SpeculationCalibration.none, forced.calibration);
     try std.testing.expect(!shouldResolveDraftModel(.off));
+    try std.testing.expect(!generationSpeculationRequested(
+        effectiveDraftModelName("draft", .off),
+        null,
+    ));
+    try std.testing.expect(generationSpeculationRequested(
+        effectiveDraftModelName("draft", .auto),
+        null,
+    ));
+    try std.testing.expect(generationSpeculationRequested(null, "auto-draft"));
     try std.testing.expectEqual(@as(usize, 7), generateAdmissionUnitsForSpeculation(7, false, .auto));
     try std.testing.expectEqual(@as(usize, 7), generateAdmissionUnitsForSpeculation(7, true, .off));
     try std.testing.expectEqual(@as(usize, 14), generateAdmissionUnitsForSpeculation(7, true, .auto));
@@ -15773,7 +15812,16 @@ test "generation memory exhaustion is an actionable non-retryable capacity error
 
     try std.testing.expectEqual(@as(u16, 507), response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"error\":\"MEMORY_BUDGET_EXCEEDED\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "--host-budget-mb") != null);
+    for ([_][]const u8{
+        "--host-budget-mb",
+        "--backend-budget-mb",
+        "--combined-budget-mb",
+        "--kv-budget-mb",
+        "--scratch-budget-mb",
+        "--process-memory-budget-mb",
+    }) |option| {
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, option) != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":false") != null);
 
     const batch_error = batchGenerationError(error.MemoryBudgetExceeded);
@@ -15985,11 +16033,12 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(auto_compiled.graph_mode_requested);
 
     const auto_default = try parseGenerateBackendSelection(null, null, null);
-    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, auto_default));
-    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, auto_default));
+    try std.testing.expectEqual(build_options.enable_metal, shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.native, true, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, false, false, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, true, false, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, true, false, auto_default));
+    try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, true, auto_default));
     try validatePromptCacheExecutionMode(true, auto_default);
 
     const explicit_compiled = try parseGenerateBackendSelection(null, "compiled", null);
@@ -16002,7 +16051,7 @@ test "generate backend selection keeps compiled mode explicit" {
     if (build_options.enable_metal) {
         const metal_eager = try parseGenerateBackendSelection(.metal, "eager", null);
         try std.testing.expect(metal_eager.eager_mode_requested);
-        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, metal_eager));
+        try std.testing.expect(!shouldAutoUseMetalWholeModelGenerate(.metal, true, false, false, false, metal_eager));
     } else {
         try std.testing.expectError(
             error.BackendUnavailable,
@@ -19116,7 +19165,7 @@ const GenerationRequestFailure = struct {
 };
 
 const memory_budget_exceeded_message =
-    "model execution exceeds the configured inference memory budget; increase the relevant budget (for CPU models, --host-budget-mb) or choose a smaller/quantized model";
+    "model execution exceeds the configured inference memory budget; increase the applicable --host-budget-mb, --backend-budget-mb, --combined-budget-mb, --kv-budget-mb, --scratch-budget-mb, or --process-memory-budget-mb, or choose a smaller/quantized model";
 
 fn logMemoryBudgetExceeded(
     session: backends_mod.Session,
