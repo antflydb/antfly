@@ -35,19 +35,7 @@ func (c *AntflyClient) CreateTable(ctx context.Context, tableName string, req Cr
 	sort.Strings(indexNames)
 	for _, indexName := range indexNames {
 		indexConfig := req.Indexes[indexName]
-		data, err := json.Marshal(indexConfig)
-		if err != nil {
-			return fmt.Errorf("validating index %q: marshal config: %w", indexName, err)
-		}
-		discriminator, err := indexConfig.Discriminator()
-		if err != nil {
-			return fmt.Errorf("validating index %q: read type: %w", indexName, err)
-		}
-		indexType := IndexType(discriminator)
-		if !indexType.Valid() {
-			return fmt.Errorf("validating index %q: unknown index type %q", indexName, discriminator)
-		}
-		if err := validateIndexRequestRelationships(data, indexType); err != nil {
+		if err := validateCreateIndexRequest(indexConfig); err != nil {
 			return fmt.Errorf("validating index %q: %w", indexName, err)
 		}
 	}
@@ -116,6 +104,9 @@ func (c *AntflyClient) ListTables(ctx context.Context) ([]TableStatus, error) {
 
 // CreateIndex creates a new index and returns its normalized effective config.
 func (c *AntflyClient) CreateIndex(ctx context.Context, tableName, indexName string, config CreateIndexRequest) (*CreatedIndex, error) {
+	if err := validateCreateIndexRequest(config); err != nil {
+		return nil, fmt.Errorf("validating index %q: %w", indexName, err)
+	}
 	resp, err := c.client.CreateIndex(ctx, tableName, indexName, config)
 	if err != nil {
 		return nil, fmt.Errorf("creating index: %w", err)
@@ -129,6 +120,26 @@ func (c *AntflyClient) CreateIndex(ctx context.Context, tableName, indexName str
 		return nil, fmt.Errorf("parsing create index response: %w", err)
 	}
 	return &created, nil
+}
+
+// validateCreateIndexRequest keeps every transport entry point aligned with
+// the relationship checks used by NewCreateIndexRequest. CreateIndexRequest is
+// an exported generated union, so callers may construct it directly without
+// passing through the convenience builder.
+func validateCreateIndexRequest(config CreateIndexRequest) error {
+	data, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	discriminator, err := config.Discriminator()
+	if err != nil {
+		return fmt.Errorf("read type: %w", err)
+	}
+	indexType := IndexType(discriminator)
+	if !indexType.Valid() {
+		return fmt.Errorf("unknown index type %q", discriminator)
+	}
+	return validateIndexRequestRelationships(data, indexType)
 }
 
 // DropIndex drops an index from a table

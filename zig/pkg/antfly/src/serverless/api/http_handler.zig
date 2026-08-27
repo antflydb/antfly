@@ -6117,8 +6117,6 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
     var parsed = try std.json.parseFromSlice(JsonValueMap, alloc, indexes_json, .{});
     defer parsed.deinit();
 
-    var full_text_count: usize = 0;
-    var versioned_full_text_count: usize = 0;
     var graph_count: usize = 0;
     var it = parsed.value.map.iterator();
     while (it.next()) |entry| {
@@ -6136,10 +6134,6 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
         }
 
         if (std.mem.eql(u8, kind, "full_text")) {
-            full_text_count += 1;
-            if (std.mem.startsWith(u8, entry.key_ptr.*, "full_text_index_v")) {
-                versioned_full_text_count += 1;
-            }
             continue;
         }
         if (std.mem.eql(u8, kind, "embeddings")) {
@@ -6161,7 +6155,7 @@ fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !v
         return error.UnsupportedCreateTableRequest;
     }
 
-    if ((full_text_count > 1 and versioned_full_text_count != full_text_count) or graph_count > 1) {
+    if (graph_count > 1) {
         return error.UnsupportedCreateTableRequest;
     }
 }
@@ -8778,6 +8772,9 @@ test "serverless index catalog rejects artifact-backed sources before publicatio
 
     try validateServerlessIndexCatalog(alloc,
         \\{"text":{"type":"full_text","field":"body"},"vectors":{"type":"embeddings","field":"body","dimension":3},"relations":{"type":"graph","edge_types":[{"name":"related","field":"related_ids"}]}}
+    );
+    try validateServerlessIndexCatalog(alloc,
+        \\{"full_text_index_v0":{"type":"full_text"},"body_search":{"type":"full_text","field":"body"}}
     );
 }
 

@@ -167,10 +167,13 @@ pub fn normalizeTableDefinitionIndexesValueAlloc(alloc: std.mem.Allocator, value
         const is_full_text = isPublicFullTextType(index_type);
 
         if (is_full_text) {
-            if (isArtifactBackedFullTextIndex(entry.value_ptr.object)) {
-                if (isReservedFullTextIndexName(entry.key_ptr.*)) return error.InvalidCreateTableRequest;
-            } else {
-                if (!isReservedFullTextIndexName(entry.key_ptr.*)) continue;
+            const artifact_backed = isArtifactBackedFullTextIndex(entry.value_ptr.object);
+            // `default` is the released compatibility spelling for the
+            // system-owned v0 full-text index. Preserve that mapping without
+            // letting it suppress arbitrary named full-text indexes.
+            if (std.mem.eql(u8, entry.key_ptr.*, "default") and !artifact_backed) continue;
+            if (isReservedFullTextIndexName(entry.key_ptr.*)) {
+                if (artifact_backed) return error.InvalidCreateTableRequest;
                 saw_full_text = true;
             }
         } else if (isReservedFullTextIndexName(entry.key_ptr.*)) {
@@ -631,6 +634,10 @@ fn validateCreateTableIndexesValue(value: std.json.Value) !void {
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .object) return error.InvalidCreateTableRequest;
         try validateCreateTableIndexName(entry.key_ptr.*);
+        if (entry.value_ptr.object.get("name")) |name_value| {
+            if (name_value != .string or !std.mem.eql(u8, name_value.string, entry.key_ptr.*))
+                return error.InvalidCreateTableRequest;
+        }
         validatePublicIndexObject(entry.value_ptr.object) catch return error.InvalidCreateTableRequest;
     }
 }
@@ -762,7 +769,8 @@ fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.jso
             else => return err,
         };
         defer alloc.free(normalized);
-        if (isPublicFullTextType(extractPublicIndexType(entry.value_ptr.object) orelse "full_text") and
+        if (std.mem.eql(u8, entry.key_ptr.*, "default") and
+            isPublicFullTextType(extractPublicIndexType(entry.value_ptr.object) orelse "full_text") and
             !isArtifactBackedFullTextIndex(entry.value_ptr.object)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
@@ -1394,10 +1402,10 @@ test "table contract rejects non-go full text fields" {
     );
 }
 
-test "table contract ignores create-table full text entries and preserves non-full-text indexes" {
+test "table contract maps the default alias and preserves named full-text indexes" {
     var req = try parseCreateTableRequest(
         std.testing.allocator,
-        "{\"description\":\"docs\",\"indexes\":{\"default\":{},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}}}",
+        "{\"description\":\"docs\",\"indexes\":{\"default\":{},\"body_search\":{\"type\":\"full_text\",\"field\":\"body\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}}}",
     );
     defer req.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("docs", req.description.?);
@@ -1407,6 +1415,10 @@ test "table contract ignores create-table full text entries and preserves non-fu
     const full_text = indexes.value.object.get("full_text_index_v0").?.object;
     try std.testing.expectEqualStrings("full_text_index_v0", full_text.get("name").?.string);
     try std.testing.expectEqualStrings("full_text", full_text.get("type").?.string);
+    const body_search = indexes.value.object.get("body_search").?.object;
+    try std.testing.expect(body_search.get("name") == null);
+    try std.testing.expectEqualStrings("full_text", body_search.get("type").?.string);
+    try std.testing.expectEqualStrings("body", body_search.get("field").?.string);
     const embedding = indexes.value.object.get("embed_idx").?.object;
     try std.testing.expect(embedding.get("name") == null);
     try std.testing.expectEqualStrings("embeddings", embedding.get("type").?.string);
@@ -1658,19 +1670,18 @@ test "table contract normalizes table-definition indexes with versioned full tex
     try std.testing.expect(std.mem.indexOf(u8, normalized, "\"semantic_idx\":{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"dimension\":3}") != null);
 }
 
-test "table contract ignores full text indexes with name field in create table request" {
-    // Matches e2e test_table_create_table_ignores_user_full_text_index_entries payload
+test "table contract preserves named full text indexes with matching name fields" {
     var req = try parseCreateTableRequest(
         std.testing.allocator,
         "{\"num_shards\":1,\"indexes\":{\"search_idx\":{\"name\":\"search_idx\",\"type\":\"full_text\"},\"embed_idx\":{\"name\":\"embed_idx\",\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}}",
     );
     defer req.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"search_idx\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"search_idx\":{\"name\":\"search_idx\",\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"embed_idx\"") != null);
 }
 
-test "table contract skips arbitrary public full text names in table-definition indexes" {
+test "table contract preserves arbitrary public full text names in table-definition indexes" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
@@ -1681,8 +1692,18 @@ test "table contract skips arbitrary public full text names in table-definition 
 
     const normalized = try normalizeTableDefinitionIndexesValueAlloc(std.testing.allocator, parsed.value);
     defer std.testing.allocator.free(normalized);
-    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"search_idx\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, normalized, "\"search_idx\":{\"name\":\"search_idx\",\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, normalized, "\"full_text_index_v0\"") != null);
+}
+
+test "table contract rejects create-table index names that disagree with their map identity" {
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"body_search\":{\"name\":\"other\",\"type\":\"full_text\",\"field\":\"body\"}}}",
+        ),
+    );
 }
 
 test "table contract schema update error message explains public sortable replacement for doc values" {

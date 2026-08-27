@@ -219,6 +219,35 @@ func TestCreateIndexReturnsNormalizedConfigAndUsesPathIdentity(t *testing.T) {
 	}
 }
 
+func TestCreateIndexRejectsInvalidDirectUnionBeforeNetwork(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	var request CreateIndexRequest
+	if err := request.FromCreateFullTextIndexRequest(CreateFullTextIndexRequest{
+		ArtifactName: "chunks_v1",
+		Sources:      []ArtifactIndexSource{{Artifact: "chunks_v2"}},
+	}); err != nil {
+		t.Fatalf("FromCreateFullTextIndexRequest: %v", err)
+	}
+
+	if _, err := client.CreateIndex(context.Background(), "docs", "text", request); err == nil ||
+		!strings.Contains(err.Error(), "sources cannot be combined with artifact_name") {
+		t.Fatalf("CreateIndex error = %v, want relationship validation", err)
+	}
+	if requests != 0 {
+		t.Fatalf("server received %d requests, want 0", requests)
+	}
+}
+
 func TestCreateIndexRejectsInvalidDiscriminatedResponse(t *testing.T) {
 	for _, body := range []string{
 		`{"name":"vectors","type":"future_index"}`,

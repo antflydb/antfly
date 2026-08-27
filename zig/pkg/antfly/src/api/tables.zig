@@ -76,6 +76,12 @@ fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json
         const config = entry.value_ptr.*;
         const is_catalog_metadata = std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
         if (!is_catalog_metadata) {
+            if (config == .object) {
+                if (config.object.get("name")) |inline_name| {
+                    if (inline_name != .string or !std.mem.eql(u8, inline_name.string, name))
+                        return error.InvalidCreateTableRequest;
+                }
+            }
             const index_type = if (config == .object) config.object.get("type") else null;
             const is_full_text = index_type == null or
                 (index_type.? == .string and std.mem.eql(u8, index_type.?.string, "full_text"));
@@ -87,9 +93,17 @@ fn normalizeRawCreateTableIndexesAlloc(alloc: std.mem.Allocator, value: std.json
                 continue;
             }
             if (std.mem.startsWith(u8, name, "full_text_index")) return error.InvalidCreateTableRequest;
-            const artifact_backed_full_text = is_full_text and config == .object and
-                (config.object.contains("artifact_name") or config.object.contains("sources") or config.object.contains("enrichments"));
-            if (is_full_text and !artifact_backed_full_text) continue;
+            // `default` is the released compatibility alias for the canonical
+            // system index. Other named full-text indexes are caller-owned and
+            // must survive create-table normalization like every other kind.
+            if (is_full_text and std.mem.eql(u8, name, "default")) {
+                if (config == .object and
+                    (config.object.contains("artifact_name") or
+                        config.object.contains("sources") or
+                        config.object.contains("enrichments")))
+                    return error.InvalidCreateTableRequest;
+                continue;
+            }
         }
 
         // Replace the closing brace, append the caller-owned entry, then close
@@ -4305,6 +4319,35 @@ test "create table raw parser merges default full text with quickstart embedding
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"title_body\":{") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"_coverage_incarnation\":") != null);
+}
+
+test "create table raw parser preserves named field full text index" {
+    var parsed = try parseCreateTableRequest(
+        std.testing.allocator,
+        "{\"indexes\":{\"body_search\":{\"type\":\"full_text\",\"field\":\"body\"}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"body_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"field\":\"body\"") != null);
+}
+
+test "create table raw parser rejects ambiguous index identities" {
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"body_search\":{\"name\":\"other\",\"type\":\"full_text\",\"field\":\"body\"}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"default\":{\"type\":\"full_text\",\"artifact_name\":\"chunks_v1\"}}}",
+        ),
+    );
 }
 
 test "create table raw parser preserves artifact backed full text index" {

@@ -1849,7 +1849,7 @@ def test_table_rejects_non_go_full_text_chunk_config(table_api):
         raise AssertionError("expected public full-text chunk config to be rejected")
 
 
-def test_table_create_table_ignores_user_full_text_index_entries(table_api):
+def test_table_create_table_preserves_user_full_text_index_entries(table_api):
     table_name = f"full_text_create_table_{time.time_ns()}"
 
     payload = {
@@ -1883,7 +1883,7 @@ def test_table_create_table_ignores_user_full_text_index_entries(table_api):
         }
     assert _table_name(created) == table_name
     assert "full_text_index_v0" in created["indexes"]
-    assert "search_idx" not in created["indexes"]
+    assert "search_idx" in created["indexes"]
     assert "embed_idx" in created["indexes"]
 
 
