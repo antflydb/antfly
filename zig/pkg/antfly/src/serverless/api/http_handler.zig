@@ -2622,10 +2622,7 @@ pub const HttpHandler = struct {
         );
         defer resp.deinit(self.alloc);
         try cancellation.check();
-        return switch (resp.status) {
-            200 => try typedJsonResponse(metadata_openapi.QueryResponses, self.alloc, 200, resp.body),
-            else => try textResponse(self.alloc, resp.status, resp.body),
-        };
+        return try adaptPublicTableQueryResponse(self.alloc, resp);
     }
 
     fn handleTablePublicGraphQueryRequest(
@@ -4599,6 +4596,7 @@ pub const HttpHandler = struct {
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
+            error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.FileNotFound => return error.NotFound,
             error.DocIdentityUnavailable => return error.DocIdentityUnavailable,
@@ -6504,6 +6502,16 @@ fn typedJsonResponse(comptime T: type, alloc: Allocator, status: u16, body: []co
     return try jsonResponse(alloc, status, parsed);
 }
 
+fn adaptPublicTableQueryResponse(alloc: Allocator, response: public_table_http.OwnedResponse) !HttpResponse {
+    if (response.status == 200) {
+        return try typedJsonResponse(metadata_openapi.QueryResponses, alloc, response.status, response.body);
+    }
+    return if (response.json)
+        try jsonSliceResponse(alloc, response.status, response.body)
+    else
+        try textResponse(alloc, response.status, response.body);
+}
+
 test "typed index status response rejects extended variant fields but raw json preserves them" {
     const alloc = std.testing.allocator;
     const body =
@@ -6774,6 +6782,33 @@ test "serverless unsupported query response uses the public contract" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("unsupported_query_request", parsed.value.@"error");
     try std.testing.expect(!parsed.value.retryable);
+}
+
+test "serverless public table query adapter preserves structured error content type" {
+    const alloc = std.testing.allocator;
+    var public_response = public_table_http.OwnedResponse{
+        .status = 422,
+        .body = try public_table_http.unsupportedQueryBody(alloc),
+        .json = true,
+    };
+    defer public_response.deinit(alloc);
+
+    var response = try adaptPublicTableQueryResponse(alloc, public_response);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type);
+    var parsed = try std.json.parseFromSlice(public_table_http.UnsupportedQueryError, alloc, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", parsed.value.@"error");
+
+    var public_text_response = public_table_http.OwnedResponse{
+        .status = 400,
+        .body = try alloc.dupe(u8, "invalid query request"),
+    };
+    defer public_text_response.deinit(alloc);
+    var text_response = try adaptPublicTableQueryResponse(alloc, public_text_response);
+    defer text_response.deinit(alloc);
+    try std.testing.expectEqualStrings("text/plain", text_response.content_type);
 }
 
 test "serverless http handler serves internal namespace lifecycle, admission, and query head" {

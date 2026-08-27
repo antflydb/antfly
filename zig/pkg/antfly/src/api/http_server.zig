@@ -8385,6 +8385,7 @@ pub const ApiHttpServer = struct {
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
             error.UnsupportedFilterQueryRequest => return error.UnsupportedFilterQueryRequest,
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
+            error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.Timeout => return error.ReadUnavailable,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
@@ -16460,9 +16461,9 @@ fn normalizePublicQueryParseError(err: anyerror) anyerror {
     return normalizeQueryEmbeddingOperationalError(err) orelse error.InvalidQueryRequest;
 }
 
-fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []const u8) error{ InvalidQueryRequest, UnsupportedExactSort } {
+fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []const u8) error{ UnsupportedQueryRequest, UnsupportedExactSort } {
     if (queryBodyHasSortPageControls(alloc, body)) return error.UnsupportedExactSort;
-    return error.InvalidQueryRequest;
+    return error.UnsupportedQueryRequest;
 }
 
 fn queryBodyHasSortPageControls(alloc: std.mem.Allocator, body: []const u8) bool {
@@ -19831,7 +19832,7 @@ test "api http public table dispatch preserves unsupported sorted query as exact
         alloc,
         "{\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
     ));
-    try std.testing.expectEqual(error.InvalidQueryRequest, unsupportedPublicTableQueryDispatchError(
+    try std.testing.expectEqual(error.UnsupportedQueryRequest, unsupportedPublicTableQueryDispatchError(
         alloc,
         "{\"join\":{}}",
     ));

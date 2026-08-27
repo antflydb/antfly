@@ -114,6 +114,7 @@ pub const TableApi = struct {
         InvalidExclusionQueryRequest,
         UnsupportedFilterQueryRequest,
         UnsupportedExclusionQueryRequest,
+        UnsupportedQueryRequest,
         UnsupportedHierarchyGrouping,
         NotFound,
         DocIdentityUnavailable,
@@ -929,6 +930,11 @@ pub fn handleTableQueryRequest(
                 "exclusion_query",
                 .unsupported,
             ),
+            error.UnsupportedQueryRequest => return .{
+                .status = 422,
+                .body = try unsupportedQueryBody(alloc),
+                .json = true,
+            },
             error.UnsupportedHierarchyGrouping => return .{
                 .status = 422,
                 .body = try unsupportedHierarchyGroupingBody(alloc),
@@ -2811,6 +2817,23 @@ test "public table query handler preserves structured filter and hierarchy diagn
     try std.testing.expectEqualStrings("use_source_grouping_or_direct_members", hierarchy_error.value.action);
     try std.testing.expect(std.mem.indexOf(u8, hierarchy_error.value.message, "return_mode") == null);
     try std.testing.expect(!hierarchy_error.value.retryable);
+
+    var unsupported_backend = Backend{ .err = error.UnsupportedQueryRequest };
+    var unsupported_resp = try handleTableQueryRequest(
+        std.testing.allocator,
+        "docs",
+        "{}",
+        null,
+        unsupported_backend.iface(),
+    );
+    defer unsupported_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 422), unsupported_resp.status);
+    try std.testing.expect(unsupported_resp.json);
+    var unsupported_error = try std.json.parseFromSlice(UnsupportedQueryError, std.testing.allocator, unsupported_resp.body, .{});
+    defer unsupported_error.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", unsupported_error.value.@"error");
+    try std.testing.expectEqualStrings("unsupported query request", unsupported_error.value.message);
+    try std.testing.expect(!unsupported_error.value.retryable);
 }
 
 test "public table query handler preserves retryable failure status" {
