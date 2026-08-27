@@ -126,7 +126,7 @@ pub fn parseValues(
 
 /// Transport-level outcome of an authenticated Raft mutation request. Only
 /// `not_proposed` permits blind rediscovery/retry. `unknown` must converge by
-/// observing the operation identity or its durable projection.
+/// observing the mutation's exact durable projection.
 pub const Outcome = enum {
     not_proposed,
     unknown,

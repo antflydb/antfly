@@ -487,16 +487,14 @@ pub const MetadataHttpClient = struct {
         forwarding: raft_mutation_forwarding.Context,
     ) !void {
         try tables_api.validateTableMutationName(table_name);
-        const operation_id = routes.tableMutationOperationId(kind, table_name, definition_json);
-        var operation_id_buf: [32]u8 = undefined;
-        const operation_id_hex = routes.formatTableMutationOperationId(operation_id, &operation_id_buf);
         const body = try std.json.Stringify.valueAlloc(self.alloc, routes.ForwardedTableMutation{
-            .operation_id = operation_id_hex,
             .kind = kind,
             .table_name = table_name,
             .definition_json = definition_json,
         }, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(body);
+        if (body.len > tables_api.max_table_create_transport_bytes)
+            return error.CreateTableRequestTooLarge;
         const uri = try join(self.alloc, base_uri, routes.Routes.internal_forwarded_table_mutation);
         defer self.alloc.free(uri);
 
@@ -1417,7 +1415,7 @@ test "metadata http client forwards table create and drop to the internal route"
     var create_exec = RecordingExecutor{
         .expected_method = .POST,
         .expected_uri_suffix = routes.Routes.internal_forwarded_table_mutation,
-        .expected_body = "{\"protocol_version\":3,\"operation_id\":\"54aa403a0a168d74ed396383e0942204\",\"kind\":\"create_table\",\"table_name\":\"sales/archive\",\"definition_json\":\"{\\\"num_shards\\\":1}\"}",
+        .expected_body = "{\"protocol_version\":3,\"kind\":\"create_table\",\"table_name\":\"sales/archive\",\"definition_json\":\"{\\\"num_shards\\\":1}\"}",
         .success_status = 201,
         .expect_service_auth = true,
     };
@@ -1958,6 +1956,8 @@ test "metadata http client round-trips server endpoints" {
         upsert_node_count: usize = 0,
         upsert_store_count: usize = 0,
         report_store_status_count: usize = 0,
+        forwarded_create_deadline_seen: bool = false,
+        forwarded_drop_deadline_seen: bool = false,
 
         const tables = [_]metadata_table_manager.TableRecord{
             .{ .table_id = 1, .name = "docs", .placement_role = "data" },
@@ -2030,7 +2030,9 @@ test "metadata http client round-trips server endpoints" {
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .create_table = createTable,
+                    .create_table_with_context = createTableWithContext,
                     .drop_table = dropTable,
+                    .drop_table_with_context = dropTableWithContext,
                     .update_schema = updateSchema,
                     .create_index = createIndex,
                     .drop_index = dropIndex,
@@ -2094,10 +2096,22 @@ test "metadata http client round-trips server endpoints" {
             self.create_count += 1;
         }
 
+        fn createTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../api/operation.zig").RequestContext, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.deadline_ns != null) self.forwarded_create_deadline_seen = true;
+            try createTable(ptr, alloc, table_name, req);
+        }
+
         fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             self.drop_count += 1;
+        }
+
+        fn dropTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../api/operation.zig").RequestContext, table_name: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.deadline_ns != null) self.forwarded_drop_deadline_seen = true;
+            try dropTable(ptr, alloc, table_name);
         }
 
         fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -2235,18 +2249,22 @@ test "metadata http client round-trips server endpoints" {
     try std.testing.expectError(error.UnsupportedOperation, client.restoreExtensions(base_uri, "{}"));
     try std.testing.expectError(error.UnsupportedOperation, client.enableExtension(base_uri, "memoryaf"));
     try client.createTable(base_uri, "docs", "{\"description\":\"docs table\"}");
+    try client.createTableForwarded(base_uri, "docs", "{\"description\":\"docs table\"}");
     try client.updateSchema(base_uri, "docs", "{\"kind\":\"demo\"}");
     try client.createIndex(base_uri, "docs", "embed_idx", "{\"type\":\"managed_embeddings\"}");
     try client.dropIndex(base_uri, "docs", "embed_idx");
     try client.putArtifactEnrichment(base_uri, "docs", "document chunks/v2", "{\"kind\":\"chunk\"}");
     try client.deleteArtifactEnrichment(base_uri, "docs", "document chunks/v2");
     try client.dropTable(base_uri, "docs");
+    try client.dropTableForwarded(base_uri, "docs");
     try client.upsertNode(base_uri, "{\"store_id\":7,\"node_id\":7}");
     try client.reportNodeStatus(base_uri, "{\"store_id\":7,\"health_class\":\"healthy\"}");
     try client.requestTableSplit(base_uri, "docs", "{\"split_key\":\"doc:m\"}");
     try client.requestTableMerge(base_uri, "docs", "{\"donor_group_id\":11,\"receiver_group_id\":10}");
-    try std.testing.expectEqual(@as(usize, 1), source.create_count);
-    try std.testing.expectEqual(@as(usize, 1), source.drop_count);
+    try std.testing.expectEqual(@as(usize, 2), source.create_count);
+    try std.testing.expectEqual(@as(usize, 2), source.drop_count);
+    try std.testing.expect(source.forwarded_create_deadline_seen);
+    try std.testing.expect(source.forwarded_drop_deadline_seen);
     try std.testing.expectEqual(@as(usize, 1), source.update_schema_count);
     try std.testing.expectEqual(@as(usize, 1), source.create_index_count);
     try std.testing.expectEqual(@as(usize, 1), source.drop_index_count);

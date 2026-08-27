@@ -42,6 +42,7 @@ const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const routes = @import("http_routes.zig");
 const service = @import("service.zig");
+const table_topology_mutations = @import("table_topology_mutations.zig");
 
 const max_forwarded_table_create_body_bytes = tables_api.max_table_create_transport_bytes;
 
@@ -97,6 +98,7 @@ pub const AdminSource = struct {
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
         preflight_table_mutation_authority: ?*const fn (ptr: *anyopaque) anyerror!void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
+        create_table_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
@@ -108,6 +110,7 @@ pub const AdminSource = struct {
             manifest: *const backups_api.TableBackupManifest,
         ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
+        drop_table_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
@@ -191,6 +194,13 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, table_name, req);
     }
 
+    pub fn createTableWithContext(self: AdminSource, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
+        if (self.vtable.create_table_with_context) |create|
+            return try create(self.ptr, alloc, request, table_name, req);
+        try request.ensureActive();
+        return try self.createTable(alloc, table_name, req);
+    }
+
     pub fn replaceTableDefinition(self: AdminSource, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const fn_ptr = self.vtable.replace_table_definition orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, expected, replacement);
@@ -212,6 +222,13 @@ pub const AdminSource = struct {
     pub fn dropTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const fn_ptr = self.vtable.drop_table orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
+    pub fn dropTableWithContext(self: AdminSource, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) !void {
+        if (self.vtable.drop_table_with_context) |drop|
+            return try drop(self.ptr, alloc, request, table_name);
+        try request.ensureActive();
+        return try self.dropTable(alloc, table_name);
     }
 
     pub fn updateSchema(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -401,9 +418,11 @@ pub const AdminSource = struct {
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .preflight_table_mutation_authority = metadataHttpServicePreflightTableMutationAuthority,
                 .create_table = metadataHttpServiceCreateTable,
+                .create_table_with_context = metadataHttpServiceCreateTableWithContext,
                 .replace_table_definition = metadataHttpServiceReplaceTableDefinition,
                 .restore_table = metadataHttpServiceRestoreTable,
                 .drop_table = metadataHttpServiceDropTable,
+                .drop_table_with_context = metadataHttpServiceDropTableWithContext,
                 .update_schema = metadataHttpServiceUpdateSchema,
                 .create_index = metadataHttpServiceCreateIndex,
                 .drop_index = metadataHttpServiceDropIndex,
@@ -872,26 +891,12 @@ pub const AdminSource = struct {
     }
 
     fn metadataHttpServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
-        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLocalTableMutationAuthority();
-        createTableOnLocalHttpService(svc, alloc, table_name, req) catch |err|
-            return metadata_authority.afterPossibleAdmission(err);
+        return metadataHttpServiceCreateTableWithContext(ptr, alloc, .{}, table_name, req);
     }
 
-    fn createTableOnLocalHttpService(svc: *service.MetadataHttpService, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
-        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-        defer workflow.deinit();
-        const table = tables_api.deriveTableRecord(table_name, req);
-        const ranges = try tables_api.deriveInitialRanges(alloc, table);
-        defer {
-            for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
-            alloc.free(ranges);
-        }
-        std.log.info("metadata create table begin table={s} ranges={d}", .{ table_name, ranges.len });
-        _ = try workflow.createTableWithRanges(svc, table, ranges);
-        std.log.info("metadata create table reconciled table={s}", .{table_name});
-        try flushMetadataHttpServiceMutation(svc);
-        std.log.info("metadata create table round complete table={s}", .{table_name});
+    fn metadataHttpServiceCreateTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try table_topology_mutations.create(svc, alloc, request, table_name, req);
     }
 
     fn metadataHttpServiceReplaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
@@ -915,22 +920,12 @@ pub const AdminSource = struct {
     }
 
     fn metadataHttpServiceDropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
-        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try svc.ensureLocalTableMutationAuthority();
-        dropTableOnLocalHttpService(svc, alloc, table_name) catch |err|
-            return metadata_authority.afterPossibleAdmission(err);
+        return metadataHttpServiceDropTableWithContext(ptr, alloc, .{}, table_name);
     }
 
-    fn dropTableOnLocalHttpService(svc: *service.MetadataHttpService, alloc: std.mem.Allocator, table_name: []const u8) !void {
-        var snapshot = try svc.adminSnapshot();
-        defer svc.freeAdminSnapshot(&snapshot);
-        const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        if (extensionOwnsTableScopedObject(&snapshot, table_name)) return error.ExtensionOwnedObject;
-
-        var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-        defer workflow.deinit();
-        _ = try workflow.dropTable(svc, table.table_id);
-        try flushMetadataHttpServiceMutation(svc);
+    fn metadataHttpServiceDropTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try table_topology_mutations.drop(svc, alloc, request, table_name);
     }
 
     fn metadataHttpServiceUpdateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -1850,9 +1845,11 @@ pub const MetadataHttpServer = struct {
     fn tableOperations(self: *MetadataHttpServer) table_operations.Operations {
         return .{ .source = .{ .ptr = self, .vtable = &.{
             .create_table = createTableOperation,
+            .create_table_with_context = createTableOperationWithContext,
             .replace_definition = replaceTableDefinitionOperation,
             .restore_table = restoreTableOperation,
             .drop_table = dropTableOperation,
+            .drop_table_with_context = dropTableOperationWithContext,
             .update_schema = updateTableSchemaOperation,
             .create_index = createTableIndexOperation,
             .drop_index = dropTableIndexOperation,
@@ -1871,6 +1868,11 @@ pub const MetadataHttpServer = struct {
         return self.source.createTable(alloc, table_name, request);
     }
 
+    fn createTableOperationWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8, create_request: tables_api.CreateTableRequest) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.createTableWithContext(alloc, request, table_name, create_request);
+    }
+
     fn replaceTableDefinitionOperation(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.replaceTableDefinition(expected, replacement);
@@ -1884,6 +1886,11 @@ pub const MetadataHttpServer = struct {
     fn dropTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.dropTable(alloc, table_name);
+    }
+
+    fn dropTableOperationWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) !void {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.dropTableWithContext(alloc, request, table_name);
     }
 
     fn updateTableSchemaOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -1945,20 +1952,22 @@ pub const MetadataHttpServer = struct {
     fn metadataCreateTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
-        return self.executeMetadataCreateTable(ctx, table_name, (try ctx.body()) orelse "");
+        return self.executeMetadataCreateTable(ctx, requestContext(ctx), table_name, (try ctx.body()) orelse "");
     }
 
     fn metadataTableMutationForwarded(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
-        const forwarding = raft_mutation_forwarding.parseValues(
+        const forwarding = (raft_mutation_forwarding.parseValues(
             ctx.header(routes.Routes.raft_mutation_remaining_ms_header),
             ctx.header(routes.Routes.raft_mutation_forwards_remaining_header),
             ctx.header(routes.Routes.raft_mutation_campaign_allowed_header),
             .{ .max_remaining_ms = 5_000, .max_forwards = 2 },
-        ) catch return ctx.status(400).text("invalid raft mutation forwarding context");
+        ) catch return ctx.status(400).text("invalid raft mutation forwarding context")) orelse
+            return ctx.status(400).text("missing raft mutation forwarding context");
         // Forwarded mutation endpoints require the complete routing context;
         // accepting a headerless request would bypass hop/deadline ownership.
-        if (forwarding == null)
-            return ctx.status(400).text("missing raft mutation forwarding context");
+        var forwarded_request = requestContext(ctx);
+        forwarded_request.deadline_ns = platform_time.monotonicNs() +|
+            @as(u64, forwarding.remaining_ms) * std.time.ns_per_ms;
         try ctx.setHeader(
             routes.Routes.raft_mutation_outcome_header,
             routes.Routes.raft_mutation_outcome_not_proposed,
@@ -1978,22 +1987,14 @@ pub const MetadataHttpServer = struct {
             return ctx.status(426).text("unsupported table mutation protocol");
         tables_api.validateTableMutationName(forwarded.value.table_name) catch
             return ctx.status(400).text("invalid table name");
-        const operation_id = routes.parseTableMutationOperationId(forwarded.value.operation_id) catch
-            return ctx.status(400).text("invalid table mutation operation id");
-        const expected_operation_id = routes.tableMutationOperationId(
-            forwarded.value.kind,
-            forwarded.value.table_name,
-            forwarded.value.definition_json,
-        );
-        if (!std.mem.eql(u8, &operation_id, &expected_operation_id))
-            return ctx.status(400).text("table mutation operation id mismatch");
         try ctx.setHeader(
             routes.Routes.raft_mutation_outcome_header,
             routes.Routes.raft_mutation_outcome_unknown,
         );
-        const response = switch (forwarded.value.kind) {
+        var response = switch (forwarded.value.kind) {
             .create_table => try self.executeMetadataCreateTable(
                 ctx,
+                forwarded_request,
                 forwarded.value.table_name,
                 forwarded.value.definition_json orelse
                     return ctx.status(400).text("missing create table definition"),
@@ -2001,11 +2002,11 @@ pub const MetadataHttpServer = struct {
             .drop_table => blk: {
                 if (forwarded.value.definition_json != null)
                     return ctx.status(400).text("drop table definition must be absent");
-                break :blk try self.executeMetadataDropTable(ctx, forwarded.value.table_name);
+                break :blk try self.executeMetadataDropTable(ctx, forwarded_request, forwarded.value.table_name);
             },
         };
         if (response.status.code >= 200 and response.status.code < 300) {
-            try ctx.setHeader(
+            try response.headers.set(
                 routes.Routes.raft_mutation_outcome_header,
                 routes.Routes.raft_mutation_outcome_committed,
             );
@@ -2016,6 +2017,7 @@ pub const MetadataHttpServer = struct {
     fn executeMetadataCreateTable(
         self: *MetadataHttpServer,
         ctx: *httpx.Context,
+        request_context: operation.RequestContext,
         table_name: []const u8,
         definition_json: []const u8,
     ) !httpx.Response {
@@ -2024,7 +2026,7 @@ pub const MetadataHttpServer = struct {
         var request = parseCreateTableRequest(ctx.allocator, definition_json) catch
             return ctx.status(400).text("invalid create table request");
         defer request.deinit(ctx.allocator);
-        self.tableOperations().create(ctx.allocator, requestContext(ctx), table_name, request) catch |err| switch (err) {
+        self.tableOperations().create(ctx.allocator, request_context, table_name, request) catch |err| switch (err) {
             error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
@@ -2053,15 +2055,16 @@ pub const MetadataHttpServer = struct {
     fn metadataDropTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
-        return self.executeMetadataDropTable(ctx, table_name);
+        return self.executeMetadataDropTable(ctx, requestContext(ctx), table_name);
     }
 
     fn executeMetadataDropTable(
         self: *MetadataHttpServer,
         ctx: *httpx.Context,
+        request_context: operation.RequestContext,
         table_name: []const u8,
     ) !httpx.Response {
-        self.tableOperations().drop(ctx.allocator, requestContext(ctx), table_name) catch |err| switch (err) {
+        self.tableOperations().drop(ctx.allocator, request_context, table_name) catch |err| switch (err) {
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),

@@ -37,13 +37,26 @@ pub const default_full_text_index_name = full_text_indexes.default_full_text_ind
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
 pub const max_table_name_bytes: usize = 255;
 pub const max_table_create_transport_bytes: usize = 32 * 1024 * 1024;
-const forwarded_table_create_envelope_bytes: usize = 38;
+// Exact serialized size of an empty create envelope. The name and canonical
+// definition can each at most double when embedded as JSON strings because
+// both have already rejected raw control bytes or been parsed as valid JSON.
+const forwarded_table_create_envelope_bytes: usize =
+    "{\"protocol_version\":3,\"kind\":\"create_table\",\"table_name\":\"\",\"definition_json\":\"\"}".len;
 pub const max_table_create_body_bytes: usize =
     (max_table_create_transport_bytes - forwarded_table_create_envelope_bytes - 2 * max_table_name_bytes) / 2;
 
 pub fn validateTableCreateBodySize(body_len: usize) !void {
     if (body_len > max_table_create_body_bytes)
         return error.CreateTableRequestTooLarge;
+}
+
+test "forwarded create body limit includes the exact worst-case JSON envelope" {
+    const worst_case_encoded_bytes = forwarded_table_create_envelope_bytes +
+        2 * max_table_name_bytes + 2 * max_table_create_body_bytes;
+    try std.testing.expect(worst_case_encoded_bytes <= max_table_create_transport_bytes);
+    // Keep the public payload ceiling tight: changing the envelope must update
+    // this calculation rather than silently sacrificing useful request space.
+    try std.testing.expect(max_table_create_transport_bytes - worst_case_encoded_bytes < 2);
 }
 
 pub fn validateTableMutationName(table_name: []const u8) !void {

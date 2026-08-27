@@ -21,50 +21,10 @@ pub const TableMutationKind = enum {
 
 pub const ForwardedTableMutation = struct {
     protocol_version: u16 = Routes.table_mutation_protocol_version,
-    operation_id: []const u8,
     kind: TableMutationKind,
     table_name: []const u8,
     definition_json: ?[]const u8 = null,
 };
-
-pub const TableMutationOperationId = [16]u8;
-
-fn hashMutationPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
-    var len: [@sizeOf(u64)]u8 = undefined;
-    std.mem.writeInt(u64, &len, @intCast(value.len), .little);
-    hasher.update(&len);
-    hasher.update(value);
-}
-
-pub fn tableMutationOperationId(
-    kind: TableMutationKind,
-    table_name: []const u8,
-    definition_json: ?[]const u8,
-) TableMutationOperationId {
-    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
-    hasher.update("antfly-metadata-table-mutation-v1");
-    hashMutationPart(&hasher, @tagName(kind));
-    hashMutationPart(&hasher, table_name);
-    hashMutationPart(&hasher, definition_json orelse "");
-    var digest: [32]u8 = undefined;
-    hasher.final(&digest);
-    return digest[0..@sizeOf(TableMutationOperationId)].*;
-}
-
-pub fn formatTableMutationOperationId(
-    operation_id: TableMutationOperationId,
-    out: *[32]u8,
-) []const u8 {
-    return std.fmt.bufPrint(out, "{x}", .{operation_id}) catch unreachable;
-}
-
-pub fn parseTableMutationOperationId(raw: []const u8) !TableMutationOperationId {
-    if (raw.len != 32) return error.InvalidTableMutationOperationId;
-    var operation_id: TableMutationOperationId = undefined;
-    _ = std.fmt.hexToBytes(&operation_id, raw) catch
-        return error.InvalidTableMutationOperationId;
-    return operation_id;
-}
 
 pub const Routes = struct {
     pub const health = "/metadata/v1/health";
@@ -87,7 +47,6 @@ pub const Routes = struct {
     pub const internal_node_shutdown_suffix = "/shutdown";
     pub const internal_node_status_suffix = "/status";
     pub const internal_schema_progress = "/internal/v1/schema-progress";
-    pub const internal_restore_progress = "/internal/v1/restore-progress";
     pub const internal_extensions_prefix = "/internal/v1/extensions/";
     pub const internal_extension_restore = "/internal/v1/extensions/restore";
     pub const internal_extension_update_suffix = "/update";
