@@ -5756,7 +5756,7 @@ pub const ProvisionedTableWriteSource = struct {
             // operation releases. The table reservation can therefore be
             // released without creating a clear-edge gap, even when repair of
             // an earlier shard completed while later shards reconciled.
-            owner.releaseStructuralReconcileStatus(self.table_name);
+            owner.releaseStructuralReconcileRequestStatus(self.*);
             self.publishDeferredRepairDebt(owner);
         }
 
@@ -5979,6 +5979,11 @@ pub const ProvisionedTableWriteSource = struct {
         // already-ready snapshot immediately before the worker appends more
         // replay work.
         structural_reconcile_status_pending: usize = 0,
+        // Index-targeted reconciliation changes no sibling incarnation and
+        // retains the storage root. Its publication fence may therefore keep
+        // the last immutable sibling status authoritative while the target's
+        // worker takes ownership.
+        targeted_structural_reconcile_status_pending: usize = 0,
         // Each affected shard acquires status authority before its compatible
         // structural operation releases. This does not reserve write
         // admission; it only makes cached status non-authoritative until the
@@ -6954,6 +6959,15 @@ pub const ProvisionedTableWriteSource = struct {
         self.activityEntryLocked(table_name, null).structural_reconcile_status_pending += 1;
     }
 
+    fn reserveTargetedStructuralReconcileStatus(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const entry = self.activityEntryLocked(table_name, null);
+        entry.structural_reconcile_status_pending += 1;
+        entry.targeted_structural_reconcile_status_pending += 1;
+    }
+
     fn releaseStructuralReconcileStatus(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
@@ -6964,6 +6978,30 @@ pub const ProvisionedTableWriteSource = struct {
         entry.structural_reconcile_status_pending -= 1;
         self.pruneTableActivityLocked(table_name, null);
         self.table_activity_ready.broadcast(io);
+    }
+
+    fn releaseTargetedStructuralReconcileStatus(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        const index = self.findTableActivityLocked(table_name, null) orelse return;
+        const entry = &self.active_table_activities.items[index];
+        std.debug.assert(entry.structural_reconcile_status_pending > 0);
+        std.debug.assert(entry.targeted_structural_reconcile_status_pending > 0);
+        entry.structural_reconcile_status_pending -= 1;
+        entry.targeted_structural_reconcile_status_pending -= 1;
+        self.pruneTableActivityLocked(table_name, null);
+        self.table_activity_ready.broadcast(io);
+    }
+
+    fn releaseStructuralReconcileRequestStatus(
+        self: *ProvisionedTableWriteSource,
+        request: StructuralReconcileRequest,
+    ) void {
+        if (request.index_name != null)
+            self.releaseTargetedStructuralReconcileStatus(request.table_name)
+        else
+            self.releaseStructuralReconcileStatus(request.table_name);
     }
 
     fn ensureStructuralRepairHandoffStatus(
@@ -7426,6 +7464,46 @@ pub const ProvisionedTableWriteSource = struct {
             if (entry.repair_handoff_status_pending > 0 or entry.publication_handoffs.items.len > 0) return true;
         }
         return self.hasAnyReadBlockingGroupOperationLocked(table_name);
+    }
+
+    fn targetedStatusSnapshotCanRemainFreshLocked(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+    ) bool {
+        var targeted_fence = false;
+        if (self.findTableActivityLocked(table_name, null)) |index| {
+            const entry = self.active_table_activities.items[index];
+            if (entry.structural_active or entry.structural_waiters > 0 or
+                entry.structuralReconcileReserved() or entry.restore_preparations > 0)
+            {
+                return false;
+            }
+            if (entry.structural_reconcile_status_pending !=
+                entry.targeted_structural_reconcile_status_pending) return false;
+            targeted_fence = entry.targeted_structural_reconcile_status_pending > 0;
+        }
+        for (self.active_table_activities.items) |entry| {
+            if (!std.mem.eql(u8, entry.table_name, table_name) or entry.group_id == null) continue;
+            if (entry.operation_waiters > 0 or entry.transition_waiters > 0 or
+                (entry.operation_active and !entry.operation_allows_reads) or
+                entry.generation_preparation_active)
+            {
+                return false;
+            }
+            targeted_fence = targeted_fence or entry.repair_handoff_status_pending > 0 or
+                entry.publication_handoffs.items.len > 0;
+        }
+        return targeted_fence;
+    }
+
+    fn targetedStatusSnapshotCanRemainFreshBestEffort(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+    ) bool {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        return self.targetedStatusSnapshotCanRemainFreshLocked(table_name);
     }
 
     fn beginStatusRequestLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) StatusRequestAdmission {
@@ -11660,7 +11738,9 @@ pub const ProvisionedTableWriteSource = struct {
             // cache-only so it cannot contend with publication. The snapshot
             // remains useful for diagnostics, but it is not authoritative for
             // readiness until live admission resumes.
-            markRuntimeStatusesStale(&cached);
+            if (!self.targetedStatusSnapshotCanRemainFreshBestEffort(table_name)) {
+                markRuntimeStatusesStale(&cached);
+            }
             return cached;
         }
         if (self.runtime_status_cache == null) {
@@ -13050,7 +13130,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.structural_reconcile_mutex.unlock(io);
         for (self.structural_reconcile_tables.items) |*request| {
             if (request.reservesWriteAdmission()) self.cancelStructuralReconcileReservation(request.table_name);
-            self.releaseStructuralReconcileStatus(request.table_name);
+            self.releaseStructuralReconcileRequestStatus(request.*);
             request.deinit(alloc);
         }
         self.structural_reconcile_tables.deinit(alloc);
@@ -13074,7 +13154,11 @@ pub const ProvisionedTableWriteSource = struct {
         // Enqueue is a structural invalidation boundary even when an existing
         // request already covers this target. A status observer admitted
         // before the request must not publish after it.
-        self.invalidateRuntimeStatusCache(table_name);
+        if (index_name == null) {
+            self.invalidateRuntimeStatusCache(table_name);
+        } else if (self.runtime_status_cache) |snapshot_cache| {
+            snapshot_cache.fenceTablePublications(table_name);
+        }
         const alloc = std.heap.page_allocator;
         const io = self.table_activity_threaded.io();
 
@@ -13091,7 +13175,7 @@ pub const ProvisionedTableWriteSource = struct {
                 if (std.mem.eql(u8, self.structural_reconcile_tables.items[i].table_name, table_name)) {
                     var removed = self.structural_reconcile_tables.orderedRemove(i);
                     if (removed.reservesWriteAdmission()) self.cancelStructuralReconcileReservation(removed.table_name);
-                    self.releaseStructuralReconcileStatus(removed.table_name);
+                    self.releaseStructuralReconcileRequestStatus(removed);
                     removed.deinit(alloc);
                     continue;
                 }
@@ -13111,14 +13195,17 @@ pub const ProvisionedTableWriteSource = struct {
             .table_name = owned_table_name,
             .index_name = owned_index_name,
         });
-        self.reserveStructuralReconcileStatus(table_name);
+        if (index_name == null)
+            self.reserveStructuralReconcileStatus(table_name)
+        else
+            self.reserveTargetedStructuralReconcileStatus(table_name);
         if (index_name == null) self.reserveStructuralReconcileActivity(table_name);
 
         if (self.structural_reconcile_scheduled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
         self.restore_repair_work_group.concurrent(io, drainStructuralReconcileTask, .{self}) catch |err| {
             var removed = self.structural_reconcile_tables.orderedRemove(appended_index);
             if (removed.reservesWriteAdmission()) self.cancelStructuralReconcileReservation(removed.table_name);
-            self.releaseStructuralReconcileStatus(removed.table_name);
+            self.releaseStructuralReconcileRequestStatus(removed);
             removed.deinit(alloc);
             self.structural_reconcile_scheduled.store(false, .release);
             return err;
@@ -14603,7 +14690,11 @@ pub const ProvisionedTableWriteSource = struct {
         if (managed_visibility_changed) {
             self.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, table_name);
         }
-        self.notifyLocalChange(table_name, .structural);
+        // The named index was reconciled in place inside the current root.
+        // Report the fresh runtime without asking the owner to enqueue a
+        // redundant whole-table reconciliation that would transiently revoke
+        // readiness for unchanged sibling indexes.
+        self.notifyLocalChange(table_name, .runtime_reconciled);
         if (managed_visibility_changed) {
             self.notifyLocalChange(table_name, .data);
         }
@@ -35372,6 +35463,7 @@ test "queued index catch-up does not reserve table write admission" {
     const status_admission = source.beginStatusRequest("docs");
     defer source.endStatusRequest("docs", status_admission);
     try std.testing.expectEqual(ProvisionedTableWriteSource.StatusRequestAdmission.snapshot_only, status_admission);
+    try std.testing.expect(source.targetedStatusSnapshotCanRemainFreshBestEffort("docs"));
 }
 
 test "structural repair handoff keeps status fenced through final shard visibility" {

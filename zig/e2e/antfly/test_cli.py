@@ -33,6 +33,7 @@ from conftest import (
     DEFAULT_ANTFLY_BIN,
     InferenceEmbeddingServer,
     InferenceGeneratorServer,
+    InferenceRerankerServer,
     StandaloneAntflyServer,
     resolve_binary_path,
 )
@@ -44,7 +45,13 @@ from port_reservations import find_free_port
 def cli_inference_servers():
     embedder = InferenceEmbeddingServer()
     generator = InferenceGeneratorServer()
-    yield {"embedder": embedder.url, "generator": generator.url}
+    reranker = InferenceRerankerServer()
+    yield {
+        "embedder": embedder.url,
+        "generator": generator.url,
+        "reranker": reranker.url,
+    }
+    reranker.stop()
     generator.stop()
     embedder.stop()
 
@@ -149,6 +156,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
     table = f"cli_quickstart_{time.time_ns()}"
     embedder_url = cli_server.cli_inference_urls["embedder"]
     generator_url = cli_server.cli_inference_urls["generator"]
+    reranker_url = cli_server.cli_inference_urls["reranker"]
     inline_index = json.dumps(
         {
             "name": "title_body",
@@ -206,8 +214,26 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             str(records),
             "--id-field",
             "id",
+            "--sync-level",
+            "full_text",
             "--no-checkpoint",
         )
+
+        full_text_query = cli(
+            "query",
+            "--table",
+            table,
+            "--full-text-search",
+            "body:alpha",
+            "--fields",
+            "title,body",
+            "--limit",
+            "2",
+        )
+        full_text_hits = parse_json(full_text_query.stdout)["responses"][0]["hits"][
+            "hits"
+        ]
+        assert full_text_hits[0]["_id"] == "doc:alpha"
 
         text_wait = cli(
             "index",
@@ -216,13 +242,19 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             table,
             "--index",
             "title_body",
+            "--until",
+            "queryable",
             "--timeout",
             "20s",
             "--poll-interval",
             "25ms",
             timeout_s=30.0,
         )
-        assert "title_body\tembeddings\tready" in text_wait.stdout
+        assert "Index title_body (embeddings) reached queryable:" in text_wait.stdout
+        assert "source_coverage=" in text_wait.stdout
+        assert "indexed_entries=" in text_wait.stdout
+        assert "visible_entries=" in text_wait.stdout
+        assert "pending_reasons=" in text_wait.stdout
 
         text_query = cli(
             "query",
@@ -263,6 +295,12 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
                 }
             ),
         )
+        text_status_after_index_create = parse_json(
+            cli("index", "get", "--table", table, "--index", "title_body").stdout
+        )
+        assert (
+            text_status_after_index_create["status"]["readiness"]["queryable"] is True
+        ), json.dumps(text_status_after_index_create, indent=2)
         image_wait = cli(
             "index",
             "wait",
@@ -270,6 +308,8 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             table,
             "--index",
             "thumbnail",
+            "--until",
+            "queryable",
             "--timeout",
             "20s",
             "--poll-interval",
@@ -281,7 +321,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             f"{image_wait.stderr}\nindex diagnostics:\n"
             f"{cli('index', 'list', '--table', table, '--output', 'json').stdout}"
         )
-        assert "thumbnail\tembeddings\tready" in image_wait.stdout
+        assert "Index thumbnail (embeddings) reached queryable:" in image_wait.stdout
         image_status = parse_json(
             cli("index", "get", "--table", table, "--index", "thumbnail").stdout
         )
@@ -309,26 +349,6 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
         image_hits = parse_json(image_query.stdout)["responses"][0]["hits"]["hits"]
         assert image_hits[0]["_id"] == "doc:alpha"
 
-        # Creating another derived index can briefly advance the table's
-        # catalog generation before every shard has republished sibling
-        # coverage. Re-establish the documented readiness precondition before
-        # exercising retrieval so the advisory remains meaningful and the
-        # pipeline is deterministic across runners.
-        text_wait_after_index_create = cli(
-            "index",
-            "wait",
-            "--table",
-            table,
-            "--index",
-            "title_body",
-            "--timeout",
-            "20s",
-            "--poll-interval",
-            "25ms",
-            timeout_s=30.0,
-        )
-        assert "title_body\tembeddings\tready" in text_wait_after_index_create.stdout
-
         rag = cli(
             "agents",
             "retrieval",
@@ -342,6 +362,20 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "Summarize the alpha document",
             "--fields",
             "title,body",
+            "--limit",
+            "1",
+            "--reranker",
+            json.dumps(
+                {
+                    "provider": "antfly",
+                    "model": "test-reranker",
+                    "url": reranker_url,
+                    "field": "body",
+                    "top_n": 1,
+                }
+            ),
+            "--pruner",
+            json.dumps({"min_score_ratio": 0.01}),
             "--generator",
             json.dumps(
                 {

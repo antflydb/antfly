@@ -276,6 +276,25 @@ pub const TableRuntimeSnapshotCache = struct {
         if (state.epoch.root_generation == 0) state.epoch.root_generation = 1;
     }
 
+    /// Fence observations captured before an in-place, index-targeted catalog
+    /// mutation without discarding the last published status for unaffected
+    /// sibling indexes. The storage root did not change, so retaining those
+    /// immutable observations is safe; subsequent publication still uses the
+    /// new epoch and rejects every pre-mutation token.
+    pub fn fenceTablePublications(self: *@This(), table_name: []const u8) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.advanceInvalidationEpochLocked();
+        self.advanceTopologyRevisionLocked();
+
+        const state = self.ensureTableLocked(table_name) catch {
+            self.clearTablesLocked();
+            self.advanceInvalidationEpochLocked();
+            return;
+        };
+        state.epoch.invalidation_epoch = self.next_invalidation_epoch;
+    }
+
     /// Captures the table lifecycle before a DB is opened or inspected.
     pub fn capturePublicationToken(self: *@This(), table_name: []const u8) !PublicationToken {
         lockAtomic(&self.mutex);
@@ -2385,6 +2404,34 @@ test "table runtime snapshot cache invalidation fences a stale observed publishe
     defer docs.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 12), docs.items[0].stats.doc_count);
     try std.testing.expectEqual(current_token.observation_generation, docs.items[0].cache_observation_generation);
+}
+
+test "table runtime snapshot cache publication fence preserves the last snapshot" {
+    const alloc = std.testing.allocator;
+    var cache = TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+
+    const stale_token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(stale_token, "docs", .{
+            .group_id = 7,
+            .stats = .{ .doc_count = 10 },
+        }),
+    );
+
+    cache.fenceTablePublications("docs");
+    var preserved = (try cache.snapshot(alloc, "docs")).?;
+    defer preserved.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 10), preserved.items[0].stats.doc_count);
+
+    try std.testing.expectEqual(
+        TableRuntimeSnapshotCache.PublishResult.stale_table,
+        try cache.publishGroup(stale_token, "docs", .{
+            .group_id = 7,
+            .stats = .{ .doc_count = 11 },
+        }),
+    );
 }
 
 test "table runtime snapshot cache batch publication is table epoch atomic" {

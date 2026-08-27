@@ -1598,6 +1598,7 @@ const AggregatedIndexStatus = struct {
     // telemetry merely because every observed repair (there are none) is
     // serviceable.
     repair_active_generation_serviceable: bool = false,
+    repair_observation_count: u64 = 0,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     enrichment_failed: bool = false,
@@ -1775,6 +1776,23 @@ fn aggregateIndexStatusIndexed(
         }
         const observation_current = statusFreshnessCountsAsFresh(runtime.metadata) and
             coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
+        // A serviceability proof is scoped to the dense incarnation itself,
+        // not to the table-status publication epoch. Preserve it across a
+        // transiently stale in-place observation so sibling index DDL cannot
+        // revoke a generation that the query gate still serves.
+        if (coverageIdentityMatches(item, coverage_generation, coverage_config_hash)) {
+            if (publicIndexRepairState(item)) |state| {
+                aggregate.repair_active_generation_serviceable = if (aggregate.repair_observation_count == 0)
+                    item.index_repair_active_generation_serviceable
+                else
+                    aggregate.repair_active_generation_serviceable and
+                        item.index_repair_active_generation_serviceable;
+                aggregate.repair_observation_count += 1;
+                if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
+                    aggregate.repair_state = state;
+                }
+            }
+        }
         // Coverage is projected only from current observations. Stale groups
         // remain visible in diagnostics but cannot contribute cardinality or
         // outcomes to a complete aggregate.
@@ -1801,16 +1819,6 @@ fn aggregateIndexStatusIndexed(
             continue;
         }
         materialization_count += 1;
-        if (publicIndexRepairState(item)) |state| {
-            aggregate.repair_active_generation_serviceable = if (aggregate.repair_state == null)
-                item.index_repair_active_generation_serviceable
-            else
-                aggregate.repair_active_generation_serviceable and
-                    item.index_repair_active_generation_serviceable;
-            if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
-                aggregate.repair_state = state;
-            }
-        }
         const public_item = publicShardIndexRuntimeView(item, runtime.stats.async_indexing);
         aggregate.doc_count += item.doc_count;
         aggregate.term_count += item.term_count;
@@ -1885,7 +1893,10 @@ fn aggregateIndexStatusIndexed(
         @intCast(expected_group_ids.len)
     else
         aggregate.reported_group_count;
-    if (aggregate.fresh_group_count > 0 and aggregate.coverage_config_mismatch_count == 0) {
+    if ((aggregate.fresh_group_count > 0 or
+        aggregate.repair_active_generation_serviceable) and
+        aggregate.coverage_config_mismatch_count == 0)
+    {
         aggregate.coverage_generation = coverage_generation;
         aggregate.coverage_config_hash = coverage_config_hash;
         aggregate.coverage_identity_ready = coverage_generation != 0;
@@ -2672,6 +2683,64 @@ test "progressive embeddings readiness exposes a queryable partial generation" {
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
         "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"incarnation\":\"g-000000000000002a\",\"target_revision\":7,\"published_revision\":7},\"coverage\":{\"source_total\":2,\"covered\":1,\"complete\":false}}",
+        encoded.items,
+    );
+}
+
+test "stale in-place status preserves an incarnation-scoped serviceability proof" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .index_repair_status = .rebuilding,
+        .index_repair_active_generation_serviceable = true,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up },
+        .stats = .{
+            .source_doc_count = 2,
+            .index_count = 1,
+            .indexes = indexes[0..],
+        },
+    }};
+    const aggregate = aggregateIndexStatusIndexed(
+        &runtimes,
+        "semantic_idx",
+        &.{7},
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(aggregate.repair_active_generation_serviceable);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.repair_observation_count);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        aggregate,
+        aggregate.table_doc_count,
+        .strict,
+        false,
+        42,
+        99,
+        null,
+        aggregate.async_indexing,
+        aggregate.enrichment,
+        aggregate.resolution,
+        aggregate.promotion,
+        aggregate.resolver_replay,
+        null,
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"runtime_unavailable\",\"shard_observation_incomplete\",\"backfill\",\"coverage\",\"replay\"]}}",
         encoded.items,
     );
 }
@@ -3974,9 +4043,15 @@ fn appendIndexReadinessStatus(
         publication_pending or coverage_pending);
     const published_generation_has_results = index_type == .embeddings and repair_state == null and
         if (@hasField(Item, "doc_count")) item.doc_count > 0 else false;
+    const stale_generation_serviceable = active_generation_serviceable and incarnation_current and
+        if (@hasField(Item, "repair_observation_count") and @hasField(Item, "expected_group_count"))
+            item.expected_group_count > 0 and item.repair_observation_count == item.expected_group_count
+        else
+            true;
     const queryable_partial = !failed and pending and index_type == .embeddings and
         (active_generation_serviceable or published_generation_has_results) and
-        observation_fresh and topology_complete and incarnation_current;
+        ((observation_fresh and topology_complete and incarnation_current) or
+            stale_generation_serviceable);
     const readiness_state = if (failed)
         "failed"
     else if (queryable_partial)
