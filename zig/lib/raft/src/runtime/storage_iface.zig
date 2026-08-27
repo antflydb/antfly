@@ -283,6 +283,10 @@ pub const StateMachine = struct {
             committed_entries: []const core.Entry,
             read_states: []const core.ReadState,
         ) anyerror!void,
+        retire_group: ?*const fn (
+            ptr: *anyopaque,
+            group_id: core.types.GroupId,
+        ) void = null,
     };
 
     pub fn prepareSnapshot(
@@ -307,6 +311,11 @@ pub const StateMachine = struct {
         read_states: []const core.ReadState,
     ) !void {
         return try self.vtable.apply_ready(self.ptr, group_id, snapshot, committed_entries, read_states);
+    }
+
+    pub fn retireGroup(self: StateMachine, group_id: core.types.GroupId) void {
+        const retire = self.vtable.retire_group orelse return;
+        retire(self.ptr, group_id);
     }
 };
 

@@ -63,6 +63,8 @@ const metadata_run_round_trace_max_phases: usize = 32;
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
+const metadata_proposal_driver_wait_ns: u64 = std.time.ns_per_ms;
+const metadata_proposal_passive_wait_ns: u64 = 25 * std.time.ns_per_ms;
 const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_min_backoff_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s;
@@ -81,6 +83,80 @@ pub const AdminSnapshotFence = struct {
     projected_core_epoch: u64 = 0,
     transition_readiness_epoch: u64 = 0,
 };
+
+pub const MetadataProposalReceipt = struct {
+    term: u64,
+    index: u64,
+};
+
+const MetadataProposalApplyObservation = enum {
+    pending,
+    applied,
+    superseded,
+};
+
+fn acceptedMetadataProposalIndex(accepted_index: ?u64, dispatch_error: ?anyerror) !u64 {
+    if (accepted_index) |index| return index;
+    if (dispatch_error) |err| return err;
+    return error.NotLeader;
+}
+
+fn observeMetadataProposalApply(
+    status: ?raft_engine.core.Status,
+    applied_entry_term: ?u64,
+    receipt: MetadataProposalReceipt,
+) MetadataProposalApplyObservation {
+    const raft_status = status orelse return .superseded;
+    if (raft_status.applied_index >= receipt.index) {
+        return if (applied_entry_term != null and applied_entry_term.? == receipt.term)
+            .applied
+        else
+            .superseded;
+    }
+    const still_receipt_leader = raft_status.soft.role == .leader and
+        raft_status.soft.leader_id != null and
+        raft_status.soft.leader_id.? == raft_status.id and
+        raft_status.hard.current_term == receipt.term;
+    return if (still_receipt_leader) .pending else .superseded;
+}
+
+test "metadata proposal receipt requires the accepted term at the applied index" {
+    const receipt: MetadataProposalReceipt = .{ .term = 3, .index = 9 };
+    var status: raft_engine.core.Status = .{
+        .id = 1,
+        .group_id = 1,
+        .soft = .{ .role = .leader, .leader_id = 1 },
+        .hard = .{ .current_term = 3, .commit_index = 9 },
+        .conf_state = .{},
+        .applied_index = 8,
+    };
+
+    try std.testing.expectEqual(.pending, observeMetadataProposalApply(status, null, receipt));
+    status.applied_index = 9;
+    try std.testing.expectEqual(.applied, observeMetadataProposalApply(status, 3, receipt));
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, 4, receipt));
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, null, receipt));
+
+    status.applied_index = 8;
+    status.soft = .{ .role = .follower, .leader_id = 2 };
+    status.hard.current_term = 4;
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, null, receipt));
+}
+
+test "metadata proposal receipt survives a post-acceptance dispatch failure" {
+    try std.testing.expectEqual(
+        @as(u64, 17),
+        try acceptedMetadataProposalIndex(17, error.OutOfMemory),
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        acceptedMetadataProposalIndex(null, error.OutOfMemory),
+    );
+    try std.testing.expectError(
+        error.NotLeader,
+        acceptedMetadataProposalIndex(null, null),
+    );
+}
 
 pub fn sameAdminSnapshotFence(before: AdminSnapshotFence, after: AdminSnapshotFence) bool {
     return before.metadata_group_id == after.metadata_group_id and
@@ -313,6 +389,61 @@ const MetadataRunRoundTrace = struct {
         return if (idx) |value| self.phases[value] else .{ .name = "-", .elapsed_ns = 0 };
     }
 };
+
+const MetadataProposalProgressDriver = struct {
+    lane: std.atomic.Mutex = .unlocked,
+    wake_epoch: std.atomic.Value(u32) = .init(0),
+
+    const Lease = struct {
+        driver: *MetadataProposalProgressDriver,
+
+        fn deinit(self: *Lease) void {
+            self.driver.lane.unlock();
+            self.driver.notifyWaiters();
+            self.* = undefined;
+        }
+    };
+
+    fn tryAcquire(self: *MetadataProposalProgressDriver) ?Lease {
+        if (!self.lane.tryLock()) return null;
+        return .{ .driver = self };
+    }
+
+    fn currentEpoch(self: *const MetadataProposalProgressDriver) u32 {
+        return self.wake_epoch.load(.acquire);
+    }
+
+    fn waitForHandoff(self: *MetadataProposalProgressDriver, observed_epoch: u32, timeout_ns: u64) void {
+        if (self.wake_epoch.load(.acquire) != observed_epoch) return;
+        std.Io.futexWaitTimeout(
+            std.Options.debug_io,
+            u32,
+            &self.wake_epoch.raw,
+            observed_epoch,
+            .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromNanoseconds(@intCast(timeout_ns)),
+            } },
+        ) catch return;
+    }
+
+    fn notifyWaiters(self: *MetadataProposalProgressDriver) void {
+        _ = self.wake_epoch.fetchAdd(1, .release);
+        std.Io.futexWake(std.Options.debug_io, u32, &self.wake_epoch.raw, std.math.maxInt(u32));
+    }
+};
+
+test "metadata proposal receipt progress uses a single transferable driver" {
+    var driver = MetadataProposalProgressDriver{};
+    var first = driver.tryAcquire() orelse return error.TestExpectedEqual;
+    try std.testing.expect(driver.tryAcquire() == null);
+    const observed_epoch = driver.currentEpoch();
+    first.deinit();
+    try std.testing.expect(driver.currentEpoch() != observed_epoch);
+
+    var next = driver.tryAcquire() orelse return error.TestExpectedEqual;
+    next.deinit();
+}
 
 const LifecycleSignal = struct {
     alloc: std.mem.Allocator,
@@ -3610,6 +3741,10 @@ pub const MetadataHttpService = struct {
     transition_mutex: std.Io.Mutex = .init,
     transition_metrics_mutex: std.Io.Mutex = .init,
     transition_metrics_snapshot: raft_transition_service.TransitionServiceMetrics = .{},
+    // One request drives low-latency Ready processing for every outstanding
+    // metadata proposal. Other requests sleep on the driver's handoff signal,
+    // avoiding a per-waiter Raft round and false lifecycle epoch changes.
+    proposal_progress_driver: MetadataProposalProgressDriver = .{},
     lifecycle_signal: LifecycleSignal,
     lifecycle_reconcile_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     lifecycle_reconcile_hook: ?LifecycleReconcileHook = null,
@@ -3848,6 +3983,7 @@ pub const MetadataHttpService = struct {
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
         }
+        self.proposal_progress_driver.notifyWaiters();
         self.lifecycle_signal.notify(signal.table_name);
     }
 
@@ -3859,6 +3995,7 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceCommittedKeySignal(ptr: *anyopaque, _: metadata_storage.raft_apply_store.CommittedKeySignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         self.lifecycle_reconcile_requested.store(true, .release);
+        self.proposal_progress_driver.notifyWaiters();
         self.lifecycle_signal.notify(null);
     }
 
@@ -3920,6 +4057,183 @@ pub const MetadataHttpService = struct {
         defer self.alloc.free(encoded);
         try self.raft.host.http_host.propose(self.metadata_group_id, encoded);
         self.lifecycle_signal.notify(null);
+    }
+
+    /// Proposes a metadata transition on the local leader and returns the
+    /// exact Raft log position that accepted it. Unlike a ReadIndex barrier,
+    /// this receipt can be used to prove that this specific mutation applied.
+    pub fn proposeTransitionCommandWithReceipt(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+    ) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null);
+    }
+
+    /// Admits a transition only while this node is still leader in the
+    /// caller's captured term. The comparison and Raft admission share the
+    /// runtime lock, closing the check-then-propose window for background work
+    /// that can outlive a leadership change.
+    pub fn proposeTransitionCommandWithReceiptInTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: u64,
+    ) !MetadataProposalReceipt {
+        if (expected_term == 0) return error.NotLeader;
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term);
+    }
+
+    fn proposeTransitionCommandWithReceiptInExpectedTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: ?u64,
+    ) !MetadataProposalReceipt {
+        var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
+        defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
+        const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+            return error.NotLeader;
+        if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or raft_status.soft.leader_id.? != raft_status.id) {
+            return error.NotLeader;
+        }
+        if (expected_term) |term| {
+            if (raft_status.hard.current_term != term) return error.NotLeader;
+        }
+        const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
+        defer self.alloc.free(encoded);
+        // Reserve proof storage before Raft accepts the entry. This keeps the
+        // accepted-but-untrackable state impossible under allocator pressure.
+        try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
+        var accepted_index: ?u64 = null;
+        var dispatch_error: ?anyerror = null;
+        self.raft.host.http_host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
+            dispatch_error = err;
+        };
+        const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
+        try self.raft.host.http_host.host.trackProposalReceipt(
+            self.metadata_group_id,
+            raft_status.hard.current_term,
+            index,
+        );
+        if (dispatch_error) |err| {
+            // Once the local leader assigned an index the proposal was
+            // accepted. Replication-message construction can still fail after
+            // that point; retain the receipt and let normal Raft progress retry
+            // delivery rather than reporting a false rejection to the caller.
+            std.log.warn(
+                "metadata proposal accepted before dispatch failure group_id={} index={} err={s}",
+                .{ self.metadata_group_id, index, @errorName(err) },
+            );
+        }
+        self.lifecycle_signal.notify(null);
+        return .{ .term = raft_status.hard.current_term, .index = index };
+    }
+
+    pub fn waitForTransitionApplied(
+        self: *MetadataHttpService,
+        receipt: MetadataProposalReceipt,
+    ) !void {
+        return self.waitForTransitionAppliedWithContext(receipt, .{});
+    }
+
+    pub fn waitForTransitionAppliedWithContext(
+        self: *MetadataHttpService,
+        receipt: MetadataProposalReceipt,
+        request: api_operation.RequestContext,
+    ) !void {
+        self.lockRuntime();
+        const tracked_receipt = self.raft.host.http_host.host.acquireProposalReceipt(
+            self.metadata_group_id,
+            receipt.term,
+            receipt.index,
+        );
+        self.unlockRuntime();
+        defer {
+            if (tracked_receipt) {
+                self.lockRuntime();
+                self.raft.host.http_host.host.releaseProposalReceipt(self.metadata_group_id, receipt.term, receipt.index);
+                self.unlockRuntime();
+            }
+        }
+        var progress_driver_lease: ?MetadataProposalProgressDriver.Lease = null;
+        defer if (progress_driver_lease) |*lease| lease.deinit();
+        const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
+            @min(local_deadline_ns, caller_deadline_ns)
+        else
+            local_deadline_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            try request.ensureActive();
+            // Capture before observing Raft so an apply notification between
+            // the observation and wait cannot be lost.
+            const lifecycle_observation = self.lifecycle_signal.snapshot(null);
+            const progress_driver_epoch = self.proposal_progress_driver.currentEpoch();
+            self.lockRuntime();
+            const maybe_raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id);
+            const applied_entry_term = if (maybe_raft_status) |raft_status|
+                if (raft_status.applied_index >= receipt.index)
+                    self.raft.host.http_host.host.raftTermAtTrackedProposalReceipt(
+                        self.metadata_group_id,
+                        receipt.term,
+                        receipt.index,
+                    ) catch null
+                else
+                    null
+            else
+                null;
+            const observation = observeMetadataProposalApply(maybe_raft_status, applied_entry_term, receipt);
+            self.unlockRuntime();
+            switch (observation) {
+                .applied => return,
+                .superseded => return error.NotLeader,
+                .pending => {},
+            }
+            if (progress_driver_lease == null) {
+                progress_driver_lease = self.proposal_progress_driver.tryAcquire();
+            }
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) break;
+            const remaining_ns = deadline_ns - now_ns;
+            if (progress_driver_lease != null) {
+                try self.runRaftProgressOnly();
+                self.lifecycle_signal.wait(
+                    lifecycle_observation,
+                    @min(remaining_ns, metadata_proposal_driver_wait_ns),
+                );
+            } else {
+                // Bound the passive sleep so request cancellation remains
+                // responsive even if the driver stalls without producing a
+                // lifecycle event. Apply and driver handoff wake passive
+                // waiters immediately.
+                self.proposal_progress_driver.waitForHandoff(
+                    progress_driver_epoch,
+                    @min(remaining_ns, metadata_proposal_passive_wait_ns),
+                );
+            }
+        }
+        try request.ensureActive();
+        return error.MetadataProposalApplyTimeout;
+    }
+
+    pub fn proposeTransitionCommandAndWaitApplied(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+    ) !MetadataProposalReceipt {
+        const receipt = try self.proposeTransitionCommandWithReceipt(command);
+        try self.waitForTransitionApplied(receipt);
+        return receipt;
+    }
+
+    pub fn proposeTransitionCommandAndWaitAppliedInTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: u64,
+    ) !MetadataProposalReceipt {
+        const receipt = try self.proposeTransitionCommandWithReceiptInTerm(command, expected_term);
+        try self.waitForTransitionApplied(receipt);
+        return receipt;
     }
 
     pub fn upsertNode(self: *MetadataHttpService, record: metadata_table_manager.NodeRecord) !void {
@@ -4694,6 +5008,19 @@ pub const MetadataHttpService = struct {
             raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
         }
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
+    }
+
+    /// Drains accepted proposals and inbound consensus work without becoming a
+    /// second owner of election and heartbeat time.
+    pub fn runRaftProgressOnly(self: *MetadataHttpService) !void {
+        try self.ensureLifecycleListenerRegistered();
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        if (self.raft.pending_updates.items.len > 0) {
+            _ = try self.raft.syncPendingRaftProgressOnly();
+        } else {
+            try self.raft.runRaftProgressOnly();
+        }
     }
 
     /// Runs metadata projection and reconciliation without advancing Raft.
@@ -13564,6 +13891,36 @@ test "metadata http service catalog cache is independent from volatile projectio
     defer svc.freeProjectedTables(std.testing.allocator, before);
     try std.testing.expectEqual(@as(usize, 0), before.len);
     try std.testing.expectEqual(true, svc.lifecycle_listener_registered);
+    const leader_status = svc.raft.host.http_host.host.raftStatus(2900) orelse return error.MissingRaftStatus;
+    try std.testing.expect(leader_status.hard.current_term > 0);
+    const receipt = try svc.proposeTransitionCommandWithReceiptInTerm(.{
+        .upsert_node = .{ .node_id = 77 },
+    }, leader_status.hard.current_term);
+    try std.testing.expectEqual(leader_status.hard.current_term, receipt.term);
+    try std.testing.expect(receipt.index > 0);
+    try svc.waitForTransitionApplied(receipt);
+    const receipt_status = svc.raft.host.http_host.host.raftStatus(2900) orelse return error.MissingRaftStatus;
+    try std.testing.expect(receipt_status.applied_index >= receipt.index);
+    const receipt_nodes = try svc.listProjectedNodes(std.testing.allocator);
+    defer svc.freeProjectedNodes(std.testing.allocator, receipt_nodes);
+    var found_receipt_node = false;
+    for (receipt_nodes) |node| {
+        if (node.node_id == 77) found_receipt_node = true;
+    }
+    try std.testing.expect(found_receipt_node);
+
+    const last_index_before_wrong_term = try store.storage().lastIndex();
+    try std.testing.expectError(error.NotLeader, svc.proposeTransitionCommandWithReceiptInTerm(.{
+        .upsert_node = .{ .node_id = 78 },
+    }, receipt.term + 1));
+    try std.testing.expectEqual(last_index_before_wrong_term, try store.storage().lastIndex());
+    const nodes_after_wrong_term = try svc.listProjectedNodes(std.testing.allocator);
+    defer svc.freeProjectedNodes(std.testing.allocator, nodes_after_wrong_term);
+    try std.testing.expectEqual(receipt_nodes.len, nodes_after_wrong_term.len);
+    for (nodes_after_wrong_term) |node| {
+        try std.testing.expect(node.node_id != 78);
+    }
+
     const catalog_epoch_before = svc.catalog_epoch.load(.acquire);
     try std.testing.expectEqual(catalog_epoch_before, svc.catalog_validation_cache.catalog_epoch);
     try std.testing.expect(svc.projected_core_snapshot_cache.snapshot == null);

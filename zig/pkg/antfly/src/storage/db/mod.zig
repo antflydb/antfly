@@ -83,6 +83,7 @@ pub const EntitySink = promotion_runtime.EntitySink;
 pub const EntityUpsert = promotion_runtime.EntityUpsert;
 pub const PromotionOwner = promotion_runtime.PromotionOwner;
 pub const DB = @import("db.zig").DB;
+pub const RaftAppliedEntryIdentity = @import("db.zig").RaftAppliedEntryIdentity;
 pub const LsmOwnerKind = DB.LsmOwnerKind;
 pub const LsmOwnerStats = DB.LsmOwnerStats;
 pub const documentExtractionStoredUnitFingerprintAlloc = @import("db.zig").documentExtractionStoredUnitFingerprintAlloc;

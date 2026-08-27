@@ -17,6 +17,7 @@ const ant_json = @import("antfly-json");
 const abi = @import("kernel_abi.zig");
 const server_mod = @import("http_server.zig");
 const handler_mod = @import("httpx_handler.zig");
+const distributed_txn_contract = @import("distributed_txn_contract.zig");
 const table_reads = @import("table_read_source.zig");
 const table_writes = @import("table_write_source.zig");
 const restore_jobs = @import("restore_jobs.zig");
@@ -752,6 +753,55 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     try std.testing.expectEqual(@as(usize, 0), KernelIngressTestRoutes.mutation_calls);
     try std.testing.expect(std.mem.indexOf(u8, mutation_response.body.slice(), "ha_mutation_not_replicated") != null);
 
+    // Linked dispatch starts the transaction deadline before policy work, but
+    // malformed metadata must not let an unauthenticated caller distinguish
+    // an internal route. Validation runs only after service authentication.
+    api_server.cfg.ha_failover_safe_mutations_only = false;
+    const invalid_deadline_headers = [_]abi.HeaderView{.{
+        .name = abi.Bytes.init(distributed_txn_contract.pre_decision_remaining_ms_header),
+        .value = abi.Bytes.init("5001"),
+    }};
+    var invalid_deadline_route = RouteState{
+        .owner = &state,
+        .handler = httpx.Handler.from(KernelIngressTestRoutes.mutation),
+    };
+    const invalid_deadline_request = abi.HttpRequestView{
+        .method = .post,
+        .path = abi.Bytes.init("/internal/v1/groups/7/tables/docs/txn-begin"),
+        .headers_ptr = invalid_deadline_headers[0..].ptr,
+        .headers_len = invalid_deadline_headers.len,
+        .body = abi.OptionalBytes.init("{}"),
+    };
+    var invalid_deadline_response_handle: ?*anyopaque = null;
+    var invalid_deadline_response: abi.HttpResponseView = undefined;
+    const unauthenticated_deadline_status = handlerHandleHttp(&.{
+        .abi_version = abi.abi_version,
+        .route_handle = &invalid_deadline_route,
+        .request = &invalid_deadline_request,
+        .executor = .init(&test_io),
+        .out_response_handle = &invalid_deadline_response_handle,
+        .out_response = &invalid_deadline_response,
+    });
+    try std.testing.expect(unauthenticated_deadline_status.isOk());
+    try std.testing.expectEqual(@as(u16, 401), invalid_deadline_response.status);
+    handlerDestroyHttpResponse(invalid_deadline_response_handle.?);
+
+    api_server.cfg.internal_service_accept_legacy_unauthenticated = true;
+    invalid_deadline_response_handle = null;
+    const authenticated_deadline_status = handlerHandleHttp(&.{
+        .abi_version = abi.abi_version,
+        .route_handle = &invalid_deadline_route,
+        .request = &invalid_deadline_request,
+        .executor = .init(&test_io),
+        .out_response_handle = &invalid_deadline_response_handle,
+        .out_response = &invalid_deadline_response,
+    });
+    try std.testing.expect(authenticated_deadline_status.isOk());
+    try std.testing.expectEqual(@as(u16, 400), invalid_deadline_response.status);
+    try std.testing.expectEqual(@as(usize, 0), KernelIngressTestRoutes.mutation_calls);
+    handlerDestroyHttpResponse(invalid_deadline_response_handle.?);
+    api_server.cfg.internal_service_accept_legacy_unauthenticated = false;
+
     var retry_route = RouteState{
         .owner = &state,
         .handler = httpx.Handler.from(KernelIngressTestRoutes.metadataNotLeader),
@@ -781,5 +831,5 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
         "{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata leader unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}",
         retry_response.body.slice(),
     );
-    try std.testing.expectEqual(@as(u64, 4), api_server.requestStats().request_count);
+    try std.testing.expectEqual(@as(u64, 6), api_server.requestStats().request_count);
 }
