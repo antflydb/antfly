@@ -1602,6 +1602,7 @@ pub const ProvisionedTableWriteCache = struct {
                 runtime: ?*db_mod.background_runtime.BackendRuntime,
                 antfly_provider: ?managed_embedder.AntflyProvider,
                 secret_store: ?*common_secrets.FileStore,
+                schema_json: ?[]const u8,
                 identity_namespace: ?doc_identity.Namespace,
                 ha_write_gate: ?db_mod.HAWriteGate,
                 ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
@@ -1625,6 +1626,7 @@ pub const ProvisionedTableWriteCache = struct {
                         identity_namespace,
                         .{
                             .drain_resolver_backfill = false,
+                            .schema_json_before_index_load = schema_json,
                             .inference_api_url = inference_api_url,
                             .ha_write_gate = ha_write_gate,
                             .ha_async_effect_mirror = effective_ha_mirror,
@@ -1696,6 +1698,7 @@ pub const ProvisionedTableWriteCache = struct {
                 self.backend_runtime,
                 self.antfly_provider,
                 self.secret_store,
+                metadata.schema_json,
                 identity_namespace,
                 self.ha_write_gate,
                 self.ha_async_mirror,
@@ -1750,6 +1753,7 @@ pub const ProvisionedTableWriteCache = struct {
             self.backend_runtime,
             self.antfly_provider,
             self.secret_store,
+            metadata.schema_json,
             identity_namespace,
             self.ha_write_gate,
             self.ha_async_mirror,
@@ -8480,6 +8484,7 @@ pub const ProvisionedTableWriteSource = struct {
             effective_open_options.drain_resolver_backfill = false;
             effective_open_options.source_table = table_name;
             effective_open_options.destination_authorizer = self.destination_authorizer;
+            effective_open_options.schema_json_before_index_load = prepared_open.?.schema_json;
             effective_open_options.inference_api_url = self.inference_api_url;
             effective_open_options.ha_write_gate = self.ha_write_gate;
             effective_open_options.ha_async_effect_mirror = effective_ha_mirror;
@@ -9464,6 +9469,7 @@ pub const ProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .inference_api_url = self.inference_api_url,
+                    .schema_json_before_index_load = metadata.schema_json,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
@@ -9844,6 +9850,7 @@ pub const ProvisionedTableWriteSource = struct {
                     identity_namespace,
                     .{
                         .drain_resolver_backfill = false,
+                        .schema_json_before_index_load = metadata.schema_json,
                         .inference_api_url = self.inference_api_url,
                         .ha_write_gate = self.ha_write_gate,
                         .ha_async_effect_mirror = effective_ha_mirror,
@@ -13144,6 +13151,7 @@ pub const ProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .drain_resolver_backfill = false,
+                    .schema_json_before_index_load = metadata.schema_json,
                     .inference_api_url = self.inference_api_url,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = self.ha_async_mirror,
@@ -13862,6 +13870,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .{
                     .inference_api_url = self.inference_api_url,
                     .drain_resolver_backfill = false,
+                    .schema_json_before_index_load = schema_json,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
@@ -17333,6 +17342,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .drain_resolver_backfill = false,
                     .source_table = table_name,
                     .destination_authorizer = self.destination_authorizer,
+                    .schema_json_before_index_load = prepared_open.?.schema_json,
                     .inference_api_url = cache.write_cache.inference_api_url,
                     .ha_write_gate = cache.write_cache.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
@@ -21158,6 +21168,7 @@ const ManagedDbOpenOptions = struct {
     drain_resolver_backfill: bool = true,
     source_table: []const u8 = "",
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
+    schema_json_before_index_load: ?[]const u8 = null,
     /// HA replay must reconcile catalog-driven indexes while the node remains a
     /// read-only standby. Perform that structural reconciliation in an isolated
     /// workerless open, then reopen with the live HA gate before publishing the
@@ -21379,6 +21390,14 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
+            const schema_before_index_load: ?storage_schema.TableSchema = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
+                if (schema_json.len == 0) break :blk null;
+                var parsed_schema = try tables_api.parseValidatedTableSchema(allocator, schema_json);
+                defer parsed_schema.deinit(allocator);
+                break :blk try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema);
+            } else null;
+            defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema);
+
             const base: db_mod.OpenOptions = .{
                 .lsm_cache = cache,
                 .hbc_cache = vector_cache,
@@ -21395,6 +21414,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                 .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                 .transaction_recovery = open_options.transaction_recovery,
+                .schema_before_index_load = schema_before_index_load,
             };
             return switch (open_mode) {
                 .default => if (enrichment_cfg != null)
@@ -21415,6 +21435,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
+                        .schema_before_index_load = schema_before_index_load,
                     }),
                 .default_async, .writer_no_replay => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -21433,6 +21454,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
+                        .schema_before_index_load = schema_before_index_load,
                         .open_mode = .writer_no_replay,
                         // The managed write cache opens DBs synchronously while
                         // table/index metadata can still be settling. Keep
@@ -21456,6 +21478,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
+                        .schema_before_index_load = schema_before_index_load,
                         .open_mode = .writer_no_replay,
                         .index_open_parallelism = 1,
                     }),
@@ -21470,6 +21493,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     .identity_namespace = namespace,
                     .prefer_existing_identity_namespace = namespace != null,
                     .ha_write_gate = open_options.ha_write_gate,
+                    .schema_before_index_load = schema_before_index_load,
                     .open_mode = .writer_no_replay,
                     .start_index_workers = false,
                     .enrichment = if (enrichment_cfg) |configured| blk: {
@@ -21511,6 +21535,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
                         .ha_write_gate = open_options.ha_write_gate,
+                        .schema_before_index_load = schema_before_index_load,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
                         .start_optional_runtime_workers = false,
@@ -21531,6 +21556,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .ha_write_gate = open_options.ha_write_gate,
+                        .schema_before_index_load = schema_before_index_load,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
                         .start_optional_runtimes = false,
@@ -24389,8 +24415,13 @@ fn openManagedDbForReplicatedApply(
         value
     else
         try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
-    const indexes_json = try loadTableIndexesJson(alloc, catalog, table_name);
-    defer if (indexes_json) |value| alloc.free(value);
+    const metadata = try loadTableManagedMetadata(alloc, catalog, table_name);
+    defer if (metadata) |owned| {
+        if (owned.indexes_json) |value| alloc.free(value);
+        if (owned.schema_json) |value| alloc.free(value);
+    };
+    const indexes_json = if (metadata) |owned| owned.indexes_json else null;
+    const schema_json = if (metadata) |owned| owned.schema_json else null;
     const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default_async, ha_async_mirror);
     var db = if (indexes_json) |value|
         try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
@@ -24409,6 +24440,7 @@ fn openManagedDbForReplicatedApply(
             namespace,
             .{
                 .drain_resolver_backfill = false,
+                .schema_json_before_index_load = schema_json,
                 .reconcile_for_replicated_apply = true,
                 .ha_write_gate = ha_write_gate,
                 .ha_async_effect_mirror = effective_ha_mirror,
@@ -36957,6 +36989,140 @@ test "standby HA replay reconciles managed indexes without opening the public wr
     try std.testing.expectError(error.HAReadOnlyStandby, source.source().batchGroupLocal(alloc, 7001, "docs", .{
         .writes = &.{.{ .key = "doc:forbidden", .value = "{\"body\":\"must not commit\"}" }},
     }));
+}
+
+test "cold replicated apply preserves declared full text projection across retained reopen" {
+    const alloc = std.testing.allocator;
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+    const cases = .{
+        .{
+            .name = "single-text-field",
+            .schema_json = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}",
+            .key = "doc:a",
+            .value = "{\"title\":\"alpha beta\"}",
+            .field = "title",
+            .query = "alpha",
+        },
+        .{
+            .name = "mixed-keyword-and-text",
+            .schema_json = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"slug\":{\"type\":\"keyword\"},\"body\":{\"type\":\"text\"}}}}}}",
+            .key = "doc:b",
+            .value = "{\"slug\":\"ignored\",\"body\":\"gamma delta\"}",
+            .field = "body",
+            .query = "gamma",
+        },
+        .{
+            .name = "alternate-document-type",
+            .schema_json = "{\"default_type\":\"article\",\"enforce_types\":true,\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"text\"}}}}}}",
+            .key = "article:c",
+            .value = "{\"summary\":\"epsilon zeta\"}",
+            .field = "summary",
+            .query = "epsilon",
+        },
+    };
+
+    inline for (cases) |case| {
+        const Catalog = struct {
+            const schema = case.schema_json;
+
+            fn iface() table_catalog.CatalogSource {
+                return .{
+                    .ptr = undefined,
+                    .vtable = &.{
+                        .admin_snapshot = adminSnapshot,
+                        .free_admin_snapshot = freeAdminSnapshot,
+                    },
+                };
+            }
+
+            fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                return .{
+                    .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                    .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                        .table_id = 7,
+                        .name = "docs",
+                        .placement_role = "data",
+                        .indexes_json = tables_api.default_indexes_json,
+                        .schema_json = schema,
+                    }})[0..]),
+                    .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                        .group_id = 7001,
+                        .table_id = 7,
+                        .start_key = "",
+                        .end_key = null,
+                    }})[0..]),
+                    .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                    .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                    .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                    .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                };
+            }
+
+            fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        };
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const replica_root_dir = try std.fmt.allocPrint(
+            alloc,
+            ".zig-cache/tmp/{s}/cold-replicated-apply-{s}",
+            .{ tmp.sub_path, case.name },
+        );
+        defer alloc.free(replica_root_dir);
+        const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+        defer alloc.free(db_path);
+
+        const tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+            .indexes_json = tables_api.default_indexes_json,
+            .schema_json = case.schema_json,
+        }};
+        const ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }};
+
+        {
+            var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+            defer source.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
+            source.write_cache = &write_cache;
+
+            _ = try source.applyReplicatedBatchGroupLocal(alloc, 7001, "docs", .{
+                .writes = &.{.{ .key = case.key, .value = case.value }},
+                .sync_level = .full_index,
+            });
+
+            _ = try source.reconcileReplicaRootTablesWithWriteCache(
+                alloc,
+                1,
+                &.{7001},
+                &tables,
+                &ranges,
+                null,
+            );
+        }
+
+        var reopened = try db_mod.DB.open(alloc, db_path, .{
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = true,
+            .start_index_workers = false,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.index_manager.loadFailure("full_text_index_v0") == null);
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "full_text_index_v0",
+            .full_text = .{ .match = .{ .field = case.field, .text = case.query } },
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    }
 }
 
 test "provisioned replicated sync marks local runtime status dirty" {

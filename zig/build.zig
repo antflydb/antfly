@@ -6287,6 +6287,7 @@ pub fn build(b: *std.Build) void {
             "managed startup catch-up allocation failure preserves bounded retry",
             "managed startup catch-up quarantines repeated zero progress with bounded backoff",
             "standby HA replay reconciles managed indexes without opening the public write gate",
+            "cold replicated apply preserves declared full text projection across retained reopen",
             "managed structural catch-up delegates durable generation repair without rebuilding inline",
             "managed structural catch-up leaves pending enrichment with the asynchronous owner",
             "managed structural catch-up does not delegate an empty producer handoff",
