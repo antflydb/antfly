@@ -4337,9 +4337,9 @@ test "create table raw parser merges default full text with quickstart embedding
     );
     defer parsed.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"title_body\":{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"_coverage_incarnation\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"_index_incarnation\":") != null);
 }
 
 test "create table raw parser preserves named field full text index" {

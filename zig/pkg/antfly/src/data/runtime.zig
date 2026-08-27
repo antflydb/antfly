@@ -2660,6 +2660,7 @@ const CachedSplitKey = union(enum) {
 const StoreStatusHeartbeatCache = struct {
     reporter_incarnation: u64 = 0,
     status_generation: u64 = 0,
+    artifact_sources_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     owns_health_class: bool = false,
@@ -10551,6 +10552,7 @@ pub const DataServer = struct {
             .store_id = registration.store_id,
             .node_id = registration.node_id,
             .reporter_incarnation = try self.reporterIncarnation(),
+            .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .api_url = api_url,
             .raft_url = raft_url,
             .role = registration.role,
@@ -11231,6 +11233,7 @@ pub const DataServer = struct {
             .store_id = registration.store_id,
             .reporter_incarnation = reporter_incarnation,
             .status_generation = status_generation,
+            .artifact_sources_protocol_version = antfly.metadata.table_manager.artifact_sources_protocol_version,
             .live = true,
             .health_class = "healthy",
             .capacity_bytes = capacity.capacity_bytes,
@@ -11614,6 +11617,7 @@ pub const DataServer = struct {
             .store_id = store_id,
             .reporter_incarnation = cache.reporter_incarnation,
             .status_generation = cache.status_generation,
+            .artifact_sources_protocol_version = cache.artifact_sources_protocol_version,
             .live = cache.live,
             .health_class = try self.alloc.dupe(u8, cache.health_class),
             .capacity_bytes = cache.capacity_bytes,
@@ -11643,6 +11647,7 @@ pub const DataServer = struct {
         var next: StoreStatusHeartbeatCache = .{
             .reporter_incarnation = report.reporter_incarnation,
             .status_generation = report.status_generation,
+            .artifact_sources_protocol_version = report.artifact_sources_protocol_version,
             .live = report.live,
             .health_class = health_class,
             .owns_health_class = true,
@@ -16438,6 +16443,23 @@ fn runtimeIndexStatusReportFromLocalIndex(
     errdefer alloc.free(kind);
     const load_error = if (index.load_error) |value| try alloc.dupe(u8, value) else null;
     errdefer if (load_error) |value| alloc.free(value);
+    const source_replay = try alloc.alloc(
+        antfly.metadata.table_manager.RuntimeIndexSourceReplayStatusReport,
+        index.source_replay.len,
+    );
+    var source_count: usize = 0;
+    errdefer {
+        for (source_replay[0..source_count]) |source| alloc.free(source.artifact_name);
+        if (source_replay.len > 0) alloc.free(source_replay);
+    }
+    for (index.source_replay, 0..) |source, i| {
+        source_replay[i] = .{
+            .artifact_name = try alloc.dupe(u8, source.artifact_name),
+            .published_sequence = source.published_sequence,
+            .target_sequence = source.target_sequence,
+        };
+        source_count += 1;
+    }
     return .{
         .name = name,
         .kind = kind,
@@ -16459,6 +16481,7 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_applied_sequence = index.replay_applied_sequence,
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
+        .source_replay = source_replay,
         .repair_status = index.index_repair_status,
         .repair_active_generation_serviceable = index.index_repair_active_generation_serviceable,
     };
@@ -16484,6 +16507,27 @@ test "data runtime report preserves compact managed repair admission state" {
         "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
+}
+
+test "data runtime report preserves per-source replay watermarks" {
+    const alloc = std.testing.allocator;
+    const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .source_replay = @constCast(&[_]antfly.db.types.IndexSourceReplayStatus{
+            .{
+                .artifact_name = "document_chunks_v1",
+                .published_sequence = 17,
+                .target_sequence = 19,
+            },
+        }),
+    });
+    defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
+
+    try std.testing.expectEqual(@as(usize, 1), report.source_replay.len);
+    try std.testing.expectEqualStrings("document_chunks_v1", report.source_replay[0].artifact_name);
+    try std.testing.expectEqual(@as(u64, 17), report.source_replay[0].published_sequence);
+    try std.testing.expectEqual(@as(u64, 19), report.source_replay[0].target_sequence);
 }
 
 fn progressMillis(progress: f64) u16 {

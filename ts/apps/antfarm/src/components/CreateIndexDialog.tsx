@@ -1314,10 +1314,11 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
 
   const schemaFields = getSchemaFieldNames(schema);
   const selectedIndexType = watch("indexType");
+  const describedIndexType = viewMode === "json" ? jsonPayload.type : selectedIndexType;
   const indexTypeLabel =
-    selectedIndexType === "full_text"
+    describedIndexType === "full_text"
       ? "full-text"
-      : selectedIndexType === "graph"
+      : describedIndexType === "graph"
         ? "graph"
         : "vector";
 

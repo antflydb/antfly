@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+
+pub const artifact_sources_protocol_version: u16 = 1;
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
@@ -293,6 +295,10 @@ pub const StoreRecord = struct {
     reporter_incarnation: u64 = 0,
     /// Highest status snapshot generation accepted for `reporter_incarnation`.
     status_generation: u64 = 0,
+    /// Non-zero only after this store can parse, materialize, and report the
+    /// generalized artifact-source index contract. Missing means an older or
+    /// not-yet-observed reporter and therefore fails cluster admission closed.
+    artifact_sources_protocol_version: u16 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -643,6 +649,7 @@ pub const StoreStatusReport = struct {
     reporter_incarnation: u64 = 0,
     /// Monotonic snapshot generation within `reporter_incarnation`.
     status_generation: u64 = 0,
+    artifact_sources_protocol_version: u16 = 0,
     live: bool = true,
     health_class: []const u8 = "healthy",
     capacity_bytes: u64 = 0,
@@ -660,6 +667,11 @@ pub const StoreStatusReport = struct {
 /// never exist without the process incarnation that gives it meaning.
 pub fn reporterFenceValid(reporter_incarnation: u64, status_generation: u64) bool {
     return reporter_incarnation != 0 or status_generation == 0;
+}
+
+pub fn artifactSourcesProtocolValid(reporter_incarnation: u64, protocol_version: u16) bool {
+    return protocol_version <= artifact_sources_protocol_version and
+        (protocol_version == 0 or reporter_incarnation != 0);
 }
 
 pub const RuntimeEnrichmentStatusReport = struct {
@@ -827,11 +839,18 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    source_replay: []RuntimeIndexSourceReplayStatusReport = &.{},
     repair_status: ?IndexRepairStatus = null,
     /// This proof is meaningful only while repair_status is non-null. It means
     /// the active generation is safe to query, not necessarily complete.
     /// Missing proof is deliberately false so mixed-version reports fail closed.
     repair_active_generation_serviceable: bool = false,
+};
+
+pub const RuntimeIndexSourceReplayStatusReport = struct {
+    artifact_name: []const u8 = "",
+    published_sequence: u64 = 0,
+    target_sequence: u64 = 0,
 };
 
 pub const SchemaProgressRecord = struct {
@@ -1958,6 +1977,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .node_id = record.node_id,
         .reporter_incarnation = record.reporter_incarnation,
         .status_generation = record.status_generation,
+        .artifact_sources_protocol_version = record.artifact_sources_protocol_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -2128,6 +2148,20 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
     errdefer alloc.free(kind);
     const load_error = if (record.load_error) |value| try alloc.dupe(u8, value) else null;
     errdefer if (load_error) |value| alloc.free(value);
+    const source_replay = try alloc.alloc(RuntimeIndexSourceReplayStatusReport, record.source_replay.len);
+    var source_count: usize = 0;
+    errdefer {
+        for (source_replay[0..source_count]) |source| alloc.free(source.artifact_name);
+        if (source_replay.len > 0) alloc.free(source_replay);
+    }
+    for (record.source_replay, 0..) |source, i| {
+        source_replay[i] = .{
+            .artifact_name = try alloc.dupe(u8, source.artifact_name),
+            .published_sequence = source.published_sequence,
+            .target_sequence = source.target_sequence,
+        };
+        source_count += 1;
+    }
     return .{
         .name = name,
         .kind = kind,
@@ -2149,6 +2183,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .source_replay = source_replay,
         .repair_status = record.repair_status,
         .repair_active_generation_serviceable = record.repair_active_generation_serviceable,
     };
@@ -2158,6 +2193,8 @@ pub fn freeRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeInd
     alloc.free(record.name);
     alloc.free(record.kind);
     if (record.load_error) |value| alloc.free(value);
+    for (record.source_replay) |source| alloc.free(source.artifact_name);
+    if (record.source_replay.len > 0) alloc.free(record.source_replay);
 }
 
 pub fn cloneRuntimeIndexStatusReports(alloc: std.mem.Allocator, records: []const RuntimeIndexStatusReport) ![]RuntimeIndexStatusReport {

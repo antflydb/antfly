@@ -1902,7 +1902,7 @@ components:
       properties:
         artifact_sources:
           type: boolean
-          description: Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments.
+          description: Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments and during distributed rolling upgrades until every live data store reports protocol support.
     ClusterStatus:
       type: object
       required:

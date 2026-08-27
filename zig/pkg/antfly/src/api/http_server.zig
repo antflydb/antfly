@@ -2256,15 +2256,45 @@ pub const ApiHttpServer = struct {
         return storageRuntimeStatus(maintenance.status());
     }
 
-    /// Transport-neutral status operation shared by direct callers and every
-    /// HTTP adapter. Ownership of nested allocations follows `alloc`.
-    pub fn loadClusterStatus(self: *ApiHttpServer, alloc: std.mem.Allocator) !cluster.ClusterStatus {
+    fn artifactSourcesSupportedByStores(stores: []const metadata_table_manager.StoreRecord) bool {
+        var saw_live_data_store = false;
+        for (stores) |store| {
+            if (!store.live or !std.mem.eql(u8, store.role, "data")) continue;
+            saw_live_data_store = true;
+            if (!metadata_table_manager.artifactSourcesProtocolValid(
+                store.reporter_incarnation,
+                store.artifact_sources_protocol_version,
+            )) return false;
+        }
+        return saw_live_data_store;
+    }
+
+    fn artifactSourcesSupportedBySnapshot(snapshot: *const metadata_api.AdminSnapshot) bool {
+        return artifactSourcesSupportedByStores(snapshot.stores);
+    }
+
+    fn artifactSourcesSupported(
+        self: *const ApiHttpServer,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+    ) bool {
+        return switch (self.cfg.deployment_mode) {
+            .serverless => false,
+            .distributed => if (snapshot) |value| artifactSourcesSupportedBySnapshot(value) else false,
+            else => true,
+        };
+    }
+
+    fn loadClusterStatusWithSnapshot(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        snapshot: ?*const metadata_api.AdminSnapshot,
+    ) !cluster.ClusterStatus {
         const metadata_status = try self.source.status();
         var status = try cluster.fromMetadataStatus(alloc, metadata_status);
         errdefer status.deinit(alloc);
         status.auth_enabled = self.cfg.auth_enabled;
         status.deployment_mode = self.cfg.deployment_mode;
-        status.index_capabilities.artifact_sources = self.cfg.deployment_mode != .serverless;
+        status.index_capabilities.artifact_sources = self.artifactSourcesSupported(snapshot);
         status.storage = self.currentStorageRuntimeStatus();
         if (self.cfg.secret_store) |secret_store| {
             _ = secret_store.refreshIfChanged() catch |err| {
@@ -2278,18 +2308,35 @@ pub const ApiHttpServer = struct {
         return status;
     }
 
+    /// Transport-neutral status operation shared by direct callers and every
+    /// HTTP adapter. Ownership of nested allocations follows `alloc`.
+    pub fn loadClusterStatus(self: *ApiHttpServer, alloc: std.mem.Allocator) !cluster.ClusterStatus {
+        if (self.cfg.deployment_mode != .distributed) {
+            return self.loadClusterStatusWithSnapshot(alloc, null);
+        }
+        var snapshot_opt = self.source.cachedAdminSnapshot() catch null;
+        if (snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
+        if (snapshot_opt) |*snapshot| {
+            defer self.source.freeAdminSnapshot(snapshot);
+            return self.loadClusterStatusWithSnapshot(alloc, snapshot);
+        }
+        return self.loadClusterStatusWithSnapshot(alloc, null);
+    }
+
     /// Transport-neutral topology operation. It composes the shared status
     /// operation with the best available metadata snapshot and returns one
     /// typed result instead of serialized HTTP bytes.
     pub fn loadClusterTopology(self: *ApiHttpServer, alloc: std.mem.Allocator) !cluster.ClusterTopology {
-        var status = try self.loadClusterStatus(alloc);
-        defer status.deinit(alloc);
         var snapshot_opt = try self.source.cachedAdminSnapshot();
         if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
         if (snapshot_opt) |*snapshot| {
             defer self.source.freeAdminSnapshot(snapshot);
+            var status = try self.loadClusterStatusWithSnapshot(alloc, snapshot);
+            defer status.deinit(alloc);
             return try cluster.topologyFromStatusAndSnapshot(alloc, status, snapshot);
         }
+        var status = try self.loadClusterStatusWithSnapshot(alloc, null);
+        defer status.deinit(alloc);
         return try cluster.topologyFromStatus(alloc, status);
     }
 
@@ -3370,8 +3417,8 @@ pub const ApiHttpServer = struct {
             if (!std.mem.eql(u8, index.name, target.name)) continue;
             const identity = target.identity orelse return 2;
             return if (index.coverage_identity_ready and
-                index.coverage_generation == identity.coverage_generation and
-                index.coverage_config_hash == identity.coverage_config_hash)
+                index.coverage_generation == identity.incarnation and
+                index.coverage_config_hash == identity.config_hash)
                 2
             else
                 1;
@@ -3662,6 +3709,8 @@ pub const ApiHttpServer = struct {
             for (indexes[0..initialized]) |item| {
                 alloc.free(item.name);
                 if (item.load_error) |value| alloc.free(value);
+                for (item.source_replay) |source| alloc.free(source.artifact_name);
+                if (item.source_replay.len > 0) alloc.free(item.source_replay);
             }
             if (indexes.len > 0) alloc.free(indexes);
         }
@@ -3672,6 +3721,20 @@ pub const ApiHttpServer = struct {
             errdefer alloc.free(name);
             const load_error = if (index.load_error) |value| try alloc.dupe(u8, value) else null;
             errdefer if (load_error) |value| alloc.free(value);
+            const source_replay = try alloc.alloc(db_mod.types.IndexSourceReplayStatus, index.source_replay.len);
+            var source_count: usize = 0;
+            errdefer {
+                for (source_replay[0..source_count]) |source| alloc.free(source.artifact_name);
+                if (source_replay.len > 0) alloc.free(source_replay);
+            }
+            for (index.source_replay, 0..) |source, source_i| {
+                source_replay[source_i] = .{
+                    .artifact_name = try alloc.dupe(u8, source.artifact_name),
+                    .published_sequence = source.published_sequence,
+                    .target_sequence = source.target_sequence,
+                };
+                source_count += 1;
+            }
             indexes[i] = .{
                 .name = name,
                 .kind = kind,
@@ -3693,6 +3756,7 @@ pub const ApiHttpServer = struct {
                 .replay_applied_sequence = index.replay_applied_sequence,
                 .replay_target_sequence = index.replay_target_sequence,
                 .replay_catch_up_required = index.replay_catch_up_required,
+                .source_replay = source_replay,
                 .index_repair_status = index.repair_status,
                 .index_repair_active_generation_serviceable = index.repair_active_generation_serviceable,
                 .catch_up_active = dense_catch_up_active,
@@ -10201,6 +10265,26 @@ pub const ApiHttpServer = struct {
             },
         };
 
+        const uses_artifact_sources = indexes_api.indexConfigUsesArtifactSources(alloc, normalized_index_json) catch
+            return error.InvalidIndexRequest;
+        if (uses_artifact_sources) {
+            if (self.cfg.deployment_mode == .serverless) return error.UnsupportedArtifactIndexSources;
+            if (self.cfg.deployment_mode == .distributed) {
+                var capability_snapshot = self.source.linearizableSnapshot(request) catch |err| switch (err) {
+                    error.Canceled => return error.Canceled,
+                    error.DeadlineExceeded => return error.DeadlineExceeded,
+                    else => return error.ArtifactIndexSourcesTemporarilyUnavailable,
+                };
+                if (capability_snapshot) |*snapshot| {
+                    defer self.source.freeAdminSnapshot(snapshot);
+                    if (!self.artifactSourcesSupported(snapshot))
+                        return error.ArtifactIndexSourcesTemporarilyUnavailable;
+                } else {
+                    return error.ArtifactIndexSourcesTemporarilyUnavailable;
+                }
+            }
+        }
+
         const destination_principal = if (request.destination_authorization_principal.len > 0)
             request.destination_authorization_principal
         else
@@ -14861,6 +14945,35 @@ fn cloneContextualResponse(alloc: std.mem.Allocator, response: contextual_operat
         .public_cors = response.public_cors,
         .headers = headers,
     };
+}
+
+test "artifact source capability waits for every live data store reporter" {
+    var stores = [_]metadata_table_manager.StoreRecord{
+        .{
+            .store_id = 1,
+            .node_id = 1,
+            .reporter_incarnation = 11,
+            .artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version,
+        },
+        .{
+            .store_id = 2,
+            .node_id = 2,
+            .reporter_incarnation = 22,
+        },
+        .{
+            .store_id = 3,
+            .node_id = 3,
+            .role = "metadata",
+        },
+    };
+    try std.testing.expect(!ApiHttpServer.artifactSourcesSupportedByStores(&stores));
+
+    stores[1].artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version;
+    try std.testing.expect(ApiHttpServer.artifactSourcesSupportedByStores(&stores));
+
+    stores[1].live = false;
+    stores[0].artifact_sources_protocol_version = 0;
+    try std.testing.expect(!ApiHttpServer.artifactSourcesSupportedByStores(&stores));
 }
 
 fn contextualResponseFromPublicTable(
@@ -33398,11 +33511,11 @@ test "api index status refreshes writer when read snapshot omits requested index
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(current_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 42, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 42, .config_hash = 99 },
     }));
 
     const unrelated_incomplete_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
@@ -33418,7 +33531,7 @@ test "api index status refreshes writer when read snapshot omits requested index
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(unrelated_incomplete_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 
     var incomplete_index = current;
@@ -33438,14 +33551,14 @@ test "api index status refreshes writer when read snapshot omits requested index
     }};
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(incomplete_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 
     var retained_live_incomplete = incomplete_statuses[0];
     retained_live_incomplete.metadata.source = .live_writer_publish;
     try std.testing.expect(ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(&.{retained_live_incomplete}, .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 
     var terminal_index = incomplete_index;
@@ -33463,7 +33576,7 @@ test "api index status refreshes writer when read snapshot omits requested index
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 
     var terminal_phase_index = incomplete_index;
@@ -33480,7 +33593,7 @@ test "api index status refreshes writer when read snapshot omits requested index
     }};
     try std.testing.expect(!ApiHttpServer.runtimeStatusesNeedWriterRefreshForIndex(terminal_phase_statuses[0..], .{
         .name = "older_idx",
-        .identity = .{ .coverage_generation = 41, .coverage_config_hash = 99 },
+        .identity = .{ .incarnation = 41, .config_hash = 99 },
     }));
 }
 
@@ -33607,7 +33720,7 @@ test "api index status prefers current same-name incarnation from write source" 
             defer parsed.deinit();
             const identity = (try indexes_api.indexRuntimeIdentity(inner_alloc, "vec", parsed.value)) orelse
                 return error.TestUnexpectedResult;
-            var statuses = try StatusFactory.make(inner_alloc, identity.coverage_generation, identity.coverage_config_hash, .cached_snapshot, .fresh, 7);
+            var statuses = try StatusFactory.make(inner_alloc, identity.incarnation, identity.config_hash, .cached_snapshot, .fresh, 7);
             statuses.items[0].stats.repair_summary_ready = false;
             statuses.items[0].stats.repair_degraded = true;
             statuses.items[0].stats.indexes[0].repair_summary_ready = false;
@@ -33648,7 +33761,7 @@ test "api index status prefers current same-name incarnation from write source" 
                 return error.TestUnexpectedResult;
             // The current writer may legitimately be catching up. Its matching
             // incarnation must still beat a fresh retained read snapshot.
-            return try StatusFactory.make(inner_alloc, identity.coverage_generation, identity.coverage_config_hash, .live_writer_publish, .catching_up, 11);
+            return try StatusFactory.make(inner_alloc, identity.incarnation, identity.config_hash, .live_writer_publish, .catching_up, 11);
         }
     };
 

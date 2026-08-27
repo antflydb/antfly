@@ -712,14 +712,6 @@ components:
         incarnation:
           type: string
           description: "Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents."
-        target_revision:
-          type: integer
-          format: uint64
-          description: "Highest captured source/replay revision required by this readiness observation."
-        published_revision:
-          type: integer
-          format: uint64
-          description: "Highest revision published to the query-visible index represented by this observation."
         pending_reasons:
           type: array
           items:
@@ -737,8 +729,6 @@ components:
         - artifact
         - state
         - complete
-        - target_revision
-        - published_revision
         - pending_reasons
       properties:
         artifact:
@@ -753,14 +743,6 @@ components:
         complete:
           type: boolean
           description: "Whether this source is published through its captured target revision on every expected shard."
-        target_revision:
-          type: integer
-          format: uint64
-          description: "Highest committed revision captured for this artifact stream."
-        published_revision:
-          type: integer
-          format: uint64
-          description: "Highest revision the query-visible index has durably processed for this artifact stream."
         pending_reasons:
           type: array
           items:

@@ -31,6 +31,7 @@ const chunking_api_openapi = @import("antfly_chunking_api_openapi");
 const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 const public_index_contract = @import("public_index_contract.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
+const table_index_config = @import("table_index_config.zig");
 
 pub fn parseCreateIndexRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
     if (body.len == 0) return error.InvalidCreateIndexRequest;
@@ -738,22 +739,26 @@ pub fn encodeSingleIndex(
 }
 
 pub const IndexRuntimeIdentity = struct {
-    coverage_generation: u64,
-    coverage_config_hash: u64,
+    incarnation: u64,
+    config_hash: u64,
 };
 
-/// Returns the runtime identity carried by an incarnation-scoped index.
-/// Non-embedding indexes have no catalog incarnation and therefore use the
-/// existing name-scoped status selection.
+/// Returns the durable identity for the desired index incarnation. New catalog
+/// mutations persist a random identity for every index kind; v0.2 metadata that
+/// predates the generalized field uses the same deterministic config-derived
+/// fallback as the storage parser.
 pub fn indexRuntimeIdentity(
     alloc: std.mem.Allocator,
     index_name: []const u8,
     config: std.json.Value,
 ) !?IndexRuntimeIdentity {
-    const coverage_generation = coverage_policy_mod.incarnation(config) orelse return null;
+    const storage_config = try table_index_config.extractIndexConfigJson(alloc, index_name, config);
+    defer alloc.free(storage_config);
+    const incarnation = coverage_policy_mod.incarnation(config) orelse
+        internal_keys.derivedCoverageGeneration(storage_config);
     return .{
-        .coverage_generation = coverage_generation,
-        .coverage_config_hash = try expectedCoverageConfigHash(alloc, index_name, config),
+        .incarnation = incarnation,
+        .config_hash = try internal_keys.derivedCoverageConfigFingerprint(alloc, storage_config),
     };
 }
 
@@ -1076,8 +1081,8 @@ fn appendIndexStatusWithIdentity(
         embeddingsIsSparse(config)
     else
         false;
-    const coverage_generation = if (runtime_identity) |identity| identity.coverage_generation else 0;
-    const coverage_config_hash = if (runtime_identity) |identity| identity.coverage_config_hash else 0;
+    const coverage_generation = if (runtime_identity) |identity| identity.incarnation else 0;
+    const coverage_config_hash = if (runtime_identity) |identity| identity.config_hash else 0;
     var source_name_buffer: [64][]const u8 = undefined;
     const configured_sources = configuredArtifactSourceNames(config, index_type, &source_name_buffer);
     try out.appendSlice(alloc, "{\"config\":");
@@ -1120,6 +1125,35 @@ fn configuredArtifactSourceNames(config: std.json.Value, index_type: ApiIndexTyp
         }
     }
     return &.{};
+}
+
+/// Returns whether a validated public index configuration consumes an artifact
+/// stream. Admission uses this syntax-only check before the catalog mutation;
+/// producer resolution and semantic validation remain authoritative elsewhere.
+pub fn indexConfigUsesArtifactSources(alloc: std.mem.Allocator, config_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCreateIndexRequest;
+    const object = parsed.value.object;
+    const type_value = object.get("type") orelse return error.InvalidCreateIndexRequest;
+    if (type_value != .string) return error.InvalidCreateIndexRequest;
+
+    if (object.get("sources") != null) return true;
+    if (std.mem.eql(u8, type_value.string, "full_text")) return object.get("artifact_name") != null;
+    if (std.mem.eql(u8, type_value.string, "embeddings")) return object.get("embedding_name") != null;
+    if (std.mem.eql(u8, type_value.string, "graph")) return object.get("source") != null;
+    return false;
+}
+
+test "artifact source admission recognizes canonical and v0.2 request forms" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try indexConfigUsesArtifactSources(alloc, "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks\"}]}"));
+    try std.testing.expect(try indexConfigUsesArtifactSources(alloc, "{\"type\":\"full_text\",\"artifact_name\":\"chunks\"}"));
+    try std.testing.expect(try indexConfigUsesArtifactSources(alloc, "{\"type\":\"embeddings\",\"embedding_name\":\"chunk_vectors\"}"));
+    try std.testing.expect(try indexConfigUsesArtifactSources(alloc, "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations\"}}"));
+    try std.testing.expect(!try indexConfigUsesArtifactSources(alloc, "{\"type\":\"full_text\",\"field\":\"body\"}"));
+    try std.testing.expect(!try indexConfigUsesArtifactSources(alloc, "{\"type\":\"embeddings\",\"field\":\"body\"}"));
+    try std.testing.expect(!try indexConfigUsesArtifactSources(alloc, "{\"type\":\"graph\",\"edge_types\":[]}"));
 }
 
 fn appendIndexConfig(
@@ -1209,7 +1243,8 @@ fn appendPublicIndexConfig(
     var it = config.object.iterator();
     while (it.next()) |entry| {
         if (std.mem.eql(u8, entry.key_ptr.*, "name") or
-            std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.incarnation_field)) continue;
+            std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.incarnation_field) or
+            std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.legacy_coverage_incarnation_field)) continue;
         if (single_full_text_artifact != null and std.mem.eql(u8, entry.key_ptr.*, "artifact_name")) continue;
         if (single_graph_source != null and std.mem.eql(u8, entry.key_ptr.*, "source")) continue;
         if (index_type == .graph and std.mem.eql(u8, entry.key_ptr.*, "artifact") and
@@ -1575,7 +1610,7 @@ fn canonicalIndexConfigJson(
 const EmbeddingsCoveragePolicy = coverage_policy_mod.Policy;
 
 fn expectedCoverageConfigHash(alloc: std.mem.Allocator, index_name: []const u8, config: std.json.Value) !u64 {
-    const stored = try managed_embedder.translateEmbeddingsIndexConfigJson(alloc, index_name, config);
+    const stored = try table_index_config.extractIndexConfigJson(alloc, index_name, config);
     defer alloc.free(stored);
     return try internal_keys.derivedCoverageConfigFingerprint(alloc, stored);
 }
@@ -1828,7 +1863,7 @@ fn appendMinimalIndexRuntimeStatus(
 ) !void {
     try out.appendSlice(alloc, "{\"index_type\":");
     try appendJsonString(alloc, out, indexTypeName(index_type));
-    try out.appendSlice(alloc, ",\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"target_revision\":0,\"published_revision\":0,\"pending_reasons\":[\"runtime_unavailable\"]");
+    try out.appendSlice(alloc, ",\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"runtime_unavailable\"]");
     try appendConfiguredSourceReadinessStatuses(alloc, out, configured_sources, false, false, false);
     try out.appendSlice(alloc, "}}");
 }
@@ -2049,18 +2084,10 @@ fn canonicalizeConfiguredSourceReplay(aggregate: *AggregatedIndexStatus, configu
         ordered[ordered_count] = status;
         ordered_count += 1;
     }
-    for (aggregate.source_replay[0..aggregate.source_replay_count]) |existing| {
-        var present = false;
-        for (ordered[0..ordered_count]) |candidate| {
-            if (std.mem.eql(u8, candidate.artifact_name, existing.artifact_name)) {
-                present = true;
-                break;
-            }
-        }
-        if (present or ordered_count == ordered.len) continue;
-        ordered[ordered_count] = existing;
-        ordered_count += 1;
-    }
+    // Runtime observations from a replaced configuration are useful to
+    // internal diagnostics, but the public readiness contract contains exactly
+    // the configured sources in configuration order. Never append stale or
+    // unexpected source identities here.
     aggregate.source_replay = ordered;
     aggregate.source_replay_count = ordered_count;
 }
@@ -3087,7 +3114,7 @@ test "progressive embeddings readiness exposes a queryable partial generation" {
     );
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"incarnation\":\"g-000000000000002a\",\"target_revision\":7,\"published_revision\":7},\"coverage\":{\"source_total\":2,\"covered\":1,\"complete\":false}}",
+        "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"incarnation\":\"g-000000000000002a\"},\"coverage\":{\"source_total\":2,\"covered\":1,\"complete\":false}}",
         encoded.items,
     );
 }
@@ -4342,8 +4369,8 @@ fn appendIndexReadinessStatus(
         item.expected_group_count == item.fresh_group_count
     else
         true;
-    const incarnation_current = index_type != .embeddings or
-        (coverage_generation != 0 and coverageIdentityMatches(item, coverage_generation, coverage_config_hash));
+    const incarnation_current = coverage_generation != 0 and
+        coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
     const repair_failed = if (repair_state) |state|
         std.mem.eql(u8, state, "paused") or std.mem.eql(u8, state, "failed")
     else
@@ -4353,12 +4380,22 @@ fn appendIndexReadinessStatus(
         replay_target_sequence > replay_applied_sequence;
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
         (!incarnation_current or backfill_active);
-    const pending = !failed and (!observation_fresh or !topology_complete or !incarnation_current or
+    const sources_complete = if (@hasField(Item, "source_replay")) blk: {
+        const sources = if (@hasField(Item, "source_replay_count"))
+            item.source_replay[0..item.source_replay_count]
+        else
+            item.source_replay;
+        break :blk indexSourcesComplete(sources, observation_fresh, topology_complete, expected_source_observations);
+    } else true;
+    const pending = !failed and (!observation_fresh or !topology_complete or !incarnation_current or !sources_complete or
         backfill_active or repair_state != null or replay_catch_up_required or catch_up_active or
         publication_pending or coverage_pending);
-    const published_generation_has_results = index_type == .embeddings and repair_state == null and
-        if (@hasField(Item, "doc_count")) item.doc_count > 0 else false;
-    const queryable_partial = !failed and pending and index_type == .embeddings and
+    const published_generation_has_results = repair_state == null and
+        ((if (@hasField(Item, "doc_count")) item.doc_count > 0 else false) or
+            (if (@hasField(Item, "term_count")) item.term_count > 0 else false) or
+            (if (@hasField(Item, "edge_count")) item.edge_count > 0 else false) or
+            (if (@hasField(Item, "node_count")) item.node_count > 0 else false));
+    const queryable_partial = !failed and pending and
         (active_generation_serviceable or published_generation_has_results) and
         observation_fresh and topology_complete and incarnation_current;
     const readiness_state = if (failed)
@@ -4376,16 +4413,12 @@ fn appendIndexReadinessStatus(
     try out.appendSlice(alloc, if (queryable_partial or !pending and !failed) "true" else "false");
     try out.appendSlice(alloc, ",\"complete\":");
     try out.appendSlice(alloc, if (!pending and !failed) "true" else "false");
-    if (index_type == .embeddings and coverage_generation != 0) {
+    if (coverage_generation != 0) {
         const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
         defer alloc.free(incarnation);
         try out.appendSlice(alloc, ",\"incarnation\":");
         try appendJsonString(alloc, out, incarnation);
     }
-    try out.appendSlice(alloc, ",\"target_revision\":");
-    try appendIntValue(alloc, out, replay_target_sequence);
-    try out.appendSlice(alloc, ",\"published_revision\":");
-    try appendIntValue(alloc, out, replay_applied_sequence);
     try out.appendSlice(alloc, ",\"pending_reasons\":[");
     var emitted = false;
     const appendReason = struct {
@@ -4403,6 +4436,7 @@ fn appendIndexReadinessStatus(
     if (!observation_fresh) try appendReason(alloc, out, "runtime_unavailable", &emitted);
     if (!topology_complete) try appendReason(alloc, out, "shard_observation_incomplete", &emitted);
     if (!incarnation_current) try appendReason(alloc, out, "incarnation_pending", &emitted);
+    if (!sources_complete) try appendReason(alloc, out, "source_publication", &emitted);
     if (repair_state != null) try appendReason(alloc, out, "repair", &emitted);
     if (backfill_active) try appendReason(alloc, out, "backfill", &emitted);
     if (coverage_pending) try appendReason(alloc, out, "coverage", &emitted);
@@ -4435,6 +4469,20 @@ fn appendIndexReadinessStatus(
     try out.append(alloc, '}');
 }
 
+fn indexSourcesComplete(
+    sources: []const db_mod.types.IndexSourceReplayStatus,
+    observation_fresh: bool,
+    topology_complete: bool,
+    expected_observation_count: u64,
+) bool {
+    if (!observation_fresh or !topology_complete) return false;
+    for (sources) |source| {
+        if (source.observation_count < expected_observation_count or
+            source.published_sequence < source.target_sequence) return false;
+    }
+    return true;
+}
+
 fn appendIndexSourceReadinessStatuses(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -4458,10 +4506,6 @@ fn appendIndexSourceReadinessStatuses(
         try appendJsonString(alloc, out, state);
         try out.appendSlice(alloc, ",\"complete\":");
         try out.appendSlice(alloc, if (!index_failed and !pending) "true" else "false");
-        try out.appendSlice(alloc, ",\"target_revision\":");
-        try appendIntValue(alloc, out, source.target_sequence);
-        try out.appendSlice(alloc, ",\"published_revision\":");
-        try appendIntValue(alloc, out, source.published_sequence);
         try out.appendSlice(alloc, ",\"pending_reasons\":[");
         var emitted = false;
         if (index_failed) {
@@ -4515,7 +4559,7 @@ test "source readiness distinguishes lagging artifact streams" {
     };
     try appendIndexSourceReadinessStatuses(std.testing.allocator, &out, &sources, true, true, false, 1);
     try std.testing.expectEqualStrings(
-        ",\"sources\":[{\"artifact\":\"document_vectors\",\"state\":\"ready\",\"complete\":true,\"target_revision\":41,\"published_revision\":41,\"pending_reasons\":[]},{\"artifact\":\"chunk_vectors\",\"state\":\"pending\",\"complete\":false,\"target_revision\":52,\"published_revision\":41,\"pending_reasons\":[\"publication\"]}]",
+        ",\"sources\":[{\"artifact\":\"document_vectors\",\"state\":\"ready\",\"complete\":true,\"pending_reasons\":[]},{\"artifact\":\"chunk_vectors\",\"state\":\"pending\",\"complete\":false,\"pending_reasons\":[\"publication\"]}]",
         out.items,
     );
 }
@@ -6982,6 +7026,10 @@ test "embeddings index status reports dense catch-up phase separately from publi
 }
 
 test "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible" {
+    const config_json = "{\"type\":\"embeddings\",\"dimension\":512,\"external\":true}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(std.testing.allocator, "dense_idx", parsed_config.value)).?;
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -6990,6 +7038,9 @@ test "embeddings index status ignores inactive stale catch-up progress once dens
         .doc_count = 217_500,
         .node_count = 3_300,
         .root_node = 1,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 325,
         .replay_target_sequence = 325,
         .replay_catch_up_required = false,

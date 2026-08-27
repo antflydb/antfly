@@ -22903,7 +22903,6 @@ pub const DB = struct {
     }
 
     fn initializeDerivedCoverageIdentity(cfg: types.IndexConfig, item: *types.DBIndexStats) void {
-        if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return;
         item.coverage_generation = internal_keys.derivedCoverageGenerationForConfig(cfg.coverage_generation, cfg.config_json);
         if (cfg.coverage_config_fingerprint) |fingerprint| {
             item.coverage_config_hash = fingerprint;
@@ -22919,7 +22918,7 @@ pub const DB = struct {
     fn hydrateDerivedCoverageIdentities(self: *DB, alloc: Allocator, items: []types.DBIndexStats) !void {
         var needs_hydration = false;
         for (items) |item| {
-            if ((item.kind == .dense_vector or item.kind == .sparse_vector) and !item.coverage_identity_ready) {
+            if (!item.coverage_identity_ready) {
                 needs_hydration = true;
                 break;
             }
@@ -22929,7 +22928,6 @@ pub const DB = struct {
         var identities = try self.core.index_manager.coverageIdentityMapAlloc(alloc);
         defer identities.deinit(alloc);
         for (items) |*item| {
-            if (item.kind != .dense_vector and item.kind != .sparse_vector) continue;
             const identity = identities.get(item.name) orelse {
                 markMissingDerivedCoverageIdentity(item);
                 continue;
@@ -22950,7 +22948,7 @@ pub const DB = struct {
 
     fn markMissingDerivedCoverageIdentities(items: []types.DBIndexStats) void {
         for (items) |*item| {
-            if (item.kind == .dense_vector or item.kind == .sparse_vector) markMissingDerivedCoverageIdentity(item);
+            markMissingDerivedCoverageIdentity(item);
         }
     }
 

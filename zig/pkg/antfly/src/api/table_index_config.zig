@@ -20,6 +20,7 @@ const algebraic = @import("../storage/db/algebraic/mod.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const coverage_policy_mod = @import("coverage_policy.zig");
 const index_manager = @import("../storage/db/catalog/index_manager.zig");
+const internal_keys = @import("../storage/internal_keys.zig");
 
 pub fn parseIndexKind(value: std.json.Value) !db_types.IndexKind {
     if (value != .object) return .full_text;
@@ -53,11 +54,15 @@ pub fn parseIndexConfigWithOptions(
     const kind = try parseIndexKind(parsed.value);
     const config_json = try extractIndexConfigJsonWithOptions(alloc, index_name, parsed.value, options);
     errdefer alloc.free(config_json);
+    const configured_incarnation = coverage_policy_mod.incarnation(parsed.value);
     return .{
         .name = try alloc.dupe(u8, index_name),
         .kind = kind,
         .config_json = config_json,
-        .coverage_generation = coverage_policy_mod.incarnation(parsed.value) orelse 0,
+        // v0.2 configs may predate the private catalog incarnation. Derive a
+        // deterministic cross-shard fallback so rolling upgrades fence stale
+        // same-name observations without assigning unrelated local generations.
+        .coverage_generation = configured_incarnation orelse internal_keys.derivedCoverageGeneration(config_json),
     };
 }
 
@@ -144,7 +149,9 @@ pub fn extractIndexConfigJsonWithOptions(
             std.mem.eql(u8, entry.key_ptr.*, "name") or
             std.mem.eql(u8, entry.key_ptr.*, "description") or
             std.mem.eql(u8, entry.key_ptr.*, "validation") or
-            std.mem.eql(u8, entry.key_ptr.*, "enrichments"))
+            std.mem.eql(u8, entry.key_ptr.*, "enrichments") or
+            std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.incarnation_field) or
+            std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.legacy_coverage_incarnation_field))
         {
             continue;
         }

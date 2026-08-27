@@ -2304,8 +2304,15 @@ const ParsedRuntimeIndexStatus = struct {
     replay_applied_sequence: ?u64 = null,
     replay_target_sequence: ?u64 = null,
     replay_catch_up_required: ?bool = null,
+    source_replay: ?[]ParsedRuntimeIndexSourceReplayStatus = null,
     repair_status: ?metadata_table_manager.IndexRepairStatus = null,
     repair_active_generation_serviceable: ?bool = null,
+};
+
+const ParsedRuntimeIndexSourceReplayStatus = struct {
+    artifact_name: ?[]const u8 = null,
+    published_sequence: ?u64 = null,
+    target_sequence: ?u64 = null,
 };
 
 const ParsedRuntimeGroupStatus = struct {
@@ -2341,6 +2348,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         node_id: u64,
         reporter_incarnation: ?u64 = null,
         status_generation: ?u64 = null,
+        artifact_sources_protocol_version: ?u16 = null,
         api_url: ?[]const u8 = null,
         raft_url: ?[]const u8 = null,
         role: ?[]const u8 = null,
@@ -2366,6 +2374,10 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.status_generation orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.artifactSourcesProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.artifact_sources_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -2375,6 +2387,7 @@ fn parseStoreRecord(alloc: std.mem.Allocator, body: []const u8) !metadata_table_
         .node_id = parsed.value.node_id,
         .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
         .status_generation = parsed.value.status_generation orelse 0,
+        .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
         .api_url = try alloc.dupe(u8, parsed.value.api_url orelse ""),
         .raft_url = try alloc.dupe(u8, parsed.value.raft_url orelse ""),
         .role = try alloc.dupe(u8, parsed.value.role orelse "data"),
@@ -2466,6 +2479,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         store_id: ?u64 = null,
         reporter_incarnation: ?u64 = null,
         status_generation: ?u64 = null,
+        artifact_sources_protocol_version: ?u16 = null,
         live: ?bool = null,
         health_class: ?[]const u8 = null,
         capacity_bytes: ?u64 = null,
@@ -2485,6 +2499,10 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         parsed.value.reporter_incarnation orelse 0,
         parsed.value.status_generation orelse 0,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.artifactSourcesProtocolValid(
+        parsed.value.reporter_incarnation orelse 0,
+        parsed.value.artifact_sources_protocol_version orelse 0,
+    )) return error.InvalidStoreReporterFence;
     const group_statuses = try cloneParsedGroupStatuses(alloc, parsed.value.group_statuses orelse &.{});
     errdefer metadata_table_manager.freeGroupStatuses(alloc, group_statuses);
     const runtime_statuses = try cloneParsedRuntimeGroupStatuses(alloc, parsed.value.runtime_statuses orelse &.{});
@@ -2495,6 +2513,7 @@ fn parseStoreStatusReportWithDefaultStoreID(alloc: std.mem.Allocator, body: []co
         .store_id = store_id,
         .reporter_incarnation = parsed.value.reporter_incarnation orelse 0,
         .status_generation = parsed.value.status_generation orelse 0,
+        .artifact_sources_protocol_version = parsed.value.artifact_sources_protocol_version orelse 0,
         .live = parsed.value.live orelse true,
         .health_class = try alloc.dupe(u8, parsed.value.health_class orelse "healthy"),
         .capacity_bytes = parsed.value.capacity_bytes orelse 0,
@@ -2637,6 +2656,23 @@ fn cloneParsedRuntimeIndexStatus(
     errdefer alloc.free(kind);
     const load_error = if (parsed.load_error) |value| try alloc.dupe(u8, value) else null;
     errdefer if (load_error) |value| alloc.free(value);
+    const parsed_sources = parsed.source_replay orelse &.{};
+    const source_replay = try alloc.alloc(metadata_table_manager.RuntimeIndexSourceReplayStatusReport, parsed_sources.len);
+    var source_count: usize = 0;
+    errdefer {
+        for (source_replay[0..source_count]) |source| alloc.free(source.artifact_name);
+        if (source_replay.len > 0) alloc.free(source_replay);
+    }
+    for (parsed_sources, 0..) |source, i| {
+        const artifact_name = source.artifact_name orelse return error.InvalidRuntimeStatus;
+        if (artifact_name.len == 0) return error.InvalidRuntimeStatus;
+        source_replay[i] = .{
+            .artifact_name = try alloc.dupe(u8, artifact_name),
+            .published_sequence = source.published_sequence orelse 0,
+            .target_sequence = source.target_sequence orelse 0,
+        };
+        source_count += 1;
+    }
     return .{
         .name = name,
         .kind = kind,
@@ -2658,6 +2694,7 @@ fn cloneParsedRuntimeIndexStatus(
         .replay_applied_sequence = parsed.replay_applied_sequence orelse 0,
         .replay_target_sequence = parsed.replay_target_sequence orelse 0,
         .replay_catch_up_required = parsed.replay_catch_up_required orelse false,
+        .source_replay = source_replay,
         .repair_status = parsed.repair_status,
         .repair_active_generation_serviceable = parsed.repair_status != null and
             (parsed.repair_active_generation_serviceable orelse false),

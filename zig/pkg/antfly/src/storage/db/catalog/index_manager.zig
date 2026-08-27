@@ -8941,7 +8941,6 @@ pub const IndexManager = struct {
 
     pub fn coverageGenerationForIndex(self: *const IndexManager, index_name: []const u8) ?u64 {
         const cfg = self.get(index_name) orelse return null;
-        if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return null;
         return coverageGenerationForConfig(cfg.*);
     }
 
@@ -8953,16 +8952,26 @@ pub const IndexManager = struct {
     pub fn coverageIdentityMapAlloc(self: *const IndexManager, alloc: Allocator) !std.StringHashMapUnmanaged(CoverageIdentity) {
         var identities = std.StringHashMapUnmanaged(CoverageIdentity).empty;
         errdefer identities.deinit(alloc);
-        const vector_count = self.dense_indexes.items.len + self.sparse_indexes.items.len + self.status_only_index_configs.len;
-        try identities.ensureTotalCapacity(alloc, @intCast(vector_count));
+        const index_count = self.text_indexes.items.len + self.dense_indexes.items.len +
+            self.sparse_indexes.items.len + self.graph_indexes.items.len +
+            self.algebraic_indexes.items.len + self.status_only_index_configs.len;
+        try identities.ensureTotalCapacity(alloc, @intCast(index_count));
+        for (self.text_indexes.items) |entry| {
+            identities.putAssumeCapacity(entry.config.name, coverageIdentityForConfig(entry.config));
+        }
         for (self.dense_indexes.items) |entry| {
             identities.putAssumeCapacity(entry.config.name, coverageIdentityForConfig(entry.config));
         }
         for (self.sparse_indexes.items) |entry| {
             identities.putAssumeCapacity(entry.config.name, coverageIdentityForConfig(entry.config));
         }
+        for (self.graph_indexes.items) |entry| {
+            identities.putAssumeCapacity(entry.config.name, coverageIdentityForConfig(entry.config));
+        }
+        for (self.algebraic_indexes.items) |entry| {
+            identities.putAssumeCapacity(entry.config.name, coverageIdentityForConfig(entry.config));
+        }
         for (self.status_only_index_configs) |cfg| {
-            if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) continue;
             identities.putAssumeCapacity(cfg.name, coverageIdentityForConfig(cfg));
         }
         return identities;
@@ -18534,10 +18543,6 @@ fn indexConfigWithCoverageGeneration(alloc: Allocator, runtime_io: ?std.Io, cfg:
 }
 
 fn populateCoverageConfigFingerprint(alloc: Allocator, cfg: *types.IndexConfig) !void {
-    if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) {
-        cfg.coverage_config_fingerprint = null;
-        return;
-    }
     if (cfg.coverage_config_fingerprint == null) {
         cfg.coverage_config_fingerprint = try internal_keys.derivedCoverageConfigFingerprint(alloc, cfg.config_json);
     }

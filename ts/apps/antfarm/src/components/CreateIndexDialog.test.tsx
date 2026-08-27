@@ -371,6 +371,25 @@ describe("CreateIndexDialog", () => {
     expect(screen.getByTestId("index-form")).toBeTruthy();
   });
 
+  it("describes the index kind selected in Raw JSON", () => {
+    render(
+      <CreateIndexDialog
+        open
+        onClose={() => undefined}
+        tableName="docs"
+        onIndexCreated={() => undefined}
+        schema={null}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("switch"));
+    fireEvent.change(screen.getByLabelText("Advanced index JSON"), {
+      target: { value: '{"name":"relations","type":"graph","edge_types":[]}' },
+    });
+
+    expect(screen.getByText("Create a new graph index for your table.")).toBeTruthy();
+  });
+
   it("lets operators reorder graph sources to control precedence", () => {
     vi.stubGlobal(
       "ResizeObserver",
