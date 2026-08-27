@@ -25,7 +25,7 @@ const process_mod = @import("vopr_io_process.zig");
 const task_mod = @import("vopr_io_task.zig");
 const transition = @import("transition.zig");
 
-pub const model_version: u32 = 3;
+pub const model_version: u32 = 6;
 
 pub const Capability = enum(u6) {
     eager_async,
@@ -677,10 +677,16 @@ fn networkReady(ptr: *anyopaque, resource_id: ids.StableId) !void {
     return kernel.waitExternalReady(resource_id);
 }
 
+fn networkRebind(ptr: *anyopaque, old_resource_id: ids.StableId, new_resource_id: ids.StableId) !void {
+    const kernel: *task_mod.Kernel = @ptrCast(@alignCast(ptr));
+    return kernel.rebindExternalResource(old_resource_id, new_resource_id);
+}
+
 const network_wait_vtable: net_mod.WaitPort.VTable = .{
     .wait = networkWait,
     .wake = networkWake,
     .ready = networkReady,
+    .rebind = networkRebind,
 };
 
 fn state(userdata: ?*anyopaque) *VoprIo {
@@ -1230,7 +1236,9 @@ fn netBindIp(userdata: ?*anyopaque, address: *const std.Io.net.IpAddress, option
 }
 
 fn netConnectIp(userdata: ?*anyopaque, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.ConnectOptions) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
-    return state(userdata).network.connectIp(address, options);
+    const self = state(userdata);
+    const owner_id = self.tasks.currentTaskId() orelse ids.stable("sim-io", "root-network-owner");
+    return self.network.connectIp(address, options, owner_id);
 }
 
 fn netListenUnix(userdata: ?*anyopaque, address: *const std.Io.net.UnixAddress, options: std.Io.net.UnixAddress.ListenOptions) std.Io.net.UnixAddress.ListenError!std.Io.net.Socket.Handle {
@@ -1238,11 +1246,15 @@ fn netListenUnix(userdata: ?*anyopaque, address: *const std.Io.net.UnixAddress, 
 }
 
 fn netConnectUnix(userdata: ?*anyopaque, address: *const std.Io.net.UnixAddress) std.Io.net.UnixAddress.ConnectError!std.Io.net.Socket.Handle {
-    return state(userdata).network.connectUnix(address);
+    const self = state(userdata);
+    const owner_id = self.tasks.currentTaskId() orelse ids.stable("sim-io", "root-network-owner");
+    return self.network.connectUnix(address, owner_id);
 }
 
 fn netSocketCreatePair(userdata: ?*anyopaque, options: std.Io.net.Socket.CreatePairOptions) std.Io.net.Socket.CreatePairError![2]std.Io.net.Socket {
-    return state(userdata).network.createPair(options);
+    const self = state(userdata);
+    const owner_id = self.tasks.currentTaskId() orelse ids.stable("sim-io", "root-network-owner");
+    return self.network.createPair(options, owner_id);
 }
 
 fn netSend(userdata: ?*anyopaque, handle: std.Io.net.Socket.Handle, messages: []std.Io.net.OutgoingMessage, _: std.Io.net.SendFlags) struct { ?std.Io.net.Socket.SendError, usize } {

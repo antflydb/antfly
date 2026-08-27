@@ -158,6 +158,7 @@ test "toy scenario records, parses, and exactly replays" {
 
     var parsed = try trace.parseAlloc(std.testing.allocator, encoded);
     defer parsed.deinit();
+    try std.testing.expect(try recorded.canonicalEqual(&parsed, std.testing.allocator));
     for (0..100) |_| {
         var replayed = try replay.exact(ToyScenario, std.testing.allocator, &parsed);
         replayed.deinit();

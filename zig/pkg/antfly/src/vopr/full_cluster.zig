@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
+const data_runtime = @import("../data/runtime.zig");
 const metadata_sim = @import("../metadata/sim_harness.zig");
 const production_cluster = @import("production_cluster.zig");
 const serverless_workflow = @import("serverless_workflow.zig");
@@ -14,7 +15,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 12;
+    pub const version: u32 = 13;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -66,15 +67,18 @@ pub const Scenario = struct {
         serverless_stale_generation,
         resource_pressure,
         production_data_plane_baseline,
+        production_data_plane_graph,
         production_data_plane,
 
         fn isProduction(self: Mode) bool {
-            return self == .production_data_plane_baseline or self == .production_data_plane;
+            return self == .production_data_plane_baseline or
+                self == .production_data_plane_graph or
+                self == .production_data_plane;
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -103,6 +107,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "serverless-stale-generation"),
         vopr.id.stable(name, "resource-pressure"),
         vopr.id.stable(name, "production-data-plane-baseline"),
+        vopr.id.stable(name, "production-data-plane-graph"),
         vopr.id.stable(name, "production-data-plane"),
     };
     const mode_names = [_][]const u8{
@@ -116,6 +121,7 @@ pub const Scenario = struct {
         name ++ ".serverless-stale-generation",
         name ++ ".resource-pressure",
         name ++ ".production-data-plane-baseline",
+        name ++ ".production-data-plane-graph",
         name ++ ".production-data-plane",
     };
 
@@ -314,6 +320,7 @@ pub const Scenario = struct {
                     .hosts = snapshot.hosts,
                     .requests_ok = snapshot.requests_ok,
                     .topology_ok = snapshot.topology_ok,
+                    .graph_query_ok = snapshot.graph_query_ok,
                     .cleanup_ok = snapshot.cleanup_ok,
                     .raft_wire_requests = snapshot.raft_wire_requests,
                     .node_resource_managers = snapshot.node_resource_managers,
@@ -369,6 +376,7 @@ pub const Scenario = struct {
                     return;
                 };
                 self.production_cluster.?.setActiveSplitEnabled(mode == .production_data_plane);
+                self.production_cluster.?.setGraphEnabled(mode == .production_data_plane_graph);
                 self.production_cluster.?.bootstrap() catch |err| {
                     const teardown_cancelled = blk: {
                         std.Io.checkCancel(self.sim.io()) catch |cancel_err|
@@ -534,7 +542,7 @@ pub const Scenario = struct {
                     .resource,
                     domain_id,
                 ),
-                .production_data_plane_baseline, .production_data_plane => {},
+                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane => {},
             }
         }
 
@@ -627,6 +635,23 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".production-left-write-status", if (production) |production_fixture| production_fixture.write_statuses[0] else 0);
         try builder.addNamed(allocator, name ++ ".production-right-write-status", if (production) |production_fixture| production_fixture.write_statuses[1] else 0);
         try builder.addNamed(allocator, name ++ ".production-tenant-write-status", if (production) |production_fixture| production_fixture.write_statuses[2] else 0);
+        try builder.addNamed(allocator, name ++ ".production-left-write-attempts", if (production) |production_fixture| @intCast(production_fixture.write_attempts[0]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-right-write-attempts", if (production) |production_fixture| @intCast(production_fixture.write_attempts[1]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-tenant-write-attempts", if (production) |production_fixture| @intCast(production_fixture.write_attempts[2]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-left-write-unknowns", if (production) |production_fixture| @intCast(production_fixture.write_outcome_unknowns[0]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-right-write-unknowns", if (production) |production_fixture| @intCast(production_fixture.write_outcome_unknowns[1]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-tenant-write-unknowns", if (production) |production_fixture| @intCast(production_fixture.write_outcome_unknowns[2]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-routing-started", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.routing_started)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-forward-started", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.remote_forward_started)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-forward-completed", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.remote_forward_completed)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-proposal-accepted", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.proposal_accepted)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-proposal-persisted", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.proposal_persisted)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-apply-confirmed", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.apply_confirmed)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-visibility-confirmed", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.visibility_confirmed)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-ack-ready", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.response_ack_ready)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-last-group", if (production) |production_fixture| @intCast(production_fixture.last_request_lifecycle_group) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-last-index", if (production) |production_fixture| @intCast(production_fixture.last_request_lifecycle_index) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-last-phase", if (production) |production_fixture| @intFromEnum(production_fixture.last_request_lifecycle_phase) + 1 else 0);
         // Observation values are signed, but digests are opaque 64-bit
         // identities. Preserve every bit instead of trapping on hashes whose
         // high bit is set.
@@ -691,13 +716,18 @@ pub const Scenario = struct {
         const production = state.production_cluster;
         const cluster = state.clusterHealth();
         const production_mode = state.mode != null and state.mode.?.isProduction();
+        const production_graph_mode = state.mode == .production_data_plane_graph;
         const resources = state.sim.resourceSnapshot();
         try sink.check(allocator, acknowledged_id, !state.complete or (cluster != null and cluster.?.requests_ok));
         try sink.check(allocator, quorum_id, !state.complete or (cluster != null and cluster.?.topology_ok));
         try sink.check(allocator, routing_id, !state.complete or (cluster != null and cluster.?.hosts == 2));
         try sink.check(allocator, isolation_id, !state.complete or
             (if (production) |value| value.tenant_sound else fixture != null and fixture.?.table_isolation_sound));
-        try sink.check(allocator, graph_query_id, !state.complete or production_mode or (cluster != null and cluster.?.graph_query_ok));
+        try sink.check(allocator, graph_query_id, !state.complete or
+            (if (production_mode)
+                !production_graph_mode or (cluster != null and cluster.?.graph_query_ok)
+            else
+                cluster != null and cluster.?.graph_query_ok));
         try sink.check(allocator, graph_restart_id, !state.complete or state.mode.? != .graph_inflight_restart or
             (cluster != null and cluster.?.graph_inflight_restart_observed and cluster.?.graph_inflight_restart_recovered and
                 cluster.?.graph_query_ok));
@@ -767,7 +797,8 @@ fn runExactMode(
     const backend_ids = vopr.vopr_io.artifactBackendIds();
     const active_split_mode = mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 1];
     const production_mode = active_split_mode or
-        mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 2];
+        mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 2] or
+        mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 3];
     var fair_choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4655_4c4c + mode_ordinal);
     var cooperative_choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{mode_id}, 0x4655_4c4c + mode_ordinal);
     const choice_source = if (production_mode)
@@ -780,7 +811,12 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 1]) "full-cluster-vopr-v12" else "full-cluster-vopr-v11")
+            (if (mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 1])
+                "full-cluster-vopr-v12"
+            else if (mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 2])
+                "full-cluster-vopr-v13-graph"
+            else
+                "full-cluster-vopr-v11")
         else
             "full-cluster-vopr-v9",
         .target = "native",
@@ -804,6 +840,18 @@ fn runExactMode(
             }
         };
     }
+    // Reproducibility is a prerequisite for interpreting either a passing or
+    // failing property result. Replay before asserting the scenario oracle so
+    // newly discovered failures cannot bypass the exact-replay gate.
+    var replayed = vopr.replay.exact(Scenario, history_alloc, &recorded) catch |err| {
+        std.debug.print("full cluster mode={s} exact replay failed: {s}\n", .{
+            Scenario.mode_names[mode_ordinal],
+            @errorName(err),
+        });
+        return err;
+    };
+    replayed.deinit();
+
     switch (completion_expectation) {
         .complete => try std.testing.expectEqual(@as(u64, 0), recorded.summary.?.property_failures),
         .bounded_lifecycle => {
@@ -828,14 +876,6 @@ fn runExactMode(
             }
         },
     }
-    var replayed = vopr.replay.exact(Scenario, history_alloc, &recorded) catch |err| {
-        std.debug.print("full cluster mode={s} exact replay failed: {s}\n", .{
-            Scenario.mode_names[mode_ordinal],
-            @errorName(err),
-        });
-        return err;
-    };
-    replayed.deinit();
 }
 
 test "full cluster VOPR exact replays the composed deployment and recovery" {
@@ -848,7 +888,7 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
     // Keep the promoted aggregate on its last green contract. Experimental
     // modes receive a distinct focused gate and join this slice only after
     // their recorded history and exact replay pass within the tier budget.
-    const promoted_mode_count = Scenario.mode_ids.len - 2;
+    const promoted_mode_count = Scenario.mode_ids.len - 3;
     for (Scenario.mode_ids[0..promoted_mode_count], 0..) |mode_id, mode_ordinal| {
         try runExactMode(history_alloc, mode_id, mode_ordinal, 50_000, .complete);
     }
@@ -863,6 +903,19 @@ test "full cluster production data plane VOPR active split exact replay" {
         Scenario.mode_ids[ordinal],
         ordinal,
         320_000,
+        .complete,
+    );
+}
+
+test "full cluster production data plane graph exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.mode_ids.len - 2;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        60_000,
         .complete,
     );
 }
@@ -883,7 +936,7 @@ test "full cluster production data plane VOPR bounded cutoff exact replay" {
 test "full cluster production data plane baseline exact replay" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
-    const ordinal = Scenario.mode_ids.len - 2;
+    const ordinal = Scenario.mode_ids.len - 3;
     try runExactMode(
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],

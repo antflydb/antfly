@@ -4305,6 +4305,14 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn internalAuthRealtimeNs(self: *ApiHttpServer) i128 {
+        if (self.cfg.backend_runtime) |runtime| {
+            if (runtime.io()) |io|
+                return @intCast(std.Io.Clock.real.now(io).nanoseconds);
+        }
+        return nowNs();
+    }
+
     fn authenticateTrustedPrincipalWithIssuer(
         self: *ApiHttpServer,
         token: []const u8,
@@ -4349,7 +4357,7 @@ pub const ApiHttpServer = struct {
         }
         const subject = jsonStringField(payload.get("sub")) orelse return error.Unauthorized;
         const exp = jsonIntegerField(payload.get("exp")) orelse return error.Unauthorized;
-        const now: i64 = @intCast(@divFloor(nowNs(), std.time.ns_per_s));
+        const now: i64 = @intCast(@divFloor(self.internalAuthRealtimeNs(), std.time.ns_per_s));
         if (exp < now) return error.Unauthorized;
         const issued_at = jsonIntegerField(payload.get("iat"));
         if (issued_at) |iat| {

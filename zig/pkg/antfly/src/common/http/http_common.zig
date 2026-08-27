@@ -235,6 +235,10 @@ pub const RequestExecutor = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
     boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    /// Optional clock authority owned by the same runtime as the transport.
+    /// Authentication and retry envelopes use this instead of escaping to the
+    /// host clock when an executor is backed by a simulated or embedded Io.
+    realtime_ns_fn: ?*const fn (ptr: *anyopaque) i128 = null,
 
     pub const VTable = struct {
         execute: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: HttpRequest) anyerror!HttpResponse,
@@ -243,6 +247,11 @@ pub const RequestExecutor = struct {
 
     pub fn execute(self: RequestExecutor, alloc: std.mem.Allocator, req: HttpRequest) !HttpResponse {
         return try BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req });
+    }
+
+    pub fn realtimeNs(self: RequestExecutor) ?i128 {
+        const now = self.realtime_ns_fn orelse return null;
+        return now(self.ptr);
     }
 };
 

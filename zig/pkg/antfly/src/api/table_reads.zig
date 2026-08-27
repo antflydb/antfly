@@ -125,6 +125,8 @@ pub fn normalizeDistributedGraphOperationalError(err: anyerror) anyerror {
         // complete request against a fresh plan.
         error.TopologyChanged,
         error.UnknownGroup,
+        error.NotLeader,
+        error.ReadIndexTimeout,
         => error.DistributedQueryUnavailable,
         else => err,
     };
@@ -136,6 +138,8 @@ test "distributed graph transport failures become one retryable availability con
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.ConnectionTimedOut));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.TopologyChanged));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.UnknownGroup));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.NotLeader));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedGraphOperationalError(error.ReadIndexTimeout));
     try std.testing.expectEqual(error.Timeout, normalizeDistributedGraphOperationalError(error.Timeout));
     try std.testing.expectEqual(error.InternalFailure, normalizeDistributedGraphOperationalError(error.InternalFailure));
 }
@@ -1246,6 +1250,34 @@ pub const GroupVisibleRootGenerationSource = struct {
         if (self.finish_root_generation_reservation == null) return error.InvalidRootGenerationSource;
         try reserve(self.ptr, group_id);
         return .{ .source = self, .group_id = group_id };
+    }
+};
+
+/// Strong distributed graph reads require both a quorum read barrier and the
+/// corresponding local derived-index visibility. A Raft ReadState alone only
+/// proves that the base state machine applied through its index; followers and
+/// newly elected leaders may still be building graph/full-text artifacts. The
+/// caller's logical timeout and cancellation token bound the combined wait.
+pub const GraphReadBarrier = struct {
+    ptr: *anyopaque,
+    wait_fn: *const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        timeout_ms: ?u32,
+        cancellation: db_mod.types.CancellationToken,
+    ) anyerror!void,
+
+    pub fn wait(
+        self: GraphReadBarrier,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        timeout_ms: ?u32,
+        cancellation: db_mod.types.CancellationToken,
+    ) !void {
+        try self.wait_fn(self.ptr, alloc, group_id, table_name, timeout_ms, cancellation);
     }
 };
 
@@ -2577,6 +2609,15 @@ pub const ProvisionedTableReadSource = struct {
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    graph_read_barrier: ?GraphReadBarrier = null,
+    /// Optional production data-plane routing for public reads. Internal
+    /// group-local endpoints remain on the resident owner, while a public
+    /// coordinator resolves the current group route. Strong graph phases are
+    /// additionally fenced by `graph_read_barrier` before derived-state use.
+    distributed_router: ?table_router.HostedGroupRouter = null,
+    distributed_executor: ?http_common.RequestExecutor = null,
+    internal_service_secret: ?[]const u8 = null,
+    internal_service_issuer: ?[]const u8 = null,
 
     const topology_read_attempt_limit: usize = 4;
 
@@ -2637,6 +2678,73 @@ pub const ProvisionedTableReadSource = struct {
     ) *ProvisionedTableReadSource {
         self.io_impl = .{ .backend = io, .async_limit = async_limit };
         return self;
+    }
+
+    pub fn withDistributedRouting(
+        self: *ProvisionedTableReadSource,
+        router: table_router.HostedGroupRouter,
+        executor: http_common.RequestExecutor,
+        internal_service_secret: ?[]const u8,
+        internal_service_issuer: ?[]const u8,
+    ) *ProvisionedTableReadSource {
+        self.distributed_router = router;
+        self.distributed_executor = executor;
+        self.internal_service_secret = internal_service_secret;
+        self.internal_service_issuer = internal_service_issuer;
+        return self;
+    }
+
+    fn distributedInternalExecutor(self: *ProvisionedTableReadSource) http_common.RequestExecutor {
+        std.debug.assert(self.distributed_executor != null);
+        return .{ .ptr = self, .vtable = &.{ .execute = executeDistributedInternalRequest } };
+    }
+
+    /// Reuse the production hosted-route implementation for public operations
+    /// when this provisioned source is backed by per-group data Raft. Internal
+    /// group-local endpoints still execute through this source's resident DB
+    /// and admission owners; only the public coordinator is adapted here.
+    fn routedHostedSource(self: *ProvisionedTableReadSource) HostedProvisionedTableReadSource {
+        var hosted = HostedProvisionedTableReadSource.init(
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            self.distributed_router.?,
+            self.distributed_executor.?,
+        );
+        hosted.io_impl = self.io_impl;
+        hosted.internal_service_secret = self.internal_service_secret;
+        hosted.internal_service_issuer = self.internal_service_issuer;
+        hosted.backend_runtime = self.backend_runtime;
+        hosted.group_visible_root_generation = self.group_visible_root_generation;
+        hosted.antfly_provider = self.antfly_provider;
+        hosted.inference_api_url = self.inference_api_url;
+        hosted.secret_store = self.secret_store;
+        hosted.remote_content = self.remote_content;
+        hosted.graph_read_barrier = self.graph_read_barrier;
+        // Preserve the production resident/admission owner for routes that
+        // resolve back to this DataServer. The hosted coordinator owns route
+        // selection; it must not turn a local route into an unmanaged DB open.
+        hosted.local_source = self.source();
+        return hosted;
+    }
+
+    pub fn withGraphReadBarrier(
+        self: *ProvisionedTableReadSource,
+        barrier: ?GraphReadBarrier,
+    ) *ProvisionedTableReadSource {
+        self.graph_read_barrier = barrier;
+        return self;
+    }
+
+    fn executeDistributedInternalRequest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: http_common.HttpRequest,
+    ) anyerror!http_common.HttpResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var client = http_client.ApiHttpClient.init(alloc, self.distributed_executor.?);
+        _ = client.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
+        return client.executeRequest(request);
     }
 
     pub fn withAntflyProvider(
@@ -2948,6 +3056,63 @@ pub const ProvisionedTableReadSource = struct {
         kind: ReadPreparation.Kind,
         expected_epoch: u64,
     ) !?ReadPreparation.Activity {
+        return self.prepareKnownGroupReadWithFallback(
+            alloc,
+            group_id,
+            table_name,
+            request,
+            consistency,
+            kind,
+            expected_epoch,
+            true,
+            null,
+            .none,
+        );
+    }
+
+    /// Distributed strong reads must never reinterpret `NotLeader` as
+    /// permission to publish a stale local result. The coordinator can route
+    /// or retry the group; returning a successful partial graph is not an
+    /// admissible availability policy.
+    fn prepareKnownGroupReadStrict(
+        self: *ProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        request: ?ProvisionedConsistencyRequest,
+        consistency: raft_mod.ReadConsistency,
+        kind: ReadPreparation.Kind,
+        expected_epoch: u64,
+        timeout_ms: ?u32,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?ReadPreparation.Activity {
+        return self.prepareKnownGroupReadWithFallback(
+            alloc,
+            group_id,
+            table_name,
+            request,
+            consistency,
+            kind,
+            expected_epoch,
+            false,
+            timeout_ms,
+            cancellation,
+        );
+    }
+
+    fn prepareKnownGroupReadWithFallback(
+        self: *ProvisionedTableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        request: ?ProvisionedConsistencyRequest,
+        consistency: raft_mod.ReadConsistency,
+        kind: ReadPreparation.Kind,
+        expected_epoch: u64,
+        fallback_to_stale_on_not_leader: bool,
+        timeout_ms: ?u32,
+        cancellation: db_mod.types.CancellationToken,
+    ) !?ReadPreparation.Activity {
         if (consistency == .stale) {
             var activity = self.beginPreparedRead(table_name, kind);
             errdefer if (activity) |*held| held.deinit();
@@ -2964,7 +3129,20 @@ pub const ProvisionedTableReadSource = struct {
         else
             try table_catalog.groupTopologyEpoch(alloc, self.catalog, table_name, group_id);
         if (expected_epoch != 0) try table_catalog.validatePinnedGroupTopology(alloc, self.catalog, table_name, group_id, epoch);
-        if (request) |gate_request| try self.prepareGroupsForReadAdmission(alloc, &.{group_id}, gate_request, consistency);
+        if (request) |gate_request| {
+            if (!fallback_to_stale_on_not_leader and self.graph_read_barrier != null) {
+                try self.graph_read_barrier.?.wait(alloc, group_id, table_name, timeout_ms, cancellation);
+            } else if (fallback_to_stale_on_not_leader)
+                try self.prepareGroupsForReadAdmission(alloc, &.{group_id}, gate_request, consistency)
+            else
+                try prepareProvisionedGroupConsistency(
+                    self.requester,
+                    group_id,
+                    gate_request,
+                    consistency,
+                    false,
+                );
+        }
         var activity = self.beginPreparedRead(table_name, kind);
         errdefer if (activity) |*held| held.deinit();
         try table_catalog.validatePinnedGroupTopology(alloc, self.catalog, table_name, group_id, epoch);
@@ -2995,6 +3173,10 @@ pub const ProvisionedTableReadSource = struct {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkLookupOptionsActive(opts);
         try self.ensureHAReadAllowed(consistency);
+        if (self.distributed_router != null) {
+            var hosted = self.routedHostedSource();
+            return HostedProvisionedTableReadSource.lookup(&hosted, alloc, table_name, key, opts, consistency);
+        }
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             try checkLookupOptionsActive(opts);
@@ -3002,7 +3184,7 @@ pub const ProvisionedTableReadSource = struct {
             defer prepared.deinit();
             try checkLookupOptionsActive(opts);
             const group_id = prepared.group_id orelse return null;
-            return lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, .stale) catch |err| switch (err) {
+            return lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, .stale, prepared.activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
                     try self.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
@@ -3025,12 +3207,23 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        if (self.distributed_router != null) {
+            var hosted = self.routedHostedSource();
+            return HostedProvisionedTableReadSource.documentArtifactManifest(
+                &hosted,
+                alloc,
+                table_name,
+                doc_key,
+                artifact_name,
+                consistency,
+            );
+        }
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var prepared = try self.prepareRoutedKeyRead(alloc, table_name, doc_key, .{ .lookup = .{ .key = doc_key, .opts = .{} } }, consistency, .general);
             defer prepared.deinit();
             const group_id = prepared.group_id orelse return null;
-            return documentArtifactManifestProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, .stale, true) catch |err| switch (err) {
+            return documentArtifactManifestProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, .stale, prepared.activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
                     try self.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
@@ -3052,12 +3245,22 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        if (self.distributed_router != null) {
+            var hosted = self.routedHostedSource();
+            return HostedProvisionedTableReadSource.documentArtifactManifests(
+                &hosted,
+                alloc,
+                table_name,
+                doc_key,
+                consistency,
+            );
+        }
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var prepared = try self.prepareRoutedKeyRead(alloc, table_name, doc_key, .{ .lookup = .{ .key = doc_key, .opts = .{} } }, consistency, .general);
             defer prepared.deinit();
             const group_id = prepared.group_id orelse return null;
-            return documentArtifactManifestsProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, .stale, true) catch |err| switch (err) {
+            return documentArtifactManifestsProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, .stale, prepared.activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
                     try self.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
@@ -3081,6 +3284,10 @@ pub const ProvisionedTableReadSource = struct {
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        if (self.distributed_router != null) {
+            var hosted = self.routedHostedSource();
+            return HostedProvisionedTableReadSource.scan(&hosted, alloc, table_name, from_key, to_key, opts, consistency);
+        }
         var attempt: usize = 0;
         retry: while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var prepared = try self.prepareRoutedSpanRead(alloc, table_name, from_key, to_key, .{ .scan = .{ .from_key = from_key, .to_key = to_key, .opts = opts } }, consistency, .general);
@@ -3099,7 +3306,7 @@ pub const ProvisionedTableReadSource = struct {
                     group_opts.limit = opts.limit - emitted;
                 }
 
-                var result = (scanProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, group_opts, .stale, true) catch |err| switch (err) {
+                var result = (scanProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, group_opts, .stale, prepared.activity != null) catch |err| switch (err) {
                     error.ResidentDbRetryRequired => {
                         prepared.releaseActivity();
                         try self.prepareResidentGroupsForReadRetry(alloc, table_name, group_ids);
@@ -3126,6 +3333,10 @@ pub const ProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        if (self.distributed_router != null) {
+            var hosted = self.routedHostedSource();
+            return HostedProvisionedTableReadSource.query(&hosted, alloc, table_name, req, consistency);
+        }
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             checkQueryDeadline(req) catch |err| return err;
@@ -3153,7 +3364,7 @@ pub const ProvisionedTableReadSource = struct {
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
         const start_ns = platform_time.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
-            var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
+            var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, .stale, prepared.activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     prepared.releaseActivity();
                     try self.prepareResidentGroupsForReadRetry(alloc, table_name, group_ids);
@@ -3271,6 +3482,17 @@ pub const ProvisionedTableReadSource = struct {
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try self.ensureHAReadAllowed(consistency);
+        if (self.distributed_router != null) {
+            var hosted = self.routedHostedSource();
+            return HostedProvisionedTableReadSource.preflightQuery(
+                &hosted,
+                alloc,
+                table_name,
+                req,
+                consistency,
+                max_work,
+            );
+        }
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var prepared = try self.prepareRoutedSpanRead(alloc, table_name, "", "", .{ .search = req }, consistency, readPreparationKindForQuery(req));
@@ -3315,7 +3537,7 @@ pub const ProvisionedTableReadSource = struct {
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general, 0);
             defer if (read_activity) |*activity| activity.deinit();
-            return lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, .stale) catch |err| switch (err) {
+            return lookupProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, .stale, read_activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
                     read_activity = null;
@@ -3344,7 +3566,7 @@ pub const ProvisionedTableReadSource = struct {
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = doc_key, .opts = .{} } }, consistency, .general, 0);
             defer if (read_activity) |*activity| activity.deinit();
-            return documentArtifactManifestProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, .stale, true) catch |err| switch (err) {
+            return documentArtifactManifestProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, .stale, read_activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
                     read_activity = null;
@@ -3372,7 +3594,7 @@ pub const ProvisionedTableReadSource = struct {
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = doc_key, .opts = .{} } }, consistency, .general, 0);
             defer if (read_activity) |*activity| activity.deinit();
-            return documentArtifactManifestsProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, .stale, true) catch |err| switch (err) {
+            return documentArtifactManifestsProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, .stale, read_activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
                     read_activity = null;
@@ -3415,7 +3637,7 @@ pub const ProvisionedTableReadSource = struct {
                 req,
                 .stale,
                 max_work,
-                true,
+                read_activity != null,
             ) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
@@ -3446,7 +3668,7 @@ pub const ProvisionedTableReadSource = struct {
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .scan = .{ .from_key = from_key, .to_key = to_key, .opts = opts } }, consistency, .general, 0);
             defer if (read_activity) |*activity| activity.deinit();
-            return scanProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, .stale, true) catch |err| switch (err) {
+            return scanProvisionedHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, .stale, read_activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
                     read_activity = null;
@@ -3475,7 +3697,7 @@ pub const ProvisionedTableReadSource = struct {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = req }, consistency, readPreparationKindForQuery(req), 0);
             defer if (read_activity) |*activity| activity.deinit();
             const start_ns = platform_time.monotonicNs();
-            var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
+            var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale, read_activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
                     read_activity = null;
@@ -3517,7 +3739,7 @@ pub const ProvisionedTableReadSource = struct {
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = req }, consistency, readPreparationKindForQuery(req), 0);
             defer if (read_activity) |*activity| activity.deinit();
-            return queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale) catch |err| switch (err) {
+            return queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale, read_activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
                     read_activity = null;
@@ -3543,7 +3765,7 @@ pub const ProvisionedTableReadSource = struct {
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, null, .stale, .general, 0);
             defer if (read_activity) |*activity| activity.deinit();
-            return collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, true) catch |err| switch (err) {
+            return collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, read_activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
                     read_activity = null;
@@ -3569,7 +3791,7 @@ pub const ProvisionedTableReadSource = struct {
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, null, .stale, .general, 0);
             defer if (read_activity) |*activity| activity.deinit();
-            return collectProvisionedHostedLocalAlgebraicPartials(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, true) catch |err| switch (err) {
+            return collectProvisionedHostedLocalAlgebraicPartials(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, read_activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
                     read_activity = null;
@@ -3705,7 +3927,7 @@ pub const ProvisionedTableReadSource = struct {
                 group_id,
                 self.visibleRootGeneration(group_id),
                 table_name,
-                true,
+                read_activity != null,
             ) catch |err| switch (err) {
                 // ResidentDbRetryRequired is a private in-process retry
                 // protocol and is intentionally absent from the runtime error
@@ -3885,6 +4107,12 @@ pub const HostedProvisionedTableReadSource = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     distributed_graph_lifecycle_hook: ?distributed_graph.LifecycleHook = null,
+    antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
+    graph_read_barrier: ?GraphReadBarrier = null,
+    local_source: ?TableReadSource = null,
 
     pub fn init(
         replica_root_dir: []const u8,
@@ -3966,6 +4194,50 @@ pub const HostedProvisionedTableReadSource = struct {
     fn monotonicNs(self: *const HostedProvisionedTableReadSource) u64 {
         const io_impl = self.io_impl orelse return platform_time.monotonicNs();
         return @intCast(std.Io.Clock.now(.awake, io_impl.io()).nanoseconds);
+    }
+
+    fn managedReadRuntimeConfig(self: *const HostedProvisionedTableReadSource) ManagedReadRuntimeConfig {
+        return .{
+            .backend_runtime = self.backend_runtime,
+            .antfly_provider = self.antfly_provider,
+            .inference_api_url = self.inference_api_url,
+            .secret_store = self.secret_store,
+            .remote_content = self.remote_content,
+        };
+    }
+
+    fn lookupLocal(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
+        if (self.local_source) |local| return try local.lookupGroupLocal(alloc, group_id, table_name, key, opts, consistency);
+        return try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency, false);
+    }
+
+    fn scanLocal(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?ScanResponse {
+        if (self.local_source) |local| return try local.scanGroupLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency);
+        return try scanProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency, false);
+    }
+
+    fn searchResultLocal(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
+        if (self.local_source) |local| return try local.searchResultGroupLocal(alloc, group_id, table_name, req, consistency);
+        return try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency, false);
+    }
+
+    fn requireSearchResultLocal(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !db_mod.types.SearchResult {
+        return (try self.searchResultLocal(alloc, group_id, table_name, req, consistency)) orelse error.TableNotFound;
+    }
+
+    fn requirePreflightLocal(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, max_work: u32) !db_mod.RuntimePreflightSummary {
+        if (self.local_source) |local| return (try local.preflightQueryGroupLocal(alloc, group_id, table_name, req, consistency, max_work)) orelse error.TableNotFound;
+        return try preflightHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency, max_work, false);
+    }
+
+    fn requireTextStatsLocal(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !query_api.QueryResponse {
+        if (self.local_source) |local| return (try local.textStatsGroupLocal(alloc, group_id, table_name, body)) orelse error.TableNotFound;
+        return (try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse error.TableNotFound;
+    }
+
+    fn requireAlgebraicPartialsLocal(self: *HostedProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, body: []const u8) !query_api.QueryResponse {
+        if (self.local_source) |local| return (try local.algebraicPartialsGroupLocal(alloc, group_id, table_name, body)) orelse error.TableNotFound;
+        return (try collectProvisionedHostedLocalAlgebraicPartials(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse error.TableNotFound;
     }
 
     pub fn source(self: *HostedProvisionedTableReadSource) TableReadSource {
@@ -4061,7 +4333,10 @@ pub const HostedProvisionedTableReadSource = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
-            .local => try documentArtifactManifestProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency, false),
+            .local => if (self.local_source) |local|
+                try local.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, consistency)
+            else
+                try documentArtifactManifestProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency, false),
             .remote => |remote| documentArtifactManifestRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, doc_key, artifact_name) catch |err| switch (err) {
                 error.UnexpectedHttpStatus, error.NotFound => null,
                 else => err,
@@ -4080,7 +4355,10 @@ pub const HostedProvisionedTableReadSource = struct {
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
         defer route.deinit(alloc);
         return switch (route) {
-            .local => try documentArtifactManifestsProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency, false),
+            .local => if (self.local_source) |local|
+                try local.documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, consistency)
+            else
+                try documentArtifactManifestsProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency, false),
             .remote => |remote| documentArtifactManifestsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, doc_key) catch |err| switch (err) {
                 error.UnexpectedHttpStatus, error.NotFound => null,
                 else => err,
@@ -4099,7 +4377,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         return switch (route) {
-            .local => try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency),
+            .local => try self.lookupLocal(alloc, group_id, table_name, key, opts, consistency),
             .remote => |remote| lookupRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, key, opts, consistency) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
@@ -4134,7 +4412,7 @@ pub const HostedProvisionedTableReadSource = struct {
             const node_id = intent.record.local_node_id;
             if (node_id == local_node_id) {
                 if (tried_local or self.router.localStatus(group_id) != .active) continue;
-                if (try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency)) |result| return result;
+                if (try self.lookupLocal(alloc, group_id, table_name, key, opts, consistency)) |result| return result;
                 continue;
             }
             if (node_id == tried_remote_node_id) continue;
@@ -4204,7 +4482,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             var result = switch (route) {
-                .local => try scanProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, group_opts, consistency, false),
+                .local => try self.scanLocal(alloc, group_id, table_name, from_key, to_key, group_opts, consistency),
                 .remote => |remote| try scanRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, from_key, to_key, group_opts),
             } orelse return null;
             defer result.deinit(alloc);
@@ -4234,7 +4512,10 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
 
             if (route == .local) {
-                var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+                if (self.local_source) |local| {
+                    return try local.queryGroupLocal(alloc, group_ids[0], table_name, req, consistency);
+                }
+                var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, consistency, false);
                 defer execution.releaseDb();
                 try checkQueryDeadline(execution.request);
                 var result = execution.result;
@@ -4249,7 +4530,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, response_req, &result, &meta, execution.db(), consistency);
                 execution.releaseDb();
                 try checkQueryDeadline(response_req);
-                try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), response_req, &result, &meta, null, null);
+                try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), response_req, &result, &meta, self.antfly_provider, self.secret_store);
                 return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
             }
         }
@@ -4276,7 +4557,7 @@ pub const HostedProvisionedTableReadSource = struct {
             defer meta.deinit(alloc);
             try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, graph_req, &merged, &meta, null, consistency);
             try checkQueryDeadline(graph_req);
-            try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), graph_req, &merged, &meta, null, null);
+            try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), graph_req, &merged, &meta, self.antfly_provider, self.secret_store);
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, req, table_name, consistency);
@@ -4290,7 +4571,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, group_ids, table_name, req, &merged, &meta, null, consistency);
         try checkQueryDeadline(req);
-        try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), req, &merged, &meta, null, null);
+        try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), req, &merged, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, req, meta, merged);
     }
 
@@ -4327,7 +4608,10 @@ pub const HostedProvisionedTableReadSource = struct {
             defer route.deinit(alloc);
             switch (route) {
                 .local => {
-                    const summary = try preflightHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency, max_work, false);
+                    const summary = self.requirePreflightLocal(alloc, group_id, table_name, req, consistency, max_work) catch |err| switch (err) {
+                        error.TableNotFound => return null,
+                        else => return err,
+                    };
                     if (first_summary == null) {
                         first_summary = summary;
                     } else {
@@ -4358,7 +4642,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try lookupProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
+        return try self.lookupLocal(alloc, group_id, table_name, key, opts, consistency);
     }
 
     fn documentArtifactManifestGroupLocal(
@@ -4371,6 +4655,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.local_source) |local| return try local.documentArtifactManifestGroupLocal(alloc, group_id, table_name, doc_key, artifact_name, consistency);
         return try documentArtifactManifestProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency, false);
     }
 
@@ -4383,6 +4668,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.local_source) |local| return try local.documentArtifactManifestsGroupLocal(alloc, group_id, table_name, doc_key, consistency);
         return try documentArtifactManifestsProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency, false);
     }
 
@@ -4396,7 +4682,10 @@ pub const HostedProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try preflightHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency, max_work, false);
+        return self.requirePreflightLocal(alloc, group_id, table_name, req, consistency, max_work) catch |err| switch (err) {
+            error.TableNotFound => null,
+            else => return err,
+        };
     }
 
     fn scanGroupLocal(
@@ -4410,7 +4699,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try scanProvisionedHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency, false);
+        return try self.scanLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency);
     }
 
     fn queryGroupLocal(
@@ -4422,8 +4711,9 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.local_source) |local| return try local.queryGroupLocal(alloc, group_id, table_name, req, consistency);
         const start_ns = platform_time.monotonicNs();
-        var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency);
+        var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency, false);
         defer execution.releaseDb();
         var result = execution.result;
         defer result.deinit();
@@ -4436,7 +4726,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer meta.deinit(alloc);
         try applyHostedProvisionedQueryAggregations(self, alloc, &.{group_id}, table_name, response_req, &result, &meta, execution.db(), consistency);
         execution.releaseDb();
-        try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), response_req, &result, &meta, null, null);
+        try applyQueryPostProcessing(alloc, postProcessingIo(self.backend_runtime), response_req, &result, &meta, self.antfly_provider, self.secret_store);
         return try query_api.encodeQueryResponses(alloc, table_name, response_req, meta, result);
     }
 
@@ -4453,7 +4743,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, req, consistency),
+            .local => try self.searchResultLocal(alloc, group_id, table_name, req, consistency),
             .remote => null,
         };
     }
@@ -4466,7 +4756,10 @@ pub const HostedProvisionedTableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false);
+        return self.requireTextStatsLocal(alloc, group_id, table_name, body) catch |err| switch (err) {
+            error.TableNotFound => null,
+            else => return err,
+        };
     }
 
     fn algebraicPartialsGroupLocal(
@@ -4477,7 +4770,10 @@ pub const HostedProvisionedTableReadSource = struct {
         body: []const u8,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        return try collectProvisionedHostedLocalAlgebraicPartials(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false);
+        return self.requireAlgebraicPartialsLocal(alloc, group_id, table_name, body) catch |err| switch (err) {
+            error.TableNotFound => null,
+            else => return err,
+        };
     }
 
     fn joinPartitionGroupLocal(
@@ -4493,7 +4789,10 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => null,
+            .local => if (self.local_source) |local|
+                try local.joinPartitionGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
+            else
+                null,
             .remote => |remote| joinPartitionRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
@@ -4514,7 +4813,10 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => null,
+            .local => if (self.local_source) |local|
+                try local.joinRowsGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
+            else
+                null,
             .remote => |remote| joinRowsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
@@ -4535,7 +4837,10 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => null,
+            .local => if (self.local_source) |local|
+                try local.joinUnmatchedGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
+            else
+                null,
             .remote => |remote| joinUnmatchedRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
@@ -4556,7 +4861,10 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => null,
+            .local => if (self.local_source) |local|
+                try local.joinFinalizeGroupLocalWithTimeout(alloc, group_id, table_name, body, timeout_ms)
+            else
+                null,
             .remote => |remote| joinFinalizeRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
@@ -4576,7 +4884,10 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => null,
+            .local => if (self.local_source) |local|
+                try local.joinJobStateGroupLocal(alloc, group_id, table_name, body)
+            else
+                null,
             .remote => |remote| joinJobStateRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
                 error.UnexpectedHttpStatus => null,
                 else => err,
@@ -4605,8 +4916,15 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => blk: {
+            .local => if (self.local_source) |local|
+                (try local.graphExpandGroupLocal(alloc, group_id, table_name, req, consistency)) orelse error.TableNotFound
+            else blk: {
                 try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
+                if (consistency != .stale) if (self.graph_read_barrier) |barrier| {
+                    try barrier.wait(alloc, group_id, table_name, req.timeout_ms, req.cancellation orelse .none);
+                };
+                const local_consistency: raft_mod.ReadConsistency =
+                    if (consistency != .stale and self.graph_read_barrier != null) .stale else consistency;
                 const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
                 var initialized: usize = 0;
                 errdefer {
@@ -4621,7 +4939,7 @@ pub const HostedProvisionedTableReadSource = struct {
                         .frontier_id = item.id,
                         .frontier_key = try alloc.dupe(u8, item.key),
                         .graph_result = graph_blk: {
-                            var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, search_req, consistency);
+                            var result = try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, search_req, local_consistency, false);
                             defer result.deinit();
                             var graph_result = if (result.graph_results.len > 0)
                                 try distributed_graph.filterGraphSearchResult(alloc, table_name, result.graph_results[0], req.exclude_nodes, req.exclude_edges)
@@ -4681,7 +4999,16 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route.deinit(alloc);
 
         return switch (route) {
-            .local => try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency),
+            .local => if (self.local_source) |local|
+                (try local.graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency)) orelse error.TableNotFound
+            else blk: {
+                if (consistency != .stale) if (self.graph_read_barrier) |barrier| {
+                    try barrier.wait(alloc, group_id, table_name, req.timeout_ms, req.cancellation orelse .none);
+                };
+                const local_consistency: raft_mod.ReadConsistency =
+                    if (consistency != .stale and self.graph_read_barrier != null) .stale else consistency;
+                break :blk try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, local_consistency);
+            },
             .remote => |remote| try graphEdgesRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req),
         };
     }
@@ -4822,7 +5149,7 @@ fn collectProvisionedSearchRequestTextStatsParallel(
                 source.backend_runtime,
                 table_name_inner,
                 body_inner,
-                true,
+                source.prepare_for_read != null,
             ) catch |err| {
                 slot.err = err;
                 return;
@@ -4914,19 +5241,13 @@ fn collectHostedSearchRequestTextStatsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var response = switch (route) {
-                .local => collectProvisionedHostedLocalTextStats(
-                    null,
-                    null,
-                    source.replica_root_dir,
-                    source.catalog,
-                    arena,
-                    group_id,
-                    0,
-                    source.backend_runtime,
-                    table_name_inner,
-                    body_inner,
-                    false,
-                ),
+                .local => blk: {
+                    const local = source.requireTextStatsLocal(arena, group_id, table_name_inner, body_inner) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                    break :blk @as(?query_api.QueryResponse, local);
+                },
                 .remote => |remote| textStatsRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, body_inner, req_inner),
             } catch |err| {
                 slot.err = err;
@@ -5008,6 +5329,7 @@ fn queryProvisionedAcrossGroupsParallel(
                 table_name_inner,
                 group_req,
                 consistency_inner,
+                source.prepare_for_read != null,
             ) catch |err| {
                 slot.err = err;
                 return;
@@ -5081,20 +5403,7 @@ fn queryHostedAcrossGroupsParallel(
             var group_req = shard_req_inner.*;
             if (required_identity_generation) |generation| group_req.identity_read_generation = generation;
             slot.result = switch (route) {
-                .local => queryHostedLocal(
-                    null,
-                    null,
-                    source.replica_root_dir,
-                    source.catalog,
-                    source.requester,
-                    arena,
-                    group_id,
-                    0,
-                    .{ .backend_runtime = source.backend_runtime },
-                    table_name_inner,
-                    group_req,
-                    consistency_inner,
-                ),
+                .local => source.requireSearchResultLocal(arena, group_id, table_name_inner, group_req, consistency_inner),
                 .remote => |remote| queryRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, group_req),
             } catch |err| {
                 slot.err = err;
@@ -6350,22 +6659,7 @@ fn preflightHostedGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             slot.summary = switch (route) {
-                .local => preflightHostedLocal(
-                    null,
-                    null,
-                    source.replica_root_dir,
-                    source.catalog,
-                    source.requester,
-                    arena,
-                    group_id,
-                    0,
-                    source.backend_runtime,
-                    table_name_inner,
-                    req_inner.*,
-                    consistency_inner,
-                    max_work_inner,
-                    false,
-                ),
+                .local => source.requirePreflightLocal(arena, group_id, table_name_inner, req_inner.*, consistency_inner, max_work_inner),
                 .remote => |remote| preflightRemote(
                     source.internalExecutor(),
                     arena,
@@ -7787,7 +8081,7 @@ fn queryProvisionedAcrossGroupsPhase(
     for (group_ids, 0..) |group_id, i| {
         var group_req = shard_req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
-        shard_results[i] = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, group_req, consistency);
+        shard_results[i] = try queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, group_req, consistency, self.prepare_for_read != null);
         initialized += 1;
         result_identity_generations[i] = shard_results[i].identity_read_generation;
         if (required_identity_generations) |generations| {
@@ -7835,7 +8129,7 @@ fn queryHostedAcrossGroupsPhase(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         shard_results[i] = switch (route) {
-            .local => try queryHostedLocal(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), .{ .backend_runtime = self.backend_runtime }, table_name, group_req, consistency),
+            .local => try self.requireSearchResultLocal(alloc, group_id, table_name, group_req, consistency),
             .remote => |remote| try queryRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, group_req),
         };
         initialized += 1;
@@ -7918,6 +8212,27 @@ fn executeProvisionedGraphExpand(
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphExpandResponse {
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    if (ctx.source.distributed_router) |router| {
+        var route = (try table_router.resolveGroupRoute(
+            alloc,
+            ctx.source.catalog,
+            router,
+            group_id,
+            routePolicyForConsistency(consistency),
+        )) orelse return error.TableNotFound;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => {},
+            .remote => |remote| return try graphExpandRemote(
+                ctx.source.distributedInternalExecutor(),
+                alloc,
+                remote.base_uri,
+                group_id,
+                table_name,
+                req,
+            ),
+        }
+    }
     var attempt: usize = 0;
     while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
         return executeProvisionedGraphExpandAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
@@ -7952,7 +8267,17 @@ fn executeProvisionedGraphExpandAttempt(
     // A consistency wait may depend on Raft apply, while apply takes the
     // table's exclusive operation admission. The shared helper completes the
     // wait first, then admits and revalidates the caller's topology stamp.
-    var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, gate_request, consistency, .general, req.topology_epoch);
+    var read_activity = try self.prepareKnownGroupReadStrict(
+        alloc,
+        group_id,
+        table_name,
+        gate_request,
+        consistency,
+        .general,
+        req.topology_epoch,
+        req.timeout_ms,
+        req.cancellation orelse .none,
+    );
     defer if (read_activity) |*activity| activity.deinit();
     var db_owner = try provisionedLocalQueryDbOwner(
         self.resident_db,
@@ -8012,6 +8337,27 @@ fn executeProvisionedGraphHydrate(
     consistency: raft_mod.ReadConsistency,
 ) !distributed_graph.GraphHydrateResponse {
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    if (ctx.source.distributed_router) |router| {
+        var route = (try table_router.resolveGroupRoute(
+            alloc,
+            ctx.source.catalog,
+            router,
+            group_id,
+            routePolicyForConsistency(consistency),
+        )) orelse return error.TableNotFound;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => {},
+            .remote => |remote| return try graphHydrateRemote(
+                ctx.source.distributedInternalExecutor(),
+                alloc,
+                remote.base_uri,
+                group_id,
+                table_name,
+                req,
+            ),
+        }
+    }
     var attempt: usize = 0;
     while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
         return executeProvisionedGraphHydrateAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
@@ -8037,7 +8383,17 @@ fn executeProvisionedGraphHydrateAttempt(
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
     const self = ctx.source;
     const search_req = graphHydrateSearchRequest(req);
-    var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = search_req }, consistency, .general, req.topology_epoch);
+    var read_activity = try self.prepareKnownGroupReadStrict(
+        alloc,
+        group_id,
+        table_name,
+        .{ .search = search_req },
+        consistency,
+        .general,
+        req.topology_epoch,
+        req.timeout_ms,
+        req.cancellation orelse .none,
+    );
     defer if (read_activity) |*activity| activity.deinit();
     var db_owner = try provisionedLocalQueryDbOwner(
         self.resident_db,
@@ -8081,7 +8437,14 @@ fn executeHostedGraphHydrate(
     defer route.deinit(alloc);
 
     return switch (route) {
-        .local => blk: {
+        .local => if (self.local_source) |local|
+            (try local.graphHydrateGroupLocal(alloc, group_id, table_name, req, consistency)) orelse error.TableNotFound
+        else blk: {
+            if (consistency != .stale) if (self.graph_read_barrier) |barrier| {
+                try barrier.wait(alloc, group_id, table_name, req.timeout_ms, req.cancellation orelse .none);
+            };
+            const local_consistency: raft_mod.ReadConsistency =
+                if (consistency != .stale and self.graph_read_barrier != null) .stale else consistency;
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
             const identity_namespace = try requireTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
@@ -8095,7 +8458,7 @@ fn executeHostedGraphHydrate(
             try validateGraphHydrateResolvedDocFilterForDb(req, &db);
 
             const reads = raft_mod.FeatureDBReads.init(group_id, self.requester);
-            break :blk try graphHydrateOnOpenDb(alloc, reads, &db, req, consistency, false);
+            break :blk try graphHydrateOnOpenDb(alloc, reads, &db, req, local_consistency, false);
         },
         .remote => |remote| blk: {
             if (req.resolved_doc_filter != null) {
@@ -8124,6 +8487,27 @@ fn executeProvisionedGraphGetEdges(
     consistency: raft_mod.ReadConsistency,
 ) anyerror!distributed_graph.GraphEdgesResponse {
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    if (ctx.source.distributed_router) |router| {
+        var route = (try table_router.resolveGroupRoute(
+            alloc,
+            ctx.source.catalog,
+            router,
+            group_id,
+            routePolicyForConsistency(consistency),
+        )) orelse return error.TableNotFound;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => {},
+            .remote => |remote| return try graphEdgesRemote(
+                ctx.source.distributedInternalExecutor(),
+                alloc,
+                remote.base_uri,
+                group_id,
+                table_name,
+                req,
+            ),
+        }
+    }
     var attempt: usize = 0;
     while (attempt < ProvisionedTableReadSource.topology_read_attempt_limit) : (attempt += 1) {
         return executeProvisionedGraphGetEdgesAttempt(ptr, alloc, group_id, table_name, req, consistency) catch |err| switch (err) {
@@ -8149,7 +8533,17 @@ fn executeProvisionedGraphGetEdgesAttempt(
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
     const self = ctx.source;
     try distributed_graph.validateGraphEdgesTensorAccessPath(alloc, req);
-    var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = req.key, .opts = .{} } }, consistency, .general, req.topology_epoch);
+    var read_activity = try self.prepareKnownGroupReadStrict(
+        alloc,
+        group_id,
+        table_name,
+        .{ .lookup = .{ .key = req.key, .opts = .{} } },
+        consistency,
+        .general,
+        req.topology_epoch,
+        req.timeout_ms,
+        req.cancellation orelse .none,
+    );
     defer if (read_activity) |*activity| activity.deinit();
     var db_owner = try provisionedLocalQueryDbOwner(
         self.resident_db,
@@ -8183,7 +8577,16 @@ fn executeHostedGraphGetEdges(
     defer route.deinit(alloc);
 
     return switch (route) {
-        .local => graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency),
+        .local => if (self.local_source) |local|
+            (try local.graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency)) orelse error.TableNotFound
+        else blk: {
+            if (consistency != .stale) if (self.graph_read_barrier) |barrier| {
+                try barrier.wait(alloc, group_id, table_name, req.timeout_ms, req.cancellation orelse .none);
+            };
+            const local_consistency: raft_mod.ReadConsistency =
+                if (consistency != .stale and self.graph_read_barrier != null) .stale else consistency;
+            break :blk try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, local_consistency);
+        },
         .remote => |remote| try graphEdgesRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, req),
     };
 }
@@ -8256,6 +8659,7 @@ fn lookupProvisionedLocal(
     key: []const u8,
     opts: db_mod.types.LookupOptions,
     consistency: raft_mod.ReadConsistency,
+    read_activity_held: bool,
 ) !?LookupResponse {
     try checkLookupOptionsActive(opts);
     // Point lookups need only the primary document store. Prefer the existing
@@ -8266,7 +8670,7 @@ fn lookupProvisionedLocal(
     // routing before reaching this function again. A null lease is reserved for
     // query-only runtimes, which use the cache.
     if (resident_db) |source| {
-        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{ .read_activity_held = true })) |lease_value| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{ .read_activity_held = read_activity_held })) |lease_value| {
             var lease = lease_value;
             defer lease.release(alloc);
             try checkLookupOptionsActive(opts);
@@ -8348,9 +8752,10 @@ fn lookupProvisionedHostedLocal(
     key: []const u8,
     opts: db_mod.types.LookupOptions,
     consistency: raft_mod.ReadConsistency,
+    read_activity_held: bool,
 ) !?LookupResponse {
-    return lookupProvisionedLocal(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, consistency) catch |err| switch (err) {
-        error.NotLeader => if (consistency == .stale) err else try lookupProvisionedLocal(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, .stale),
+    return lookupProvisionedLocal(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, consistency, read_activity_held) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try lookupProvisionedLocal(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, .stale, read_activity_held),
         else => err,
     };
 }
@@ -8554,7 +8959,7 @@ fn queryLocal(
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
 ) !db_mod.types.SearchResult {
-    var detailed = try queryLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
+    var detailed = try queryLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency, false);
     defer detailed.releaseDb();
     var result = detailed.result;
     result.identity_read_generation = detailed.request.identity_read_generation;
@@ -8804,6 +9209,7 @@ fn queryLocalDetailed(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
+    read_activity_held: bool,
 ) !LocalQueryExecution {
     // A provisioned writer/apply DB already owns the complete, generation-matched
     // index catalog. Lease it before consulting the query-read cache so a query
@@ -8812,7 +9218,7 @@ fn queryLocalDetailed(
     // phase. The lease holds read activity for its lifetime, preventing
     // structural maintenance from retiring the DB during search execution.
     if (resident_db) |source| {
-        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{ .read_activity_held = true })) |lease_value| {
+        if (try source.leaseGroup(alloc, table_name, group_id, lsm_root_generation, .{ .read_activity_held = read_activity_held })) |lease_value| {
             validateProvisionedDbIdentityNamespace(alloc, catalog, table_name, group_id, lease_value.db) catch |err| {
                 var lease = lease_value;
                 lease.release(alloc);
@@ -9208,7 +9614,7 @@ fn preflightProvisionedGroups(
             req,
             consistency,
             max_work,
-            true,
+            self.prepare_for_read != null,
         );
         if (first_summary == null) {
             first_summary = summary;
@@ -9232,8 +9638,9 @@ fn queryHostedLocal(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
+    read_activity_held: bool,
 ) !db_mod.types.SearchResult {
-    var detailed = try queryHostedLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency);
+    var detailed = try queryHostedLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency, read_activity_held);
     defer detailed.releaseDb();
     var result = detailed.result;
     // The coordinator needs the generation the shard actually read, including
@@ -9255,9 +9662,10 @@ fn queryHostedLocalDetailed(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
     consistency: raft_mod.ReadConsistency,
+    read_activity_held: bool,
 ) !LocalQueryExecution {
-    return queryLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency) catch |err| switch (err) {
-        error.NotLeader => if (consistency == .stale) err else try queryLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, .stale),
+    return queryLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, consistency, read_activity_held) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try queryLocalDetailed(resident_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, runtime_cfg, table_name, req, .stale, read_activity_held),
         else => err,
     };
 }
@@ -12783,7 +13191,7 @@ fn applyProvisionedQueryAggregations(
             self.visibleRootGeneration(group_ids[0]),
             self.backend_runtime,
             table_name,
-            true,
+            self.prepare_for_read != null,
         );
         defer db_owner.deinit();
         return try applyCapturedDbQueryAggregations(alloc, self.requester, group_ids[0], table_name, "provisioned-local", req, result, meta, db_owner.db(), consistency);
@@ -12856,7 +13264,7 @@ fn tryApplyProvisionedAlgebraicDistributedAggregations(
         self.visibleRootGeneration(group_ids[0]),
         self.backend_runtime,
         table_name,
-        true,
+        self.prepare_for_read != null,
     );
     defer first_owner.deinit();
     const first_db = first_owner.db();
@@ -12971,7 +13379,7 @@ fn collectProvisionedAlgebraicDistributedPartials(
                 self.visibleRootGeneration(group_id),
                 self.backend_runtime,
                 table_name,
-                true,
+                self.prepare_for_read != null,
             );
             break :blk db_owner.?.db();
         };
@@ -13071,7 +13479,11 @@ fn tryApplyHostedAlgebraicDistributedAggregations(
 ) !bool {
     if (group_ids.len <= 1 or req.aggregations_json.len == 0) return false;
     if (!canConsiderAlgebraicAggregations(req)) return false;
-    const representative_group_id: ?u64 = blk: {
+    // A routed Provisioned coordinator must not borrow a resident index
+    // pointer outside the local owner's read-admission lifetime. Its planner
+    // is configuration-only, so reconstruct it from the catalog and keep all
+    // per-group partial collection behind the group-local interface.
+    const representative_group_id: ?u64 = if (self.local_source != null) null else blk: {
         for (group_ids) |group_id| {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return false;
             defer route.deinit(alloc);
@@ -13118,7 +13530,10 @@ fn tryApplyHostedAlgebraicDistributedAggregations(
 
     var catalog_index = (try openCatalogAlgebraicPlannerIndex(alloc, self.catalog, table_name, req.index_name)) orelse return false;
     defer catalog_index.close();
-    if (!catalog_index.plannerLifecycleReady()) return false;
+    // This index is a configuration-only coordinator planner. It has no local
+    // shard store whose runtime lifecycle could become ready; every group-local
+    // partial endpoint independently enforces its resident index lifecycle,
+    // identity generation, and freshness before returning data.
     return try applyHostedAlgebraicDistributedAggregationsWithPlanner(
         self,
         alloc,
@@ -14062,17 +14477,9 @@ fn collectHostedAlgebraicDistributedPartials(
         defer route.deinit(alloc);
         const shard_partials = switch (route) {
             .local => blk: {
-                const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
-                defer alloc.free(path);
-                var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_id, self.visibleRootGeneration(group_id), self.backend_runtime);
-                defer db.close();
-                if (!(try algebraicIndexFreshEnoughForRequest(alloc, group_req, &db))) return null;
-                var parsed = try parseAlgebraicPartialsRequest(alloc, body);
-                defer parsed.deinit(alloc);
-                break :blk collectAlgebraicPartialsFromDbForRequest(alloc, &db, parsed) catch |err| switch (err) {
-                    error.HllCardinalityUnavailable => return null,
-                    else => return err,
-                };
+                var response = self.requireAlgebraicPartialsLocal(alloc, group_id, table_name, body) catch return null;
+                defer response.deinit(alloc);
+                break :blk try parseAlgebraicPartialsResponse(alloc, response.json);
             },
             .remote => |remote| blk: {
                 var response = (algebraicPartialsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req) catch return null) orelse return null;
@@ -15500,7 +15907,7 @@ fn collectProvisionedSearchRequestTextStats(
             group_req.identity_read_generation = generation.?;
             const body = try encodeQueryTextStatsRequest(alloc, group_req);
             defer alloc.free(body);
-            var response = (try collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, true)) orelse return error.TableNotFound;
+            var response = (try collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, self.prepare_for_read != null)) orelse return error.TableNotFound;
             defer response.deinit(alloc);
             shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
             initialized += 1;
@@ -15525,7 +15932,7 @@ fn collectProvisionedSearchRequestTextStats(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        var response = (try collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, true)) orelse return error.TableNotFound;
+        var response = (try collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, self.prepare_for_read != null)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -15561,7 +15968,7 @@ fn collectHostedSearchRequestTextStats(
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
             defer route.deinit(alloc);
             var response = switch (route) {
-                .local => (try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse return error.TableNotFound,
+                .local => try self.requireTextStatsLocal(alloc, group_id, table_name, body),
                 .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
             };
             defer response.deinit(alloc);
@@ -15591,7 +15998,7 @@ fn collectHostedSearchRequestTextStats(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         var response = switch (route) {
-            .local => (try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse return error.TableNotFound,
+            .local => try self.requireTextStatsLocal(alloc, group_id, table_name, body),
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -15634,7 +16041,7 @@ fn collectProvisionedAggregationTextStats(
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         const body = try encodeExplicitTextStatsRequestForSearchRequest(alloc, field_requests, group_req);
         defer alloc.free(body);
-        var response = (try collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, true)) orelse return error.TableNotFound;
+        var response = (try collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, self.prepare_for_read != null)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -15674,7 +16081,7 @@ fn collectProvisionedAggregationBackgroundTextStats(
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         const body = try encodeBackgroundTextStatsRequestForSearchRequest(alloc, field_requests, group_req);
         defer alloc.free(body);
-        var response = (try collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, true)) orelse return error.TableNotFound;
+        var response = (try collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, self.prepare_for_read != null)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseBackgroundTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -15718,7 +16125,7 @@ fn collectHostedAggregationTextStats(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         var response = switch (route) {
-            .local => (try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse return error.TableNotFound,
+            .local => try self.requireTextStatsLocal(alloc, group_id, table_name, body),
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -15764,7 +16171,7 @@ fn collectHostedAggregationBackgroundTextStats(
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TableNotFound;
         defer route.deinit(alloc);
         var response = switch (route) {
-            .local => (try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false)) orelse return error.TableNotFound,
+            .local => try self.requireTextStatsLocal(alloc, group_id, table_name, body),
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -19092,6 +19499,7 @@ test "provisioned local query execution returns stamped identity request" {
         "docs",
         .{ .limit = 1 },
         .stale,
+        false,
     );
     defer execution.releaseDb();
     defer execution.result.deinit();
@@ -19415,6 +19823,7 @@ test "provisioned local query reuses resident generation without readonly open" 
         "docs",
         .{ .limit = 1 },
         .stale,
+        false,
     );
     defer execution.releaseDb();
     defer execution.result.deinit();
@@ -19723,6 +20132,36 @@ test "provisioned graph hydrate completes consistency before resident read admis
         }
     };
 
+    const VisibilityTracker = struct {
+        reads: *ReadTracker,
+        gate: *GateTracker,
+        waits: usize = 0,
+
+        fn iface(self: *@This()) GraphReadBarrier {
+            return .{ .ptr = self, .wait_fn = wait };
+        }
+
+        fn wait(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            timeout_ms: ?u32,
+            cancellation: db_mod.types.CancellationToken,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7001), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(?u32, 123), timeout_ms);
+            try cancellation.check();
+            // The combined production barrier owns ReadIndex plus derived
+            // visibility and must finish before table read admission.
+            try std.testing.expectEqual(self.reads.ends, self.reads.begins);
+            self.gate.requests += 1;
+            self.waits += 1;
+        }
+    };
+
     const RootGeneration = struct {
         fn source() GroupVisibleRootGenerationSource {
             return .{
@@ -19741,6 +20180,7 @@ test "provisioned graph hydrate completes consistency before resident read admis
     var resident = ResidentSource{ .db = &db, .active_reads = &active_reads };
     var tracker: ReadTracker = .{ .active_reads = &active_reads };
     var gate = GateTracker{ .reads = &tracker };
+    var visibility = VisibilityTracker{ .reads = &tracker, .gate = &gate };
     var source = ProvisionedTableReadSource.init(
         "/tmp/antfly-graph-hydrate-fallback-must-not-open",
         SingleGroupReadTestCatalog.iface(),
@@ -19749,6 +20189,7 @@ test "provisioned graph hydrate completes consistency before resident read admis
     source.resident_db = resident.iface();
     source.prepare_for_read = tracker.iface();
     _ = source.withGroupVisibleRootGeneration(RootGeneration.source());
+    _ = source.withGraphReadBarrier(visibility.iface());
 
     var worker_ctx = ProvisionedGraphWorkerContext.init(&source);
     var response = try executeProvisionedGraphHydrate(
@@ -19756,7 +20197,7 @@ test "provisioned graph hydrate completes consistency before resident read admis
         alloc,
         7001,
         "docs",
-        .{ .keys = @constCast((&[_][]u8{})[0..]), .include_hits = false },
+        .{ .keys = @constCast((&[_][]u8{})[0..]), .include_hits = false, .timeout_ms = 123 },
         .read_index,
     );
     response.deinit(alloc);
@@ -19766,6 +20207,7 @@ test "provisioned graph hydrate completes consistency before resident read admis
     try std.testing.expectEqual(@as(usize, 1), resident.preparations);
     try std.testing.expect(resident.observed_read_activity_held);
     try std.testing.expectEqual(@as(usize, 2), gate.requests);
+    try std.testing.expectEqual(@as(usize, 2), visibility.waits);
     try std.testing.expectEqual(@as(usize, 2), tracker.begins);
     try std.testing.expectEqual(@as(usize, 2), tracker.ends);
 
@@ -19782,6 +20224,7 @@ test "provisioned graph hydrate completes consistency before resident read admis
     try std.testing.expectEqual(@as(usize, 3), resident.leases);
     try std.testing.expectEqual(@as(usize, 2), resident.releases);
     try std.testing.expectEqual(@as(usize, 2), gate.requests);
+    try std.testing.expectEqual(@as(usize, 2), visibility.waits);
     try std.testing.expectEqual(@as(usize, 3), tracker.begins);
     try std.testing.expectEqual(@as(usize, 3), tracker.ends);
 
@@ -19802,6 +20245,7 @@ test "provisioned graph hydrate completes consistency before resident read admis
     try std.testing.expectEqual(@as(usize, 3), resident.releases);
     try std.testing.expect(!resident.observed_read_activity_held);
     try std.testing.expectEqual(@as(usize, 2), gate.requests);
+    try std.testing.expectEqual(@as(usize, 2), visibility.waits);
     try std.testing.expectEqual(@as(usize, 3), tracker.begins);
     try std.testing.expectEqual(@as(usize, 3), tracker.ends);
 }
@@ -20812,6 +21256,27 @@ test "provisioned table read source falls back from read_index to stale on not l
     defer parsed.deinit();
     try std.testing.expectEqualStrings("doc:a", parsed.value.responses.?[0].hits.?.hits.?[0]._id);
     try std.testing.expectEqual(@as(usize, 2), requester.count);
+    try std.testing.expectEqual(@as(usize, 2), reads.begins);
+    try std.testing.expectEqual(@as(usize, 2), reads.ends);
+
+    // A distributed coordinator has a route/retry owner and therefore must
+    // not inherit the legacy local-availability downgrade. It observes
+    // NotLeader before acquiring table read admission and can fail closed.
+    try std.testing.expectError(
+        error.NotLeader,
+        source.prepareKnownGroupReadStrict(
+            alloc,
+            7001,
+            "docs",
+            .{ .lookup = .{ .key = "doc:a", .opts = .{} } },
+            .read_index,
+            .general,
+            0,
+            null,
+            .none,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 3), requester.count);
     try std.testing.expectEqual(@as(usize, 2), reads.begins);
     try std.testing.expectEqual(@as(usize, 2), reads.ends);
 }
@@ -23530,7 +23995,7 @@ test "provisioned distributed aggregations collect path terms nested cardinality
                     .name = "docs",
                     .placement_role = "data",
                     .indexes_json =
-                    \\{"alg":{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}}
+                    \\{"alg":{"type":"algebraic","version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}}
                     ,
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
@@ -23555,6 +24020,7 @@ test "provisioned distributed aggregations collect path terms nested cardinality
         attempts: usize = 0,
         leases: usize = 0,
         releases: usize = 0,
+        outer_admission_claims: usize = 0,
 
         fn iface(self: *@This()) ResidentDbSource {
             return .{
@@ -23573,7 +24039,7 @@ test "provisioned distributed aggregations collect path terms nested cardinality
         ) !?ResidentDbLease {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expect(options.read_activity_held);
+            if (options.read_activity_held) self.outer_admission_claims += 1;
             self.attempts += 1;
             if (self.fail_next) {
                 self.fail_next = false;
@@ -23685,10 +24151,20 @@ test "provisioned distributed aggregations collect path terms nested cardinality
         FakeRouter.iface(),
         executor_state.iface(),
     );
+    // A public Provisioned coordinator may reuse Hosted routing, but a route
+    // that resolves locally must still acquire the Provisioned resident owner
+    // for every shard partial. The catalog-only planner needs no DB lease.
+    hosted.local_source = source.source();
     var hosted_meta: query_api.QueryResponseMeta = .{};
     defer hosted_meta.deinit(alloc);
     try std.testing.expect(try tryApplyHostedAlgebraicDistributedAggregations(&hosted, alloc, group_ids[0..], "docs", stamped_req, &hosted_meta, .read_index, null));
     try std.testing.expectEqual(@as(usize, 0), executor_state.call_count);
+    try std.testing.expectEqual(@as(usize, 7), resident.attempts);
+    try std.testing.expectEqual(@as(usize, 6), resident.leases);
+    try std.testing.expectEqual(resident.leases, resident.releases);
+    // This source intentionally has no ReadPreparation hook. Every resident
+    // lease must therefore be told to acquire its own admission.
+    try std.testing.expectEqual(@as(usize, 0), resident.outer_admission_claims);
 
     try std.testing.expectEqual(@as(usize, 1), meta.aggregation_results.len);
     const aggregation = meta.aggregation_results[0];
@@ -26500,6 +26976,7 @@ test "provisioned primary lookup lease fails on identity namespace mismatch" {
         "doc:a",
         .{},
         .stale,
+        false,
     ));
 }
 

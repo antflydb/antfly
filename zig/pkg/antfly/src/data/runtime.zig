@@ -1183,6 +1183,16 @@ const RaftTableApplyStateMachine = struct {
         outcome: ApplyOutcome = .pending,
     };
 
+    const ReadLeaseKey = struct {
+        group_id: u64,
+        request_id: u64,
+    };
+
+    const ReadLeaseWaiter = struct {
+        target_index: ?u64 = null,
+        complete: bool = false,
+    };
+
     alloc: std.mem.Allocator,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
     applied_mutex: std.atomic.Mutex = .unlocked,
@@ -1192,6 +1202,11 @@ const RaftTableApplyStateMachine = struct {
     // The map is therefore bounded by live synchronous proposals rather than
     // by Raft history or an eviction policy that could lose an outcome.
     apply_outcomes: std.AutoHashMapUnmanaged(ApplyFailureKey, ApplyOutcomeWaiter) = .empty,
+    // ReadIndex is asynchronous: enqueuing it is not a read barrier. A caller
+    // registers before issuing the request and waits until the corresponding
+    // ReadState has crossed this exact replica's state-machine apply boundary.
+    // Only live requests are retained, so this map is request-bounded.
+    read_lease_waiters: std.AutoHashMapUnmanaged(ReadLeaseKey, ReadLeaseWaiter) = .empty,
 
     fn init(
         alloc: std.mem.Allocator,
@@ -1211,6 +1226,7 @@ const RaftTableApplyStateMachine = struct {
         self.write_source.deinit();
         self.applied_indexes.deinit(self.alloc);
         self.apply_outcomes.deinit(self.alloc);
+        self.read_lease_waiters.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -1283,6 +1299,66 @@ const RaftTableApplyStateMachine = struct {
 
         const existing = self.applied_indexes.get(group_id) orelse 0;
         if (applied_index > existing) try self.applied_indexes.put(self.alloc, group_id, applied_index);
+        const visible_applied_index = @max(existing, applied_index);
+        var read_waiters = self.read_lease_waiters.iterator();
+        while (read_waiters.next()) |entry| {
+            if (entry.key_ptr.group_id != group_id) continue;
+            const target_index = entry.value_ptr.target_index orelse continue;
+            if (visible_applied_index >= target_index) entry.value_ptr.complete = true;
+        }
+    }
+
+    fn registerReadLease(self: *RaftTableApplyStateMachine, group_id: u64, request_id: u64) !void {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const result = try self.read_lease_waiters.getOrPut(self.alloc, .{
+            .group_id = group_id,
+            .request_id = request_id,
+        });
+        if (result.found_existing) return error.DuplicateRaftReadLeaseWaiter;
+        result.value_ptr.* = .{};
+    }
+
+    fn cancelReadLease(self: *RaftTableApplyStateMachine, group_id: u64, request_id: u64) void {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        _ = self.read_lease_waiters.remove(.{ .group_id = group_id, .request_id = request_id });
+    }
+
+    fn takeCompletedReadLease(self: *RaftTableApplyStateMachine, group_id: u64, request_id: u64) bool {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const key = ReadLeaseKey{ .group_id = group_id, .request_id = request_id };
+        const waiter = self.read_lease_waiters.get(key) orelse return false;
+        if (!waiter.complete) return false;
+        _ = self.read_lease_waiters.remove(key);
+        return true;
+    }
+
+    fn observeReadStates(
+        self: *RaftTableApplyStateMachine,
+        group_id: u64,
+        read_states: []const raft_engine.core.ReadState,
+    ) void {
+        if (read_states.len == 0) return;
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const applied_index = self.applied_indexes.get(group_id) orelse 0;
+        for (read_states) |read_state| {
+            const separator = std.mem.lastIndexOfScalar(u8, read_state.request_ctx, ':') orelse continue;
+            if (separator + 1 >= read_state.request_ctx.len) continue;
+            const request_id = std.fmt.parseUnsigned(
+                u64,
+                read_state.request_ctx[separator + 1 ..],
+                16,
+            ) catch continue;
+            const waiter = self.read_lease_waiters.getPtr(.{
+                .group_id = group_id,
+                .request_id = request_id,
+            }) orelse continue;
+            waiter.target_index = read_state.index;
+            waiter.complete = applied_index >= read_state.index;
+        }
     }
 
     fn registerApplyOutcomeWaiter(
@@ -1345,7 +1421,7 @@ const RaftTableApplyStateMachine = struct {
         group_id: raft_engine.core.types.GroupId,
         snapshot: ?raft_engine.core.types.Snapshot,
         committed_entries: []const raft_engine.core.Entry,
-        _: []const raft_engine.core.ReadState,
+        read_states: []const raft_engine.core.ReadState,
     ) !void {
         const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
         const snapshot_index: u64 = if (snapshot) |value| value.metadata.index else 0;
@@ -1400,6 +1476,7 @@ const RaftTableApplyStateMachine = struct {
             };
         }
         if (last_index > 0) try self.publishAppliedReady(group_id, snapshot_index, committed_entries, last_index);
+        self.observeReadStates(group_id, read_states);
     }
 };
 
@@ -3044,7 +3121,7 @@ const OwnedLocalGroupStatusRefresh = struct {
         self.alloc.free(self.ranges);
         for (self.stores) |record| antfly.metadata.table_manager.freeStore(self.alloc, record);
         self.alloc.free(self.stores);
-        self.alloc.free(self.merged_group_statuses);
+        freeMergedGroupStatusesOwned(self.alloc, self.merged_group_statuses);
         for (self.split_transitions) |record| antfly.metadata.table_manager.freeSplitTransitionRecord(self.alloc, record);
         self.alloc.free(self.split_transitions);
         for (self.merge_transitions) |record| antfly.metadata.table_manager.freeMergeTransitionRecord(self.alloc, record);
@@ -3055,6 +3132,34 @@ const OwnedLocalGroupStatusRefresh = struct {
         self.* = undefined;
     }
 };
+
+test "owned local group status refresh releases merged status lifecycle strings" {
+    var server: DataServer = undefined;
+    const statuses = [_]antfly.metadata.reconciler.MergedGroupStatus{.{
+        .group_id = 77,
+        .doc_identity_lifecycle = "retired",
+    }};
+    var refresh = try OwnedLocalGroupStatusRefresh.init(
+        std.testing.allocator,
+        &server,
+        1,
+        2,
+        "replicas",
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &statuses,
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        null,
+        null,
+        null,
+    );
+    refresh.deinit();
+}
 
 const InferredSnapshotLeadershipConfig = struct {
     local_node_id: u64,
@@ -4589,6 +4694,7 @@ pub const DataServer = struct {
     data_raft_factory: ?*DataDescriptorFactory = null,
     data_raft_store: ?*raft_engine.core.MemoryStorage = null,
     data_raft_apply: ?*RaftTableApplyStateMachine = null,
+    data_read_lease_sequence: std.atomic.Value(u64) = .init(1),
     data_raft_base_uri: ?[]u8 = null,
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
@@ -5181,6 +5287,18 @@ pub const DataServer = struct {
         try self.provisioned_storage.attachSources(&self.read_source, &self.write_source);
         if (self.data_raft) |raft| {
             try raft.attachDataApplyStoreResourceManager(&self.provisioned_storage.resource_manager);
+            // Public strong distributed reads must follow the live data-Raft
+            // leader for each group. The former no-op requester plus local
+            // follower fallback could publish a partial graph while the
+            // acknowledged leader had already reached `full_index`.
+            self.read_source.requester = self.dataReadableLeaseRequester();
+            _ = self.read_source.withGraphReadBarrier(self.dataGraphReadBarrier());
+            _ = self.read_source.withDistributedRouting(
+                self.dataReadGroupRouter(),
+                raft.host.http_host.request_executor,
+                api_server_cfg.internal_service_secret,
+                api_server_cfg.internal_service_issuer,
+            );
         }
         _ = self.read_source.withHAReadGate(self.haReadGate());
         const ha_write_gate = self.haWriteGate();
@@ -7190,6 +7308,12 @@ pub const DataServer = struct {
 
     pub fn refreshRemoteMetadataSnapshot(self: *DataServer) !void {
         const remote_metadata = self.remote_metadata orelse return;
+        // "Refresh" is an explicit freshness boundary. Going through the
+        // ordinary fetch path without invalidation can legally return a
+        // snapshot cached for metadata_snapshot_cache_ttl_ms, which makes the
+        // caller believe a just-published catalog mutation is visible when it
+        // is not. Retire both the head and snapshot before fetching.
+        remote_metadata.invalidateCache();
         var snapshot = try remote_metadata.fetchSnapshot();
         freeAdminSnapshotOwned(self.alloc, &snapshot);
     }
@@ -7247,6 +7371,215 @@ pub const DataServer = struct {
                 .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
             },
         };
+    }
+
+    fn dataReadGroupRouter(self: *DataServer) antfly.public_api.table_router.HostedGroupRouter {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .local_node_id = dataReadRouterLocalNodeId,
+                .local_status = dataReadRouterLocalStatus,
+                .group_leader_node_id = dataReadRouterGroupLeaderNodeId,
+                .node_base_uri = dataReadRouterNodeBaseUri,
+                .node_base_uri_for_group = dataReadRouterNodeBaseUriForGroup,
+            },
+        };
+    }
+
+    fn dataReadableLeaseRequester(self: *DataServer) antfly.raft.ReadableLeaseRequester {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .request_readable_lease = requestDataReadableLease },
+        };
+    }
+
+    fn dataGraphReadBarrier(self: *DataServer) antfly.public_api.table_reads.GraphReadBarrier {
+        return .{
+            .ptr = self,
+            .wait_fn = waitForDataGraphReadBarrier,
+        };
+    }
+
+    const GraphReadDeadline = struct {
+        server: *DataServer,
+        cancellation: antfly.db.types.CancellationToken,
+        deadline_ns: ?u64,
+
+        fn init(
+            server: *DataServer,
+            cancellation: antfly.db.types.CancellationToken,
+            timeout_ms: ?u32,
+        ) GraphReadDeadline {
+            return .{
+                .server = server,
+                .cancellation = cancellation,
+                .deadline_ns = if (timeout_ms) |milliseconds|
+                    server.dataRaftMonotonicNs() +| (@as(u64, milliseconds) * std.time.ns_per_ms)
+                else
+                    null,
+            };
+        }
+
+        fn token(self: *const GraphReadDeadline) antfly.db.types.CancellationToken {
+            return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+        }
+
+        fn isCancelled(ptr: *const anyopaque) bool {
+            const self: *const GraphReadDeadline = @ptrCast(@alignCast(ptr));
+            return self.cancellation.isCancelled() or self.timedOut();
+        }
+
+        fn timedOut(self: *const GraphReadDeadline) bool {
+            const deadline_ns = self.deadline_ns orelse return false;
+            return self.server.dataRaftMonotonicNs() >= deadline_ns;
+        }
+
+        fn classify(self: *const GraphReadDeadline, err: anyerror) anyerror {
+            if (self.cancellation.isCancelled()) return error.Cancelled;
+            if (self.timedOut()) return error.Timeout;
+            return err;
+        }
+    };
+
+    fn waitForDataGraphReadBarrier(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        timeout_ms: ?u32,
+        cancellation: antfly.db.types.CancellationToken,
+    ) anyerror!void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var deadline = GraphReadDeadline.init(self, cancellation, timeout_ms);
+        const bounded_cancellation = deadline.token();
+        // ReadIndex is the base-state quorum barrier. Derived indexes are
+        // maintained outside Raft apply, so a newly elected leader must also
+        // catch its local graph/full-text state up before serving the phase.
+        self.requestDataReadableLeaseWithCancellation(
+            group_id,
+            "distributed-graph:read-index",
+            timeout_ms,
+            bounded_cancellation,
+        ) catch |err| return deadline.classify(err);
+        const apply_sm = self.data_raft_apply orelse return error.NotLeader;
+        apply_sm.write_source.syncReplicatedBatchGroupLocalWithCancellation(
+            alloc,
+            group_id,
+            table_name,
+            .full_index,
+            bounded_cancellation,
+        ) catch |err| return deadline.classify(err);
+    }
+
+    fn requestDataReadableLease(
+        ptr: *anyopaque,
+        group_id: u64,
+        request_ctx: []const u8,
+    ) anyerror!void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        try self.requestDataReadableLeaseWithCancellation(group_id, request_ctx, null, .none);
+    }
+
+    fn requestDataReadableLeaseWithCancellation(
+        self: *DataServer,
+        group_id: u64,
+        request_ctx: []const u8,
+        timeout_ms: ?u32,
+        cancellation: antfly.db.types.CancellationToken,
+    ) anyerror!void {
+        const raft = self.data_raft orelse return error.NotLeader;
+        const apply_sm = self.data_raft_apply orelse return error.NotLeader;
+        var request_id = self.data_read_lease_sequence.fetchAdd(1, .monotonic);
+        if (request_id == 0) request_id = self.data_read_lease_sequence.fetchAdd(1, .monotonic);
+        try apply_sm.registerReadLease(group_id, request_id);
+        var waiter_live = true;
+        defer if (waiter_live) apply_sm.cancelReadLease(group_id, request_id);
+
+        var context_buffer: [160]u8 = undefined;
+        const unique_context = std.fmt.bufPrint(
+            &context_buffer,
+            "{s}:vopr-read-v1:{x}",
+            .{ request_ctx, request_id },
+        ) catch return error.ReadIndexContextTooLong;
+
+        // RawNode mutation and Ready processing share this owner lock. Release
+        // it before waiting so the Raft driver can deliver the quorum response
+        // and apply the resulting ReadState.
+        lockAtomic(&self.data_raft_mutex);
+        raft.requestReadableLease(group_id, unique_context) catch |err| {
+            self.data_raft_mutex.unlock();
+            return err;
+        };
+        self.data_raft_mutex.unlock();
+
+        const io = self.dataRaftIo() orelse return error.BackendRuntimeUnavailable;
+        const started_ns = self.dataRaftMonotonicNs();
+        const default_timeout_ns: u64 = 5 * std.time.ns_per_s;
+        const timeout_ns = if (timeout_ms) |milliseconds|
+            @min(default_timeout_ns, @as(u64, milliseconds) * std.time.ns_per_ms)
+        else
+            default_timeout_ns;
+        if (cancellation.isCancelled()) return error.Cancelled;
+        while (self.dataRaftMonotonicNs() -| started_ns < timeout_ns) {
+            if (cancellation.isCancelled()) return error.Cancelled;
+            if (apply_sm.takeCompletedReadLease(group_id, request_id)) {
+                waiter_live = false;
+                return;
+            }
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.ReadIndexTimeout;
+    }
+
+    fn dataReadRouterLocalNodeId(ptr: *anyopaque) u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return 0;
+        return raft.host.http_host.host.cfg.local_node_id;
+    }
+
+    fn dataReadRouterLocalStatus(ptr: *anyopaque, group_id: u64) antfly.raft.host.HostedReplicaStatus {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return .absent;
+        return raft.host.http_host.host.status(group_id);
+    }
+
+    fn dataReadRouterGroupLeaderNodeId(ptr: *anyopaque, group_id: u64) ?u64 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const raft = self.data_raft orelse return null;
+        return raft.host.http_host.host.leaderId(group_id);
+    }
+
+    fn dataReadRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.read_source.catalog.adminSnapshot();
+        defer self.read_source.catalog.freeAdminSnapshot(&snapshot);
+        const store = findSnapshotStoreByNodeId(snapshot.stores, node_id) orelse return null;
+        if (!store.live or !std.mem.eql(u8, store.health_class, "healthy") or store.api_url.len == 0)
+            return null;
+        return try alloc.dupe(u8, store.api_url);
+    }
+
+    fn dataReadRouterNodeBaseUriForGroup(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        node_id: u64,
+    ) !?[]u8 {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.read_source.catalog.adminSnapshot();
+        defer self.read_source.catalog.freeAdminSnapshot(&snapshot);
+        var readable_placement = false;
+        for (snapshot.placement_intents) |intent| {
+            if (intent.record.group_id != group_id or intent.record.local_node_id != node_id) continue;
+            if (!antfly.raft.reconciler.placementReadableWithPeers(snapshot.placement_intents, intent)) continue;
+            readable_placement = true;
+            break;
+        }
+        if (!readable_placement) return null;
+        const store = findSnapshotStoreByNodeId(snapshot.stores, node_id) orelse return null;
+        if (!store.live or !std.mem.eql(u8, store.health_class, "healthy") or store.api_url.len == 0)
+            return null;
+        return try alloc.dupe(u8, store.api_url);
     }
 
     fn routedRaftBatchWriter(self: *DataServer) antfly.public_api.internal_group_operations.RoutedRaftBatchWriter {
@@ -7883,8 +8216,13 @@ pub const DataServer = struct {
             defer if (protocol_activation_lock_owned) protocol_activation_entry.?.activation_mutex.unlock();
             if (preflighted_local_leader) {
                 if (batchMutatesDocuments(req)) {
+                    // No proposal has been attempted yet. A transition store
+                    // that is not ready is retryable unavailability, not an
+                    // ambiguous write outcome: returning the latter would
+                    // falsely tell ingress that this mutation may have
+                    // committed and suppress safe routing fallback.
                     const source_store = self.localTransitionApplyStore() orelse
-                        return error.RaftBatchWriteOutcomeUnknown;
+                        return error.LeaderUnavailable;
                     if (try source_store.currentMergeSourceState(alloc, group_id)) |merge_source| {
                         if (merge_source.phase == .finalized) return error.MergeSourceFenced;
                     }
@@ -7982,8 +8320,10 @@ pub const DataServer = struct {
                         // proposing a batch that skipped pressure admission.
                         retry_for_leader_preflight = true;
                     } else {
+                        // Leadership disappeared before proposal acceptance,
+                        // so the caller may safely retry another route.
                         const status = raft.host.http_host.host.raftStatus(group_id) orelse
-                            return error.RaftBatchWriteOutcomeUnknown;
+                            return error.LeaderUnavailable;
                         // Recheck the shared state while proposal ordering is
                         // locked. A concurrent request may have appended the
                         // barrier after this request skipped its singleflight
@@ -8694,6 +9034,7 @@ pub const DataServer = struct {
             // apply it twice, so callers must receive an explicit ambiguous
             // outcome instead of transparent failover.
             error.RaftBatchWriteOutcomeUnknown,
+            error.RaftBatchWriteTransportOutcomeUnknown,
             error.UnexpectedHttpStatus,
             error.HttpConnectionClosing,
             error.ConnectionResetByPeer,
@@ -20222,6 +20563,52 @@ test "DataServer VOPR background owner executes and cancels maintenance on VoprI
     try std.testing.expect(!server.provisioned_warmup_active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), background_jobs.stats().pending_jobs);
     try std.testing.expect(sim.scheduler().quiescent());
+}
+
+test "data raft read lease completes only after matching ReadState apply" {
+    const alloc = std.testing.allocator;
+    var apply_sm = RaftTableApplyStateMachine.init(
+        alloc,
+        "/tmp/unused-antfly-read-lease-state",
+        antfly.public_api.table_catalog.emptyCatalogSource(),
+        null,
+    );
+    defer apply_sm.deinit();
+
+    try apply_sm.registerReadLease(7001, 0x2a);
+    try apply_sm.publishAppliedReady(7001, 0, &.{}, 7);
+    try std.testing.expect(!apply_sm.takeCompletedReadLease(7001, 0x2a));
+    apply_sm.observeReadStates(7001, &.{.{
+        .index = 7,
+        .request_ctx = @constCast("lookup:read_index:vopr-read-v1:2a"),
+    }});
+    try std.testing.expect(apply_sm.takeCompletedReadLease(7001, 0x2a));
+    try std.testing.expect(!apply_sm.takeCompletedReadLease(7001, 0x2a));
+
+    try apply_sm.registerReadLease(7001, 0x2b);
+    apply_sm.observeReadStates(7001, &.{.{
+        .index = 9,
+        .request_ctx = @constCast("search:read_index:vopr-read-v1:2b"),
+    }});
+    try std.testing.expect(!apply_sm.takeCompletedReadLease(7001, 0x2b));
+    try apply_sm.publishAppliedReady(7001, 0, &.{}, 9);
+    try std.testing.expect(apply_sm.takeCompletedReadLease(7001, 0x2b));
+
+    var server: DataServer = undefined;
+    server.backend_runtime = null;
+    var expired = DataServer.GraphReadDeadline.init(&server, .none, 0);
+    try std.testing.expect(expired.timedOut());
+    try std.testing.expect(expired.token().isCancelled());
+    try std.testing.expectEqual(error.Timeout, expired.classify(error.EnrichmentWaitCanceled));
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    var canceled_deadline = DataServer.GraphReadDeadline.init(
+        &server,
+        antfly.db.types.CancellationToken.fromAtomic(&cancelled),
+        null,
+    );
+    try std.testing.expect(canceled_deadline.token().isCancelled());
+    try std.testing.expectEqual(error.Cancelled, canceled_deadline.classify(error.EnrichmentWaitCanceled));
 }
 
 test "data raft bootstrap campaign retries leaderless voter elections" {
@@ -33628,6 +34015,7 @@ test "data raft forwarding distinguishes safe retries from ambiguous outcomes" {
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.Timeout));
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.ConnectionResetByPeer));
     try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.RaftBatchWriteOutcomeUnknown));
+    try std.testing.expectEqual(.outcome_unknown, DataServer.classifyDataRaftForwardError(error.RaftBatchWriteTransportOutcomeUnknown));
     // A peer's typed 202 proves the mutation committed. Preserve the pending
     // visibility/repair result instead of reclassifying it as ambiguous and
     // risking a transform replay.

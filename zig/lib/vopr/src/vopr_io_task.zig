@@ -80,13 +80,23 @@ const ExternalResourceSequence = struct {
     next_waiter_sequence: u64 = 1,
 };
 
+const TaskIdentitySequence = struct {
+    parent: ids.StableId,
+    callsite: u64,
+    next_sequence: u64 = 1,
+};
+
 const Task = struct {
     kernel: *Kernel,
     id: ids.StableId,
+    /// Immutable identity of the logical operation that created resources.
+    /// Scheduler identity may later bind to an inbound socket/listener wait,
+    /// but an outbound connection must not make its caller the child of the
+    /// previous retry's socket and thereby form a replay-fragile chain.
+    resource_owner_id: ids.StableId,
     identity_parent: ids.StableId,
     identity_sequence: u64,
     creation_sequence: u64,
-    next_child_sequence: u64 = 1,
     next_futex_sequence: u64 = 1,
     external_identity_bound: bool = false,
     resume_generation: u64 = 1,
@@ -186,6 +196,16 @@ const Entry = struct {
     }
 };
 
+fn taskIdentityAnchor(_: *const anyopaque, _: *anyopaque) void {}
+
+fn taskCallsite(start: *const fn (*const anyopaque, *anyopaque) void) u64 {
+    return @intFromPtr(start) -% @intFromPtr(&taskIdentityAnchor);
+}
+
+fn taskIdentityScope(parent: ids.StableId, start: *const fn (*const anyopaque, *anyopaque) void) ids.StableId {
+    return ids.derive("sim-io.task-callsite", parent, taskCallsite(start));
+}
+
 pub const Execution = struct {
     task_id: ids.StableId,
     completed: bool,
@@ -199,7 +219,6 @@ pub const Kernel = struct {
     /// to the logical parent task so unrelated owners cannot exchange them when
     /// their internal spawn calls happen in a different wall-memory order.
     next_sequence: u64 = 1,
-    next_root_task_sequence: u64 = 1,
     next_root_futex_sequence: u64 = 1,
     next_wait_sequence: u64 = 1,
     main_context: std.Io.fiber.Context = undefined,
@@ -210,6 +229,7 @@ pub const Kernel = struct {
     futex_identities: std.ArrayListUnmanaged(FutexIdentity) = .empty,
     external_wakes: std.ArrayListUnmanaged(ExternalWake) = .empty,
     external_resource_sequences: std.ArrayListUnmanaged(ExternalResourceSequence) = .empty,
+    task_identity_sequences: std.ArrayListUnmanaged(TaskIdentitySequence) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Kernel {
         if (config.stack_size < 64 * 1024) return error.VoprIoStackTooSmall;
@@ -230,6 +250,7 @@ pub const Kernel = struct {
         self.futex_identities.deinit(self.allocator);
         self.external_wakes.deinit(self.allocator);
         self.external_resource_sequences.deinit(self.allocator);
+        self.task_identity_sequences.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -465,6 +486,14 @@ pub const Kernel = struct {
         return task.checkCancel();
     }
 
+    /// Stable logical owner for resources created by the currently executing
+    /// fiber. Network identities use the immutable operation origin rather
+    /// than either global connect order or the mutable scheduler identity that
+    /// may bind to an external wait.
+    pub fn currentTaskId(self: *Kernel) ?ids.StableId {
+        return if (self.currentTask()) |task| task.resource_owner_id else null;
+    }
+
     pub fn sleepCurrent(self: *Kernel, sleep_info: ?Sleep) !void {
         const task = self.currentTask() orelse return error.VoprIoOperationOutsideTask;
         try task.checkCancel();
@@ -560,6 +589,42 @@ pub const Kernel = struct {
             .sequence = try self.allocateExternalWakeSequence(resource_id),
             .eligible_through = self.next_wait_sequence - 1,
         });
+    }
+
+    /// Move parked ownership from a provisional modeled resource to its
+    /// semantic identity before readiness becomes scheduler-visible.
+    pub fn rebindExternalResource(self: *Kernel, old_resource_id: ids.StableId, new_resource_id: ids.StableId) !void {
+        if (old_resource_id == new_resource_id) return;
+        var identity_count: u64 = 0;
+        for (self.tasks.items) |task| {
+            if (task.external_id == old_resource_id and task.identity_parent == old_resource_id)
+                identity_count += 1;
+        }
+        var next_identity: u64 = 0;
+        if (identity_count != 0) {
+            const resource = for (self.external_resource_sequences.items) |*candidate| {
+                if (candidate.resource_id == new_resource_id) break candidate;
+            } else blk: {
+                try self.external_resource_sequences.append(self.allocator, .{ .resource_id = new_resource_id });
+                break :blk &self.external_resource_sequences.items[self.external_resource_sequences.items.len - 1];
+            };
+            next_identity = resource.next_waiter_sequence;
+            resource.next_waiter_sequence = std.math.add(u64, next_identity, identity_count) catch
+                return error.VoprIoSequenceExhausted;
+        }
+        for (self.external_wakes.items) |*wake| {
+            if (wake.resource_id == old_resource_id) wake.resource_id = new_resource_id;
+        }
+        for (self.tasks.items) |task| {
+            if (task.external_id != old_resource_id) continue;
+            task.external_id = new_resource_id;
+            if (task.identity_parent != old_resource_id) continue;
+            const waiter_sequence = next_identity;
+            task.id = ids.derive("sim-io.external-task", new_resource_id, waiter_sequence);
+            task.identity_parent = new_resource_id;
+            task.identity_sequence = waiter_sequence;
+            next_identity += 1;
+        }
     }
 
     pub fn enumerateReady(self: *const Kernel, list: *transition.List, allocator: std.mem.Allocator) !void {
@@ -689,7 +754,7 @@ pub const Kernel = struct {
             return error.VoprIoTaskAlignmentUnsupported;
 
         const creation_sequence = try self.allocateSequence();
-        const identity = try self.allocateTaskIdentity();
+        const identity = try self.allocateTaskIdentity(start);
         const result_offset = result_alignment.forward(context_bytes.len);
         const storage_len = result_offset + @max(result_len, 1);
         const task = try self.allocator.create(Task);
@@ -708,9 +773,11 @@ pub const Kernel = struct {
             stack_alignment,
         );
         const entry_context: *Entry = @ptrFromInt(entry_address);
+        const task_id = ids.derive("sim-io.task", identity.parent, identity.sequence);
         task.* = .{
             .kernel = self,
-            .id = ids.derive("sim-io.task", identity.parent, identity.sequence),
+            .id = task_id,
+            .resource_owner_id = task_id,
             .identity_parent = identity.parent,
             .identity_sequence = identity.sequence,
             .creation_sequence = creation_sequence,
@@ -744,19 +811,35 @@ pub const Kernel = struct {
         sequence: u64,
     };
 
-    fn allocateTaskIdentity(self: *Kernel) !ScopedSequence {
-        if (self.current) |parent| {
-            if (parent.next_child_sequence == std.math.maxInt(u64))
+    fn allocateTaskIdentity(
+        self: *Kernel,
+        start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    ) !ScopedSequence {
+        const parent = if (self.current) |current| current.id else capability_kernel_id;
+        // Both addresses move by the same ASLR slide. The wrapping relative
+        // offset is stable for one pinned target/source revision and therefore
+        // suitable for replay identity without serializing a process address.
+        const callsite = taskCallsite(start);
+        for (self.task_identity_sequences.items) |*identity| {
+            if (identity.parent != parent or identity.callsite != callsite) continue;
+            if (identity.next_sequence == std.math.maxInt(u64))
                 return error.VoprIoSequenceExhausted;
-            const sequence = parent.next_child_sequence;
-            parent.next_child_sequence += 1;
-            return .{ .parent = parent.id, .sequence = sequence };
+            const sequence = identity.next_sequence;
+            identity.next_sequence += 1;
+            return .{
+                .parent = taskIdentityScope(parent, start),
+                .sequence = sequence,
+            };
         }
-        if (self.next_root_task_sequence == std.math.maxInt(u64))
-            return error.VoprIoSequenceExhausted;
-        const sequence = self.next_root_task_sequence;
-        self.next_root_task_sequence += 1;
-        return .{ .parent = capability_kernel_id, .sequence = sequence };
+        try self.task_identity_sequences.append(self.allocator, .{
+            .parent = parent,
+            .callsite = callsite,
+            .next_sequence = 2,
+        });
+        return .{
+            .parent = taskIdentityScope(parent, start),
+            .sequence = 1,
+        };
     }
 
     fn allocateFutexIdentity(self: *Kernel) !ScopedSequence {
@@ -953,27 +1036,27 @@ pub const Kernel = struct {
 
     fn bindExternalIdentity(self: *Kernel, task: *Task, resource_id: ids.StableId) !void {
         if (task.external_identity_bound) return;
-        var waiter_sequence: u64 = 1;
+        const waiter_sequence = try self.allocateExternalWaiterIdentity(resource_id);
+        task.id = ids.derive("sim-io.external-task", resource_id, waiter_sequence);
+        task.identity_parent = resource_id;
+        task.identity_sequence = waiter_sequence;
+        task.external_identity_bound = true;
+    }
+
+    fn allocateExternalWaiterIdentity(self: *Kernel, resource_id: ids.StableId) !u64 {
         for (self.external_resource_sequences.items) |*resource| {
             if (resource.resource_id != resource_id) continue;
             if (resource.next_waiter_sequence == std.math.maxInt(u64))
                 return error.VoprIoSequenceExhausted;
-            waiter_sequence = resource.next_waiter_sequence;
+            const waiter_sequence = resource.next_waiter_sequence;
             resource.next_waiter_sequence += 1;
-            task.id = ids.derive("sim-io.external-task", resource_id, waiter_sequence);
-            task.identity_parent = resource_id;
-            task.identity_sequence = waiter_sequence;
-            task.external_identity_bound = true;
-            return;
+            return waiter_sequence;
         }
         try self.external_resource_sequences.append(self.allocator, .{
             .resource_id = resource_id,
             .next_waiter_sequence = 2,
         });
-        task.id = ids.derive("sim-io.external-task", resource_id, waiter_sequence);
-        task.identity_parent = resource_id;
-        task.identity_sequence = waiter_sequence;
-        task.external_identity_bound = true;
+        return 1;
     }
 
     fn futexIdentity(self: *const Kernel, ptr: *const u32) ?ids.StableId {
@@ -1041,8 +1124,37 @@ test "task and futex identities follow logical parents instead of global creatio
     try std.testing.expectEqual(first_futex_b, second_futex_b);
     try std.testing.expect(first_root_b.creation_sequence != second_root_b.creation_sequence);
     try std.testing.expect(first_child_a.creation_sequence != second_child_a.creation_sequence);
-    try std.testing.expectEqual(first_root_a.id, first_child_a.identity_parent);
-    try std.testing.expectEqual(first_root_b.id, first_child_b.identity_parent);
+    try std.testing.expectEqual(taskIdentityScope(first_root_a.id, start), first_child_a.identity_parent);
+    try std.testing.expectEqual(taskIdentityScope(first_root_b.id, start), first_child_b.identity_parent);
+}
+
+test "task identities are scoped by callsite before creation order" {
+    const starts = struct {
+        noinline fn first(context: *const anyopaque, _: *anyopaque) void {
+            // Keep the two code identities distinct under ReleaseSafe. Empty
+            // address-taken helpers may be folded into one function, which
+            // would invalidate this test's premise rather than the task model.
+            std.mem.doNotOptimizeAway(context);
+        }
+        noinline fn second(_: *const anyopaque, result: *anyopaque) void {
+            std.mem.doNotOptimizeAway(result);
+        }
+    };
+
+    var first = try Kernel.init(std.testing.allocator, .{});
+    defer first.deinit();
+    const first_a = try first.createTask(0, .@"1", &.{}, .@"1", starts.first, null);
+    const first_b = try first.createTask(0, .@"1", &.{}, .@"1", starts.second, null);
+
+    var second = try Kernel.init(std.testing.allocator, .{});
+    defer second.deinit();
+    const second_b = try second.createTask(0, .@"1", &.{}, .@"1", starts.second, null);
+    const second_a = try second.createTask(0, .@"1", &.{}, .@"1", starts.first, null);
+
+    try std.testing.expectEqual(first_a.id, second_a.id);
+    try std.testing.expectEqual(first_b.id, second_b.id);
+    try std.testing.expect(first_a.creation_sequence != second_a.creation_sequence);
+    try std.testing.expect(first_b.creation_sequence != second_b.creation_sequence);
 }
 
 test "first external wait binds a task to the logical resource epoch" {
@@ -1069,6 +1181,28 @@ test "first external wait binds a task to the logical resource epoch" {
     try std.testing.expectEqual(first_listener.id, second_listener.id);
     try std.testing.expectEqual(listener_resource, first_listener.identity_parent);
     try std.testing.expectEqual(@as(u64, 1), first_listener.identity_sequence);
+    try std.testing.expectEqual(first_creation_id, first_listener.resource_owner_id);
+    try std.testing.expectEqual(second_creation_id, second_listener.resource_owner_id);
+}
+
+test "parked external task migrates to a semantic resource identity" {
+    const start = struct {
+        fn call(_: *const anyopaque, _: *anyopaque) void {}
+    }.call;
+    const provisional = ids.stable("test", "provisional-socket-read");
+    const semantic = ids.stable("test", "semantic-socket-read");
+
+    var kernel = try Kernel.init(std.testing.allocator, .{});
+    defer kernel.deinit();
+    const task = try kernel.createTask(0, .@"1", &.{}, .@"1", start, null);
+    try kernel.bindExternalIdentity(task, provisional);
+    task.external_id = provisional;
+    task.status = .waiting_external;
+
+    try kernel.rebindExternalResource(provisional, semantic);
+    try std.testing.expectEqual(semantic, task.external_id.?);
+    try std.testing.expectEqual(semantic, task.identity_parent);
+    try std.testing.expectEqual(ids.derive("sim-io.external-task", semantic, 1), task.id);
 }
 
 test "task kernel parks future await and exposes each resume" {

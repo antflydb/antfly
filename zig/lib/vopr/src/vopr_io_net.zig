@@ -36,6 +36,7 @@ pub const WaitPort = struct {
         wait: *const fn (*anyopaque, ids.StableId) anyerror!void,
         wake: *const fn (*anyopaque, ids.StableId, u32) anyerror!void,
         ready: ?*const fn (*anyopaque, ids.StableId) anyerror!void = null,
+        rebind: ?*const fn (*anyopaque, ids.StableId, ids.StableId) anyerror!void = null,
     };
 
     pub fn wait(self: WaitPort, resource_id: ids.StableId) !void {
@@ -53,6 +54,11 @@ pub const WaitPort = struct {
     pub fn ready(self: WaitPort, resource_id: ids.StableId) !void {
         const ready_fn = self.vtable.ready orelse return error.ReadyWaitUnsupported;
         return ready_fn(self.ptr, resource_id);
+    }
+
+    pub fn rebind(self: WaitPort, old_resource_id: ids.StableId, new_resource_id: ids.StableId) !void {
+        const rebind_fn = self.vtable.rebind orelse return;
+        return rebind_fn(self.ptr, old_resource_id, new_resource_id);
     }
 };
 
@@ -88,6 +94,10 @@ const SocketState = struct {
     peer_hard_disconnected: bool = false,
     closed: bool = false,
     next_packet_sequence: u64 = 1,
+    connection_endpoint_id: ?ids.StableId = null,
+    connection_owner_id: ?ids.StableId = null,
+    connection_client: bool = false,
+    connection_identity_bound: bool = false,
 
     fn readResource(self: *const SocketState) ids.StableId {
         return ids.derive("sim-io.socket-read", self.id, 0);
@@ -124,7 +134,6 @@ pub const Network = struct {
     config: Config,
     wait_port: ?WaitPort = null,
     next_handle: std.Io.net.Socket.Handle = 0x5000_0000,
-    next_pair_sequence: u64 = 1,
     next_ephemeral_port: u16 = 20_000,
     sockets: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, *SocketState) = .empty,
     socket_order: std.ArrayListUnmanaged(*SocketState) = .empty,
@@ -189,11 +198,11 @@ pub const Network = struct {
         return listener.handle;
     }
 
-    pub fn connectIp(self: *Network, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.ConnectOptions) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
+    pub fn connectIp(self: *Network, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.ConnectOptions, owner_id: ids.StableId) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
         if (self.faults.network_down) return error.NetworkDown;
         if (options.mode != .stream) return error.SocketModeUnsupported;
         const listener = self.findIpListener(address.*) orelse return error.ConnectionRefused;
-        const client = self.connectToListener(listener, address.*) catch |err| return mapConnectResourceError(err);
+        const client = self.connectToListener(listener, address.*, owner_id) catch |err| return mapConnectResourceError(err);
         return .{ .handle = client.handle, .address = address.* };
     }
 
@@ -209,23 +218,23 @@ pub const Network = struct {
         return .{ .handle = socket_state.handle, .address = address };
     }
 
-    pub fn connectUnix(self: *Network, address: *const std.Io.net.UnixAddress) std.Io.net.UnixAddress.ConnectError!std.Io.net.Socket.Handle {
+    pub fn connectUnix(self: *Network, address: *const std.Io.net.UnixAddress, owner_id: ids.StableId) std.Io.net.UnixAddress.ConnectError!std.Io.net.Socket.Handle {
         if (self.faults.network_down) return error.NetworkDown;
         const listener = self.findUnixListener(address.path) orelse return error.FileNotFound;
-        const client = self.connectToListener(listener, .{ .ip4 = .loopback(0) }) catch |err|
+        const client = self.connectToListener(listener, .{ .ip4 = .loopback(0) }, owner_id) catch |err|
             return mapUnixConnectResourceError(err);
         return client.handle;
     }
 
-    pub fn createPair(self: *Network, options: std.Io.net.Socket.CreatePairOptions) std.Io.net.Socket.CreatePairError![2]std.Io.net.Socket {
+    pub fn createPair(self: *Network, options: std.Io.net.Socket.CreatePairOptions, owner_id: ids.StableId) std.Io.net.Socket.CreatePairError![2]std.Io.net.Socket {
         if (options.mode != .stream) return error.SocketModeUnsupported;
         const address: std.Io.net.IpAddress = switch (options.family) {
             .ip4 => .{ .ip4 = .loopback(0) },
             .ip6 => .{ .ip6 = .loopback(0) },
         };
-        if (self.next_pair_sequence == std.math.maxInt(u64)) return error.SystemResources;
-        const pair_parent = ids.derive("sim-io.socket-pair", network_id, self.next_pair_sequence);
-        self.next_pair_sequence += 1;
+        const pair_owner = ids.derive("sim-io.socket-pair-owner", network_id, owner_id);
+        const pair_sequence = self.allocateIdentitySequence(pair_owner) catch return error.SystemResources;
+        const pair_parent = ids.derive("sim-io.socket-pair", pair_owner, pair_sequence);
         const left = self.createSocket(.stream, address, pair_parent) catch |err| return mapPairResourceError(err);
         errdefer self.destroyLastSocket(left);
         const right = self.createSocket(.stream, address, pair_parent) catch |err| return mapPairResourceError(err);
@@ -310,9 +319,11 @@ pub const Network = struct {
             written += copyLimited(bytes, buffer, written);
             if (written == bytes.len) break :outer;
         };
+        self.bindConnectionIdentity(source, destination, bytes) catch return error.SystemResources;
         const sequence = self.allocatePacketSequence(source) catch return error.SystemResources;
+        const packet_id = ids.derive("sim-io.packet", source.id, sequence);
         self.packets.append(self.allocator, .{
-            .id = ids.derive("sim-io.packet", source.id, sequence),
+            .id = packet_id,
             .sequence = sequence,
             .source = source.handle,
             .destination = destination.handle,
@@ -551,15 +562,23 @@ pub const Network = struct {
         return self.open_sockets;
     }
 
-    fn connectToListener(self: *Network, listener: *SocketState, address: std.Io.net.IpAddress) !*SocketState {
+    fn connectToListener(self: *Network, listener: *SocketState, address: std.Io.net.IpAddress, owner_id: ids.StableId) !*SocketState {
         if (listener.pending_accept.items.len >= listener.backlog) return error.ConnectionRefused;
-        const client = try self.createSocket(.stream, address, listener.id);
-        const server = self.createSocket(.stream, address, listener.id) catch |err| {
+        const connection_owner = ids.derive("sim-io.connection-owner", listener.id, owner_id);
+        const connection_sequence = try self.allocateIdentitySequence(connection_owner);
+        const connection_parent = ids.derive("sim-io.connection", connection_owner, connection_sequence);
+        const client = try self.createSocket(.stream, address, connection_parent);
+        const server = self.createSocket(.stream, address, connection_parent) catch |err| {
             self.destroyLastSocket(client);
             return err;
         };
         client.peer = server.handle;
         server.peer = client.handle;
+        client.connection_endpoint_id = listener.id;
+        client.connection_owner_id = connection_owner;
+        client.connection_client = true;
+        server.connection_endpoint_id = listener.id;
+        server.connection_owner_id = connection_owner;
         listener.pending_accept.append(self.allocator, server.handle) catch |err| {
             self.destroyLastSocket(server);
             self.destroyLastSocket(client);
@@ -567,6 +586,50 @@ pub const Network = struct {
         };
         try self.wait_port.?.wake(listener.acceptResource(), 1);
         return client;
+    }
+
+    fn bindConnectionIdentity(
+        self: *Network,
+        source: *SocketState,
+        destination: *SocketState,
+        first_bytes: []const u8,
+    ) !void {
+        if (source.connection_identity_bound or source.connection_endpoint_id == null) return;
+        std.debug.assert(destination.connection_endpoint_id == source.connection_endpoint_id);
+        std.debug.assert(source.connection_owner_id != null);
+        std.debug.assert(destination.connection_owner_id == source.connection_owner_id);
+        std.debug.assert(!destination.connection_identity_bound);
+
+        const content_owner = ids.derive(
+            "sim-io.connection-content",
+            source.connection_owner_id.?,
+            ids.digest(first_bytes),
+        );
+        const occurrence = try self.allocateIdentitySequence(content_owner);
+        const connection_parent = ids.derive("sim-io.semantic-connection", content_owner, occurrence);
+        const client = if (source.connection_client) source else destination;
+        const server = if (source.connection_client) destination else source;
+        const old_client_id = client.id;
+        const old_server_id = server.id;
+        client.id = ids.derive("sim-io.socket", connection_parent, 1);
+        server.id = ids.derive("sim-io.socket", connection_parent, 2);
+        client.connection_identity_bound = true;
+        server.connection_identity_bound = true;
+
+        try self.rebindSocketResources(old_client_id, client.id);
+        try self.rebindSocketResources(old_server_id, server.id);
+    }
+
+    fn rebindSocketResources(self: *Network, old_socket_id: ids.StableId, new_socket_id: ids.StableId) !void {
+        const wait_port = self.wait_port orelse return;
+        try wait_port.rebind(
+            ids.derive("sim-io.socket-read", old_socket_id, 0),
+            ids.derive("sim-io.socket-read", new_socket_id, 0),
+        );
+        try wait_port.rebind(
+            ids.derive("sim-io.socket-write", old_socket_id, 0),
+            ids.derive("sim-io.socket-write", new_socket_id, 0),
+        );
     }
 
     fn createSocket(self: *Network, kind: SocketKind, address: std.Io.net.IpAddress, identity_parent: ids.StableId) !*SocketState {
@@ -844,8 +907,8 @@ test "listener and connection identities are scoped to their logical endpoint" {
     first.bindWaitPort(.{ .ptr = &first_context, .vtable = &NoopWaitPort.vtable });
     const first_listener_a = try first.listenIp(&address_a, .{});
     const first_listener_b = try first.listenIp(&address_b, .{});
-    const first_client_a = try first.connectIp(&address_a, .{ .mode = .stream });
-    const first_client_b = try first.connectIp(&address_b, .{ .mode = .stream });
+    const first_client_a = try first.connectIp(&address_a, .{ .mode = .stream }, 101);
+    const first_client_b = try first.connectIp(&address_b, .{ .mode = .stream }, 202);
 
     var second = try Network.init(std.testing.allocator, .{});
     defer second.deinit();
@@ -853,13 +916,83 @@ test "listener and connection identities are scoped to their logical endpoint" {
     second.bindWaitPort(.{ .ptr = &second_context, .vtable = &NoopWaitPort.vtable });
     const second_listener_b = try second.listenIp(&address_b, .{});
     const second_listener_a = try second.listenIp(&address_a, .{});
-    const second_client_b = try second.connectIp(&address_b, .{ .mode = .stream });
-    const second_client_a = try second.connectIp(&address_a, .{ .mode = .stream });
+    const second_client_b = try second.connectIp(&address_b, .{ .mode = .stream }, 202);
+    const second_client_a = try second.connectIp(&address_a, .{ .mode = .stream }, 101);
 
     try std.testing.expectEqual(first.getSocket(first_listener_a.handle).?.id, second.getSocket(second_listener_a.handle).?.id);
     try std.testing.expectEqual(first.getSocket(first_listener_b.handle).?.id, second.getSocket(second_listener_b.handle).?.id);
     try std.testing.expectEqual(first.getSocket(first_client_a.handle).?.id, second.getSocket(second_client_a.handle).?.id);
     try std.testing.expectEqual(first.getSocket(first_client_b.handle).?.id, second.getSocket(second_client_b.handle).?.id);
+}
+
+test "connection identities are scoped to logical clients on one listener" {
+    const NoopWaitPort = struct {
+        fn wait(_: *anyopaque, _: ids.StableId) anyerror!void {
+            return error.UnexpectedWait;
+        }
+
+        fn wake(_: *anyopaque, _: ids.StableId, _: u32) anyerror!void {}
+
+        const vtable = WaitPort.VTable{ .wait = wait, .wake = wake };
+    };
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(21_003) };
+    const owner_a: ids.StableId = 303;
+    const owner_b: ids.StableId = 404;
+
+    var first = try Network.init(std.testing.allocator, .{});
+    defer first.deinit();
+    var first_context: u8 = 0;
+    first.bindWaitPort(.{ .ptr = &first_context, .vtable = &NoopWaitPort.vtable });
+    _ = try first.listenIp(&address, .{});
+    const first_client_a = try first.connectIp(&address, .{ .mode = .stream }, owner_a);
+    const first_client_b = try first.connectIp(&address, .{ .mode = .stream }, owner_b);
+
+    var second = try Network.init(std.testing.allocator, .{});
+    defer second.deinit();
+    var second_context: u8 = 0;
+    second.bindWaitPort(.{ .ptr = &second_context, .vtable = &NoopWaitPort.vtable });
+    _ = try second.listenIp(&address, .{});
+    const second_client_b = try second.connectIp(&address, .{ .mode = .stream }, owner_b);
+    const second_client_a = try second.connectIp(&address, .{ .mode = .stream }, owner_a);
+
+    try std.testing.expectEqual(first.getSocket(first_client_a.handle).?.id, second.getSocket(second_client_a.handle).?.id);
+    try std.testing.expectEqual(first.getSocket(first_client_b.handle).?.id, second.getSocket(second_client_b.handle).?.id);
+}
+
+test "first stream payload preserves logical owner independent of connect order" {
+    const NoopWaitPort = struct {
+        fn wait(_: *anyopaque, _: ids.StableId) anyerror!void {
+            return error.UnexpectedWait;
+        }
+
+        fn wake(_: *anyopaque, _: ids.StableId, _: u32) anyerror!void {}
+
+        const vtable = WaitPort.VTable{ .wait = wait, .wake = wake };
+    };
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(21_004) };
+
+    var first = try Network.init(std.testing.allocator, .{});
+    defer first.deinit();
+    var first_context: u8 = 0;
+    first.bindWaitPort(.{ .ptr = &first_context, .vtable = &NoopWaitPort.vtable });
+    _ = try first.listenIp(&address, .{});
+    const first_alpha = try first.connectIp(&address, .{ .mode = .stream }, 1);
+    const first_beta = try first.connectIp(&address, .{ .mode = .stream }, 2);
+    _ = try first.write(first_alpha.handle, "", &.{"same request"}, 1);
+    _ = try first.write(first_beta.handle, "", &.{"same request"}, 1);
+
+    var second = try Network.init(std.testing.allocator, .{});
+    defer second.deinit();
+    var second_context: u8 = 0;
+    second.bindWaitPort(.{ .ptr = &second_context, .vtable = &NoopWaitPort.vtable });
+    _ = try second.listenIp(&address, .{});
+    const second_beta = try second.connectIp(&address, .{ .mode = .stream }, 2);
+    const second_alpha = try second.connectIp(&address, .{ .mode = .stream }, 1);
+    _ = try second.write(second_beta.handle, "", &.{"same request"}, 1);
+    _ = try second.write(second_alpha.handle, "", &.{"same request"}, 1);
+
+    try std.testing.expectEqual(first.getSocket(first_alpha.handle).?.id, second.getSocket(second_alpha.handle).?.id);
+    try std.testing.expectEqual(first.getSocket(first_beta.handle).?.id, second.getSocket(second_beta.handle).?.id);
 }
 
 test "stream FIN never overtakes earlier payload when reordering is enabled" {
@@ -877,7 +1010,7 @@ test "stream FIN never overtakes earlier payload when reordering is enabled" {
     defer network.deinit();
     var wait_context: u8 = 0;
     network.bindWaitPort(.{ .ptr = &wait_context, .vtable = &NoopWaitPort.vtable });
-    const pair = try network.createPair(.{ .family = .ip4, .mode = .stream });
+    const pair = try network.createPair(.{ .family = .ip4, .mode = .stream }, 1);
     try std.testing.expectEqual(
         @as(usize, "payload".len),
         try network.write(pair[0].handle, "", &.{"payload"}, 1),
@@ -923,7 +1056,7 @@ test "stream delivery preserves bytes across reorder drop and duplicate faults" 
     defer network.deinit();
     var wait_context: u8 = 0;
     network.bindWaitPort(.{ .ptr = &wait_context, .vtable = &NoopWaitPort.vtable });
-    const pair = try network.createPair(.{ .family = .ip4, .mode = .stream });
+    const pair = try network.createPair(.{ .family = .ip4, .mode = .stream }, 1);
     network.faults.drop_next = true;
     network.faults.duplicate_next = true;
     try std.testing.expectEqual(@as(usize, 5), try network.write(pair[0].handle, "", &.{"first"}, 1));

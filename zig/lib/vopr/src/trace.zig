@@ -418,6 +418,111 @@ pub const Trace = struct {
         try appendJsonLine(allocator, &out, SummaryWire.from(self.summary.?));
         return try out.toOwnedSlice(allocator);
     }
+
+    /// Compares the canonical wire artifact without materializing either full
+    /// trace. The success path compares wire values directly. A mismatch
+    /// renders only the first unequal JSONL record into two reusable buffers,
+    /// preserving diagnostics while bounding memory to one record.
+    pub fn canonicalEqual(
+        self: *const Trace,
+        other: *const Trace,
+        allocator: std.mem.Allocator,
+    ) !bool {
+        try self.validate();
+        try other.validate();
+
+        var expected_line: std.ArrayListUnmanaged(u8) = .empty;
+        defer expected_line.deinit(allocator);
+        var actual_line: std.ArrayListUnmanaged(u8) = .empty;
+        defer actual_line.deinit(allocator);
+
+        if (!try canonicalLineEqual(
+            allocator,
+            &expected_line,
+            &actual_line,
+            "header",
+            0,
+            HeaderWire{
+                .system = self.header.system,
+                .scenario = self.header.scenario,
+                .scenario_version = self.header.scenario_version,
+                .source_revision = self.header.source_revision,
+                .target = self.header.target,
+                .optimize = self.header.optimize,
+            },
+            HeaderWire{
+                .system = other.header.system,
+                .scenario = other.header.scenario,
+                .scenario_version = other.header.scenario_version,
+                .source_revision = other.header.source_revision,
+                .target = other.header.target,
+                .optimize = other.header.optimize,
+            },
+        )) return false;
+        if (!try canonicalLineEqual(
+            allocator,
+            &expected_line,
+            &actual_line,
+            "config",
+            0,
+            ConfigWire{
+                .seed = self.config.seed,
+                .transition_budget = self.config.transition_budget,
+                .resource_budget = self.config.resource_budget,
+                .fixture_hashes = self.config.fixture_hashes,
+                .feature_flags = self.config.feature_flags,
+                .backend_ids = self.config.backend_ids,
+                .scenario_parameters = self.config.scenario_parameters,
+            },
+            ConfigWire{
+                .seed = other.config.seed,
+                .transition_budget = other.config.transition_budget,
+                .resource_budget = other.config.resource_budget,
+                .fixture_hashes = other.config.fixture_hashes,
+                .feature_flags = other.config.feature_flags,
+                .backend_ids = other.config.backend_ids,
+                .scenario_parameters = other.config.scenario_parameters,
+            },
+        )) return false;
+
+        if (!canonicalLengthEqual("choice", self.choices.items.len, other.choices.items.len)) return false;
+        for (self.choices.items, other.choices.items, 0..) |expected, actual, index|
+            if (!try canonicalLineEqual(allocator, &expected_line, &actual_line, "choice", index, ChoiceWire.from(expected), ChoiceWire.from(actual))) return false;
+
+        if (!canonicalLengthEqual("transition", self.transitions.items.len, other.transitions.items.len)) return false;
+        for (self.transitions.items, other.transitions.items, 0..) |expected, actual, index|
+            if (!try canonicalLineEqual(allocator, &expected_line, &actual_line, "transition", index, TransitionWire.from(expected), TransitionWire.from(actual))) return false;
+
+        if (!canonicalLengthEqual("fault", self.faults.items.len, other.faults.items.len)) return false;
+        for (self.faults.items, other.faults.items, 0..) |expected, actual, index|
+            if (!try canonicalLineEqual(allocator, &expected_line, &actual_line, "fault", index, FaultWire.from(expected), FaultWire.from(actual))) return false;
+
+        if (!canonicalLengthEqual("event", self.events.items.len, other.events.items.len)) return false;
+        for (self.events.items, other.events.items, 0..) |expected, actual, index|
+            if (!try canonicalLineEqual(allocator, &expected_line, &actual_line, "event", index, EventWire.from(expected), EventWire.from(actual))) return false;
+
+        if (!canonicalLengthEqual("observation", self.observations.items.len, other.observations.items.len)) return false;
+        for (self.observations.items, other.observations.items, 0..) |expected, actual, index|
+            if (!try canonicalLineEqual(allocator, &expected_line, &actual_line, "observation", index, ObservationWire.from(expected), ObservationWire.from(actual))) return false;
+
+        if (!canonicalLengthEqual("property", self.properties.items.len, other.properties.items.len)) return false;
+        for (self.properties.items, other.properties.items, 0..) |expected, actual, index|
+            if (!try canonicalLineEqual(allocator, &expected_line, &actual_line, "property", index, PropertyWire.from(expected), PropertyWire.from(actual))) return false;
+
+        if (!canonicalLengthEqual("failure", self.failures.items.len, other.failures.items.len)) return false;
+        for (self.failures.items, other.failures.items, 0..) |expected, actual, index|
+            if (!try canonicalLineEqual(allocator, &expected_line, &actual_line, "failure", index, FailureWire.from(expected), FailureWire.from(actual))) return false;
+
+        return try canonicalLineEqual(
+            allocator,
+            &expected_line,
+            &actual_line,
+            "summary",
+            0,
+            SummaryWire.from(self.summary.?),
+            SummaryWire.from(other.summary.?),
+        );
+    }
 };
 
 const HeaderWire = struct {
@@ -549,6 +654,93 @@ fn appendJsonLine(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)
     try out.append(allocator, '\n');
 }
 
+fn canonicalLengthEqual(section: []const u8, expected: usize, actual: usize) bool {
+    if (expected == actual) return true;
+    std.log.err("exact replay canonical {s} count diverged expected={d} actual={d}", .{
+        section,
+        expected,
+        actual,
+    });
+    return false;
+}
+
+fn canonicalLineEqual(
+    allocator: std.mem.Allocator,
+    expected_line: *std.ArrayListUnmanaged(u8),
+    actual_line: *std.ArrayListUnmanaged(u8),
+    section: []const u8,
+    index: usize,
+    expected: anytype,
+    actual: @TypeOf(expected),
+) !bool {
+    if (canonicalValueEqual(expected, actual)) return true;
+
+    expected_line.clearRetainingCapacity();
+    actual_line.clearRetainingCapacity();
+    try appendJsonLine(allocator, expected_line, expected);
+    try appendJsonLine(allocator, actual_line, actual);
+
+    const max_diagnostic_bytes = 1024;
+    std.log.err(
+        "exact replay canonical {s}[{d}] diverged\nexpected: {s}\nactual:   {s}",
+        .{
+            section,
+            index,
+            expected_line.items[0..@min(expected_line.items.len, max_diagnostic_bytes)],
+            actual_line.items[0..@min(actual_line.items.len, max_diagnostic_bytes)],
+        },
+    );
+    return false;
+}
+
+/// `std.meta.eql` deliberately compares slices by address. Canonical trace
+/// equality instead follows slices because independently constructed record and
+/// replay artifacts must compare by value.
+fn canonicalValueEqual(expected: anytype, actual: @TypeOf(expected)) bool {
+    const T = @TypeOf(expected);
+    return switch (@typeInfo(T)) {
+        .@"struct" => |info| blk: {
+            inline for (info.fields) |field| {
+                if (!canonicalValueEqual(@field(expected, field.name), @field(actual, field.name))) break :blk false;
+            }
+            break :blk true;
+        },
+        .array => blk: {
+            for (expected, actual) |expected_item, actual_item| {
+                if (!canonicalValueEqual(expected_item, actual_item)) break :blk false;
+            }
+            break :blk true;
+        },
+        .pointer => |info| switch (info.size) {
+            .slice => blk: {
+                if (expected.len != actual.len) break :blk false;
+                for (expected, actual) |expected_item, actual_item| {
+                    if (!canonicalValueEqual(expected_item, actual_item)) break :blk false;
+                }
+                break :blk true;
+            },
+            .one, .many, .c => expected == actual,
+        },
+        .optional => if (expected) |expected_value|
+            if (actual) |actual_value| canonicalValueEqual(expected_value, actual_value) else false
+        else
+            actual == null,
+        .@"union" => |info| blk: {
+            if (info.tag_type == null) @compileError("cannot compare untagged canonical wire union " ++ @typeName(T));
+            const expected_tag = std.meta.activeTag(expected);
+            if (expected_tag != std.meta.activeTag(actual)) break :blk false;
+            switch (expected) {
+                inline else => |value, tag| break :blk canonicalValueEqual(value, @field(actual, @tagName(tag))),
+            }
+        },
+        .error_union => if (expected) |expected_value|
+            if (actual) |actual_value| canonicalValueEqual(expected_value, actual_value) else |_| false
+        else |expected_error| if (actual) |_| false else |actual_error| expected_error == actual_error,
+        .vector => @reduce(.And, expected == actual),
+        else => expected == actual,
+    };
+}
+
 pub fn parseAlloc(allocator: std.mem.Allocator, encoded: []const u8) !Trace {
     var lines = std.mem.splitScalar(u8, encoded, '\n');
     const header_line = lines.next() orelse return error.MissingTraceHeader;
@@ -649,4 +841,26 @@ fn recordRank(record_type: []const u8) ?u8 {
     if (std.mem.eql(u8, record_type, "failure")) return 8;
     if (std.mem.eql(u8, record_type, "summary")) return 9;
     return null;
+}
+
+test "canonical value equality follows nested slice contents" {
+    const expected_ids = try std.testing.allocator.dupe(u64, &.{ 11, 22 });
+    defer std.testing.allocator.free(expected_ids);
+    const actual_ids = try std.testing.allocator.dupe(u64, &.{ 11, 22 });
+    defer std.testing.allocator.free(actual_ids);
+    const different_ids = try std.testing.allocator.dupe(u64, &.{ 11, 23 });
+    defer std.testing.allocator.free(different_ids);
+
+    const expected_name = try std.testing.allocator.dupe(u8, "mode");
+    defer std.testing.allocator.free(expected_name);
+    const actual_name = try std.testing.allocator.dupe(u8, "mode");
+    defer std.testing.allocator.free(actual_name);
+    const expected_parameters = [_]Parameter{.{ .id = 7, .name = expected_name, .value = 3 }};
+    const actual_parameters = [_]Parameter{.{ .id = 7, .name = actual_name, .value = 3 }};
+    const expected_parameter_slice: []const Parameter = &expected_parameters;
+    const actual_parameter_slice: []const Parameter = &actual_parameters;
+
+    try std.testing.expect(canonicalValueEqual(expected_ids, actual_ids));
+    try std.testing.expect(!canonicalValueEqual(expected_ids, different_ids));
+    try std.testing.expect(canonicalValueEqual(expected_parameter_slice, actual_parameter_slice));
 }

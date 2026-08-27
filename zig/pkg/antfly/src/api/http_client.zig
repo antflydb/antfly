@@ -1987,7 +1987,14 @@ pub const ApiHttpClient = struct {
                 // An executor that cannot identify its send boundary remains
                 // unknown, except for a refused connection that never existed.
                 // An explicit post-send phase always wins over the error name.
-                return error.RaftBatchWriteOutcomeUnknown;
+                // Keep transport ambiguity distinct inside the data-plane
+                // router. The public API deliberately collapses both forms
+                // to `RaftBatchWriteOutcomeUnknown`, but production
+                // diagnostics and deterministic tests need to know whether a
+                // peer explicitly reported an ambiguous proposal or whether
+                // the client lost the response after crossing its send
+                // boundary.
+                return error.RaftBatchWriteTransportOutcomeUnknown;
             }
             return err;
         };
@@ -3607,6 +3614,50 @@ test "api http client forwards bounded raft batch routing context without alloca
     try std.testing.expectEqual(executor.response_body_address, @intFromPtr(response.body.ptr));
     try std.testing.expect(executor.saw_service_token);
     response.deinit(std.testing.allocator);
+}
+
+test "internal service request signing uses the transport clock authority" {
+    const alloc = std.testing.allocator;
+    const config: internal_service_auth.Config = .{
+        .secret = "0123456789abcdef0123456789abcdef",
+        .issuer = "cluster-a",
+    };
+    const expected = try internal_service_auth.tokenAlloc(alloc, config, 42);
+    defer alloc.free(expected);
+
+    const Executor = struct {
+        expected: []const u8,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+                .realtime_ns_fn = realtimeNs,
+            };
+        }
+
+        fn realtimeNs(_: *anyopaque) i128 {
+            return 42 * std.time.ns_per_s;
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings(
+                self.expected,
+                request.header(internal_service_auth.header_name).?,
+            );
+            return .{ .status = 200, .body = @constCast((&[_]u8{})[0..]) };
+        }
+    };
+
+    var executor = Executor{ .expected = expected };
+    var client = ApiHttpClient.init(alloc, executor.iface());
+    _ = client.withInternalServiceAuth(config.secret, config.issuer);
+    var response = try client.executeRequest(.{
+        .method = .GET,
+        .uri = "http://node/internal/v1/status",
+    });
+    response.deinit(alloc);
 }
 
 test "api http client authenticates only the internal API namespace" {

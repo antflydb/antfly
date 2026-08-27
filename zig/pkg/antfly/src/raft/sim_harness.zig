@@ -1700,10 +1700,12 @@ pub const ManagedHttpClusterSimulation = struct {
         for (owned_configs) |*cfg| cfg.async_transport = false;
         const owned_deps = try alloc.dupe(ManagedHttpHostSimulationDeps, deps);
         errdefer alloc.free(owned_deps);
-        for (owned_deps) |*dep| {
+        for (owned_deps, owned_configs) |*dep, cfg| {
             dep.host.http.request_executor = network.executor();
             dep.host.http.listener_disabled = dep.borrowed_io != null;
             dep.service.transition_retry_clock = network.transitionRetryClock();
+            const node_id = cfg.host.http.host.local_node_id;
+            dep.service.transition_retry_jitter_salt = node_id ^ 0x7472_616e_7369_7469;
         }
 
         const nodes = try alloc.alloc(ManagedHttpHostSimulation, configs.len);

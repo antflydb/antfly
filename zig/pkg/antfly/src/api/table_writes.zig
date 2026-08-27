@@ -12274,6 +12274,12 @@ pub const ProvisionedTableWriteSource = struct {
             cached.deinit(alloc);
             return;
         }
+        // A runtime backed by borrowed std.Io may execute every fiber on one
+        // scheduler thread. Blocking that thread on the native atomic mutex
+        // prevents the cache publisher that owns the mutex from ever
+        // resuming. Surface the existing retryable read contract instead;
+        // the caller will retry after the publisher gets a scheduler turn.
+        if (resident.open_contended) return error.StorageReadTemporarilyUnavailable;
         if (self.readCompatibleMaintenanceActiveBestEffort(table_name, group_id)) {
             return error.StorageReadTemporarilyUnavailable;
         }
@@ -12302,6 +12308,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     const ResidentDbSnapshot = struct {
         cached: ?ProvisionedTableWriteCache.CachedDb = null,
+        open_contended: bool = false,
     };
 
     fn snapshotResidentDbLocked(
@@ -12330,17 +12337,26 @@ pub const ProvisionedTableWriteSource = struct {
         lsm_root_generation: u64,
     ) ResidentDbSnapshot {
         const caches = [_]?*ProvisionedTableWriteCache{ self.write_cache, self.startup_write_cache };
+        const cooperative_runtime = if (self.backend_runtime) |runtime| runtime.usesBorrowedIo() else false;
+        var open_contended = false;
         for (caches, 0..) |maybe_cache, index| {
             const cache = maybe_cache orelse continue;
             if (index != 0 and caches[0] != null and cache == caches[0].?) continue;
-            lockAtomic(&cache.open_mutex);
+            if (cooperative_runtime) {
+                if (!cache.open_mutex.tryLock()) {
+                    open_contended = true;
+                    continue;
+                }
+            } else {
+                lockAtomic(&cache.open_mutex);
+            }
             lockAtomic(&self.local_db_mutex);
             const observed = self.snapshotResidentDbLocked(table_name, group_id, lsm_root_generation);
             self.local_db_mutex.unlock();
             cache.open_mutex.unlock();
             if (observed.cached != null) return observed;
         }
-        return .{};
+        return .{ .open_contended = open_contended };
     }
 
     const ResidentLeaseContext = struct {
@@ -45786,6 +45802,40 @@ test "resident DB retry preparation waits outside admission for writer publicati
         .{ .read_activity_held = true },
     )).?;
     lease.release(alloc);
+}
+
+test "resident DB retry preparation does not block a borrowed std.Io scheduler" {
+    const alloc = std.testing.allocator;
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = io_impl.io() },
+    });
+    defer runtime.deinit();
+
+    var startup_cache = ProvisionedTableWriteCache.init(alloc);
+    defer startup_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-cooperative-resident-open",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    source.startup_write_cache = &startup_cache;
+    source.backend_runtime = &runtime;
+
+    lockAtomic(&startup_cache.open_mutex);
+    defer startup_cache.open_mutex.unlock();
+    try std.testing.expectError(
+        error.StorageReadTemporarilyUnavailable,
+        source.residentDbSource().prepareGroupForReadRetry(
+            alloc,
+            "docs",
+            7001,
+            table_reads.backend_current_root_generation,
+        ),
+    );
 }
 
 test "write cache transition locks use stable cache roles instead of addresses" {

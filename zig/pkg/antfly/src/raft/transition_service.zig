@@ -125,11 +125,28 @@ pub const TransitionService = struct {
         ops: anytype,
         retry_clock: RetryClock,
     ) !TransitionService {
+        return try initWithRetryClockAndJitterSalt(
+            alloc,
+            ops,
+            retry_clock,
+            randomRetryJitterSalt(),
+        );
+    }
+
+    /// Constructs a service with caller-owned retry entropy. Simulation and
+    /// replay harnesses must supply a stable per-node salt so retry timing is
+    /// part of their controlled state rather than host RNG state.
+    pub fn initWithRetryClockAndJitterSalt(
+        alloc: std.mem.Allocator,
+        ops: anytype,
+        retry_clock: RetryClock,
+        retry_jitter_salt: u64,
+    ) !TransitionService {
         const OpsType = @TypeOf(ops);
         return .{
             .alloc = alloc,
             .retry_clock = retry_clock,
-            .retry_jitter_salt = randomRetryJitterSalt(),
+            .retry_jitter_salt = retry_jitter_salt,
             .ops = if (@hasField(OpsType, "ptr") and @hasField(OpsType, "vtable"))
                 .{ .adapter = try shard_ops.OwnedShardOperationAdapter.init(alloc, .{
                     .ptr = ops.ptr,
@@ -882,6 +899,12 @@ fn randomRetryJitterSalt() u64 {
     var salt: u64 = undefined;
     std.Options.debug_io.random(std.mem.asBytes(&salt));
     return if (salt == 0) 1 else salt;
+}
+
+/// Resolves optional caller-owned entropy without forcing production callers
+/// to know how retry salts are generated.
+pub fn resolveRetryJitterSalt(configured: ?u64) u64 {
+    return configured orelse randomRetryJitterSalt();
 }
 
 fn mixRetryJitter(value: u64) u64 {

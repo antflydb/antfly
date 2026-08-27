@@ -15,13 +15,24 @@ const metadata_sim = @import("../metadata/sim_harness.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const api_http_client = @import("../api/http_client.zig");
+const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const common_http = @import("../common/http/http_common.zig");
 const io_http_executor = @import("../common/http/io_http_executor.zig");
 const api_table_router = @import("../api/table_router.zig");
 const hosted_shard_ops = @import("../raft/hosted_shard_ops.zig");
 const shard_ops = @import("../raft/shard_ops.zig");
 const transition_state = @import("../metadata/transition_state.zig");
+const metadata_table_manager = @import("../metadata/table_manager.zig");
 const resource_manager = @import("../storage/resource_manager.zig");
+const metadata_openapi = @import("antfly_metadata_openapi");
+
+// The composed deployment uses the same service identity as the metadata
+// quorum fixture. Leaving this unset does not model an unauthenticated legacy
+// cluster: production middleware fails every internal route closed with an
+// unmarked 503, which correctly prevents the forwarding client from assuming
+// that a mutation was not proposed.
+const internal_service_secret = "metadata-simulation-internal-service-secret";
+const internal_service_issuer = "metadata-sim";
 
 const ModeledCapacitySource = struct {
     sim: *vopr.vopr_io.VoprIo,
@@ -62,6 +73,7 @@ pub const Fixture = struct {
         workload_started,
         writes_complete,
         reads_complete,
+        graph_query_complete,
         split_requested,
         split_finalized,
         split_published,
@@ -90,6 +102,17 @@ pub const Fixture = struct {
     const split_transition_id: u64 = 6_842_001;
     const split_destination_group_id: u64 = 6_846;
     const split_key = "doc:g";
+    const graph_index_name = "graph_idx";
+    const left_batch_body =
+        \\{"inserts":{"doc:c":{"title":"production-left","_edges":{"graph_idx":{"links":[{"target":"doc:x"}]}}},"doc:k":{"title":"production-split"}},"sync_level":"full_index"}
+    ;
+    const right_batch_body =
+        \\{"inserts":{"doc:x":{"title":"production-right","_edges":{"graph_idx":{"links":[{"target":"doc:k"}]}}}},"sync_level":"full_index"}
+    ;
+    const ordinary_left_batch_body =
+        "{\"inserts\":{\"doc:c\":{\"title\":\"production-left\"},\"doc:k\":{\"title\":\"production-split\"}},\"sync_level\":\"write\"}";
+    const ordinary_right_batch_body =
+        "{\"inserts\":{\"doc:x\":{\"title\":\"production-right\"}},\"sync_level\":\"write\"}";
     const DataServer = data_runtime.DataServer;
 
     alloc: std.mem.Allocator,
@@ -141,10 +164,18 @@ pub const Fixture = struct {
     driver_failure: ?anyerror = null,
     driver_rounds: u64 = 0,
     raft_driver_rounds: [node_count]u64 = .{0} ** node_count,
-    control_rounds_enabled: bool = false,
+    control_requests: std.Io.Semaphore = .{},
+    control_completions: std.Io.Semaphore = .{},
     control_round_active: bool = false,
     write_statuses: [3]u16 = .{ 0, 0, 0 },
     write_body_digests: [3]u64 = .{ 0, 0, 0 },
+    write_attempts: [3]u64 = .{ 0, 0, 0 },
+    write_outcome_unknowns: [3]u64 = .{ 0, 0, 0 },
+    request_lifecycle_counts: [std.meta.fields(data_runtime.DataRequestLifecyclePhase).len]u64 =
+        .{0} ** std.meta.fields(data_runtime.DataRequestLifecyclePhase).len,
+    last_request_lifecycle_group: u64 = 0,
+    last_request_lifecycle_index: u64 = 0,
+    last_request_lifecycle_phase: data_runtime.DataRequestLifecyclePhase = .routing_started,
     read_statuses: [4]u16 = .{ 0, 0, 0, 0 },
     read_body_digests: [4]u64 = .{ 0, 0, 0, 0 },
     read_attempts: [4]u16 = .{ 0, 0, 0, 0 },
@@ -152,6 +183,7 @@ pub const Fixture = struct {
     write_sound: bool = false,
     read_sound: bool = false,
     tenant_sound: bool = false,
+    graph_sound: bool = false,
     topology_sound: bool = false,
     split_sound: bool = false,
     split_finalized: bool = false,
@@ -165,6 +197,7 @@ pub const Fixture = struct {
     phase: Phase = .created,
     teardown_started: bool = false,
     active_split_enabled: bool = true,
+    graph_enabled: bool = false,
 
     pub fn create(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*Fixture {
         const self = try alloc.create(Fixture);
@@ -182,6 +215,11 @@ pub const Fixture = struct {
     pub fn setActiveSplitEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.active_split_enabled = enabled;
+    }
+
+    pub fn setGraphEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.graph_enabled = enabled;
     }
 
     pub fn bootstrap(self: *Fixture) !void {
@@ -306,8 +344,16 @@ pub const Fixture = struct {
                 .process_memory_limit_bytes = 512 * 1024 * 1024,
                 .capacity_source = self.capacity_sources[index].source(),
                 .backend_runtime = self.backend_runtimes[index].ptr(),
+                .api_server_cfg = .{
+                    .internal_service_secret = internal_service_secret,
+                    .internal_service_issuer = internal_service_issuer,
+                },
                 .metadata_request_executors = &request_executors,
                 .data_raft_request_executor = self.raft_executor.executor(),
+                .data_request_lifecycle_hook = .{
+                    .ptr = self,
+                    .reach_fn = observeDataRequestLifecycle,
+                },
                 .data_raft_listener_external = true,
                 // Keep the production async Raft delivery owner active. Its
                 // borrowed std.Io is VoprIo-backed, so the sender itself is a
@@ -360,6 +406,10 @@ pub const Fixture = struct {
                 .{ .ptr = self, .readiness = externalTransitionReadiness },
                 null,
             );
+            _ = self.transition_adapters[index].withInternalServiceAuth(
+                internal_service_secret,
+                internal_service_issuer,
+            );
             self.transition_registrations[index] = try self.metadata.?.replaceExternalTransitionOps(
                 index,
                 self.transition_adapters[index].adapter(),
@@ -385,6 +435,17 @@ pub const Fixture = struct {
         if (!leader_known) return .leader_unknown;
         if (replicas != 2) return .voter_count_mismatch;
         return .ready;
+    }
+
+    fn observeDataRequestLifecycle(
+        raw: *anyopaque,
+        event: data_runtime.DataRequestLifecycleEvent,
+    ) anyerror!void {
+        const self: *Fixture = @ptrCast(@alignCast(raw));
+        self.request_lifecycle_counts[@intFromEnum(event.phase)] +|= 1;
+        self.last_request_lifecycle_group = event.group_id;
+        self.last_request_lifecycle_index = event.log_index;
+        self.last_request_lifecycle_phase = event.phase;
     }
 
     fn ensureMetadataIncarnation(self: *Fixture) !void {
@@ -539,21 +600,27 @@ pub const Fixture = struct {
     fn driveControl(self: *Fixture) void {
         defer self.driver_done = true;
         while (!self.driver_stop and !self.control_driver_stop) {
-            if (self.control_rounds_enabled) {
-                self.runControlCycle() catch |err| {
-                    if (self.control_driver_stop or (err == error.Canceled and self.driver_stop)) return;
-                    self.driver_failure = err;
-                    self.driver_stop = true;
-                    return;
-                };
-            }
-            self.driver_rounds +|= 1;
-            self.sim.io().sleep(.fromMilliseconds(1), .awake) catch |err| {
+            self.control_requests.wait(self.sim.io()) catch |err| {
                 if (self.control_driver_stop or (err == error.Canceled and self.driver_stop)) return;
                 self.driver_failure = err;
                 self.driver_stop = true;
                 return;
             };
+            if (self.driver_stop or self.control_driver_stop) return;
+            self.runControlCycle() catch |err| {
+                self.driver_failure = err;
+                self.driver_stop = true;
+                // A requester must always leave its completion wait before it
+                // can observe and propagate the driver failure.
+                self.control_completions.post(self.sim.io());
+                return;
+            };
+            self.driver_rounds +|= 1;
+            // Publish one scheduler-visible completion for exactly one
+            // requested round. Raft tickers remain independent tasks, but the
+            // workload cannot race an unbounded next control round against its
+            // finalized-state observation.
+            self.control_completions.post(self.sim.io());
         }
     }
 
@@ -568,9 +635,22 @@ pub const Fixture = struct {
     fn stopControlDriver(self: *Fixture) void {
         self.control_driver_stop = true;
         if (self.driver_future) |*future| {
-            future.cancel(self.sim.io());
+            self.control_requests.post(self.sim.io());
+            future.await(self.sim.io());
             self.driver_future = null;
         }
+    }
+
+    fn runOneControlRound(self: *Fixture) !void {
+        if (self.driver_failure) |err| return err;
+        if (self.driver_stop or self.control_driver_stop) return error.ProductionDataControlDriverStopped;
+        self.control_requests.post(self.sim.io());
+        try self.control_completions.wait(self.sim.io());
+        if (self.driver_failure) |err| return err;
+        // Preserve the production loop's one-millisecond control cadence and
+        // give the independently owned Raft and HTTP tasks a deterministic
+        // scheduling boundary before the next status observation.
+        try self.sim.io().sleep(.fromMilliseconds(1), .awake);
     }
 
     fn driveRaft(self: *Fixture, index: usize) void {
@@ -627,8 +707,10 @@ pub const Fixture = struct {
             // synthetic Canceled failure after the workload has succeeded.
             if (self.teardown_started)
                 future.cancel(self.sim.io())
-            else
+            else {
+                self.control_requests.post(self.sim.io());
                 future.await(self.sim.io());
+            }
             self.driver_future = null;
         }
         for (&self.raft_driver_futures) |*future| if (future.*) |*live| {
@@ -654,6 +736,8 @@ pub const Fixture = struct {
     }
 
     fn runWorkloadInner(self: *Fixture) !void {
+        const left_body = if (self.graph_enabled) left_batch_body else ordinary_left_batch_body;
+        const right_body = if (self.graph_enabled) right_batch_body else ordinary_right_batch_body;
         for (initial_groups) |group_id| {
             try self.waitForDataLeader(group_id);
             std.log.debug("production data-plane VOPR elected group leader group={}", .{group_id});
@@ -665,14 +749,14 @@ pub const Fixture = struct {
             0,
             self.data_api_uris[2],
             "docs",
-            "{\"inserts\":{\"doc:c\":{\"title\":\"production-left\"},\"doc:k\":{\"title\":\"production-split\"}},\"sync_level\":\"write\"}",
+            left_body,
         });
         var right_write = self.sim.io().async(runWrite, .{
             self,
             1,
             self.data_api_uris[0],
             "docs",
-            "{\"inserts\":{\"doc:x\":{\"title\":\"production-right\"}},\"sync_level\":\"write\"}",
+            right_body,
         });
         var tenant_write = self.sim.io().async(runWrite, .{
             self,
@@ -684,10 +768,9 @@ pub const Fixture = struct {
         const left_write_result = left_write.await(self.sim.io());
         const right_write_result = right_write.await(self.sim.io());
         const tenant_write_result = tenant_write.await(self.sim.io());
-        const left_write_sound = try operationSucceeded(left_write_result);
-        const right_write_sound = try operationSucceeded(right_write_result);
-        const tenant_write_sound = try operationSucceeded(tenant_write_result);
-        self.write_sound = left_write_sound and right_write_sound and tenant_write_sound;
+        const left_write_disposition = try writeDisposition(left_write_result);
+        const right_write_disposition = try writeDisposition(right_write_result);
+        const tenant_write_disposition = try writeDisposition(tenant_write_result);
         self.phase = .writes_complete;
 
         var left_read = self.sim.io().async(runRead, .{
@@ -702,14 +785,65 @@ pub const Fixture = struct {
         const left_read_result = left_read.await(self.sim.io());
         const right_read_result = right_read.await(self.sim.io());
         const tenant_read_result = tenant_read.await(self.sim.io());
-        const left_read_sound = try operationSucceeded(left_read_result);
-        const right_read_sound = try operationSucceeded(right_read_result);
-        const tenant_read_sound = try operationSucceeded(tenant_read_result);
+        var left_read_sound = try operationSucceeded(left_read_result);
+        var right_read_sound = try operationSucceeded(right_read_result);
+        var tenant_read_sound = try operationSucceeded(tenant_read_result);
+        left_read_sound = try self.resolveIdempotentWrite(
+            left_write_disposition,
+            left_read_sound,
+            0,
+            self.data_api_uris[2],
+            1,
+            "docs",
+            left_body,
+            "doc:c",
+            "production-left",
+        );
+        right_read_sound = try self.resolveIdempotentWrite(
+            right_write_disposition,
+            right_read_sound,
+            1,
+            self.data_api_uris[0],
+            2,
+            "docs",
+            right_body,
+            "doc:x",
+            "production-right",
+        );
+        tenant_read_sound = try self.resolveIdempotentWrite(
+            tenant_write_disposition,
+            tenant_read_sound,
+            2,
+            self.data_api_uris[1],
+            0,
+            "tenant_b_docs",
+            "{\"inserts\":{\"tenant:q\":{\"title\":\"production-tenant\"}},\"sync_level\":\"write\"}",
+            "tenant:q",
+            "production-tenant",
+        );
+        // A 409 "write outcome unknown" is never blindly retried: the generic
+        // batch API may contain non-idempotent transforms. These particular
+        // fixed-ID upserts first resolve ambiguity by reading the exact value
+        // and may retry only their known-idempotent final state. An
+        // acknowledged or ambiguous write is sound only when that value is
+        // visible through the public routing path.
+        self.write_sound = left_read_sound and right_read_sound and tenant_read_sound;
         self.read_sound = left_read_sound and right_read_sound;
         self.tenant_sound = tenant_read_sound;
         self.phase = .reads_complete;
         if (!self.write_sound or !self.read_sound or !self.tenant_sound)
             return error.ProductionDataPublicRoundTripFailed;
+
+        if (self.graph_enabled) {
+            if (!try self.waitForDocIdentityReady("docs", 64))
+                return error.ProductionDataDocIdentityPublicationTimeout;
+            const right_hop_sound = try self.runGraphQuery("doc:x", 1, &.{"doc:k"});
+            const round_trip_sound = try self.runGraphQuery("doc:c", 2, &.{ "doc:x", "doc:k" });
+            self.graph_sound = right_hop_sound and round_trip_sound;
+            self.phase = .graph_query_complete;
+            if (!self.graph_sound) return error.ProductionDataGraphQueryFailed;
+        }
+
         if (!self.active_split_enabled) return;
 
         // A full distributed witness must do more than host a static
@@ -723,17 +857,14 @@ pub const Fixture = struct {
             split_key,
         );
         self.phase = .split_requested;
-        self.control_rounds_enabled = true;
         try self.waitForSplitFinalized();
         self.split_finalized = true;
         self.phase = .split_finalized;
 
-        self.control_rounds_enabled = false;
-        for (0..30_000) |_| {
-            if (!self.control_round_active) break;
-            if (self.driver_failure) |err| return err;
-            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
-        } else return error.ProductionDataControlHandoffTimeout;
+        // waitForSplitFinalized only observes state after a requested control
+        // round has published its completion, so no later round can still be
+        // racing publication at this handoff.
+        std.debug.assert(!self.control_round_active);
         self.stopControlDriver();
         try self.metadata.?.retireExternalDataSplit(split_transition_id);
         self.split_published = true;
@@ -753,25 +884,199 @@ pub const Fixture = struct {
         if (!self.split_sound) return error.ProductionDataSplitRoundTripFailed;
     }
 
+    fn runGraphQuery(
+        self: *Fixture,
+        start_key: []const u8,
+        max_depth: u32,
+        expected_keys: []const []const u8,
+    ) !bool {
+        const query_body = try test_contract_helpers.encodeGraphTraverseQueryRequest(
+            self.alloc,
+            "walk",
+            graph_index_name,
+            &.{start_key},
+            &.{"links"},
+            max_depth,
+            10,
+        );
+        defer self.alloc.free(query_body);
+
+        // Queries are idempotent. Retry only typed availability responses;
+        // never reinterpret a successful partial response as transient.
+        for (0..node_count * 4) |attempt| {
+            const uri = self.data_api_uris[attempt % node_count];
+            var response = self.client.fetchQueryRaw(uri, "docs", query_body) catch |err| switch (err) {
+                error.Canceled => return err,
+                else => {
+                    try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                },
+            };
+            defer response.deinit(self.alloc);
+            if (response.status != 200) {
+                if (response.status != 409 and response.status != 503)
+                    return error.UnexpectedHttpStatus;
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                continue;
+            }
+
+            var parsed = try std.json.parseFromSlice(
+                metadata_openapi.QueryResponses,
+                self.alloc,
+                response.body,
+                .{},
+            );
+            defer parsed.deinit();
+            const responses = parsed.value.responses orelse return false;
+            if (responses.len != 1) return false;
+            const graph_results = responses[0].graph_results orelse return false;
+            const walk = graph_results.map.get("walk") orelse return false;
+            const nodes = walk.nodes orelse return false;
+            if (walk.total != expected_keys.len or nodes.len != expected_keys.len) {
+                std.debug.print(
+                    "production graph probe start={s} depth={} returned incomplete result: {s}\n",
+                    .{ start_key, max_depth, response.body },
+                );
+                return false;
+            }
+            for (expected_keys) |expected| {
+                var found = false;
+                for (nodes) |node| found = found or std.mem.eql(u8, node.key, expected);
+                if (!found) {
+                    std.debug.print(
+                        "production graph probe start={s} missing={s}: {s}\n",
+                        .{ start_key, expected, response.body },
+                    );
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn waitForDocIdentityReady(self: *Fixture, table_name: []const u8, max_rounds: usize) !bool {
+        for (0..max_rounds) |_| {
+            _ = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse {
+                try self.runOneControlRound();
+                continue;
+            };
+            var every_metadata_replica_ready = true;
+            for (0..node_count) |node_index| {
+                const node = self.metadata.?.cluster.node(node_index);
+                var snapshot = try node.adminSnapshot();
+                defer node.freeAdminSnapshot(&snapshot);
+
+                var table_id: ?u64 = null;
+                for (snapshot.tables) |table| {
+                    if (!std.mem.eql(u8, table.name, table_name)) continue;
+                    table_id = table.table_id;
+                    break;
+                }
+                var range_count: usize = 0;
+                var ready_count: usize = 0;
+                if (table_id) |id| for (snapshot.ranges) |range| {
+                    if (range.table_id != id) continue;
+                    range_count += 1;
+                    for (snapshot.merged_group_statuses) |status| {
+                        if (status.group_id != range.group_id) continue;
+                        const identity = status.doc_identity;
+                        if (!status.doc_identity_reassignment_active and
+                            !status.doc_identity_namespace_conflict and
+                            !identity.rebuild_required and
+                            identity.namespace_table_id == range.table_id and
+                            identity.namespace_shard_id == metadata_table_manager.rangeDocIdentityShardId(range) and
+                            identity.namespace_range_id == metadata_table_manager.rangeDocIdentityRangeId(range))
+                        {
+                            ready_count += 1;
+                        }
+                        break;
+                    }
+                };
+                if (range_count == 0 or ready_count != range_count) {
+                    every_metadata_replica_ready = false;
+                    break;
+                }
+            }
+            if (every_metadata_replica_ready) {
+                for (&self.data_servers) |*server|
+                    try server.refreshRemoteMetadataSnapshot();
+                return true;
+            }
+            try self.runOneControlRound();
+        }
+        return false;
+    }
+
     fn waitForSplitFinalized(self: *Fixture) !void {
         for (0..30_000) |_| {
             if (try self.metadata.?.externalDataSplitFinalized(split_transition_id)) return;
-            if (self.driver_failure) |err| return err;
-            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            try self.runOneControlRound();
         }
         return error.ProductionDataSplitTimeout;
     }
 
     const OperationResult = union(enum) {
         success: bool,
+        outcome_unknown,
         failure: anyerror,
     };
 
     fn operationSucceeded(result: OperationResult) !bool {
         return switch (result) {
             .success => |sound| sound,
+            .outcome_unknown => error.UnresolvedWriteOutcome,
             .failure => |err| err,
         };
+    }
+
+    const WriteDisposition = enum { acknowledged, outcome_unknown };
+
+    fn writeDisposition(result: OperationResult) !WriteDisposition {
+        return switch (result) {
+            .success => |sound| if (sound) .acknowledged else error.UnsuccessfulWrite,
+            .outcome_unknown => .outcome_unknown,
+            .failure => |err| err,
+        };
+    }
+
+    fn resolveIdempotentWrite(
+        self: *Fixture,
+        initial_disposition: WriteDisposition,
+        initially_visible: bool,
+        operation_index: usize,
+        write_uri: []const u8,
+        read_uri_index: usize,
+        table_name: []const u8,
+        body: []const u8,
+        key: []const u8,
+        expected: []const u8,
+    ) !bool {
+        if (initially_visible) return true;
+        // An acknowledged-but-invisible value is a safety failure. Only the
+        // explicit unknown-outcome contract permits this workload to retry,
+        // and only because these fixed-ID upserts have an idempotent final
+        // state. Generic batch callers must not infer the same permission.
+        if (initial_disposition == .acknowledged) return false;
+        for (0..3) |_| {
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            const disposition = try writeDisposition(self.runWrite(
+                operation_index,
+                write_uri,
+                table_name,
+                body,
+            ));
+            const visible = try operationSucceeded(self.runRead(
+                operation_index,
+                read_uri_index,
+                table_name,
+                key,
+                expected,
+            ));
+            if (visible) return true;
+            if (disposition == .acknowledged) return false;
+        }
+        return false;
     }
 
     fn runWrite(
@@ -781,13 +1086,25 @@ pub const Fixture = struct {
         table_name: []const u8,
         body: []const u8,
     ) OperationResult {
+        self.write_attempts[operation_index] +|= 1;
         var response = self.client.fetchBatchResponse(uri, table_name, body) catch |err|
             return .{ .failure = err };
         defer response.deinit(self.alloc);
         self.write_statuses[operation_index] = response.status;
         self.write_body_digests[operation_index] = std.hash.Wyhash.hash(0, response.body);
-        if (response.status != 201 and response.status != 202)
+        if (response.status == 409 and
+            std.mem.eql(u8, std.mem.trim(u8, response.body, " \t\r\n"), "write outcome unknown"))
+        {
+            self.write_outcome_unknowns[operation_index] +|= 1;
+            return .outcome_unknown;
+        }
+        if (response.status != 201 and response.status != 202) {
+            std.debug.print(
+                "production write operation={} status={} body={s}\n",
+                .{ operation_index, response.status, response.body },
+            );
             return .{ .failure = error.UnexpectedHttpStatus };
+        }
         return .{ .success = true };
     }
 
@@ -813,10 +1130,17 @@ pub const Fixture = struct {
             const visible = status == 200 and std.mem.indexOf(u8, response.body, expected) != null;
             self.read_statuses[operation_index] = status;
             self.read_body_digests[operation_index] = std.hash.Wyhash.hash(0, response.body);
+            if (status != 200 and status != 404) {
+                std.debug.print(
+                    "production read operation={} table={s} key={s} status={} body={s}\n",
+                    .{ operation_index, table_name, key, status, response.body },
+                );
+            }
             response.deinit(self.alloc);
             if (visible) return .{ .success = true };
-            if (status != 200 and status != 404)
+            if (status != 200 and status != 404) {
                 return .{ .failure = error.UnexpectedHttpStatus };
+            }
             self.sim.io().sleep(.fromMilliseconds(1), .awake) catch |err|
                 return .{ .failure = err };
         }
@@ -1058,6 +1382,7 @@ pub const Fixture = struct {
     pub fn healthSnapshot(self: *const Fixture) struct {
         requests_ok: bool,
         topology_ok: bool,
+        graph_query_ok: bool,
         cleanup_ok: bool,
         node_resource_managers: usize,
         hosts: usize,
@@ -1067,9 +1392,11 @@ pub const Fixture = struct {
             .requests_ok = self.write_sound and
                 self.read_sound and
                 self.tenant_sound and
+                (!self.graph_enabled or self.graph_sound) and
                 (!self.active_split_enabled or self.split_sound) and
                 self.failure == null,
             .topology_ok = self.topology_sound,
+            .graph_query_ok = self.graph_sound,
             .cleanup_ok = self.cleanup_sound,
             // `backend_runtime_count` is live ownership and intentionally
             // reaches zero during cleanup. Keep the monotonic construction

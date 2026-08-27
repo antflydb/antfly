@@ -76,7 +76,13 @@ pub const IoHttpExecutor = struct {
         return .{
             .ptr = self,
             .vtable = &.{ .execute = execute },
+            .realtime_ns_fn = realtimeNs,
         };
+    }
+
+    fn realtimeNs(ptr: *anyopaque) i128 {
+        const self: *IoHttpExecutor = @ptrCast(@alignCast(ptr));
+        return @intCast(std.Io.Clock.real.now(self.io).nanoseconds);
     }
 
     fn execute(

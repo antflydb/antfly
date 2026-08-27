@@ -48,6 +48,9 @@ pub const ManagedServiceDeps = struct {
     transition_runtime: ?transition_runtime.TransitionRuntime = null,
     transition_ops: ?shard_ops.ShardOperationAdapter = null,
     transition_retry_clock: transition_service.RetryClock = transition_service.RetryClock.real(),
+    /// Null keeps production jitter seeded from host entropy. Deterministic
+    /// runtimes provide a stable per-node salt for exact replay.
+    transition_retry_jitter_salt: ?u64 = null,
     transition_authority: ?TransitionAuthority = null,
 };
 
@@ -163,6 +166,7 @@ pub const ManagedHostService = struct {
     cfg: ManagedServiceConfig,
     host: managed_host.ManagedHost,
     transition_retry_clock: transition_service.RetryClock,
+    transition_retry_jitter_salt: u64,
     transition_authority: ?TransitionAuthority,
     local_transition_runtime: ?transition_runtime.TransitionRuntime = null,
     pending_updates: std.ArrayListUnmanaged(metadata_view.MetadataUpdate) = .empty,
@@ -176,17 +180,21 @@ pub const ManagedHostService = struct {
         cfg: ManagedServiceConfig,
         deps: ManagedServiceDeps,
     ) !ManagedHostService {
+        const retry_jitter_salt = transition_service.resolveRetryJitterSalt(
+            deps.transition_retry_jitter_salt,
+        );
         var svc = ManagedHostService{
             .alloc = alloc,
             .cfg = cfg,
             .host = try managed_host.ManagedHost.init(alloc, host_cfg, host_deps),
             .transition_retry_clock = deps.transition_retry_clock,
+            .transition_retry_jitter_salt = retry_jitter_salt,
             .transition_authority = deps.transition_authority,
             .local_transition_runtime = deps.transition_runtime,
             .transition_svc = if (deps.transition_ops) |ops|
-                try transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClockAndJitterSalt(alloc, ops, deps.transition_retry_clock, retry_jitter_salt)
             else if (deps.transition_runtime) |runtime|
-                try transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClockAndJitterSalt(alloc, runtime, deps.transition_retry_clock, retry_jitter_salt)
             else
                 null,
         };
@@ -254,10 +262,11 @@ pub const ManagedHostService = struct {
         self: *ManagedHostService,
         ops: shard_ops.ShardOperationAdapter,
     ) !shard_ops.OwnedShardOperationAdapter.Registration {
-        var replacement = try transition_service.TransitionService.initWithRetryClock(
+        var replacement = try transition_service.TransitionService.initWithRetryClockAndJitterSalt(
             self.alloc,
             ops,
             self.transition_retry_clock,
+            self.transition_retry_jitter_salt,
         );
         errdefer replacement.deinit();
         try self.seedTransitionServiceFromMetadataStore(
@@ -532,6 +541,7 @@ pub const ManagedHttpHostService = struct {
     cfg: ManagedServiceConfig,
     host: managed_host.ManagedHttpHost,
     transition_retry_clock: transition_service.RetryClock,
+    transition_retry_jitter_salt: u64,
     transition_authority: ?TransitionAuthority,
     local_transition_runtime: ?transition_runtime.TransitionRuntime = null,
     pending_updates: std.ArrayListUnmanaged(metadata_view.MetadataUpdate) = .empty,
@@ -546,17 +556,21 @@ pub const ManagedHttpHostService = struct {
         cfg: ManagedServiceConfig,
         deps: ManagedServiceDeps,
     ) !ManagedHttpHostService {
+        const retry_jitter_salt = transition_service.resolveRetryJitterSalt(
+            deps.transition_retry_jitter_salt,
+        );
         var svc = ManagedHttpHostService{
             .alloc = alloc,
             .cfg = cfg,
             .host = try managed_host.ManagedHttpHost.init(alloc, host_cfg, host_deps),
             .transition_retry_clock = deps.transition_retry_clock,
+            .transition_retry_jitter_salt = retry_jitter_salt,
             .transition_authority = deps.transition_authority,
             .local_transition_runtime = deps.transition_runtime,
             .transition_svc = if (deps.transition_ops) |ops|
-                try transition_service.TransitionService.initWithRetryClock(alloc, ops, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClockAndJitterSalt(alloc, ops, deps.transition_retry_clock, retry_jitter_salt)
             else if (deps.transition_runtime) |runtime|
-                try transition_service.TransitionService.initWithRetryClock(alloc, runtime, deps.transition_retry_clock)
+                try transition_service.TransitionService.initWithRetryClockAndJitterSalt(alloc, runtime, deps.transition_retry_clock, retry_jitter_salt)
             else
                 null,
         };
@@ -608,10 +622,11 @@ pub const ManagedHttpHostService = struct {
         self: *ManagedHttpHostService,
         ops: shard_ops.ShardOperationAdapter,
     ) !shard_ops.OwnedShardOperationAdapter.Registration {
-        var replacement = try transition_service.TransitionService.initWithRetryClock(
+        var replacement = try transition_service.TransitionService.initWithRetryClockAndJitterSalt(
             self.alloc,
             ops,
             self.transition_retry_clock,
+            self.transition_retry_jitter_salt,
         );
         errdefer replacement.deinit();
         try self.seedTransitionServiceFromMetadataStore(
@@ -2275,8 +2290,11 @@ test "managed host service preserves leader-routed observation roles from transi
         .host = .{ .descriptor_factory = factory.iface() },
     }, .{}, .{
         .transition_ops = FakeShardOps.adapter(),
+        .transition_retry_jitter_salt = 0x1234,
     });
     defer svc.deinit();
+    try std.testing.expectEqual(@as(u64, 0x1234), svc.transition_retry_jitter_salt);
+    try std.testing.expectEqual(@as(u64, 0x1234), svc.transition_svc.?.retry_jitter_salt);
 
     try svc.submitSplitTransition(.{
         .transition_id = 3001,
@@ -2323,6 +2341,10 @@ test "managed host service preserves leader-routed observation roles from transi
         .destination_group_id = 1902,
     });
     try std.testing.expect(after_failed_replace.source_local_leader);
+
+    var replacement_registration = try svc.replaceTransitionOps(FakeShardOps.adapter());
+    defer replacement_registration.deinit();
+    try std.testing.expectEqual(@as(u64, 0x1234), svc.transition_svc.?.retry_jitter_salt);
 }
 
 test "managed service module compiles" {

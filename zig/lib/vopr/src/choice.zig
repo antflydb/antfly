@@ -534,14 +534,14 @@ pub const Replay = struct {
             std.debug.print("\nexpected enabled[{d}]={d}", .{ ordinal, id });
         for (request.enabled[0..@min(request.enabled.len, diagnostic_limit)], 0..) |enabled, ordinal|
             std.debug.print(
-                "\nactual enabled[{d}]={d} name={s} actor={?d} resource={?d} parameter={d}",
-                .{ ordinal, enabled.id, enabled.name, enabled.actor_id, enabled.resource_id, enabled.parameter },
+                "\nactual enabled[{d}]={d} name={s} actor={?d} resource={?d} parameter={d} semantic={d} payload={d}",
+                .{ ordinal, enabled.id, enabled.name, enabled.actor_id, enabled.resource_id, enabled.parameter, enabled.semantic_digest, enabled.payloadDigest() },
             );
         if (index < self.expected_transitions.len) {
             const expected = self.expected_transitions[index];
             std.debug.print(
-                "\nrecorded selected transition id={d} name={s} actor={?d} resource={?d} parameter={d}",
-                .{ expected.id, expected.name, expected.actor_id, expected.resource_id, expected.parameter },
+                "\nrecorded selected transition id={d} name={s} actor={?d} resource={?d} parameter={d} payload={d}",
+                .{ expected.id, expected.name, expected.actor_id, expected.resource_id, expected.parameter, expected.payload_digest },
             );
         }
         const recent_count = @min(self.recent_actual_count, self.recent_actual.len);
@@ -550,14 +550,14 @@ pub const Replay = struct {
             const choice_index = index - recent_count + offset;
             const actual = self.recent_actual[(recent_start + offset) % self.recent_actual.len];
             std.debug.print(
-                "\nprior actual[{d}] id={d} name={s} actor={?d} resource={?d} parameter={d}",
-                .{ choice_index, actual.id, actual.name, actual.actor_id, actual.resource_id, actual.parameter },
+                "\nprior actual[{d}] id={d} name={s} actor={?d} resource={?d} parameter={d} semantic={d} payload={d}",
+                .{ choice_index, actual.id, actual.name, actual.actor_id, actual.resource_id, actual.parameter, actual.semantic_digest, actual.payloadDigest() },
             );
             if (choice_index < self.expected_transitions.len) {
                 const expected = self.expected_transitions[choice_index];
                 std.debug.print(
-                    "\nprior expected[{d}] id={d} name={s} actor={?d} resource={?d} parameter={d}",
-                    .{ choice_index, expected.id, expected.name, expected.actor_id, expected.resource_id, expected.parameter },
+                    "\nprior expected[{d}] id={d} name={s} actor={?d} resource={?d} parameter={d} payload={d}",
+                    .{ choice_index, expected.id, expected.name, expected.actor_id, expected.resource_id, expected.parameter, expected.payload_digest },
                 );
             }
         }

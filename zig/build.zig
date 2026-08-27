@@ -4389,6 +4389,7 @@ pub fn build(b: *std.Build) void {
         "data runtime local group status does not open roots owned by transitions",
         "data runtime local group status provider collects and caches group statuses",
         "data runtime storage ownership fingerprint excludes transient placement progress",
+        "owned local group status refresh releases merged status lifecycle strings",
         "data descriptor factory separates bootstrap voters from transport peers",
         "data runtime remote admin snapshot clone owns parser-backed slices",
         "data runtime remote admin snapshot clone releases partial ownership",
@@ -4458,6 +4459,7 @@ pub fn build(b: *std.Build) void {
         "data public API listener uses public API request body limit",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
+        "data raft read lease completes only after matching ReadState apply",
         "data raft ticker advances consensus independently of control rounds",
         "raft batch round trips table batch payload",
         "raft batch round trips deterministic transaction begin",
@@ -5498,6 +5500,7 @@ pub fn build(b: *std.Build) void {
         "stored destination envelopes cannot be forged and validate on resume",
         "stored destination grants bind credential source and live permissions",
         "api http client forwards bounded raft batch routing context without allocation",
+        "internal service request signing uses the transport clock authority",
         "api http client authenticates only the internal API namespace",
         "MCP document sampling pushes mandatory row filters into storage scans",
         "internal service credentials cannot authorize public inference routes",
@@ -6332,6 +6335,7 @@ pub fn build(b: *std.Build) void {
     api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     const api_table_writes_production_regression_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
         .filters = &.{
             "provisioned writer cache starts DB workers after stable entry installation",
             "table write source restore acquires lifecycle unless caller reserves it",
@@ -6373,6 +6377,7 @@ pub fn build(b: *std.Build) void {
             "managed create publication handoff releases on converged owner publication",
             "managed dense publication handoff releases when its incarnation is superseded",
             "resident DB retry preparation waits outside admission for writer publication",
+            "resident DB retry preparation does not block a borrowed std.Io scheduler",
             "admitted resident DB lease never waits for an in-flight writer publication",
             "write cache local mutation preempts stale startup writer",
             "structural reconcile pending set never revisits completed groups",
@@ -7190,6 +7195,7 @@ pub fn build(b: *std.Build) void {
     const full_cluster_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster VOPR exact replays"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_full_cluster_vopr_tests = b.addRunArtifact(full_cluster_vopr_tests);
     const full_cluster_vopr_test_step = b.step(
@@ -7201,18 +7207,49 @@ pub fn build(b: *std.Build) void {
     const production_cluster_baseline_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane baseline exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_production_cluster_baseline_vopr_tests = b.addRunArtifact(production_cluster_baseline_vopr_tests);
     const production_cluster_bounded_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane VOPR bounded cutoff exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_production_cluster_bounded_vopr_tests = b.addRunArtifact(production_cluster_bounded_vopr_tests);
+    // Each production composition may use most of its large RSS allowance.
+    // Keep the smoke aggregate deterministic under constrained CI hosts by
+    // running the two fresh-world replay processes serially.
+    run_production_cluster_bounded_vopr_tests.step.dependOn(&run_production_cluster_baseline_vopr_tests.step);
     const production_cluster_deep_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane VOPR active split exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_production_cluster_deep_vopr_tests = b.addRunArtifact(production_cluster_deep_vopr_tests);
+    const production_cluster_graph_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production data plane graph exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_graph_vopr_tests = b.addRunArtifact(production_cluster_graph_vopr_tests);
+    // Stackful VoprIo fibers do not use Zig's persistent std.zig.Server test
+    // protocol: after a successful test body the server runner can report a
+    // spurious subprocess failure, while the same binary and seed pass in
+    // normal test mode. Run these production-sized gates as ordinary
+    // exit-code-checked subprocesses. `.inherit` also takes the build graph's
+    // global stdio lock, preventing two large fresh-world replays from sharing
+    // the host at once.
+    inline for (.{
+        run_production_cluster_baseline_vopr_tests,
+        run_production_cluster_bounded_vopr_tests,
+        run_production_cluster_deep_vopr_tests,
+        run_production_cluster_graph_vopr_tests,
+    }) |run_production_cluster_test| {
+        // addRunArtifact appends cache-dir, seed, and --listen arguments after
+        // the artifact; simple mode needs only the artifact itself.
+        run_production_cluster_test.argv.shrinkRetainingCapacity(1);
+        run_production_cluster_test.stdio = .inherit;
+    }
     const production_cluster_vopr_smoke_test_step = b.step(
         "production-cluster-vopr-smoke-test",
         "Exact-replay the production DataServer deployment baseline and bounded lifecycle",
@@ -7224,12 +7261,18 @@ pub fn build(b: *std.Build) void {
         "Exact-replay the complete metadata-driven production DataServer split history",
     );
     production_cluster_vopr_deep_test_step.dependOn(&run_production_cluster_deep_vopr_tests.step);
+    const production_cluster_graph_vopr_test_step = b.step(
+        "production-cluster-graph-vopr-test",
+        "Exact-replay a depth-two public graph across production DataServer owners",
+    );
+    production_cluster_graph_vopr_test_step.dependOn(&run_production_cluster_graph_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
         "Run production DataServer deployment smoke and deep active-reconfiguration histories",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_graph_vopr_test_step);
 
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
