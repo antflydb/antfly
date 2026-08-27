@@ -1578,7 +1578,6 @@ pub const HttpHandler = struct {
         var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
-                error.UnsupportedQueryRequest,
                 error.EmbeddingIndexNotFound,
                 error.InvalidEmbeddingDimensions,
                 error.PermanentPromptFailure,
@@ -1590,6 +1589,7 @@ pub const HttpHandler = struct {
                     std.log.warn("serverless public table search rejected table={s} err={}", .{ table_name, err });
                     return error.InvalidQueryRequest;
                 },
+                error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
                 error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
                 error.FileNotFound,
                 error.VectorSegmentNotFound,
@@ -2695,7 +2695,6 @@ pub const HttpHandler = struct {
 
             var execution = self.executePublishedSearch(namespace, table_name, search_body, cancellation) catch |err| switch (err) {
                 error.InvalidQueryRequest,
-                error.UnsupportedQueryRequest,
                 error.EmbeddingIndexNotFound,
                 error.InvalidEmbeddingDimensions,
                 error.PermanentPromptFailure,
@@ -2704,6 +2703,7 @@ pub const HttpHandler = struct {
                 error.VectorDimsMismatch,
                 error.SparseQueryRequired,
                 => return error.InvalidQueryRequest,
+                error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
                 error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
                 else => return err,
             };
@@ -2785,7 +2785,6 @@ pub const HttpHandler = struct {
         var execution = self.executePublishedSearch(namespace, null, body, cancellation) catch |err| {
             switch (err) {
                 error.InvalidQueryRequest,
-                error.UnsupportedQueryRequest,
                 error.EmbeddingIndexNotFound,
                 error.InvalidEmbeddingDimensions,
                 error.PermanentPromptFailure,
@@ -2797,6 +2796,7 @@ pub const HttpHandler = struct {
                     std.log.err("serverless query invalid namespace={s} err={}", .{ namespace, err });
                     return try textResponse(self.alloc, 400, "invalid query request");
                 },
+                error.UnsupportedQueryRequest => return try unsupportedQueryResponse(self.alloc),
                 error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
                 error.FileNotFound => {
                     std.log.err("serverless query missing namespace={s} err={}", .{ namespace, err });
@@ -2878,7 +2878,6 @@ pub const HttpHandler = struct {
         defer self.alloc.free(namespace);
         var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest,
-            error.UnsupportedQueryRequest,
             error.EmbeddingIndexNotFound,
             error.InvalidEmbeddingDimensions,
             error.PermanentPromptFailure,
@@ -2887,6 +2886,7 @@ pub const HttpHandler = struct {
             error.VectorDimsMismatch,
             error.SparseQueryRequired,
             => return try textResponse(self.alloc, 400, "invalid query request"),
+            error.UnsupportedQueryRequest => return try unsupportedQueryResponse(self.alloc),
             error.UnsupportedHierarchyGrouping => return try unsupportedHierarchyGroupingResponse(self.alloc),
             error.FileNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.VectorSegmentNotFound => return try textResponse(self.alloc, 404, "vector segment not found"),
@@ -6711,6 +6711,10 @@ fn unsupportedHierarchyGroupingResponse(alloc: Allocator) !HttpResponse {
     return jsonResponse(alloc, 422, public_table_http.UnsupportedHierarchyGroupingError{});
 }
 
+fn unsupportedQueryResponse(alloc: Allocator) !HttpResponse {
+    return jsonResponse(alloc, 422, public_table_http.UnsupportedQueryError{});
+}
+
 const UnsupportedArtifactIndexSourcesError = struct {
     @"error": []const u8 = "unsupported_index_capability",
     message: []const u8 = "artifact-backed index sources are not supported by this deployment",
@@ -6752,6 +6756,24 @@ test "serverless unsupported hierarchy grouping response uses the public contrac
     try std.testing.expectEqualStrings("unsupported_hierarchy_grouping", parsed.value.@"error");
     try std.testing.expectEqualStrings("use_source_grouping_or_direct_members", parsed.value.action);
     try std.testing.expect(std.mem.indexOf(u8, parsed.value.message, "return_mode") == null);
+}
+
+test "serverless unsupported query response uses the public contract" {
+    const alloc = std.testing.allocator;
+    var response = try unsupportedQueryResponse(alloc);
+    defer response.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u16, 422), response.status);
+    try std.testing.expectEqualStrings("application/json", response.content_type);
+    var parsed = try std.json.parseFromSlice(
+        public_table_http.UnsupportedQueryError,
+        alloc,
+        response.body,
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", parsed.value.@"error");
+    try std.testing.expect(!parsed.value.retryable);
 }
 
 test "serverless http handler serves internal namespace lifecycle, admission, and query head" {

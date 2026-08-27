@@ -6989,7 +6989,10 @@ components:
             supplied. Provisioned deployments require at least one index for `semantic_search`;
             serverless may infer its single published dense index when this field is omitted. When
             `embeddings` is supplied without this field, the embedding map keys select the indexes.
-            Results from multiple indexes are merged using RRF.
+            Provisioned results from multiple indexes are merged using RRF. Serverless currently
+            executes at most one dense and one sparse index per request; it rejects multiple
+            same-kind selectors and omitted selectors when more than one corresponding index is
+            published rather than choosing an index by catalog order.
           example: ["title_body_nomic", "description_embedding"]
         filter_prefix:
           type: string

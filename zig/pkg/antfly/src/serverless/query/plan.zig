@@ -500,9 +500,20 @@ fn resolveSearchSources(
         (req.mode == .sparse or req.mode == .hybrid) and
         (req.sparse != null and req.sparse.?.len != 0);
     var resolved = try published_search_sources.resolveRequested(req.indexes, needs_vector, needs_sparse);
-    if (req.semantic_search != null and resolved.findVector() == null) {
+
+    // The published-segment executor currently has one vector and one sparse
+    // execution lane. Omitted selectors are safe only when the catalog is
+    // unambiguous; otherwise fail closed instead of making result quality
+    // depend on catalog insertion order.
+    if (needs_vector and resolved.findVector() == null) {
+        if (published_search_sources.countKind(.vector) > 1) return error.UnsupportedQueryRequest;
         const fallback = published_search_sources.findVector() orelse return error.InvalidQueryRequest;
         try resolved.append(.{ .vector = fallback });
+    }
+    if (needs_sparse and resolved.findSparse() == null) {
+        if (published_search_sources.countKind(.sparse) > 1) return error.UnsupportedQueryRequest;
+        const fallback = published_search_sources.findSparse() orelse return error.InvalidQueryRequest;
+        try resolved.append(.{ .sparse = fallback });
     }
     if (needs_text and resolved.findText() == null) {
         if (req.full_text_index) |index_name| {
@@ -572,6 +583,76 @@ test "search plan defaults semantic-only requests to vector mode and resolves de
     defer plan.deinit(alloc);
     try std.testing.expectEqual(request.QueryMode.vector, plan.request.mode);
     try std.testing.expectEqualStrings(search_sources.default_chunk_embedding_index_name, plan.vectorSource().?.index_name);
+}
+
+test "serverless search plan rejects ambiguous and multiple same-lane embedding selectors" {
+    const alloc = std.testing.allocator;
+    const sources = search_sources.PublishedSearchSources{
+        .items = @constCast(&[_]search_sources.SearchSourceDescriptor{
+            .{ .text = .{ .index_name = search_sources.default_full_text_index_name } },
+            .{ .vector = .{
+                .index_name = "semantic_a",
+                .document_source = .top_level_embedding,
+                .embedding_name = "semantic_a",
+            } },
+            .{ .vector = .{
+                .index_name = "semantic_b",
+                .document_source = .top_level_embedding,
+                .embedding_name = "semantic_b",
+            } },
+            .{ .sparse = .{
+                .index_name = "sparse_a",
+                .document_source = .sparse_embedding,
+                .embedding_name = "sparse_a",
+            } },
+            .{ .sparse = .{
+                .index_name = "sparse_b",
+                .document_source = .sparse_embedding,
+                .embedding_name = "sparse_b",
+            } },
+        }),
+    };
+
+    // An omitted selector must not make behavior depend on catalog order.
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseSearchPlanAlloc(alloc, "{\"semantic_search\":\"cat\"}", sources),
+    );
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseSearchPlanAlloc(alloc, "{\"vector\":[1,0,0],\"mode\":\"vector\"}", sources),
+    );
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseSearchPlanAlloc(alloc, "{\"sparse\":[{\"term\":\"cat\",\"weight\":1}],\"mode\":\"sparse\"}", sources),
+    );
+
+    // Explicit same-lane fan-out is also rejected until the serverless reader
+    // can execute and fuse every selected segment.
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseSearchPlanAlloc(
+            alloc,
+            "{\"semantic_search\":\"cat\",\"indexes\":[\"semantic_a\",\"semantic_b\"]}",
+            sources,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSearchPlanAlloc(
+            alloc,
+            "{\"semantic_search\":\"cat\",\"indexes\":[\"semantic_a\",\"sparse_a\"]}",
+            sources,
+        ),
+    );
+
+    var selected = try parseSearchPlanAlloc(
+        alloc,
+        "{\"semantic_search\":\"cat\",\"indexes\":[\"semantic_b\"]}",
+        sources,
+    );
+    defer selected.deinit(alloc);
+    try std.testing.expectEqualStrings("semantic_b", selected.vectorSource().?.index_name);
 }
 
 test "search plan accepts public dense embeddings map" {

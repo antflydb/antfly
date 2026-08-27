@@ -136,6 +136,24 @@ pub const PublishedSearchSources = struct {
         return self.sparse;
     }
 
+    /// Counts the published sources for one search lane. The optional singular
+    /// fields are the pre-registry representation; when registry items for a
+    /// lane exist they are authoritative, matching the find* helpers above.
+    pub fn countKind(self: PublishedSearchSources, kind: SearchSourceKind) usize {
+        if (self.items) |items| {
+            var count: usize = 0;
+            for (items) |item| {
+                if (item.kind() == kind) count += 1;
+            }
+            if (count != 0) return count;
+        }
+        return switch (kind) {
+            .text => @intFromBool(self.text != null),
+            .vector => @intFromBool(self.vector != null),
+            .sparse => @intFromBool(self.sparse != null),
+        };
+    }
+
     pub fn resolveRequested(
         self: PublishedSearchSources,
         indexes: ?[][]u8,
@@ -184,6 +202,8 @@ pub const PublishedSearchSources = struct {
 
         if (needs_vector and indexes != null and resolved.findVector() == null) return error.InvalidQueryRequest;
         if (needs_sparse and indexes != null and resolved.findSparse() == null) return error.InvalidQueryRequest;
+        if (!needs_vector and resolved.findVector() != null) return error.InvalidQueryRequest;
+        if (!needs_sparse and resolved.findSparse() != null) return error.InvalidQueryRequest;
         return resolved;
     }
 };
@@ -205,7 +225,10 @@ pub const MaterializedDerivedOutputs = struct {
 };
 
 pub const ResolvedSearchSources = struct {
-    items: [4]SearchSourceDescriptor = undefined,
+    // Serverless currently executes one full-text, one dense, and one sparse
+    // lane. Admission rejects a second distinct source for any lane rather
+    // than allowing execution to silently choose the first descriptor.
+    items: [3]SearchSourceDescriptor = undefined,
     len: usize = 0,
 
     pub fn asSlice(self: *const ResolvedSearchSources) []const SearchSourceDescriptor {
@@ -216,6 +239,7 @@ pub const ResolvedSearchSources = struct {
         for (self.asSlice()) |item| {
             if (item.kind() != descriptor.kind()) continue;
             if (std.mem.eql(u8, item.indexName(), descriptor.indexName())) return;
+            return error.UnsupportedQueryRequest;
         }
         if (self.len >= self.items.len) return error.InvalidQueryRequest;
         self.items[self.len] = descriptor;
@@ -922,6 +946,36 @@ test "published search sources preserve multiple named embedding indexes" {
     try std.testing.expectEqualStrings("semantic_idx_b", resolved.findVector().?.embedding_name.?);
     try std.testing.expectEqualStrings("sparse_idx_b", resolved.findSparse().?.index_name);
     try std.testing.expectEqualStrings("sparse_idx_b", resolved.findSparse().?.embedding_name.?);
+}
+
+test "serverless published search sources reject multiple selectors for one execution lane" {
+    const alloc = std.testing.allocator;
+    var sources = try publishedSearchSourcesForIndexesJsonAlloc(
+        alloc,
+        "{\"semantic_a\":{\"type\":\"embeddings\",\"dimension\":3},\"semantic_b\":{\"type\":\"embeddings\",\"dimension\":3},\"sparse_a\":{\"type\":\"embeddings\",\"sparse\":true},\"sparse_b\":{\"type\":\"embeddings\",\"sparse\":true}}",
+    );
+    defer deinitPublishedSearchSources(alloc, &sources);
+
+    try std.testing.expectEqual(@as(usize, 2), sources.countKind(.vector));
+    try std.testing.expectEqual(@as(usize, 2), sources.countKind(.sparse));
+
+    var dense_indexes = [_][]u8{ @constCast("semantic_a"), @constCast("semantic_b") };
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        sources.resolveRequested(dense_indexes[0..], true, false),
+    );
+
+    var sparse_indexes = [_][]u8{ @constCast("sparse_a"), @constCast("sparse_b") };
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        sources.resolveRequested(sparse_indexes[0..], false, true),
+    );
+
+    // One source from each independently executable lane remains supported.
+    var hybrid_indexes = [_][]u8{ @constCast("semantic_b"), @constCast("sparse_b") };
+    const hybrid = try sources.resolveRequested(hybrid_indexes[0..], true, true);
+    try std.testing.expectEqualStrings("semantic_b", hybrid.findVector().?.index_name);
+    try std.testing.expectEqualStrings("sparse_b", hybrid.findSparse().?.index_name);
 }
 
 test "published search sources reject unknown index names" {
