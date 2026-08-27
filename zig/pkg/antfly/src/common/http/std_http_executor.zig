@@ -42,6 +42,15 @@ pub const StdHttpExecutorConfig = struct {
 };
 
 pub const StdHttpExecutor = struct {
+    const ControlledRequestState = struct {
+        result: anyerror!common.HttpResponse = error.Canceled,
+        done: std.Io.Event = .unset,
+        /// Captured immediately after transport completion so deadline
+        /// arbitration depends on when the operation finished, not on when a
+        /// delayed waiter happened to resume.
+        completed_at: ?std.Io.Clock.Timestamp = null,
+    };
+
     const IoOwner = enum {
         owned,
         shared,
@@ -284,35 +293,22 @@ pub const StdHttpExecutor = struct {
     fn executeWithControl(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         if (req.timeout_ms != null and req.timeout_ms.? == 0) return error.Timeout;
 
-        const RequestResult = anyerror!common.HttpResponse;
-        const RequestState = struct {
-            result: RequestResult = error.Canceled,
-            done: std.Io.Event = .unset,
-        };
-
         const Task = struct {
             fn requestTask(
-                state: *RequestState,
+                state: *ControlledRequestState,
                 task_io: std.Io,
                 http_executor: *StdHttpExecutor,
                 request_alloc: std.mem.Allocator,
                 request: common.HttpRequest,
             ) std.Io.Cancelable!void {
                 state.result = http_executor.executeTransport(request_alloc, request);
+                state.completed_at = std.Io.Clock.Timestamp.now(task_io, .awake);
                 state.done.set(task_io);
-            }
-
-            fn drainResult(state: *RequestState, response_alloc: std.mem.Allocator) void {
-                if (!state.done.isSet()) return;
-                if (state.result) |response_value| {
-                    var response = response_value;
-                    response.deinit(response_alloc);
-                } else |_| {}
             }
 
             fn cancelAndDrain(
                 group: *std.Io.Group,
-                state: *RequestState,
+                state: *ControlledRequestState,
                 task_io: std.Io,
                 response_alloc: std.mem.Allocator,
             ) void {
@@ -320,7 +316,7 @@ pub const StdHttpExecutor = struct {
                 // request/client defers retire an interrupted connection before
                 // any request-owned pointers are allowed to leave this scope.
                 group.cancel(task_io);
-                drainResult(state, response_alloc);
+                drainControlledResult(state, response_alloc);
             }
         };
 
@@ -332,7 +328,7 @@ pub const StdHttpExecutor = struct {
             })
         else
             null;
-        var state = RequestState{};
+        var state = ControlledRequestState{};
         var group: std.Io.Group = .init;
         try group.concurrent(io, Task.requestTask, .{
             &state,
@@ -386,18 +382,46 @@ pub const StdHttpExecutor = struct {
 
         group.await(io) catch |err| {
             group_active = false;
-            Task.drainResult(&state, alloc);
+            drainControlledResult(&state, alloc);
             return err;
         };
         group_active = false;
-        var response = try state.result;
-        if (req.cancellation) |cancellation| {
-            if (cancellation.isCancelled()) {
-                response.deinit(alloc);
+        return finishControlledRequest(&state, alloc, deadline, req.cancellation);
+    }
+
+    fn finishControlledRequest(
+        state: *ControlledRequestState,
+        response_alloc: std.mem.Allocator,
+        deadline: ?std.Io.Clock.Timestamp,
+        cancellation: ?*const common.RequestCancellation,
+    ) !common.HttpResponse {
+        if (cancellation) |request_cancellation| {
+            if (request_cancellation.isCancelled()) {
+                drainControlledResult(state, response_alloc);
                 return error.Cancelled;
             }
         }
-        return response;
+        if (deadline) |value| {
+            const completed_at = state.completed_at orelse {
+                // A normally joined request always publishes its completion
+                // timestamp before signaling done. Fail closed if a future
+                // transport violates that internal contract.
+                drainControlledResult(state, response_alloc);
+                return error.Timeout;
+            };
+            if (completed_at.compare(.gte, value)) {
+                drainControlledResult(state, response_alloc);
+                return error.Timeout;
+            }
+        }
+        return try state.result;
+    }
+
+    fn drainControlledResult(state: *ControlledRequestState, response_alloc: std.mem.Allocator) void {
+        if (state.result) |response_value| {
+            var response = response_value;
+            response.deinit(response_alloc);
+        } else |_| {}
     }
 
     fn executeDirect(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
@@ -617,6 +641,57 @@ test "std http executor owns a finite controlled request worker budget" {
     defer executor.deinit();
 
     try std.testing.expectEqual(std.Io.Limit.limited(7), executor.io_impl.concurrent_limit);
+}
+
+test "controlled HTTP completion time arbitrates the absolute deadline" {
+    const io = std.testing.io;
+    const completed_before_deadline = std.Io.Clock.Timestamp.now(io, .awake);
+    const future_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
+        .raw = std.Io.Duration.fromMilliseconds(1_000),
+        .clock = .awake,
+    });
+    var timely = StdHttpExecutor.ControlledRequestState{};
+    timely.result = common.HttpResponse{
+        .status = 200,
+        .body = try std.testing.allocator.dupe(u8, "timely"),
+    };
+    timely.completed_at = completed_before_deadline;
+    var timely_response = try StdHttpExecutor.finishControlledRequest(
+        &timely,
+        std.testing.allocator,
+        future_deadline,
+        null,
+    );
+    defer timely_response.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("timely", timely_response.body);
+
+    const expired_deadline = std.Io.Clock.Timestamp.now(io, .awake);
+    var expired = StdHttpExecutor.ControlledRequestState{};
+    expired.result = common.HttpResponse{
+        .status = 200,
+        .body = try std.testing.allocator.dupe(u8, "expired"),
+    };
+    expired.completed_at = expired_deadline;
+    try std.testing.expectError(error.Timeout, StdHttpExecutor.finishControlledRequest(
+        &expired,
+        std.testing.allocator,
+        expired_deadline,
+        null,
+    ));
+
+    // Missing completion provenance is an internal contract violation. It
+    // must fail closed and reclaim a response instead of bypassing the limit.
+    var missing_completion = StdHttpExecutor.ControlledRequestState{};
+    missing_completion.result = common.HttpResponse{
+        .status = 200,
+        .body = try std.testing.allocator.dupe(u8, "missing"),
+    };
+    try std.testing.expectError(error.Timeout, StdHttpExecutor.finishControlledRequest(
+        &missing_completion,
+        std.testing.allocator,
+        future_deadline,
+        null,
+    ));
 }
 
 test "std http executor forwards only end-to-end request headers" {
