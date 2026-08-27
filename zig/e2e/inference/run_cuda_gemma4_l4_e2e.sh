@@ -221,13 +221,13 @@ require_file "ANTFLY_BIN" "$antfly_bin"
   "$zig_bin" build quant-kernel-cuda-ffn-diff \
     -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 \
     -Doptimize=ReleaseFast -- --json
-  python3 scripts/validate_gemma4_cuda_candidate.py \
+  python3 scripts/gemma4/validate_gemma4_cuda_candidate.py \
     --kernel-id cuda.attention.gqa.decode.score_prework \
     --qualification-profile screening \
     --binary "$antfly_bin" \
     --artifact-check-script scripts/regen-cuda-artifacts.sh \
     --model "$e2b_model" \
-    --prompt-fixture scripts/fixtures/gemma4_long_context_v1.json \
+    --prompt-fixture scripts/gemma4/fixtures/gemma4_long_context_v1.json \
     --lengths 300 \
     --prefill-chunk-size 512 \
     --cache-dtype f16 \
@@ -243,7 +243,7 @@ require_file "ANTFLY_BIN" "$antfly_bin"
     | tee "$evidence_dir/paged_attention_diff.json"
 )
 
-python3 "$inference_dir/scripts/benchmark_gemma4_cuda_batching.py" \
+python3 "$inference_dir/scripts/gemma4/benchmark_gemma4_cuda_batching.py" \
   --antfly-bin "$antfly_bin" \
   --model "$e2b_model" \
   --models-dir "$repo_root/.models" \
@@ -257,7 +257,7 @@ python3 "$inference_dir/scripts/benchmark_gemma4_cuda_batching.py" \
   --max-c1-p95-ratio 1.20
 
 release_args=(
-  python3 "$inference_dir/scripts/gemma4_cuda_l4_release_gate.py"
+  python3 "$inference_dir/scripts/gemma4/gemma4_cuda_l4_release_gate.py"
   --binary "$antfly_bin"
   --llama-cpp-bin "$llama_cpp_bin"
   --e2b-model "$e2b_model"
@@ -275,7 +275,7 @@ fi
 if [[ "$long_e2e_configured" -eq 3 ]]; then
   long_e2e_dir="$evidence_dir/long-e2e"
   benchmark_rc=0
-  python3 "$inference_dir/scripts/benchmark_gemma4_long_e2e_server.py" \
+  python3 "$inference_dir/scripts/gemma4/benchmark_gemma4_long_e2e_server.py" \
     --antfly-bin "$antfly_bin" \
     --llama-server-bin "$llama_server_bin" \
     --backend cuda \
@@ -289,7 +289,7 @@ if [[ "$long_e2e_configured" -eq 3 ]]; then
     --lockfile-sha256 "$long_e2e_lock_sha256" \
     --require-lock \
     --enforce-performance || benchmark_rc=$?
-  python3 "$inference_dir/scripts/merge_gemma4_long_e2e_release_summary.py" \
+  python3 "$inference_dir/scripts/gemma4/merge_gemma4_long_e2e_release_summary.py" \
     "$evidence_dir/release_summary.json" \
     "$long_e2e_dir/evidence.json" \
     "$benchmark_rc"
@@ -299,7 +299,7 @@ fi
 if [[ -n "$e4b_qat_model" ]]; then
   e4b_dir="$evidence_dir/e4b-regression"
   e4b_args=(
-    python3 "$inference_dir/scripts/benchmark_gemma4_long_e2e_server.py"
+    python3 "$inference_dir/scripts/gemma4/benchmark_gemma4_long_e2e_server.py"
     --antfly-bin "$antfly_bin"
     --llama-server-bin "$llama_server_bin"
     --backend cuda
@@ -324,7 +324,7 @@ if [[ -n "$e4b_qat_model" ]]; then
   fi
   benchmark_rc=0
   "${e4b_args[@]}" || benchmark_rc=$?
-  python3 "$inference_dir/scripts/merge_gemma4_long_e2e_release_summary.py" \
+  python3 "$inference_dir/scripts/gemma4/merge_gemma4_long_e2e_release_summary.py" \
     --lane-field e4b_regression \
     --lane-label "Gemma 4 E4B warm-server correctness/regression lane" \
     "$evidence_dir/release_summary.json" \
@@ -343,7 +343,7 @@ if [[ "$mode" == "nightly" ]]; then
       'release_contract=none; experimental diagnostic only' \
       > "$mtp_dir/mtp_collection_profile.txt"
   else
-    source "$inference_dir/scripts/gemma4_qat_cuda_tuning.sh"
+    source "$inference_dir/scripts/gemma4/gemma4_qat_cuda_tuning.sh"
     gemma4_qat_cuda_tuning_env 544
     export "${GEMMA4_QAT_CUDA_ENV[@]}"
     export ANTFLY_GEMMA4_MTP_TARGET_REPLAY=auto
@@ -374,7 +374,7 @@ if [[ "$mode" == "nightly" ]]; then
     MTP_SPECULATIVE_K=1 \
     MTP_MIN_ACTIVE_SPEED_RATIO=0 \
     OUT_DIR="$mtp_dir" \
-      "$inference_dir/scripts/gemma4_cuda_production_gate.sh" --mtp-only || mtp_status=$?
+      "$inference_dir/scripts/gemma4/gemma4_cuda_production_gate.sh" --mtp-only || mtp_status=$?
     printf '%s\n' \
       'comparison=collection-only; not paired or interleaved with llama.cpp' \
       'prompt=Here is a sentence about ants:' \

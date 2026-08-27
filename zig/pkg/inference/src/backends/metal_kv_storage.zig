@@ -957,6 +957,11 @@ test "Metal KV binding only covers successfully encoded tokens" {
     try std.testing.expect(binding.commitWrite(40, 4));
     try std.testing.expectEqual(@as(usize, 40), binding.written_tokens);
     try std.testing.expectEqual(@as(usize, 4), binding.position_offset);
+    // Expert-checkpoint replay rewrites the same token position after a miss.
+    // Equal watermarks are intentionally idempotent and must remain valid.
+    try std.testing.expect(binding.commitWrite(40, 4));
+    try std.testing.expectEqual(@as(usize, 40), binding.written_tokens);
+    try std.testing.expectEqual(@as(usize, 4), binding.position_offset);
     try std.testing.expect(!binding.commitWrite(39, 4));
     try std.testing.expect(!binding.commitWrite(40, 3));
     binding.truncateTo(32);

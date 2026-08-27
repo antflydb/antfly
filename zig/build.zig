@@ -7047,6 +7047,7 @@ pub fn build(b: *std.Build) void {
             "inference admission bridge charges combined native residency to resource manager",
             "standalone tokenizer bridge enforces growth and permits exact teardown",
             "standalone inference keep alive parses compound durations and zero",
+            "standalone preload bridge preserves A4B residency controls",
             "standalone data directory does not change the default models directory",
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked inference ABI rejects mismatched context and function-table prefixes",

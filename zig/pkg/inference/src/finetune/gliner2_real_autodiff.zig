@@ -62,7 +62,7 @@
 //!     unit-tested here. The `gliner2_total_loss` structure, classification, and
 //!     count components are all graph-native and exercised against the upstream
 //!     Python trainer by the full-task parity gate (`test_gliner2_lora_parity.py`
-//!     full-task matrix via `scripts/compare_gliner2_lora_python_zig.py`).
+//!     full-task matrix via `scripts/gliner2/compare_gliner2_lora_python_zig.py`).
 //!     Real-model numeric parity is trustworthy on the native backend; the Metal
 //!     training-graph-executor path reproduces native step-for-step but has
 //!     narrower automated coverage (see that harness for the reconciliation
