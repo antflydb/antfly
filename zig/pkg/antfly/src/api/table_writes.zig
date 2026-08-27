@@ -1783,6 +1783,7 @@ pub const ProvisionedTableWriteCache = struct {
         // unrelated reopen. Read-only and short-lived catch-up DBs are gated
         // out by the DB worker itself.
         owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
+        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
         var cached = CachedDb{
             .cache = self,
             .entry = owned_entry,
@@ -2145,6 +2146,7 @@ pub const ProvisionedTableWriteCache = struct {
         errdefer owned_entry.deinit(self.alloc);
         try self.entries.append(self.alloc, owned_entry);
         owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
+        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
         opened.* = null;
         return .{
             .cache = self,
@@ -2204,6 +2206,7 @@ pub const ProvisionedTableWriteCache = struct {
         try self.replaceTableMetadataLocked(table_name, indexes_json, schema_json);
         try self.entries.append(self.alloc, owned_entry);
         owned_entry.db.startArtifactRepairMetadataWorkerIfNeeded();
+        owned_entry.db.startQuarantineRetryWorkerIfNeeded();
     }
 
     pub fn getLocked(
@@ -31736,6 +31739,96 @@ test "provisioned table write source recovers durable status without shared snap
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
     try std.testing.expectEqualStrings("semantic_idx", statuses.items[0].stats.indexes[0].name);
+}
+
+test "provisioned writer cache starts DB workers after stable entry installation" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Catalog = struct {
+        var table_records = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+        }};
+        var range_records = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = table_records[0..],
+                .ranges = range_records[0..],
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const InstallationPath = enum {
+        catalog_open,
+        prepared_open,
+        seeded_create,
+    };
+
+    inline for (std.enums.values(InstallationPath)) |installation_path| {
+        const path = try std.fmt.allocPrint(
+            alloc,
+            ".zig-cache/tmp/{s}/stable-worker-owner-{s}",
+            .{ tmp.sub_path, @tagName(installation_path) },
+        );
+        defer alloc.free(path);
+
+        var write_cache = ProvisionedTableWriteCache.init(alloc);
+        defer write_cache.deinit();
+
+        switch (installation_path) {
+            .catalog_open => {
+                var cached = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+                defer cached.deinit(alloc);
+                try std.testing.expect(cached.db.quarantineRetryWorkerStartedAtCurrentAddressForTest());
+            },
+            .prepared_open => {
+                var opened: ?db_mod.DB = try db_mod.DB.open(alloc, path, .{});
+                defer if (opened) |*db| db.close();
+                var prepared: ProvisionedTableWriteCache.PreparedOpen = .{};
+                defer prepared.deinit(alloc);
+                var cached = try write_cache.adoptPreparedOpenLocked(
+                    &opened,
+                    7001,
+                    0,
+                    "docs",
+                    .default,
+                    &prepared,
+                );
+                defer cached.deinit(alloc);
+                try std.testing.expect(cached.db.quarantineRetryWorkerStartedAtCurrentAddressForTest());
+            },
+            .seeded_create => {
+                var opened: ?db_mod.DB = try db_mod.DB.open(alloc, path, .{});
+                defer if (opened) |*db| db.close();
+                try write_cache.seedCreatedDbLocked(&opened, 7001, 0, "docs", "{}", "{}");
+                try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
+                try std.testing.expect(write_cache.entries.items[0].db.quarantineRetryWorkerStartedAtCurrentAddressForTest());
+            },
+        }
+    }
 }
 
 test "provisioned table write cache retires stale db when index metadata changes" {
