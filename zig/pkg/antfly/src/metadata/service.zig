@@ -91,113 +91,79 @@ pub const MetadataProposalReceipt = struct {
     index: u64,
 };
 
-/// A drop command derived from one projection point while Raft apply is
-/// excluded by the metadata runtime lock. Keeping the range membership and
-/// its generation together prevents a newly applied range from being paired
-/// with a stale range list and then orphaned by a drop.
+/// A compact drop command derived from one coherent storage read transaction.
+/// Keeping the range membership and its generation together prevents a newly
+/// applied range from being orphaned without making the Raft entry grow with
+/// the table's shard count.
 pub const TableDropAdmission = struct {
     table_id: u64,
     expected_name: []u8,
     expected_transition_generation: u64,
-    range_group_ids: []u64,
+    range_membership: metadata_topology_protocol.RangeMembership,
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         alloc.free(self.expected_name);
-        alloc.free(self.range_group_ids);
     }
 };
 
 fn tableDropAdmissionFromProjection(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
-    ranges: []const metadata_table_manager.RangeRecord,
-    extension_members: []const extension_domain.ExtensionMember,
     fence: metadata_storage.raft_apply_store.TableTransitionFence,
+    extension_owned: bool,
 ) !TableDropAdmission {
     if (fence.active()) return error.TableTransitionActive;
-    for (extension_members) |member| {
-        const member_table = if (member.table_name.len != 0)
-            member.table_name
-        else if (member.scope.kind == .table)
-            member.scope.table_name
-        else
-            continue;
-        if (std.mem.eql(u8, member_table, table.name))
-            return error.ExtensionOwnedObject;
-    }
-
-    var range_count: usize = 0;
-    for (ranges) |record| {
-        if (record.table_id == table.table_id) range_count += 1;
-    }
-    const range_group_ids = try alloc.alloc(u64, range_count);
-    errdefer alloc.free(range_group_ids);
-    var range_index: usize = 0;
-    for (ranges) |record| {
-        if (record.table_id != table.table_id) continue;
-        range_group_ids[range_index] = record.group_id;
-        range_index += 1;
-    }
-    std.sort.pdq(u64, range_group_ids, {}, std.sort.asc(u64));
+    if (extension_owned) return error.ExtensionOwnedObject;
     const expected_name = try alloc.dupe(u8, table.name);
     errdefer alloc.free(expected_name);
     return .{
         .table_id = table.table_id,
         .expected_name = expected_name,
         .expected_transition_generation = fence.generation,
-        .range_group_ids = range_group_ids,
+        .range_membership = fence.membership(table.table_id),
     };
 }
 
-test "metadata service table drop admission binds sorted range membership to one fence" {
+test "metadata service table drop admission binds compact range membership to one fence" {
     const tables = [_]metadata_table_manager.TableRecord{
         .{ .table_id = 7, .name = "docs" },
         .{ .table_id = 8, .name = "other" },
     };
-    const ranges = [_]metadata_table_manager.RangeRecord{
-        .{ .group_id = 302, .table_id = 7, .start_key = "m" },
-        .{ .group_id = 401, .table_id = 8, .start_key = "" },
-        .{ .group_id = 301, .table_id = 7, .start_key = "" },
+    var membership: metadata_topology_protocol.RangeMembershipAccumulator = .{};
+    try membership.add(302);
+    try membership.add(301);
+    const fence: metadata_storage.raft_apply_store.TableTransitionFence = .{
+        .generation = 9,
+        .range_membership = membership,
     };
-    const fence: metadata_storage.raft_apply_store.TableTransitionFence = .{ .generation = 9 };
     const admission = try tableDropAdmissionFromProjection(
         std.testing.allocator,
         &tables[0],
-        &ranges,
-        &.{},
         fence,
+        false,
     );
     defer admission.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 7), admission.table_id);
     try std.testing.expectEqual(@as(u64, 9), admission.expected_transition_generation);
     try std.testing.expectEqualStrings("docs", admission.expected_name);
-    try std.testing.expectEqualSlices(u64, &.{ 301, 302 }, admission.range_group_ids);
+    try std.testing.expect(admission.range_membership.eql(membership.finish(7)));
 
     try std.testing.expectError(
         error.TableTransitionActive,
         tableDropAdmissionFromProjection(
             std.testing.allocator,
             &tables[0],
-            &ranges,
-            &.{},
             .{ .generation = 9, .active_count = 1 },
+            false,
         ),
     );
-    const extension_members = [_]extension_domain.ExtensionMember{.{
-        .extension_name = "memoryaf",
-        .scope = .{ .kind = .table, .table_name = "docs" },
-        .object_kind = .index,
-        .object_name = "memory_text",
-        .table_name = "docs",
-    }};
     try std.testing.expectError(
         error.ExtensionOwnedObject,
         tableDropAdmissionFromProjection(
             std.testing.allocator,
             &tables[0],
-            &ranges,
-            &extension_members,
             fence,
+            true,
         ),
     );
 }
@@ -6139,34 +6105,37 @@ pub const MetadataHttpService = struct {
         return &(self.catalog_validation_cache.snapshot orelse unreachable);
     }
 
-    /// Capture every apply-time drop precondition from the same projected
-    /// point. The runtime lock prevents Raft apply from advancing the durable
-    /// transition fence between reading the cached catalog and the fence.
+    /// Capture every apply-time drop precondition from one storage read
+    /// transaction. Derived indexes are repaired before the read, outside the
+    /// Raft runtime critical section, so admission is O(1) in cluster size.
     pub fn captureTableDropAdmission(
         self: *MetadataHttpService,
         alloc: std.mem.Allocator,
         table_name: []const u8,
     ) !TableDropAdmission {
-        self.lockRuntime();
-        defer self.unlockRuntime();
-        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
-
-        const catalog = try self.catalogValidationSnapshotLocked();
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        const extension_members = try store.listExtensionMembers(alloc, self.metadata_group_id);
-        defer store.freeExtensionMembers(alloc, extension_members);
-        const table = for (catalog.tables) |*candidate| {
-            if (std.mem.eql(u8, candidate.name, table_name)) break candidate;
-        } else return error.TableNotFound;
-        const fence = try store.getTableTransitionFence(self.metadata_group_id, table.table_id);
-        return try tableDropAdmissionFromProjection(
-            alloc,
-            table,
-            catalog.ranges,
-            extension_members,
-            fence,
-        );
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            try store.ensureDerivedCatalogIndexes(self.metadata_group_id);
+            var projection = (store.captureTableDropProjection(
+                alloc,
+                self.metadata_group_id,
+                table_name,
+            ) catch |err| switch (err) {
+                // Snapshot install atomically removes local indexes. Retry
+                // once after rebuilding instead of exposing a false 404.
+                error.InvalidDerivedCatalogIndex => continue,
+                else => return err,
+            }) orelse return error.TableNotFound;
+            defer projection.deinit(alloc);
+            return try tableDropAdmissionFromProjection(
+                alloc,
+                &projection.table,
+                projection.fence,
+                projection.extension_owned,
+            );
+        }
+        return error.InvalidDerivedCatalogIndex;
     }
 
     pub fn freeAdminSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.AdminSnapshot) void {

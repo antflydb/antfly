@@ -63,11 +63,29 @@ pub const ExtensionLifecycleDelta = struct {
 pub const TableTransitionFence = struct {
     generation: u64 = 0,
     active_count: u32 = 0,
+    range_membership: topology_protocol.RangeMembershipAccumulator = .{},
 
     pub fn active(self: @This()) bool {
         return self.active_count != 0;
     }
+
+    pub fn membership(self: @This(), table_id: u64) topology_protocol.RangeMembership {
+        return self.range_membership.finish(table_id);
+    }
 };
+
+pub const TableDropProjection = struct {
+    table: metadata.TableRecord,
+    fence: TableTransitionFence,
+    extension_owned: bool,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        metadata_table_manager.freeTable(alloc, self.table);
+        self.* = undefined;
+    }
+};
+
+const derived_catalog_index_version = "1";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -82,10 +100,13 @@ pub const TableTopologyMutation = union(enum) {
         table_id: u64,
         expected_name: []const u8,
         expected_transition_generation: u64,
-        /// Sorted data-group IDs observed with the table at the transition
-        /// generation above. The generation CAS rejects any intervening range
-        /// mutation, keeping validation and writes proportional to this table.
-        range_group_ids: []const u64,
+        range_contract: union(enum) {
+            /// Fixed-size membership proof used by topology protocol v2.
+            membership: topology_protocol.RangeMembership,
+            /// Decode-only compatibility for v1 entries already present in a
+            /// Raft log during a rolling binary upgrade.
+            legacy_group_ids: []const u64,
+        },
     },
 };
 
@@ -237,7 +258,10 @@ pub const TransitionCommand = union(enum) {
                 },
                 .drop => |drop| {
                     alloc.free(drop.expected_name);
-                    alloc.free(drop.range_group_ids);
+                    switch (drop.range_contract) {
+                        .membership => {},
+                        .legacy_group_ids => |ids| alloc.free(ids),
+                    }
                 },
             },
             .upsert_restore_progress => |*record| {
@@ -349,12 +373,17 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             .drop => |drop| {
                 if (drop.table_id == 0 or drop.expected_name.len == 0)
                     return error.InvalidTableTopologyMutation;
-                var previous_group_id: u64 = 0;
-                for (drop.range_group_ids, 0..) |range_group_id, index| {
-                    try group_ids.requireDataGroupId(range_group_id);
-                    if (index > 0 and range_group_id <= previous_group_id)
-                        return error.InvalidTableTopologyMutation;
-                    previous_group_id = range_group_id;
+                switch (drop.range_contract) {
+                    .membership => {},
+                    .legacy_group_ids => |ids| {
+                        var previous_group_id: u64 = 0;
+                        for (ids, 0..) |range_group_id, index| {
+                            try group_ids.requireDataGroupId(range_group_id);
+                            if (index > 0 and range_group_id <= previous_group_id)
+                                return error.InvalidTableTopologyMutation;
+                            previous_group_id = range_group_id;
+                        }
+                    },
                 }
             },
         },
@@ -586,6 +615,45 @@ test "transition command validation rejects metadata group ids in data group fie
     }
 }
 
+test "table topology mutation compact drop wire contract remains bounded beyond legacy range limits" {
+    var accumulator: topology_protocol.RangeMembershipAccumulator = .{};
+    for (0..70_000) |offset| try accumulator.add(10_000 + @as(u64, @intCast(offset)));
+    const expected = accumulator.finish(7);
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_topology = .{ .drop = .{
+            .table_id = 7,
+            .expected_name = "docs",
+            .expected_transition_generation = 11,
+            .range_contract = .{ .membership = expected },
+        } },
+    });
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(encoded.len < 128);
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)).?;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expect(decoded.apply_table_topology.drop.range_contract == .membership);
+    try std.testing.expect(decoded.apply_table_topology.drop.range_contract.membership.eql(expected));
+}
+
+test "table topology mutation legacy drop decoder derives its allocation bound from the frame" {
+    const ids = try std.testing.allocator.alloc(u64, 65_537);
+    defer std.testing.allocator.free(ids);
+    for (ids, 0..) |*id, index| id.* = 10_000 + @as(u64, @intCast(index));
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_topology = .{ .drop = .{
+            .table_id = 7,
+            .expected_name = "docs",
+            .expected_transition_generation = 11,
+            .range_contract = .{ .legacy_group_ids = ids },
+        } },
+    });
+    defer std.testing.allocator.free(encoded);
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)).?;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expect(decoded.apply_table_topology.drop.range_contract == .legacy_group_ids);
+    try std.testing.expectEqual(@as(usize, 65_537), decoded.apply_table_topology.drop.range_contract.legacy_group_ids.len);
+}
+
 test "table topology mutation atomically creates and drops catalog ranges" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -595,6 +663,12 @@ test "table topology mutation atomically creates and drops catalog ranges" {
         .{tmp.sub_path},
     );
     defer std.testing.allocator.free(root);
+    const restored_root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/metadata-table-topology-mutation-restored",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(restored_root);
 
     var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
     defer store.deinit();
@@ -635,6 +709,17 @@ test "table topology mutation atomically creates and drops catalog ranges" {
 
     const create_fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
     try std.testing.expectEqual(@as(u64, 1), create_fence.generation);
+    try store.ensureDerivedCatalogIndexes(metadata_group_id);
+    var create_projection = (try store.captureTableDropProjection(
+        std.testing.allocator,
+        metadata_group_id,
+        table.name,
+    )).?;
+    defer create_projection.deinit(std.testing.allocator);
+    try std.testing.expect(!create_projection.extension_owned);
+    try std.testing.expect(create_projection.fence.membership(table.table_id).eql(
+        create_fence.membership(table.table_id),
+    ));
     // A range admitted after the caller's snapshot advances the table fence.
     // The stale drop must therefore no-op without scanning unrelated ranges.
     const concurrent_range = metadata.RangeRecord{
@@ -660,7 +745,7 @@ test "table topology mutation atomically creates and drops catalog ranges" {
             .table_id = table.table_id,
             .expected_name = table.name,
             .expected_transition_generation = create_fence.generation,
-            .range_group_ids = &.{301},
+            .range_contract = .{ .legacy_group_ids = &.{301} },
         } },
     });
     defer std.testing.allocator.free(incomplete_drop);
@@ -685,6 +770,35 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     const current_fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
     try std.testing.expectEqual(@as(u64, 2), current_fence.generation);
 
+    // Even a legacy command with the current generation must contain the
+    // exact range set; otherwise it could delete the table and orphan ranges.
+    const incomplete_current_drop = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_topology = .{ .drop = .{
+            .table_id = table.table_id,
+            .expected_name = table.name,
+            .expected_transition_generation = current_fence.generation,
+            .range_contract = .{ .legacy_group_ids = &.{ 301, 302 } },
+        } },
+    });
+    defer std.testing.allocator.free(incomplete_current_drop);
+    const incomplete_current_drop_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = incomplete_current_drop },
+    });
+    defer std.testing.allocator.free(incomplete_current_drop_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 4,
+        .entries_bytes = incomplete_current_drop_entries,
+    });
+    {
+        const retained_tables = try store.listTables(std.testing.allocator, metadata_group_id);
+        defer store.freeTables(std.testing.allocator, retained_tables);
+        const retained_ranges = try store.listRanges(std.testing.allocator, metadata_group_id);
+        defer store.freeRanges(std.testing.allocator, retained_ranges);
+        try std.testing.expectEqual(@as(usize, 1), retained_tables.len);
+        try std.testing.expectEqual(@as(usize, 3), retained_ranges.len);
+    }
+
     const owned_member = try encodeTransitionCommand(std.testing.allocator, .{
         .upsert_extension_member = .{
             .extension_name = "memoryaf",
@@ -696,38 +810,70 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     });
     defer std.testing.allocator.free(owned_member);
     const owned_member_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = owned_member },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = owned_member },
     });
     defer std.testing.allocator.free(owned_member_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = metadata_group_id,
-        .commit_index = 4,
+        .commit_index = 5,
         .entries_bytes = owned_member_entries,
     });
+    var owned_projection = (try store.captureTableDropProjection(
+        std.testing.allocator,
+        metadata_group_id,
+        table.name,
+    )).?;
+    defer owned_projection.deinit(std.testing.allocator);
+    try std.testing.expect(owned_projection.extension_owned);
+
+    // Derived indexes do not inflate Raft snapshots. Snapshot installation
+    // discards any local copies and rebuilds them from authoritative rows.
+    const snapshot = try store.snapshotBuilder().buildSnapshot(std.testing.allocator, metadata_group_id);
+    defer std.testing.allocator.free(snapshot);
+    {
+        var restored = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = restored_root });
+        defer restored.deinit();
+        try std.testing.expect(try restored.snapshotBuilder().installSnapshot(
+            std.testing.allocator,
+            metadata_group_id,
+            5,
+            snapshot,
+        ));
+        try restored.ensureDerivedCatalogIndexes(metadata_group_id);
+        var restored_projection = (try restored.captureTableDropProjection(
+            std.testing.allocator,
+            metadata_group_id,
+            table.name,
+        )).?;
+        defer restored_projection.deinit(std.testing.allocator);
+        try std.testing.expect(restored_projection.extension_owned);
+        try std.testing.expect(restored_projection.fence.membership(table.table_id).eql(
+            current_fence.membership(table.table_id),
+        ));
+    }
 
     const drop = try encodeTransitionCommand(std.testing.allocator, .{
         .apply_table_topology = .{ .drop = .{
             .table_id = table.table_id,
             .expected_name = table.name,
             .expected_transition_generation = current_fence.generation,
-            .range_group_ids = &.{ 301, 302, 303 },
+            .range_contract = .{ .membership = current_fence.membership(table.table_id) },
         } },
     });
     defer std.testing.allocator.free(drop);
     var decoded_drop = (try decodeTransitionCommand(std.testing.allocator, drop)).?;
     defer decoded_drop.deinit(std.testing.allocator);
-    try std.testing.expectEqualSlices(
-        u64,
-        &.{ 301, 302, 303 },
-        decoded_drop.apply_table_topology.drop.range_group_ids,
-    );
+    try std.testing.expect(decoded_drop.apply_table_topology.drop.range_contract == .membership);
+    try std.testing.expect(decoded_drop.apply_table_topology.drop.range_contract.membership.eql(
+        current_fence.membership(table.table_id),
+    ));
     const drop_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 5, .entry_type = .normal, .data = drop },
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = drop },
     });
     defer std.testing.allocator.free(drop_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = metadata_group_id,
-        .commit_index = 5,
+        .commit_index = 6,
         .entries_bytes = drop_entries,
     });
     {
@@ -745,21 +891,21 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     });
     defer std.testing.allocator.free(remove_owned_member);
     const remove_owned_member_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 6, .entry_type = .normal, .data = remove_owned_member },
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = remove_owned_member },
     });
     defer std.testing.allocator.free(remove_owned_member_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = metadata_group_id,
-        .commit_index = 6,
+        .commit_index = 7,
         .entries_bytes = remove_owned_member_entries,
     });
     const final_drop_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 7, .entry_type = .normal, .data = drop },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = drop },
     });
     defer std.testing.allocator.free(final_drop_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = metadata_group_id,
-        .commit_index = 7,
+        .commit_index = 8,
         .entries_bytes = final_drop_entries,
     });
     const projected_tables = try store.listTables(std.testing.allocator, metadata_group_id);
@@ -774,12 +920,12 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     });
     defer std.testing.allocator.free(delayed_upsert);
     const delayed_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 8, .entry_type = .normal, .data = delayed_upsert },
+        .{ .term = 1, .index = 9, .entry_type = .normal, .data = delayed_upsert },
     });
     defer std.testing.allocator.free(delayed_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = metadata_group_id,
-        .commit_index = 8,
+        .commit_index = 9,
         .entries_bytes = delayed_entries,
     });
     const ranges_after_delayed_upsert = try store.listRanges(std.testing.allocator, metadata_group_id);
@@ -2150,6 +2296,309 @@ pub const RaftApplyStore = struct {
         alloc.free(records);
     }
 
+    /// Builds local, derivable indexes once per metadata projection. These
+    /// rows are intentionally excluded from Raft snapshots: snapshot install
+    /// removes them and the next apply (or indexed read) reconstructs them
+    /// atomically from primary range and extension-member rows.
+    pub fn ensureDerivedCatalogIndexes(self: *RaftApplyStore, group_id: u64) !void {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
+        var txn = try self.store.beginWriteTxn();
+        var finished = false;
+        defer if (!finished) txn.abort();
+        const rebuilt = try self.ensureDerivedCatalogIndexesTxn(&txn, group_id);
+        if (rebuilt) {
+            try txn.commit();
+        } else {
+            txn.abort();
+        }
+        finished = true;
+    }
+
+    pub fn captureTableDropProjection(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+    ) !?TableDropProjection {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        // The marker and every derived row are committed or removed in one
+        // transaction. Checking it inside this read snapshot prevents a
+        // concurrent snapshot install from being misreported as a missing
+        // table between index repair and admission capture.
+        var version_key_buf: [160]u8 = undefined;
+        const version_key = try derivedCatalogIndexVersionKey(&version_key_buf, group_id);
+        const version = txn.get(version_key) catch |err| switch (err) {
+            error.NotFound => return error.InvalidDerivedCatalogIndex,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, version, derived_catalog_index_version))
+            return error.InvalidDerivedCatalogIndex;
+        var name_key_buf: [640]u8 = undefined;
+        const name_key = try tableNameIndexKey(&name_key_buf, group_id, table_name);
+        const encoded_table_id = txn.get(name_key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        if (encoded_table_id.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
+        const table_id = std.mem.readInt(u64, encoded_table_id[0..@sizeOf(u64)], .little);
+        var table_key_buf: [160]u8 = undefined;
+        const table_key = try tableKeyForGroup(&table_key_buf, group_id, table_id);
+        const encoded_table = txn.get(table_key) catch |err| switch (err) {
+            error.NotFound => return error.InvalidDerivedCatalogIndex,
+            else => return err,
+        };
+        const table = try decodeTableRecord(alloc, encoded_table);
+        errdefer metadata_table_manager.freeTable(alloc, table);
+        if (!std.mem.eql(u8, table.name, table_name)) return error.InvalidDerivedCatalogIndex;
+
+        var fence_key_buf: [192]u8 = undefined;
+        const fence_key = try tableTransitionFenceKeyForGroup(&fence_key_buf, group_id, table_id);
+        const fence = if (txn.get(fence_key)) |encoded|
+            try decodeTableTransitionFence(encoded)
+        else |err| switch (err) {
+            error.NotFound => TableTransitionFence{},
+            else => return err,
+        };
+
+        var owner_prefix_buf: [640]u8 = undefined;
+        const owner_prefix = try extensionTableOwnerIndexPrefixForTable(
+            &owner_prefix_buf,
+            group_id,
+            table_name,
+        );
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const owner_entry = try cursor.seekAtOrAfter(owner_prefix);
+        const extension_owned = if (owner_entry) |row|
+            std.mem.startsWith(u8, row.key, owner_prefix)
+        else
+            false;
+        return .{
+            .table = table,
+            .fence = fence,
+            .extension_owned = extension_owned,
+        };
+    }
+
+    fn extensionMemberTableName(member: extension_domain.ExtensionMember) ?[]const u8 {
+        if (member.table_name.len != 0) return member.table_name;
+        if (member.scope.kind == .table) return member.scope.table_name;
+        return null;
+    }
+
+    fn putTableRangeIndexTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        range_group_id: u64,
+    ) !void {
+        _ = self;
+        var key_buf: [192]u8 = undefined;
+        const key = try tableRangeIndexKey(&key_buf, group_id, table_id, range_group_id);
+        var value: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &value, range_group_id, .little);
+        try txn.put(key, &value);
+    }
+
+    fn putTableNameIndexTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_name: []const u8,
+        table_id: u64,
+    ) !void {
+        _ = self;
+        var key_buf: [640]u8 = undefined;
+        const key = try tableNameIndexKey(&key_buf, group_id, table_name);
+        var value: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &value, table_id, .little);
+        try txn.put(key, &value);
+    }
+
+    fn deleteTableNameIndexTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_name: []const u8,
+    ) !void {
+        _ = self;
+        var key_buf: [640]u8 = undefined;
+        const key = try tableNameIndexKey(&key_buf, group_id, table_name);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    fn deleteTableRangeIndexTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        range_group_id: u64,
+    ) !void {
+        _ = self;
+        var key_buf: [192]u8 = undefined;
+        const key = try tableRangeIndexKey(&key_buf, group_id, table_id, range_group_id);
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    fn putExtensionTableOwnerIndexTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        member: extension_domain.ExtensionMember,
+    ) !void {
+        _ = self;
+        const table_name = extensionMemberTableName(member) orelse return;
+        var key_buf: [1024]u8 = undefined;
+        const key = try extensionTableOwnerIndexKey(
+            &key_buf,
+            group_id,
+            table_name,
+            member.extension_name,
+            member.object_kind,
+            member.object_name,
+        );
+        try txn.put(key, "");
+    }
+
+    fn deleteExtensionTableOwnerIndexTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        member: extension_domain.ExtensionMember,
+    ) !void {
+        _ = self;
+        const table_name = extensionMemberTableName(member) orelse return;
+        var key_buf: [1024]u8 = undefined;
+        const key = try extensionTableOwnerIndexKey(
+            &key_buf,
+            group_id,
+            table_name,
+            member.extension_name,
+            member.object_kind,
+            member.object_name,
+        );
+        txn.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    fn deleteDerivedPrefixTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        prefix: []const u8,
+    ) !void {
+        const rows = try docstore.DocStore.scanPrefixTxn(self.alloc, txn, prefix);
+        defer freeMetadataSnapshotRows(self.alloc, rows);
+        for (rows) |row| try txn.delete(row.key);
+    }
+
+    /// Returns true when the transaction was mutated.
+    fn ensureDerivedCatalogIndexesTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+    ) !bool {
+        var version_key_buf: [160]u8 = undefined;
+        const version_key = try derivedCatalogIndexVersionKey(&version_key_buf, group_id);
+        const current_version = txn.get(version_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (current_version) |value| {
+            if (std.mem.eql(u8, value, derived_catalog_index_version)) return false;
+        }
+
+        var range_index_prefix_buf: [128]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(
+            txn,
+            try tableRangeIndexPrefixForGroup(&range_index_prefix_buf, group_id),
+        );
+        var table_name_index_prefix_buf: [128]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(
+            txn,
+            try tableNameIndexPrefixForGroup(&table_name_index_prefix_buf, group_id),
+        );
+        var owner_index_prefix_buf: [128]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(
+            txn,
+            try extensionTableOwnerIndexPrefixForGroup(&owner_index_prefix_buf, group_id),
+        );
+
+        var table_prefix_buf: [128]u8 = undefined;
+        const table_rows = try docstore.DocStore.scanPrefixTxn(
+            self.alloc,
+            txn,
+            try tablePrefixForGroup(&table_prefix_buf, group_id),
+        );
+        defer freeMetadataSnapshotRows(self.alloc, table_rows);
+        for (table_rows) |row| {
+            const table = try decodeTableRecord(self.alloc, row.value);
+            defer metadata_table_manager.freeTable(self.alloc, table);
+            try self.putTableNameIndexTxn(txn, group_id, table.name, table.table_id);
+            var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table.table_id);
+            fence.range_membership = .{};
+            var fence_key_buf: [192]u8 = undefined;
+            const fence_key = try tableTransitionFenceKeyForGroup(&fence_key_buf, group_id, table.table_id);
+            var encoded_fence: [table_transition_fence_encoded_len]u8 = undefined;
+            encodeTableTransitionFence(&encoded_fence, fence);
+            try txn.put(fence_key, &encoded_fence);
+        }
+
+        var range_prefix_buf: [128]u8 = undefined;
+        const range_rows = try docstore.DocStore.scanPrefixTxn(
+            self.alloc,
+            txn,
+            try rangePrefixForGroup(&range_prefix_buf, group_id),
+        );
+        defer freeMetadataSnapshotRows(self.alloc, range_rows);
+        var memberships = std.AutoHashMapUnmanaged(u64, topology_protocol.RangeMembershipAccumulator).empty;
+        defer memberships.deinit(self.alloc);
+        for (range_rows) |row| {
+            const record = try decodeRangeRecord(self.alloc, row.value);
+            defer metadata_table_manager.freeRange(self.alloc, record);
+            try self.putTableRangeIndexTxn(txn, group_id, record.table_id, record.group_id);
+            const entry = try memberships.getOrPut(self.alloc, record.table_id);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            try entry.value_ptr.add(record.group_id);
+        }
+        var membership_iterator = memberships.iterator();
+        while (membership_iterator.next()) |entry| {
+            var fence = try self.loadTableTransitionFenceTxn(txn, group_id, entry.key_ptr.*);
+            fence.range_membership = entry.value_ptr.*;
+            var fence_key_buf: [192]u8 = undefined;
+            const fence_key = try tableTransitionFenceKeyForGroup(&fence_key_buf, group_id, entry.key_ptr.*);
+            var encoded_fence: [table_transition_fence_encoded_len]u8 = undefined;
+            encodeTableTransitionFence(&encoded_fence, fence);
+            try txn.put(fence_key, &encoded_fence);
+        }
+
+        var member_prefix_buf: [128]u8 = undefined;
+        const member_rows = try docstore.DocStore.scanPrefixTxn(
+            self.alloc,
+            txn,
+            try extensionMemberPrefixForGroup(&member_prefix_buf, group_id),
+        );
+        defer freeMetadataSnapshotRows(self.alloc, member_rows);
+        for (member_rows) |row| {
+            var member = try decodeExtensionMemberRecord(self.alloc, row.value);
+            defer member.deinitOwned(self.alloc);
+            try self.putExtensionTableOwnerIndexTxn(txn, group_id, member);
+        }
+        try txn.put(version_key, derived_catalog_index_version);
+        return true;
+    }
+
     fn freeKvs(alloc: std.mem.Allocator, kvs: anytype) void {
         for (kvs) |kv| {
             alloc.free(kv.key);
@@ -2455,6 +2904,12 @@ pub const RaftApplyStore = struct {
             break :blk try self.collectMetadataSnapshotRowsTxn(alloc, &read_txn, group_id, null);
         };
         defer freeMetadataSnapshotRows(alloc, existing);
+        const derived_existing = blk: {
+            var read_txn = try self.store.beginReadTxn();
+            defer read_txn.abort();
+            break :blk try self.collectDerivedCatalogIndexRowsTxn(alloc, &read_txn, group_id);
+        };
+        defer freeMetadataSnapshotRows(alloc, derived_existing);
 
         const watermark = try alloc.alloc(u8, @sizeOf(u64) + empty_entries.len);
         defer alloc.free(watermark);
@@ -2467,9 +2922,10 @@ pub const RaftApplyStore = struct {
         defer alloc.free(writes);
         for (rows, 0..) |row, i| writes[i] = .{ .key = row.key, .value = row.value };
         writes[rows.len] = .{ .key = watermark_key, .value = watermark };
-        const deletes = try alloc.alloc([]const u8, existing.len);
+        const deletes = try alloc.alloc([]const u8, existing.len + derived_existing.len);
         defer alloc.free(deletes);
         for (existing, 0..) |row, i| deletes[i] = row.key;
+        for (derived_existing, existing.len..) |row, i| deletes[i] = row.key;
         try self.store.putBatch(writes, deletes);
 
         if (self.batches.getPtr(group_id)) |batch| {
@@ -2521,6 +2977,49 @@ pub const RaftApplyStore = struct {
             }
         }
         std.sort.pdq(docstore.OwnedKVPair, rows.items, {}, metadataSnapshotRowLessThan);
+        return try rows.toOwnedSlice(alloc);
+    }
+
+    fn collectDerivedCatalogIndexRowsTxn(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+    ) ![]docstore.OwnedKVPair {
+        _ = self;
+        var rows = std.ArrayListUnmanaged(docstore.OwnedKVPair).empty;
+        errdefer {
+            for (rows.items) |row| {
+                alloc.free(row.key);
+                alloc.free(row.value);
+            }
+            rows.deinit(alloc);
+        }
+        var prefix_buf: [160]u8 = undefined;
+        try appendMetadataPrefixRowsTxn(
+            alloc,
+            txn,
+            &rows,
+            try tableRangeIndexPrefixForGroup(&prefix_buf, group_id),
+        );
+        try appendMetadataPrefixRowsTxn(
+            alloc,
+            txn,
+            &rows,
+            try tableNameIndexPrefixForGroup(&prefix_buf, group_id),
+        );
+        try appendMetadataPrefixRowsTxn(
+            alloc,
+            txn,
+            &rows,
+            try extensionTableOwnerIndexPrefixForGroup(&prefix_buf, group_id),
+        );
+        try appendMetadataPointRowTxn(
+            alloc,
+            txn,
+            &rows,
+            try derivedCatalogIndexVersionKey(&prefix_buf, group_id),
+        );
         return try rows.toOwnedSlice(alloc);
     }
 
@@ -2662,6 +3161,7 @@ pub const RaftApplyStore = struct {
     }
 
     fn projectEntriesTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, entries_bytes: []const u8) !void {
+        _ = try self.ensureDerivedCatalogIndexesTxn(txn, group_id);
         const decoded = raft_state_machine.decodeCommittedEntries(self.alloc, entries_bytes) catch |err| switch (err) {
             error.InvalidCommittedEntriesEncoding => return,
             else => return err,
@@ -2833,6 +3333,8 @@ pub const RaftApplyStore = struct {
                     error.NotFound => {},
                     else => return err,
                 };
+                if (existing_table_name) |name|
+                    try self.deleteTableNameIndexTxn(txn, group_id, name);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .table,
@@ -2957,7 +3459,18 @@ pub const RaftApplyStore = struct {
                 const value = try encodeRangeRecord(self.alloc, record);
                 defer self.alloc.free(value);
                 try txn.put(key, value);
-                try self.advanceTableTransitionGenerationTxn(txn, group_id, record.table_id);
+                try self.putTableRangeIndexTxn(txn, group_id, record.table_id, record.group_id);
+                if (encoded_existing == null) {
+                    try self.advanceTableTransitionGenerationWithRangeChangesTxn(
+                        txn,
+                        group_id,
+                        record.table_id,
+                        &.{record.group_id},
+                        &.{},
+                    );
+                } else {
+                    try self.advanceTableTransitionGenerationTxn(txn, group_id, record.table_id);
+                }
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .range,
@@ -3015,7 +3528,14 @@ pub const RaftApplyStore = struct {
                 const key = try rangeKeyForGroup(&key_buf, group_id, record.group_id);
                 if (existing == null) return;
                 try txn.delete(key);
-                try self.advanceTableTransitionGenerationTxn(txn, group_id, existing_table_id);
+                try self.deleteTableRangeIndexTxn(txn, group_id, existing_table_id, record.group_id);
+                try self.advanceTableTransitionGenerationWithRangeChangesTxn(
+                    txn,
+                    group_id,
+                    existing_table_id,
+                    &.{},
+                    &.{record.group_id},
+                );
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{
                     .kind = .range,
@@ -3239,14 +3759,33 @@ pub const RaftApplyStore = struct {
             .upsert_extension_member => |record| {
                 var key_buf: [256]u8 = undefined;
                 const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
+                const encoded_existing = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (encoded_existing) |encoded| {
+                    var existing = try decodeExtensionMemberRecord(self.alloc, encoded);
+                    defer existing.deinitOwned(self.alloc);
+                    try self.deleteExtensionTableOwnerIndexTxn(txn, group_id, existing);
+                }
                 const value = try encodeExtensionMemberRecord(self.alloc, record);
                 defer self.alloc.free(value);
                 try txn.put(key, value);
+                try self.putExtensionTableOwnerIndexTxn(txn, group_id, record);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             },
             .remove_extension_member => |record| {
                 var key_buf: [256]u8 = undefined;
                 const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
+                const encoded_existing = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (encoded_existing) |encoded| {
+                    var existing = try decodeExtensionMemberRecord(self.alloc, encoded);
+                    defer existing.deinitOwned(self.alloc);
+                    try self.deleteExtensionTableOwnerIndexTxn(txn, group_id, existing);
+                }
                 txn.delete(key) catch |err| switch (err) {
                     error.NotFound => {},
                     else => return err,
@@ -3297,6 +3836,104 @@ pub const RaftApplyStore = struct {
         try self.putTableRecordTxn(txn, group_id, key, record);
     }
 
+    fn indexedTableRangeIdsTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+    ) ![]u64 {
+        var prefix_buf: [192]u8 = undefined;
+        const prefix = try tableRangeIndexPrefixForTable(&prefix_buf, group_id, table_id);
+        var ids = std.ArrayListUnmanaged(u64).empty;
+        errdefer ids.deinit(self.alloc);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            if (row.value.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
+            try ids.append(self.alloc, std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little));
+        }
+        return try ids.toOwnedSlice(self.alloc);
+    }
+
+    fn indexedRangeMembershipMatchesTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        ids: []const u64,
+        expected: topology_protocol.RangeMembership,
+    ) !bool {
+        var accumulator: topology_protocol.RangeMembershipAccumulator = .{};
+        for (ids) |range_group_id| {
+            var range_key_buf: [160]u8 = undefined;
+            const range_key = try rangeKeyForGroup(&range_key_buf, group_id, range_group_id);
+            const encoded = txn.get(range_key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            const record = try decodeRangeRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeRange(self.alloc, record);
+            if (record.table_id != table_id or record.group_id != range_group_id) return false;
+            try accumulator.add(range_group_id);
+        }
+        return accumulator.finish(table_id).eql(expected);
+    }
+
+    /// Rare repair path for projections created before the derived index was
+    /// introduced or after local index corruption. Normal drop apply never
+    /// scans the cluster-wide range namespace.
+    fn rebuildTableRangeIndexTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+    ) ![]u64 {
+        var table_prefix_buf: [192]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(
+            txn,
+            try tableRangeIndexPrefixForTable(&table_prefix_buf, group_id, table_id),
+        );
+        var range_prefix_buf: [128]u8 = undefined;
+        const rows = try docstore.DocStore.scanPrefixTxn(
+            self.alloc,
+            txn,
+            try rangePrefixForGroup(&range_prefix_buf, group_id),
+        );
+        defer freeMetadataSnapshotRows(self.alloc, rows);
+        var ids = std.ArrayListUnmanaged(u64).empty;
+        errdefer ids.deinit(self.alloc);
+        for (rows) |row| {
+            const record = try decodeRangeRecord(self.alloc, row.value);
+            defer metadata_table_manager.freeRange(self.alloc, record);
+            if (record.table_id != table_id) continue;
+            try ids.append(self.alloc, record.group_id);
+        }
+        for (ids.items) |range_group_id|
+            try self.putTableRangeIndexTxn(txn, group_id, table_id, range_group_id);
+        return try ids.toOwnedSlice(self.alloc);
+    }
+
+    fn compactDropRangeIdsTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        expected: topology_protocol.RangeMembership,
+    ) !?[]u64 {
+        var ids = self.indexedTableRangeIdsTxn(txn, group_id, table_id) catch |err| switch (err) {
+            error.InvalidDerivedCatalogIndex => try self.rebuildTableRangeIndexTxn(txn, group_id, table_id),
+            else => return err,
+        };
+        if (try self.indexedRangeMembershipMatchesTxn(txn, group_id, table_id, ids, expected)) return ids;
+        self.alloc.free(ids);
+        ids = try self.rebuildTableRangeIndexTxn(txn, group_id, table_id);
+        if (try self.indexedRangeMembershipMatchesTxn(txn, group_id, table_id, ids, expected)) return ids;
+        self.alloc.free(ids);
+        return null;
+    }
+
     fn applyTableTopologyMutationTxn(
         self: *RaftApplyStore,
         txn: *docstore.DocStore.Txn,
@@ -3345,6 +3982,8 @@ pub const RaftApplyStore = struct {
                 }
 
                 var changed = false;
+                var added_range_group_ids = std.ArrayListUnmanaged(u64).empty;
+                defer added_range_group_ids.deinit(self.alloc);
                 if (encoded_table == null) {
                     try self.putTableRecordTxn(txn, group_id, table_key, create.table);
                     changed = true;
@@ -3361,6 +4000,8 @@ pub const RaftApplyStore = struct {
                     const encoded_range = try encodeRangeRecord(self.alloc, record);
                     defer self.alloc.free(encoded_range);
                     try txn.put(range_key, encoded_range);
+                    try self.putTableRangeIndexTxn(txn, group_id, record.table_id, record.group_id);
+                    try added_range_group_ids.append(self.alloc, record.group_id);
                     self.notifyCommittedKeyListeners(.{
                         .metadata_group_id = group_id,
                         .key = range_key,
@@ -3373,12 +4014,25 @@ pub const RaftApplyStore = struct {
                         .group_id = record.group_id,
                     });
                 }
-                if (changed)
-                    try self.advanceTableTransitionGenerationTxn(txn, group_id, create.table.table_id);
+                if (changed) {
+                    if (added_range_group_ids.items.len > 0) {
+                        try self.advanceTableTransitionGenerationWithRangeChangesTxn(
+                            txn,
+                            group_id,
+                            create.table.table_id,
+                            added_range_group_ids.items,
+                            &.{},
+                        );
+                    } else {
+                        try self.advanceTableTransitionGenerationTxn(txn, group_id, create.table.table_id);
+                    }
+                }
             },
             .drop => |drop| {
                 const fence = try self.loadTableTransitionFenceTxn(txn, group_id, drop.table_id);
                 if (fence.active() or fence.generation != drop.expected_transition_generation) return;
+                if (drop.range_contract == .membership and
+                    !fence.membership(drop.table_id).eql(drop.range_contract.membership)) return;
 
                 var table_key_buf: [160]u8 = undefined;
                 const table_key = try tableKeyForGroup(&table_key_buf, group_id, drop.table_id);
@@ -3393,25 +4047,54 @@ pub const RaftApplyStore = struct {
                 if (!std.mem.eql(u8, existing.name, drop.expected_name)) return;
                 if (try self.extensionOwnsTableTxn(txn, group_id, existing.name)) return;
 
-                // The generation CAS proves that no range mutation occurred
-                // after the caller's linearizable snapshot. Validate only the
-                // exact keys carried by the command; scanning every range in
-                // the metadata group would make a one-table drop O(cluster).
-                for (drop.range_group_ids) |range_group_id| {
-                    var range_key_buf: [160]u8 = undefined;
-                    const range_key = try rangeKeyForGroup(&range_key_buf, group_id, range_group_id);
-                    const encoded_range = txn.get(range_key) catch |err| switch (err) {
-                        error.NotFound => return,
-                        else => return err,
-                    };
-                    const record = try decodeRangeRecord(self.alloc, encoded_range);
-                    defer metadata_table_manager.freeRange(self.alloc, record);
-                    if (record.table_id != drop.table_id) return;
+                var owned_range_group_ids: ?[]u64 = null;
+                defer if (owned_range_group_ids) |ids| self.alloc.free(ids);
+                var ranges_validated = false;
+                const range_group_ids = switch (drop.range_contract) {
+                    .membership => |membership| blk: {
+                        owned_range_group_ids = (try self.compactDropRangeIdsTxn(
+                            txn,
+                            group_id,
+                            drop.table_id,
+                            membership,
+                        )) orelse return;
+                        ranges_validated = true;
+                        break :blk owned_range_group_ids.?;
+                    },
+                    .legacy_group_ids => |ids| blk: {
+                        // V1 carried the full set directly. Recompute its
+                        // compact proof so a malformed legacy entry cannot
+                        // omit a range and orphan it when deleting the table.
+                        var membership: topology_protocol.RangeMembershipAccumulator = .{};
+                        for (ids) |range_group_id| try membership.add(range_group_id);
+                        if (!membership.finish(drop.table_id).eql(fence.membership(drop.table_id)))
+                            return;
+                        break :blk ids;
+                    },
+                };
+
+                // The generation CAS proves that no legitimate membership
+                // mutation occurred after admission. The fixed-size digest
+                // validates the local table-keyed index, whose rare repair
+                // path falls back to the primary range projection.
+                if (!ranges_validated) {
+                    for (range_group_ids) |range_group_id| {
+                        var range_key_buf: [160]u8 = undefined;
+                        const range_key = try rangeKeyForGroup(&range_key_buf, group_id, range_group_id);
+                        const encoded_range = txn.get(range_key) catch |err| switch (err) {
+                            error.NotFound => return,
+                            else => return err,
+                        };
+                        const record = try decodeRangeRecord(self.alloc, encoded_range);
+                        defer metadata_table_manager.freeRange(self.alloc, record);
+                        if (record.table_id != drop.table_id) return;
+                    }
                 }
-                for (drop.range_group_ids) |range_group_id| {
+                for (range_group_ids) |range_group_id| {
                     var range_key_buf: [160]u8 = undefined;
                     const range_key = try rangeKeyForGroup(&range_key_buf, group_id, range_group_id);
                     try txn.delete(range_key);
+                    try self.deleteTableRangeIndexTxn(txn, group_id, drop.table_id, range_group_id);
                     self.notifyCommittedKeyListeners(.{
                         .metadata_group_id = group_id,
                         .key = range_key,
@@ -3425,7 +4108,14 @@ pub const RaftApplyStore = struct {
                     });
                 }
                 try txn.delete(table_key);
-                try self.advanceTableTransitionGenerationTxn(txn, group_id, drop.table_id);
+                try self.deleteTableNameIndexTxn(txn, group_id, existing.name);
+                try self.advanceTableTransitionGenerationWithRangeChangesTxn(
+                    txn,
+                    group_id,
+                    drop.table_id,
+                    &.{},
+                    range_group_ids,
+                );
                 self.notifyCommittedKeyListeners(.{
                     .metadata_group_id = group_id,
                     .key = table_key,
@@ -3446,24 +4136,13 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         table_name: []const u8,
     ) !bool {
-        var prefix_buf: [128]u8 = undefined;
-        const prefix = try extensionMemberPrefixForGroup(&prefix_buf, group_id);
+        _ = self;
+        var prefix_buf: [640]u8 = undefined;
+        const prefix = try extensionTableOwnerIndexPrefixForTable(&prefix_buf, group_id, table_name);
         var cursor = try txn.openCursor();
         defer cursor.close();
-        var entry = try cursor.seekAtOrAfter(prefix);
-        while (entry) |row| : (entry = try cursor.next()) {
-            if (!std.mem.startsWith(u8, row.key, prefix)) break;
-            var member = try decodeExtensionMemberRecord(self.alloc, row.value);
-            defer member.deinitOwned(self.alloc);
-            const member_table = if (member.table_name.len != 0)
-                member.table_name
-            else if (member.scope.kind == .table)
-                member.scope.table_name
-            else
-                continue;
-            if (std.mem.eql(u8, member_table, table_name)) return true;
-        }
-        return false;
+        const entry = try cursor.seekAtOrAfter(prefix);
+        return if (entry) |row| std.mem.startsWith(u8, row.key, prefix) else false;
     }
 
     fn applyReplicationSourceStatusUpsertTxn(
@@ -3690,9 +4369,19 @@ pub const RaftApplyStore = struct {
         key: []const u8,
         record: metadata.TableRecord,
     ) !void {
+        const encoded_existing = txn.get(key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (encoded_existing) |encoded| {
+            const existing = try decodeTableRecord(self.alloc, encoded);
+            defer metadata_table_manager.freeTable(self.alloc, existing);
+            try self.deleteTableNameIndexTxn(txn, group_id, existing.name);
+        }
         const value = try encodeTableRecord(self.alloc, record);
         defer self.alloc.free(value);
         try txn.put(key, value);
+        try self.putTableNameIndexTxn(txn, group_id, record.name, record.table_id);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         self.notifyProjectionListeners(.{
             .kind = .table,
@@ -3742,7 +4431,7 @@ pub const RaftApplyStore = struct {
 
         var key_buf: [192]u8 = undefined;
         const key = try tableTransitionFenceKeyForGroup(&key_buf, group_id, table_id);
-        var encoded: [@sizeOf(u64) + @sizeOf(u32)]u8 = undefined;
+        var encoded: [table_transition_fence_encoded_len]u8 = undefined;
         encodeTableTransitionFence(&encoded, fence);
         try txn.put(key, &encoded);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
@@ -3762,7 +4451,33 @@ pub const RaftApplyStore = struct {
 
         var key_buf: [192]u8 = undefined;
         const key = try tableTransitionFenceKeyForGroup(&key_buf, group_id, table_id);
-        var encoded: [@sizeOf(u64) + @sizeOf(u32)]u8 = undefined;
+        var encoded: [table_transition_fence_encoded_len]u8 = undefined;
+        encodeTableTransitionFence(&encoded, fence);
+        try txn.put(key, &encoded);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+    }
+
+    fn advanceTableTransitionGenerationWithRangeChangesTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_id: u64,
+        added_range_group_ids: []const u64,
+        removed_range_group_ids: []const u64,
+    ) !void {
+        if (table_id == 0) return;
+        var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table_id);
+        if (fence.generation == std.math.maxInt(u64))
+            return error.TableTransitionGenerationExhausted;
+        for (added_range_group_ids) |range_group_id|
+            try fence.range_membership.add(range_group_id);
+        for (removed_range_group_ids) |range_group_id|
+            try fence.range_membership.remove(range_group_id);
+        fence.generation += 1;
+
+        var key_buf: [192]u8 = undefined;
+        const key = try tableTransitionFenceKeyForGroup(&key_buf, group_id, table_id);
+        var encoded: [table_transition_fence_encoded_len]u8 = undefined;
         encodeTableTransitionFence(&encoded, fence);
         try txn.put(key, &encoded);
         self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
@@ -4116,6 +4831,15 @@ pub const RaftApplyStore = struct {
         for (delta.remove_extension_members) |record| {
             var key_buf: [256]u8 = undefined;
             const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
+            const encoded_existing = txn.get(key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (encoded_existing) |encoded| {
+                var existing = try decodeExtensionMemberRecord(self.alloc, encoded);
+                defer existing.deinitOwned(self.alloc);
+                try self.deleteExtensionTableOwnerIndexTxn(txn, group_id, existing);
+            }
             txn.delete(key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -4150,9 +4874,19 @@ pub const RaftApplyStore = struct {
         for (delta.upsert_extension_members) |record| {
             var key_buf: [256]u8 = undefined;
             const key = try extensionMemberKeyForGroup(&key_buf, group_id, record.extension_name, record.object_kind, record.object_name);
+            const encoded_existing = txn.get(key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (encoded_existing) |encoded| {
+                var existing = try decodeExtensionMemberRecord(self.alloc, encoded);
+                defer existing.deinitOwned(self.alloc);
+                try self.deleteExtensionTableOwnerIndexTxn(txn, group_id, existing);
+            }
             const value = try encodeExtensionMemberRecord(self.alloc, record);
             defer self.alloc.free(value);
             try txn.put(key, value);
+            try self.putExtensionTableOwnerIndexTxn(txn, group_id, record);
             self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
         }
     }
@@ -4993,19 +5727,30 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
                     }
                 },
                 .drop => |drop| {
-                    try out.append(alloc, 2);
+                    try out.append(alloc, switch (drop.range_contract) {
+                        .legacy_group_ids => 2,
+                        .membership => 3,
+                    });
                     try appendInt(alloc, &out, u64, drop.table_id);
                     try appendRequiredString(alloc, &out, drop.expected_name);
                     try appendInt(alloc, &out, u64, drop.expected_transition_generation);
-                    try appendInt(
-                        alloc,
-                        &out,
-                        u32,
-                        std.math.cast(u32, drop.range_group_ids.len) orelse
-                            return error.InvalidMetadataTransitionEncoding,
-                    );
-                    for (drop.range_group_ids) |range_group_id|
-                        try appendInt(alloc, &out, u64, range_group_id);
+                    switch (drop.range_contract) {
+                        .membership => |membership| {
+                            try appendInt(alloc, &out, u64, membership.count);
+                            try out.appendSlice(alloc, &membership.digest);
+                        },
+                        .legacy_group_ids => |ids| {
+                            try appendInt(
+                                alloc,
+                                &out,
+                                u32,
+                                std.math.cast(u32, ids.len) orelse
+                                    return error.InvalidMetadataTransitionEncoding,
+                            );
+                            for (ids) |range_group_id|
+                                try appendInt(alloc, &out, u64, range_group_id);
+                        },
+                    }
                 },
             }
         },
@@ -5286,7 +6031,7 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 errdefer alloc.free(expected_name);
                 const expected_transition_generation = try readInt(encoded, &pos, u64);
                 const range_count = try readInt(encoded, &pos, u32);
-                if (range_count > 65_536)
+                if (range_count > (encoded.len - pos) / @sizeOf(u64))
                     return error.InvalidMetadataTransitionEncoding;
                 const range_group_ids = try alloc.alloc(u64, range_count);
                 errdefer alloc.free(range_group_ids);
@@ -5296,7 +6041,28 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                     .table_id = table_id,
                     .expected_name = expected_name,
                     .expected_transition_generation = expected_transition_generation,
-                    .range_group_ids = range_group_ids,
+                    .range_contract = .{ .legacy_group_ids = range_group_ids },
+                } } };
+            }
+            if (kind == 3) {
+                const table_id = try readInt(encoded, &pos, u64);
+                const expected_name = try readRequiredString(alloc, encoded, &pos);
+                errdefer alloc.free(expected_name);
+                const expected_transition_generation = try readInt(encoded, &pos, u64);
+                const range_count = try readInt(encoded, &pos, u64);
+                if (pos + topology_protocol.range_membership_digest_len > encoded.len)
+                    return error.InvalidMetadataTransitionEncoding;
+                var digest: [topology_protocol.range_membership_digest_len]u8 = undefined;
+                @memcpy(&digest, encoded[pos .. pos + digest.len]);
+                pos += digest.len;
+                break :blk .{ .apply_table_topology = .{ .drop = .{
+                    .table_id = table_id,
+                    .expected_name = expected_name,
+                    .expected_transition_generation = expected_transition_generation,
+                    .range_contract = .{ .membership = .{
+                        .count = range_count,
+                        .digest = digest,
+                    } },
                 } } };
             }
             return error.InvalidMetadataTransitionEncoding;
@@ -8031,6 +8797,70 @@ pub fn rangePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_range:{d}:", .{group_id});
 }
 
+fn tableRangeIndexPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:table_range:{d}:", .{group_id});
+}
+
+fn tableNameIndexPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:table_name:{d}:", .{group_id});
+}
+
+fn tableNameIndexKey(buf: []u8, group_id: u64, table_name: []const u8) ![]const u8 {
+    return try std.fmt.bufPrint(
+        buf,
+        "\x00\x00__metadata_derived__:table_name:{d}:{d}:{s}",
+        .{ group_id, table_name.len, table_name },
+    );
+}
+
+fn tableRangeIndexPrefixForTable(buf: []u8, group_id: u64, table_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:table_range:{d}:{d}:", .{ group_id, table_id });
+}
+
+fn tableRangeIndexKey(
+    buf: []u8,
+    group_id: u64,
+    table_id: u64,
+    range_group_id: u64,
+) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:table_range:{d}:{d}:{d}", .{ group_id, table_id, range_group_id });
+}
+
+fn extensionTableOwnerIndexPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:extension_table_owner:{d}:", .{group_id});
+}
+
+fn extensionTableOwnerIndexPrefixForTable(
+    buf: []u8,
+    group_id: u64,
+    table_name: []const u8,
+) ![]const u8 {
+    return try std.fmt.bufPrint(
+        buf,
+        "\x00\x00__metadata_derived__:extension_table_owner:{d}:{d}:{s}:",
+        .{ group_id, table_name.len, table_name },
+    );
+}
+
+fn extensionTableOwnerIndexKey(
+    buf: []u8,
+    group_id: u64,
+    table_name: []const u8,
+    extension_name: []const u8,
+    object_kind: extension_domain.ExtensionObjectKind,
+    object_name: []const u8,
+) ![]const u8 {
+    return try std.fmt.bufPrint(
+        buf,
+        "\x00\x00__metadata_derived__:extension_table_owner:{d}:{d}:{s}:{d}:{s}:{s}:{s}",
+        .{ group_id, table_name.len, table_name, extension_name.len, extension_name, @tagName(object_kind), object_name },
+    );
+}
+
+fn derivedCatalogIndexVersionKey(buf: []u8, group_id: u64) ![]const u8 {
+    return try std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:catalog_index_version:{d}", .{group_id});
+}
+
 pub fn mergeTransitionPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_transition:merge:{d}:", .{group_id});
 }
@@ -8150,8 +8980,12 @@ fn rangesAreAdjacent(
     return false;
 }
 
+const table_transition_fence_v1_len = @sizeOf(u64) + @sizeOf(u32);
+const table_transition_fence_encoded_len = table_transition_fence_v1_len +
+    @sizeOf(u64) + topology_protocol.range_membership_digest_len;
+
 fn encodeTableTransitionFence(
-    out: *[@sizeOf(u64) + @sizeOf(u32)]u8,
+    out: *[table_transition_fence_encoded_len]u8,
     fence: TableTransitionFence,
 ) void {
     std.mem.writeInt(u64, out[0..@sizeOf(u64)], fence.generation, .little);
@@ -8161,12 +8995,24 @@ fn encodeTableTransitionFence(
         fence.active_count,
         .little,
     );
+    const count_offset = table_transition_fence_v1_len;
+    std.mem.writeInt(
+        u64,
+        out[count_offset .. count_offset + @sizeOf(u64)],
+        fence.range_membership.count,
+        .little,
+    );
+    @memcpy(
+        out[count_offset + @sizeOf(u64) ..],
+        &fence.range_membership.xor_digest,
+    );
 }
 
 fn decodeTableTransitionFence(encoded: []const u8) !TableTransitionFence {
-    if (encoded.len != @sizeOf(u64) + @sizeOf(u32))
+    if (encoded.len != table_transition_fence_v1_len and
+        encoded.len != table_transition_fence_encoded_len)
         return error.InvalidTableTransitionFence;
-    return .{
+    var fence: TableTransitionFence = .{
         .generation = std.mem.readInt(u64, encoded[0..@sizeOf(u64)], .little),
         .active_count = std.mem.readInt(
             u32,
@@ -8174,6 +9020,19 @@ fn decodeTableTransitionFence(encoded: []const u8) !TableTransitionFence {
             .little,
         ),
     };
+    if (encoded.len == table_transition_fence_encoded_len) {
+        const count_offset = table_transition_fence_v1_len;
+        fence.range_membership.count = std.mem.readInt(
+            u64,
+            encoded[count_offset .. count_offset + @sizeOf(u64)],
+            .little,
+        );
+        @memcpy(
+            &fence.range_membership.xor_digest,
+            encoded[count_offset + @sizeOf(u64) ..],
+        );
+    }
+    return fence;
 }
 
 fn transitionPhaseTerminal(phase: metadata.TransitionPhase) bool {

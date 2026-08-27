@@ -126,7 +126,7 @@ pub fn drop(
             .table_id = admission.table_id,
             .expected_name = admission.expected_name,
             .expected_transition_generation = admission.expected_transition_generation,
-            .range_group_ids = admission.range_group_ids,
+            .range_contract = .{ .membership = admission.range_membership },
         } },
     }) catch |err| {
         if (metadata_authority.isMutationNotAdmittedError(err)) return error.NotLeader;
