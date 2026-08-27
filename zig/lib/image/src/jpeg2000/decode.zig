@@ -106,6 +106,9 @@ pub const Header = struct {
     bits_per_component: u8,
     is_signed: bool,
     uses_multiple_tiles: bool,
+    /// Smallest DWT decomposition depth across all components. A discard
+    /// request at or below this value reduces every output component.
+    decomposition_levels: u8,
 
     pub fn supportsDecodeU8(self: Header) bool {
         return color.supportsOutputU8(self.components, self.bits_per_component, self.is_signed);
@@ -290,12 +293,12 @@ pub fn decodeHeaderBytes(allocator: std.mem.Allocator, bytes: []const u8) !Heade
         if (parsed.codestream_offset == null) return error.MissingCodestreamBox;
         var state = try codestream.parseState(allocator, bytes[parsed.codestream_offset.?..]);
         defer state.deinit(allocator);
-        return fromCodestream(.jp2, &state.header);
+        return fromCodestream(.jp2, &state);
     }
     if (codestream.hasSoc(bytes)) {
         var state = try codestream.parseState(allocator, bytes);
         defer state.deinit(allocator);
-        return fromCodestream(.j2k, &state.header);
+        return fromCodestream(.j2k, &state);
     }
     return error.UnsupportedImageFormat;
 }
@@ -322,6 +325,15 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
     var state = try codestream.parseState(allocator, codestream_bytes);
     defer state.deinit(allocator);
 
+    return decodeU8BytesFromState(allocator, codestream_bytes, &state, jp2_color);
+}
+
+fn decodeU8BytesFromState(
+    allocator: std.mem.Allocator,
+    codestream_bytes: []const u8,
+    state: *const codestream.State,
+    jp2_color: Jp2ColorMetadata,
+) !DecodedImage {
     _ = state.coding_style orelse return error.MissingCodingStyle;
 
     if (state.fullNativeDecodeSupport() != .supported) return error.UnsupportedNativeDecode;
@@ -332,7 +344,7 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
 
     // Standard JPEG 2000 decode path with canonical policies.
     if (state.header.uses_multiple_tiles) {
-        const pixels = try decodeMultiTile(allocator, codestream_bytes, &state);
+        const pixels = try decodeMultiTile(allocator, codestream_bytes, state);
         return .{
             .allocator = allocator,
             .width = state.header.width,
@@ -349,15 +361,15 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
     // component APIs for subsampled single-tile streams so U8 and U16, and
     // single- and multi-tile decode, all perform those operations in the same
     // order. Keep the optimized raw-plane path below for the common 1:1 case.
-    if (hasSubsampledComponents(&state)) {
+    if (hasSubsampledComponents(state)) {
         const pixels = if (state.header.components[0].bits_per_component == 8) blk: {
-            var component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, &state, 0);
+            var component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, state, 0);
             defer component_planes.deinit(allocator);
-            break :blk try reconstruct.interleaveComponentSamplesU8(allocator, &component_planes, &state);
+            break :blk try reconstruct.interleaveComponentSamplesU8(allocator, &component_planes, state);
         } else blk: {
-            var component_planes = try decodeSingleTileComponentPlanesU16AtResolution(allocator, codestream_bytes, &state, 0);
+            var component_planes = try decodeSingleTileComponentPlanesU16AtResolution(allocator, codestream_bytes, state, 0);
             defer component_planes.deinit(allocator);
-            break :blk try reconstruct.interleaveNativeComponentSamplesU8(allocator, &component_planes, &state);
+            break :blk try reconstruct.interleaveNativeComponentSamplesU8(allocator, &component_planes, state);
         };
         return .{
             .allocator = allocator,
@@ -370,14 +382,14 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
         };
     }
 
-    const packed_headers = try collectPackedPacketHeaders(allocator, &state, 1, null);
+    const packed_headers = try collectPackedPacketHeaders(allocator, state, 1, null);
     defer freePackedPacketHeaders(allocator, packed_headers);
 
     const payload_info = try codestreamPayloadInfoWithPackedMode(allocator, codestream_bytes, packed_headers != null);
     defer allocator.free(payload_info.payload);
 
-    var decode_state = state;
-    decode_state.quantization_style = quantizationStyleForTile(&state, 0);
+    var decode_state = state.*;
+    decode_state.quantization_style = quantizationStyleForTile(state, 0);
 
     var packet_model = if (packed_headers) |headers|
         try packet.buildPacketModelFromSplitPayload(
@@ -459,12 +471,13 @@ pub fn decodeU8BytesAtResolution(allocator: std.mem.Allocator, bytes: []const u8
 
     var state = try codestream.parseState(allocator, codestream_bytes);
     defer state.deinit(allocator);
+    _ = state.coding_style orelse return error.MissingCodingStyle;
+    const discard_levels = @min(requested_discard_levels, minimumDecompositionLevels(&state));
+    if (discard_levels == 0)
+        return decodeU8BytesFromState(allocator, codestream_bytes, &state, jp2_color);
     if (state.header.uses_multiple_tiles) return error.UnsupportedReducedMultiTileDecode;
     if (state.fullNativeDecodeSupport() != .supported) return error.UnsupportedNativeDecode;
     try reconstruct.requireHomogeneousComponents(&state.header);
-    const coding_style = state.coding_style orelse return error.MissingCodingStyle;
-    const discard_levels = @min(requested_discard_levels, coding_style.decomposition_levels);
-    if (discard_levels == 0) return decodeU8Bytes(allocator, bytes);
 
     var component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, &state, discard_levels);
     defer component_planes.deinit(allocator);
@@ -736,16 +749,29 @@ pub fn nativeDecodeSupportBytes(allocator: std.mem.Allocator, bytes: []const u8)
     return error.UnsupportedImageFormat;
 }
 
-fn fromCodestream(format: Format, stream_header: *const codestream.Header) Header {
-    const first = stream_header.components[0];
+fn minimumDecompositionLevels(state: *const codestream.State) u8 {
+    const default_style = state.coding_style orelse return 0;
+    var levels = default_style.decomposition_levels;
+    for (state.header.components, 0..) |_, component_index| {
+        if (component_index < state.component_coding_styles.len) {
+            if (state.component_coding_styles[component_index]) |style|
+                levels = @min(levels, style.decomposition_levels);
+        }
+    }
+    return levels;
+}
+
+fn fromCodestream(format: Format, state: *const codestream.State) Header {
+    const first = state.header.components[0];
     return .{
         .format = format,
-        .width = stream_header.width,
-        .height = stream_header.height,
-        .components = @intCast(stream_header.components.len),
+        .width = state.header.width,
+        .height = state.header.height,
+        .components = @intCast(state.header.components.len),
         .bits_per_component = first.bits_per_component,
         .is_signed = first.is_signed,
-        .uses_multiple_tiles = stream_header.uses_multiple_tiles,
+        .uses_multiple_tiles = state.header.uses_multiple_tiles,
+        .decomposition_levels = minimumDecompositionLevels(state),
     };
 }
 
@@ -1999,10 +2025,27 @@ test "decode OpenJPEG flat100 4x4 no-decomp" {
     const allocator = std.testing.allocator;
     const bytes = readTestFile(allocator, "testdata/image/jpeg2000/flat100.j2k") catch return;
     defer allocator.free(bytes);
-    var decoded = try decodeU8Bytes(allocator, bytes);
-    defer decoded.deinit();
-    try std.testing.expectEqual(@as(u32, 4), decoded.width);
-    for (decoded.pixels) |p| try std.testing.expectEqual(@as(u8, 100), p);
+    const header = try decodeHeaderBytes(allocator, bytes);
+    try std.testing.expectEqual(@as(u8, 0), header.decomposition_levels);
+
+    var direct_peak = TestPeakAllocator{ .backing = allocator };
+    var direct = try decodeU8Bytes(direct_peak.allocator(), bytes);
+    const expected = try allocator.dupe(u8, direct.pixels);
+    defer allocator.free(expected);
+    try std.testing.expectEqual(@as(u32, 4), direct.width);
+    for (direct.pixels) |p| try std.testing.expectEqual(@as(u8, 100), p);
+    direct.deinit();
+    try std.testing.expectEqual(@as(usize, 0), direct_peak.live_bytes);
+
+    // A nonzero request against a zero-depth codestream reuses the already
+    // parsed state for the full decode; it must not retain one parser while
+    // recursively starting another full decode.
+    var requested_peak = TestPeakAllocator{ .backing = allocator };
+    var requested = try decodeU8BytesAtResolution(requested_peak.allocator(), bytes, 1);
+    try std.testing.expectEqualSlices(u8, expected, requested.pixels);
+    try std.testing.expect(requested_peak.peak_live_bytes <= direct_peak.peak_live_bytes);
+    requested.deinit();
+    try std.testing.expectEqual(@as(usize, 0), requested_peak.live_bytes);
 }
 
 test "decode OpenJPEG simple 2x2" {

@@ -2720,6 +2720,12 @@ pub const Reader = struct {
             self.alloc.free(streams);
         }
 
+        // The decoder already returns an owned buffer. Preserve that ownership
+        // for the overwhelmingly common single-stream page instead of copying
+        // it into a second equally sized aggregation buffer at peak memory.
+        if (streams.len == 1)
+            return try self.readDecodedStreamDataWithLimits(&streams[0], self.decode_limits);
+
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
         for (streams, 0..) |*stream, stream_index| {
@@ -4038,7 +4044,10 @@ pub const Reader = struct {
                 const full_mask_rgba_len = std.math.mul(usize, pixel_count, 4) catch
                     return error.PdfDecodeWorkingSetTooLarge;
                 const discard_levels = if (can_reduce_resolution)
-                    jpeg2000DiscardLevelsForTarget(width, height, self.image_decode_target)
+                    @min(
+                        jpeg2000DiscardLevelsForTarget(width, height, self.image_decode_target),
+                        header.decomposition_levels,
+                    )
                 else
                     0;
                 var decoded_mask = if (discard_levels > 0) reduced: {
@@ -4130,7 +4139,10 @@ pub const Reader = struct {
             }
 
             const discard_levels = if (can_reduce_resolution and !indexed_color_space and !transparency_plan.needsNativeSamples())
-                jpeg2000DiscardLevelsForTarget(width, height, self.image_decode_target)
+                @min(
+                    jpeg2000DiscardLevelsForTarget(width, height, self.image_decode_target),
+                    header.decomposition_levels,
+                )
             else
                 0;
             var decoded_at_reduced_resolution = discard_levels > 0;
@@ -12735,6 +12747,38 @@ test "reader preserves text state across page content streams" {
     try std.testing.expectEqual(first.font_index, second.font_index);
     try std.testing.expectApproxEqAbs(render_runs.text_runs[0].a, render_runs.text_runs[1].a, 0.001);
     try std.testing.expectApproxEqAbs(render_runs.text_runs[0].b, render_runs.text_runs[1].b, 0.001);
+}
+
+test "reader retains a single decoded content stream without a second full copy" {
+    const alloc = std.testing.allocator;
+    var content: [700]u8 = @splat(' ');
+    const operation = "BT (Bounded) Tj ET\n";
+    @memcpy(content[content.len - operation.len ..], operation);
+    const stream_object = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content.len, &content },
+    );
+    defer alloc.free(stream_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n",
+        stream_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    // The owned decoded stream fits. An aggregation copy would require 1,400
+    // bytes at peak and incorrectly reject this ordinary single-stream page.
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 768,
+        .max_working_set_bytes = 768,
+    });
+    defer reader.deinit();
+    const text = try reader.extractPageTextAlloc(1);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Bounded", std.mem.trim(u8, text, &std.ascii.whitespace));
 }
 
 test "graphics matrices pre-concatenate PDF cm operators" {

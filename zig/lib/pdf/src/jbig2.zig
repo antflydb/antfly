@@ -785,14 +785,17 @@ const Decoder = struct {
             while (i < ref_count) : (i += 1) refs[i] = if (number <= 256) try cursor.byte() else if (number <= 65536) try cursor.u16be() else try cursor.u32be();
             _ = if ((flags & 0x40) != 0) try cursor.u32be() else try cursor.byte();
             const length = try cursor.u32be();
+            var unknown_generic_rows: ?u32 = null;
             const payload = if (length == 0xffffffff) blk: {
-                // Unknown length is permitted for immediate generic regions.
-                // In a PDF filter stream there is no segment scanner capable
-                // of locating a following header, so accept it only as the
-                // terminal segment and hand the bounded remainder to MQ decode.
+                // T.88 7.2.7 terminates an unknown-length arithmetic-coded
+                // immediate generic region with FF AC followed by the decoded
+                // row count. Locate that bounded framing marker instead of
+                // consuming subsequent segment headers as image data.
                 if (segment_type != 38 and segment_type != 39)
                     return error.UnsupportedJbig2UnknownLength;
-                break :blk try cursor.take(bytes.len - cursor.pos);
+                const framed = try self.takeUnknownLengthGeneric(&cursor);
+                unknown_generic_rows = framed.rows;
+                break :blk framed.payload;
             } else try cursor.take(length);
             // Reserve list capacity before a segment decoder creates owned
             // data, so an append OOM cannot orphan a decoded dictionary.
@@ -801,7 +804,7 @@ const Decoder = struct {
             switch (segment_type) {
                 0 => stored.dictionary = try self.decodeDictionary(payload, refs[0..ref_count]),
                 6, 7 => try self.decodeText(payload, refs[0..ref_count]),
-                38, 39 => try self.decodeGeneric(payload),
+                38, 39 => try self.decodeGeneric(payload, unknown_generic_rows),
                 48 => try self.decodePageInformation(payload),
                 49, 50, 51, 52 => {},
                 62 => try validateExtension(payload),
@@ -809,6 +812,39 @@ const Decoder = struct {
             }
             self.segments.appendAssumeCapacity(stored);
         }
+    }
+
+    const UnknownLengthGeneric = struct {
+        payload: []const u8,
+        rows: u32,
+    };
+
+    fn takeUnknownLengthGeneric(self: *Decoder, cursor: *Cursor) !UnknownLengthGeneric {
+        const payload_start = cursor.pos;
+        var header = Cursor{ .bytes = cursor.bytes[payload_start..] };
+        _ = try header.u32be();
+        _ = try header.u32be();
+        _ = try header.u32be();
+        _ = try header.u32be();
+        _ = try header.byte();
+        const flags = try header.byte();
+        if ((flags & 1) != 0) return error.UnsupportedJbig2GenericProfile;
+        const template: u2 = @truncate((flags >> 1) & 3);
+        _ = try header.take(2 * genericAdaptivePointCount(template));
+
+        var marker = header.pos;
+        while (marker + 6 <= header.bytes.len) : (marker += 1) {
+            try self.work.charge(1);
+            if (header.bytes[marker] != 0xff or header.bytes[marker + 1] != 0xac) continue;
+            const rows = std.mem.readInt(u32, header.bytes[marker + 2 ..][0..4], .big);
+            if (rows == 0) return error.InvalidJbig2UnknownRowCount;
+            const payload_len = marker + 6;
+            return .{
+                .payload = try cursor.take(payload_len),
+                .rows = rows,
+            };
+        }
+        return error.TruncatedJbig2UnknownLength;
     }
 
     fn decodePageInformation(self: *Decoder, payload: []const u8) !void {
@@ -1048,11 +1084,16 @@ const Decoder = struct {
         try self.page.?.compose(region, x, y, if (self.page_allows_op_override) @truncate(region_flags & 7) else self.page_op, self.work);
     }
 
-    fn decodeGeneric(self: *Decoder, payload: []const u8) !void {
+    fn decodeGeneric(self: *Decoder, payload: []const u8, unknown_rows: ?u32) !void {
         if (self.page == null) return error.MissingJbig2PageInformation;
         var cursor = Cursor{ .bytes = payload };
         const width = try cursor.u32be();
-        const height = try cursor.u32be();
+        const declared_height = try cursor.u32be();
+        const height = if (unknown_rows) |rows| blk: {
+            if (declared_height != std.math.maxInt(u32) and declared_height != rows)
+                return error.InvalidJbig2UnknownRowCount;
+            break :blk rows;
+        } else declared_height;
         const x = try cursor.i32be();
         const y = try cursor.i32be();
         const region_flags = try cursor.byte();
@@ -1170,11 +1211,49 @@ test "embedded generic region decodes through segment and page composition" {
     try std.testing.expectEqual(@as(u8, 0), decoded.pixels[0]);
     try std.testing.expectError(error.Jbig2WorkLimitExceeded, decodeAlloc(std.testing.allocator, null, &stream, 1024, 128 * 1024, 130, null));
 
-    var unknown_length_stream = stream;
+    var unknown_length_stream: [stream.len + 6]u8 = undefined;
+    @memcpy(unknown_length_stream[0..stream.len], &stream);
     @memset(unknown_length_stream[page.len + 7 .. page.len + 11], 0xff);
+    const end_marker = [_]u8{ 0xff, 0xac, 0, 0, 0, 1 };
+    @memcpy(unknown_length_stream[stream.len..], &end_marker);
     var unknown_length = try decodeAlloc(std.testing.allocator, null, &unknown_length_stream, 1024, 128 * 1024, 1_000_000, null);
     defer unknown_length.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, decoded.pixels, unknown_length.pixels);
+
+    var unknown_height = unknown_length_stream;
+    @memset(unknown_height[page.len + 15 .. page.len + 19], 0xff);
+    var row_terminated = try decodeAlloc(std.testing.allocator, null, &unknown_height, 1024, 128 * 1024, 1_000_000, null);
+    defer row_terminated.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, decoded.pixels, row_terminated.pixels);
+
+    const necessary_extension = [_]u8{
+        0,    0, 0, 2, 62, 0, 0, 0, 0, 0, 4,
+        0xa0, 0, 0, 1,
+    };
+    var followed: [unknown_length_stream.len + necessary_extension.len]u8 = undefined;
+    @memcpy(followed[0..unknown_length_stream.len], &unknown_length_stream);
+    @memcpy(followed[unknown_length_stream.len..], &necessary_extension);
+    try std.testing.expectError(
+        error.UnsupportedJbig2NecessaryExtension,
+        decodeAlloc(std.testing.allocator, null, &followed, 1024, 128 * 1024, 1_000_000, null),
+    );
+
+    var truncated: [stream.len + 2]u8 = undefined;
+    @memcpy(truncated[0..stream.len], &stream);
+    @memset(truncated[page.len + 7 .. page.len + 11], 0xff);
+    const truncated_marker = [_]u8{ 0xff, 0xac };
+    @memcpy(truncated[stream.len..], &truncated_marker);
+    try std.testing.expectError(
+        error.TruncatedJbig2UnknownLength,
+        decodeAlloc(std.testing.allocator, null, &truncated, 1024, 128 * 1024, 1_000_000, null),
+    );
+
+    var mismatched = unknown_length_stream;
+    mismatched[mismatched.len - 1] = 2;
+    try std.testing.expectError(
+        error.InvalidJbig2UnknownRowCount,
+        decodeAlloc(std.testing.allocator, null, &mismatched, 1024, 128 * 1024, 1_000_000, null),
+    );
 }
 
 test "PDF 32000 JBIG2 example decodes global dictionary and text region" {
