@@ -1622,6 +1622,7 @@ fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
         .alloc = alloc,
         .db = db,
     };
+    handle.db.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }
 
@@ -1946,6 +1947,7 @@ fn openLiteHandleAlloc(
         .lite_profile = resolved.profile,
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
     };
+    handle.db.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }
 
@@ -1995,6 +1997,7 @@ fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOptions)
         .db = db,
         .open_mode = resolved.open_mode,
     };
+    handle.db.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }
 

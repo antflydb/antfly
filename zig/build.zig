@@ -2954,6 +2954,7 @@ pub fn build(b: *std.Build) void {
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
+            "replicated restore persistence maps private callback errors to stable unavailability",
             "failed destination authorization refresh reuses the idempotent restore job",
             "delayed replicated restore refresh cannot regress a running job",
             "restore job store is idempotent and fenced",
@@ -4082,6 +4083,7 @@ pub fn build(b: *std.Build) void {
             "host records backup restore bootstrap failure when no handler is available",
             "file replica catalog persists backup restore bootstrap records across reopen",
             "replica catalog rejects invalid backup restore authority and integrity bindings",
+            "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4354,6 +4356,9 @@ pub fn build(b: *std.Build) void {
         "data runtime local group status provider collects and caches group statuses",
         "data runtime storage ownership fingerprint excludes transient placement progress",
         "data descriptor factory separates bootstrap voters from transport peers",
+        "data runtime remote admin snapshot clone owns parser-backed slices",
+        "data runtime remote admin snapshot clone releases partial ownership",
+        "data runtime remote metadata status stabilizes parser-backed role",
         "data descriptor factory bootstraps pristine group from complete intent peer set",
         "placement peer collection preserves complete intent peers during partial projection",
         "placement topology refuses partial transition bootstrap voters",
@@ -6250,6 +6255,7 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_production_regression_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
+            "provisioned writer cache starts DB workers after stable entry installation",
             "table write source restore acquires lifecycle unless caller reserves it",
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned create succeeds when post-commit runtime status is fenced",

@@ -24,6 +24,7 @@ pub const RouteMatch = struct {
     handler: Handler,
     data: ?*anyopaque,
     params: []const RouteParam,
+    max_body_size: ?usize,
 };
 
 /// Handler function type — canonical definition lives in server.zig.
@@ -36,6 +37,7 @@ const Route = struct {
     segments: []const Segment,
     handler: Handler,
     data: ?*anyopaque = null,
+    max_body_size: ?usize = null,
 };
 
 const Segment = union(enum) {
@@ -57,6 +59,8 @@ pub const Router = struct {
     allocator: Allocator,
     /// Per-method route lists indexed by @intFromEnum(method).
     method_routes: [method_count]std.ArrayListUnmanaged(Route) = [_]std.ArrayListUnmanaged(Route){.empty} ** method_count,
+    body_limited_route_count: usize = 0,
+    body_limited_route_counts: [method_count]usize = [_]usize{0} ** method_count,
     const Self = @This();
 
     /// Creates a new router.
@@ -87,11 +91,19 @@ pub const Router = struct {
 
     /// Adds a route to the router.
     pub fn add(self: *Self, method: types.Method, pattern: []const u8, handler: anytype) !void {
-        return self.addWithData(method, pattern, handler, null);
+        return self.addWithDataAndBodyLimit(method, pattern, handler, null, null);
     }
 
     /// Adds a route with borrowed opaque request data.
     pub fn addWithData(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: ?*anyopaque) !void {
+        return self.addWithDataAndBodyLimit(method, pattern, handler, data, null);
+    }
+
+    pub fn addWithBodyLimit(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, max_body_size: usize) !void {
+        return self.addWithDataAndBodyLimit(method, pattern, handler, null, max_body_size);
+    }
+
+    fn addWithDataAndBodyLimit(self: *Self, method: types.Method, pattern: []const u8, handler: anytype, data: ?*anyopaque, max_body_size: ?usize) !void {
         const segments = try self.parsePattern(pattern);
         errdefer self.allocator.free(segments);
         for (self.routesForConst(method)) |route| {
@@ -103,7 +115,12 @@ pub const Router = struct {
             .segments = segments,
             .handler = Handler.from(handler),
             .data = data,
+            .max_body_size = max_body_size,
         });
+        if (max_body_size != null) {
+            self.body_limited_route_count += 1;
+            self.body_limited_route_counts[@intFromEnum(method)] += 1;
+        }
     }
 
     /// Adds a route with an owned (duped) pattern string.
@@ -185,11 +202,29 @@ pub const Router = struct {
                     .handler = route.handler,
                     .data = route.data,
                     .params = params_buf[0..param_count],
+                    .max_body_size = route.max_body_size,
                 };
             }
         }
 
         return null;
+    }
+
+    pub fn bodySizeLimit(self: *const Self, method: types.Method, path: []const u8) ?usize {
+        if (!self.hasBodyLimitsForMethod(method)) return null;
+        var params_buf: [16]RouteParam = undefined;
+        for (self.routesForConst(method)) |route| {
+            if (self.matchRoute(route, path, &params_buf) != null) return route.max_body_size;
+        }
+        return null;
+    }
+
+    pub fn hasBodyLimits(self: *const Self) bool {
+        return self.body_limited_route_count != 0;
+    }
+
+    pub fn hasBodyLimitsForMethod(self: *const Self, method: types.Method) bool {
+        return self.body_limited_route_counts[@intFromEnum(method)] != 0;
     }
 
     /// Returns the list of allowed methods for a given path.
@@ -353,6 +388,32 @@ test "Router basic matching" {
 
     const result4 = router.find(.PUT, "/users", &pbuf).?;
     try std.testing.expectEqual(@as(?*anyopaque, &route_state), result4.data);
+}
+
+test "Router exposes route-specific body limits" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.addWithBodyLimit(.POST, "/bounded/:id", handler, 64 * 1024);
+    try router.add(.POST, "/unbounded", handler);
+    try router.add(.PUT, "/overlap/:id", handler);
+    try router.addWithBodyLimit(.PUT, "/overlap/*", handler, 1024);
+    try std.testing.expect(router.hasBodyLimits());
+    try std.testing.expect(router.hasBodyLimitsForMethod(.POST));
+    try std.testing.expect(router.hasBodyLimitsForMethod(.PUT));
+    try std.testing.expect(!router.hasBodyLimitsForMethod(.GET));
+    try std.testing.expectEqual(@as(?usize, 64 * 1024), router.bodySizeLimit(.POST, "/bounded/7"));
+    try std.testing.expectEqual(@as(?usize, null), router.bodySizeLimit(.POST, "/unbounded"));
+    // Body-limit resolution must preserve normal route precedence: the first
+    // matching route is unbounded even though a later limited route also matches.
+    try std.testing.expectEqual(@as(?usize, null), router.bodySizeLimit(.PUT, "/overlap/7"));
+    try std.testing.expectEqual(@as(?usize, null), router.bodySizeLimit(.GET, "/bounded/7"));
 }
 
 test "Router multiple parameters" {
