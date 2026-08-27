@@ -12132,8 +12132,14 @@ pub const ProvisionedTableWriteSource = struct {
         const open_start_ns = platform_time.monotonicNs();
         var open_attempts: usize = 0;
         var logged_open_wait = false;
+        var raft_apply_marker_reset = staged_generation == null;
         while (true) {
-            if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.table_activity_threaded.io(), path)) return;
+            const runtime_repair_needed = try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(
+                alloc,
+                self.table_activity_threaded.io(),
+                path,
+            );
+            if (!runtime_repair_needed and raft_apply_marker_reset) return;
 
             const owned_indexes_json = if (indexes_json_override == null)
                 (try loadTableIndexesJson(alloc, self.catalog, table_name)) orelse return error.TableVisibilityTimeout
@@ -12169,10 +12175,20 @@ pub const ProvisionedTableWriteSource = struct {
             };
             defer db.close();
 
+            if (!raft_apply_marker_reset) {
+                // A restored generation contains document state, not the
+                // destination replica's Raft history. Reset the group-local
+                // replay fence before this isolated generation is sealed.
+                try db.clearRaftAppliedEntry();
+                raft_apply_marker_reset = true;
+            }
+
             if (schema_json_override) |schema_json| {
                 try applyLocalTableSchemaJson(alloc, &db, schema_json);
             }
-            try self.repairRestoredDbRuntimeStateBlocking(alloc, &db, group_id, open_attempts);
+            if (runtime_repair_needed) {
+                try self.repairRestoredDbRuntimeStateBlocking(alloc, &db, group_id, open_attempts);
+            }
             return;
         }
     }
@@ -15325,6 +15341,7 @@ pub const ProvisionedTableWriteSource = struct {
             table_name,
             req,
             .catalog,
+            null,
         );
     }
 
@@ -15344,6 +15361,28 @@ pub const ProvisionedTableWriteSource = struct {
             table_name,
             req,
             .local_persisted,
+            null,
+        );
+    }
+
+    /// Applies an exact data-Raft entry. The DB commits the entry identity with
+    /// ordinary document mutations so restart replay can skip non-idempotent
+    /// transforms that were already durable before the Raft watermark advanced.
+    pub fn applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        entry: db_mod.RaftAppliedEntryIdentity,
+    ) !?void {
+        return try self.applyReplicatedBatchGroupLocalWithMetadata(
+            alloc,
+            group_id,
+            table_name,
+            req,
+            .local_persisted,
+            entry,
         );
     }
 
@@ -15366,6 +15405,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
         metadata_source: ReplicatedApplyMetadataSource,
+        raft_entry: ?db_mod.RaftAppliedEntryIdentity,
     ) !?void {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -15429,9 +15469,19 @@ pub const ProvisionedTableWriteSource = struct {
             runTestBeforeBatchExecutionHook();
             try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
             if (apply_req.transaction != null) {
-                try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
-                try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
-            } else try cached.db.batchReplicatedApply(apply_req);
+                const already_applied = if (raft_entry) |entry|
+                    try cached.db.raftEntryAlreadyApplied(entry)
+                else
+                    false;
+                if (!already_applied) {
+                    try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                    try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
+                    if (raft_entry) |entry| try cached.db.markRaftEntryApplied(entry);
+                }
+            } else if (raft_entry) |entry|
+                try cached.db.batchRaftReplicatedApply(apply_req, entry)
+            else
+                try cached.db.batchReplicatedApply(apply_req);
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
                 lockAtomic(&self.local_db_mutex);
@@ -15461,9 +15511,19 @@ pub const ProvisionedTableWriteSource = struct {
             runTestBeforeBatchExecutionHook();
             try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
             if (apply_req.transaction != null) {
-                try db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
-                try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
-            } else try db.batchReplicatedApply(apply_req);
+                const already_applied = if (raft_entry) |entry|
+                    try db.raftEntryAlreadyApplied(entry)
+                else
+                    false;
+                if (!already_applied) {
+                    try db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                    try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
+                    if (raft_entry) |entry| try db.markRaftEntryApplied(entry);
+                }
+            } else if (raft_entry) |entry|
+                try db.batchRaftReplicatedApply(apply_req, entry)
+            else
+                try db.batchReplicatedApply(apply_req);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);

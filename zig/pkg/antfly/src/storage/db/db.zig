@@ -1573,6 +1573,7 @@ const BatchExecutionOptions = struct {
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     bypass_ha_write_gate: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
+    raft_applied_entry_marker: ?RaftAppliedEntryIdentity = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
     transaction_resolution: ?TransactionResolution = null,
@@ -1580,6 +1581,57 @@ const BatchExecutionOptions = struct {
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,
 };
+
+pub const RaftAppliedEntryIdentity = struct {
+    term: u64,
+    index: u64,
+};
+
+const raft_applied_entry_value_len = 2 * @sizeOf(u64);
+
+fn raftAppliedEntryWrite(
+    identity: RaftAppliedEntryIdentity,
+    value_buf: *[raft_applied_entry_value_len]u8,
+) docstore_mod.KVPair {
+    std.mem.writeInt(u64, value_buf[0..8], identity.term, .little);
+    std.mem.writeInt(u64, value_buf[8..16], identity.index, .little);
+    return .{
+        .key = internal_keys.raft_document_applied_entry_key[0..],
+        .value = value_buf[0..],
+    };
+}
+
+fn readRaftAppliedEntry(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+) !?RaftAppliedEntryIdentity {
+    const raw = store.get(alloc, internal_keys.raft_document_applied_entry_key[0..]) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    if (raw.len != raft_applied_entry_value_len) return error.CorruptRaftAppliedEntry;
+    const identity: RaftAppliedEntryIdentity = .{
+        .term = std.mem.readInt(u64, raw[0..8], .little),
+        .index = std.mem.readInt(u64, raw[8..16], .little),
+    };
+    if (identity.term == 0 or identity.index == 0) return error.CorruptRaftAppliedEntry;
+    return identity;
+}
+
+const RaftAppliedEntryDisposition = enum { apply, already_applied };
+
+fn raftAppliedEntryDisposition(
+    persisted: ?RaftAppliedEntryIdentity,
+    incoming: RaftAppliedEntryIdentity,
+) !RaftAppliedEntryDisposition {
+    if (incoming.term == 0 or incoming.index == 0) return error.InvalidRaftAppliedEntry;
+    const current = persisted orelse return .apply;
+    if (current.index > incoming.index) return .already_applied;
+    if (current.index < incoming.index) return .apply;
+    if (current.term != incoming.term) return error.ConflictingRaftAppliedEntry;
+    return .already_applied;
+}
 
 const TransactionResolution = struct {
     txn_id: transactions_mod.TxnId,
@@ -5415,6 +5467,72 @@ pub const DB = struct {
         try self.batchReplicatedApplyWithMarker(req, null);
     }
 
+    /// Applies one exact data-Raft log entry and persists its identity in the
+    /// same primary-store batch. Replaying the entry after a crash becomes an
+    /// allocation-light no-op before transforms or derived work execute.
+    pub fn batchRaftReplicatedApply(
+        self: *DB,
+        req: types.BatchRequest,
+        identity: RaftAppliedEntryIdentity,
+    ) anyerror!void {
+        // Most restart replays should avoid executor health checks, resource
+        // admission, transform expansion, and derived-payload construction.
+        // batchInternal repeats this check under the mutation lock, which is
+        // the correctness fence if another caller advances the marker here.
+        if (try self.raftEntryAlreadyApplied(identity)) return;
+        var apply_req = req;
+        apply_req.sync_level = .write;
+        try self.batchInternal(apply_req, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .raft_applied_entry_marker = identity,
+        });
+    }
+
+    pub fn raftAppliedEntry(self: *DB) !?RaftAppliedEntryIdentity {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try readRaftAppliedEntry(self.alloc, self.core.store);
+    }
+
+    pub fn raftEntryAlreadyApplied(self: *DB, identity: RaftAppliedEntryIdentity) !bool {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return switch (try raftAppliedEntryDisposition(
+            try readRaftAppliedEntry(self.alloc, self.core.store),
+            identity,
+        )) {
+            .apply => false,
+            .already_applied => true,
+        };
+    }
+
+    pub fn markRaftEntryApplied(self: *DB, identity: RaftAppliedEntryIdentity) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        switch (try raftAppliedEntryDisposition(
+            try readRaftAppliedEntry(self.alloc, self.core.store),
+            identity,
+        )) {
+            .already_applied => return,
+            .apply => {},
+        }
+        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        try self.core.store.putBatch(&.{marker}, &.{});
+    }
+
+    /// Removes group-local apply history when this document generation is
+    /// materialized for a different Raft history (for example restore or the
+    /// destination side of a split). The caller must hold structural ownership
+    /// of the generation; ordinary Raft apply must never clear this fence.
+    pub fn clearRaftAppliedEntry(self: *DB) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        try self.core.store.putBatch(&.{}, &.{internal_keys.raft_document_applied_entry_key[0..]});
+    }
+
     fn batchReplicatedApplyWithMarker(self: *DB, req: types.BatchRequest, applied_lsn_marker: ?u64) anyerror!void {
         var apply_req = req;
         apply_req.sync_level = .write;
@@ -5756,6 +5874,20 @@ pub const DB = struct {
         lockApply(self);
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
+
+        if (opts.raft_applied_entry_marker) |identity| {
+            switch (try raftAppliedEntryDisposition(
+                try readRaftAppliedEntry(self.alloc, self.core.store),
+                identity,
+            )) {
+                .apply => {},
+                .already_applied => {
+                    self.core.unlockApply();
+                    apply_mutex_held = false;
+                    return;
+                },
+            }
+        }
 
         if (opts.transaction_resolution) |resolution| {
             const intent_snapshot = try self.core.validateTransactionIntentSnapshot(
@@ -6288,6 +6420,7 @@ pub const DB = struct {
             opts.extra_store_writes.len == 0 and
             opts.transaction_resolution == null and
             opts.ha_applied_lsn_marker == null and
+            opts.raft_applied_entry_marker == null and
             !thinReplayInputsHaveDerivedWork(
                 effective_req,
                 deleted_artifact_keys,
@@ -6413,6 +6546,10 @@ pub const DB = struct {
             if (lsn != 0) {
                 try store_writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &ha_applied_lsn_value_buf));
             }
+        }
+        var raft_applied_entry_value_buf: [raft_applied_entry_value_len]u8 = undefined;
+        if (opts.raft_applied_entry_marker) |identity| {
+            try store_writes.append(self.alloc, raftAppliedEntryWrite(identity, &raft_applied_entry_value_buf));
         }
         var split_range_value: ?[]u8 = null;
         defer if (split_range_value) |value| self.alloc.free(value);
@@ -43092,6 +43229,10 @@ fn clearSystemMetadataFromSplitDestination(alloc: Allocator, dest_store: *docsto
     const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
     defer alloc.free(admission_prefix);
     try deleteKeysWithPrefixFromStore(alloc, dest_store, admission_prefix);
+    // The destination owns an independent Raft log. A physical page split can
+    // copy the source's higher applied index; retaining it would suppress valid
+    // low-index entries in the new group.
+    try dest_store.putBatch(&.{}, &.{internal_keys.raft_document_applied_entry_key[0..]});
 }
 
 fn ensureReplayFloor(store: *docstore_mod.DocStore, next_sequence: u64) !void {

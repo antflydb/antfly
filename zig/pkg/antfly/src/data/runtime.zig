@@ -142,6 +142,7 @@ const provisioned_index_repair_fallback_rotation_target_ms: u64 = 30 * std.time.
 const provisioned_index_repair_queued_groups_per_scan: usize = 32;
 const provisioned_index_repair_retry_min_ms: u64 = 30 * std.time.ms_per_s;
 const provisioned_index_repair_retry_max_ms: u64 = 10 * std.time.ms_per_min;
+const data_raft_writer_unavailable_log_interval_ns: u64 = 5 * std.time.ns_per_s;
 /// Bound one non-activation reconstruction turn so the BackendRuntime owner can
 /// rotate fairly across broken groups. Dense scan code observes this only at a
 /// durable streaming-session boundary, keeping the hot batch path branch-free.
@@ -1173,6 +1174,15 @@ const RaftTableApplyStateMachine = struct {
     const RetryApplyCheckpoint = struct {
         completed_index: u64 = 0,
         completed_term: u64 = 0,
+        writer_unavailable_attempts: u64 = 0,
+        writer_unavailable_suppressed: u64 = 0,
+        next_writer_unavailable_log_ns: u64 = 0,
+    };
+
+    const WriterUnavailableObservation = struct {
+        emit_log: bool,
+        attempts: u64,
+        suppressed: u64,
     };
 
     const TestFaults = if (@import("builtin").is_test) struct {
@@ -1230,6 +1240,8 @@ const RaftTableApplyStateMachine = struct {
     applied_mutex: std.atomic.Mutex = .unlocked,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     retry_apply_checkpoints: std.AutoHashMapUnmanaged(u64, RetryApplyCheckpoint) = .empty,
+    writer_unavailable_retries_total: std.atomic.Value(u64) = .init(0),
+    writer_unavailable_logs_suppressed_total: std.atomic.Value(u64) = .init(0),
     // Only the proposing leader registers an outcome waiter. Followers retain
     // no request-scoped state, and timed-out callers remove their own waiter.
     // The map is therefore bounded by live synchronous proposals rather than
@@ -1364,10 +1376,40 @@ const RaftTableApplyStateMachine = struct {
         _ = self.retry_apply_checkpoints.remove(group_id);
     }
 
+    fn noteWriterUnavailable(
+        self: *RaftTableApplyStateMachine,
+        group_id: u64,
+        now_ns: u64,
+    ) WriterUnavailableObservation {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const checkpoint = self.retry_apply_checkpoints.getPtr(group_id) orelse unreachable;
+        checkpoint.writer_unavailable_attempts +|= 1;
+        _ = self.writer_unavailable_retries_total.fetchAdd(1, .monotonic);
+        if (now_ns < checkpoint.next_writer_unavailable_log_ns) {
+            checkpoint.writer_unavailable_suppressed +|= 1;
+            _ = self.writer_unavailable_logs_suppressed_total.fetchAdd(1, .monotonic);
+            return .{
+                .emit_log = false,
+                .attempts = checkpoint.writer_unavailable_attempts,
+                .suppressed = checkpoint.writer_unavailable_suppressed,
+            };
+        }
+        const suppressed = checkpoint.writer_unavailable_suppressed;
+        checkpoint.writer_unavailable_suppressed = 0;
+        checkpoint.next_writer_unavailable_log_ns = now_ns +| data_raft_writer_unavailable_log_interval_ns;
+        return .{
+            .emit_log = true,
+            .attempts = checkpoint.writer_unavailable_attempts,
+            .suppressed = suppressed,
+        };
+    }
+
     fn applyDocumentBatchForEntry(
         self: *RaftTableApplyStateMachine,
         group_id: u64,
         entry_index: u64,
+        entry_term: u64,
         table_name: []const u8,
         req: antfly.db.types.BatchRequest,
     ) !void {
@@ -1378,11 +1420,12 @@ const RaftTableApplyStateMachine = struct {
                 return error.RaftApplyWriterUnavailable;
             }
         }
-        _ = try self.write_source.applyPreparedReplicatedBatchGroupLocal(
+        _ = try self.write_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
             self.alloc,
             group_id,
             table_name,
             req,
+            .{ .term = entry_term, .index = entry_index },
         );
         if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
     }
@@ -1537,6 +1580,7 @@ const RaftTableApplyStateMachine = struct {
                     self.applyDocumentBatchForEntry(
                         group_id,
                         entry.index,
+                        entry.term,
                         decoded.table_name,
                         decoded.batch.req,
                     ) catch |err| {
@@ -1552,12 +1596,20 @@ const RaftTableApplyStateMachine = struct {
                                 @errorName(err),
                             });
                         } else if (err == error.RaftApplyWriterUnavailable) {
-                            std.log.warn("data raft document apply deferred group_id={} index={} table={s} err={s}", .{
+                            const observation = self.noteWriterUnavailable(
                                 group_id,
-                                entry.index,
-                                decoded.table_name,
-                                @errorName(err),
-                            });
+                                platform_time.monotonicNs(),
+                            );
+                            if (observation.emit_log) {
+                                std.log.warn("data raft document apply deferred group_id={} index={} table={s} attempts={} suppressed_since_last_log={} err={s}", .{
+                                    group_id,
+                                    entry.index,
+                                    decoded.table_name,
+                                    observation.attempts,
+                                    observation.suppressed,
+                                    @errorName(err),
+                                });
+                            }
                             return err;
                         } else {
                             std.log.err("data raft document apply failed group_id={} index={} table={s} err={}", .{
@@ -1693,6 +1745,10 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_completions_total", "counter", "Raft snapshot compactions published", raft_metrics.runtime_snapshot_compaction_completions);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_failures_total", "counter", "Raft snapshot compaction build or publication failures", raft_metrics.runtime_snapshot_compaction_failures);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", raft_metrics.runtime_snapshot_compaction_candidates);
+        if (self.data_server.data_raft_apply) |apply_sm| {
+            try health_metrics.appendPromMetric(writer, "antfly_data_raft_writer_unavailable_retries_total", "counter", "Data-Raft document apply retries deferred while another runtime owns the writer", apply_sm.writer_unavailable_retries_total.load(.monotonic));
+            try health_metrics.appendPromMetric(writer, "antfly_data_raft_writer_unavailable_logs_suppressed_total", "counter", "Repeated writer-unavailable warnings suppressed by per-group rate limiting", apply_sm.writer_unavailable_logs_suppressed_total.load(.monotonic));
+        }
         try health_metrics.appendPromMetric(writer, "antfly_data_api_requests_total", "counter", "Requests handled by the local API server process", api_request_stats.request_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_api_first_request_elapsed_ms", "gauge", "Milliseconds from API server initialization until the first handled request", api_request_stats.first_request_elapsed_ms);
         if (listener_stats) |http| {
@@ -19184,13 +19240,25 @@ test "data raft retry checkpoints survive changed ready windows and publication 
     );
     try std.testing.expectEqual(@as(u64, 0), apply_sm.appliedIndex(group_id));
     try std.testing.expectEqual(@as(usize, 1), apply_sm.retry_apply_checkpoints.count());
+    try std.testing.expectEqual(@as(u64, 1), apply_sm.writer_unavailable_retries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), apply_sm.writer_unavailable_logs_suppressed_total.load(.monotonic));
+
+    // A busy writer can span many progress turns. Keep retrying for prompt
+    // ownership handoff, but bound warning volume independently per group.
+    apply_sm.test_faults.writer_unavailable_once_at_index = 2;
+    try std.testing.expectError(
+        error.RaftApplyWriterUnavailable,
+        RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &.{}),
+    );
+    try std.testing.expectEqual(@as(u64, 2), apply_sm.writer_unavailable_retries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), apply_sm.writer_unavailable_logs_suppressed_total.load(.monotonic));
     try DataServer.handleRaftProgressError(error.RaftApplyWriterUnavailable);
     try std.testing.expectError(error.OutOfMemory, DataServer.handleRaftProgressError(error.OutOfMemory));
 
     try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &extended_entries, &.{});
     try std.testing.expectEqual(@as(u64, 3), apply_sm.appliedIndex(group_id));
     try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
-    try std.testing.expectEqual(@as(usize, 4), apply_sm.test_faults.document_apply_attempts);
+    try std.testing.expectEqual(@as(usize, 5), apply_sm.test_faults.document_apply_attempts);
     try std.testing.expectEqual(@as(usize, 3), apply_sm.test_faults.document_apply_successes);
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 1).?);
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 2).?);
@@ -19226,7 +19294,7 @@ test "data raft retry checkpoints survive changed ready windows and publication 
     try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &shifted_entries, &.{});
     try std.testing.expectEqual(@as(u64, 5), apply_sm.appliedIndex(group_id));
     try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
-    try std.testing.expectEqual(@as(usize, 6), apply_sm.test_faults.document_apply_attempts);
+    try std.testing.expectEqual(@as(usize, 7), apply_sm.test_faults.document_apply_attempts);
     try std.testing.expectEqual(@as(usize, 5), apply_sm.test_faults.document_apply_successes);
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 4).?);
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 5).?);
@@ -19240,6 +19308,70 @@ test "data raft retry checkpoints survive changed ready windows and publication 
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
         defer parsed.deinit();
         try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("count").?.integer);
+    }
+}
+
+test "data raft document apply identity prevents non-idempotent restart replay" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/data-raft-document-entry-marker",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    const increment: antfly.db.types.BatchRequest = .{
+        .transforms = &.{.{
+            .key = "doc:counter",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+        }},
+    };
+    const first_entry: antfly.db.RaftAppliedEntryIdentity = .{ .term = 4, .index = 11 };
+
+    {
+        var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
+        defer db.close();
+        try db.batch(.{ .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }} });
+        try db.batchRaftReplicatedApply(increment, first_entry);
+        try std.testing.expectEqual(first_entry, (try db.raftAppliedEntry()).?);
+    }
+
+    {
+        var db = try antfly.db.DB.open(alloc, path, .{ .start_index_workers = false });
+        defer db.close();
+
+        // Replaying the exact accepted entry after process reconstruction is a
+        // no-op; a different term at the same index is never accepted as it.
+        try db.batchRaftReplicatedApply(increment, first_entry);
+        try std.testing.expectError(
+            error.ConflictingRaftAppliedEntry,
+            db.batchRaftReplicatedApply(increment, .{ .term = 5, .index = 11 }),
+        );
+
+        const raw = (try db.get(alloc, "doc:counter")) orelse return error.TestExpectedDocument;
+        defer alloc.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
+
+        const second_entry: antfly.db.RaftAppliedEntryIdentity = .{ .term = 5, .index = 12 };
+        try db.batchRaftReplicatedApply(increment, second_entry);
+        try std.testing.expectEqual(second_entry, (try db.raftAppliedEntry()).?);
+
+        // Structural import into a new Raft history deliberately clears the
+        // group-local fence, allowing that history to begin at a lower index.
+        try db.clearRaftAppliedEntry();
+        try std.testing.expectEqual(null, try db.raftAppliedEntry());
+        const imported_history_entry: antfly.db.RaftAppliedEntryIdentity = .{ .term = 1, .index = 1 };
+        try db.batchRaftReplicatedApply(increment, imported_history_entry);
+        try std.testing.expectEqual(imported_history_entry, (try db.raftAppliedEntry()).?);
+        const reset_raw = (try db.get(alloc, "doc:counter")) orelse return error.TestExpectedDocument;
+        defer alloc.free(reset_raw);
+        var reset_parsed = try std.json.parseFromSlice(std.json.Value, alloc, reset_raw, .{});
+        defer reset_parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 3), reset_parsed.value.object.get("count").?.integer);
     }
 }
 
@@ -26643,6 +26775,12 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     defer server.deinit();
     try server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
     try server.initApiServer();
+    const apply_sm = try std.testing.allocator.create(RaftTableApplyStateMachine);
+    apply_sm.* = RaftTableApplyStateMachine.init(std.testing.allocator, ".", FakeCatalog.iface(), null);
+    apply_sm.attachProvisionedStorage(&server.provisioned_storage);
+    apply_sm.writer_unavailable_retries_total.store(9, .monotonic);
+    apply_sm.writer_unavailable_logs_suppressed_total.store(7, .monotonic);
+    server.data_raft_apply = apply_sm;
 
     var status_resp = try executeApiHttpxTestRequest(&server.http_server.?, .{ .method = .GET, .uri = antfly.public_api.http_routes.Routes.status });
     defer status_resp.deinit(server.http_server.?.alloc);
@@ -26772,6 +26910,8 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_groups 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_runtime_status_indexes 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_requests_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_raft_writer_unavailable_retries_total 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_raft_writer_unavailable_logs_suppressed_total 7") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_first_request_elapsed_ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_hits_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_coalesced_waiters_total 0") != null);
