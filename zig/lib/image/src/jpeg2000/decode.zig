@@ -635,8 +635,7 @@ pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedI
     const pixels = try reconstruct.interleaveComponentPlanesU16(
         allocator,
         &component_planes,
-        state.header.width,
-        state.header.height,
+        &state,
     );
     return .{
         .allocator = allocator,
@@ -701,7 +700,14 @@ fn componentPlaneFullDimensions(allocator: std.mem.Allocator, state: *const code
     const heights = try allocator.alloc(usize, state.header.components.len);
     errdefer allocator.free(heights);
     for (state.header.components, 0..) |component, i| {
-        const dims = tile.componentDimensions(state.header.width, state.header.height, component.xrsiz, component.yrsiz);
+        const dims = tile.componentDimensionsAt(
+            state.header.x_offset,
+            state.header.y_offset,
+            state.header.width,
+            state.header.height,
+            component.xrsiz,
+            component.yrsiz,
+        );
         widths[i] = @intCast(dims.width);
         heights[i] = @intCast(dims.height);
     }
@@ -864,7 +870,14 @@ fn decodeMultiTileComponentPlanesU8(
     const component_yrs = try allocator.alloc(usize, num_components);
     defer allocator.free(component_yrs);
     for (state.header.components, 0..) |component, c| {
-        const dims = tile.componentDimensions(state.header.width, state.header.height, component.xrsiz, component.yrsiz);
+        const dims = tile.componentDimensionsAt(
+            state.header.x_offset,
+            state.header.y_offset,
+            state.header.width,
+            state.header.height,
+            component.xrsiz,
+            component.yrsiz,
+        );
         component_widths[c] = @intCast(dims.width);
         component_heights[c] = @intCast(dims.height);
         component_xrs[c] = if (component.xrsiz == 0) 1 else @intCast(component.xrsiz);
@@ -902,8 +915,6 @@ fn decodeMultiTileComponentPlanesU8(
 
     for (tile_payloads, 0..) |tr, tile_idx| {
         const tile_bounds = tile_grid.tileBounds(@intCast(tile_idx));
-        const rel_x0: usize = @intCast(tile_bounds.x0 - state.header.x_offset);
-        const rel_y0: usize = @intCast(tile_bounds.y0 - state.header.y_offset);
         const this_tile_w = tile_bounds.width;
         const this_tile_h = tile_bounds.height;
         const tile_poc = try pocEntriesForTile(allocator, state, @intCast(tile_idx));
@@ -955,8 +966,10 @@ fn decodeMultiTileComponentPlanesU8(
         defer component_planes.deinit(allocator);
 
         for (component_planes.planes, 0..) |plane, c| {
-            const comp_x0 = ceilDivUsize(rel_x0, component_xrs[c]);
-            const comp_y0 = ceilDivUsize(rel_y0, component_yrs[c]);
+            const comp_x0 = ceilDivUsize(tile_bounds.x0, component_xrs[c]) -
+                ceilDivUsize(state.header.x_offset, component_xrs[c]);
+            const comp_y0 = ceilDivUsize(tile_bounds.y0, component_yrs[c]) -
+                ceilDivUsize(state.header.y_offset, component_yrs[c]);
             const copy_w = component_planes.widths[c];
             const copy_h = component_planes.heights[c];
             var y: usize = 0;
@@ -992,7 +1005,14 @@ fn decodeMultiTileComponentPlanesU16(
     const component_yrs = try allocator.alloc(usize, num_components);
     defer allocator.free(component_yrs);
     for (state.header.components, 0..) |component, c| {
-        const dims = tile.componentDimensions(state.header.width, state.header.height, component.xrsiz, component.yrsiz);
+        const dims = tile.componentDimensionsAt(
+            state.header.x_offset,
+            state.header.y_offset,
+            state.header.width,
+            state.header.height,
+            component.xrsiz,
+            component.yrsiz,
+        );
         component_widths[c] = @intCast(dims.width);
         component_heights[c] = @intCast(dims.height);
         component_xrs[c] = if (component.xrsiz == 0) 1 else @intCast(component.xrsiz);
@@ -1030,8 +1050,6 @@ fn decodeMultiTileComponentPlanesU16(
 
     for (tile_payloads, 0..) |tr, tile_idx| {
         const tile_bounds = tile_grid.tileBounds(@intCast(tile_idx));
-        const rel_x0: usize = @intCast(tile_bounds.x0 - state.header.x_offset);
-        const rel_y0: usize = @intCast(tile_bounds.y0 - state.header.y_offset);
         const this_tile_w = tile_bounds.width;
         const this_tile_h = tile_bounds.height;
         const tile_poc = try pocEntriesForTile(allocator, state, @intCast(tile_idx));
@@ -1083,8 +1101,10 @@ fn decodeMultiTileComponentPlanesU16(
         defer component_planes.deinit(allocator);
 
         for (component_planes.planes, 0..) |plane, c| {
-            const comp_x0 = ceilDivUsize(rel_x0, component_xrs[c]);
-            const comp_y0 = ceilDivUsize(rel_y0, component_yrs[c]);
+            const comp_x0 = ceilDivUsize(tile_bounds.x0, component_xrs[c]) -
+                ceilDivUsize(state.header.x_offset, component_xrs[c]);
+            const comp_y0 = ceilDivUsize(tile_bounds.y0, component_yrs[c]) -
+                ceilDivUsize(state.header.y_offset, component_yrs[c]);
             const copy_w = component_planes.widths[c];
             const copy_h = component_planes.heights[c];
             var y: usize = 0;
@@ -1238,131 +1258,13 @@ fn decodeMultiTileU16(
     codestream_bytes: []const u8,
     state: *const codestream.State,
 ) ![]u16 {
-    const image_width: usize = @intCast(state.header.width);
-    const image_height: usize = @intCast(state.header.height);
-    const num_components: usize = state.header.components.len;
-    _ = state.coding_style orelse return error.MissingCodingStyle;
-
-    const tile_grid = tile.buildTileGrid(state);
-    const num_tiles: usize = @intCast(tile_grid.tileCount());
-
-    const has_packed_headers = hasPackedPacketHeaders(state);
-    const tile_payloads = try collectTilePayloadsWithPackedMode(allocator, codestream_bytes, num_tiles, has_packed_headers);
-    defer {
-        for (tile_payloads) |payload| {
-            allocator.free(payload.payload);
-            if (payload.packet_lengths.len > 0) allocator.free(payload.packet_lengths);
-        }
-        allocator.free(tile_payloads);
-    }
-
-    const packed_headers = try collectPackedPacketHeaders(allocator, state, num_tiles, tile_payloads);
-    defer freePackedPacketHeaders(allocator, packed_headers);
-
-    var tile_pixels_list = try allocator.alloc(reconstruct.TilePixelsU16, num_tiles);
-    defer allocator.free(tile_pixels_list);
-
-    var decoded_buffers = try allocator.alloc(?[]u16, num_tiles);
-    defer allocator.free(decoded_buffers);
-    @memset(decoded_buffers, null);
-    errdefer {
-        for (decoded_buffers) |buf| {
-            if (buf) |b| allocator.free(b);
-        }
-    }
-
-    for (tile_payloads, 0..) |tr, tile_idx| {
-        const tile_bounds = tile_grid.tileBounds(@intCast(tile_idx));
-        const rel_x0: usize = @intCast(tile_bounds.x0 - state.header.x_offset);
-        const rel_y0: usize = @intCast(tile_bounds.y0 - state.header.y_offset);
-        const this_tile_w = tile_bounds.width;
-        const this_tile_h = tile_bounds.height;
-        const tile_poc = try pocEntriesForTile(allocator, state, @intCast(tile_idx));
-        defer tile_poc.deinit(allocator);
-
-        var tile_state = codestream.State{
-            .header = .{
-                .width = this_tile_w,
-                .height = this_tile_h,
-                .x_offset = tile_bounds.x0,
-                .y_offset = tile_bounds.y0,
-                .components = state.header.components,
-                .tile_width = this_tile_w,
-                .tile_height = this_tile_h,
-                .tile_x_offset = tile_bounds.x0,
-                .tile_y_offset = tile_bounds.y0,
-                .uses_multiple_tiles = false,
-            },
-            .coding_style = state.coding_style,
-            .quantization_style = quantizationStyleForTile(state, @intCast(tile_idx)),
-            .component_coding_styles = state.component_coding_styles,
-            .component_quantization_styles = state.component_quantization_styles,
-            .poc_entries = if (packed_headers != null) &.{} else tile_poc.entries,
-            .rgn_entries = state.rgn_entries,
-            .comments = state.comments,
-            .tile_parts = &.{},
-            .has_start_of_data = true,
-            .has_end_of_codestream = true,
-        };
-
-        var packet_model = try buildPacketModelForTilePayload(allocator, &tile_state, tr, packed_headers, tile_idx);
-        defer packet_model.deinit(allocator);
-
-        const policy = policiesForState(&tile_state);
-        var execution = try packet.executeTier1SegmentsForState(
-            allocator,
-            &packet_model,
-            tr.payload,
-            &tile_state,
-            .standard,
-            policy.refinement,
-            policy.magnitude,
-            0,
-            .standard,
-        );
-        defer execution.deinit(allocator);
-
-        var component_planes = try reconstruct.reconstructTier1ComponentPlanesU16(
-            allocator,
-            &tile_state,
-            &execution,
-        );
-        defer component_planes.deinit(allocator);
-        const pixels = try reconstruct.interleaveComponentPlanesU16(
-            allocator,
-            &component_planes,
-            this_tile_w,
-            this_tile_h,
-        );
-
-        decoded_buffers[tile_idx] = pixels;
-        tile_pixels_list[tile_idx] = .{
-            .x0 = rel_x0,
-            .y0 = rel_y0,
-            .width = @intCast(this_tile_w),
-            .height = @intCast(this_tile_h),
-            .pixels = pixels,
-        };
-
-        tile_state.header.components = &.{};
-        tile_state.coding_style = null;
-        tile_state.quantization_style = null;
-        tile_state.comments = &.{};
-    }
-
-    const result = try reconstruct.reconstructMultiTileU16(
+    var component_planes = try reconstructComponentPlanesU16FromPlanes(
         allocator,
-        tile_pixels_list,
-        image_width,
-        image_height,
-        num_components,
+        try decodeMultiTileComponentPlanesU16(allocator, codestream_bytes, state),
+        state,
     );
-
-    for (decoded_buffers) |buf| {
-        if (buf) |b| allocator.free(b);
-    }
-
-    return result;
+    defer component_planes.deinit(allocator);
+    return reconstruct.interleaveComponentPlanesU16(allocator, &component_planes, state);
 }
 
 const TilePayload = struct {
@@ -2276,6 +2178,50 @@ test "decodeU16 preserves exact subsampled input" {
     try std.testing.expectEqual(@as(u16, 192), decoded.pixels[63]);
 }
 
+test "decodeU16 upsamples stitched component planes without tile seams" {
+    const allocator = std.testing.allocator;
+    const pixels = [_]u8{
+        0,  32,  64,  96,
+        32, 64,  96,  128,
+        64, 96,  128, 160,
+        96, 128, 160, 192,
+    };
+    const single_params = encode.EncodeParams{
+        .width = 4,
+        .height = 4,
+        .components = 1,
+        .bits_per_component = 8,
+        .decomposition_levels = 0,
+        .num_layers = 1,
+        .progression_order = 0,
+        .wavelet_transform = 1,
+        .multiple_component_transform = false,
+        .code_block_width_exponent = 2,
+        .code_block_height_exponent = 2,
+        .format = .j2k,
+    };
+    var tiled_params = single_params;
+    tiled_params.tile_width = 2;
+    tiled_params.tile_height = 2;
+
+    const single_const = try encode.encodeU8Bytes(allocator, &pixels, &single_params);
+    defer allocator.free(single_const);
+    const tiled_const = try encode.encodeU8Bytes(allocator, &pixels, &tiled_params);
+    defer allocator.free(tiled_const);
+    const single = try allocator.dupe(u8, single_const);
+    defer allocator.free(single);
+    const tiled = try allocator.dupe(u8, tiled_const);
+    defer allocator.free(tiled);
+    try rewriteSizForSubsampling(single, 8, 8, 8, 8, 2, 2);
+    try rewriteSizForSubsampling(tiled, 8, 8, 4, 4, 2, 2);
+
+    var single_decoded = try decodeU16Bytes(allocator, single);
+    defer single_decoded.deinit();
+    var tiled_decoded = try decodeU16Bytes(allocator, tiled);
+    defer tiled_decoded.deinit();
+    try std.testing.expectEqualSlices(u16, single_decoded.pixels, tiled_decoded.pixels);
+}
+
 test "decode supports native gray-alpha and high-bit CMYK component layouts" {
     const allocator = std.testing.allocator;
     const gray_alpha = [_]u8{ 10, 20, 30, 40, 50, 60, 70, 80 };
@@ -2308,7 +2254,7 @@ test "decode supports native gray-alpha and high-bit CMYK component layouts" {
         .bits_per_component = 10,
         .decomposition_levels = 0,
         .wavelet_transform = 1,
-        .multiple_component_transform = false,
+        .multiple_component_transform = true,
         .format = .j2k,
     };
     const cmyk_encoded = try encode.encodeU16Bytes(allocator, &cmyk, &u16_params);

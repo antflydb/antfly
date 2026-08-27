@@ -434,13 +434,14 @@ pub fn interleavePlanesU16(
 pub fn interleaveComponentPlanesU16(
     allocator: std.mem.Allocator,
     component_planes: *const ComponentPlanesU16,
-    image_width: usize,
-    image_height: usize,
+    state: *const codestream.State,
 ) ![]u16 {
     const component_count = component_planes.planes.len;
-    if (component_count < 1 or component_count > 5 or
+    if (component_count < 1 or component_count > 5 or component_count != state.header.components.len or
         component_planes.widths.len != component_count or
         component_planes.heights.len != component_count) return error.UnsupportedPlaneCount;
+    const image_width: usize = @intCast(state.header.width);
+    const image_height: usize = @intCast(state.header.height);
     const pixel_count = std.math.mul(usize, image_width, image_height) catch return error.InvalidPlaneLength;
     const output_len = std.math.mul(usize, pixel_count, component_count) catch return error.InvalidPlaneLength;
     const output = try allocator.alloc(u16, output_len);
@@ -456,13 +457,30 @@ pub fn interleaveComponentPlanesU16(
         const plane = if (source_width == image_width and source_height == image_height)
             source
         else blk: {
-            upsampled = try upsample.bilinearU16(
+            const component = state.header.components[component_index];
+            const geometry = tile.componentDimensionsAt(
+                state.header.x_offset,
+                state.header.y_offset,
+                state.header.width,
+                state.header.height,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            if (source_width != geometry.width or source_height != geometry.height)
+                return error.InvalidPlaneLength;
+            upsampled = try upsample.bilinearU16ReferenceGrid(
                 allocator,
                 source,
                 source_width,
                 source_height,
                 image_width,
                 image_height,
+                state.header.x_offset,
+                state.header.y_offset,
+                geometry.origin_x,
+                geometry.origin_y,
+                component.xrsiz,
+                component.yrsiz,
             );
             break :blk upsampled.?;
         };
@@ -1307,7 +1325,7 @@ pub const StreamingPlaneAssembler = struct {
             }
         }
 
-        if (default_coding_style.multiple_component_transform and self.plane_storage.len == 3) {
+        if (default_coding_style.multiple_component_transform and self.plane_storage.len >= 3) {
             const all_same = self.comp_widths[0] == self.comp_widths[1] and
                 self.comp_widths[1] == self.comp_widths[2] and
                 self.comp_heights[0] == self.comp_heights[1] and
@@ -1316,12 +1334,12 @@ pub const StreamingPlaneAssembler = struct {
                 if (try buildCustomMctMatrixFromState(
                     self.allocator,
                     self.state,
-                    @intCast(self.plane_storage.len),
+                    3,
                 )) |matrix| {
                     defer self.allocator.free(matrix.forward);
                     defer self.allocator.free(matrix.inverse);
                     defer self.allocator.free(matrix.offsets);
-                    try color_transform.applyCustomMctInverse(matrix, self.plane_storage);
+                    try color_transform.applyCustomMctInverse(matrix, self.plane_storage[0..3]);
                 } else {
                     color_transform.inverseIct(
                         self.plane_storage[0],
@@ -1452,6 +1470,55 @@ test "streaming plane assembly honors per-component COC wavelet overrides" {
         std.testing.allocator.free(planes);
     }
     try std.testing.expectEqual(@as(i32, 17), planes[1][0]);
+}
+
+test "irreversible MCT transforms RGB planes when an alpha plane is present" {
+    var components = [_]codestream.Component{
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+    };
+    const style = codestream.CodingStyle{
+        .progression_order = 0,
+        .num_layers = 1,
+        .multiple_component_transform = true,
+        .decomposition_levels = 0,
+        .code_block_width_exponent = 2,
+        .code_block_height_exponent = 2,
+        .code_block_style = 0,
+        .wavelet_transform = 0,
+        .precincts_present = false,
+    };
+    var state = codestream.State{
+        .header = .{
+            .width = 1,
+            .height = 1,
+            .components = &components,
+            .tile_width = 1,
+            .tile_height = 1,
+            .uses_multiple_tiles = false,
+        },
+        .coding_style = style,
+        .comments = &.{},
+        .tile_parts = &.{},
+    };
+    var assembler = try StreamingPlaneAssembler.init(std.testing.allocator, &state);
+    defer assembler.deinit();
+    assembler.plane_storage[0][0] = 100;
+    assembler.plane_storage[1][0] = 0;
+    assembler.plane_storage[2][0] = 0;
+    assembler.plane_storage[3][0] = 77;
+
+    const planes = try assembler.finish(0);
+    defer {
+        for (planes) |plane| std.testing.allocator.free(plane);
+        std.testing.allocator.free(planes);
+    }
+    try std.testing.expectEqual(@as(i32, 100), planes[0][0]);
+    try std.testing.expectEqual(@as(i32, 100), planes[1][0]);
+    try std.testing.expectEqual(@as(i32, 100), planes[2][0]);
+    try std.testing.expectEqual(@as(i32, 77), planes[3][0]);
 }
 
 fn interleaveComponentPlanesU8WithUpsampling(

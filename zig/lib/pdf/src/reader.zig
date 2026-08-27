@@ -4301,8 +4301,11 @@ pub const Reader = struct {
             const src = i * 3;
             const dst = i * 4;
             const y = applyDecodeUnit(decoded[src], decode_obj, 0);
-            const cb = applyDecodeUnit(decoded[src + 1], decode_obj, 1) - 0.5;
-            const cr = applyDecodeUnit(decoded[src + 2], decode_obj, 2) - 0.5;
+            // JPEG 2000 sYCC uses integer code 128 as neutral chroma. Center
+            // after /Decode so identity maps remain bit-exact and custom maps
+            // preserve their intended span without introducing a half-code tint.
+            const cb = applyDecodeUnit(decoded[src + 1], decode_obj, 1) - applyDecodeUnit(128, decode_obj, 1);
+            const cr = applyDecodeUnit(decoded[src + 2], decode_obj, 2) - applyDecodeUnit(128, decode_obj, 2);
             rgba[dst + 0] = floatChannel(y + 1.402 * cr);
             rgba[dst + 1] = floatChannel(y - 0.344136 * cb - 0.714136 * cr);
             rgba[dst + 2] = floatChannel(y + 1.772 * cb);
@@ -15077,9 +15080,7 @@ test "JP2 sYCC conversion uses chroma rather than treating channels as RGB" {
     var rgba: [8]u8 = undefined;
     const samples = [_]u8{ 128, 128, 128, 76, 85, 255 };
     try Reader.decodeJpeg2000SyccToRgba(&rgba, 2, &samples, null);
-    try std.testing.expect(@abs(@as(i16, rgba[0]) - 128) <= 1);
-    try std.testing.expect(@abs(@as(i16, rgba[1]) - 128) <= 1);
-    try std.testing.expect(@abs(@as(i16, rgba[2]) - 128) <= 1);
+    try std.testing.expectEqualSlices(u8, &.{ 128, 128, 128, 255 }, rgba[0..4]);
     try std.testing.expect(rgba[4] > 240);
     try std.testing.expect(rgba[5] < 20);
     try std.testing.expect(rgba[6] < 20);

@@ -318,7 +318,7 @@ fn encodeFromShiftedPlanes(
 
     // Forward color transform. RCT requires integer 5/3 path; ICT operates on f32
     // and is applied inside the 9/7 tile path so we can avoid a double i32/f32 round-trip.
-    if (params.multiple_component_transform and num_components == 3 and params.wavelet_transform == 1) {
+    if (params.multiple_component_transform and num_components >= 3 and params.wavelet_transform == 1) {
         color_transform.forwardRct(planes[0], planes[1], planes[2]);
     }
 
@@ -561,8 +561,9 @@ fn forward97Pipeline(
         for (tile_planes[idx], 0..) |sample, i| plane.*[i] = @floatFromInt(sample);
     }
 
-    if (params.multiple_component_transform and num_components == 3) {
+    if (params.multiple_component_transform and num_components >= 3) {
         if (params.custom_mct) |matrix| {
+            if (num_components != 3) return error.InvalidCustomMct;
             color_transform.applyCustomMctForward(matrix, f32_planes) catch return error.InvalidCustomMct;
         } else {
             color_transform.forwardIct(f32_planes[0], f32_planes[1], f32_planes[2]);

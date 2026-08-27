@@ -299,9 +299,9 @@ pub const State = struct {
     /// Allows arbitrary decomposition levels, wavelet transform 0 or 1,
     /// quantization styles 0/1/2, MCT, and all code block styles.
     /// Supports single-tile and multi-tile.
-    /// Requires 1-16 bpc, 1/3/4 components, and standard progression orders.
-    /// Component subsampling (XRsiz/YRsiz > 1) is allowed for the u8 decode
-    /// path; subsampled components are upsampled to the image grid post-IDWT.
+    /// Requires 1-16 bpc, 1-5 components, and standard progression orders.
+    /// Component subsampling (XRsiz/YRsiz > 1) is supported by both native
+    /// output paths and is upsampled to the reference grid post-IDWT.
     pub fn fullNativeDecodeSupport(self: *const State) NativeDecodeSupport {
         if (self.header.components.len < 1 or self.header.components.len > 5) return .unsupported_components;
         for (self.header.components) |component| {
