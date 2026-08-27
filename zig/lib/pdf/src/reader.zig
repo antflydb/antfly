@@ -58,7 +58,8 @@ const jbig2_work_unit_ceiling: u64 = 256_000_000;
 /// Bounds both the final output of one PDF stream and the cumulative live
 /// allocations used while applying its filter chain. The working-set limit is
 /// intentionally separate: chained filters and predictors retain their input
-/// until the next output has been produced.
+/// until the next output has been produced. Image XObjects share that same
+/// working-set budget across codec scratch space and their complete mask tree.
 pub const DecodeLimits = struct {
     max_decoded_stream_bytes: usize = default_max_decoded_stream_bytes,
     max_working_set_bytes: usize = default_max_decode_working_set_bytes,
