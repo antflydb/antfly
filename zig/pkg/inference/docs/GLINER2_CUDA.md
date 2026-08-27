@@ -40,7 +40,7 @@ The comparison uses a checked-in text fixture and fails if either runtime does
 not observe exactly 256 encoder tokens. The count includes GLiNER2's schema and
 label prefix, not just the natural-language text.
 
-- Fixture: `scripts/fixtures/gliner2_256.txt`
+- Fixture: `scripts/gliner2/fixtures/gliner2_256.txt`
 - Labels: `person`, `organization`, `location`, `date`, `money`
 - Tasks: entity extraction
 - Batch inputs: the same realistic text repeated B1 or B8
@@ -57,7 +57,7 @@ The repeated-row B8 result is a real supported workload and both implementations
 receive the same inputs. It also exercises Antfly's request-local duplicate
 reuse. It must not be presented as a distinct-text B8 result; a separate
 distinct-text release fixture is checked in as
-`scripts/fixtures/gliner2_256_distinct_b8.txt`. That fixture is used for route,
+`scripts/gliner2/fixtures/gliner2_256_distinct_b8.txt`. That fixture is used for route,
 memory, and fallback qualification, while the performance comparison table
 below remains explicitly repeated-row because Fastino has not yet been rerun
 on the same heterogeneous corpus.
@@ -222,7 +222,7 @@ preparation and decode remain request-local.
 
 ## Correctness and Route Evidence
 
-`scripts/verify_gliner2_cuda.sh` checks native, production CUDA, and optional
+`scripts/gliner2/verify_gliner2_cuda.sh` checks native, production CUDA, and optional
 generated attention at the entity level. It requires identical label, byte
 span, and text identity, bounds every entity-score difference, and verifies
 that generated attention executed the M32 schedule rather than silently
@@ -278,7 +278,7 @@ MODEL=/absolute/path/to/fp16-gliner2-gguf-directory
 $ZIG build -Dcuda=true -Dcuda-artifacts=sm89 -Dcuda-libs=auto \
   -Doptimize=ReleaseFast bench-gliner2-e2e -- \
   --model-dir "$MODEL" --backend cuda --task entities \
-  --text-file scripts/fixtures/gliner2_256.txt \
+  --text-file scripts/gliner2/fixtures/gliner2_256.txt \
   --expect-encoder-seq-len 256 --batch-size 8 \
   --label person --label organization --label location \
   --label date --label money \
@@ -293,7 +293,7 @@ ANTFLY_INFERENCE_CUDA_DEBERTA_GENERATED_TC_VARIANT=m32 \
   $ZIG build -Dcuda=true -Dcuda-artifacts=sm89 -Dcuda-libs=auto \
   -Doptimize=ReleaseFast bench-gliner2-e2e -- \
   --model-dir "$MODEL" --backend cuda --task entities \
-  --text-file scripts/fixtures/gliner2_256.txt \
+  --text-file scripts/gliner2/fixtures/gliner2_256.txt \
   --expect-encoder-seq-len 256 --batch-size 8 \
   --label person --label organization --label location \
   --label date --label money \
@@ -304,9 +304,9 @@ Fastino reference, from the repository root with an environment containing the
 Fastino GLiNER2 package and CUDA PyTorch:
 
 ```sh
-python3 zig/pkg/inference/scripts/benchmark_fastino_gliner2_cuda.py \
+python3 zig/pkg/inference/scripts/gliner2/benchmark_fastino_gliner2_cuda.py \
   --model fastino/gliner2-base-v1 --mode compiled \
-  --text-file zig/pkg/inference/scripts/fixtures/gliner2_256.txt \
+  --text-file zig/pkg/inference/scripts/gliner2/fixtures/gliner2_256.txt \
   --expect-encoder-seq-len 256 \
   --label person --label organization --label location \
   --label date --label money --warmups 3 --repeats 10
@@ -322,7 +322,7 @@ Correctness and artifact gates:
 ANTFLY_GLINER2_MODEL_DIR="$MODEL" \
 ANTFLY_GLINER2_VERIFY_GENERATED_TC=1 \
 ANTFLY_CUDA_ARTIFACTS=sm89 \
-  scripts/verify_gliner2_cuda.sh
+  scripts/gliner2/verify_gliner2_cuda.sh
 
 scripts/regen-cuda-artifacts.sh --check --all
 ```

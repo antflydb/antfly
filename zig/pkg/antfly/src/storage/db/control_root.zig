@@ -30,6 +30,7 @@ pub const aggregations = @import("aggregations_contract.zig");
 pub const algebraic = @import("algebraic/control_root.zig");
 pub const doc_filter_wire = @import("doc_filter_wire.zig");
 pub const background_runtime = @import("../background_runtime.zig");
+pub const LsmOwnerKind = background_runtime.LsmOwnerKind;
 pub const query_metrics = @import("query_metrics.zig");
 pub const enrichment_utf8_text = @import("enrichment/utf8_text.zig");
 pub const documentExtractionStoredUnitFingerprintAlloc = @import("enrichment/document_unit_fingerprint.zig").storedPayloadLegacyFingerprintAlloc;

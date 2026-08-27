@@ -94,7 +94,7 @@ fn shouldSkipAutoMtpDraftLoad(config: generation.GenerationConfig, draft_cfg: gp
 }
 
 fn requiresNativeChannelProjection(config: gpt_model_mod.Config) bool {
-    return config.family == .gemma and config.hasPle();
+    return config.usesGemma4Channels();
 }
 
 fn generationPipelineSession(pipeline: anytype) ?backends_mod.Session {
@@ -104,6 +104,289 @@ fn generationPipelineSession(pipeline: anytype) ?backends_mod.Session {
     };
     if (comptime @hasField(Pipeline, "session")) return pipeline.session;
     return null;
+}
+
+fn generationPipelineUsesReasoningChannels(pipeline: anytype) bool {
+    const Pipeline = switch (@typeInfo(@TypeOf(pipeline))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(pipeline),
+    };
+    if (comptime @hasField(Pipeline, "gpt_config")) {
+        return requiresNativeChannelProjection(pipeline.gpt_config);
+    }
+    return false;
+}
+
+fn shouldDeferStreamContentForReasoning(
+    pipeline: anytype,
+    config: generation.GenerationConfig,
+) bool {
+    return generationPipelineUsesReasoningChannels(pipeline) and
+        config.enable_thinking != false and
+        // Grammar-constrained Gemma4 generation rewrites the prompt to open
+        // the public final channel directly, so no private reasoning can
+        // precede its incrementally streamed content.
+        config.grammar == null;
+}
+
+test "channel streaming defers content only when reasoning can precede it" {
+    const Probe = struct { gpt_config: gpt_model_mod.Config };
+    const pipeline = Probe{ .gpt_config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+    } };
+    try std.testing.expect(shouldDeferStreamContentForReasoning(&pipeline, .{}));
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&pipeline, .{ .enable_thinking = false }));
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&pipeline, .{ .grammar = "json" }));
+    const ordinary = Probe{ .gpt_config = .{ .family = .llama } };
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&ordinary, .{}));
+}
+
+fn serverA4bTelemetryEnabled() bool {
+    return platform.env.getenvBool("TERMITE_SERVER_A4B_TELEMETRY");
+}
+
+const ServerA4bTelemetry = struct {
+    route_select_attempts: u64 = 0,
+    route_select_successes: u64 = 0,
+    route_select_fallbacks: u64 = 0,
+    slot_lookup_attempts: u64 = 0,
+    slot_route_hits: u64 = 0,
+    slot_route_misses: u64 = 0,
+    slot_all_hit_layers: u64 = 0,
+    slot_map_publications: u64 = 0,
+    slot_map_publish_failures: u64 = 0,
+    slot_arena_attempts: u64 = 0,
+    slot_arena_successes: u64 = 0,
+    slot_arena_failures: u64 = 0,
+    selected_page_attempts: u64 = 0,
+    selected_page_successes: u64 = 0,
+    selected_page_failures: u64 = 0,
+    selected_page_logical_bytes: u64 = 0,
+    selected_page_mapped_bytes: u64 = 0,
+    selected_page_allocations: u64 = 0,
+    checkpoint_attempts: u64 = 0,
+    checkpoint_all_hit_tokens: u64 = 0,
+    checkpoint_miss_tokens: u64 = 0,
+    checkpoint_replays: u64 = 0,
+    slot_upload_batches: u64 = 0,
+    slot_uploads: u64 = 0,
+    slot_upload_bytes: u64 = 0,
+    mapped_attempts: u64 = 0,
+    mapped_fallbacks: u64 = 0,
+    mapped_failures: u64 = 0,
+    linear_attempts: u64 = 0,
+    linear_successes: u64 = 0,
+    linear_fallbacks: u64 = 0,
+    pair_attempts: u64 = 0,
+    pair_successes: u64 = 0,
+    pair_fallbacks: u64 = 0,
+    scatter_attempts: u64 = 0,
+    scatter_successes: u64 = 0,
+    scatter_fallbacks: u64 = 0,
+    frame_begins: u64 = 0,
+    frame_submits: u64 = 0,
+    compute_encoders: u64 = 0,
+    blit_encoders: u64 = 0,
+    bootstrap_misses: u64 = 0,
+};
+
+fn serverA4bTelemetrySnapshot(cb: ?*const ops.ComputeBackend) ?ops.NativeQuantTimingStats {
+    if (!serverA4bTelemetryEnabled()) return null;
+    const backend = cb orelse return null;
+    if (backend.kind() != .metal) return null;
+    return backend.debugTimingSnapshot().provider;
+}
+
+fn serverA4bTelemetryDelta(
+    after: ops.NativeQuantTimingStats,
+    before: ops.NativeQuantTimingStats,
+) ServerA4bTelemetry {
+    return .{
+        .route_select_attempts = after.a4b_moe_route_select_attempts -| before.a4b_moe_route_select_attempts,
+        .route_select_successes = after.a4b_moe_route_select_successes -| before.a4b_moe_route_select_successes,
+        .route_select_fallbacks = after.a4b_moe_route_select_fallbacks -| before.a4b_moe_route_select_fallbacks,
+        .slot_lookup_attempts = after.a4b_moe_slot_lookup_attempts -| before.a4b_moe_slot_lookup_attempts,
+        .slot_route_hits = after.a4b_moe_slot_route_hits -| before.a4b_moe_slot_route_hits,
+        .slot_route_misses = after.a4b_moe_slot_route_misses -| before.a4b_moe_slot_route_misses,
+        .slot_all_hit_layers = after.a4b_moe_slot_all_hit_layers -| before.a4b_moe_slot_all_hit_layers,
+        .slot_map_publications = after.a4b_moe_slot_map_publications -| before.a4b_moe_slot_map_publications,
+        .slot_map_publish_failures = after.a4b_moe_slot_map_publish_failures -| before.a4b_moe_slot_map_publish_failures,
+        .slot_arena_attempts = after.a4b_moe_slot_arena_attempts -| before.a4b_moe_slot_arena_attempts,
+        .slot_arena_successes = after.a4b_moe_slot_arena_successes -| before.a4b_moe_slot_arena_successes,
+        .slot_arena_failures = after.a4b_moe_slot_arena_failures -| before.a4b_moe_slot_arena_failures,
+        .selected_page_attempts = after.a4b_moe_selected_page_attempts -| before.a4b_moe_selected_page_attempts,
+        .selected_page_successes = after.a4b_moe_selected_page_successes -| before.a4b_moe_selected_page_successes,
+        .selected_page_failures = after.a4b_moe_selected_page_failures -| before.a4b_moe_selected_page_failures,
+        .selected_page_logical_bytes = after.a4b_moe_selected_page_logical_bytes -| before.a4b_moe_selected_page_logical_bytes,
+        .selected_page_mapped_bytes = after.a4b_moe_selected_page_mapped_bytes -| before.a4b_moe_selected_page_mapped_bytes,
+        .selected_page_allocations = after.a4b_moe_selected_page_allocations -| before.a4b_moe_selected_page_allocations,
+        .checkpoint_attempts = after.a4b_moe_checkpoint_attempts -| before.a4b_moe_checkpoint_attempts,
+        .checkpoint_all_hit_tokens = after.a4b_moe_checkpoint_all_hit_tokens -| before.a4b_moe_checkpoint_all_hit_tokens,
+        .checkpoint_miss_tokens = after.a4b_moe_checkpoint_miss_tokens -| before.a4b_moe_checkpoint_miss_tokens,
+        .checkpoint_replays = after.a4b_moe_checkpoint_replays -| before.a4b_moe_checkpoint_replays,
+        .slot_upload_batches = after.a4b_moe_slot_upload_batches -| before.a4b_moe_slot_upload_batches,
+        .slot_uploads = after.a4b_moe_slot_uploads -| before.a4b_moe_slot_uploads,
+        .slot_upload_bytes = after.a4b_moe_slot_upload_bytes -| before.a4b_moe_slot_upload_bytes,
+        .mapped_attempts = after.metal_provider_quantized_runtime_mapped_attempts -| before.metal_provider_quantized_runtime_mapped_attempts,
+        .mapped_fallbacks = after.metal_provider_quantized_runtime_mapped_fallbacks -| before.metal_provider_quantized_runtime_mapped_fallbacks,
+        .mapped_failures = after.metal_provider_quantized_runtime_mapped_failures -| before.metal_provider_quantized_runtime_mapped_failures,
+        .linear_attempts = after.a4b_packed_q4_0_linear_attempts -| before.a4b_packed_q4_0_linear_attempts,
+        .linear_successes = after.a4b_packed_q4_0_linear_successes -| before.a4b_packed_q4_0_linear_successes,
+        .linear_fallbacks = after.a4b_packed_q4_0_linear_fallbacks -| before.a4b_packed_q4_0_linear_fallbacks,
+        .pair_attempts = after.a4b_packed_q4_0_pair_attempts -| before.a4b_packed_q4_0_pair_attempts,
+        .pair_successes = after.a4b_packed_q4_0_pair_successes -| before.a4b_packed_q4_0_pair_successes,
+        .pair_fallbacks = after.a4b_packed_q4_0_pair_fallbacks -| before.a4b_packed_q4_0_pair_fallbacks,
+        .scatter_attempts = after.a4b_moe_scatter_attempts -| before.a4b_moe_scatter_attempts,
+        .scatter_successes = after.a4b_moe_scatter_successes -| before.a4b_moe_scatter_successes,
+        .scatter_fallbacks = after.a4b_moe_scatter_fallbacks -| before.a4b_moe_scatter_fallbacks,
+        .frame_begins = after.decoder_runtime_frame_begins -| before.decoder_runtime_frame_begins,
+        .frame_submits = after.decoder_runtime_frame_submits -| before.decoder_runtime_frame_submits,
+        .compute_encoders = after.metal_runtime_compute_encoder_count -| before.metal_runtime_compute_encoder_count,
+        .blit_encoders = after.metal_runtime_blit_encoder_count -| before.metal_runtime_blit_encoder_count,
+        .bootstrap_misses = after.compressed_block_active_frame_bootstrap_misses -| before.compressed_block_active_frame_bootstrap_misses,
+    };
+}
+
+fn logServerA4bTelemetry(
+    cb: ?*const ops.ComputeBackend,
+    before: ?ops.NativeQuantTimingStats,
+    model_name: []const u8,
+) void {
+    const start = before orelse return;
+    const backend = cb orelse return;
+    const delta = serverA4bTelemetryDelta(backend.debugTimingSnapshot().provider, start);
+    std.log.info(
+        "metal_a4b_server_request: scope=process_delta model={s} route_select_attempts={d} route_select_successes={d} route_select_fallbacks={d} slot_lookup_attempts={d} slot_route_hits={d} slot_route_misses={d} slot_all_hit_layers={d} slot_map_publications={d} slot_map_publish_failures={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} slot_upload_batches={d} slot_uploads={d} mapped_attempts={d} mapped_fallbacks={d} mapped_failures={d} linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} frame_begins={d} frame_submits={d} compute_encoders={d} blit_encoders={d} bootstrap_misses={d}",
+        .{
+            model_name,
+            delta.route_select_attempts,
+            delta.route_select_successes,
+            delta.route_select_fallbacks,
+            delta.slot_lookup_attempts,
+            delta.slot_route_hits,
+            delta.slot_route_misses,
+            delta.slot_all_hit_layers,
+            delta.slot_map_publications,
+            delta.slot_map_publish_failures,
+            delta.slot_arena_attempts,
+            delta.slot_arena_successes,
+            delta.slot_arena_failures,
+            delta.slot_upload_batches,
+            delta.slot_uploads,
+            delta.mapped_attempts,
+            delta.mapped_fallbacks,
+            delta.mapped_failures,
+            delta.linear_attempts,
+            delta.linear_successes,
+            delta.linear_fallbacks,
+            delta.pair_attempts,
+            delta.pair_successes,
+            delta.pair_fallbacks,
+            delta.scatter_attempts,
+            delta.scatter_successes,
+            delta.scatter_fallbacks,
+            delta.frame_begins,
+            delta.frame_submits,
+            delta.compute_encoders,
+            delta.blit_encoders,
+            delta.bootstrap_misses,
+        },
+    );
+    std.log.info(
+        "metal_a4b_server_selected_page: scope=process_delta model={s} attempts={d} successes={d} failures={d} logical_bytes={d} mapped_bytes={d} allocations={d}",
+        .{
+            model_name,
+            delta.selected_page_attempts,
+            delta.selected_page_successes,
+            delta.selected_page_failures,
+            delta.selected_page_logical_bytes,
+            delta.selected_page_mapped_bytes,
+            delta.selected_page_allocations,
+        },
+    );
+    std.log.info(
+        "metal_a4b_server_checkpoint: scope=process_delta model={s} attempts={d} all_hit_tokens={d} miss_tokens={d} replays={d}",
+        .{
+            model_name,
+            delta.checkpoint_attempts,
+            delta.checkpoint_all_hit_tokens,
+            delta.checkpoint_miss_tokens,
+            delta.checkpoint_replays,
+        },
+    );
+}
+
+test "server A4B telemetry reports saturating request deltas" {
+    var before = ops.NativeQuantTimingStats{};
+    before.a4b_moe_route_select_attempts = 10;
+    before.a4b_packed_q4_0_linear_attempts = 90;
+    before.decoder_runtime_frame_submits = 20;
+    before.metal_provider_quantized_runtime_mapped_fallbacks = 2;
+
+    var after = before;
+    after.a4b_moe_route_select_attempts = 130;
+    after.a4b_moe_route_select_successes = 120;
+    after.a4b_moe_slot_lookup_attempts = 120;
+    after.a4b_moe_slot_route_hits = 880;
+    after.a4b_moe_slot_route_misses = 80;
+    after.a4b_moe_slot_all_hit_layers = 70;
+    after.a4b_moe_slot_map_publications = 120;
+    after.a4b_moe_slot_arena_attempts = 120;
+    after.a4b_moe_slot_arena_successes = 118;
+    after.a4b_moe_slot_arena_failures = 2;
+    after.a4b_moe_selected_page_attempts = 120;
+    after.a4b_moe_selected_page_successes = 120;
+    after.a4b_moe_selected_page_logical_bytes = 3_211_591_680;
+    after.a4b_moe_selected_page_mapped_bytes = 3_232_235_520;
+    after.a4b_moe_selected_page_allocations = 1_920;
+    after.a4b_moe_checkpoint_attempts = 3;
+    after.a4b_moe_checkpoint_all_hit_tokens = 2;
+    after.a4b_moe_checkpoint_miss_tokens = 1;
+    after.a4b_moe_checkpoint_replays = 1;
+    after.a4b_moe_slot_upload_batches = 10;
+    after.a4b_moe_slot_uploads = 80;
+    after.a4b_moe_slot_upload_bytes = 268_697_600;
+    after.a4b_packed_q4_0_linear_attempts = 810;
+    after.a4b_packed_q4_0_linear_successes = 720;
+    after.a4b_packed_q4_0_pair_attempts = 240;
+    after.a4b_packed_q4_0_pair_successes = 240;
+    after.a4b_moe_scatter_attempts = 240;
+    after.a4b_moe_scatter_successes = 240;
+    after.decoder_runtime_frame_submits = 477;
+    // A runtime counter reset must never wrap to a false giant failure count.
+    after.metal_provider_quantized_runtime_mapped_fallbacks = 0;
+
+    const delta = serverA4bTelemetryDelta(after, before);
+    try std.testing.expectEqual(@as(u64, 120), delta.route_select_attempts);
+    try std.testing.expectEqual(@as(u64, 120), delta.route_select_successes);
+    try std.testing.expectEqual(@as(u64, 120), delta.slot_lookup_attempts);
+    try std.testing.expectEqual(@as(u64, 880), delta.slot_route_hits);
+    try std.testing.expectEqual(@as(u64, 80), delta.slot_route_misses);
+    try std.testing.expectEqual(@as(u64, 70), delta.slot_all_hit_layers);
+    try std.testing.expectEqual(@as(u64, 120), delta.slot_map_publications);
+    try std.testing.expectEqual(@as(u64, 120), delta.slot_arena_attempts);
+    try std.testing.expectEqual(@as(u64, 118), delta.slot_arena_successes);
+    try std.testing.expectEqual(@as(u64, 2), delta.slot_arena_failures);
+    try std.testing.expectEqual(@as(u64, 120), delta.selected_page_attempts);
+    try std.testing.expectEqual(@as(u64, 120), delta.selected_page_successes);
+    try std.testing.expectEqual(@as(u64, 0), delta.selected_page_failures);
+    try std.testing.expectEqual(@as(u64, 3_211_591_680), delta.selected_page_logical_bytes);
+    try std.testing.expectEqual(@as(u64, 3_232_235_520), delta.selected_page_mapped_bytes);
+    try std.testing.expectEqual(@as(u64, 1_920), delta.selected_page_allocations);
+    try std.testing.expectEqual(@as(u64, 3), delta.checkpoint_attempts);
+    try std.testing.expectEqual(@as(u64, 2), delta.checkpoint_all_hit_tokens);
+    try std.testing.expectEqual(@as(u64, 1), delta.checkpoint_miss_tokens);
+    try std.testing.expectEqual(@as(u64, 1), delta.checkpoint_replays);
+    try std.testing.expectEqual(@as(u64, 10), delta.slot_upload_batches);
+    try std.testing.expectEqual(@as(u64, 80), delta.slot_uploads);
+    try std.testing.expectEqual(@as(u64, 268_697_600), delta.slot_upload_bytes);
+    try std.testing.expectEqual(@as(u64, 720), delta.linear_attempts);
+    try std.testing.expectEqual(@as(u64, 720), delta.linear_successes);
+    try std.testing.expectEqual(@as(u64, 240), delta.pair_attempts);
+    try std.testing.expectEqual(@as(u64, 240), delta.scatter_successes);
+    try std.testing.expectEqual(@as(u64, 457), delta.frame_submits);
+    try std.testing.expectEqual(@as(u64, 0), delta.mapped_fallbacks);
 }
 
 fn generationStreamShouldContinue(
@@ -135,6 +418,22 @@ test "channel-aware Gemma generation stays on projected native backends" {
         .family = .gemma,
         .ple_hidden_size = 256,
     }));
+    try std.testing.expect(requiresNativeChannelProjection(.{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+    }));
+}
+
+test "generate API serializes public content and reasoning separately" {
+    const rendered = try std.json.Stringify.valueAlloc(std.testing.allocator, api.GenerateMessage{
+        .role = .assistant,
+        .content = "Paris",
+        .reasoning_content = "The capital of France is Paris.",
+    }, .{ .emit_null_optional_fields = false });
+    defer std.testing.allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"content\":\"Paris\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"reasoning_content\":\"The capital of France is Paris.\"") != null);
 }
 
 const GenerateSpeculationOptions = struct {
@@ -815,7 +1114,53 @@ pub const WarmModel = struct {
     backend: ?backends_mod.BackendType = null,
     format: ?[]const u8 = null,
     quantization: ?[]const u8 = null,
+    residency_mode: ?ops.A4bResidencyMode = null,
+    memory_budget_mb: ?u32 = null,
+
+    pub fn a4bRequest(self: WarmModel) ?ops.A4bInferenceRequest {
+        const residency_mode = self.residency_mode orelse .auto;
+        const memory_budget_mb = self.memory_budget_mb orelse 0;
+        // The documented wire defaults are policy-neutral. Treating explicit
+        // `auto`/`0` as an A4B request makes an otherwise ordinary generator
+        // fail geometry qualification merely because defaults were serialized.
+        if (residency_mode == .auto and memory_budget_mb == 0) return null;
+        return .{ .residency_mode = residency_mode, .memory_budget_mb = memory_budget_mb };
+    }
 };
+
+fn validatedWarmModelA4bRequest(model: WarmModel) !?ops.A4bInferenceRequest {
+    const request = model.a4bRequest();
+    if (request != null and model.kind != .generator) return error.A4bUnsupportedModelKind;
+    if (request != null and model.backend != null and model.backend.? != .metal)
+        return error.A4bRequiresMetal;
+    return request;
+}
+
+test "warm model A4B controls are Metal generator only" {
+    try std.testing.expect((WarmModel{
+        .name = "ordinary-generator",
+        .residency_mode = .auto,
+        .memory_budget_mb = 0,
+    }).a4bRequest() == null);
+    const request = (try validatedWarmModelA4bRequest(.{
+        .name = "gemma4-a4b",
+        .backend = .metal,
+        .residency_mode = .streamed,
+        .memory_budget_mb = 4096,
+    })).?;
+    try std.testing.expectEqual(ops.A4bResidencyMode.streamed, request.residency_mode);
+    try std.testing.expectEqual(@as(u32, 4096), request.memory_budget_mb);
+    try std.testing.expectError(error.A4bRequiresMetal, validatedWarmModelA4bRequest(.{
+        .name = "gemma4-a4b",
+        .backend = .native,
+        .memory_budget_mb = 4096,
+    }));
+    try std.testing.expectError(error.A4bUnsupportedModelKind, validatedWarmModelA4bRequest(.{
+        .kind = .embedder,
+        .name = "embedder",
+        .residency_mode = .streamed,
+    }));
+}
 
 fn warmModelTaskDir(kind: WarmModelKind) []const u8 {
     return switch (kind) {
@@ -2596,6 +2941,35 @@ fn classifyExtractionResolutionFailure(err: anyerror) ExtractionResolutionFailur
     };
 }
 
+fn compatibilityBackendsForSessionManager(
+    session_manager: *const backends_mod.SessionManager,
+    required_scratch: *[1]backends_mod.BackendType,
+) ![]const backends_mod.BackendType {
+    return session_manager.requiredBackendCandidates(
+        session_manager.preferred_backends,
+        required_scratch,
+    );
+}
+
+test "compatibility backend candidates honor required policy" {
+    var session_manager = backends_mod.SessionManager.init(std.testing.allocator);
+    session_manager.preferred_backends = &.{ .native, .cuda };
+    session_manager.required_backend = .cuda;
+    session_manager.required_backend_invalid = false;
+    var required_scratch: [1]backends_mod.BackendType = undefined;
+    try std.testing.expectEqualSlices(
+        backends_mod.BackendType,
+        &.{.cuda},
+        try compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+
+    session_manager.required_backend = .pjrt;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+}
+
 pub const Node = struct {
     config: NodeConfig,
     allocator: std.mem.Allocator,
@@ -2713,6 +3087,7 @@ pub const Node = struct {
         try config.kernel_jit.validate();
         try config.prompt_cache.validate();
         var session_manager = backends_mod.SessionManager.init(allocator);
+        try session_manager.validateRequiredBackendPolicy();
         session_manager.kernel_jit = config.kernel_jit;
         try graph_mod.kernel_jit.validateMetalProfileBackend(
             backends_mod.BackendType.metal.available(),
@@ -2872,6 +3247,11 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !CompatibilitySummary {
+        var required_backend_scratch: [1]backends_mod.BackendType = undefined;
+        const compatibility_backends = try compatibilityBackendsForSessionManager(
+            &self.session_manager,
+            &required_backend_scratch,
+        );
         var io_impl: ?std.Io.Threaded = null;
         defer if (io_impl) |*threaded| threaded.deinit();
         const io = self.session_manager.io orelse blk: {
@@ -2930,7 +3310,7 @@ pub const Node = struct {
                 allocator,
                 model_path,
                 &man,
-                self.session_manager.preferred_backends,
+                compatibility_backends,
             );
 
             var verification_manifest = try manifest_mod.loadListingFromDir(
@@ -3208,7 +3588,7 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false, null);
     }
 
     pub fn generateMessagesDirect(
@@ -3217,7 +3597,7 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, false, null, false, null);
     }
 
     pub fn beginDirectGenerateAdmission(
@@ -3293,6 +3673,7 @@ pub const Node = struct {
             false,
             null,
             false,
+            null,
         );
     }
 
@@ -3351,6 +3732,7 @@ pub const Node = struct {
         cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
         pin_after_success: bool,
+        a4b_request: ?ops.A4bInferenceRequest,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const preflight = try directGeneratePreflightForMessages(messages);
@@ -3365,6 +3747,7 @@ pub const Node = struct {
             cache_default_alias,
             timing,
             pin_after_success,
+            a4b_request,
         );
     }
 
@@ -3378,6 +3761,7 @@ pub const Node = struct {
         cache_default_alias: bool,
         timing: ?*DirectGenerateTiming,
         pin_after_success: bool,
+        a4b_request: ?ops.A4bInferenceRequest,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
         const admitted_node = admission.node orelse return error.InvalidGenerationAdmission;
@@ -3396,7 +3780,17 @@ pub const Node = struct {
         };
         defer self.allocator.free(model_path);
         const resolved_at_ns = embedTimingNowNs();
-        var model_handle = if (preferred_backends) |backends|
+        var model_handle = if (a4b_request) |request|
+            if (preferred_backends) |backends|
+                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
+                    model_path,
+                    backends,
+                    cache_default_alias,
+                    request,
+                )
+            else
+                try self.model_manager.acquireFromDirWithA4bRequest(model_path, request)
+        else if (preferred_backends) |backends|
             try self.model_manager.acquireFromDirWithPreferredBackends(model_path, backends, cache_default_alias)
         else
             try self.model_manager.acquireFromDir(model_path);
@@ -3660,9 +4054,10 @@ pub const Node = struct {
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        const a4b_request = try validatedWarmModelA4bRequest(model);
         const materialize_optional_sessions = kernelJitMaterializesOptionalSessions(self.config.kernel_jit.mode);
         switch (model.kind) {
-            .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend),
+            .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend, a4b_request),
             .embedder => try self.warmEmbedder(allocator, model.name, model.backend, materialize_optional_sessions),
             .reranker => try self.warmReranker(allocator, model.name, model.backend),
             .chunker, .classifier, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model),
@@ -3677,7 +4072,18 @@ pub const Node = struct {
         defer io_impl.deinit();
         const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
         defer self.allocator.free(model_path);
-        var loaded_handle = if (model.backend) |backend|
+        const a4b_request = model.a4bRequest();
+        var loaded_handle = if (a4b_request) |request|
+            if (model.backend) |backend|
+                try self.model_manager.acquireFromDirWithPreferredBackendsAndA4bRequest(
+                    model_path,
+                    singleBackendPreference(backend),
+                    true,
+                    request,
+                )
+            else
+                try self.model_manager.acquireFromDirWithA4bRequest(model_path, request)
+        else if (model.backend) |backend|
             try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), true)
         else
             try self.model_manager.acquireFromDir(model_path);
@@ -3693,10 +4099,16 @@ pub const Node = struct {
     }
 
     pub fn warmGenerator(self: *Node, allocator: std.mem.Allocator, model_name: []const u8) !void {
-        try self.warmGeneratorWithBackend(allocator, model_name, null);
+        try self.warmGeneratorWithBackend(allocator, model_name, null, null);
     }
 
-    fn warmGeneratorWithBackend(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
+    fn warmGeneratorWithBackend(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        backend: ?backends_mod.BackendType,
+        a4b_request: ?ops.A4bInferenceRequest,
+    ) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference generator model={s}", .{model_name});
@@ -3706,7 +4118,17 @@ pub const Node = struct {
             .content = "ping",
         }};
         var timing = DirectGenerateTiming{};
-        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, true, &timing, true);
+        const text = try self.generateMessagesDirectMaxTokens(
+            allocator,
+            model_name,
+            &messages,
+            1,
+            preferred_backends,
+            true,
+            &timing,
+            true,
+            a4b_request,
+        );
         defer allocator.free(text);
         const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
         std.log.info(
@@ -5986,7 +6408,10 @@ pub const Node = struct {
             self.config.allow_unknown_models,
         )) |response|
             return response;
-        const allow_onnx = effective_draft_model_name == null and
+        const required_policy_allows_onnx = self.session_manager.allowsDirectBackend(.onnx) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        const allow_onnx = required_policy_allows_onnx and
+            effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
             (body.backend == null or backend_selection.native_choice == .onnx);
 
@@ -6080,6 +6505,7 @@ pub const Node = struct {
                     ctx,
                     body.model,
                     &pipeline,
+                    null,
                     messages.items,
                     config,
                     if (tool_parser) |*parser| parser else null,
@@ -6125,6 +6551,7 @@ pub const Node = struct {
                 ctx,
                 body.model,
                 response_text,
+                result.reasoning_text,
                 if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
                 result.prompt_tokens,
                 result.tokens_used,
@@ -6218,6 +6645,7 @@ pub const Node = struct {
                         ctx,
                         body.model,
                         &pipeline,
+                        null,
                         messages.items,
                         config,
                         if (tool_parser) |*parser| parser else null,
@@ -6263,6 +6691,7 @@ pub const Node = struct {
                     ctx,
                     body.model,
                     response_text,
+                    result.reasoning_text,
                     if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
                     result.prompt_tokens,
                     result.tokens_used,
@@ -6320,6 +6749,10 @@ pub const Node = struct {
             .metal
         else
             backend_selection.compiled_partition_backend;
+        native_backend_choice.validateRequiredCompiledBackend(
+            &self.session_manager,
+            effective_compiled_partition_backend,
+        ) catch |err| return modelLoadFailureResponse(ctx, err);
         const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
             .whole_model
         else
@@ -6878,6 +7311,7 @@ pub const Node = struct {
                 ctx,
                 body.model,
                 &pipeline,
+                &pipeline.cb,
                 messages.items,
                 config,
                 if (tool_parser) |*parser| parser else null,
@@ -6885,6 +7319,8 @@ pub const Node = struct {
             );
         }
 
+        const server_a4b_telemetry_before = serverA4bTelemetrySnapshot(&pipeline.cb);
+        defer logServerA4bTelemetry(&pipeline.cb, server_a4b_telemetry_before, body.model);
         var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err| {
             if (err == error.MemoryBudgetExceeded)
                 return generationMemoryBudgetResponse(ctx, model.session, &run_budget);
@@ -6931,6 +7367,7 @@ pub const Node = struct {
             ctx,
             body.model,
             response_text,
+            result.reasoning_text,
             if (parsed_tool_calls != null) "tool_calls" else result.finish_reason,
             result.prompt_tokens,
             result.tokens_used,
@@ -7286,6 +7723,7 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_name: []const u8,
         response_text: []const u8,
+        reasoning_text: ?[]const u8,
         finish_reason: []const u8,
         prompt_tokens: usize,
         completion_tokens: usize,
@@ -7296,7 +7734,11 @@ pub const Node = struct {
         const choices = try allocator.alloc(api.GenerateChoice, 1);
         choices[0] = .{
             .index = 0,
-            .message = .{ .role = .assistant, .content = content },
+            .message = .{
+                .role = .assistant,
+                .content = content,
+                .reasoning_content = if (reasoning_text) |reasoning| try allocator.dupe(u8, reasoning) else null,
+            },
             .finish_reason = parseFinishReason(finish_reason),
         };
         return .{
@@ -7311,6 +7753,7 @@ pub const Node = struct {
 
     const BatchGenerateTaskResult = struct {
         text: ?[]const u8 = null,
+        reasoning_text: ?[]const u8 = null,
         finish_reason: []const u8 = "length",
         prompt_tokens: usize = 0,
         completion_tokens: usize = 0,
@@ -7330,6 +7773,7 @@ pub const Node = struct {
                 allocator,
                 model_name,
                 text,
+                task_result.reasoning_text,
                 task_result.finish_reason,
                 task_result.prompt_tokens,
                 task_result.completion_tokens,
@@ -7410,6 +7854,10 @@ pub const Node = struct {
             formatted_response_text = try coerceGenerateResponseFormat(self.allocator, self.response_format, response_text);
             if (formatted_response_text) |text| response_text = text;
             self.out.text = try self.allocator.dupe(u8, response_text);
+            self.out.reasoning_text = if (result.reasoning_text) |reasoning|
+                try self.allocator.dupe(u8, reasoning)
+            else
+                null;
             self.out.finish_reason = result.finish_reason;
             self.out.prompt_tokens = result.prompt_tokens;
             self.out.completion_tokens = result.tokens_used;
@@ -8287,6 +8735,7 @@ pub const Node = struct {
             stream_created,
             model_name,
             result.text,
+            result.reasoning_text,
             result.finish_reason,
             tool_parser,
             result.speculative,
@@ -8440,6 +8889,7 @@ pub const Node = struct {
         ctx: *httpx.Context,
         model_name: []const u8,
         response_text: []const u8,
+        reasoning_text: ?[]const u8,
         finish_reason: []const u8,
         prompt_tokens: usize,
         completion_tokens: usize,
@@ -8455,7 +8905,10 @@ pub const Node = struct {
         const completion_id = try allocCompletionId(alloc);
         const created = completionCreatedTimestamp();
 
-        var message: api.GenerateMessage = .{ .role = .assistant };
+        var message: api.GenerateMessage = .{
+            .role = .assistant,
+            .reasoning_content = reasoning_text,
+        };
         if (tool_calls) |calls| {
             if (calls.len == 0) {
                 message.content = response_text;
@@ -8544,11 +8997,14 @@ pub const Node = struct {
         ctx: *httpx.Context,
         model_name: []const u8,
         pipeline: anytype,
+        telemetry_cb: ?*const ops.ComputeBackend,
         messages: []const @import("../pipelines/generation.zig").Message,
         config: @import("../pipelines/generation.zig").GenerationConfig,
         tool_parser: ?*tool_parser_mod.Parser,
         include_usage: bool,
     ) !httpx.Response {
+        const server_a4b_telemetry_before = serverA4bTelemetrySnapshot(telemetry_cb);
+        defer logServerA4bTelemetry(telemetry_cb, server_a4b_telemetry_before, model_name);
         var writer = ctx.streamResponse(200) catch |err| {
             std.debug.print("streamResponse failed: {}\n", .{err});
             return ctx.status(500).json(.{ .@"error" = "STREAM_INIT_FAILED", .message = internalErrorMessage("STREAM_INIT_FAILED", err) });
@@ -8566,6 +9022,7 @@ pub const Node = struct {
             allocator: std.mem.Allocator,
             parser: ?*tool_parser_mod.Parser,
             request_context: *const httpx.Context,
+            defer_content: bool,
             errored: bool = false,
 
             fn shouldContinue(raw_ctx: *anyopaque) bool {
@@ -8575,6 +9032,11 @@ pub const Node = struct {
 
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
+                // Reasoning is projected only once generation completes. For
+                // channel-aware thinking requests, retain protocol order by
+                // emitting the buffered reasoning before the completed public
+                // content below.
+                if (stream.defer_content) return true;
                 if (stream.parser) |parser| {
                     const update = parser.feed(token_text) catch {
                         stream.errored = true;
@@ -8619,6 +9081,7 @@ pub const Node = struct {
             .allocator = ctx.allocator,
             .parser = tool_parser,
             .request_context = ctx,
+            .defer_content = shouldDeferStreamContentForReasoning(pipeline, config),
         };
 
         if (comptime @hasField(@TypeOf(pipeline.*), "continue_ctx") and
@@ -8696,18 +9159,51 @@ pub const Node = struct {
         );
         recordSpeculationOutcome(&self.metrics, speculative);
 
-        if (tool_parser != null) {
-            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
+        if (stream_ctx.defer_content) {
+            writeStreamCompletion(
+                ctx.allocator,
+                &writer,
+                stream_id,
+                stream_created,
+                model_name,
+                result.text,
+                result.reasoning_text,
+                result.finish_reason,
+                tool_parser,
+                speculative,
+            ) catch |err| {
                 writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
         } else {
-            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
-                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
-                writer.close() catch {};
-                return ctx.response.build();
-            };
+            if (result.reasoning_text) |reasoning| {
+                if (reasoning.len > 0) emitReasoningDelta(
+                    &writer,
+                    ctx.allocator,
+                    stream_id,
+                    stream_created,
+                    model_name,
+                    reasoning,
+                ) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            }
+            if (tool_parser != null) {
+                flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            } else {
+                emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            }
         }
 
         emitTerminalUsageOrDone(
@@ -8737,10 +9233,14 @@ pub const Node = struct {
         stream_created: i64,
         model_name: []const u8,
         full_text: []const u8,
+        reasoning_text: ?[]const u8,
         default_finish_reason: []const u8,
         tool_parser: ?*tool_parser_mod.Parser,
         speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
+        if (reasoning_text) |reasoning| {
+            if (reasoning.len > 0) try emitReasoningDelta(writer, allocator, stream_id, stream_created, model_name, reasoning);
+        }
         if (tool_parser) |parser| {
             parser.reset();
             _ = try parser.feed(full_text);
@@ -8837,6 +9337,27 @@ pub const Node = struct {
         const choices = [_]api.GenerateChunkChoice{.{
             .index = 0,
             .delta = .{ .content = token_text },
+        }};
+        try writeGenerateChunkEvent(writer, allocator, .{
+            .id = stream_id,
+            .object = "chat.completion.chunk",
+            .created = stream_created,
+            .model = model_name,
+            .choices = &choices,
+        });
+    }
+
+    fn emitReasoningDelta(
+        writer: *httpx.Context.StreamWriter,
+        allocator: std.mem.Allocator,
+        stream_id: []const u8,
+        stream_created: i64,
+        model_name: []const u8,
+        reasoning_text: []const u8,
+    ) !void {
+        const choices = [_]api.GenerateChunkChoice{.{
+            .index = 0,
+            .delta = .{ .reasoning_content = reasoning_text },
         }};
         try writeGenerateChunkEvent(writer, allocator, .{
             .id = stream_id,
@@ -10904,7 +11425,11 @@ pub const Node = struct {
 
     fn readyzHandler(self: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
         const snapshot = self.readiness_inventory.load();
-        const is_ready = snapshot.initialized and snapshot.counts.total() > 0;
+        const required_backend_ready = blk: {
+            self.session_manager.validateRequiredBackendPolicy() catch break :blk false;
+            break :blk true;
+        };
+        const is_ready = required_backend_ready and snapshot.initialized and snapshot.counts.total() > 0;
         const status_text = if (is_ready) "ready" else "not_ready";
         const status_code: u16 = if (is_ready) 200 else 503;
         return ctx.status(status_code).json(.{
@@ -15220,6 +15745,19 @@ test "readyz serves only the published inventory snapshot" {
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"ready\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"generators\":2") != null);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"embedders\":1") != null);
+    }
+
+    node.session_manager.required_backend_invalid = true;
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/readyz");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.readyzHandler(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"not_ready\"") != null);
     }
 }
 

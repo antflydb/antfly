@@ -12817,6 +12817,7 @@ fn searchDenseInternal(
                 @as(usize, @intCast(bounded_full_candidate_count))
             else
                 null,
+            .search_effort = effort,
             .search_width = resolved_search_width,
             .epsilon = resolved_epsilon,
             .rerank_factor = resolveRerankFactor(effort),

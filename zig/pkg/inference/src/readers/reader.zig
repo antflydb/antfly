@@ -244,14 +244,16 @@ pub const LoadedReader = union(enum) {
 
         const parser_kind = try detectParserKind(allocator, model_path);
         if (parser_kind == .moondream) {
-            if (onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path)) {
-                return .{ .vlm = try VlmLoadedReader.loadFromDir(allocator, model_path) };
-            }
-            if (build_options.enable_onnx) {
-                if (GenAiLoadedReader.loadFromDir(allocator, model_path)) |reader| {
-                    return .{ .genai = reader };
-                } else |err| {
-                    std.log.warn("ortgenai moondream reader load failed for {s}: {s}", .{ model_path, @errorName(err) });
+            if (try session_manager.allowsDirectBackend(.onnx)) {
+                if (onnx_decoder_only_vlm.isSupportedModelDir(allocator, model_path)) {
+                    return .{ .vlm = try VlmLoadedReader.loadFromDir(allocator, model_path) };
+                }
+                if (build_options.enable_onnx) {
+                    if (GenAiLoadedReader.loadFromDir(allocator, model_path)) |reader| {
+                        return .{ .genai = reader };
+                    } else |err| {
+                        std.log.warn("ortgenai moondream reader load failed for {s}: {s}", .{ model_path, @errorName(err) });
+                    }
                 }
             }
         }
