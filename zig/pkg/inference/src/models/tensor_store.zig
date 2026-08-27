@@ -494,6 +494,7 @@ fn ggufGetTensor(self: *GgufStore, name: []const u8) !weight_source_mod.LoadedWe
             .source_name = storage_source_name,
             .raw_owned = false,
             .raw_mmap_backed = self.mmap_region != null,
+            .raw_mmap_source_bytes = if (self.mmap_region != null) self.rawData() else null,
             .allocator = self.allocator,
         };
     } else null;
@@ -571,6 +572,7 @@ fn ggufGetQuantizedStorageRef(self: *GgufStore, tensor_ref: *const LazyTensorRef
         .source_name = try self.allocator.dupe(u8, source_name),
         .raw_owned = false,
         .raw_mmap_backed = self.mmap_region != null,
+        .raw_mmap_source_bytes = if (self.mmap_region != null) self.rawData() else null,
         .allocator = self.allocator,
     };
 }
@@ -619,6 +621,7 @@ fn ggufGetPackedExpertTensor(
             },
             .raw_owned = false,
             .raw_mmap_backed = self.mmap_region != null,
+            .raw_mmap_source_bytes = if (self.mmap_region != null) self.rawData() else null,
             .allocator = self.allocator,
         };
         errdefer {
@@ -706,6 +709,7 @@ fn ggufGetPackedExpertQuantizedStorage(
         },
         .raw_owned = false,
         .raw_mmap_backed = self.mmap_region != null,
+        .raw_mmap_source_bytes = if (self.mmap_region != null) self.rawData() else null,
         .allocator = self.allocator,
     };
 }
@@ -749,6 +753,7 @@ fn ggufGetPackedMoeQuantizedStorage(
         },
         .raw_owned = false,
         .raw_mmap_backed = self.mmap_region != null,
+        .raw_mmap_source_bytes = if (self.mmap_region != null) self.rawData() else null,
         .allocator = self.allocator,
     };
 }

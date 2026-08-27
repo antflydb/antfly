@@ -9,7 +9,7 @@ no authority to enable, promote, or default a kernel.
 ## Reviewed suite
 
 The versioned
-`scripts/fixtures/gemma4_cuda_quality_suite_v1.json` suite contains four
+`scripts/gemma4/fixtures/gemma4_cuda_quality_suite_v1.json` suite contains four
 different 2,051-token prompts. Every prompt locks the rendered UTF-8 byte
 count, rendered SHA-256, prompt-token count, and canonical prompt-token-ID
 SHA-256. Token IDs use the embedded Gemma 4 GGUF BPE with BOS insertion and
@@ -59,7 +59,7 @@ Use an empty output path outside the repository so evidence creation cannot
 change the source snapshot being measured:
 
 ```sh
-python3 zig/pkg/inference/scripts/validate_gemma4_cuda_quality_candidate.py \
+python3 zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_quality_candidate.py \
   --kernel-id <catalog-kernel-id> \
   --model .models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
   --output-dir /tmp/gemma4-cuda-quality-exact-v1
@@ -96,7 +96,7 @@ token and decoded-text policy.
 For a diagnostic collection only:
 
 ```sh
-python3 zig/pkg/inference/scripts/validate_gemma4_cuda_quality_candidate.py \
+python3 zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_quality_candidate.py \
   --kernel-id <catalog-kernel-id> \
   --model .models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
   --threshold-profile bounded-freeform-v1 \

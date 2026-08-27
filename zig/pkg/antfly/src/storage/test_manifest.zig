@@ -83,6 +83,7 @@ comptime {
     _ = @import("db/graph_runtime.zig");
     _ = @import("db/lease.zig");
     _ = @import("db/maintenance/graph_metric_runtime.zig");
+    _ = @import("db/maintenance/sparse_compaction_runtime.zig");
     _ = @import("db/maintenance/transaction_runtime.zig");
     _ = @import("db/maintenance/ttl_runtime.zig");
     _ = @import("db/mod.zig");

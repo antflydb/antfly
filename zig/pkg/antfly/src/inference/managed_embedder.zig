@@ -403,6 +403,7 @@ pub const ManagedEmbeddingEntry = struct {
     model: []u8,
     base_url: []u8,
     region: []u8 = "",
+    bedrock_request_format: bedrock_provider.RequestFormat = .auto,
     input_type: []u8 = "",
     truncate: []u8 = "",
     bedrock_credentials: bedrock_provider.CredentialCache = .{},
@@ -513,6 +514,7 @@ fn managedEmbeddingEntriesEquivalentForLookup(
         std.mem.eql(u8, lhs.model, rhs.model) and
         std.mem.eql(u8, lhs.base_url, rhs.base_url) and
         std.mem.eql(u8, lhs.region, rhs.region) and
+        lhs.bedrock_request_format == rhs.bedrock_request_format and
         std.mem.eql(u8, lhs.input_type, rhs.input_type) and
         std.mem.eql(u8, lhs.truncate, rhs.truncate);
 }
@@ -1214,7 +1216,9 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
     const sparse = cfg.sparse orelse false;
     const external = cfg.external orelse false;
+    const publication_policy = cfg.publication_policy orelse .progressive;
     if (external and cfg.coverage_policy != null) return error.InvalidCreateTableRequest;
+    if (external and cfg.publication_policy != null) return error.InvalidCreateTableRequest;
 
     if (root.get("summarizer") != null) return error.UnsupportedCreateTableRequest;
 
@@ -1276,6 +1280,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
 
         try out.appendSlice(alloc, "{\"field\":");
         try appendJsonString(alloc, &out, source_field);
+        try appendPublicationPolicy(alloc, &out, publication_policy);
         try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
         if (cfg.top_k) |top_k| {
             try out.appendSlice(alloc, ",\"top_k\":");
@@ -1351,6 +1356,7 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try appendJsonString(alloc, &out, metric);
     try out.appendSlice(alloc, ",\"embedding_name\":");
     try appendJsonString(alloc, &out, artifact_embedding_name orelse index_name);
+    if (!external) try appendPublicationPolicy(alloc, &out, publication_policy);
     try appendCoveragePolicyIfPresent(alloc, &out, cfg.coverage_policy);
 
     if (artifact_embedding_name != null) {
@@ -1592,6 +1598,13 @@ fn buildManagedEmbeddingEntry(
 
     const provider = try parseEmbedderProvider(embedder_cfg);
     if (embedder_cfg.model.len == 0 and provider != .antfly) return error.InvalidManagedEmbeddingIndex;
+    const bedrock_request_format = if (provider == .bedrock)
+        try bedrock_provider.resolveRequestFormat(
+            embedder_cfg.model,
+            try bedrock_provider.parseRequestFormat(embedder_cfg.request_format),
+        )
+    else
+        bedrock_provider.RequestFormat.auto;
     const requests_per_minute = try resolveEmbedderRequestsPerMinute(embedder, provider);
     const burst = try resolveEmbedderBurst(embedder, provider);
     const antfly_provider = if (isAntflyProvider(provider) and shouldUseAntflyProvider(embedder_cfg, options))
@@ -1644,6 +1657,7 @@ fn buildManagedEmbeddingEntry(
         .model = owned_model,
         .base_url = base_url,
         .region = bedrock_region,
+        .bedrock_request_format = bedrock_request_format,
         .input_type = input_type,
         .truncate = truncate,
         .api_key = api_key,
@@ -2200,6 +2214,7 @@ fn embedWithEntryParts(
         var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
             .region = entry.region,
             .endpoint = entry.base_url,
+            .request_format = entry.bedrock_request_format,
             .input_type = entry.input_type,
             .truncate = entry.truncate,
             .dimension = dims,
@@ -2540,7 +2555,7 @@ fn embedBatchWithBedrock(
     texts: []const []const u8,
     dims: u32,
 ) ![]const []const f32 {
-    const max_batch = bedrock_provider.maxBatchSize(entry.model);
+    const max_batch = bedrock_provider.maxBatchSizeForFormat(entry.bedrock_request_format);
     var out = std.ArrayListUnmanaged([]const f32).empty;
     errdefer {
         for (out.items) |vector| alloc.free(vector);
@@ -2572,6 +2587,7 @@ fn embedBatchWithBedrockRequest(
     var provider = bedrock_provider.Provider.initWithCredentialCache(alloc, &http, .{
         .region = entry.region,
         .endpoint = entry.base_url,
+        .request_format = entry.bedrock_request_format,
         .input_type = entry.input_type,
         .truncate = entry.truncate,
         .dimension = dims,
@@ -2737,6 +2753,15 @@ fn appendCoveragePolicyIfPresent(
     const value = policy orelse return;
     try out.appendSlice(alloc, ",\"coverage_policy\":");
     try appendJsonString(alloc, out, @tagName(value));
+}
+
+fn appendPublicationPolicy(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    policy: indexes_openapi.IndexPublicationPolicy,
+) !void {
+    try out.appendSlice(alloc, ",\"publication_policy\":");
+    try appendJsonString(alloc, out, @tagName(policy));
 }
 
 fn appendExecutionObjectIfPresent(
@@ -2995,9 +3020,22 @@ test "managed embedder translates managed embeddings config into db generator co
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"field\":\"body\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"dims\":384") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding_name\":\"semantic_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"publication_policy\":\"progressive\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"generator\":{\"kind\":\"dense_embedding\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"execution\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"embedding\":{\"batch_items\":16,\"batch_bytes\":262144}") != null);
+}
+
+test "managed embedder preserves atomic publication policy" {
+    var local = TestLocalDenseProvider{ .dimensions = 3 };
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"type":"embeddings","publication_policy":"atomic","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
+    , .{});
+    defer parsed.deinit();
+
+    const config_json = try translateEmbeddingsIndexConfigJsonWithOptions(std.testing.allocator, "semantic_idx", parsed.value, .{ .antfly_provider = local.provider() });
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"publication_policy\":\"atomic\"") != null);
 }
 
 test "managed embedder rejects invalid execution batch policy" {
@@ -4275,6 +4313,29 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     try std.testing.expectError(error.InvalidEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3));
 
     try std.testing.expectError(error.EmptyEmbeddingResponse, embedWithEntryParts(std.testing.allocator, &managed.entries[0], &.{}, 3));
+}
+
+pub fn testBedrockRequestFormatConfiguration() !void {
+    const alloc = std.testing.allocator;
+
+    var system_profile = try ManagedEmbedder.initFromIndexesJson(alloc,
+        \\{"bedrock_idx":{"type":"embeddings","field":"body","dimension":1024,"embedder":{"provider":"bedrock","model":"us.amazon.titan-embed-image-v1:0","region":"us-east-1"}}}
+    );
+    defer system_profile.deinit();
+    try std.testing.expectEqual(bedrock_provider.RequestFormat.titan_multimodal, system_profile.entries[0].bedrock_request_format);
+
+    var application_profile = try ManagedEmbedder.initFromIndexesJson(alloc,
+        \\{"bedrock_idx":{"type":"embeddings","field":"body","dimension":1024,"embedder":{"provider":"bedrock","model":"arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings","request_format":"titan_multimodal","region":"us-east-1"}}}
+    );
+    defer application_profile.deinit();
+    try std.testing.expectEqual(bedrock_provider.RequestFormat.titan_multimodal, application_profile.entries[0].bedrock_request_format);
+
+    try std.testing.expectError(
+        error.BedrockRequestFormatRequired,
+        ManagedEmbedder.initFromIndexesJson(alloc,
+            \\{"bedrock_idx":{"type":"embeddings","field":"body","dimension":1024,"embedder":{"provider":"bedrock","model":"arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings","region":"us-east-1"}}}
+        ),
+    );
 }
 
 test "managed embedder preserves antfly api_url path for shared antfly endpoint" {

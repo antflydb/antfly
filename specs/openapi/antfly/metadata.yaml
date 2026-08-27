@@ -1209,7 +1209,10 @@ tags:
       1. **Embedding API Unavailable**
          - Enrichment retries automatically when service recovers
          - Documents remain indexed (without embeddings) for full-text search
-         - Use `sync_level: enrichments` for synchronous embedding (fails write if embedding fails)
+         - Use `sync_level: enrichments` to precompute enrichments before committing.
+           A synchronous producer failure rejects the write. Failures detected after a
+           document has committed retain it and may report `committed_repair_required` so
+           operators can repair the derived state.
 
       2. **Rate Limiting**
          - Automatic backoff and retry
@@ -3387,7 +3390,9 @@ components:
         - "propose": Wait for Raft proposal acceptance (fastest, default)
         - "write": Wait for Pebble KV write
         - "full_text": Wait for full-text index WAL write
-        - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
+        - "enrichments": Precompute enrichments before committing the document. A synchronous
+          producer failure rejects the write; post-commit worker failures retain the document
+          and may return `committed_repair_required`.
         - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     ShardConfig: # Simplified from common.ShardInfo for brevity
       type: object
@@ -9688,6 +9693,7 @@ paths:
         admission and drains current readers and writers before swapping the
         direct-path generation.
       operationId: restore
+      x-antfly-credential-note: Durable CDC and graph destinations require Basic or API-key authentication.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -9722,6 +9728,12 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "409":
           $ref: "#/components/responses/Conflict"
+        "422":
+          description: The selected backup contains durable destinations that cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
         "500":
@@ -10258,6 +10270,7 @@ paths:
       tags:
         - table_management
       operationId: createTable
+      x-antfly-credential-note: Durable CDC and graph destinations require Basic or API-key authentication.
       requestBody:
         required: true
         content:
@@ -10273,6 +10286,12 @@ paths:
                 $ref: "#/components/schemas/Table"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "422":
+          description: Durable destinations cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     delete:
       summary: Drop a table
       tags:
@@ -10528,6 +10547,7 @@ paths:
       tags:
         - data_operations
       operationId: restoreTable
+      x-antfly-credential-note: Durable CDC and graph destinations require Basic or API-key authentication.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -10562,8 +10582,72 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "409":
           $ref: "#/components/responses/Conflict"
+        "422":
+          description: The backup contains durable destinations that cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/destination-authorization:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table whose stored destinations should be adopted
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Adopt stored write destinations with the current credential
+      description: |
+        Reauthorizes the table's existing CDC routes and graph resolver destinations
+        using the caller's current permissions. This idempotent operation is intended
+        for upgrading tables created before durable destination authorization was
+        introduced, and for explicitly transferring destination ownership after a
+        credential is rotated. The caller needs admin permission on the source table
+        and write permission on every eventual destination table.
+      tags:
+        - table_management
+      operationId: reauthorizeTableDestinations
+      responses:
+        "200":
+          description: Destination authorization was durably adopted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - table
+                  - status
+                properties:
+                  table:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - authorized
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Caller lacks authority on the source or a destination table
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          description: Durable destinations cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/schema:
@@ -11491,6 +11575,7 @@ paths:
       tags:
         - index_management
       operationId: createIndex
+      x-antfly-credential-note: Graph resolver destinations require Basic or API-key authentication.
       requestBody:
         required: true
         content:
@@ -11512,6 +11597,12 @@ paths:
           $ref: "#/components/responses/MethodNotAllowed"
         "409":
           $ref: "#/components/responses/Conflict"
+        "422":
+          description: Graph resolver destinations cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "429":
           $ref: "#/components/responses/StorageResourceExhausted"
         "503":

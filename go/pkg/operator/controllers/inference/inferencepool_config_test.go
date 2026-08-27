@@ -78,9 +78,39 @@ func TestGenerateCompleteConfigBuildsEagerPreloadArtifactSelection(t *testing.T)
 	g.Expect(json.Unmarshal([]byte(raw), &config)).To(Succeed())
 	g.Expect(config.Preload).To(HaveLen(1))
 	g.Expect(config.Preload[0]).To(HaveKeyWithValue("kind", "generator"))
+	g.Expect(config.Preload[0]).To(HaveKeyWithValue("name", "owner/model:gguf:Q4_K"))
 	g.Expect(config.Preload[0]).NotTo(HaveKey("backend"))
 	g.Expect(config.Preload[0]).To(HaveKeyWithValue("format", "gguf"))
 	g.Expect(config.Preload[0]).To(HaveKeyWithValue("quantization", "Q4_K"))
+}
+
+func TestGenerateCompleteConfigPreservesExplicitRuntimeOverrides(t *testing.T) {
+	g := NewWithT(t)
+	pool := &antflyaiv1alpha1.InferencePool{
+		Spec: antflyaiv1alpha1.InferencePoolSpec{
+			Config: `{"models_dir":"/custom-models","preload":[{"kind":"embedder","name":"custom/model:i8","backend":"cuda"}]}`,
+			Models: antflyaiv1alpha1.ModelConfig{
+				Preload: []antflyaiv1alpha1.ModelSpec{
+					{Name: "hf:owner/model:i8", Tasks: []string{"embed"}},
+				},
+				LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
+			},
+		},
+	}
+
+	raw, err := (&InferencePoolReconciler{}).generateCompleteConfig(pool)
+	g.Expect(err).NotTo(HaveOccurred())
+	var config map[string]any
+	g.Expect(json.Unmarshal([]byte(raw), &config)).To(Succeed())
+	g.Expect(config).To(HaveKeyWithValue("models_dir", "/custom-models"))
+	preload, ok := config["preload"].([]any)
+	g.Expect(ok).To(BeTrue())
+	g.Expect(preload).To(HaveLen(1))
+	g.Expect(preload[0]).To(Equal(map[string]any{
+		"kind":    "embedder",
+		"name":    "custom/model:i8",
+		"backend": "cuda",
+	}))
 }
 
 func TestGenerateCompleteConfigPreservesLazyAcceleratorStrategy(t *testing.T) {
@@ -158,4 +188,12 @@ func TestZigWarmModelKindUsesRegistryTaskPrecedence(t *testing.T) {
 	g.Expect(zigWarmModelKind([]string{"embed"})).To(Equal("embedder"))
 	g.Expect(zigWarmModelKind([]string{"generate", "rerank"})).To(Equal("reranker"))
 	g.Expect(zigWarmModelKind(nil)).To(Equal("generator"))
+}
+
+func TestInferenceWarmModelNamePreservesVariant(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(inferenceWarmModelName("BAAI/bge-small-en-v1.5:i8")).To(Equal("BAAI/bge-small-en-v1.5:i8"))
+	g.Expect(inferenceWarmModelName("hf:owner/model:i8")).To(Equal("owner/model:i8"))
+	g.Expect(inferenceWarmModelName("owner/model")).To(Equal("owner/model"))
+	g.Expect(inferenceWarmModelName("s3://bucket/model")).To(Equal("s3://bucket/model"))
 }

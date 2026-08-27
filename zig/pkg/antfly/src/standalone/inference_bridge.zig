@@ -20,7 +20,7 @@ const error_abi = @import("../runtime_error_abi.zig");
 const http_abi = @import("../runtime_http_abi.zig");
 const native_abi = @import("../runtime_native_abi.zig");
 
-pub const abi_version: u32 = 16;
+pub const abi_version: u32 = 17;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -57,12 +57,20 @@ pub const OptionalString = extern struct {
     }
 };
 
+pub const A4bResidencyMode = enum(u8) {
+    auto = 0,
+    resident = 1,
+    streamed = 2,
+};
+
 pub const WarmModel = extern struct {
     kind: String,
     name: String,
     backend: OptionalString = .{},
     format: OptionalString = .{},
     quantization: OptionalString = .{},
+    residency_mode: A4bResidencyMode = .auto,
+    memory_budget_mb: u32 = 0,
 };
 
 pub const ProcessMemoryLimitProvenance = enum(u8) {

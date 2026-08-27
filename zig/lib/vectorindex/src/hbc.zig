@@ -188,11 +188,14 @@ pub const NodeHeader = struct {
     pub const encoded_size = 11;
 };
 
-pub const packed_node_magic = "HBN1";
-pub const packed_node_header_size = 4 + NodeHeader.encoded_size + 4 + 4;
+pub const packed_node_magic_v1 = "HBN1";
+pub const packed_node_magic = "HBN2";
+pub const packed_node_header_size_v1 = 4 + NodeHeader.encoded_size + 4 + 4;
+pub const packed_node_header_size = 4 + NodeHeader.encoded_size + @sizeOf(f32) + 4 + 4;
 
 pub const PackedNodeValue = struct {
     header: NodeHeader,
+    covering_radius: f32,
     centroid_bytes: []const u8,
     ids_bytes: []const u8,
 };
@@ -204,6 +207,7 @@ pub fn packedNodeValueSize(centroid_len: usize, ids_len: usize) usize {
 pub fn encodePackedNodeValue(
     buf: []u8,
     header: NodeHeader,
+    covering_radius: f32,
     centroid_bytes: []const u8,
     ids_bytes: []const u8,
 ) ![]u8 {
@@ -213,6 +217,8 @@ pub fn encodePackedNodeValue(
     var hdr_buf: [NodeHeader.encoded_size]u8 = undefined;
     @memcpy(buf[4..][0..NodeHeader.encoded_size], header.encode(&hdr_buf));
     var pos: usize = 4 + NodeHeader.encoded_size;
+    std.mem.writeInt(u32, buf[pos..][0..4], @bitCast(covering_radius), .little);
+    pos += 4;
     writeU32LE(buf, &pos, @intCast(centroid_bytes.len));
     writeU32LE(buf, &pos, @intCast(ids_bytes.len));
     std.mem.copyForwards(u8, buf[pos..][0..centroid_bytes.len], centroid_bytes);
@@ -223,15 +229,25 @@ pub fn encodePackedNodeValue(
 }
 
 pub fn decodePackedNodeValue(data: []const u8) !PackedNodeValue {
-    if (data.len < packed_node_header_size) return error.Corrupted;
-    if (!std.mem.eql(u8, data[0..4], packed_node_magic)) return error.Corrupted;
+    if (data.len < packed_node_header_size_v1) return error.Corrupted;
+    const is_v2 = std.mem.eql(u8, data[0..4], packed_node_magic);
+    const is_v1 = std.mem.eql(u8, data[0..4], packed_node_magic_v1);
+    if (!is_v1 and !is_v2) return error.Corrupted;
     const header = NodeHeader.decode(data[4..][0..NodeHeader.encoded_size]);
     var pos: usize = 4 + NodeHeader.encoded_size;
+    const covering_radius: f32 = if (is_v2) blk: {
+        if (data.len < packed_node_header_size) return error.Corrupted;
+        const bits = std.mem.readInt(u32, data[pos..][0..4], .little);
+        pos += 4;
+        break :blk @bitCast(bits);
+    } else std.math.nan(f32);
     const centroid_len: usize = @intCast(readU32LE(data, &pos));
     const ids_len: usize = @intCast(readU32LE(data, &pos));
-    if (data.len != packed_node_header_size + centroid_len + ids_len) return error.Corrupted;
+    const header_size: usize = if (is_v2) packed_node_header_size else packed_node_header_size_v1;
+    if (data.len != header_size + centroid_len + ids_len) return error.Corrupted;
     return .{
         .header = header,
+        .covering_radius = covering_radius,
         .centroid_bytes = data[pos..][0..centroid_len],
         .ids_bytes = data[pos + centroid_len ..][0..ids_len],
     };
@@ -257,4 +273,38 @@ fn readU64LE(data: []const u8, pos: *usize) u64 {
     const val = std.mem.readInt(u64, data[pos.*..][0..8], .little);
     pos.* += 8;
     return val;
+}
+
+test "packed node v2 round trips covering radius" {
+    const header = NodeHeader{ .is_leaf = true, .level = 3, .parent = 9 };
+    const centroid = std.mem.sliceAsBytes(&[_]f32{ 1, 2 });
+    const ids = std.mem.sliceAsBytes(&[_]u64{ 7, 8 });
+    var storage: [128]u8 = undefined;
+    const encoded = try encodePackedNodeValue(&storage, header, 4.5, centroid, ids);
+    const decoded = try decodePackedNodeValue(encoded);
+    try std.testing.expectEqual(@as(f32, 4.5), decoded.covering_radius);
+    try std.testing.expectEqualSlices(u8, centroid, decoded.centroid_bytes);
+    try std.testing.expectEqualSlices(u8, ids, decoded.ids_bytes);
+}
+
+test "packed node v1 decodes with unknown covering radius" {
+    const header = NodeHeader{ .is_leaf = false, .level = 1, .parent = 0 };
+    const centroid = std.mem.sliceAsBytes(&[_]f32{1});
+    const ids = std.mem.sliceAsBytes(&[_]u64{2});
+    var storage: [128]u8 = undefined;
+    @memcpy(storage[0..4], packed_node_magic_v1);
+    var header_storage: [NodeHeader.encoded_size]u8 = undefined;
+    @memcpy(storage[4..][0..NodeHeader.encoded_size], header.encode(&header_storage));
+    var pos: usize = 4 + NodeHeader.encoded_size;
+    writeU32LE(&storage, &pos, @intCast(centroid.len));
+    writeU32LE(&storage, &pos, @intCast(ids.len));
+    @memcpy(storage[pos..][0..centroid.len], centroid);
+    pos += centroid.len;
+    @memcpy(storage[pos..][0..ids.len], ids);
+    pos += ids.len;
+
+    const decoded = try decodePackedNodeValue(storage[0..pos]);
+    try std.testing.expect(std.math.isNan(decoded.covering_radius));
+    try std.testing.expectEqualSlices(u8, centroid, decoded.centroid_bytes);
+    try std.testing.expectEqualSlices(u8, ids, decoded.ids_bytes);
 }

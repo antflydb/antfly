@@ -48,6 +48,17 @@ pub const CancellationToken = struct {
     }
 };
 
+/// One scored posting in the flat centroid frontier. This lives in the shared
+/// search types module so SearchScratch can own both the frontier and its merge
+/// workspace without introducing an import cycle with spfresh_index.
+pub const FlatCentroidProbe = struct {
+    posting_id: u64,
+    distance: f32,
+    error_bound: f32,
+    member_lower_bound: f32 = -std.math.inf(f32),
+    bound_resolved: bool = false,
+};
+
 pub const SearchResult = search_results.SearchResult;
 pub const SearchResults = search_results.SearchResults;
 
@@ -55,6 +66,10 @@ pub const SearchRequest = struct {
     query: []const f32,
     k: usize,
     rerank_k: ?usize = null,
+    /// Normalized public search effort. The storage layer may still provide a
+    /// tuned search_width, but HBC owns topology-sensitive semantics such as
+    /// effort 1.0 exhausting the published search snapshot.
+    search_effort: ?f32 = null,
     search_width: ?u32 = null,
     epsilon: ?f32 = null,
     // Multiplier on k for how many approximate candidates are retained for
@@ -70,6 +85,31 @@ pub const SearchRequest = struct {
     /// intervals so a disconnected caller does not retain query capacity.
     cancellation: ?CancellationToken = null,
 };
+
+pub fn normalizedSearchEffort(req: SearchRequest) ?f32 {
+    const effort = req.search_effort orelse return null;
+    if (std.math.isNan(effort)) return null;
+    return std.math.clamp(effort, 0, 1);
+}
+
+/// Controls whether search may tolerate a partially readable index snapshot.
+/// Approximate requests preserve availability by skipping missing artifacts;
+/// full-effort requests must either cover the published snapshot or fail.
+pub const CoveragePolicy = enum {
+    best_effort,
+    complete_snapshot,
+};
+
+pub fn coveragePolicy(req: SearchRequest) CoveragePolicy {
+    return if ((normalizedSearchEffort(req) orelse return .best_effort) >= 1)
+        .complete_snapshot
+    else
+        .best_effort;
+}
+
+pub fn requiresExhaustiveCoverage(req: SearchRequest) bool {
+    return coveragePolicy(req) == .complete_snapshot;
+}
 
 pub fn checkCancelled(req: SearchRequest) !void {
     if (req.cancellation) |cancellation| {
@@ -97,18 +137,51 @@ pub const SearchProfile = struct {
     rerank_vector_load_ns: u64 = 0,
     rerank_prefetch_ns: u64 = 0,
     rerank_metadata_lookup_ns: u64 = 0,
+    /// Vector-to-document metadata rows requested after decoded-cache probing.
+    /// Warm decoded vectors must not contribute to this count.
+    rerank_metadata_vectors_loaded: u64 = 0,
     rerank_artifact_key_ns: u64 = 0,
     rerank_artifact_read_ns: u64 = 0,
     rerank_artifact_decode_ns: u64 = 0,
     rerank_artifact_distance_ns: u64 = 0,
     rerank_lsm_cache_hits: u64 = 0,
     rerank_lsm_cache_misses: u64 = 0,
+    /// Candidates scored without reading an external artifact. This includes
+    /// governed decoded residency and a request-local hit when a caller has a
+    /// legitimate reuse opportunity.
+    rerank_artifact_cache_hits: u64 = 0,
+    /// External artifact values requested, including missing/corrupt values.
+    /// Unlike LSM block-cache counters, this is a per-vector work signal.
+    rerank_artifact_vectors_loaded: u64 = 0,
+    vector_cache_hits: u64 = 0,
+    vector_cache_misses: u64 = 0,
+    metadata_cache_hits: u64 = 0,
+    metadata_cache_misses: u64 = 0,
+    metadata_cache_miss_ns: u64 = 0,
     rerank_vector_view_ns: u64 = 0,
     rerank_distance_ns: u64 = 0,
     rerank_apply_ns: u64 = 0,
     rerank_resort_ns: u64 = 0,
+    rerank_batches: u64 = 0,
+    rerank_max_batch_size: u64 = 0,
+    rerank_candidates_skipped_by_bound: u64 = 0,
     rerank_finalize_ns: u64 = 0,
     rerank_metadata_ns: u64 = 0,
+    filter_candidates: u64 = 0,
+    filter_rejected: u64 = 0,
+    filter_metadata_batches: u64 = 0,
+    filter_metadata_batch_ns: u64 = 0,
+    traversal_waves: u64 = 0,
+    traversal_initial_wave_leaves: u64 = 0,
+    traversal_max_wave_leaves: u64 = 0,
+    traversal_bound_resolutions: u64 = 0,
+    traversal_bound_fallbacks: u64 = 0,
+    traversal_bound_stops: u64 = 0,
+    traversal_yield_stops: u64 = 0,
+    traversal_frontier_remaining: u64 = 0,
+    traversal_eligible_vectors: u64 = 0,
+    traversal_stop_lower_bound: f32 = 0,
+    traversal_stop_result_upper_bound: f32 = 0,
     nodes_visited: u64 = 0,
     leaves_explored: u64 = 0,
     approx_nodes_expanded: u64 = 0,
@@ -250,6 +323,9 @@ pub fn candidateLessThan(_: void, a: types.PriorityItem, b: types.PriorityItem) 
 }
 
 fn candidatePriorityScore(item: types.PriorityItem) f32 {
+    // Covering-radius bounds are proof metadata, not an ANN-quality ranking.
+    // Ordering by them preferentially visits broad postings whose lower bound
+    // is near zero even when their centroid is far from the query.
     return item.distance - item.error_bound;
 }
 
@@ -261,4 +337,41 @@ test "candidateLessThan gives NaN scores deterministic lowest priority" {
     try std.testing.expectEqual(std.math.Order.lt, candidateLessThan({}, finite, nan_distance));
     try std.testing.expectEqual(std.math.Order.gt, candidateLessThan({}, nan_distance, finite));
     try std.testing.expectEqual(std.math.Order.lt, candidateLessThan({}, nan_distance, nan_bound));
+}
+
+test "candidateLessThan does not promote unresolved children over nearer siblings" {
+    const nearer_resolved = types.PriorityItem{
+        .id = 10,
+        .distance = 1,
+        .error_bound = 0.1,
+        .lower_bound = 0.9,
+        .bound_resolved = true,
+    };
+    const farther_unresolved = types.PriorityItem{
+        .id = 20,
+        .distance = 10,
+        .error_bound = 0.1,
+        .bound_resolved = false,
+    };
+
+    try std.testing.expectEqual(std.math.Order.lt, candidateLessThan({}, nearer_resolved, farther_unresolved));
+    try std.testing.expectEqual(std.math.Order.gt, candidateLessThan({}, farther_unresolved, nearer_resolved));
+}
+
+test "candidateLessThan does not substitute covering lower bounds for ANN priority" {
+    const nearer = types.PriorityItem{
+        .id = 10,
+        .distance = 1,
+        .error_bound = 0.1,
+        .lower_bound = 0.9,
+    };
+    const farther_broad = types.PriorityItem{
+        .id = 20,
+        .distance = 10,
+        .error_bound = 0.1,
+        .lower_bound = 0,
+    };
+
+    try std.testing.expectEqual(std.math.Order.lt, candidateLessThan({}, nearer, farther_broad));
+    try std.testing.expectEqual(std.math.Order.gt, candidateLessThan({}, farther_broad, nearer));
 }

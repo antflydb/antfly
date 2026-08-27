@@ -29,8 +29,9 @@ import (
 // AntflyBackupReconciler reconciles an AntflyBackup object
 type AntflyBackupReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
+	Scheme        *runtime.Scheme
+	Recorder      events.EventRecorder
+	ClusterDomain string
 }
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflybackups,verbs=get;list;watch;create;update;patch;delete
@@ -74,6 +75,14 @@ func (r *AntflyBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		r.updateStatusWithError(ctx, backup, antflyv1.BackupPhaseFailed, antflyv1.TypeBackupScheduleReady, antflyv1.ReasonBackupValidationFailed, err.Error())
 		return ctrl.Result{}, nil
 	}
+	if strings.TrimSpace(backup.Spec.Destination.Connection) == "" {
+		if err := r.suspendCronJobForConnectionMigration(ctx, backup); err != nil {
+			return ctrl.Result{}, err
+		}
+		message := "A named external_io connection with backup.write is required. The existing schedule is suspended until spec.destination.connection is configured."
+		r.updateStatusWithError(ctx, backup, antflyv1.BackupPhasePending, antflyv1.TypeBackupScheduleReady, antflyv1.ReasonBackupConnectionRequired, message)
+		return ctrl.Result{}, nil
+	}
 
 	// Fetch the referenced AntflyCluster.
 	// Use BackupPhasePending (not Failed) for cluster-not-found since this is a
@@ -101,6 +110,29 @@ func (r *AntflyBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// suspendCronJobForConnectionMigration preserves the CronJob and its history
+// while preventing an upgraded CLI from repeatedly starting a request that it
+// must reject. A later normal reconcile restores the user's desired suspend
+// value after the connection is configured.
+func (r *AntflyBackupReconciler) suspendCronJobForConnectionMigration(ctx context.Context, backup *antflyv1.AntflyBackup) error {
+	cronJob := &batchv1.CronJob{}
+	key := types.NamespacedName{Name: backup.Name + "-backup", Namespace: backup.Namespace}
+	if err := r.Get(ctx, key, cronJob); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("read legacy backup CronJob: %w", err)
+	}
+	if cronJob.Spec.Suspend != nil && *cronJob.Spec.Suspend {
+		return nil
+	}
+	cronJob.Spec.Suspend = new(true)
+	if err := r.Update(ctx, cronJob); err != nil {
+		return fmt.Errorf("suspend legacy backup CronJob: %w", err)
+	}
+	return nil
 }
 
 // getReferencedCluster fetches the AntflyCluster referenced by the backup
@@ -164,8 +196,7 @@ func (r *AntflyBackupReconciler) buildCronJobSpec(backup *antflyv1.AntflyBackup,
 	}
 
 	// Build the cluster API URL using the public-api service
-	clusterURL := fmt.Sprintf("http://%s-public-api.%s.svc.cluster.local",
-		cluster.Name, clusterNamespace)
+	clusterURL := "http://" + serviceDNSName(cluster.Name+"-public-api", clusterNamespace, r.ClusterDomain)
 
 	// Build shell command. All user-controlled values are shell-quoted to
 	// prevent injection. backup.Name is additionally safe because Kubernetes
@@ -506,6 +537,9 @@ func (r *AntflyBackupReconciler) setCondition(backup *antflyv1.AntflyBackup, con
 
 // SetupWithManager sets up the controller with the Manager
 func (r *AntflyBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := normalizeClusterDomainField(&r.ClusterDomain); err != nil {
+		return fmt.Errorf("configure AntflyBackup controller: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&antflyv1.AntflyBackup{}).
 		Owns(&batchv1.CronJob{}).

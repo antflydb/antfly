@@ -10,8 +10,7 @@ import (
 
 	"github.com/ajroetker/pdf"
 	"github.com/ajroetker/pdf/render"
-	"github.com/antflydb/antfly/go/pkg/libaf/ai"
-	"github.com/antflydb/antfly/go/pkg/libaf/reading"
+	"github.com/antflydb/antfly/go/pkg/docsaf/reading"
 )
 
 // PDFProgress reports progress during PDF processing.
@@ -93,7 +92,7 @@ func (pp *PDFProcessor) ocrFallback(pdfData []byte, pageNum int) (string, bool) 
 		return "", false
 	}
 
-	results, err := pp.OCR.Read(context.TODO(), []ai.BinaryContent{
+	results, err := pp.OCR.Read(context.TODO(), []reading.BinaryContent{
 		{MIMEType: "image/png", Data: pngBytes},
 	}, nil)
 	if err != nil || len(results) == 0 {

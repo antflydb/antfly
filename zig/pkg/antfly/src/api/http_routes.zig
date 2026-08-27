@@ -87,6 +87,7 @@ pub const Routes = struct {
     pub const merge_suffix = "/merge";
     pub const backup_suffix = "/backup";
     pub const restore_suffix = "/restore";
+    pub const destination_authorization_suffix = "/destination-authorization";
     pub const query_suffix = "/query";
     pub const query_preflight_suffix = "/query-preflight";
     pub const text_stats_suffix = "/text-stats";
@@ -507,6 +508,14 @@ pub const Routes = struct {
     pub fn matchTablePath(path: []const u8) ?TablePath {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         const table_name = path[tables_prefix.len..];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableDestinationAuthorization(path: []const u8) ?TablePath {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, destination_authorization_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - destination_authorization_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }

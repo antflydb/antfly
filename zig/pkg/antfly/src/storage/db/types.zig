@@ -245,6 +245,36 @@ pub const IndexKind = enum {
     algebraic,
 };
 
+pub const IndexPublicationPolicy = enum {
+    progressive,
+    atomic,
+};
+
+pub fn indexPublicationPolicy(alloc: Allocator, cfg: IndexConfig) !IndexPublicationPolicy {
+    if (cfg.kind != .dense_vector and cfg.kind != .sparse_vector) return .atomic;
+    const Parsed = struct {
+        publication_policy: ?IndexPublicationPolicy = null,
+    };
+    var parsed = try std.json.parseFromSlice(Parsed, alloc, cfg.config_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    return parsed.value.publication_policy orelse .progressive;
+}
+
+test "embeddings publication policy defaults progressive and preserves atomic" {
+    const progressive = IndexConfig{
+        .name = "progressive",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    };
+    try std.testing.expectEqual(IndexPublicationPolicy.progressive, try indexPublicationPolicy(std.testing.allocator, progressive));
+
+    var atomic = progressive;
+    atomic.config_json = "{\"field\":\"embedding\",\"dims\":3,\"publication_policy\":\"atomic\"}";
+    try std.testing.expectEqual(IndexPublicationPolicy.atomic, try indexPublicationPolicy(std.testing.allocator, atomic));
+}
+
 pub const IndexConfig = struct {
     name: []const u8,
     kind: IndexKind,
@@ -3120,9 +3150,9 @@ pub const DBIndexStats = struct {
     // Compact lifecycle used when DBIndexStats crosses process boundaries.
     // The full local durable diagnostics remain authoritative when present.
     index_repair_status: ?IndexRepairStatus = null,
-    // Internal proof that the durable intent is obsolete because the active
-    // managed-admission generation has already converged. Public status uses
-    // this to avoid advertising reconstruction that no longer blocks reads.
+    // Internal proof that the active managed-admission generation is safe to
+    // query. Under progressive publication it may still have incomplete source
+    // coverage; repair intent remains authoritative until full convergence.
     index_repair_active_generation_serviceable: bool = false,
     projection_checkpoint_status: []const u8 = "clean",
     projection_checkpoint_applied_sequence: u64 = 0,
@@ -3410,7 +3440,11 @@ pub const HbcPostingStats = struct {
 pub const HbcCacheKindStats = struct {
     used_bytes: u64 = 0,
     peak_bytes: u64 = 0,
+    hits: u64 = 0,
+    misses: u64 = 0,
     insertions: u64 = 0,
+    replacements: u64 = 0,
+    sampled_admissions: u64 = 0,
     admission_skips: u64 = 0,
     evictions: u64 = 0,
 };
@@ -3418,6 +3452,7 @@ pub const HbcCacheKindStats = struct {
 pub const HbcCacheStats = struct {
     total_bytes: u64 = 0,
     accounted_bytes: u64 = 0,
+    pinned_bytes: u64 = 0,
     node: HbcCacheKindStats = .{},
     quantized: HbcCacheKindStats = .{},
     vector: HbcCacheKindStats = .{},

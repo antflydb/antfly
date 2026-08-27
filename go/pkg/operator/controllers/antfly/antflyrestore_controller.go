@@ -24,8 +24,9 @@ import (
 // AntflyRestoreReconciler reconciles an AntflyRestore object
 type AntflyRestoreReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Recorder events.EventRecorder
+	Scheme        *runtime.Scheme
+	Recorder      events.EventRecorder
+	ClusterDomain string
 }
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyrestores,verbs=get;list;watch;create;update;patch;delete
@@ -49,7 +50,10 @@ func (r *AntflyRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// If restore is already completed or failed, skip reconciliation
+	// Terminal restores are immutable. In particular, never infer that a failed
+	// pre-upgrade Job is safe to replay merely because it lacked --connection:
+	// it may already have applied a partial overwrite. Pending legacy resources
+	// that never created a Job remain migratable below.
 	if restore.Status.Phase == antflyv1.RestorePhaseCompleted ||
 		restore.Status.Phase == antflyv1.RestorePhaseFailed {
 		log.Info("Restore already finished", "phase", restore.Status.Phase)
@@ -62,6 +66,26 @@ func (r *AntflyRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := restore.ValidateAntflyRestore(); err != nil {
 		log.Error(err, "AntflyRestore validation failed")
 		r.updateStatusWithError(ctx, restore, antflyv1.RestorePhaseFailed, antflyv1.TypeRestoreJobReady, antflyv1.ReasonRestoreValidationFailed, err.Error())
+		return ctrl.Result{}, nil
+	}
+	if strings.TrimSpace(restore.Spec.Source.Connection) == "" {
+		job := &batchv1.Job{}
+		jobKey := types.NamespacedName{Name: restore.Name + "-restore", Namespace: restore.Namespace}
+		if err := r.Get(ctx, jobKey, job); err != nil && !errors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		} else if err == nil {
+			// A pre-upgrade Job already owns the operation. Continue observing it;
+			// deleting or replacing a running restore would be unsafe.
+			if err := r.updateStatusFromJob(ctx, restore, job); err != nil {
+				return ctrl.Result{}, err
+			}
+			if restore.Status.Phase == antflyv1.RestorePhaseRunning {
+				return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			}
+			return ctrl.Result{}, nil
+		}
+		message := "A named external_io connection with restore.read is required. No restore Job was created; set spec.source.connection to continue."
+		r.updateStatusWithError(ctx, restore, antflyv1.RestorePhasePending, antflyv1.TypeRestoreJobReady, antflyv1.ReasonRestoreConnectionRequired, message)
 		return ctrl.Result{}, nil
 	}
 
@@ -174,8 +198,7 @@ func (r *AntflyRestoreReconciler) buildRestoreJob(restore *antflyv1.AntflyRestor
 	}
 
 	// Build the cluster API URL using the public-api service
-	clusterURL := fmt.Sprintf("http://%s-public-api.%s.svc.cluster.local",
-		cluster.Name, clusterNamespace)
+	clusterURL := "http://" + serviceDNSName(cluster.Name+"-public-api", clusterNamespace, r.ClusterDomain)
 
 	// Build CLI arguments
 	args := []string{
@@ -374,6 +397,9 @@ func (r *AntflyRestoreReconciler) setCondition(restore *antflyv1.AntflyRestore, 
 
 // SetupWithManager sets up the controller with the Manager
 func (r *AntflyRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := normalizeClusterDomainField(&r.ClusterDomain); err != nil {
+		return fmt.Errorf("configure AntflyRestore controller: %w", err)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&antflyv1.AntflyRestore{}).
 		Owns(&batchv1.Job{}).

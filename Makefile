@@ -11,10 +11,8 @@ GO_MODULES := \
 	./go/pkg/antflylite \
 	./go/pkg/sdk \
 	./go/pkg/proxy \
-	./go/pkg/libaf \
 	./go/pkg/operator \
 	./go/pkg/docsaf \
-	./go/pkg/generating \
 	./go/pkg/evalaf \
 	./go/pkg/evalaf/plugins/antfly \
 	./go/pkg/genkit/antfly \

@@ -21,6 +21,28 @@ const vectorindex = @import("antfly_vectorindex");
 pub const SearchOutcome = struct {
     results: vectorindex.SearchResults,
     vectors_scored: u64,
+    profile: Profile = .{},
+
+    pub const Profile = struct {
+        candidate_count: u64 = 0,
+        batch_count: u64 = 0,
+        max_batch_size: u64 = 0,
+        workspace_bytes: u64 = 0,
+        request_vector_cache_entries: u64 = 0,
+        raw_batch_reads: u64 = 0,
+        raw_scalar_reads: u64 = 0,
+        missing_vectors: u64 = 0,
+        candidate_prepare_ns: u64 = 0,
+        metadata_lookup_ns: u64 = 0,
+        artifact_key_ns: u64 = 0,
+        artifact_read_ns: u64 = 0,
+        artifact_decode_ns: u64 = 0,
+        distance_ns: u64 = 0,
+        lsm_cache_hits: u64 = 0,
+        lsm_cache_misses: u64 = 0,
+        artifact_cache_hits: u64 = 0,
+        artifact_vectors_loaded: u64 = 0,
+    };
 };
 
 /// An owned, sorted, unique include set with a sorted exclusion set removed.
