@@ -27,6 +27,26 @@ const max_cluster_failure_details: usize = 8;
 const max_cluster_failure_table_name_bytes: usize = 256;
 const max_cluster_failure_error_bytes: usize = 256;
 const restore_job_format_version: u32 = 4;
+pub const restore_retry_min_ms: u64 = 100;
+pub const restore_retry_max_ms: u64 = 5_000;
+
+fn restoreRetryDelayMs(job_id: u64, attempt_id: u64) u64 {
+    const exponent: u6 = @intCast(@min(attempt_id -| 1, 6));
+    const exponential_ms: u64 = @min(
+        restore_retry_min_ms << exponent,
+        restore_retry_max_ms * 4 / 5,
+    );
+    var mixed = job_id ^ (attempt_id *% 0x9e3779b97f4a7c15);
+    mixed ^= mixed >> 30;
+    mixed *%= 0xbf58476d1ce4e5b9;
+    mixed ^= mixed >> 27;
+    const jitter_span: u64 = exponential_ms / 2 + 1;
+    return std.math.clamp(
+        exponential_ms * 3 / 4 + mixed % jitter_span,
+        restore_retry_min_ms,
+        restore_retry_max_ms,
+    );
+}
 
 pub const Scope = enum { table, cluster };
 pub const Phase = enum { queued, running, succeeded, failed, cancelled };
@@ -134,7 +154,7 @@ pub const ReplicatedPersistence = extern struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    pub const abi_version: u32 = 1;
+    pub const abi_version: u32 = 2;
 
     pub const OwnedRow = struct { key: []u8, value: []u8 };
     pub const AbiRow = extern struct {
@@ -161,24 +181,27 @@ pub const ReplicatedPersistence = extern struct {
             ptr: *anyopaque,
             key: runtime_memory_abi.Bytes,
             value: runtime_memory_abi.Bytes,
+            leadership_term: u64,
         ) callconv(.c) runtime_error_abi.Status,
         delete: *const fn (
             ptr: *anyopaque,
             key: runtime_memory_abi.Bytes,
+            leadership_term: u64,
         ) callconv(.c) runtime_error_abi.Status,
         delete_many: *const fn (
             ptr: *anyopaque,
             alloc: *const runtime_memory_abi.Allocator,
             keys: ?[*]const runtime_memory_abi.Bytes,
             key_count: usize,
+            leadership_term: u64,
         ) callconv(.c) runtime_error_abi.Status,
     };
     pub const LocalVTable = struct {
         load: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]OwnedRow,
         get: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) anyerror!?[]u8,
-        put: *const fn (ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
-        delete: *const fn (ptr: *anyopaque, key: []const u8) anyerror!void,
-        delete_many: *const fn (ptr: *anyopaque, keys: []const []const u8) anyerror!void,
+        put: *const fn (ptr: *anyopaque, key: []const u8, value: []const u8, leadership_term: u64) anyerror!void,
+        delete: *const fn (ptr: *anyopaque, key: []const u8, leadership_term: u64) anyerror!void,
+        delete_many: *const fn (ptr: *anyopaque, keys: []const []const u8, leadership_term: u64) anyerror!void,
     };
 
     pub fn fromLocal(ptr: *anyopaque, comptime local: LocalVTable) ReplicatedPersistence {
@@ -254,16 +277,18 @@ pub const ReplicatedPersistence = extern struct {
                 ptr: *anyopaque,
                 key: runtime_memory_abi.Bytes,
                 value: runtime_memory_abi.Bytes,
+                leadership_term: u64,
             ) callconv(.c) runtime_error_abi.Status {
-                local.put(ptr, key.slice(), value.slice()) catch |err| return fail("put", err);
+                local.put(ptr, key.slice(), value.slice(), leadership_term) catch |err| return fail("put", err);
                 return .ok;
             }
 
             fn delete(
                 ptr: *anyopaque,
                 key: runtime_memory_abi.Bytes,
+                leadership_term: u64,
             ) callconv(.c) runtime_error_abi.Status {
-                local.delete(ptr, key.slice()) catch |err| return fail("delete", err);
+                local.delete(ptr, key.slice(), leadership_term) catch |err| return fail("delete", err);
                 return .ok;
             }
 
@@ -272,6 +297,7 @@ pub const ReplicatedPersistence = extern struct {
                 allocator: *const runtime_memory_abi.Allocator,
                 keys_ptr: ?[*]const runtime_memory_abi.Bytes,
                 key_count: usize,
+                leadership_term: u64,
             ) callconv(.c) runtime_error_abi.Status {
                 if (!allocator.valid())
                     return fail("delete_many", error.UnsupportedVersion);
@@ -280,7 +306,7 @@ pub const ReplicatedPersistence = extern struct {
                 defer alloc.free(keys);
                 const abi_keys = if (key_count == 0) &.{} else keys_ptr.?[0..key_count];
                 for (abi_keys, 0..) |key, index| keys[index] = key.slice();
-                local.delete_many(ptr, keys) catch |err| return fail("delete_many", err);
+                local.delete_many(ptr, keys, leadership_term) catch |err| return fail("delete_many", err);
                 return .ok;
             }
         };
@@ -316,17 +342,17 @@ pub const ReplicatedPersistence = extern struct {
         return if (out.present != 0) out.bytes.slice() else null;
     }
 
-    pub fn put(self: ReplicatedPersistence, key: []const u8, value: []const u8) !void {
+    pub fn put(self: ReplicatedPersistence, key: []const u8, value: []const u8, leadership_term: u64) !void {
         try self.validateVersion();
-        try statusToError(self.vtable.put(self.ptr, .fromSlice(key), .fromSlice(value)));
+        try statusToError(self.vtable.put(self.ptr, .fromSlice(key), .fromSlice(value), leadership_term));
     }
 
-    pub fn delete(self: ReplicatedPersistence, key: []const u8) !void {
+    pub fn delete(self: ReplicatedPersistence, key: []const u8, leadership_term: u64) !void {
         try self.validateVersion();
-        try statusToError(self.vtable.delete(self.ptr, .fromSlice(key)));
+        try statusToError(self.vtable.delete(self.ptr, .fromSlice(key), leadership_term));
     }
 
-    pub fn deleteMany(self: ReplicatedPersistence, alloc: std.mem.Allocator, keys: []const []const u8) !void {
+    pub fn deleteMany(self: ReplicatedPersistence, alloc: std.mem.Allocator, keys: []const []const u8, leadership_term: u64) !void {
         try self.validateVersion();
         const abi_keys = try alloc.alloc(runtime_memory_abi.Bytes, keys.len);
         defer alloc.free(abi_keys);
@@ -338,6 +364,7 @@ pub const ReplicatedPersistence = extern struct {
             &abi_allocator,
             if (abi_keys.len == 0) null else abi_keys.ptr,
             abi_keys.len,
+            leadership_term,
         ));
     }
 
@@ -385,6 +412,9 @@ pub const Store = struct {
     opened: ?*OpenedStore = null,
     runtime: ?*backend_erased.Store = null,
     replicated: ?ReplicatedPersistence = null,
+    /// Captured metadata leadership term used for every replicated mutation.
+    /// The persistence adapter atomically compares this term at Raft admission.
+    replicated_leadership_term: u64 = 0,
     retained_bytes: usize = 0,
     next_prune_at_ms: u64 = 0,
 
@@ -614,10 +644,12 @@ pub const Store = struct {
     /// Called once for each newly acquired metadata leadership term. Running
     /// attempts from the old leader are fenced by incrementing their attempt on
     /// the next begin and returned to the durable FIFO.
-    pub fn prepareReplicatedLeadership(self: *Store, alloc: std.mem.Allocator) !void {
+    pub fn prepareReplicatedLeadership(self: *Store, alloc: std.mem.Allocator, leadership_term: u64) !void {
         self.lock();
         defer self.mutex.unlock();
         const persistence = self.replicated orelse return;
+        if (leadership_term == 0) return error.NotLeader;
+        self.replicated_leadership_term = leadership_term;
         self.clearInMemoryLocked();
         const rows = try persistence.load(self.alloc);
         defer ReplicatedPersistence.freeRows(self.alloc, rows);
@@ -636,7 +668,11 @@ pub const Store = struct {
         var expired_offset: usize = 0;
         while (expired_offset < expired_keys.items.len) {
             const end = @min(expired_offset + restore_job_prune_batch_size, expired_keys.items.len);
-            try persistence.deleteMany(self.alloc, expired_keys.items[expired_offset..end]);
+            try persistence.deleteMany(
+                self.alloc,
+                expired_keys.items[expired_offset..end],
+                self.replicated_leadership_term,
+            );
             expired_offset = end;
         }
         self.sortPendingLocked();
@@ -650,22 +686,40 @@ pub const Store = struct {
             defer parsed.deinit();
             if (parsed.value.phase == .running) try running.append(alloc, parsed.value.job_id);
         }
+        self.compactPendingFullyLocked();
+        // Reserve every runnable-index slot before changing any durable row.
+        // Once a recovered attempt is persisted as queued, allocation failure
+        // must not leave it absent from the in-memory dispatcher.
+        try self.pending.ensureUnusedCapacity(self.alloc, running.items.len);
         for (running.items) |job_id| {
             const current = self.jobs.get(job_id) orelse continue;
             var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const encoded = try self.updateLocked(alloc, parsed.value, .{ .phase = .queued, .last_error = "resuming_after_leader_change" });
+            if (parsed.value.cancel_requested) {
+                const encoded = try self.updateLocked(alloc, parsed.value, .{
+                    .phase = .cancelled,
+                    .last_error = "cancel_requested",
+                });
+                alloc.free(encoded);
+                continue;
+            }
+            const dispatch_sequence = try self.allocateDispatchSequenceLocked();
+            const not_before_ms = nowMillis() +| restoreRetryDelayMs(job_id, parsed.value.attempt_id);
+            const encoded = try self.updateLocked(alloc, parsed.value, .{
+                .phase = .queued,
+                .dispatch_sequence = dispatch_sequence,
+                .not_before_ms = not_before_ms,
+                .last_error = "resuming_after_leader_change",
+            });
             alloc.free(encoded);
-            try self.pending.append(self.alloc, .{
+            try self.insertPendingSortedLocked(.{
                 .job_id = job_id,
-                .dispatch_sequence = parsed.value.dispatch_sequence,
-                .not_before_ms = 0,
+                .dispatch_sequence = dispatch_sequence,
+                .not_before_ms = not_before_ms,
             });
         }
-        // Recovered in-flight attempts retain their original FIFO position;
-        // appending them after the initial queued rebuild would otherwise let
-        // every newer queued job jump ahead after a leader change.
-        self.sortPendingLocked();
+        // Recovered attempts receive a new FIFO position so repeated
+        // leadership churn cannot monopolize the head of the runnable queue.
     }
 
     fn clearInMemoryLocked(self: *Store) void {
@@ -1249,21 +1303,128 @@ pub const Store = struct {
         });
     }
 
-    pub fn begin(self: *Store, alloc: std.mem.Allocator, job_id: u64) !?[]u8 {
+    pub const BeginResult = struct {
+        encoded: []u8,
+        /// Zero means no running attempt was established (for example, a
+        /// cancellation was made terminal while the job was dequeued).
+        attempt_id: u64,
+    };
+
+    /// Begins queued work and returns its ownership token in the same critical
+    /// section as the durable transition. `attempt_id_out` is set before the
+    /// persistence call so an ambiguous error can reconcile either the original
+    /// queued record or that exact proposed attempt. Callers must not derive
+    /// ownership by reparsing the encoded record: parsing can itself fail after
+    /// persistence.
+    pub fn beginAttempt(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        job_id: u64,
+        attempt_id_out: *u64,
+    ) !?BeginResult {
+        attempt_id_out.* = 0;
         self.lock();
         defer self.mutex.unlock();
         const current = self.jobs.get(job_id) orelse return null;
         var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        if (isTerminal(parsed.value.phase)) return try alloc.dupe(u8, current);
+        if (isTerminal(parsed.value.phase)) return .{
+            .encoded = try alloc.dupe(u8, current),
+            .attempt_id = 0,
+        };
         if (parsed.value.phase == .running) return null;
         const next_phase: Phase = if (parsed.value.cancel_requested) .cancelled else .running;
-        return try self.updateLocked(alloc, parsed.value, .{
-            .phase = next_phase,
-            .attempt_id = parsed.value.attempt_id +| 1,
-            .not_before_ms = 0,
-            .last_error = if (next_phase == .cancelled) "cancel_requested" else null,
+        const attempt_id = parsed.value.attempt_id +| 1;
+        if (next_phase == .running) attempt_id_out.* = attempt_id;
+        return .{
+            .encoded = try self.updateLocked(alloc, parsed.value, .{
+                .phase = next_phase,
+                .attempt_id = attempt_id,
+                .not_before_ms = 0,
+                .last_error = if (next_phase == .cancelled) "cancel_requested" else null,
+            }),
+            .attempt_id = if (next_phase == .running) attempt_id else 0,
+        };
+    }
+
+    /// Compatibility wrapper for store-level callers that only need the
+    /// encoded state. Runtime workers should use `beginAttempt`.
+    pub fn begin(self: *Store, alloc: std.mem.Allocator, job_id: u64) !?[]u8 {
+        var attempt_id: u64 = 0;
+        const result = (try self.beginAttempt(alloc, job_id, &attempt_id)) orelse return null;
+        return result.encoded;
+    }
+
+    pub const DispatchRecovery = enum {
+        /// The queued predecessor is still durable because begin did not
+        /// commit. The current worker retains scheduling ownership and retries
+        /// after backoff instead of allocating another durable job.
+        retry_queued,
+        /// The exact running attempt was durably returned to the shared FIFO.
+        requeued,
+        /// Cancellation won and the exact attempt was made terminal.
+        cancelled,
+        /// The durable record no longer belongs to this worker.
+        stale,
+    };
+
+    /// Restores dispatcher ownership after a retryable worker failure. A queued
+    /// predecessor remains owned by the current worker; running records are
+    /// fenced exactly, so a stale owner cannot requeue a replacement attempt.
+    pub fn recoverDispatchedAttempt(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        job_id: u64,
+        attempt_id: u64,
+        err_name: []const u8,
+    ) !DispatchRecovery {
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return .stale;
+        var parsed = try std.json.parseFromSlice(
+            JobState,
+            alloc,
+            current,
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+        if (parsed.value.phase == .queued) {
+            if (attempt_id != 0 and parsed.value.attempt_id +| 1 != attempt_id)
+                return .stale;
+            return .retry_queued;
+        }
+        if (attempt_id == 0 or
+            parsed.value.phase != .running or
+            parsed.value.attempt_id != attempt_id)
+        {
+            return .stale;
+        }
+        if (parsed.value.cancel_requested) {
+            const cancelled = try self.updateLocked(alloc, parsed.value, .{
+                .phase = .cancelled,
+                .last_error = "cancel_requested",
+            });
+            alloc.free(cancelled);
+            return .cancelled;
+        }
+
+        self.compactPendingFullyLocked();
+        try self.pending.ensureUnusedCapacity(self.alloc, 1);
+        const dispatch_sequence = try self.allocateDispatchSequenceLocked();
+        const not_before_ms = nowMillis() +| restoreRetryDelayMs(job_id, attempt_id);
+        const encoded = try self.updateLocked(alloc, parsed.value, .{
+            .phase = .queued,
+            .dispatch_sequence = dispatch_sequence,
+            .not_before_ms = not_before_ms,
+            .last_error = err_name,
         });
+        defer alloc.free(encoded);
+        try self.insertPendingSortedLocked(.{
+            .job_id = job_id,
+            .dispatch_sequence = dispatch_sequence,
+            .not_before_ms = not_before_ms,
+        });
+        return .requeued;
     }
 
     pub fn finish(self: *Store, alloc: std.mem.Allocator, expected: JobState, result_json: []const u8) ![]u8 {
@@ -1278,15 +1439,19 @@ pub const Store = struct {
         return try self.finishAs(alloc, expected, .failed, result_json, err_name);
     }
 
-    pub fn failRunningById(self: *Store, alloc: std.mem.Allocator, job_id: u64, err_name: []const u8) !void {
+    /// Terminalizes only the exact running attempt owned by the caller. A
+    /// delayed worker from an older attempt is a no-op after leadership recovery
+    /// or another dispatcher has begun a replacement attempt.
+    pub fn failRunningAttempt(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, err_name: []const u8) !bool {
         self.lock();
         defer self.mutex.unlock();
-        const current = self.jobs.get(job_id) orelse return;
+        const current = self.jobs.get(job_id) orelse return false;
         var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        if (parsed.value.phase != .running) return;
+        if (attempt_id == 0 or parsed.value.phase != .running or parsed.value.attempt_id != attempt_id) return false;
         const encoded = try self.updateLocked(alloc, parsed.value, .{ .phase = .failed, .last_error = err_name });
         alloc.free(encoded);
+        return true;
     }
 
     /// Return one exact running attempt to the durable FIFO after a
@@ -1644,7 +1809,8 @@ pub const Store = struct {
             try txn.put(key, value);
             return txn.commit();
         }
-        if (self.replicated) |replicated| return replicated.put(key, value);
+        if (self.replicated) |replicated|
+            return replicated.put(key, value, self.replicated_leadership_term);
         return error.RestoreJobPersistenceUnavailable;
     }
 
@@ -1659,7 +1825,8 @@ pub const Store = struct {
             };
             return txn.commit();
         }
-        if (self.replicated) |replicated| return replicated.delete(key);
+        if (self.replicated) |replicated|
+            return replicated.delete(key, self.replicated_leadership_term);
         return error.RestoreJobPersistenceUnavailable;
     }
 
@@ -1683,7 +1850,8 @@ pub const Store = struct {
             };
             return txn.commit();
         }
-        if (self.replicated) |replicated| return replicated.deleteMany(self.alloc, keys);
+        if (self.replicated) |replicated|
+            return replicated.deleteMany(self.alloc, keys, self.replicated_leadership_term);
         return error.RestoreJobPersistenceUnavailable;
     }
 
@@ -2045,6 +2213,8 @@ const TestReplicatedPersistence = struct {
     fail_load_private: bool = false,
     fail_put_private: bool = false,
     fail_delete_many: bool = false,
+    required_leadership_term: ?u64 = null,
+    last_mutation_term: u64 = 0,
 
     fn init(alloc: std.mem.Allocator) TestReplicatedPersistence {
         return .{ .alloc = alloc };
@@ -2102,8 +2272,12 @@ const TestReplicatedPersistence = struct {
         return result;
     }
 
-    fn put(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
+    fn put(ptr: *anyopaque, key: []const u8, value: []const u8, leadership_term: u64) !void {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
+        self.last_mutation_term = leadership_term;
+        if (self.required_leadership_term) |required| {
+            if (leadership_term != required) return error.NotLeader;
+        }
         if (self.fail_put_private) return error.TestRestoreJobPutPrivateFailure;
         const owned_value = try self.alloc.dupe(u8, value);
         errdefer self.alloc.free(owned_value);
@@ -2117,18 +2291,22 @@ const TestReplicatedPersistence = struct {
         try self.rows.put(self.alloc, owned_key, owned_value);
     }
 
-    fn delete(ptr: *anyopaque, key: []const u8) !void {
+    fn delete(ptr: *anyopaque, key: []const u8, leadership_term: u64) !void {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
+        self.last_mutation_term = leadership_term;
+        if (self.required_leadership_term) |required| {
+            if (leadership_term != required) return error.NotLeader;
+        }
         if (self.rows.fetchRemove(key)) |removed| {
             self.alloc.free(removed.key);
             self.alloc.free(removed.value);
         }
     }
 
-    fn deleteMany(ptr: *anyopaque, keys: []const []const u8) !void {
+    fn deleteMany(ptr: *anyopaque, keys: []const []const u8, leadership_term: u64) !void {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
         if (self.fail_delete_many) return error.RestoreJobPersistenceUnavailable;
-        for (keys) |key| try delete(ptr, key);
+        for (keys) |key| try delete(ptr, key, leadership_term);
     }
 };
 
@@ -2218,7 +2396,7 @@ test "replicated restore persistence maps private callback errors to stable unav
     persistence.fail_put_private = true;
     try std.testing.expectError(
         error.RestoreJobPersistenceUnavailable,
-        replicated.put("restore/jobs/1", "{}"),
+        replicated.put("restore/jobs/1", "{}", 7),
     );
 }
 
@@ -2520,6 +2698,203 @@ test "retryable restore contention durably requeues progress and honors cancella
     );
 }
 
+test "restore ownership loss requeues only the exact running attempt" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const created = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "ownership-loss",
+        .location = "s3://archive/ownership-loss",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:cluster",
+    });
+    defer std.testing.allocator.free(created);
+    var parsed_created = try std.json.parseFromSlice(JobState, std.testing.allocator, created, .{});
+    defer parsed_created.deinit();
+    const running_one = (try store.begin(std.testing.allocator, parsed_created.value.job_id)).?;
+    defer std.testing.allocator.free(running_one);
+    var parsed_one = try std.json.parseFromSlice(JobState, std.testing.allocator, running_one, .{});
+    defer parsed_one.deinit();
+
+    try std.testing.expectEqual(Store.DispatchRecovery.requeued, try store.recoverDispatchedAttempt(
+        std.testing.allocator,
+        parsed_one.value.job_id,
+        parsed_one.value.attempt_id,
+        "NotLeader",
+    ));
+    const queued = (try store.load(std.testing.allocator, parsed_one.value.job_id)).?;
+    defer std.testing.allocator.free(queued);
+    var parsed_queued = try std.json.parseFromSlice(JobState, std.testing.allocator, queued, .{});
+    defer parsed_queued.deinit();
+    try std.testing.expectEqual(Phase.queued, parsed_queued.value.phase);
+    try std.testing.expect(parsed_queued.value.not_before_ms > 0);
+
+    const running_two = (try store.begin(std.testing.allocator, parsed_one.value.job_id)).?;
+    defer std.testing.allocator.free(running_two);
+    var parsed_two = try std.json.parseFromSlice(JobState, std.testing.allocator, running_two, .{});
+    defer parsed_two.deinit();
+    try std.testing.expectEqual(parsed_one.value.attempt_id + 1, parsed_two.value.attempt_id);
+    try std.testing.expectEqual(Store.DispatchRecovery.stale, try store.recoverDispatchedAttempt(
+        std.testing.allocator,
+        parsed_one.value.job_id,
+        parsed_one.value.attempt_id,
+        "stale-owner",
+    ));
+    const still_running = (try store.load(std.testing.allocator, parsed_one.value.job_id)).?;
+    defer std.testing.allocator.free(still_running);
+    var parsed_still_running = try std.json.parseFromSlice(JobState, std.testing.allocator, still_running, .{});
+    defer parsed_still_running.deinit();
+    try std.testing.expectEqual(Phase.running, parsed_still_running.value.phase);
+    try std.testing.expectEqual(parsed_two.value.attempt_id, parsed_still_running.value.attempt_id);
+
+    try std.testing.expect(!try store.failRunningAttempt(
+        std.testing.allocator,
+        parsed_one.value.job_id,
+        parsed_one.value.attempt_id,
+        "stale-owner",
+    ));
+    try std.testing.expect(try store.failRunningAttempt(
+        std.testing.allocator,
+        parsed_two.value.job_id,
+        parsed_two.value.attempt_id,
+        "terminal",
+    ));
+}
+
+test "replicated restore mutations are rejected after leadership term changes" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    persistence.required_leadership_term = 7;
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+    try store.prepareReplicatedLeadership(std.testing.allocator, 7);
+
+    const created = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "term-fence",
+        .location = "s3://archive/term-fence",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:cluster",
+    });
+    defer std.testing.allocator.free(created);
+    var parsed_created = try std.json.parseFromSlice(JobState, std.testing.allocator, created, .{});
+    defer parsed_created.deinit();
+    const dispatched = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(dispatched);
+    const running = (try store.begin(std.testing.allocator, parsed_created.value.job_id)).?;
+    defer std.testing.allocator.free(running);
+    var parsed_running = try std.json.parseFromSlice(JobState, std.testing.allocator, running, .{});
+    defer parsed_running.deinit();
+    try std.testing.expectEqual(@as(u64, 7), persistence.last_mutation_term);
+
+    // Model the node reacquiring leadership in a newer term before the old
+    // worker reaches the persistence callback. The old store token must be
+    // rejected at the mutation boundary, leaving the running record intact.
+    persistence.required_leadership_term = 9;
+    try std.testing.expectError(
+        error.NotLeader,
+        store.failRunningAttempt(
+            std.testing.allocator,
+            parsed_running.value.job_id,
+            parsed_running.value.attempt_id,
+            "stale-worker",
+        ),
+    );
+    const still_running = (try store.load(std.testing.allocator, parsed_running.value.job_id)).?;
+    defer std.testing.allocator.free(still_running);
+    var parsed_still_running = try std.json.parseFromSlice(JobState, std.testing.allocator, still_running, .{});
+    defer parsed_still_running.deinit();
+    try std.testing.expectEqual(Phase.running, parsed_still_running.value.phase);
+
+    try store.prepareReplicatedLeadership(std.testing.allocator, 9);
+    try std.testing.expectEqual(@as(u64, 9), persistence.last_mutation_term);
+}
+
+test "restore dispatch recovery retains worker ownership when begin fails" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const created = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "begin-persistence-failure",
+        .location = "s3://archive/begin-persistence-failure",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:cluster",
+    });
+    defer std.testing.allocator.free(created);
+    var parsed_created = try std.json.parseFromSlice(JobState, std.testing.allocator, created, .{});
+    defer parsed_created.deinit();
+
+    const dispatched = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(dispatched);
+    try std.testing.expectEqualSlices(u64, &.{parsed_created.value.job_id}, dispatched);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var unestablished_attempt_id: u64 = 99;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        store.beginAttempt(
+            failing.allocator(),
+            parsed_created.value.job_id,
+            &unestablished_attempt_id,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), unestablished_attempt_id);
+    try std.testing.expectEqual(Store.DispatchRecovery.retry_queued, try store.recoverDispatchedAttempt(
+        std.testing.allocator,
+        parsed_created.value.job_id,
+        unestablished_attempt_id,
+        "OutOfMemory",
+    ));
+
+    persistence.fail_put_private = true;
+    var proposed_attempt_id: u64 = 0;
+    try std.testing.expectError(
+        error.RestoreJobPersistenceUnavailable,
+        store.beginAttempt(
+            std.testing.allocator,
+            parsed_created.value.job_id,
+            &proposed_attempt_id,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 1), proposed_attempt_id);
+    persistence.fail_put_private = false;
+
+    try std.testing.expectEqual(Store.DispatchRecovery.retry_queued, try store.recoverDispatchedAttempt(
+        std.testing.allocator,
+        parsed_created.value.job_id,
+        proposed_attempt_id,
+        "RestoreJobPersistenceUnavailable",
+    ));
+    const recovered = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(recovered);
+    try std.testing.expectEqual(@as(usize, 0), recovered.len);
+
+    const running = (try store.begin(std.testing.allocator, parsed_created.value.job_id)).?;
+    defer std.testing.allocator.free(running);
+    var parsed_running = try std.json.parseFromSlice(JobState, std.testing.allocator, running, .{});
+    defer parsed_running.deinit();
+    try std.testing.expectEqual(proposed_attempt_id, parsed_running.value.attempt_id);
+}
+
+test "restore retry jitter is stable and honors production bounds" {
+    for (1..128) |attempt| {
+        const attempt_id: u64 = @intCast(attempt);
+        const delay_ms = restoreRetryDelayMs(42, attempt_id);
+        try std.testing.expect(delay_ms >= restore_retry_min_ms);
+        try std.testing.expect(delay_ms <= restore_retry_max_ms);
+        try std.testing.expectEqual(delay_ms, restoreRetryDelayMs(42, attempt_id));
+    }
+}
+
 test "delayed restore contention yields FIFO capacity to unrelated jobs" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
@@ -2675,7 +3050,9 @@ test "replicated restore leadership rebuild preserves FIFO and recovers running 
     defer std.testing.allocator.free(first);
     try std.testing.expectEqualSlices(u64, created[0..1], first);
     const running = (try store.begin(std.testing.allocator, created[0])).?;
-    std.testing.allocator.free(running);
+    defer std.testing.allocator.free(running);
+    var parsed_running = try std.json.parseFromSlice(JobState, std.testing.allocator, running, .{});
+    defer parsed_running.deinit();
 
     const expired_key = try jobKey(std.testing.allocator, 999);
     defer std.testing.allocator.free(expired_key);
@@ -2697,13 +3074,60 @@ test "replicated restore leadership rebuild preserves FIFO and recovers running 
         .expires_at_ms = 0,
     });
     defer std.testing.allocator.free(expired);
-    try TestReplicatedPersistence.put(&persistence, expired_key, expired);
+    try TestReplicatedPersistence.put(&persistence, expired_key, expired, 0);
 
-    try store.prepareReplicatedLeadership(std.testing.allocator);
+    try store.prepareReplicatedLeadership(std.testing.allocator, 7);
     try std.testing.expect(!persistence.rows.contains(expired_key));
     const recovered = try store.takePendingIds(std.testing.allocator, 3);
     defer std.testing.allocator.free(recovered);
-    try std.testing.expectEqualSlices(u64, &created, recovered);
+    try std.testing.expectEqualSlices(u64, created[1..], recovered);
+    try std.testing.expect((store.nextPendingDelayMs() orelse 0) > 0);
+
+    const recovered_running = (try store.load(std.testing.allocator, created[0])).?;
+    defer std.testing.allocator.free(recovered_running);
+    var parsed_recovered = try std.json.parseFromSlice(JobState, std.testing.allocator, recovered_running, .{});
+    defer parsed_recovered.deinit();
+    try std.testing.expectEqual(Phase.queued, parsed_recovered.value.phase);
+    try std.testing.expect(parsed_recovered.value.not_before_ms > 0);
+    try std.testing.expect(parsed_recovered.value.dispatch_sequence > parsed_running.value.dispatch_sequence);
+}
+
+test "replicated restore leadership terminalizes cancellation of a running attempt" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const created = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "cancelled-leader-change",
+        .location = "s3://archive/cancelled-leader-change",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:cluster",
+    });
+    defer std.testing.allocator.free(created);
+    var parsed_created = try std.json.parseFromSlice(JobState, std.testing.allocator, created, .{});
+    defer parsed_created.deinit();
+    const job_id = parsed_created.value.job_id;
+
+    const dispatched = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(dispatched);
+    const running = (try store.begin(std.testing.allocator, job_id)).?;
+    defer std.testing.allocator.free(running);
+    const cancellation = (try store.cancel(std.testing.allocator, job_id)).?;
+    std.testing.allocator.free(cancellation);
+
+    try store.prepareReplicatedLeadership(std.testing.allocator, 7);
+    const loaded = (try store.load(std.testing.allocator, job_id)).?;
+    defer std.testing.allocator.free(loaded);
+    var parsed = try std.json.parseFromSlice(JobState, std.testing.allocator, loaded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(Phase.cancelled, parsed.value.phase);
+    try std.testing.expectEqualStrings("cancel_requested", parsed.value.last_error.?);
+    const pending = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
 }
 
 test "replicated restore expiry deletion preserves foreign boundary failure" {
@@ -2734,11 +3158,11 @@ test "replicated restore expiry deletion preserves foreign boundary failure" {
         .expires_at_ms = 0,
     });
     defer std.testing.allocator.free(expired);
-    try TestReplicatedPersistence.put(&persistence, expired_key, expired);
+    try TestReplicatedPersistence.put(&persistence, expired_key, expired, 0);
 
     try std.testing.expectError(
         error.RestoreJobPersistenceUnavailable,
-        store.prepareReplicatedLeadership(std.testing.allocator),
+        store.prepareReplicatedLeadership(std.testing.allocator, 7),
     );
     try std.testing.expect(persistence.rows.contains(expired_key));
 }

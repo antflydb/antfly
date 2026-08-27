@@ -734,9 +734,12 @@ fn metadataRestoreJobLoad(ptr: *anyopaque, alloc: std.mem.Allocator) ![]restore_
     return out;
 }
 
-fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
+fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8, leadership_term: u64) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    _ = try svc.proposeTransitionCommandAndWaitApplied(.{ .upsert_restore_job = .{ .key = key, .value = value } });
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(
+        .{ .upsert_restore_job = .{ .key = key, .value = value } },
+        leadership_term,
+    );
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const committed = (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) orelse
         return error.RestoreJobCommitNotApplied;
@@ -744,9 +747,12 @@ fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8) !v
     if (!std.mem.eql(u8, committed, value)) return error.RestoreJobCommitNotApplied;
 }
 
-fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8) !void {
+fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8, leadership_term: u64) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    _ = try svc.proposeTransitionCommandAndWaitApplied(.{ .remove_restore_job = .{ .key = key } });
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(
+        .{ .remove_restore_job = .{ .key = key } },
+        leadership_term,
+    );
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     if (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) |committed| {
         svc.alloc.free(committed);
@@ -754,10 +760,13 @@ fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8) !void {
     }
 }
 
-fn metadataRestoreJobDeleteMany(ptr: *anyopaque, keys: []const []const u8) !void {
+fn metadataRestoreJobDeleteMany(ptr: *anyopaque, keys: []const []const u8, leadership_term: u64) !void {
     if (keys.len == 0) return;
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    _ = try svc.proposeTransitionCommandAndWaitApplied(.{ .remove_restore_jobs = .{ .keys = keys } });
+    _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(
+        .{ .remove_restore_jobs = .{ .keys = keys } },
+        leadership_term,
+    );
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     for (keys) |key| {
         if (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) |committed| {
