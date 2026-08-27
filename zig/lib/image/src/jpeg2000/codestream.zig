@@ -303,7 +303,7 @@ pub const State = struct {
     /// Component subsampling (XRsiz/YRsiz > 1) is allowed for the u8 decode
     /// path; subsampled components are upsampled to the image grid post-IDWT.
     pub fn fullNativeDecodeSupport(self: *const State) NativeDecodeSupport {
-        if (self.header.components.len != 1 and self.header.components.len != 3 and self.header.components.len != 4) return .unsupported_components;
+        if (self.header.components.len < 1 or self.header.components.len > 5) return .unsupported_components;
         for (self.header.components) |component| {
             if (component.bits_per_component == 0 or component.bits_per_component > 16) return .unsupported_precision;
             if (component.xrsiz == 0 or component.yrsiz == 0) return .unsupported_components;

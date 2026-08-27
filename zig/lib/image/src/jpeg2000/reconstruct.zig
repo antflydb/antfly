@@ -384,7 +384,7 @@ pub fn interleavePlanesU8(
     bits_per_component: u8,
     is_signed: bool,
 ) ![]u8 {
-    if (planes.len != 1 and planes.len != 3 and planes.len != 4) return error.UnsupportedPlaneCount;
+    if (planes.len < 1 or planes.len > 5) return error.UnsupportedPlaneCount;
     const plane_len = width * height;
     for (planes) |plane| {
         if (plane.len != plane_len) return error.InvalidPlaneLength;
@@ -410,7 +410,7 @@ pub fn interleavePlanesU16(
     bits_per_component: u8,
     is_signed: bool,
 ) ![]u16 {
-    if (planes.len != 1 and planes.len != 3) return error.UnsupportedPlaneCount;
+    if (planes.len < 1 or planes.len > 5) return error.UnsupportedPlaneCount;
     const plane_len = width * height;
     for (planes) |plane| {
         if (plane.len != plane_len) return error.InvalidPlaneLength;
@@ -426,6 +426,51 @@ pub fn interleavePlanesU16(
         }
     }
     return out;
+}
+
+/// Interleave reconstructed native-precision component planes, upsampling any
+/// subsampled plane to the image grid. Keeping this path in U16 avoids the
+/// quantization that would make 9-16 bit PDF color keys inexact.
+pub fn interleaveComponentPlanesU16(
+    allocator: std.mem.Allocator,
+    component_planes: *const ComponentPlanesU16,
+    image_width: usize,
+    image_height: usize,
+) ![]u16 {
+    const component_count = component_planes.planes.len;
+    if (component_count < 1 or component_count > 5 or
+        component_planes.widths.len != component_count or
+        component_planes.heights.len != component_count) return error.UnsupportedPlaneCount;
+    const pixel_count = std.math.mul(usize, image_width, image_height) catch return error.InvalidPlaneLength;
+    const output_len = std.math.mul(usize, pixel_count, component_count) catch return error.InvalidPlaneLength;
+    const output = try allocator.alloc(u16, output_len);
+    errdefer allocator.free(output);
+
+    for (component_planes.planes, 0..) |source, component_index| {
+        const source_width = component_planes.widths[component_index];
+        const source_height = component_planes.heights[component_index];
+        if (source_width == 0 or source_height == 0 or source.len != source_width * source_height)
+            return error.InvalidPlaneLength;
+        var upsampled: ?[]u16 = null;
+        defer if (upsampled) |plane| allocator.free(plane);
+        const plane = if (source_width == image_width and source_height == image_height)
+            source
+        else blk: {
+            upsampled = try upsample.bilinearU16(
+                allocator,
+                source,
+                source_width,
+                source_height,
+                image_width,
+                image_height,
+            );
+            break :blk upsampled.?;
+        };
+        for (plane, 0..) |sample, pixel_index| {
+            output[pixel_index * component_count + component_index] = sample;
+        }
+    }
+    return output;
 }
 
 /// Stitch decoded tile pixels into a single output image buffer.
@@ -1474,7 +1519,7 @@ pub fn interleaveComponentPlanesU8(
     raw_planes: [][]i32,
 ) ![]u8 {
     if (raw_planes.len != state.header.components.len) return error.InvalidPlaneLength;
-    if (raw_planes.len != 1 and raw_planes.len != 3 and raw_planes.len != 4)
+    if (raw_planes.len < 1 or raw_planes.len > 5)
         return error.UnsupportedPlaneCount;
 
     const image_width: usize = @intCast(state.header.width);

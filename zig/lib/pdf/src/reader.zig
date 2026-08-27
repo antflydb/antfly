@@ -3907,7 +3907,11 @@ pub const Reader = struct {
                 if (decoded_u16.width != width or decoded_u16.height != height) return error.UnsupportedPdfRendering;
                 const sample_bytes = std.math.mul(usize, decoded_u16.pixels.len, @sizeOf(u16)) catch return error.PdfDecodeWorkingSetTooLarge;
                 const normalized_len = decoded_u16.pixels.len;
-                try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ raw.len, sample_bytes, normalized_len, rgba_len });
+                const renderer_scratch_len = if (decoded_u16.jp2_color.alphaLayout(decoded_u16.components)) |alpha_layout|
+                    std.math.mul(usize, pixel_count, alpha_layout.color_count) catch return error.PdfDecodeWorkingSetTooLarge
+                else
+                    0;
+                try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ raw.len, sample_bytes, normalized_len, rgba_len, renderer_scratch_len });
                 const layout = try self.jpeg2000SourceLayout(obj, decoded_u16.components, decoded_u16.jp2_color);
                 const source_view = ImageSourceSamples{
                     .data = .{ .u16 = decoded_u16.pixels },
@@ -3920,7 +3924,7 @@ pub const Reader = struct {
                 const transparency_live_bytes = try decodeWorkingSetTotal(
                     self.decode_limits.max_working_set_bytes,
                     ancestor_live_bytes,
-                    &.{ raw.len, sample_bytes, normalized_len, rgba_len },
+                    &.{ raw.len, sample_bytes, normalized_len, rgba_len, renderer_scratch_len },
                 );
                 var prepared_matte = try self.prepareMatteSoftMaskAlloc(&transparency_plan, source_view, obj, width, height, context, transparency_live_bytes, mask_depth);
                 defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
@@ -3935,11 +3939,15 @@ pub const Reader = struct {
             var decoded_u8 = try image_lib.jpeg2000.decodeU8Bytes(self.alloc, raw);
             defer decoded_u8.deinit();
             if (decoded_u8.width != width or decoded_u8.height != height) return error.UnsupportedPdfRendering;
-            try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ raw.len, decoded_u8.pixels.len, rgba_len });
+            const renderer_scratch_len = if (decoded_u8.jp2_color.alphaLayout(decoded_u8.components)) |alpha_layout|
+                std.math.mul(usize, pixel_count, alpha_layout.color_count) catch return error.PdfDecodeWorkingSetTooLarge
+            else
+                0;
+            try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ raw.len, decoded_u8.pixels.len, rgba_len, renderer_scratch_len });
             const transparency_live_bytes = try decodeWorkingSetTotal(
                 self.decode_limits.max_working_set_bytes,
                 ancestor_live_bytes,
-                &.{ raw.len, decoded_u8.pixels.len, rgba_len },
+                &.{ raw.len, decoded_u8.pixels.len, rgba_len, renderer_scratch_len },
             );
             var source_view: ?ImageSourceSamples = null;
             if (transparency_plan.needsNativeSamples()) {
@@ -3964,18 +3972,25 @@ pub const Reader = struct {
             return .{ .rgba = rgba, .width = width, .height = height };
         }
         if (!image_mask and streamHasFilter(obj.get("Filter"), "DCTDecode")) {
-            if (transparency_plan.nativeMatte()) |matte| {
-                // The JPEG API intentionally returns display RGBA. Native
-                // Matte reversal is therefore safe only where those channels
-                // are the parent sample domain; reject other color spaces
-                // before paying for a full entropy decode.
-                if (matte.component_count != 1 and matte.component_count != 3) return error.UnsupportedPdfRendering;
-                const color_space = (obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering).asName() orelse
-                    return error.UnsupportedPdfRendering;
-                if (!std.mem.eql(u8, color_space, "DeviceGray") and
-                    !std.mem.eql(u8, color_space, "G") and
-                    !std.mem.eql(u8, color_space, "DeviceRGB") and
-                    !std.mem.eql(u8, color_space, "RGB")) return error.UnsupportedPdfRendering;
+            const needs_sample_pipeline = transparency_plan.needsNativeSamples() or obj.get("Decode") != null;
+            var source_component_count: usize = 0;
+            var source_device_space: []const u8 = "";
+            if (needs_sample_pipeline) {
+                if (bits_i != 8) return error.UnsupportedPdfRendering;
+                const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
+                var color_space = try self.resolveValue(color_space_obj);
+                defer color_space.deinit(self.alloc);
+                const name = color_space.asName() orelse return error.UnsupportedPdfRendering;
+                if (std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G")) {
+                    source_component_count = 1;
+                    source_device_space = "DeviceGray";
+                } else if (std.mem.eql(u8, name, "DeviceRGB") or std.mem.eql(u8, name, "RGB")) {
+                    source_component_count = 3;
+                    source_device_space = "DeviceRGB";
+                } else return error.UnsupportedPdfRendering;
+                if (transparency_plan.nativeMatte()) |matte| {
+                    if (matte.component_count != source_component_count) return error.UnsupportedPdfRendering;
+                }
             }
             const raw = try self.readRawStreamData(obj);
             const encoded = try decodeStreamFiltersBeforeOwnedAlloc(
@@ -3990,59 +4005,53 @@ pub const Reader = struct {
             const jpeg_decoded = try image_lib.jpeg.decodeRgba(self.alloc, encoded);
             errdefer self.alloc.free(jpeg_decoded.rgba);
             if (jpeg_decoded.width != width or jpeg_decoded.height != height) return error.UnsupportedPdfRendering;
-            try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, jpeg_decoded.rgba.len });
+            const source_len = if (needs_sample_pipeline)
+                std.math.mul(usize, pixel_count, source_component_count) catch return error.PdfDecodeWorkingSetTooLarge
+            else
+                0;
+            try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, jpeg_decoded.rgba.len, source_len });
             var source_view: ?ImageSourceSamples = null;
-            var gray_samples: ?[]u8 = null;
-            defer if (gray_samples) |samples| self.alloc.free(samples);
-            if (transparency_plan.needsNativeSamples()) {
-                const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
-                var color_space = try self.resolveValue(color_space_obj);
-                defer color_space.deinit(self.alloc);
-                const name = color_space.asName() orelse return error.UnsupportedPdfRendering;
-                const component_count: usize = if (std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G"))
-                    1
-                else if (std.mem.eql(u8, name, "DeviceRGB") or std.mem.eql(u8, name, "RGB"))
-                    3
-                else
-                    return error.UnsupportedPdfRendering;
-                if (bits_i != 8) return error.UnsupportedPdfRendering;
-                if (component_count == 1) {
-                    gray_samples = try self.alloc.alloc(u8, pixel_count);
-                    for (gray_samples.?, 0..) |*sample, pixel| sample.* = jpeg_decoded.rgba[pixel * 4];
-                    source_view = .{
-                        .data = .{ .u8 = gray_samples.? },
-                        .pixel_count = pixel_count,
-                        .component_count = 1,
-                        .stride = 1,
-                        .bits_per_component = 8,
-                    };
-                } else source_view = .{
-                    .data = .{ .u8 = jpeg_decoded.rgba },
+            var source_samples: ?[]u8 = null;
+            defer if (source_samples) |samples| self.alloc.free(samples);
+            if (needs_sample_pipeline) {
+                source_samples = try self.alloc.alloc(u8, source_len);
+                for (0..pixel_count) |pixel| {
+                    const rgba_offset = pixel * 4;
+                    const source_offset = pixel * source_component_count;
+                    source_samples.?[source_offset] = jpeg_decoded.rgba[rgba_offset];
+                    if (source_component_count == 3) {
+                        source_samples.?[source_offset + 1] = jpeg_decoded.rgba[rgba_offset + 1];
+                        source_samples.?[source_offset + 2] = jpeg_decoded.rgba[rgba_offset + 2];
+                    }
+                }
+                if (transparency_plan.needsNativeSamples()) source_view = .{
+                    .data = .{ .u8 = source_samples.? },
                     .pixel_count = pixel_count,
-                    .component_count = component_count,
-                    .stride = 4,
+                    .component_count = source_component_count,
+                    .stride = source_component_count,
                     .bits_per_component = 8,
                 };
             }
-            const gray_live_bytes = if (gray_samples) |samples| samples.len else 0;
             const transparency_live_bytes = try decodeWorkingSetTotal(
                 self.decode_limits.max_working_set_bytes,
                 ancestor_live_bytes,
-                &.{ encoded.len, jpeg_decoded.rgba.len, gray_live_bytes },
+                &.{ encoded.len, jpeg_decoded.rgba.len, source_len },
             );
             var prepared_matte = if (source_view) |view|
                 try self.prepareMatteSoftMaskAlloc(&transparency_plan, view, obj, width, height, context, transparency_live_bytes, mask_depth)
             else
                 null;
             defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
-            if (prepared_matte != null) if (gray_samples) |samples| {
-                for (samples, 0..) |sample, pixel| {
-                    const offset = pixel * 4;
-                    jpeg_decoded.rgba[offset + 0] = sample;
-                    jpeg_decoded.rgba[offset + 1] = sample;
-                    jpeg_decoded.rgba[offset + 2] = sample;
-                }
-            };
+            // Matte reversal mutates encoded parent samples. Apply /Decode only
+            // afterward, matching the ordinary image pipeline and avoiding a
+            // second decode transform during soft-mask processing.
+            if (source_samples) |samples| try decodeDeviceColorSpaceToRgba(
+                jpeg_decoded.rgba,
+                pixel_count,
+                samples,
+                source_device_space,
+                obj.get("Decode"),
+            );
             try self.applyImageTransparencyPlanAlloc(jpeg_decoded.rgba, width, height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
             return .{
                 .rgba = jpeg_decoded.rgba,
@@ -4133,15 +4142,14 @@ pub const Reader = struct {
             defer color_space.deinit(self.alloc);
             break :blk try self.colorSpaceInputComponentCount(&color_space);
         } else if (jp2_color.alphaLayout(components) != null)
-            3
+            jp2_color.alphaLayout(components).?.color_count
         else blk: {
-            const inferred = try jpeg2000InferredDeviceColorSpace(jp2_color, components);
-            break :blk if (std.mem.eql(u8, inferred, "DeviceGray")) @as(usize, 1) else if (std.mem.eql(u8, inferred, "DeviceRGB")) @as(usize, 3) else @as(usize, 4);
+            break :blk (try jpeg2000InferredColorSpace(jp2_color, components)).componentCount();
         };
         var offsets: [4]u8 = .{ 0, 1, 2, 3 };
         if (jp2_color.alphaLayout(components)) |layout| {
-            if (component_count != 3) return error.UnsupportedPdfRendering;
-            offsets = .{ layout.red, layout.green, layout.blue, layout.alpha };
+            if (component_count != layout.color_count) return error.UnsupportedPdfRendering;
+            offsets = layout.color_offsets;
         } else if (component_count != components) return error.UnsupportedPdfRendering;
         return .{ .component_count = component_count, .offsets = offsets };
     }
@@ -4162,51 +4170,90 @@ pub const Reader = struct {
         if (pixels.len != sample_count) return error.UnsupportedPdfRendering;
 
         const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
+        const compact_len = if (jp2_color.alphaLayout(components)) |layout|
+            std.math.mul(usize, pixel_count, layout.color_count) catch return error.UnsupportedPdfRendering
+        else
+            0;
+        try ensureDecodeWorkingSet(self.decode_limits.max_working_set_bytes, &.{ pixels.len, rgba_len, compact_len });
         const rgba = try self.alloc.alloc(u8, rgba_len);
         errdefer self.alloc.free(rgba);
         const decode_obj = image_obj.get("Decode");
+        const alpha_layout = jp2_color.alphaLayout(components);
+        if (alpha_mode != .ignore and alpha_layout == null) return error.UnsupportedPdfRendering;
+
+        var compact: ?[]u8 = null;
+        defer if (compact) |samples| self.alloc.free(samples);
+        const color_samples: []const u8 = if (alpha_layout) |layout| blk: {
+            const allocated_compact_len = std.math.mul(usize, pixel_count, layout.color_count) catch
+                return error.UnsupportedPdfRendering;
+            const samples = try self.alloc.alloc(u8, allocated_compact_len);
+            compact = samples;
+            for (0..pixel_count) |pixel| {
+                const source_base = pixel * components;
+                const destination_base = pixel * layout.color_count;
+                const alpha = pixels[source_base + layout.alpha];
+                for (0..layout.color_count) |component| {
+                    const raw = pixels[source_base + layout.color_offsets[component]];
+                    samples[destination_base + component] = if (alpha_mode == .premultiplied)
+                        try unpremultiplyEncodedByte(raw, alpha, decode_obj, component)
+                    else
+                        raw;
+                }
+            }
+            break :blk samples;
+        } else pixels;
+        const color_component_count: usize = if (alpha_layout) |layout| layout.color_count else components;
 
         if (image_obj.get("ColorSpace")) |color_space_obj| {
             var resolved_color_space = try self.resolveValue(color_space_obj);
             defer resolved_color_space.deinit(self.alloc);
-
-            if (jp2_color.alphaLayout(components)) |layout| {
-                if (try self.colorSpaceInputComponentCount(&resolved_color_space) != 3) return error.UnsupportedPdfRendering;
-                try decodeJpeg2000RgbaChannels(rgba, pixel_count, pixels, layout, decode_obj, alpha_mode);
-                return rgba;
-            }
-            if (alpha_mode != .ignore or try self.colorSpaceInputComponentCount(&resolved_color_space) != components)
+            if (try self.colorSpaceInputComponentCount(&resolved_color_space) != color_component_count)
                 return error.UnsupportedPdfRendering;
-
-            if (resolved_color_space.asName()) |color_space| {
-                try decodeDeviceColorSpaceToRgba(rgba, pixel_count, pixels, color_space, decode_obj);
-            } else if (resolved_color_space == .array) {
-                if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, pixels, resolved_color_space.array, decode_obj)) {
-                    // handled
-                } else if (try self.tryDecodeCalibratedImageToRgba(rgba, pixel_count, pixels, resolved_color_space.array, decode_obj)) {
-                    // handled
-                } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, pixels, resolved_color_space.array, decode_obj)) {
-                    // handled
-                } else {
-                    try self.decodeIndexedImageToRgba(rgba, pixel_count, pixels, resolved_color_space.array, decode_obj);
-                }
-            } else {
-                return error.UnsupportedPdfRendering;
-            }
-            return rgba;
-        }
-
-        // PDF permits ColorSpace to be omitted only when the JP2 container
-        // supplies enough color metadata. Do not infer four channels as RGBA:
-        // enumerated JP2 CMYK and explicit opacity are distinct layouts.
-        if (jp2_color.alphaLayout(components)) |layout| {
-            try decodeJpeg2000RgbaChannels(rgba, pixel_count, pixels, layout, decode_obj, alpha_mode);
+            try self.decodeResolvedImageColorSpaceToRgba(rgba, pixel_count, color_samples, &resolved_color_space, decode_obj);
         } else {
-            if (alpha_mode != .ignore) return error.UnsupportedPdfRendering;
-            const color_space = try jpeg2000InferredDeviceColorSpace(jp2_color, components);
-            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, pixels, color_space, decode_obj);
+            // Embedded ICC profiles require a real profile transform. Mapping
+            // them to a same-component device space silently changes colors,
+            // so fail closed until the native color engine supports that path.
+            const container_space = try jpeg2000InferredColorSpace(jp2_color, @intCast(color_component_count));
+            switch (container_space) {
+                .gray => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, color_samples, "DeviceGray", decode_obj),
+                .rgb => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, color_samples, "DeviceRGB", decode_obj),
+                .cmyk => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, color_samples, "DeviceCMYK", decode_obj),
+                .sycc => try decodeJpeg2000SyccToRgba(rgba, pixel_count, color_samples, decode_obj),
+            }
+        }
+        if (alpha_layout) |layout| {
+            for (0..pixel_count) |pixel| {
+                rgba[pixel * 4 + 3] = if (alpha_mode == .ignore)
+                    0xff
+                else
+                    pixels[pixel * components + layout.alpha];
+            }
         }
         return rgba;
+    }
+
+    fn decodeResolvedImageColorSpaceToRgba(
+        self: *const Reader,
+        rgba: []u8,
+        pixel_count: usize,
+        samples: []const u8,
+        resolved_color_space: *const syntax.Object,
+        decode_obj: ?*const syntax.Object,
+    ) !void {
+        if (resolved_color_space.asName()) |color_space| {
+            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, samples, color_space, decode_obj);
+        } else if (resolved_color_space.* == .array) {
+            if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+                // handled
+            } else if (try self.tryDecodeCalibratedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+                // handled
+            } else if (try self.tryDecodeSpotColorSpaceToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
+                // handled
+            } else {
+                try self.decodeIndexedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj);
+            }
+        } else return error.UnsupportedPdfRendering;
     }
 
     fn colorSpaceInputComponentCount(self: *const Reader, color_space: *const syntax.Object) !usize {
@@ -4243,38 +4290,23 @@ pub const Reader = struct {
         return error.UnsupportedPdfRendering;
     }
 
-    fn decodeJpeg2000RgbaChannels(
+    fn decodeJpeg2000SyccToRgba(
         rgba: []u8,
         pixel_count: usize,
         decoded: []const u8,
-        layout: image_lib.jpeg2000.Jp2ColorMetadata.AlphaLayout,
         decode_obj: ?*const syntax.Object,
-        alpha_mode: JpxAlphaMode,
     ) !void {
-        if (decoded.len != pixel_count * 4) return error.UnsupportedPdfRendering;
-        var i: usize = 0;
-        while (i < pixel_count) : (i += 1) {
-            const src = i * 4;
+        if (decoded.len != pixel_count * 3 or rgba.len < pixel_count * 4) return error.UnsupportedPdfRendering;
+        for (0..pixel_count) |i| {
+            const src = i * 3;
             const dst = i * 4;
-            const alpha = if (alpha_mode == .ignore) @as(u8, 0xff) else decoded[src + layout.alpha];
-            var red = applyDecodeByte(decoded[src + layout.red], decode_obj, 0);
-            var green = applyDecodeByte(decoded[src + layout.green], decode_obj, 1);
-            var blue = applyDecodeByte(decoded[src + layout.blue], decode_obj, 2);
-            if (alpha_mode == .premultiplied) {
-                if (alpha == 0) {
-                    red = 0;
-                    green = 0;
-                    blue = 0;
-                } else {
-                    red = @intCast(@min(@as(u32, 255), (@as(u32, red) * 255 + alpha / 2) / alpha));
-                    green = @intCast(@min(@as(u32, 255), (@as(u32, green) * 255 + alpha / 2) / alpha));
-                    blue = @intCast(@min(@as(u32, 255), (@as(u32, blue) * 255 + alpha / 2) / alpha));
-                }
-            }
-            rgba[dst + 0] = red;
-            rgba[dst + 1] = green;
-            rgba[dst + 2] = blue;
-            rgba[dst + 3] = alpha;
+            const y = applyDecodeUnit(decoded[src], decode_obj, 0);
+            const cb = applyDecodeUnit(decoded[src + 1], decode_obj, 1) - 0.5;
+            const cr = applyDecodeUnit(decoded[src + 2], decode_obj, 2) - 0.5;
+            rgba[dst + 0] = floatChannel(y + 1.402 * cr);
+            rgba[dst + 1] = floatChannel(y - 0.344136 * cb - 0.714136 * cr);
+            rgba[dst + 2] = floatChannel(y + 1.772 * cb);
+            rgba[dst + 3] = 0xff;
         }
     }
 
@@ -10595,17 +10627,28 @@ fn parseJpxAlphaMode(obj: *const syntax.Object, has_jpx: bool) !JpxAlphaMode {
     };
 }
 
-fn jpeg2000InferredDeviceColorSpace(metadata: image_lib.jpeg2000.Jp2ColorMetadata, components: u8) ![]const u8 {
+const Jpeg2000ColorSpace = enum {
+    gray,
+    rgb,
+    cmyk,
+    sycc,
+
+    fn componentCount(self: Jpeg2000ColorSpace) usize {
+        return switch (self) {
+            .gray => 1,
+            .rgb, .sycc => 3,
+            .cmyk => 4,
+        };
+    }
+};
+
+fn jpeg2000InferredColorSpace(metadata: image_lib.jpeg2000.Jp2ColorMetadata, components: u8) !Jpeg2000ColorSpace {
+    if (metadata.has_icc_profile) return error.UnsupportedPdfRendering;
     if (metadata.enumerated_color_space) |color_space| return switch (color_space) {
-        12 => if (components == 4) "DeviceCMYK" else error.UnsupportedPdfRendering,
-        16, 18 => if (components == 3) "DeviceRGB" else error.UnsupportedPdfRendering,
-        17 => if (components == 1) "DeviceGray" else error.UnsupportedPdfRendering,
-        else => error.UnsupportedPdfRendering,
-    };
-    if (metadata.has_icc_profile) return switch (components) {
-        1 => "DeviceGray",
-        3 => "DeviceRGB",
-        4 => "DeviceCMYK",
+        12 => if (components == 4) .cmyk else error.UnsupportedPdfRendering,
+        16 => if (components == 3) .rgb else error.UnsupportedPdfRendering,
+        17 => if (components == 1) .gray else error.UnsupportedPdfRendering,
+        18 => if (components == 3) .sycc else error.UnsupportedPdfRendering,
         else => error.UnsupportedPdfRendering,
     };
     return error.UnsupportedPdfRendering;
@@ -10697,6 +10740,23 @@ fn invertDecodeNormalized(value: f64, decode_obj: ?*const syntax.Object, compone
     const span = range.max - range.min;
     if (!std.math.isFinite(span) or @abs(span) <= std.math.floatEps(f64)) return error.UnsupportedPdfRendering;
     return std.math.clamp((value - range.min) / span, 0.0, 1.0);
+}
+
+fn unpremultiplyEncodedByte(
+    encoded: u8,
+    alpha: u8,
+    decode_obj: ?*const syntax.Object,
+    component_index: usize,
+) !u8 {
+    if (alpha == 0) return 0;
+    const decoded = applyDecodeNormalized(
+        @as(f64, @floatFromInt(encoded)) / 255.0,
+        decode_obj,
+        component_index,
+    );
+    const opacity = @as(f64, @floatFromInt(alpha)) / 255.0;
+    const straight = std.math.clamp(decoded / opacity, 0.0, 1.0);
+    return floatChannel(try invertDecodeNormalized(straight, decode_obj, component_index));
 }
 
 fn unblendNativeComponent(preblended: f64, alpha: u8, matte: f64) f64 {
@@ -13631,7 +13691,7 @@ test "reader decodes one-component DeviceN image xobject draw" {
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[2]);
 }
 
-test "reader decodes DCTDecode image xobject draw" {
+test "reader applies PDF Decode after DCTDecode" {
     const alloc = std.testing.allocator;
     const jpeg_base64 =
         "/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjI4LjEwMAD/2wBDAAgEBAQEBAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABLAAEBAAAAAAAAAAAAAAAAAAAABwEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIAAEAAgMBIgACEQADEQD/2gAMAwEAAhEDEQA/AL+AD//Z";
@@ -13648,7 +13708,7 @@ test "reader decodes DCTDecode image xobject draw" {
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
         try std.fmt.allocPrint(
             alloc,
-            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Decode [1 0 1 0 1 0] /Filter /DCTDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
             .{ jpeg_bytes.len, jpeg_bytes },
         ),
     };
@@ -13686,9 +13746,9 @@ test "reader decodes DCTDecode image xobject draw" {
     try std.testing.expectEqual(@as(usize, 1), runs.len);
     try std.testing.expectEqual(@as(u32, 2), runs[0].width);
     try std.testing.expectEqual(@as(u32, 1), runs[0].height);
-    try std.testing.expect(runs[0].rgba[0] > 200);
-    try std.testing.expect(runs[0].rgba[1] > 200);
-    try std.testing.expect(runs[0].rgba[2] > 200);
+    try std.testing.expect(runs[0].rgba[0] < 55);
+    try std.testing.expect(runs[0].rgba[1] < 55);
+    try std.testing.expect(runs[0].rgba[2] < 55);
 }
 
 test "reader decodes JPXDecode image xobject draw" {
@@ -14996,31 +15056,33 @@ test "color key mask supports four-component source samples and rejects malforme
 }
 
 test "JPX embedded alpha obeys SMaskInData modes" {
-    const pixels = [_]u8{ 64, 32, 16, 128 };
-    const layout = image_lib.jpeg2000.Jp2ColorMetadata.AlphaLayout{
-        .red = 0,
-        .green = 1,
-        .blue = 2,
-        .alpha = 3,
-        .premultiplied = false,
-    };
-    var rgba: [4]u8 = undefined;
-
-    try Reader.decodeJpeg2000RgbaChannels(&rgba, 1, &pixels, layout, null, .ignore);
-    try std.testing.expectEqualSlices(u8, &.{ 64, 32, 16, 255 }, &rgba);
-
-    try Reader.decodeJpeg2000RgbaChannels(&rgba, 1, &pixels, layout, null, .straight);
-    try std.testing.expectEqualSlices(u8, &.{ 64, 32, 16, 128 }, &rgba);
-
-    try Reader.decodeJpeg2000RgbaChannels(&rgba, 1, &pixels, layout, null, .premultiplied);
-    try std.testing.expectEqualSlices(u8, &.{ 128, 64, 32, 128 }, &rgba);
+    try std.testing.expectEqual(@as(u8, 128), try unpremultiplyEncodedByte(64, 128, null, 0));
+    try std.testing.expectEqual(@as(u8, 64), try unpremultiplyEncodedByte(32, 128, null, 1));
+    try std.testing.expectEqual(@as(u8, 32), try unpremultiplyEncodedByte(16, 128, null, 2));
+    try std.testing.expectEqual(@as(u8, 0), try unpremultiplyEncodedByte(16, 0, null, 2));
 }
 
 test "JP2 metadata distinguishes CMYK from embedded alpha" {
-    try std.testing.expectEqualStrings("DeviceCMYK", try jpeg2000InferredDeviceColorSpace(.{
+    try std.testing.expectEqual(Jpeg2000ColorSpace.cmyk, try jpeg2000InferredColorSpace(.{
         .enumerated_color_space = 12,
     }, 4));
-    try std.testing.expectError(error.UnsupportedPdfRendering, jpeg2000InferredDeviceColorSpace(.{}, 4));
+    try std.testing.expectEqual(Jpeg2000ColorSpace.sycc, try jpeg2000InferredColorSpace(.{
+        .enumerated_color_space = 18,
+    }, 3));
+    try std.testing.expectError(error.UnsupportedPdfRendering, jpeg2000InferredColorSpace(.{ .has_icc_profile = true }, 3));
+    try std.testing.expectError(error.UnsupportedPdfRendering, jpeg2000InferredColorSpace(.{}, 4));
+}
+
+test "JP2 sYCC conversion uses chroma rather than treating channels as RGB" {
+    var rgba: [8]u8 = undefined;
+    const samples = [_]u8{ 128, 128, 128, 76, 85, 255 };
+    try Reader.decodeJpeg2000SyccToRgba(&rgba, 2, &samples, null);
+    try std.testing.expect(@abs(@as(i16, rgba[0]) - 128) <= 1);
+    try std.testing.expect(@abs(@as(i16, rgba[1]) - 128) <= 1);
+    try std.testing.expect(@abs(@as(i16, rgba[2]) - 128) <= 1);
+    try std.testing.expect(rgba[4] > 240);
+    try std.testing.expect(rgba[5] < 20);
+    try std.testing.expect(rgba[6] < 20);
 }
 
 test "native Matte reversal supports four-component parent samples" {
@@ -15040,6 +15102,28 @@ test "native Matte reversal supports four-component parent samples" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.7), @as(f64, @floatFromInt(samples[1])) / 255.0, 0.01);
     try std.testing.expectApproxEqAbs(@as(f64, 0.6), @as(f64, @floatFromInt(samples[2])) / 255.0, 0.01);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), @as(f64, @floatFromInt(samples[3])) / 255.0, 0.01);
+}
+
+test "native Matte reversal precedes PDF Decode mapping" {
+    var samples = [_]u8{64};
+    const mask = [_]u8{ 128, 128, 128, 255 };
+    const decode_values = [_]syntax.Object{ .{ .integer = 1 }, .{ .integer = 0 } };
+    const decode = syntax.Object{ .array = @constCast(&decode_values) };
+    try applyResampledMatteToSamples(.{
+        .data = .{ .u8 = &samples },
+        .pixel_count = 1,
+        .component_count = 1,
+        .stride = 1,
+        .bits_per_component = 8,
+    }, 1, 1, &mask, 1, 1, false, .{
+        .component_count = 1,
+        .components = .{ 0.25, 0, 0, 0 },
+    }, &decode);
+    var rgba: [4]u8 = undefined;
+    try Reader.decodeDeviceColorSpaceToRgba(&rgba, 1, &samples, "DeviceGray", &decode);
+    try std.testing.expect(samples[0] < 2);
+    try std.testing.expect(rgba[0] > 253);
+    try std.testing.expectEqual(@as(u8, 0xff), rgba[3]);
 }
 
 test "mask decode context rejects an active reference immediately" {

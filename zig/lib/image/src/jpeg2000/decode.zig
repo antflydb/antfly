@@ -112,7 +112,7 @@ pub const Header = struct {
     }
 
     pub fn supportsDecodeU16(self: Header) bool {
-        return (self.components == 1 or self.components == 3) and self.bits_per_component >= 1 and self.bits_per_component <= 16;
+        return self.components >= 1 and self.components <= 5 and self.bits_per_component >= 1 and self.bits_per_component <= 16;
     }
 };
 
@@ -120,15 +120,14 @@ pub const Jp2ColorMetadata = struct {
     color_method: ?box.ColorMethod = null,
     enumerated_color_space: ?u32 = null,
     has_icc_profile: bool = false,
-    /// Indexed by codestream component. Four is the maximum component count
+    /// Indexed by codestream component. Five is the maximum component count
     /// accepted by the U8 decoder, so metadata remains allocation-free after
     /// the JP2 box parser returns.
-    channel_definitions: [4]?box.ChannelDefinition = .{null} ** 4,
+    channel_definitions: [5]?box.ChannelDefinition = .{null} ** 5,
 
     pub const AlphaLayout = struct {
-        red: u8,
-        green: u8,
-        blue: u8,
+        color_count: u8,
+        color_offsets: [4]u8,
         alpha: u8,
         premultiplied: bool,
     };
@@ -149,13 +148,15 @@ pub const Jp2ColorMetadata = struct {
         return metadata;
     }
 
-    /// Resolve JP2 channel definitions into straight RGBA component indexes.
+    /// Resolve JP2 channel definitions into color-plus-opacity component indexes.
     /// Partial color associations are completed in codestream order, but an
     /// explicit opacity channel is mandatory so CMYK cannot be mistaken for
     /// RGB plus alpha.
     pub fn alphaLayout(self: Jp2ColorMetadata, components: u8) ?AlphaLayout {
-        if (components != 4) return null;
-        var color_indexes: [3]?u8 = .{ null, null, null };
+        if (components < 2 or components > 5) return null;
+        const color_count: u8 = components - 1;
+        if (color_count != 1 and color_count != 3 and color_count != 4) return null;
+        var color_indexes: [4]?u8 = .{ null, null, null, null };
         var alpha: ?u8 = null;
         var premultiplied = false;
 
@@ -169,7 +170,7 @@ pub const Jp2ColorMetadata = struct {
                     premultiplied = definition.kind == .premultiplied_opacity;
                 },
                 .color => {
-                    if (definition.association >= 1 and definition.association <= 3) {
+                    if (definition.association >= 1 and definition.association <= color_count) {
                         const association: usize = definition.association - 1;
                         if (color_indexes[association] != null) return null;
                         color_indexes[association] = @intCast(component_index);
@@ -180,15 +181,15 @@ pub const Jp2ColorMetadata = struct {
         }
         const alpha_index = alpha orelse return null;
 
-        var used = [_]bool{false} ** 4;
+        var used = [_]bool{false} ** 5;
         used[alpha_index] = true;
-        for (color_indexes) |maybe_index| {
+        for (color_indexes[0..color_count]) |maybe_index| {
             if (maybe_index) |index| {
                 if (used[index]) return null;
                 used[index] = true;
             }
         }
-        for (&color_indexes) |*maybe_index| {
+        for (color_indexes[0..color_count]) |*maybe_index| {
             if (maybe_index.* != null) continue;
             for (0..components) |index| {
                 if (used[index]) continue;
@@ -198,10 +199,11 @@ pub const Jp2ColorMetadata = struct {
             }
             if (maybe_index.* == null) return null;
         }
+        var offsets: [4]u8 = .{ 0, 1, 2, 3 };
+        for (color_indexes[0..color_count], 0..) |maybe_index, index| offsets[index] = maybe_index.?;
         return .{
-            .red = color_indexes[0].?,
-            .green = color_indexes[1].?,
-            .blue = color_indexes[2].?,
+            .color_count = color_count,
+            .color_offsets = offsets,
             .alpha = alpha_index,
             .premultiplied = premultiplied,
         };
@@ -568,13 +570,7 @@ pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedI
     // refuse heterogeneous SIZ component declarations before they corrupt output.
     try reconstruct.requireHomogeneousComponents(&state.header);
 
-    // The U16 decode path does not yet support component subsampling; subsampled
-    // components must be upsampled through the U8 pipeline.
-    for (state.header.components) |component| {
-        if (component.xrsiz != 1 or component.yrsiz != 1) return error.UnsupportedSubsampling;
-    }
-
-    const coding_style = state.coding_style orelse return error.MissingCodingStyle;
+    _ = state.coding_style orelse return error.MissingCodingStyle;
 
     if (state.header.uses_multiple_tiles) {
         const pixels = try decodeMultiTileU16(allocator, codestream_bytes, &state);
@@ -630,26 +626,17 @@ pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedI
     );
     defer execution.deinit(allocator);
 
-    const use_irreversible = coding_style.wavelet_transform == 0;
-    const planes = if (use_irreversible)
-        try reconstruct.assemblePlanesFromTier1Irreversible(allocator, &decode_state, &execution)
-    else
-        try reconstruct.assemblePlanesFromTier1(allocator, &decode_state, &execution);
-    defer {
-        for (planes) |plane| allocator.free(plane);
-        allocator.free(planes);
-    }
-
-    const bits_per_component = state.header.components[0].bits_per_component;
-    const is_signed = state.header.components[0].is_signed;
-
-    const pixels = try reconstruct.interleavePlanesU16(
+    var component_planes = try reconstruct.reconstructTier1ComponentPlanesU16(
         allocator,
-        planes,
+        &decode_state,
+        &execution,
+    );
+    defer component_planes.deinit(allocator);
+    const pixels = try reconstruct.interleaveComponentPlanesU16(
+        allocator,
+        &component_planes,
         state.header.width,
         state.header.height,
-        bits_per_component,
-        is_signed,
     );
     return .{
         .allocator = allocator,
@@ -1254,11 +1241,7 @@ fn decodeMultiTileU16(
     const image_width: usize = @intCast(state.header.width);
     const image_height: usize = @intCast(state.header.height);
     const num_components: usize = state.header.components.len;
-    const coding_style = state.coding_style orelse return error.MissingCodingStyle;
-    const bits_per_component = state.header.components[0].bits_per_component;
-    const is_signed = state.header.components[0].is_signed;
-
-    const use_irreversible = coding_style.wavelet_transform == 0;
+    _ = state.coding_style orelse return error.MissingCodingStyle;
 
     const tile_grid = tile.buildTileGrid(state);
     const num_tiles: usize = @intCast(tile_grid.tileCount());
@@ -1339,22 +1322,17 @@ fn decodeMultiTileU16(
         );
         defer execution.deinit(allocator);
 
-        const planes = if (use_irreversible)
-            try reconstruct.assemblePlanesFromTier1Irreversible(allocator, &tile_state, &execution)
-        else
-            try reconstruct.assemblePlanesFromTier1(allocator, &tile_state, &execution);
-        defer {
-            for (planes) |plane| allocator.free(plane);
-            allocator.free(planes);
-        }
-
-        const pixels = try reconstruct.interleavePlanesU16(
+        var component_planes = try reconstruct.reconstructTier1ComponentPlanesU16(
             allocator,
-            planes,
+            &tile_state,
+            &execution,
+        );
+        defer component_planes.deinit(allocator);
+        const pixels = try reconstruct.interleaveComponentPlanesU16(
+            allocator,
+            &component_planes,
             this_tile_w,
             this_tile_h,
-            bits_per_component,
-            is_signed,
         );
 
         decoded_buffers[tile_idx] = pixels;
@@ -1995,11 +1973,24 @@ test "JP2 channel definitions distinguish opacity from a fourth color component"
     metadata.channel_definitions[2] = .{ .channel = 2, .kind = .color, .association = 3 };
     metadata.channel_definitions[3] = .{ .channel = 3, .kind = .opacity, .association = 0 };
     const layout = metadata.alphaLayout(4) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u8, 0), layout.red);
-    try std.testing.expectEqual(@as(u8, 1), layout.green);
-    try std.testing.expectEqual(@as(u8, 2), layout.blue);
+    try std.testing.expectEqual(@as(u8, 3), layout.color_count);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2 }, layout.color_offsets[0..3]);
     try std.testing.expectEqual(@as(u8, 3), layout.alpha);
     try std.testing.expect(!layout.premultiplied);
+
+    var gray_alpha = Jp2ColorMetadata{};
+    gray_alpha.channel_definitions[1] = .{ .channel = 1, .kind = .opacity, .association = 0 };
+    const gray_layout = gray_alpha.alphaLayout(2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 1), gray_layout.color_count);
+    try std.testing.expectEqual(@as(u8, 0), gray_layout.color_offsets[0]);
+    try std.testing.expectEqual(@as(u8, 1), gray_layout.alpha);
+
+    var cmyk_alpha = Jp2ColorMetadata{};
+    cmyk_alpha.channel_definitions[4] = .{ .channel = 4, .kind = .premultiplied_opacity, .association = 0 };
+    const cmyk_layout = cmyk_alpha.alphaLayout(5) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 4), cmyk_layout.color_count);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 2, 3 }, &cmyk_layout.color_offsets);
+    try std.testing.expect(cmyk_layout.premultiplied);
 }
 
 test "decode OpenJPEG header parsing for lossy J2K" {
@@ -2247,7 +2238,7 @@ test "decodeU8 upsamples a 2x2-subsampled single-component codestream" {
     try std.testing.expectEqual(@as(u8, 160), decoded.pixels[63]);
 }
 
-test "decodeU16 rejects subsampled input" {
+test "decodeU16 preserves exact subsampled input" {
     const allocator = std.testing.allocator;
     const pixels = [_]u8{
         0,  32,  64,  96,
@@ -2275,7 +2266,57 @@ test "decodeU16 rejects subsampled input" {
     defer allocator.free(encoded);
     try rewriteSizForSubsampling(encoded, 8, 8, 8, 8, 2, 2);
 
-    try std.testing.expectError(error.UnsupportedSubsampling, decodeU16Bytes(allocator, encoded));
+    var decoded = try decodeU16Bytes(allocator, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 8), decoded.width);
+    try std.testing.expectEqual(@as(u32, 8), decoded.height);
+    try std.testing.expectEqual(@as(u8, 1), decoded.components);
+    try std.testing.expectEqual(@as(usize, 64), decoded.pixels.len);
+    try std.testing.expectEqual(@as(u16, 0), decoded.pixels[0]);
+    try std.testing.expectEqual(@as(u16, 192), decoded.pixels[63]);
+}
+
+test "decode supports native gray-alpha and high-bit CMYK component layouts" {
+    const allocator = std.testing.allocator;
+    const gray_alpha = [_]u8{ 10, 20, 30, 40, 50, 60, 70, 80 };
+    const u8_params = encode.EncodeParams{
+        .width = 2,
+        .height = 2,
+        .components = 2,
+        .decomposition_levels = 0,
+        .wavelet_transform = 1,
+        .multiple_component_transform = false,
+        .format = .j2k,
+    };
+    const gray_alpha_encoded = try encode.encodeU8Bytes(allocator, &gray_alpha, &u8_params);
+    defer allocator.free(gray_alpha_encoded);
+    var gray_alpha_decoded = try decodeU8Bytes(allocator, gray_alpha_encoded);
+    defer gray_alpha_decoded.deinit();
+    try std.testing.expectEqual(@as(u8, 2), gray_alpha_decoded.components);
+    try std.testing.expectEqualSlices(u8, &gray_alpha, gray_alpha_decoded.pixels);
+
+    const cmyk = [_]u16{
+        0,   100, 200,  300,
+        400, 500, 600,  700,
+        800, 900, 1000, 1023,
+        12,  34,  56,   78,
+    };
+    const u16_params = encode.EncodeParams{
+        .width = 2,
+        .height = 2,
+        .components = 4,
+        .bits_per_component = 10,
+        .decomposition_levels = 0,
+        .wavelet_transform = 1,
+        .multiple_component_transform = false,
+        .format = .j2k,
+    };
+    const cmyk_encoded = try encode.encodeU16Bytes(allocator, &cmyk, &u16_params);
+    defer allocator.free(cmyk_encoded);
+    var cmyk_decoded = try decodeU16Bytes(allocator, cmyk_encoded);
+    defer cmyk_decoded.deinit();
+    try std.testing.expectEqual(@as(u8, 4), cmyk_decoded.components);
+    try std.testing.expectEqualSlices(u16, &cmyk, cmyk_decoded.pixels);
 }
 
 const SplitTilePayload = struct {

@@ -174,6 +174,50 @@ pub fn bilinearI32(
     return out;
 }
 
+/// Bilinear upsampling for exact unsigned component samples. Interpolation is
+/// performed in the native sample domain and rounded once, preserving the
+/// endpoints needed by PDF color-key and Matte processing.
+pub fn bilinearU16(
+    allocator: std.mem.Allocator,
+    input: []const u16,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+) ![]u16 {
+    std.debug.assert(in_width > 0 and in_height > 0);
+    std.debug.assert(out_width > 0 and out_height > 0);
+    const out = try allocator.alloc(u16, out_width * out_height);
+    errdefer allocator.free(out);
+
+    const x_scale = @as(f64, @floatFromInt(in_width)) / @as(f64, @floatFromInt(out_width));
+    const y_scale = @as(f64, @floatFromInt(in_height)) / @as(f64, @floatFromInt(out_height));
+    const max_x: isize = @as(isize, @intCast(in_width)) - 1;
+    const max_y: isize = @as(isize, @intCast(in_height)) - 1;
+    for (0..out_height) |y| {
+        const sy = (@as(f64, @floatFromInt(y)) + 0.5) * y_scale - 0.5;
+        const y0_f = @floor(sy);
+        const fy = sy - y0_f;
+        const y0_i: isize = @intFromFloat(y0_f);
+        const y0: usize = @intCast(clampISize(y0_i, 0, max_y));
+        const y1: usize = @intCast(clampISize(y0_i + 1, 0, max_y));
+        for (0..out_width) |x| {
+            const sx = (@as(f64, @floatFromInt(x)) + 0.5) * x_scale - 0.5;
+            const x0_f = @floor(sx);
+            const fx = sx - x0_f;
+            const x0_i: isize = @intFromFloat(x0_f);
+            const x0: usize = @intCast(clampISize(x0_i, 0, max_x));
+            const x1: usize = @intCast(clampISize(x0_i + 1, 0, max_x));
+            const top = @as(f64, @floatFromInt(input[y0 * in_width + x0])) * (1.0 - fx) +
+                @as(f64, @floatFromInt(input[y0 * in_width + x1])) * fx;
+            const bottom = @as(f64, @floatFromInt(input[y1 * in_width + x0])) * (1.0 - fx) +
+                @as(f64, @floatFromInt(input[y1 * in_width + x1])) * fx;
+            out[y * out_width + x] = @intFromFloat(@round(top * (1.0 - fy) + bottom * fy));
+        }
+    }
+    return out;
+}
+
 /// Bilinear upsampling for f32 planes.
 pub fn bilinearF32(
     allocator: std.mem.Allocator,
@@ -588,8 +632,8 @@ test "upsampleI32 dispatch lanczos2x falls back to bilinear for non-2x" {
     const allocator = std.testing.allocator;
     // 4x3 -> 7x5 is not a 2x integer upscale so it must fall back to bilinear.
     const input = [_]i32{
-        0,  40, 80, 120,
-        10, 50, 90, 130,
+        0,  40, 80,  120,
+        10, 50, 90,  130,
         20, 60, 100, 140,
     };
     const a = try upsampleI32(allocator, .lanczos2x, &input, 4, 3, 7, 5);
