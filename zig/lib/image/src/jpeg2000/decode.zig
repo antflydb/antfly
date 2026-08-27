@@ -438,6 +438,65 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
     };
 }
 
+/// Decode a single-tile codestream at a lower DWT resolution. The requested
+/// discard count is clamped to the codestream's decomposition depth. Compact
+/// equal-grid component planes are interleaved directly, avoiding a full-size
+/// presentation buffer when a PDF renderer needs only page-raster resolution.
+pub fn decodeU8BytesAtResolution(allocator: std.mem.Allocator, bytes: []const u8, requested_discard_levels: u8) !DecodedImage {
+    if (requested_discard_levels == 0) return decodeU8Bytes(allocator, bytes);
+
+    var jp2_color = Jp2ColorMetadata{};
+    const codestream_bytes = if (box.hasSignature(bytes)) blk: {
+        var parsed = try box.parseOwned(allocator, bytes);
+        defer box.freeParsed(allocator, &parsed);
+        jp2_color = Jp2ColorMetadata.fromParsed(parsed);
+        const offset = parsed.codestream_offset orelse return error.MissingCodestreamBox;
+        break :blk bytes[offset..];
+    } else if (codestream.hasSoc(bytes))
+        bytes
+    else
+        return error.UnsupportedImageFormat;
+
+    var state = try codestream.parseState(allocator, codestream_bytes);
+    defer state.deinit(allocator);
+    if (state.header.uses_multiple_tiles) return error.UnsupportedReducedMultiTileDecode;
+    if (state.fullNativeDecodeSupport() != .supported) return error.UnsupportedNativeDecode;
+    try reconstruct.requireHomogeneousComponents(&state.header);
+    const coding_style = state.coding_style orelse return error.MissingCodingStyle;
+    const discard_levels = @min(requested_discard_levels, coding_style.decomposition_levels);
+    if (discard_levels == 0) return decodeU8Bytes(allocator, bytes);
+
+    var component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, &state, discard_levels);
+    defer component_planes.deinit(allocator);
+    if (component_planes.planes.len == 0 or component_planes.planes.len > 5)
+        return error.UnsupportedPlaneCount;
+    const width = component_planes.widths[0];
+    const height = component_planes.heights[0];
+    for (component_planes.planes, 0..) |plane, index| {
+        if (component_planes.widths[index] != width or component_planes.heights[index] != height)
+            return error.UnsupportedReducedSubsampledDecode;
+        const plane_len = std.math.mul(usize, width, height) catch return error.InvalidPlaneLength;
+        if (plane.len != plane_len) return error.InvalidPlaneLength;
+    }
+    const pixel_count = std.math.mul(usize, width, height) catch return error.InvalidPlaneLength;
+    const output_len = std.math.mul(usize, pixel_count, component_planes.planes.len) catch return error.InvalidPlaneLength;
+    const pixels = try allocator.alloc(u8, output_len);
+    errdefer allocator.free(pixels);
+    for (0..pixel_count) |pixel_index| {
+        for (component_planes.planes, 0..) |plane, component_index|
+            pixels[pixel_index * component_planes.planes.len + component_index] = plane[pixel_index];
+    }
+    return .{
+        .allocator = allocator,
+        .width = @intCast(width),
+        .height = @intCast(height),
+        .components = @intCast(component_planes.planes.len),
+        .backend = .pure_zig,
+        .pixels = pixels,
+        .jp2_color = jp2_color,
+    };
+}
+
 pub fn decodeComponentPlanesU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedComponentPlanesU8 {
     return decodeComponentPlanesU8BytesAtResolution(allocator, bytes, 0);
 }
@@ -765,7 +824,7 @@ fn decodeStreamingRawPlanes(
     policy: Tier1Policy,
     discard_levels: u8,
 ) ![][]i32 {
-    var assembler = try reconstruct.StreamingPlaneAssembler.init(allocator, state);
+    var assembler = try reconstruct.StreamingPlaneAssembler.initAtResolution(allocator, state, discard_levels);
     defer assembler.deinit();
     const Visitor = struct {
         fn visit(context: *anyopaque, codeblock_state: *const packet.Tier1CodeblockState) !void {
@@ -1777,6 +1836,25 @@ test "OfficeQA JPEG 2000 page decodes natively within bounded memory" {
     decoded.deinit();
     try std.testing.expectEqual(@as(usize, 0), peak.live_bytes);
 }
+
+test "reduced JPEG 2000 decode bounds coefficient planes before reconstruction" {
+    const fixture = try readTestFile(
+        std.testing.allocator,
+        "testdata/image/jpeg2000/regression/officeqa-1985-page1-2319x3253.j2k",
+    );
+    defer std.testing.allocator.free(fixture);
+
+    var peak = TestPeakAllocator{ .backing = std.testing.allocator };
+    var decoded = try decodeU8BytesAtResolution(peak.allocator(), fixture, 1);
+    try std.testing.expectEqual(@as(u32, 1160), decoded.width);
+    try std.testing.expectEqual(@as(u32, 1627), decoded.height);
+    try std.testing.expectEqual(@as(u8, 3), decoded.components);
+    try std.testing.expectEqual(@as(usize, 1160 * 1627 * 3), decoded.pixels.len);
+    try std.testing.expect(peak.peak_live_bytes <= 64 * 1024 * 1024);
+    decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), peak.live_bytes);
+}
+
 test "larger OfficeQA JPEG 2000 page decodes within 128 MiB" {
     const fixture = try readTestFile(
         std.testing.allocator,

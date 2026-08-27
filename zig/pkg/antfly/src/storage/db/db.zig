@@ -28790,6 +28790,12 @@ fn computeDocumentExtractionAssetRequestDerived(
     } else if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or config.transcription_enabled) {
         return error.MissingAssetProducer;
     }
+    // Decoder capacity is a transient peak reservation. OCR has consumed all
+    // page renders, so release it before building retained extraction state.
+    if (pdf_decode_reservation) |*reservation| {
+        reservation.release();
+        pdf_decode_reservation = null;
+    }
     document_extraction_mod.rebaseUnitCharOffsets(extraction.units);
 
     const byte_source_fingerprint = if (metadata_fingerprint == null)

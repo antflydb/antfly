@@ -4776,10 +4776,12 @@ fn processDocumentExtractionAsset(
     } else {
         try resource_tracker.setDownloadedBytes(downloaded_mut.data.len);
     }
-    if (document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data)) {
-        const decode_budget = try resource_tracker.reservePdfDecodeWorkingSet(config.pdf_decode_limits.max_working_set_bytes);
+    const source_is_pdf = document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data);
+    const configured_pdf_decode_limits = config.pdf_decode_limits;
+    if (source_is_pdf) {
+        const decode_budget = try resource_tracker.reservePdfDecodeWorkingSet(configured_pdf_decode_limits.max_working_set_bytes);
         config.pdf_decode_limits.max_working_set_bytes = decode_budget;
-        config.pdf_decode_limits.max_decoded_stream_bytes = @min(config.pdf_decode_limits.max_decoded_stream_bytes, decode_budget);
+        config.pdf_decode_limits.max_decoded_stream_bytes = @min(configured_pdf_decode_limits.max_decoded_stream_bytes, decode_budget);
     }
 
     // Retained collection state can grow with row-controlled unit/chunk
@@ -4837,6 +4839,8 @@ fn processDocumentExtractionAsset(
     };
     defer collect_ctx.deinit();
     document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, collect_ctx.sink()) catch |raw_err| {
+        try resource_tracker.releasePdfDecodeWorkingSet();
+        config.pdf_decode_limits = configured_pdf_decode_limits;
         const err: anyerror = if (raw_err == error.OutOfMemory and collection_budgeted != null and collection_budgeted.?.denied())
             error.DocumentExtractionWorkingSetTooLarge
         else
@@ -4861,6 +4865,10 @@ fn processDocumentExtractionAsset(
         try recordIsolatedRequestError(runtime, window, request, err);
         return;
     };
+    // Page rendering is complete. Return its atomic decoder credit before
+    // retained navigation and write payloads are materialized.
+    try resource_tracker.releasePdfDecodeWorkingSet();
+    config.pdf_decode_limits = configured_pdf_decode_limits;
     // The streaming extractor has released its last borrowed unit. Retained
     // collection allocations remain independently charged by collection_alloc.
     try resource_tracker.setBytes(resource_tracker.locallyAccountedDownloadedBytes());
@@ -5067,7 +5075,14 @@ fn processDocumentExtractionAsset(
         .generated_units = &generated_units,
         .mode = .store_artifacts,
     };
+    if (source_is_pdf) {
+        const decode_budget = try resource_tracker.reservePdfDecodeWorkingSet(configured_pdf_decode_limits.max_working_set_bytes);
+        config.pdf_decode_limits.max_working_set_bytes = decode_budget;
+        config.pdf_decode_limits.max_decoded_stream_bytes = @min(configured_pdf_decode_limits.max_decoded_stream_bytes, decode_budget);
+    }
     document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, store_ctx.sink()) catch |err| {
+        try resource_tracker.releasePdfDecodeWorkingSet();
+        config.pdf_decode_limits = configured_pdf_decode_limits;
         if (shouldYieldRequestError(runtime, err)) return err;
         try writeDocumentExtractionFailureManifest(
             runtime,
@@ -5088,6 +5103,8 @@ fn processDocumentExtractionAsset(
         try recordIsolatedRequestError(runtime, window, request, err);
         return;
     };
+    try resource_tracker.releasePdfDecodeWorkingSet();
+    config.pdf_decode_limits = configured_pdf_decode_limits;
     try flushRuntimeKVBatchAndClear(runtime, &writes, &deletes);
 
     const manifest = try documentExtractionManifestPayloadAlloc(
@@ -5162,7 +5179,18 @@ fn processDocumentExtractionAsset(
         .generated_units = &generated_units,
         .mode = .publish_replay,
     };
-    try document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, replay_ctx.sink());
+    if (source_is_pdf) {
+        const decode_budget = try resource_tracker.reservePdfDecodeWorkingSet(configured_pdf_decode_limits.max_working_set_bytes);
+        config.pdf_decode_limits.max_working_set_bytes = decode_budget;
+        config.pdf_decode_limits.max_decoded_stream_bytes = @min(configured_pdf_decode_limits.max_decoded_stream_bytes, decode_budget);
+    }
+    document_extraction_mod.extractDownloadedStreaming(runtime.alloc, downloaded_mut, source_url, config, replay_ctx.sink()) catch |err| {
+        try resource_tracker.releasePdfDecodeWorkingSet();
+        config.pdf_decode_limits = configured_pdf_decode_limits;
+        return err;
+    };
+    try resource_tracker.releasePdfDecodeWorkingSet();
+    config.pdf_decode_limits = configured_pdf_decode_limits;
     // A successful extraction can legitimately produce no chunk artifacts (for
     // example, an image-only PDF whose OCR output is rejected as trivial). No
     // downstream chunk or embedding request will exist to close coverage for
@@ -6612,6 +6640,13 @@ const RuntimeDocumentExtractionResourceTracker = struct {
         return std.math.cast(usize, reserved) orelse return error.DocumentExtractionWorkingSetTooLarge;
     }
 
+    fn releasePdfDecodeWorkingSet(self: *@This()) !void {
+        if (self.pdf_decode_reservation_bytes == 0) return;
+        const next = self.current_bytes -| self.pdf_decode_reservation_bytes;
+        try self.setAccountedBytes(next);
+        self.pdf_decode_reservation_bytes = 0;
+    }
+
     fn updateWorkingSet(
         self: *@This(),
         unit_bytes: usize,
@@ -6794,6 +6829,8 @@ test "document extraction reserves PDF decoder peak memory atomically" {
     try tracker.setBytes(40);
     try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
     try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, tracker.setBytes(41));
+    try tracker.releasePdfDecodeWorkingSet();
+    try std.testing.expectEqual(@as(u64, 40), manager.sliceStats(.document_extraction_working_set).used_bytes);
 }
 
 test "PDF decoder credit and OCR transient allocations compose without double charging" {
