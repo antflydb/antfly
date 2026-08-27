@@ -1420,9 +1420,17 @@ pub fn supportsConfig(gpt_config: gpt_mod.Config) bool {
         // the retained KV. The remaining unsupported cases are the extra
         // decoder-side sublayers that still branch the block structure.
         .llama, .mistral, .qwen2, .qwen3 => !gpt_config.usesMoe() and !gpt_config.hasPle(),
-        .gemma => gemma4_runtime.supportsRuntimeConfig(gpt_config),
+        .gemma => gemma4_runtime.supportsPreparedDenseRuntimeConfig(gpt_config),
         else => false,
     };
+}
+
+/// A4B deliberately extends only the backend-owned qLen=1 decode lane. Keep
+/// the older family-wide predicate dense-only so prefill and any fallback
+/// block path cannot accidentally interpret routed experts as a dense FFN.
+fn supportsPreparedDecodeConfig(gpt_config: gpt_mod.Config) bool {
+    return supportsConfig(gpt_config) or
+        gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config);
 }
 
 fn supportsDirectGatedRuntime(gpt_config: gpt_mod.Config, configured_layer_count: usize, decode_context: *const gpt_arch.DecodeContext) bool {
@@ -1440,7 +1448,12 @@ fn supportsDirectGatedRuntime(gpt_config: gpt_mod.Config, configured_layer_count
 fn supportsDirectGemmaRuntime(gpt_config: gpt_mod.Config, configured_layer_count: usize, decode_context: *const gpt_arch.DecodeContext) bool {
     if (disableDirectGatedFamilyRequested()) return false;
     if (gpt_config.family != .gemma) return false;
-    if (!supportsConfig(gpt_config)) return false;
+    if (!supportsPreparedDecodeConfig(gpt_config)) return false;
+    if (gpt_config.usesMoe() and
+        (decode_context.attention_mode != .paged_decode or decode_context.query_sequence_len != 1))
+    {
+        return false;
+    }
     if (gpt_config.hasPle() and
         decode_context.attention_mode == .paged_decode and
         decode_context.query_sequence_len == 1 and
@@ -1546,14 +1559,50 @@ fn tryBackendOwnedGreedyTokenResultPhaseHidden(
     capture_pre_norm_hidden: bool,
     phase: contracts.DecoderRuntimeDecodePhase,
 ) !?BackendOwnedGreedyTokenResult {
-    if (gatedFamilyCompareRequested()) return null;
-    if (disableActivePagedGatedBlockForDecodeRequested()) return null;
-    if (referenceGatedFamilyDecodeRequested()) return null;
-    if (!supportsDirectGemmaRuntime(gpt_config, configured_layer_count, decode_context)) return null;
-    if (!gpt_config.hasPle()) return null;
-    if (decode_context.query_sequence_len != 1) return null;
-    if (decode_context.attention_mode != .paged_decode) return null;
-    if (gpt_config.num_hidden_layers > 256) return null;
+    const trace = getenvBool("TERMITE_METAL_TRACE_DECODER_RUNTIME_DECODE");
+    if (gatedFamilyCompareRequested()) {
+        if (trace) std.debug.print("decoder-runtime-admission: miss reason=compare\n", .{});
+        return null;
+    }
+    if (disableActivePagedGatedBlockForDecodeRequested()) {
+        if (trace) std.debug.print("decoder-runtime-admission: miss reason=active-block-disabled\n", .{});
+        return null;
+    }
+    if (referenceGatedFamilyDecodeRequested()) {
+        if (trace) std.debug.print("decoder-runtime-admission: miss reason=reference-decode\n", .{});
+        return null;
+    }
+    if (!supportsDirectGemmaRuntime(gpt_config, configured_layer_count, decode_context)) {
+        if (trace) std.debug.print(
+            "decoder-runtime-admission: miss reason=unsupported-direct family={s} moe={} prepared_a4b={} qlen={d} mode={s} layers={d}/{d}\n",
+            .{
+                @tagName(gpt_config.family),
+                gpt_config.usesMoe(),
+                gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config),
+                decode_context.query_sequence_len,
+                @tagName(decode_context.attention_mode),
+                preparedLayers(@min(configured_layer_count, gpt_config.num_hidden_layers)),
+                gpt_config.num_hidden_layers,
+            },
+        );
+        return null;
+    }
+    if (!gpt_config.hasPle() and !gpt_config.usesMoe()) {
+        if (trace) std.debug.print("decoder-runtime-admission: miss reason=no-ple\n", .{});
+        return null;
+    }
+    if (decode_context.query_sequence_len != 1) {
+        if (trace) std.debug.print("decoder-runtime-admission: miss reason=qlen qlen={d}\n", .{decode_context.query_sequence_len});
+        return null;
+    }
+    if (decode_context.attention_mode != .paged_decode) {
+        if (trace) std.debug.print("decoder-runtime-admission: miss reason=attention-mode mode={s}\n", .{@tagName(decode_context.attention_mode)});
+        return null;
+    }
+    if (gpt_config.num_hidden_layers > 256) {
+        if (trace) std.debug.print("decoder-runtime-admission: miss reason=layer-count layers={d}\n", .{gpt_config.num_hidden_layers});
+        return null;
+    }
 
     var layers_buf: [256]contracts.DecoderRuntimeLayerSpec = undefined;
     const layer_spec_started_at = monotonicNowNs();
@@ -1586,13 +1635,19 @@ fn tryBackendOwnedGreedyTokenResultPhaseHidden(
     errdefer if (output_hidden) |hidden| cb.free(hidden);
     const token_embedding_weight = try gpt_arch.getEmbeddingWeight(cb, gpt_config);
     defer cb.free(token_embedding_weight);
-    const ple_token_embedding_weight = gpt_arch.getModelWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
-        error.MissingWeight => try gpt_arch.getModelWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
-        else => return err,
-    };
-    defer cb.free(ple_token_embedding_weight);
+    const ple_token_embedding_weight: ?ops.CT = if (gpt_config.hasPle())
+        gpt_arch.getModelWeight(cb, gpt_config, "model.per_layer_input.per_layer_token_embd.weight") catch |err| switch (err) {
+            error.MissingWeight => try gpt_arch.getModelWeight(cb, gpt_config, "model.embed_tokens_per_layer.weight"),
+            else => return err,
+        }
+    else
+        null;
+    defer if (ple_token_embedding_weight) |weight| cb.free(weight);
     const request = contracts.DecoderRuntimeDecodeRequest{
-        .contract = .gemma4_gated_ple_shared_kv,
+        .contract = if (gpt_config.usesMoe())
+            .gemma4_a4b_shared_kv
+        else
+            .gemma4_gated_ple_shared_kv,
         .mode = .greedy_argmax,
         .phase = phase,
         .configured_layer_count = configured_layer_count,
@@ -4818,6 +4873,130 @@ fn prepareLinearNoBiasSlotForConfig(
     });
 }
 
+fn getGemmaWeightWithFallback(
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    primary: []const u8,
+    fallback: []const u8,
+) !ops.CT {
+    return gpt_arch.getModelWeight(cb, gpt_config, primary) catch |err| switch (err) {
+        error.MissingWeight, error.WeightNotFound => gpt_arch.getModelWeight(cb, gpt_config, fallback),
+        else => return err,
+    };
+}
+
+fn prepareA4bMoeRuntimeLayer(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    configured_layer_count: usize,
+    layer: usize,
+) !bool {
+    if (comptime !build_options.enable_metal) return false;
+    if (!gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config)) return false;
+
+    const hidden_size: usize = @intCast(gpt_config.hidden_size);
+    const shared_intermediate_size: usize = @intCast(if (gpt_config.shared_expert_intermediate_size > 0)
+        gpt_config.shared_expert_intermediate_size
+    else
+        gpt_config.intermediateSize(layer));
+    const expert_intermediate_size: usize = @intCast(gpt_config.expertIntermediateSize());
+    const num_experts: usize = @intCast(gpt_config.num_local_experts);
+    const top_k: usize = @intCast(gpt_config.num_experts_per_tok);
+    var name_buf: [256]u8 = undefined;
+
+    const router_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.block_sparse_moe.gate.weight", .{layer});
+    const router = try gpt_arch.getModelWeight(cb, gpt_config, router_name);
+    defer cb.free(router);
+    // The router is stored as dense F32.  The generic prepared-slot default
+    // retains a fallback by converting small dense matrices to Q8_0, while
+    // the qualified graph lane executes this matrix in F32.  Router logits
+    // are routing decisions, so that implicit requantization is not a safe
+    // approximation here.
+    if (!(try decoder_rms_runtime.prepareLinearNoBiasSlotWithOptions(
+        cb,
+        allocator,
+        gemma4_runtime.moeRouterSlot(configured_layer_count, layer),
+        router,
+        hidden_size,
+        num_experts,
+        .{ .retain_dense_fallback = false },
+    ))) return false;
+
+    // Gemma 4 GGUF exposes the always-on shared branch through the ordinary
+    // MLP aliases; the packed block_sparse_moe tensors are routed experts.
+    const shared_gate = try gpt_arch.getFFNWeight(cb, gpt_config, layer, "gate", &name_buf);
+    defer cb.free(shared_gate);
+    if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_gate), shared_gate, hidden_size, shared_intermediate_size, false))) return false;
+
+    const shared_up = try gpt_arch.getFFNWeight(cb, gpt_config, layer, "up", &name_buf);
+    defer cb.free(shared_up);
+    if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_up), shared_up, hidden_size, shared_intermediate_size, false))) return false;
+
+    const shared_down = try gpt_arch.getFFNWeight(cb, gpt_config, layer, "down", &name_buf);
+    defer cb.free(shared_down);
+    if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_down), shared_down, shared_intermediate_size, hidden_size, false))) return false;
+
+    const packed_gate_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.block_sparse_moe.packed.w1.weight", .{layer});
+    const packed_gate = try gpt_arch.getModelWeight(cb, gpt_config, packed_gate_name);
+    defer cb.free(packed_gate);
+    const packed_up_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.block_sparse_moe.packed.w3.weight", .{layer});
+    const packed_up = try gpt_arch.getModelWeight(cb, gpt_config, packed_up_name);
+    defer cb.free(packed_up);
+    const packed_down_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.block_sparse_moe.packed.w2.weight", .{layer});
+    const packed_down = try gpt_arch.getModelWeight(cb, gpt_config, packed_down_name);
+    defer cb.free(packed_down);
+
+    const expert_scale_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.block_sparse_moe.expert_output_scale", .{layer});
+    const expert_scale = try gpt_arch.getModelWeight(cb, gpt_config, expert_scale_name);
+    defer cb.free(expert_scale);
+
+    var primary_buf: [256]u8 = undefined;
+    var fallback_buf: [256]u8 = undefined;
+    const shared_pre_primary = try std.fmt.bufPrint(&primary_buf, "model.layers.{d}.pre_feedforward_layernorm.weight", .{layer});
+    const shared_pre_fallback = try std.fmt.bufPrint(&fallback_buf, "model.layers.{d}.post_attention_layernorm.weight", .{layer});
+    const shared_pre = try getGemmaWeightWithFallback(cb, gpt_config, shared_pre_primary, shared_pre_fallback);
+    defer cb.free(shared_pre);
+
+    const routed_pre_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.pre_feedforward_layernorm_2.weight", .{layer});
+    const routed_pre = try gpt_arch.getModelWeight(cb, gpt_config, routed_pre_name);
+    defer cb.free(routed_pre);
+    const router_pre_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.block_sparse_moe.gate.input_scale", .{layer});
+    const router_pre = try gpt_arch.getModelWeight(cb, gpt_config, router_pre_name);
+    defer cb.free(router_pre);
+
+    const shared_post_primary = try std.fmt.bufPrint(&primary_buf, "model.layers.{d}.post_feedforward_layernorm_1.weight", .{layer});
+    const shared_post_fallback = try std.fmt.bufPrint(&fallback_buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer});
+    const shared_post = try getGemmaWeightWithFallback(cb, gpt_config, shared_post_primary, shared_post_fallback);
+    defer cb.free(shared_post);
+    const routed_post_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_feedforward_layernorm_2.weight", .{layer});
+    const routed_post = try gpt_arch.getModelWeight(cb, gpt_config, routed_post_name);
+    defer cb.free(routed_post);
+    const combined_post_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.post_feedforward_layernorm.weight", .{layer});
+    const combined_post = try gpt_arch.getModelWeight(cb, gpt_config, combined_post_name);
+    defer cb.free(combined_post);
+
+    return metal_compute_mod.MetalCompute.prepareA4bMoeLayer(cb, &.{
+        .layer_index = layer,
+        .hidden_size = hidden_size,
+        .shared_intermediate_size = shared_intermediate_size,
+        .expert_intermediate_size = expert_intermediate_size,
+        .num_experts = num_experts,
+        .top_k = top_k,
+        .packed_gate = packed_gate,
+        .packed_up = packed_up,
+        .packed_down = packed_down,
+        .expert_scale = expert_scale,
+        .shared_pre_norm = shared_pre,
+        .routed_pre_norm = routed_pre,
+        .router_pre_norm = router_pre,
+        .shared_post_norm = shared_post,
+        .routed_post_norm = routed_post,
+        .combined_post_norm = combined_post,
+        .norm_weight_offset = gpt_config.norm_weight_offset,
+    });
+}
+
 fn gemma4E4bDenseFallbackMaxBytes(gpt_config: gpt_mod.Config) ?usize {
     if (disableGemma4E4bFastResidencyRequested()) return null;
     if (gpt_config.family != .gemma) return null;
@@ -4848,7 +5027,7 @@ pub fn prepareDecodeRuntime(
     kv_tokens: usize,
     configured_layer_count: usize,
 ) !bool {
-    if (!supportsConfig(gpt_config)) return false;
+    if (!supportsPreparedDecodeConfig(gpt_config)) return false;
     timing_stats.prepare_calls += 1;
     var started_at = monotonicNowNs();
     if (!(try cb.decoderRuntimePrepareGreedy(&.{
@@ -5022,8 +5201,13 @@ pub fn prepareDecodeRuntime(
             if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
             started_at = monotonicNowNs();
-            const v_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
-            const v_w = try gpt_arch.getModelWeight(cb, gpt_config, v_name);
+            const v_w = if (gpt_config.layerOmitsVProj(layer)) blk: {
+                const k_as_v_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.k_proj.weight", .{layer});
+                break :blk try gpt_arch.getModelWeight(cb, gpt_config, k_as_v_name);
+            } else blk: {
+                const v_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.self_attn.v_proj.weight", .{layer});
+                break :blk try gpt_arch.getModelWeight(cb, gpt_config, v_name);
+            };
             defer cb.free(v_w);
             finished_at = monotonicNowNs();
             if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
@@ -5069,47 +5253,58 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
-        started_at = monotonicNowNs();
-        const gate_w = try gpt_arch.getFFNWeight(cb, gpt_config, layer, "gate", &name_buf);
-        defer cb.free(gate_w);
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-        started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_gate), gate_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer), false))) {
-            timing_stats.prepare_mlp_gate_failures += 1;
-            tracePrepareLayerFailure(layer, "mlp_gate", linearSlot(layer, .mlp_gate), gpt_config.hidden_size, gpt_config.intermediateSize(layer));
-            return false;
-        }
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
+        if (gemma4_runtime.isQualifiedA4bArchitecture(gpt_config)) {
+            started_at = monotonicNowNs();
+            if (!(try prepareA4bMoeRuntimeLayer(cb, allocator, gpt_config, configured_layer_count, layer))) {
+                timing_stats.prepare_mlp_gate_failures += 1;
+                tracePrepareLayerFailure(layer, "a4b_moe", linearSlot(layer, .mlp_gate), gpt_config.hidden_size, gpt_config.expertIntermediateSize());
+                return false;
+            }
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
+        } else {
+            started_at = monotonicNowNs();
+            const gate_w = try gpt_arch.getFFNWeight(cb, gpt_config, layer, "gate", &name_buf);
+            defer cb.free(gate_w);
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+            started_at = monotonicNowNs();
+            if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_gate), gate_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer), false))) {
+                timing_stats.prepare_mlp_gate_failures += 1;
+                tracePrepareLayerFailure(layer, "mlp_gate", linearSlot(layer, .mlp_gate), gpt_config.hidden_size, gpt_config.intermediateSize(layer));
+                return false;
+            }
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
-        started_at = monotonicNowNs();
-        const up_w = try gpt_arch.getFFNWeight(cb, gpt_config, layer, "up", &name_buf);
-        defer cb.free(up_w);
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-        started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_up), up_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer), false))) {
-            timing_stats.prepare_mlp_up_failures += 1;
-            tracePrepareLayerFailure(layer, "mlp_up", linearSlot(layer, .mlp_up), gpt_config.hidden_size, gpt_config.intermediateSize(layer));
-            return false;
-        }
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
+            started_at = monotonicNowNs();
+            const up_w = try gpt_arch.getFFNWeight(cb, gpt_config, layer, "up", &name_buf);
+            defer cb.free(up_w);
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+            started_at = monotonicNowNs();
+            if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_up), up_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer), false))) {
+                timing_stats.prepare_mlp_up_failures += 1;
+                tracePrepareLayerFailure(layer, "mlp_up", linearSlot(layer, .mlp_up), gpt_config.hidden_size, gpt_config.intermediateSize(layer));
+                return false;
+            }
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
-        started_at = monotonicNowNs();
-        const down_w = try gpt_arch.getFFNWeight(cb, gpt_config, layer, "down", &name_buf);
-        defer cb.free(down_w);
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
-        started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_down), down_w, gpt_config.intermediateSize(layer), gpt_config.hidden_size, false))) {
-            timing_stats.prepare_mlp_down_failures += 1;
-            tracePrepareLayerFailure(layer, "mlp_down", linearSlot(layer, .mlp_down), gpt_config.intermediateSize(layer), gpt_config.hidden_size);
-            return false;
+            started_at = monotonicNowNs();
+            const down_w = try gpt_arch.getFFNWeight(cb, gpt_config, layer, "down", &name_buf);
+            defer cb.free(down_w);
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
+            started_at = monotonicNowNs();
+            if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_down), down_w, gpt_config.intermediateSize(layer), gpt_config.hidden_size, false))) {
+                timing_stats.prepare_mlp_down_failures += 1;
+                tracePrepareLayerFailure(layer, "mlp_down", linearSlot(layer, .mlp_down), gpt_config.intermediateSize(layer), gpt_config.hidden_size);
+                return false;
+            }
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
         }
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.linear_prep_nanos += finished_at - started_at;
 
         if (gpt_config.family == .gemma and gpt_config.hasPle()) {
             started_at = monotonicNowNs();
@@ -5301,7 +5496,7 @@ pub fn forwardGreedyToken(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !?i64 {
-    if (!supportsConfig(gpt_config)) return null;
+    if (!supportsPreparedDecodeConfig(gpt_config)) return null;
     if (decode_context.query_sequence_len != 1) return null;
     if (decode_context.attention_mode != .paged_decode) return null;
     timing_stats.greedy_calls += 1;
@@ -5315,6 +5510,9 @@ pub fn forwardGreedyToken(
         seq_len,
         decode_context,
     )) |token| return token;
+    // A4B has no dense prepared fallback. If the backend-owned frame declines,
+    // let the caller use the canonical MoE graph path.
+    if (gpt_config.usesMoe()) return null;
 
     var started_at = monotonicNowNs();
     const hidden = try decoder_rms_runtime.embedToken(cb, allocator, gpt_config, token_id);
@@ -5450,7 +5648,7 @@ pub fn forwardGreedyTokenPipelinedArm(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !bool {
-    if (!supportsConfig(gpt_config)) return false;
+    if (!supportsPreparedDecodeConfig(gpt_config)) return false;
     if (decode_context.query_sequence_len != 1) return false;
     if (decode_context.attention_mode != .paged_decode) return false;
     const result = try tryBackendOwnedGreedyTokenResultPhase(
@@ -5475,7 +5673,7 @@ pub fn forwardGreedyTokenPipelinedStep(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !?i64 {
-    if (!supportsConfig(gpt_config)) return null;
+    if (!supportsPreparedDecodeConfig(gpt_config)) return null;
     if (decode_context.query_sequence_len != 1) return null;
     if (decode_context.attention_mode != .paged_decode) return null;
     timing_stats.greedy_calls += 1;
@@ -5546,7 +5744,7 @@ pub fn forwardGreedyTokenAndFinalHidden(
     seq_len: usize,
     decode_context: *const gpt_arch.DecodeContext,
 ) !?GreedyTokenAndFinalHidden {
-    if (!supportsConfig(gpt_config)) return null;
+    if (!supportsPreparedDecodeConfig(gpt_config)) return null;
     if (decode_context.query_sequence_len != 1) return null;
     if (decode_context.attention_mode != .paged_decode) return null;
     timing_stats.greedy_calls += 1;
@@ -6444,7 +6642,7 @@ pub fn forwardSampledToken(
     sampling: model_runtime.SamplingConfig,
     token_history: []const i64,
 ) !?i64 {
-    if (!supportsConfig(gpt_config)) return null;
+    if (!supportsPreparedDecodeConfig(gpt_config)) return null;
     if (decode_context.query_sequence_len != 1) return null;
     if (decode_context.attention_mode != .paged_decode) return null;
     // The backend sample contracts do not currently carry model-level token
@@ -6464,6 +6662,7 @@ pub fn forwardSampledToken(
         sampling,
         token_history,
     )) |token| return token;
+    if (gpt_config.usesMoe()) return null;
 
     var started_at = monotonicNowNs();
     const hidden = try decoder_rms_runtime.embedToken(cb, allocator, gpt_config, token_id);
