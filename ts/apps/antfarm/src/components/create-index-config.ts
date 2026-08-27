@@ -32,17 +32,30 @@ export function parseAdvancedIndexConfig(source: string): IndexConfig {
       graphIndexSources(...(config.sources as Parameters<typeof graphIndexSources>));
     } else {
       const seen = new Set<string>();
+      const allowedKeys =
+        config.type === "full_text" ? new Set(["artifact", "field"]) : new Set(["artifact"]);
       config.sources.forEach((source, index) => {
         if (!source || typeof source !== "object" || Array.isArray(source)) {
           throw new Error(`Index sources[${index}] must be an object.`);
         }
         const keys = Object.keys(source);
-        if (keys.some((key) => key !== "artifact")) {
-          throw new Error(`Index sources[${index}] only supports artifact.`);
+        const unsupportedKey = keys.find((key) => !allowedKeys.has(key));
+        if (unsupportedKey !== undefined) {
+          throw new Error(
+            `Index sources[${index}] does not support ${JSON.stringify(unsupportedKey)}.`
+          );
         }
-        const artifact = (source as Record<string, unknown>).artifact;
+        const sourceConfig = source as Record<string, unknown>;
+        const artifact = sourceConfig.artifact;
         if (typeof artifact !== "string" || !artifact.trim()) {
           throw new Error(`Index sources[${index}].artifact must be a non-empty string.`);
+        }
+        if (
+          config.type === "full_text" &&
+          sourceConfig.field !== undefined &&
+          (typeof sourceConfig.field !== "string" || !sourceConfig.field.trim())
+        ) {
+          throw new Error(`Index sources[${index}].field must be a non-empty string.`);
         }
         if (seen.has(artifact)) {
           throw new Error(`Index sources contains duplicate artifact ${JSON.stringify(artifact)}.`);

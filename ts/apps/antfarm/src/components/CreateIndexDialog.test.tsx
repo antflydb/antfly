@@ -197,6 +197,19 @@ describe("CreateIndexDialog", () => {
         })
       )
     ).toMatchObject({ name: "knowledge_graph", type: "graph" });
+    expect(
+      parseAdvancedIndexConfig(
+        JSON.stringify({
+          name: "artifact_text",
+          type: "full_text",
+          sources: [{ artifact: "document_chunks_v1", field: "summary" }],
+        })
+      )
+    ).toMatchObject({
+      name: "artifact_text",
+      type: "full_text",
+      sources: [{ artifact: "document_chunks_v1", field: "summary" }],
+    });
     expect(() => parseAdvancedIndexConfig("[]")).toThrow("must be a JSON object");
     expect(() => parseAdvancedIndexConfig('{"name":"missing_type"}')).toThrow("type must be");
     expect(() =>
@@ -218,6 +231,15 @@ describe("CreateIndexDialog", () => {
         })
       )
     ).toThrow("duplicate artifact");
+    expect(() =>
+      parseAdvancedIndexConfig(
+        JSON.stringify({
+          name: "blank_source_field",
+          type: "full_text",
+          sources: [{ artifact: "chunks_v1", field: " " }],
+        })
+      )
+    ).toThrow("field must be a non-empty string");
     expect(() =>
       parseAdvancedIndexConfig(
         JSON.stringify({

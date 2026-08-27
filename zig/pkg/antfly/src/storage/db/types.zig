@@ -299,8 +299,10 @@ pub const IndexConfig = struct {
     coverage_config_fingerprint: ?u64 = null,
 
     pub fn clone(alloc: Allocator, cfg: IndexConfig) !IndexConfig {
+        const name = try alloc.dupe(u8, cfg.name);
+        errdefer alloc.free(name);
         return .{
-            .name = try alloc.dupe(u8, cfg.name),
+            .name = name,
             .kind = cfg.kind,
             .config_json = try alloc.dupe(u8, cfg.config_json),
             .coverage_generation = cfg.coverage_generation,

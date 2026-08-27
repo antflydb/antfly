@@ -11416,20 +11416,25 @@ pub const IndexManager = struct {
                 var apply_mutex_owned = true;
                 errdefer if (apply_mutex_owned) self.destroyIndexApplyMutex(apply_mutex);
 
+                var owned_config = try OwnedTextIndexConfig.init(self.alloc, cfg, text_cfg, path);
+                var owned_config_moved = false;
+                errdefer if (!owned_config_moved) owned_config.deinit(self.alloc);
+
                 var entry = TextIndex{
                     .instance_id = self.allocateTextIndexInstanceId(),
                     .apply_mutex = apply_mutex,
-                    .config = try types.IndexConfig.clone(self.alloc, cfg),
-                    .chunk_name = if (text_cfg.source_artifact_name) |name| try self.alloc.dupe(u8, name) else null,
-                    .source_artifact_names = try cloneOwnedStrings(self.alloc, text_cfg.source_artifact_names),
-                    .source_selected_fields = try cloneOptionalOwnedStrings(self.alloc, text_cfg.source_selected_fields),
-                    .selected_field = if (text_cfg.selected_field) |field| try self.alloc.dupe(u8, field) else null,
+                    .config = owned_config.config,
+                    .chunk_name = owned_config.chunk_name,
+                    .source_artifact_names = owned_config.source_artifact_names,
+                    .source_selected_fields = owned_config.source_selected_fields,
+                    .selected_field = owned_config.selected_field,
                     .text_analysis = text_analysis,
                     .observed_field_analyzers = observed_field_analyzers,
                     .runtime_schema = runtime_schema,
-                    .rebuild_root_path = try self.alloc.dupe(u8, path),
+                    .rebuild_root_path = owned_config.rebuild_root_path,
                     .persistent = persistent,
                 };
+                owned_config_moved = true;
                 apply_mutex_owned = false;
                 persistent_moved = true;
                 runtime_schema_moved = true;
@@ -18893,6 +18898,55 @@ const TextConfig = struct {
     }
 };
 
+/// Owns the independently allocated configuration fields needed by a text
+/// runtime entry until the entry can be constructed without another fallible
+/// operation. Keeping this staging object separate makes every allocation
+/// failure unwind completely and transfers ownership exactly once.
+const OwnedTextIndexConfig = struct {
+    config: types.IndexConfig,
+    chunk_name: ?[]u8 = null,
+    source_artifact_names: [][]u8 = &.{},
+    source_selected_fields: []?[]u8 = &.{},
+    selected_field: ?[]u8 = null,
+    rebuild_root_path: []u8,
+
+    fn init(alloc: Allocator, cfg: types.IndexConfig, text_cfg: TextConfig, path: []const u8) !OwnedTextIndexConfig {
+        var config = try types.IndexConfig.clone(alloc, cfg);
+        errdefer config.deinit(alloc);
+        const chunk_name = if (text_cfg.source_artifact_name) |name| try alloc.dupe(u8, name) else null;
+        errdefer if (chunk_name) |name| alloc.free(name);
+        const source_artifact_names = try cloneOwnedStrings(alloc, text_cfg.source_artifact_names);
+        errdefer {
+            for (source_artifact_names) |name| alloc.free(name);
+            if (source_artifact_names.len > 0) alloc.free(source_artifact_names);
+        }
+        const source_selected_fields = try cloneOptionalOwnedStrings(alloc, text_cfg.source_selected_fields);
+        errdefer freeOptionalOwnedStrings(alloc, source_selected_fields);
+        const selected_field = if (text_cfg.selected_field) |field| try alloc.dupe(u8, field) else null;
+        errdefer if (selected_field) |field| alloc.free(field);
+
+        return .{
+            .config = config,
+            .chunk_name = chunk_name,
+            .source_artifact_names = source_artifact_names,
+            .source_selected_fields = source_selected_fields,
+            .selected_field = selected_field,
+            .rebuild_root_path = try alloc.dupe(u8, path),
+        };
+    }
+
+    fn deinit(self: *OwnedTextIndexConfig, alloc: Allocator) void {
+        self.config.deinit(alloc);
+        if (self.chunk_name) |name| alloc.free(name);
+        for (self.source_artifact_names) |name| alloc.free(name);
+        if (self.source_artifact_names.len > 0) alloc.free(self.source_artifact_names);
+        freeOptionalOwnedStrings(alloc, self.source_selected_fields);
+        if (self.selected_field) |field| alloc.free(field);
+        alloc.free(self.rebuild_root_path);
+        self.* = undefined;
+    }
+};
+
 const GeneratorConfig = struct {
     source_field: []u8,
     source_template: []u8 = &.{},
@@ -19268,6 +19322,38 @@ fn freeOptionalOwnedStrings(alloc: Allocator, values: []?[]u8) void {
         if (value) |bytes| alloc.free(bytes);
     }
     if (values.len > 0) alloc.free(values);
+}
+
+test "text index owned config releases every partial allocation" {
+    var source_names = [_][]u8{ @constCast("document_chunks_v1"), @constCast("document_assets_v1") };
+    var selected_fields = [_]?[]u8{ @constCast("summary"), null };
+    const text_cfg = TextConfig{
+        .source_artifact_name = @constCast("legacy_chunks_v1"),
+        .source_artifact_names = &source_names,
+        .source_selected_fields = &selected_fields,
+        .selected_field = @constCast("text"),
+    };
+    const cfg = types.IndexConfig{
+        .name = "search",
+        .kind = .full_text,
+        .config_json = "{\"type\":\"full_text\"}",
+    };
+
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        failing.fail_index = fail_index;
+        const alloc = failing.allocator();
+        var owned = OwnedTextIndexConfig.init(alloc, cfg, text_cfg, "/tmp/search") catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expect(failing.has_induced_failure);
+            continue;
+        };
+        defer owned.deinit(alloc);
+        try std.testing.expect(!failing.has_induced_failure);
+        return;
+    }
+    return error.TestExpectedSuccessfulAllocation;
 }
 
 fn parseEmbeddingSemanticProducerAlloc(alloc: Allocator, raw: []const u8) !?[]u8 {
