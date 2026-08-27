@@ -46084,20 +46084,22 @@ test "db vector indexes combine direct document and chunk-backed artifact source
     });
     for ([_]types.EnrichmentConfig{
         .{ .name = "title_dense_v1", .kind = .embedding, .field = "title", .expected_dims = 2, .vector_space = "test:mixed-dense-v1" },
+        .{ .name = "summary_dense_v1", .kind = .embedding, .field = "summary", .expected_dims = 2, .vector_space = "test:mixed-dense-v1" },
         .{ .name = "body_dense_v1", .kind = .embedding, .field = "text", .source_artifact_name = "body_chunks_v1", .expected_dims = 2, .vector_space = "test:mixed-dense-v1" },
         .{ .name = "title_sparse_v1", .kind = .embedding, .field = "title", .vector_space = "test:mixed-sparse-v1" },
+        .{ .name = "summary_sparse_v1", .kind = .embedding, .field = "summary", .vector_space = "test:mixed-sparse-v1" },
         .{ .name = "body_sparse_v1", .kind = .embedding, .field = "text", .source_artifact_name = "body_chunks_v1", .vector_space = "test:mixed-sparse-v1" },
     }) |cfg| try db.addEnrichment(cfg);
 
     try db.addIndex(.{
         .name = "mixed_dense",
         .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"sources\":[{\"artifact\":\"title_dense_v1\"},{\"artifact\":\"body_dense_v1\"}]}",
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"sources\":[{\"artifact\":\"title_dense_v1\"},{\"artifact\":\"summary_dense_v1\"},{\"artifact\":\"body_dense_v1\"}]}",
     });
     try db.addIndex(.{
         .name = "mixed_sparse",
         .kind = .sparse_vector,
-        .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"title_sparse_v1\"},{\"artifact\":\"body_sparse_v1\"}]}",
+        .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"title_sparse_v1\"},{\"artifact\":\"summary_sparse_v1\"},{\"artifact\":\"body_sparse_v1\"}]}",
     });
     try db.addIndex(.{
         .name = "primary_text",
@@ -46107,7 +46109,7 @@ test "db vector indexes combine direct document and chunk-backed artifact source
 
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:direct", .value = "{\"title\":\"direct\",\"body\":\"unused\"}" },
+            .{ .key = "doc:direct", .value = "{\"title\":\"direct\",\"summary\":\"second direct member\",\"body\":\"unused\"}" },
             .{ .key = "doc:chunk", .value = "{\"title\":\"unused\",\"body\":\"chunk\"}" },
         },
         .sync_level = .full_index,
@@ -46119,24 +46121,30 @@ test "db vector indexes combine direct document and chunk-backed artifact source
 
     const direct_dense = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:direct", "title_dense_v1");
     defer alloc.free(direct_dense);
+    const second_direct_dense = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:direct", "summary_dense_v1");
+    defer alloc.free(second_direct_dense);
     const chunk_dense = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "body_dense_v1");
     defer alloc.free(chunk_dense);
     try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, direct_dense, null, &.{ 0.0, 0.0 });
+    try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, second_direct_dense, null, &.{ 0.1, 0.0 });
     try putDenseEmbeddingArtifactWithCounterForTest(&db, alloc, chunk_dense, null, &.{ 0.25, 0.0 });
     try std.testing.expectEqual(
-        @as(?u64, 2),
+        @as(?u64, 3),
         try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "mixed_dense"),
     );
 
     const direct_sparse = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:direct", "title_sparse_v1");
     defer alloc.free(direct_sparse);
+    const second_direct_sparse = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:direct", "summary_sparse_v1");
+    defer alloc.free(second_direct_sparse);
     const chunk_sparse = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, "body_sparse_v1");
     defer alloc.free(chunk_sparse);
     try putSparseEmbeddingArtifactForTest(&db, alloc, direct_sparse, null, &.{1}, &.{1.0});
+    try putSparseEmbeddingArtifactForTest(&db, alloc, second_direct_sparse, null, &.{1}, &.{0.9});
     try putSparseEmbeddingArtifactForTest(&db, alloc, chunk_sparse, null, &.{1}, &.{0.75});
 
-    try std.testing.expectEqual(@as(usize, 2), try rebuildDenseIndexFromStoredEmbeddingArtifactsContext(db.async_context, "mixed_dense", 16));
-    try std.testing.expectEqual(@as(usize, 2), try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(db.async_context, "mixed_sparse", 16));
+    try std.testing.expectEqual(@as(usize, 3), try rebuildDenseIndexFromStoredEmbeddingArtifactsContext(db.async_context, "mixed_dense", 16));
+    try std.testing.expectEqual(@as(usize, 3), try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(db.async_context, "mixed_sparse", 16));
 
     var dense = try db.search(alloc, .{
         .index_name = "mixed_dense",
@@ -46170,19 +46178,19 @@ test "db vector indexes combine direct document and chunk-backed artifact source
 
     var dense_members = try db.search(alloc, .{
         .index_name = "mixed_dense",
-        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
-        .limit = 2,
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } },
+        .limit = 3,
         .search_effort = 1.0,
         .return_mode = .member,
     });
     defer dense_members.deinit();
-    try std.testing.expectEqual(@as(usize, 2), dense_members.hits.len);
+    try std.testing.expectEqual(@as(usize, 3), dense_members.hits.len);
     for (dense_members.hits) |hit| try std.testing.expect(hit.artifact_ref != null);
 
     var dense_chunk_alias = try db.search(alloc, .{
         .index_name = "mixed_dense",
-        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 } },
-        .limit = 2,
+        .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } },
+        .limit = 3,
         .search_effort = 1.0,
         .return_mode = .chunk,
     });
@@ -46229,6 +46237,17 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         sparse_has_chunk = sparse_has_chunk or std.mem.eql(u8, hit.id, "doc:chunk");
     }
     try std.testing.expect(sparse_has_direct and sparse_has_chunk);
+
+    var sparse_members = try db.search(alloc, .{
+        .index_name = "mixed_sparse",
+        .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 3 } },
+        .limit = 3,
+        .search_effort = 1.0,
+        .return_mode = .member,
+    });
+    defer sparse_members.deinit();
+    try std.testing.expectEqual(@as(usize, 3), sparse_members.hits.len);
+    for (sparse_members.hits) |hit| try std.testing.expect(hit.artifact_ref != null);
 
     var sparse_prefix = try db.search(alloc, .{
         .index_name = "mixed_sparse",
