@@ -174,6 +174,194 @@ pub fn bilinearI32(
     return out;
 }
 
+/// Bilinear upsampling for exact unsigned component samples. Interpolation is
+/// performed in the native sample domain and rounded once, preserving the
+/// endpoints needed by PDF color-key and Matte processing.
+pub fn bilinearU16(
+    allocator: std.mem.Allocator,
+    input: []const u16,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+) ![]u16 {
+    std.debug.assert(in_width > 0 and in_height > 0);
+    std.debug.assert(out_width > 0 and out_height > 0);
+    const out = try allocator.alloc(u16, out_width * out_height);
+    errdefer allocator.free(out);
+
+    const x_scale = @as(f64, @floatFromInt(in_width)) / @as(f64, @floatFromInt(out_width));
+    const y_scale = @as(f64, @floatFromInt(in_height)) / @as(f64, @floatFromInt(out_height));
+    const max_x: isize = @as(isize, @intCast(in_width)) - 1;
+    const max_y: isize = @as(isize, @intCast(in_height)) - 1;
+    for (0..out_height) |y| {
+        const sy = (@as(f64, @floatFromInt(y)) + 0.5) * y_scale - 0.5;
+        const y0_f = @floor(sy);
+        const fy = sy - y0_f;
+        const y0_i: isize = @intFromFloat(y0_f);
+        const y0: usize = @intCast(clampISize(y0_i, 0, max_y));
+        const y1: usize = @intCast(clampISize(y0_i + 1, 0, max_y));
+        for (0..out_width) |x| {
+            const sx = (@as(f64, @floatFromInt(x)) + 0.5) * x_scale - 0.5;
+            const x0_f = @floor(sx);
+            const fx = sx - x0_f;
+            const x0_i: isize = @intFromFloat(x0_f);
+            const x0: usize = @intCast(clampISize(x0_i, 0, max_x));
+            const x1: usize = @intCast(clampISize(x0_i + 1, 0, max_x));
+            const top = @as(f64, @floatFromInt(input[y0 * in_width + x0])) * (1.0 - fx) +
+                @as(f64, @floatFromInt(input[y0 * in_width + x1])) * fx;
+            const bottom = @as(f64, @floatFromInt(input[y1 * in_width + x0])) * (1.0 - fx) +
+                @as(f64, @floatFromInt(input[y1 * in_width + x1])) * fx;
+            out[y * out_width + x] = @intFromFloat(@round(top * (1.0 - fy) + bottom * fy));
+        }
+    }
+    return out;
+}
+
+fn bilinearIntegerReferenceGrid(
+    comptime Sample: type,
+    allocator: std.mem.Allocator,
+    input: []const Sample,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+    reference_origin_x: usize,
+    reference_origin_y: usize,
+    component_origin_x: usize,
+    component_origin_y: usize,
+    xrsiz: usize,
+    yrsiz: usize,
+) ![]Sample {
+    comptime {
+        const info = @typeInfo(Sample);
+        if (info != .int) @compileError("reference-grid bilinear samples must be integers");
+    }
+    if (in_width == 0 or in_height == 0 or out_width == 0 or out_height == 0 or xrsiz == 0 or yrsiz == 0)
+        return error.InvalidPlaneDimensions;
+    const input_len = std.math.mul(usize, in_width, in_height) catch return error.InvalidPlaneDimensions;
+    if (input.len != input_len) return error.InvalidPlaneDimensions;
+    const output_len = std.math.mul(usize, out_width, out_height) catch return error.InvalidPlaneDimensions;
+    const out = try allocator.alloc(Sample, output_len);
+    errdefer allocator.free(out);
+
+    const max_x: isize = @as(isize, @intCast(in_width)) - 1;
+    const max_y: isize = @as(isize, @intCast(in_height)) - 1;
+    const origin_x: f64 = @floatFromInt(component_origin_x);
+    const origin_y: f64 = @floatFromInt(component_origin_y);
+    const x_scale: f64 = @floatFromInt(xrsiz);
+    const y_scale: f64 = @floatFromInt(yrsiz);
+    for (0..out_height) |y| {
+        const reference_y = reference_origin_y + y;
+        const sy = (@as(f64, @floatFromInt(reference_y)) + 0.5) / y_scale - 0.5 - origin_y;
+        const y0_f = @floor(sy);
+        const fy = sy - y0_f;
+        const y0_i: isize = @intFromFloat(y0_f);
+        const y0: usize = @intCast(clampISize(y0_i, 0, max_y));
+        const y1: usize = @intCast(clampISize(y0_i + 1, 0, max_y));
+        for (0..out_width) |x| {
+            const reference_x = reference_origin_x + x;
+            const sx = (@as(f64, @floatFromInt(reference_x)) + 0.5) / x_scale - 0.5 - origin_x;
+            const x0_f = @floor(sx);
+            const fx = sx - x0_f;
+            const x0_i: isize = @intFromFloat(x0_f);
+            const x0: usize = @intCast(clampISize(x0_i, 0, max_x));
+            const x1: usize = @intCast(clampISize(x0_i + 1, 0, max_x));
+            const top = @as(f64, @floatFromInt(input[y0 * in_width + x0])) * (1.0 - fx) +
+                @as(f64, @floatFromInt(input[y0 * in_width + x1])) * fx;
+            const bottom = @as(f64, @floatFromInt(input[y1 * in_width + x0])) * (1.0 - fx) +
+                @as(f64, @floatFromInt(input[y1 * in_width + x1])) * fx;
+            out[y * out_width + x] = @intFromFloat(@round(top * (1.0 - fy) + bottom * fy));
+        }
+    }
+    return out;
+}
+
+/// Bilinear upsampling on the JPEG 2000 reference grid. Unlike a generic
+/// resize, this preserves the phase implied by the image/tile origin and each
+/// component's XRsiz/YRsiz sampling factors.
+pub fn bilinearI32ReferenceGrid(
+    allocator: std.mem.Allocator,
+    input: []const i32,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+    reference_origin_x: usize,
+    reference_origin_y: usize,
+    component_origin_x: usize,
+    component_origin_y: usize,
+    xrsiz: usize,
+    yrsiz: usize,
+) ![]i32 {
+    return bilinearIntegerReferenceGrid(i32, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz);
+}
+
+pub fn bilinearU8ReferenceGrid(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+    reference_origin_x: usize,
+    reference_origin_y: usize,
+    component_origin_x: usize,
+    component_origin_y: usize,
+    xrsiz: usize,
+    yrsiz: usize,
+) ![]u8 {
+    return bilinearIntegerReferenceGrid(u8, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz);
+}
+
+pub fn bilinearU16ReferenceGrid(
+    allocator: std.mem.Allocator,
+    input: []const u16,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+    reference_origin_x: usize,
+    reference_origin_y: usize,
+    component_origin_x: usize,
+    component_origin_y: usize,
+    xrsiz: usize,
+    yrsiz: usize,
+) ![]u16 {
+    return bilinearIntegerReferenceGrid(u16, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz);
+}
+
+test "reference-grid U16 upsampling preserves a non-aligned image origin" {
+    const input = [_]u16{ 10, 20, 30 };
+    const result = try bilinearU16ReferenceGrid(
+        std.testing.allocator,
+        &input,
+        3,
+        1,
+        5,
+        1,
+        3,
+        0,
+        2,
+        0,
+        2,
+        1,
+    );
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualSlices(u16, &.{ 10, 10, 13, 18, 23 }, result);
+}
+
+test "reference-grid integer upsampling is consistent across sample depths" {
+    const input_u8 = [_]u8{ 10, 20, 30 };
+    const input_i32 = [_]i32{ 10, 20, 30 };
+    const u8_result = try bilinearU8ReferenceGrid(std.testing.allocator, &input_u8, 3, 1, 5, 1, 3, 0, 2, 0, 2, 1);
+    defer std.testing.allocator.free(u8_result);
+    const i32_result = try bilinearI32ReferenceGrid(std.testing.allocator, &input_i32, 3, 1, 5, 1, 3, 0, 2, 0, 2, 1);
+    defer std.testing.allocator.free(i32_result);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 10, 13, 18, 23 }, u8_result);
+    try std.testing.expectEqualSlices(i32, &.{ 10, 10, 13, 18, 23 }, i32_result);
+}
+
 /// Bilinear upsampling for f32 planes.
 pub fn bilinearF32(
     allocator: std.mem.Allocator,
@@ -588,8 +776,8 @@ test "upsampleI32 dispatch lanczos2x falls back to bilinear for non-2x" {
     const allocator = std.testing.allocator;
     // 4x3 -> 7x5 is not a 2x integer upscale so it must fall back to bilinear.
     const input = [_]i32{
-        0,  40, 80, 120,
-        10, 50, 90, 130,
+        0,  40, 80,  120,
+        10, 50, 90,  130,
         20, 60, 100, 140,
     };
     const a = try upsampleI32(allocator, .lanczos2x, &input, 4, 3, 7, 5);
