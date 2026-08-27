@@ -1039,10 +1039,19 @@ pub const MultiRaft = struct {
         }
 
         const capacity_check_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
-        if (!self.hasOutboundCapacity(
+        const outbound_capacity_available = self.hasOutboundCapacity(
             outbox.items.items.len + ready_pressure.message_count,
             outbox.approxBytes() + ready_pressure.message_bytes,
-        )) {
+        );
+        // A byte ceiling must bound backlog, not make a single bounded Ready
+        // impossible forever. When both queues are empty, admit one oversized
+        // Ready so Raft can make progress; subsequent groups remain gated until
+        // it drains. Message-count limits stay hard to cap fan-out allocations.
+        const outbound_single_ready_progress =
+            self.pending_outbox.items.items.len == 0 and
+            outbox.items.items.len == 0 and
+            ready_pressure.message_count <= self.cfg.max_pending_outbound_messages;
+        if (!outbound_capacity_available and !outbound_single_ready_progress) {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
                 diag.denied_by_transport_capacity = true;
@@ -1051,10 +1060,14 @@ pub const MultiRaft = struct {
             self.scheduler.deferReady(group_id);
             return false;
         }
-        if (!self.hasApplyCapacity(
-            if (ready.snapshot != null or ready.committed_entries.len > 0 or ready.read_states.len > 0) 1 else 0,
+        const new_apply_tasks: usize = if (ready.snapshot != null or ready.committed_entries.len > 0 or ready.read_states.len > 0) 1 else 0;
+        const apply_capacity_available = self.hasApplyCapacity(
+            new_apply_tasks,
             ready_pressure.snapshot_bytes + ready_pressure.committed_entry_bytes + approxReadStatesSize(ready.read_states),
-        )) {
+        );
+        const apply_single_ready_progress = self.pending_apply.items.len == 0 and
+            new_apply_tasks <= self.cfg.max_pending_apply_tasks;
+        if (!apply_capacity_available and !apply_single_ready_progress) {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
                 diag.denied_by_apply_capacity = true;

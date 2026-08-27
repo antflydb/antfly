@@ -62,6 +62,7 @@ pub fn create(
     req: tables_api.CreateTableRequest,
 ) !void {
     try request.ensureActive();
+    try svc.ensureTableTopologyProtocolReadyWithContext(request);
     const table = tables_api.deriveTableRecord(table_name, req);
     const ranges = try tables_api.deriveInitialRanges(alloc, table);
     defer {
@@ -79,6 +80,7 @@ pub fn create(
         } },
     }) catch |err| {
         if (metadata_authority.isMutationNotAdmittedError(err)) return error.NotLeader;
+        if (err == error.MetadataTopologyCommandTooLarge) return error.CreateTableRequestTooLarge;
         return err;
     };
     svc.waitForTransitionAppliedWithContext(receipt, request) catch |err|
@@ -106,6 +108,7 @@ pub fn drop(
     table_name: []const u8,
 ) !void {
     try request.ensureActive();
+    try svc.ensureTableTopologyProtocolReadyWithContext(request);
     try svc.ensureLinearizableReadWithContext(request);
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);

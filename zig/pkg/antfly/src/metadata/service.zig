@@ -32,6 +32,7 @@ const metadata_table_provisioner = @import("table_provisioner.zig");
 const metadata_store_observer = @import("store_observer.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
+const metadata_topology_protocol = @import("topology_protocol.zig");
 const metadata_storage = @import("storage/mod.zig");
 const platform_clock = @import("antfly_platform").clock;
 const process_memory_mod = @import("antfly_platform").process_memory;
@@ -764,6 +765,19 @@ fn reallocationBarrierStatusCompatible(
         peer_status.metadata_raft_local_node_id == node_id and
         std.mem.eql(u8, &peer_incarnation, &incarnation) and
         peer_status.reallocation_barrier_protocol_version >= metadata_reallocation_request.barrier_protocol_version;
+}
+
+fn tableTopologyProtocolCompatible(
+    peer_status: MetadataStatus,
+    metadata_group_id: u64,
+    node_id: u64,
+    incarnation: metadata_mod.MetadataClusterIncarnation,
+) bool {
+    const peer_incarnation = peer_status.metadata_incarnation orelse return false;
+    return peer_status.metadata_group_id == metadata_group_id and
+        peer_status.metadata_raft_local_node_id == node_id and
+        std.mem.eql(u8, &peer_incarnation, &incarnation) and
+        peer_status.table_topology_protocol_version >= metadata_topology_protocol.current_version;
 }
 
 fn runtimeStatusProtocolCompatible(
@@ -4101,6 +4115,9 @@ pub const MetadataHttpService = struct {
         try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
+        if (safe_command == .apply_table_topology and
+            encoded.len > metadata_topology_protocol.max_transition_command_bytes)
+            return error.MetadataTopologyCommandTooLarge;
         try self.raft.host.http_host.propose(self.metadata_group_id, encoded);
         self.lifecycle_signal.notify(null);
     }
@@ -4125,6 +4142,9 @@ pub const MetadataHttpService = struct {
         }
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
+        if (safe_command == .apply_table_topology and
+            encoded.len > metadata_topology_protocol.max_transition_command_bytes)
+            return error.MetadataTopologyCommandTooLarge;
         // Reserve proof storage before Raft accepts the entry. This keeps the
         // accepted-but-untrackable state impossible under allocator pressure.
         try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
@@ -4948,6 +4968,63 @@ pub const MetadataHttpService = struct {
         return try reallocationBarrierContract(incarnation, required_node_ids);
     }
 
+    /// Atomic topology entries use a new Raft wire tag, so every current and
+    /// configured metadata member must advertise decoder support before the
+    /// leader may append one. This is intentionally uncached: create/drop are
+    /// rare and membership may change between requests.
+    pub fn ensureTableTopologyProtocolReadyWithContext(
+        self: *MetadataHttpService,
+        request: api_operation.RequestContext,
+    ) !void {
+        try request.ensureActive();
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+            return error.TableTopologyProtocolUpgradeRequired;
+        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
+        if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or
+            raft_status.soft.leader_id.? != local_node_id)
+            return error.NotLeader;
+        const incarnation = (try self.metadataIncarnation()) orelse
+            return error.TableTopologyProtocolUpgradeRequired;
+
+        var client = metadata_http_client.MetadataHttpClient.init(
+            self.alloc,
+            self.raft.host.http_host.request_executor,
+        );
+        const now_ns = platform_time.monotonicNs();
+        const request_deadline = request.deadline_ns orelse std.math.maxInt(u64);
+        const probe_budget = metadata_http_client.RequestBudget{
+            .deadline_ns = @min(now_ns +| reallocation_protocol_probe_timeout_ns, request_deadline),
+        };
+        const required_node_ids = try collectReallocationBarrierNodeIds(
+            self.alloc,
+            raft_status.conf_state,
+            self.reallocation_protocol_peers,
+        );
+        defer self.alloc.free(required_node_ids);
+        for (required_node_ids) |node_id| {
+            try request.ensureActive();
+            if (node_id == local_node_id) continue;
+            const peer = findReallocationProtocolPeer(self.reallocation_protocol_peers, node_id) orelse {
+                std.log.warn("table topology protocol blocked: metadata member {d} is not configured", .{node_id});
+                return error.TableTopologyProtocolUpgradeRequired;
+            };
+            const orchestration_url = peer.orchestration_url orelse
+                return error.TableTopologyProtocolUpgradeRequired;
+            if (orchestration_url.len == 0) return error.TableTopologyProtocolUpgradeRequired;
+            const peer_status = client.fetchStatusWithBudget(orchestration_url, probe_budget) catch |err| {
+                std.log.warn("table topology protocol probe failed member={d} err={s}", .{ node_id, @errorName(err) });
+                return error.TableTopologyProtocolUpgradeRequired;
+            };
+            if (!tableTopologyProtocolCompatible(peer_status, self.metadata_group_id, node_id, incarnation)) {
+                std.log.warn(
+                    "table topology protocol blocked member={d} reports node={d} group={d} protocol={d}",
+                    .{ node_id, peer_status.metadata_raft_local_node_id, peer_status.metadata_group_id, peer_status.table_topology_protocol_version },
+                );
+                return error.TableTopologyProtocolUpgradeRequired;
+            }
+        }
+    }
+
     fn requireReallocationBarrierPeer(
         self: *MetadataHttpService,
         client: *metadata_http_client.MetadataHttpClient,
@@ -5400,6 +5477,7 @@ pub const MetadataHttpService = struct {
         var fallback = MetadataStatus{
             .metadata_group_id = self.metadata_group_id,
             .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
+            .table_topology_protocol_version = metadata_topology_protocol.current_version,
             .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version,
             .metadata_epoch = self.lifecycle_signal.currentEpoch(),
             .metrics = self.metrics(),
@@ -6843,6 +6921,23 @@ test "metadata service reallocation barrier requires a current protocol from the
     ));
     current_status.metadata_incarnation = null;
     try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 42, 7, incarnation));
+}
+
+test "metadata table topology protocol requires the exact current metadata replica" {
+    const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    var status = MetadataStatus{
+        .metadata_group_id = 42,
+        .metadata_incarnation = incarnation,
+        .metadata_raft_local_node_id = 7,
+        .metrics = .{},
+    };
+    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 7, incarnation));
+    status.table_topology_protocol_version = metadata_topology_protocol.current_version;
+    try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation));
+    try std.testing.expect(!tableTopologyProtocolCompatible(status, 43, 7, incarnation));
+    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 8, incarnation));
+    status.metadata_incarnation = null;
+    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 7, incarnation));
 }
 
 test "metadata runtime status protocol requires the exact current metadata replica" {
@@ -10279,6 +10374,7 @@ pub fn snapshotStatusWithOptions(
     return .{
         .metadata_group_id = metadata_group_id,
         .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
+        .table_topology_protocol_version = metadata_topology_protocol.current_version,
         .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version,
         .metadata_incarnation = metadata_incarnation,
         .metadata_raft_local_node_id = metadata_raft.local_node_id,

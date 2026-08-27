@@ -1597,8 +1597,8 @@ fn runRoutedTableMutation(router: anytype, ops: anytype) !void {
                             elapsed_ns / std.time.ns_per_ms,
                             std.math.maxInt(u32),
                         ));
-                        forwarding = forwarding.child(elapsed_ms, 50) catch
-                            return error.NotLeader;
+                        if (elapsed_ms >= forwarding.remaining_ms) return error.NotLeader;
+                        forwarding.remaining_ms -= elapsed_ms;
                         attempt_started_ns = platform_time.monotonicNs();
                         continue;
                     },
@@ -1607,17 +1607,20 @@ fn runRoutedTableMutation(router: anytype, ops: anytype) !void {
                 return;
             },
             .forward => |peer| {
+                const elapsed_ns = platform_time.monotonicNs() -| attempt_started_ns;
+                const elapsed_ms: u32 = @intCast(@min(
+                    elapsed_ns / std.time.ns_per_ms,
+                    std.math.maxInt(u32),
+                ));
+                // Consume the hop before it crosses the process boundary, as
+                // the shared data-Raft path does. The receiver must observe
+                // the remaining allowance, never the sender's parent budget.
+                forwarding = forwarding.child(elapsed_ms, 50) catch
+                    return error.NotLeader;
+                attempt_started_ns = platform_time.monotonicNs();
                 ops.forward(peer, forwarding) catch |err| switch (err) {
                     error.NotLeader => {
                         if (attempts >= max_table_mutation_route_attempts) return error.NotLeader;
-                        const elapsed_ns = platform_time.monotonicNs() -| attempt_started_ns;
-                        const elapsed_ms: u32 = @intCast(@min(
-                            elapsed_ns / std.time.ns_per_ms,
-                            std.math.maxInt(u32),
-                        ));
-                        forwarding = forwarding.child(elapsed_ms, 50) catch
-                            return error.NotLeader;
-                        attempt_started_ns = platform_time.monotonicNs();
                         continue;
                     },
                     else => return err,
@@ -1640,6 +1643,8 @@ test "routed table mutation forwards to the resolved leader from a follower" {
     try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
     try std.testing.expectEqual(@as(usize, 0), script.local_calls);
     try std.testing.expectEqual(@as(usize, 1), script.forward_calls);
+    try std.testing.expectEqual(@as(u8, 1), script.last_forwarding.?.forwards_remaining);
+    try std.testing.expect(!script.last_forwarding.?.campaign_allowed);
 }
 
 test "routed table mutation rediscovers the leader after a typed pre-admission rejection" {
@@ -1652,6 +1657,7 @@ test "routed table mutation rediscovers the leader after a typed pre-admission r
     };
     try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
     try std.testing.expectEqual(@as(usize, 2), script.forward_calls);
+    try std.testing.expectEqual(@as(u8, 0), script.last_forwarding.?.forwards_remaining);
     try std.testing.expectEqual(@as(usize, 2), script.route_resolutions);
 }
 
@@ -1691,7 +1697,7 @@ test "routed table mutation bounds leader rediscovery" {
         error.NotLeader,
         runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script }),
     );
-    try std.testing.expectEqual(@as(usize, max_table_mutation_route_attempts), script.forward_calls);
+    try std.testing.expectEqual(@as(usize, raft_mutation_forwarding.max_forwards), script.forward_calls);
 }
 
 test "routed table mutation never replays an ambiguous forward outcome" {
@@ -1724,6 +1730,7 @@ const RoutedTableMutationScript = struct {
     route_resolutions: usize = 0,
     local_calls: usize = 0,
     forward_calls: usize = 0,
+    last_forwarding: ?raft_mutation_forwarding.Context = null,
 
     fn resolveTableMutationRoute(self: *@This()) !metadata_service.MetadataHttpService.TableMutationRoute {
         if (self.resolve_error) |err| return err;
@@ -1747,7 +1754,7 @@ const RoutedTableMutationScript = struct {
             forwarding: raft_mutation_forwarding.Context,
         ) anyerror!void {
             _ = peer;
-            _ = forwarding;
+            self.script.last_forwarding = forwarding;
             const index = self.script.forward_calls;
             self.script.forward_calls += 1;
             if (index < self.script.forward_errors.len) return self.script.forward_errors[index];
@@ -1765,7 +1772,15 @@ fn createTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
 }
 
 fn runPostMutationRound(svc: anytype) !void {
-    try svc.runControlRoundOnly();
+    // The production HTTP service has a dedicated Raft ticker, so this path
+    // must not become a second clock owner. The in-process service used by
+    // embedded callers and tests owns its Raft clock and must run the complete
+    // round to make the accepted proposal observable.
+    if (comptime @hasDecl(@TypeOf(svc.*), "runControlRoundOnly")) {
+        try svc.runControlRoundOnly();
+    } else {
+        try svc.runRound();
+    }
 }
 
 fn createNormalizedTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
@@ -12150,7 +12165,9 @@ pub const ApiHttpServer = struct {
         self.source.createTable(self.alloc, table_name, request) catch |err| return switch (err) {
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
             error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
             error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
+            error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
             else => return err,
         };
@@ -12209,6 +12226,7 @@ pub const ApiHttpServer = struct {
             error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table name"),
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
             error.TableTransitionActive => try contextual_operations.textAlloc(self.alloc, 409, "table transition active"),
+            error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
             error.ExtensionOwnedObject, error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
             else => return err,
         };

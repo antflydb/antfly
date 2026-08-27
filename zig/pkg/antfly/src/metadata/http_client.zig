@@ -542,6 +542,10 @@ pub const MetadataHttpClient = struct {
             "committed-repair-required-v1",
         ) orelse return error.MetadataMutationOutcomeUnknown;
         if (outcome == .not_proposed and resp.status == 503) return error.NotLeader;
+        if (outcome == .not_proposed and resp.status == 413 and kind == .create_table)
+            return error.CreateTableRequestTooLarge;
+        if (outcome == .not_proposed and resp.status == 426)
+            return error.TableTopologyProtocolUpgradeRequired;
         if (outcome == .committed and
             ((kind == .create_table and resp.status == 201) or
                 (kind == .drop_table and resp.status == 204))) return;
@@ -1465,6 +1469,7 @@ test "metadata http client surfaces typed rejection for forwarded table mutation
         header_name: []const u8,
         header_value: []const u8,
         outcome_value: []const u8,
+        status: u16 = 503,
         attempts: usize = 0,
 
         fn ownedHeader(
@@ -1502,7 +1507,7 @@ test "metadata http client surfaces typed rejection for forwarded table mutation
             );
             initialized += 1;
             const body = try alloc.dupe(u8, "metadata authority unavailable");
-            return .{ .status = 503, .headers = headers, .body = body };
+            return .{ .status = self.status, .headers = headers, .body = body };
         }
     };
 
@@ -1529,6 +1534,19 @@ test "metadata http client surfaces typed rejection for forwarded table mutation
         broad_hint_client.dropTableForwarded("http://127.0.0.1:9000", "docs"),
     );
     try std.testing.expectEqual(@as(usize, 1), broad_hint.attempts);
+
+    var upgrade_gate = RejectingExecutor{
+        .header_name = "Retry-After",
+        .header_value = "1",
+        .outcome_value = routes.Routes.raft_mutation_outcome_not_proposed,
+        .status = 426,
+    };
+    var upgrade_client = MetadataHttpClient.init(std.testing.allocator, upgrade_gate.executor());
+    try std.testing.expectError(
+        error.TableTopologyProtocolUpgradeRequired,
+        upgrade_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), upgrade_gate.attempts);
 }
 
 test "metadata http client preserves transport ambiguity for forwarded table mutations" {

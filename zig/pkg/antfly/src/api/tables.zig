@@ -18,6 +18,7 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
+const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -36,14 +37,19 @@ const table_create_contract = @import("table_create_contract.zig");
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
 pub const default_indexes_json = "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"}}";
 pub const max_table_name_bytes: usize = 255;
-pub const max_table_create_transport_bytes: usize = 32 * 1024 * 1024;
+pub const max_table_initial_ranges: u32 = metadata_topology_protocol.max_initial_ranges;
+pub const table_initial_ranges_error_message = std.fmt.comptimePrint(
+    "num_shards must be between 1 and {d}",
+    .{max_table_initial_ranges},
+);
+pub const max_table_create_body_bytes: usize = metadata_topology_protocol.max_create_definition_bytes;
 // Exact serialized size of an empty create envelope. The name and canonical
 // definition can each at most double when embedded as JSON strings because
 // both have already rejected raw control bytes or been parsed as valid JSON.
 const forwarded_table_create_envelope_bytes: usize =
     "{\"protocol_version\":3,\"kind\":\"create_table\",\"table_name\":\"\",\"definition_json\":\"\"}".len;
-pub const max_table_create_body_bytes: usize =
-    (max_table_create_transport_bytes - forwarded_table_create_envelope_bytes - 2 * max_table_name_bytes) / 2;
+pub const max_table_create_transport_bytes: usize = forwarded_table_create_envelope_bytes +
+    2 * max_table_name_bytes + 2 * max_table_create_body_bytes;
 
 pub fn validateTableCreateBodySize(body_len: usize) !void {
     if (body_len > max_table_create_body_bytes)
@@ -53,10 +59,7 @@ pub fn validateTableCreateBodySize(body_len: usize) !void {
 test "forwarded create body limit includes the exact worst-case JSON envelope" {
     const worst_case_encoded_bytes = forwarded_table_create_envelope_bytes +
         2 * max_table_name_bytes + 2 * max_table_create_body_bytes;
-    try std.testing.expect(worst_case_encoded_bytes <= max_table_create_transport_bytes);
-    // Keep the public payload ceiling tight: changing the envelope must update
-    // this calculation rather than silently sacrificing useful request space.
-    try std.testing.expect(max_table_create_transport_bytes - worst_case_encoded_bytes < 2);
+    try std.testing.expectEqual(max_table_create_transport_bytes, worst_case_encoded_bytes);
 }
 
 pub fn validateTableMutationName(table_name: []const u8) !void {
@@ -84,6 +87,30 @@ test "table mutation names preserve the public contract" {
         try std.testing.expectError(error.InvalidTableName, validateTableMutationName(&name));
     }
     try std.testing.expectError(error.InvalidTableName, validateTableMutationName("a\x7fb"));
+}
+
+test "create table rejects unbounded initial shard fanout" {
+    const topology_protocol = @import("../metadata/topology_protocol.zig");
+    const body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"num_shards\":{d}}}",
+        .{topology_protocol.max_initial_ranges + 1},
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expectError(
+        error.CreateTableShardCountOutOfRange,
+        parseCreateTableRequest(std.testing.allocator, body),
+    );
+
+    const invalid_table = metadata_table_manager.TableRecord{
+        .table_id = 7,
+        .name = "docs",
+        .min_ranges = topology_protocol.max_initial_ranges + 1,
+    };
+    try std.testing.expectError(
+        error.CreateTableShardCountOutOfRange,
+        deriveInitialRanges(std.testing.allocator, invalid_table),
+    );
 }
 
 fn validateIndexesValue(value: std.json.Value, comptime trusted_catalog: bool) !void {
@@ -838,6 +865,8 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
 
     if (req.num_shards) |num_shards| {
         if (num_shards == 0) return error.InvalidCreateTableRequest;
+        if (num_shards > max_table_initial_ranges)
+            return error.CreateTableShardCountOutOfRange;
     }
     return req;
 }
@@ -1142,6 +1171,9 @@ pub fn deriveInitialRanges(
     alloc: std.mem.Allocator,
     table: metadata_table_manager.TableRecord,
 ) ![]metadata_table_manager.RangeRecord {
+    if (table.min_ranges == 0) return error.InvalidCreateTableRequest;
+    if (table.min_ranges > max_table_initial_ranges)
+        return error.CreateTableShardCountOutOfRange;
     if (table.min_ranges <= 1) {
         const initial_range = deriveInitialRange(table);
         const out = try alloc.alloc(metadata_table_manager.RangeRecord, 1);

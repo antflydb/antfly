@@ -1487,6 +1487,14 @@ pub const MetadataHttpServer = struct {
         if (err == error.UnsupportedOperation) return ctx.status(405).text("unsupported operation");
         if (err == error.ReallocationProtocolUpgradeRequired)
             return ctx.status(503).text("metadata voter upgrade required");
+        if (err == error.TableTopologyProtocolUpgradeRequired) {
+            try ctx.setHeader("Retry-After", "1");
+            try ctx.setHeader(
+                routes.Routes.raft_mutation_outcome_header,
+                routes.Routes.raft_mutation_outcome_not_proposed,
+            );
+            return ctx.status(426).text("metadata topology protocol upgrade required");
+        }
         if (metadata_authority.isMutationNotAdmittedError(err)) {
             // Raft rejected this command before assigning a log index. Only
             // this narrower proof authorizes an at-most-once client to route
@@ -2023,13 +2031,23 @@ pub const MetadataHttpServer = struct {
     ) !httpx.Response {
         tables_api.validateTableCreateBodySize(definition_json.len) catch
             return ctx.status(413).text("create table request too large");
-        var request = parseCreateTableRequest(ctx.allocator, definition_json) catch
-            return ctx.status(400).text("invalid create table request");
+        var request = parseCreateTableRequest(ctx.allocator, definition_json) catch |err| switch (err) {
+            error.CreateTableShardCountOutOfRange => return ctx.status(400).text(tables_api.table_initial_ranges_error_message),
+            else => return ctx.status(400).text("invalid create table request"),
+        };
         defer request.deinit(ctx.allocator);
         self.tableOperations().create(ctx.allocator, request_context, table_name, request) catch |err| switch (err) {
             error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
+            error.CreateTableShardCountOutOfRange => return ctx.status(400).text(tables_api.table_initial_ranges_error_message),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
+            error.CreateTableRequestTooLarge => {
+                try ctx.setHeader(
+                    routes.Routes.raft_mutation_outcome_header,
+                    routes.Routes.raft_mutation_outcome_not_proposed,
+                );
+                return ctx.status(413).text("create table request too large");
+            },
             else => return metadataMutationError(ctx, err),
         };
         return ctx.status(201).text("created");
