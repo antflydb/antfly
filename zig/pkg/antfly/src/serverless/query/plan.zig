@@ -811,6 +811,37 @@ test "serverless search plan selects a named full text source" {
     );
 }
 
+test "serverless named full text selection is independent of embedding indexes" {
+    const alloc = std.testing.allocator;
+    const sources = search_sources.PublishedSearchSources{
+        .items = @constCast(&[_]search_sources.SearchSourceDescriptor{
+            .{ .text = .{ .index_name = search_sources.default_full_text_index_name } },
+            .{ .text = .{ .index_name = "title_text" } },
+            .{ .vector = .{
+                .index_name = search_sources.default_chunk_embedding_index_name,
+                .document_source = .chunk_embeddings_or_top_level,
+            } },
+        }),
+    };
+    var plan = try parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_index\":\"title_text\",\"full_text_search\":{\"query\":\"body:alpha\"},\"semantic_search\":\"alpha\",\"indexes\":[\"serverless_chunk\"]}",
+        sources,
+    );
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqualStrings("title_text", plan.sources.findText().?.index_name);
+    try std.testing.expectEqualStrings(search_sources.default_chunk_embedding_index_name, plan.sources.findVector().?.index_name);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSearchPlanAlloc(
+            alloc,
+            "{\"full_text_index\":\"title_text\",\"full_text_search\":{\"query\":\"body:alpha\"},\"indexes\":[\"full_text_index_v0\"]}",
+            sources,
+        ),
+    );
+}
+
 test "search plan rejects unsupported public full text fields" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(

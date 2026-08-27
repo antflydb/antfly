@@ -6033,6 +6033,9 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "profiled composed dense query preserves exact route telemetry",
             "aggregation completeness requires exact total relation",
+            "aggregation context rejects non-current identity generation",
+            "aggregation text analysis selects the named full text index",
+            "collect significant terms field requests gathers unique field terms from hits",
             "distributed grouped hierarchy expands only the globally merged page",
             "distributed grouped unit expansion rejects a cross-revision result",
             "distributed grouped unit expansion rejects a missing selected group",

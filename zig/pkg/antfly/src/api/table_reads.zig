@@ -9425,7 +9425,7 @@ fn aggregationContextForDb(
     return .{
         .index_manager = db.core.index_manager,
         .doc_store = db.core.store,
-        .full_text_index_name = req.index_name,
+        .full_text_index_name = aggregationFullTextIndexName(req),
         .algebraic_index_name = req.index_name,
         .algebraic_available = try algebraicIndexFreshEnoughForRequest(alloc, req, db),
         .identity_read_generation = identity_read_generation,
@@ -9452,11 +9452,19 @@ fn aggregationContextForCapturedResultDb(
     return .{
         .index_manager = db.core.index_manager,
         .doc_store = db.core.store,
-        .full_text_index_name = req.index_name,
+        .full_text_index_name = aggregationFullTextIndexName(req),
         .algebraic_index_name = req.index_name,
         .algebraic_available = try algebraicIndexFreshEnoughForRequest(alloc, req, db),
         .identity_read_generation = identity_read_generation,
     };
+}
+
+/// The public query contract lowers `full_text_index` into one named full-text
+/// query. Keep that retrieval selector separate from `index_name`, which is
+/// also used by structured filters and algebraic aggregations.
+fn aggregationFullTextIndexName(req: db_mod.types.SearchRequest) ?[]const u8 {
+    if (req.full_text_queries.len == 1) return req.full_text_queries[0].index_name;
+    return req.index_name;
 }
 
 fn currentIdentityReadGenerationForDb(requested: ?u64, db: *db_mod.DB) !u64 {
@@ -12699,7 +12707,7 @@ fn applyProvisionedQueryAggregations(
     defer alloc.free(shard_generations);
     if (try tryApplyProvisionedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta, shard_generations)) return;
 
-    var text_analysis = try loadTableAggregationTextAnalysis(alloc, self.catalog, table_name, aggregation_req.index_name);
+    var text_analysis = try loadTableAggregationTextAnalysis(alloc, self.catalog, table_name, aggregationFullTextIndexName(aggregation_req));
     defer introducer_mod.freeTextAnalysisConfig(alloc, text_analysis);
     if (aggregationCanUseCurrentResult(req, result.*)) {
         const current_agg_stats = try collectProvisionedAggregationTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, &text_analysis, shard_generations);
@@ -12934,7 +12942,7 @@ fn applyHostedProvisionedQueryAggregations(
     defer alloc.free(shard_generations);
     if (try tryApplyHostedAlgebraicDistributedAggregations(self, alloc, group_ids, table_name, aggregation_req, meta, consistency, shard_generations)) return;
 
-    var text_analysis = try loadTableAggregationTextAnalysis(alloc, self.catalog, table_name, aggregation_req.index_name);
+    var text_analysis = try loadTableAggregationTextAnalysis(alloc, self.catalog, table_name, aggregationFullTextIndexName(aggregation_req));
     defer introducer_mod.freeTextAnalysisConfig(alloc, text_analysis);
     if (aggregationCanUseCurrentResult(req, result.*)) {
         const current_agg_stats = try collectHostedAggregationTextStats(self, alloc, group_ids, table_name, aggregation_req, result.hits, &text_analysis, consistency, shard_generations);
@@ -14803,6 +14811,7 @@ fn collectSignificantTermsFieldRequests(
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
     text_analysis: *const introducer_mod.TextAnalysisConfig,
+    index_name: ?[]const u8,
 ) ![]OwnedTextStatsFieldRequest {
     var grouped = std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(void)){};
     defer {
@@ -14840,6 +14849,7 @@ fn collectSignificantTermsFieldRequests(
             .terms = terms,
         };
         initialized += 1;
+        if (index_name) |name| out[initialized - 1].index_name = try alloc.dupe(u8, name);
     }
     return out;
 }
@@ -14849,13 +14859,14 @@ fn collectSignificantTermsBackgroundFieldRequests(
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
     text_analysis: *const introducer_mod.TextAnalysisConfig,
+    index_name: ?[]const u8,
 ) ![]OwnedBackgroundTextStatsFieldRequest {
     var out = std.ArrayListUnmanaged(OwnedBackgroundTextStatsFieldRequest).empty;
     errdefer {
         for (out.items) |*item| item.deinit(alloc);
         out.deinit(alloc);
     }
-    try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, &out, requests, hits, text_analysis);
+    try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, &out, requests, hits, text_analysis, index_name);
     return try out.toOwnedSlice(alloc);
 }
 
@@ -14865,6 +14876,7 @@ fn collectSignificantTermsBackgroundFieldRequestsRecursive(
     requests: []const db_mod.aggregations.SearchAggregationRequest,
     hits: []const db_mod.types.SearchHit,
     text_analysis: *const introducer_mod.TextAnalysisConfig,
+    index_name: ?[]const u8,
 ) !void {
     for (requests) |request| {
         if (std.mem.eql(u8, request.type, "significant_terms") and request.background_query != null) {
@@ -14885,15 +14897,17 @@ fn collectSignificantTermsBackgroundFieldRequestsRecursive(
                     terms[term_index] = try alloc.dupe(u8, term.*);
                     term_index += 1;
                 }
+                const item_index = out.items.len;
                 try out.append(alloc, .{
                     .aggregation_name = try alloc.dupe(u8, request.name),
                     .field = try alloc.dupe(u8, request.field),
                     .terms = terms,
                     .background_query = try cloneBackgroundQuery(alloc, request.background_query.?),
                 });
+                if (index_name) |name| out.items[item_index].index_name = try alloc.dupe(u8, name);
             }
         }
-        try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, out, request.aggregations, hits, text_analysis);
+        try collectSignificantTermsBackgroundFieldRequestsRecursive(alloc, out, request.aggregations, hits, text_analysis, index_name);
     }
 }
 
@@ -15523,7 +15537,7 @@ fn collectProvisionedAggregationTextStats(
     try validateRequiredIdentityGenerations(group_ids.len, required_identity_generations);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits, text_analysis);
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits, text_analysis, aggregationFullTextIndexName(req));
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -15563,7 +15577,7 @@ fn collectProvisionedAggregationBackgroundTextStats(
     try validateRequiredIdentityGenerations(group_ids.len, required_identity_generations);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits, text_analysis);
+    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits, text_analysis, aggregationFullTextIndexName(req));
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -15604,7 +15618,7 @@ fn collectHostedAggregationTextStats(
     try validateRequiredIdentityGenerations(group_ids.len, required_identity_generations);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits, text_analysis);
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, requests, hits, text_analysis, aggregationFullTextIndexName(req));
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -15650,7 +15664,7 @@ fn collectHostedAggregationBackgroundTextStats(
     try validateRequiredIdentityGenerations(group_ids.len, required_identity_generations);
     const requests = try query_api.parseAggregationRequestsJson(alloc, req.aggregations_json);
     defer query_api.freeAggregationRequests(alloc, requests);
-    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits, text_analysis);
+    const field_requests = try collectSignificantTermsBackgroundFieldRequests(alloc, requests, hits, text_analysis, aggregationFullTextIndexName(req));
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
@@ -23331,6 +23345,17 @@ test "aggregation context rejects non-current identity generation" {
     const current = db.core.nextDerivedSequence();
     const ctx = try aggregationContextForDb(alloc, .{ .identity_read_generation = current }, &db);
     try std.testing.expectEqual(@as(?u64, current), ctx.identity_read_generation);
+    const named_text_queries = [_]db_mod.types.NamedFullTextQuery{.{
+        .name = "$full_text_results",
+        .index_name = "document_text",
+        .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }};
+    const named_ctx = try aggregationContextForDb(alloc, .{
+        .identity_read_generation = current,
+        .full_text_queries = &named_text_queries,
+    }, &db);
+    try std.testing.expectEqualStrings("document_text", named_ctx.full_text_index_name.?);
+    try std.testing.expect(named_ctx.algebraic_index_name == null);
     try std.testing.expectError(error.IdentityReadGenerationChanged, aggregationContextForDb(alloc, .{
         .identity_read_generation = current + 1,
     }, &db));
@@ -23346,6 +23371,52 @@ test "aggregation context rejects non-current identity generation" {
     try std.testing.expect(captured.index_manager == null);
     try std.testing.expect(captured.doc_store == null);
     try std.testing.expect(!captured.algebraic_available);
+}
+
+test "aggregation text analysis selects the named full text index" {
+    const alloc = std.testing.allocator;
+    const FakeCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json =
+                    \\{"active_text":{"type":"full_text"},"document_text":{"type":"full_text","analysis_config":{"field_analyzers":{"body":"keyword"}}}}
+                    ,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        loadTableAggregationTextAnalysis(alloc, FakeCatalog.iface(), "docs", null),
+    );
+    const analysis = try loadTableAggregationTextAnalysis(alloc, FakeCatalog.iface(), "docs", "document_text");
+    defer introducer_mod.freeTextAnalysisConfig(alloc, analysis);
+    try std.testing.expectEqual(@as(usize, 1), analysis.field_analyzers.len);
+    try std.testing.expectEqualStrings("body", analysis.field_analyzers[0].field_name);
+    try std.testing.expectEqualStrings("keyword", analysis.field_analyzers[0].analyzer_name);
 }
 
 test "aggregation full-result rerun can reuse snapped result identity generation" {
@@ -24898,13 +24969,15 @@ test "collect significant terms field requests gathers unique field terms from h
     };
 
     const text_analysis = introducer_mod.TextAnalysisConfig{};
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits, &text_analysis);
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits, &text_analysis, "document_text");
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len > 0) alloc.free(field_requests);
     }
 
     try std.testing.expectEqual(@as(usize, 2), field_requests.len);
+    try std.testing.expectEqualStrings("document_text", field_requests[0].index_name.?);
+    try std.testing.expectEqualStrings("document_text", field_requests[1].index_name.?);
 
     const body = for (field_requests) |item| {
         if (std.mem.eql(u8, item.field, "body")) break item;
@@ -24944,7 +25017,7 @@ test "distributed significant terms candidates use configured analyzers and boun
         .field = "body",
         .size = 1,
     }};
-    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits, &text_analysis);
+    const field_requests = try collectSignificantTermsFieldRequests(alloc, &requests, hits, &text_analysis, null);
     defer {
         for (field_requests) |*item| item.deinit(alloc);
         if (field_requests.len != 0) alloc.free(field_requests);

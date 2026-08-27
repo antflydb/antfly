@@ -148,22 +148,23 @@ pub const PublishedSearchSources = struct {
             for (names) |index_name| {
                 if (self.items) |items| {
                     var matched = false;
-                    for (items) |item| {
-                        if (!std.mem.eql(u8, item.indexName(), index_name)) continue;
-                        try resolved.append(item);
-                        matched = true;
-                        break;
-                    }
+                    for (items) |item| switch (item) {
+                        // Public `indexes` selects embedding lanes. Text has a
+                        // dedicated singular selector (`full_text_index`), so
+                        // accepting it here would create order-dependent
+                        // precedence between two API fields.
+                        .text => {},
+                        .vector, .sparse => {
+                            if (!std.mem.eql(u8, item.indexName(), index_name)) continue;
+                            try resolved.append(item);
+                            matched = true;
+                            break;
+                        },
+                    };
                     if (matched) {
                         continue;
                     }
                 } else {
-                    if (self.text) |text| {
-                        if (std.mem.eql(u8, text.index_name, index_name)) {
-                            try resolved.append(.{ .text = text });
-                            continue;
-                        }
-                    }
                     if (self.vector) |vector| {
                         if (std.mem.eql(u8, vector.index_name, index_name)) {
                             try resolved.append(.{ .vector = vector });
@@ -927,6 +928,12 @@ test "published search sources reject unknown index names" {
     const sources = defaultPublishedSearchSources();
     var indexes = [_][]u8{@constCast("unknown")};
     try std.testing.expectError(error.InvalidQueryRequest, sources.resolveRequested(indexes[0..], true, false));
+}
+
+test "serverless published search sources reject text names in embedding index selectors" {
+    const sources = defaultPublishedSearchSources();
+    var indexes = [_][]u8{@constCast(default_full_text_index_name)};
+    try std.testing.expectError(error.InvalidQueryRequest, sources.resolveRequested(indexes[0..], false, false));
 }
 
 test "published search sources clone alloc produces owned descriptors" {
