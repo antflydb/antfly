@@ -13,11 +13,15 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const db_mod = @import("../storage/db/mod.zig");
 const transactions_mod = @import("../storage/transactions.zig");
 const tracing = @import("../tracing/antfly_trace_writer.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const raft_host = @import("../raft/host.zig");
 const http_client_mod = @import("http_client.zig");
+const http_route_helpers = @import("http_route_helpers.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
@@ -65,6 +69,8 @@ pub const TableCommitRequest = contract.TableCommitRequest;
 pub const CommitConflict = contract.CommitConflict;
 pub const ParticipantPhase = contract.ParticipantPhase;
 pub const CommitOutcome = contract.CommitOutcome;
+pub const PreDecisionContext = contract.PreDecisionContext;
+pub const pre_decision_server_response_reserve_ms = contract.pre_decision_server_response_reserve_ms;
 
 pub const ParticipantWorker = struct {
     ptr: *anyopaque,
@@ -179,12 +185,34 @@ pub const RecoveryResolver = struct {
 };
 
 pub const HostedParticipantWorker = struct {
+    const default_pre_decision_timeout_ms: u32 = 20_000;
+    /// The data-Raft write path may spend its complete bounded window finding
+    /// a leader before it can return the authenticated `not-proposed` proof.
+    /// Keep the outer HTTP deadline strictly later so request admission,
+    /// response serialization, and transport cannot erase that proof at the
+    /// exact timeout boundary and turn a safe replica retry into an ambiguous
+    /// post-send failure.
+    const pre_decision_response_reserve_ms: u32 = 1_000;
+    const default_pre_decision_attempt_timeout_ms: u32 =
+        contract.max_pre_decision_server_budget_ms + pre_decision_response_reserve_ms;
+
+    const PreDecisionAttemptBudget = struct {
+        client_timeout_ms: u32,
+        server_budget_ms: u32,
+    };
+
     catalog: table_catalog.CatalogSource,
     router: table_router.HostedGroupRouter,
     writes: table_writes.TableWriteSource,
     executor: http_common.RequestExecutor,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    /// One process-local deadline covers routing, serialization, and every
+    /// candidate contacted by a single begin/prepare operation. Individual
+    /// attempts are capped so one black-holed peer cannot consume the entire
+    /// rediscovery window before another replica is tried.
+    pre_decision_timeout_ms: u32 = default_pre_decision_timeout_ms,
+    pre_decision_attempt_timeout_ms: u32 = default_pre_decision_attempt_timeout_ms,
 
     pub fn init(
         catalog: table_catalog.CatalogSource,
@@ -228,34 +256,312 @@ pub const HostedParticipantWorker = struct {
 
     fn beginGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnBeginRequest) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
+        const deadline_ns = self.preDecisionDeadlineNs() catch |err| {
+            if (err == error.Timeout) return error.PreDecisionNotProposed;
+            return err;
+        };
+        var route = (table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader) catch |err|
+            return preDecisionSetupNotProposed(group_id, "initial-route", err)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
+        ensurePreDecisionDeadline(deadline_ns) catch |err| {
+            if (err == error.Timeout) return error.PreDecisionNotProposed;
+            return err;
+        };
+        const attempted_node_id = switch (route) {
+            .local => self.router.localNodeId(),
+            .remote => |remote| remote.node_id,
+        };
         switch (route) {
-            .local => _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants)) orelse return error.UnknownGroup,
+            .local => {
+                const context = self.localPreDecisionContext(deadline_ns) catch |err| {
+                    if (err == error.Timeout) return error.PreDecisionNotProposed;
+                    return err;
+                };
+                const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
+                    if (!isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_begin_group_local_with_pre_decision_context != null)) return err;
+                    return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
+                };
+                if (result == null)
+                    return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
+            },
             .remote => |remote| {
                 var client = self.httpClient(alloc);
-                const body = try encodeTxnBeginRequest(alloc, req);
+                const body = encodeTxnBeginRequest(alloc, req) catch |err|
+                    return preDecisionSetupNotProposed(group_id, "initial-request-encoding", err);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnBegin(remote.base_uri, group_id, table_name, body);
-                response.deinit(alloc);
+                var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+                const budget = self.remainingPreDecisionAttemptBudget(deadline_ns) catch |err| {
+                    if (err == error.Timeout) return error.PreDecisionNotProposed;
+                    return err;
+                };
+                const outcome = client.fetchGroupTxnBeginOutcomeWithDeliveryTracking(
+                    remote.base_uri,
+                    group_id,
+                    table_name,
+                    body,
+                    &delivery_tracker,
+                    budget.client_timeout_ms,
+                    budget.server_budget_ms,
+                ) catch |err| {
+                    if (!shouldTryAnotherPreDecisionAttempt(err, &delivery_tracker)) return err;
+                    if (!isPreDecisionTransportUnavailable(err))
+                        logPreDecisionSetupFailure(group_id, attempted_node_id, "initial-request", err);
+                    return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, body, deadline_ns);
+                };
+                if (outcome != .applied)
+                    return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, body, deadline_ns);
             },
         }
     }
 
     fn prepareGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnPrepareRequest) !void {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
+        const deadline_ns = try self.preDecisionDeadlineNs();
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
+        try ensurePreDecisionDeadline(deadline_ns);
+        const attempted_node_id = switch (route) {
+            .local => self.router.localNodeId(),
+            .remote => |remote| remote.node_id,
+        };
         switch (route) {
-            .local => _ = (try self.writes.txnPrepareGroupLocal(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req)) orelse return error.UnknownGroup,
+            .local => {
+                const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
+                    if (!isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_prepare_group_local_with_pre_decision_context != null)) return err;
+                    return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
+                };
+                if (result == null)
+                    return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
+            },
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnPrepareRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnPrepare(remote.base_uri, group_id, table_name, body);
-                response.deinit(alloc);
+                var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+                const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
+                const outcome = client.fetchGroupTxnPrepareOutcomeWithDeliveryTracking(
+                    remote.base_uri,
+                    group_id,
+                    table_name,
+                    body,
+                    &delivery_tracker,
+                    budget.client_timeout_ms,
+                    budget.server_budget_ms,
+                ) catch |err| {
+                    if (!shouldTryAnotherPreDecisionAttempt(err, &delivery_tracker)) return err;
+                    return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, body, deadline_ns);
+                };
+                if (outcome != .applied)
+                    return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, body, deadline_ns);
             },
         }
+    }
+
+    fn beginGroupFromCandidates(
+        self: *HostedParticipantWorker,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: TxnBeginRequest,
+        attempted_node_id: u64,
+        encoded_body: ?[]const u8,
+        deadline_ns: u64,
+    ) !void {
+        ensurePreDecisionDeadline(deadline_ns) catch |err| {
+            if (err == error.Timeout) return error.PreDecisionNotProposed;
+            return err;
+        };
+        const node_ids = (self.router.groupNodeIds(alloc, group_id) catch |err|
+            return preDecisionSetupNotProposed(group_id, "candidate-discovery", err)) orelse return error.PreDecisionNotProposed;
+        defer alloc.free(node_ids);
+        var owned_body: ?[]u8 = null;
+        defer if (owned_body) |body| alloc.free(body);
+        const body = encoded_body orelse blk: {
+            var has_candidate = false;
+            for (node_ids) |node_id| {
+                if (node_id != attempted_node_id) {
+                    has_candidate = true;
+                    break;
+                }
+            }
+            if (!has_candidate) return error.PreDecisionNotProposed;
+            const value = encodeTxnBeginRequest(alloc, req) catch |err|
+                return preDecisionSetupNotProposed(group_id, "candidate-request-encoding", err);
+            owned_body = value;
+            break :blk value;
+        };
+        for (node_ids) |node_id| {
+            if (node_id == attempted_node_id) continue;
+            if (try self.beginGroupAtNode(alloc, group_id, table_name, req, node_id, body, deadline_ns)) return;
+        }
+        // Every contacted candidate either supplied an authenticated proof or
+        // failed before delivery. Preserve that stronger fact for coordinator
+        // abort accounting; GroupLeaderUnavailable can also represent an
+        // executor error after ambiguous delivery and must remain distinct.
+        return error.PreDecisionNotProposed;
+    }
+
+    fn beginGroupAtNode(
+        self: *HostedParticipantWorker,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: TxnBeginRequest,
+        node_id: u64,
+        body: []const u8,
+        deadline_ns: u64,
+    ) !bool {
+        ensurePreDecisionDeadline(deadline_ns) catch |err| {
+            if (err == error.Timeout) return false;
+            return err;
+        };
+        if (node_id == self.router.localNodeId()) {
+            if (self.router.localStatus(group_id) != .active) return false;
+            const context = self.localPreDecisionContext(deadline_ns) catch |err| {
+                if (err == error.Timeout) return false;
+                return err;
+            };
+            const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, context) catch |err| {
+                if (isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_begin_group_local_with_pre_decision_context != null)) return false;
+                return err;
+            };
+            return result != null;
+        }
+        if (self.router.nodeStatus(node_id, group_id)) |status| {
+            if (status != .active) return false;
+        }
+        const base_uri = (self.router.nodeBaseUriForGroup(alloc, group_id, node_id) catch |err| {
+            logPreDecisionSetupFailure(group_id, node_id, "candidate-route", err);
+            return false;
+        }) orelse return false;
+        defer alloc.free(base_uri);
+        var client = self.httpClient(alloc);
+        var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        const budget = self.remainingPreDecisionAttemptBudget(deadline_ns) catch |err| {
+            if (err == error.Timeout) return false;
+            return err;
+        };
+        const outcome = client.fetchGroupTxnBeginOutcomeWithDeliveryTracking(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            &delivery_tracker,
+            budget.client_timeout_ms,
+            budget.server_budget_ms,
+        ) catch |err| {
+            if (shouldTryAnotherPreDecisionAttempt(err, &delivery_tracker)) {
+                if (!isPreDecisionTransportUnavailable(err))
+                    logPreDecisionSetupFailure(group_id, node_id, "candidate-request", err);
+                return false;
+            }
+            return err;
+        };
+        return outcome == .applied;
+    }
+
+    fn prepareGroupFromCandidates(
+        self: *HostedParticipantWorker,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: TxnPrepareRequest,
+        attempted_node_id: u64,
+        encoded_body: ?[]const u8,
+        deadline_ns: u64,
+    ) !void {
+        try ensurePreDecisionDeadline(deadline_ns);
+        const node_ids = (try self.router.groupNodeIds(alloc, group_id)) orelse return error.GroupLeaderUnavailable;
+        defer alloc.free(node_ids);
+        var owned_body: ?[]u8 = null;
+        defer if (owned_body) |body| alloc.free(body);
+        const body = encoded_body orelse blk: {
+            var has_candidate = false;
+            for (node_ids) |node_id| {
+                if (node_id != attempted_node_id) {
+                    has_candidate = true;
+                    break;
+                }
+            }
+            if (!has_candidate) return error.GroupLeaderUnavailable;
+            const value = try encodeTxnPrepareRequest(alloc, req);
+            owned_body = value;
+            break :blk value;
+        };
+        for (node_ids) |node_id| {
+            if (node_id == attempted_node_id) continue;
+            if (try self.prepareGroupAtNode(alloc, group_id, table_name, req, node_id, body, deadline_ns)) return;
+        }
+        return error.GroupLeaderUnavailable;
+    }
+
+    fn prepareGroupAtNode(
+        self: *HostedParticipantWorker,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: TxnPrepareRequest,
+        node_id: u64,
+        body: []const u8,
+        deadline_ns: u64,
+    ) !bool {
+        try ensurePreDecisionDeadline(deadline_ns);
+        if (node_id == self.router.localNodeId()) {
+            if (self.router.localStatus(group_id) != .active) return false;
+            const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
+                if (isLocalPreDecisionCandidateMiss(err, self.writes.vtable.txn_prepare_group_local_with_pre_decision_context != null)) return false;
+                return err;
+            };
+            return result != null;
+        }
+        if (self.router.nodeStatus(node_id, group_id)) |status| {
+            if (status != .active) return false;
+        }
+        const base_uri = (try self.router.nodeBaseUriForGroup(alloc, group_id, node_id)) orelse return false;
+        defer alloc.free(base_uri);
+        var client = self.httpClient(alloc);
+        var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
+        const outcome = client.fetchGroupTxnPrepareOutcomeWithDeliveryTracking(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            &delivery_tracker,
+            budget.client_timeout_ms,
+            budget.server_budget_ms,
+        ) catch |err| {
+            if (shouldTryAnotherPreDecisionAttempt(err, &delivery_tracker)) return false;
+            return err;
+        };
+        return outcome == .applied;
+    }
+
+    fn preDecisionDeadlineNs(self: *const HostedParticipantWorker) !u64 {
+        if (self.pre_decision_timeout_ms == 0 or self.pre_decision_attempt_timeout_ms == 0)
+            return error.Timeout;
+        const duration_ns = @as(u64, self.pre_decision_timeout_ms) *| std.time.ns_per_ms;
+        return platform_time.monotonicNs() +| duration_ns;
+    }
+
+    fn remainingPreDecisionAttemptBudget(self: *const HostedParticipantWorker, deadline_ns: u64) !PreDecisionAttemptBudget {
+        const remaining_ms = try remainingPreDecisionTimeoutMs(deadline_ns);
+        const client_timeout_ms = @min(remaining_ms, self.pre_decision_attempt_timeout_ms);
+        if (client_timeout_ms <= pre_decision_response_reserve_ms + contract.pre_decision_server_response_reserve_ms)
+            return error.Timeout;
+        return .{
+            .client_timeout_ms = client_timeout_ms,
+            .server_budget_ms = @min(
+                contract.max_pre_decision_server_budget_ms,
+                client_timeout_ms - pre_decision_response_reserve_ms,
+            ),
+        };
+    }
+
+    fn localPreDecisionContext(self: *const HostedParticipantWorker, deadline_ns: u64) !PreDecisionContext {
+        const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
+        const duration_ns = @as(u64, budget.server_budget_ms) *| std.time.ns_per_ms;
+        return .{ .deadline_ns = platform_time.monotonicNs() +| duration_ns };
     }
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
@@ -324,6 +630,99 @@ pub const HostedParticipantWorker = struct {
         }
     }
 };
+
+fn isPreDecisionLeaderUnavailable(err: anyerror) bool {
+    return switch (err) {
+        error.GroupLeaderUnavailable,
+        error.LeaderUnavailable,
+        error.MetadataSnapshotUnavailable,
+        => true,
+        else => false,
+    };
+}
+
+fn isPreDecisionCandidateMiss(err: anyerror) bool {
+    return isPreDecisionLeaderUnavailable(err) or err == error.UnknownGroup;
+}
+
+fn isLocalPreDecisionCandidateMiss(err: anyerror, supports_pre_decision_context: bool) bool {
+    if (isPreDecisionCandidateMiss(err)) return true;
+    // Only the context-aware callback contract can emit this typed proof from
+    // a checked boundary before admitting the mutation. Generic deadline and
+    // timeout errors remain ambiguous across rolling-version fallbacks.
+    return supports_pre_decision_context and err == error.PreDecisionDeadlineExceeded;
+}
+
+fn beginDefinitelyCreatedNoState(err: anyerror) bool {
+    return err == error.UnknownGroup or err == error.PreDecisionNotProposed;
+}
+
+fn isPreDecisionTransportUnavailable(err: anyerror) bool {
+    return switch (err) {
+        error.Timeout,
+        error.ConnectionTimeout,
+        error.ConnectionTimedOut,
+        error.ConnectionFailed,
+        error.ConnectionRefused,
+        error.ConnectionReset,
+        error.ConnectionResetByPeer,
+        error.ConnectionClosed,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.HostUnreachable,
+        error.DnsResolutionFailed,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.TlsHandshakeFailed,
+        error.TlsCertificateError,
+        error.TlsError,
+        => true,
+        else => false,
+    };
+}
+
+fn shouldTryAnotherPreDecisionAttempt(
+    err: anyerror,
+    delivery_tracker: *const http_common.RequestDeliveryTracker,
+) bool {
+    const delivery = delivery_tracker.load();
+    // An executor or client that explicitly proves no bytes were sent may
+    // safely retry regardless of the local failure class. Unknown delivery is
+    // fail-closed except for connection refusal, which occurs before a TCP
+    // connection exists and therefore cannot have delivered the request.
+    return delivery == .not_sent or
+        (delivery == .unknown and err == error.ConnectionRefused);
+}
+
+fn preDecisionSetupNotProposed(group_id: u64, stage: []const u8, err: anyerror) error{PreDecisionNotProposed} {
+    std.log.warn("transaction begin not proposed after local setup failure group_id={} stage={s} err={s}", .{
+        group_id,
+        stage,
+        @errorName(err),
+    });
+    return error.PreDecisionNotProposed;
+}
+
+fn logPreDecisionSetupFailure(group_id: u64, node_id: u64, stage: []const u8, err: anyerror) void {
+    std.log.warn("transaction begin skipped replica after local setup failure group_id={} node_id={} stage={s} err={s}", .{
+        group_id,
+        node_id,
+        stage,
+        @errorName(err),
+    });
+}
+
+fn ensurePreDecisionDeadline(deadline_ns: u64) !void {
+    if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+}
+
+fn remainingPreDecisionTimeoutMs(deadline_ns: u64) !u32 {
+    const now_ns = platform_time.monotonicNs();
+    if (now_ns >= deadline_ns) return error.Timeout;
+    const remaining_ns = deadline_ns - now_ns;
+    const rounded_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1);
+    return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
+}
 
 pub const LocalTableWriteParticipantWorker = struct {
     writes: table_writes.TableWriteSource,
@@ -443,6 +842,731 @@ test "distributed txn classifies local and transported visibility outcomes ident
     try std.testing.expect(!isPostCommitVisibilityError(error.GroupLeaderUnavailable));
     try std.testing.expect(isTerminalVisibilityRepair(error.EnrichmentWorkerFailed));
     try std.testing.expect(!isTerminalVisibilityRepair(error.CommitVisibilityNotSatisfied));
+}
+
+test "hosted participant attempt deadline preserves the server outcome window" {
+    try std.testing.expectEqual(
+        contract.max_pre_decision_server_budget_ms,
+        internal_batch_forwarding.max_remaining_ms,
+    );
+    try std.testing.expect(
+        HostedParticipantWorker.default_pre_decision_attempt_timeout_ms >
+            contract.max_pre_decision_server_budget_ms,
+    );
+    try std.testing.expectEqual(
+        HostedParticipantWorker.pre_decision_response_reserve_ms,
+        HostedParticipantWorker.default_pre_decision_attempt_timeout_ms -
+            contract.max_pre_decision_server_budget_ms,
+    );
+}
+
+test "hosted participant rediscovery retries only pre-decision leader unavailability" {
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .group_node_ids = groupNodeIds,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 99;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+            return try alloc.dupe(u64, &.{ 1, 2, 3 });
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+            return if (node_id >= 1 and node_id <= 3) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+        }
+    };
+
+    const FakeExecutor = struct {
+        const FirstOutcome = enum {
+            marked_not_proposed,
+            unmarked_unavailable,
+            not_sent_transport,
+            post_send_transport,
+            not_sent_timeout,
+            post_send_timeout,
+            unknown_timeout,
+            not_sent_local_failure,
+            post_send_local_failure,
+            unknown_group,
+            unmarked_unknown_group,
+            forged_leader_unavailable,
+            forged_unknown_group,
+        };
+
+        first_outcome: ?FirstOutcome = .marked_not_proposed,
+        first_expected_node_id: u64 = 1,
+        fallback_expected_node_id: u64 = 2,
+        expect_service_auth: bool = false,
+        calls: usize = 0,
+        first_body: [4096]u8 = undefined,
+        first_body_len: usize = 0,
+        first_body_ptr: ?[*]const u8 = null,
+        first_timeout_ms: ?u32 = null,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const timeout_ms = req.timeout_ms orelse return error.TestExpectedBoundedTimeout;
+            try std.testing.expect(timeout_ms > 0 and timeout_ms <= HostedParticipantWorker.default_pre_decision_attempt_timeout_ms);
+            const server_budget_raw = req.header(contract.pre_decision_remaining_ms_header) orelse
+                return error.TestExpectedServerBudget;
+            const server_budget_ms = try std.fmt.parseUnsigned(u32, server_budget_raw, 10);
+            try std.testing.expect(server_budget_ms > contract.pre_decision_server_response_reserve_ms);
+            try std.testing.expect(server_budget_ms <= contract.max_pre_decision_server_budget_ms);
+            try std.testing.expect(server_budget_ms + HostedParticipantWorker.pre_decision_response_reserve_ms <= timeout_ms);
+            var service_auth_headers: usize = 0;
+            for (req.headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) continue;
+                service_auth_headers += 1;
+                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+            }
+            try std.testing.expectEqual(@as(usize, if (self.expect_service_auth) 1 else 0), service_auth_headers);
+            if (self.calls == 1) {
+                var expected_uri_buf: [64]u8 = undefined;
+                const expected_uri = try std.fmt.bufPrint(&expected_uri_buf, "http://node-{d}/", .{self.first_expected_node_id});
+                try std.testing.expect(std.mem.indexOf(u8, req.uri, expected_uri) != null);
+                try std.testing.expect(req.body.len <= self.first_body.len);
+                @memcpy(self.first_body[0..req.body.len], req.body);
+                self.first_body_len = req.body.len;
+                self.first_body_ptr = req.body.ptr;
+                self.first_timeout_ms = timeout_ms;
+                const first_outcome = self.first_outcome orelse return .{ .status = 200 };
+                return switch (first_outcome) {
+                    .marked_not_proposed => try http_route_helpers.textResponseWithHeaders(
+                        alloc,
+                        503,
+                        "group leader unavailable",
+                        &.{.{
+                            .name = contract.pre_decision_outcome_header,
+                            .value = contract.pre_decision_not_proposed_v1,
+                        }},
+                    ),
+                    .unmarked_unavailable => try http_route_helpers.textResponse(alloc, 503, "proxy unavailable"),
+                    .not_sent_transport => {
+                        const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+                        tracker.markNotSent();
+                        return error.ConnectionRefused;
+                    },
+                    .post_send_transport => {
+                        const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+                        tracker.markMayHaveBeenSent();
+                        return error.ConnectionRefused;
+                    },
+                    .not_sent_timeout => {
+                        const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+                        tracker.markNotSent();
+                        return error.Timeout;
+                    },
+                    .post_send_timeout => {
+                        const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+                        tracker.markMayHaveBeenSent();
+                        return error.Timeout;
+                    },
+                    // A conforming executor may leave delivery unknown when
+                    // it cannot identify its send boundary precisely.
+                    .unknown_timeout => return error.Timeout,
+                    .not_sent_local_failure => {
+                        const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+                        tracker.markNotSent();
+                        return error.TestPreDecisionSetupFailure;
+                    },
+                    .post_send_local_failure => {
+                        const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+                        tracker.markMayHaveBeenSent();
+                        return error.TestPreDecisionSetupFailure;
+                    },
+                    .unknown_group => try http_route_helpers.textResponseWithHeaders(
+                        alloc,
+                        404,
+                        "not found",
+                        &.{.{
+                            .name = contract.pre_decision_outcome_header,
+                            .value = contract.pre_decision_not_proposed_v1,
+                        }},
+                    ),
+                    .unmarked_unknown_group => try http_route_helpers.textResponse(alloc, 404, "not found"),
+                    .forged_leader_unavailable => {
+                        const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+                        tracker.markMayHaveBeenSent();
+                        return error.GroupLeaderUnavailable;
+                    },
+                    .forged_unknown_group => {
+                        const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+                        tracker.markMayHaveBeenSent();
+                        return error.UnknownGroup;
+                    },
+                };
+            }
+            try std.testing.expectEqual(@as(usize, 2), self.calls);
+            try std.testing.expect(timeout_ms <= self.first_timeout_ms.?);
+            var expected_uri_buf: [64]u8 = undefined;
+            const expected_uri = try std.fmt.bufPrint(&expected_uri_buf, "http://node-{d}/", .{self.fallback_expected_node_id});
+            try std.testing.expect(std.mem.indexOf(u8, req.uri, expected_uri) != null);
+            try std.testing.expectEqualStrings(self.first_body[0..self.first_body_len], req.body);
+            try std.testing.expect(req.body.ptr == self.first_body_ptr.?);
+            return .{ .status = 200 };
+        }
+    };
+
+    const AllNotProposedExecutor = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            _ = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+            _ = req.header(contract.pre_decision_remaining_ms_header) orelse
+                return error.TestExpectedServerBudget;
+            return try http_route_helpers.textResponseWithHeaders(
+                alloc,
+                503,
+                "group leader unavailable",
+                &.{.{
+                    .name = contract.pre_decision_outcome_header,
+                    .value = contract.pre_decision_not_proposed_v1,
+                }},
+            );
+        }
+    };
+
+    const txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
+    var begin_executor = FakeExecutor{};
+    var begin_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, begin_executor.iface());
+    try begin_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 2), begin_executor.calls);
+
+    var prepare_executor = FakeExecutor{};
+    var prepare_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, prepare_executor.iface());
+    try prepare_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .req = .{ .writes = &.{.{ .key = "doc:1", .value = "{}" }} },
+    });
+    try std.testing.expectEqual(@as(usize, 2), prepare_executor.calls);
+
+    var authenticated_executor = FakeExecutor{ .expect_service_auth = true };
+    var authenticated_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, authenticated_executor.iface());
+    _ = authenticated_worker.withInternalServiceAuth("cluster-secret", "cluster-a");
+    try authenticated_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 2), authenticated_executor.calls);
+
+    var ambiguous_executor = FakeExecutor{ .first_outcome = .unmarked_unavailable };
+    var ambiguous_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, ambiguous_executor.iface());
+    try std.testing.expectError(error.UnexpectedHttpStatus, ambiguous_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), ambiguous_executor.calls);
+
+    var not_sent_executor = FakeExecutor{ .first_outcome = .not_sent_transport };
+    var not_sent_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, not_sent_executor.iface());
+    try not_sent_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 2), not_sent_executor.calls);
+
+    var post_send_executor = FakeExecutor{ .first_outcome = .post_send_transport };
+    var post_send_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, post_send_executor.iface());
+    try std.testing.expectError(error.ConnectionRefused, post_send_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), post_send_executor.calls);
+
+    var not_sent_timeout_executor = FakeExecutor{ .first_outcome = .not_sent_timeout };
+    var not_sent_timeout_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, not_sent_timeout_executor.iface());
+    try not_sent_timeout_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 2), not_sent_timeout_executor.calls);
+
+    var post_send_timeout_executor = FakeExecutor{ .first_outcome = .post_send_timeout };
+    var post_send_timeout_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, post_send_timeout_executor.iface());
+    try std.testing.expectError(error.Timeout, post_send_timeout_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), post_send_timeout_executor.calls);
+
+    var unknown_timeout_executor = FakeExecutor{ .first_outcome = .unknown_timeout };
+    var unknown_timeout_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, unknown_timeout_executor.iface());
+    try std.testing.expectError(error.Timeout, unknown_timeout_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), unknown_timeout_executor.calls);
+
+    var not_sent_local_failure_executor = FakeExecutor{ .first_outcome = .not_sent_local_failure };
+    var not_sent_local_failure_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, not_sent_local_failure_executor.iface());
+    try not_sent_local_failure_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 2), not_sent_local_failure_executor.calls);
+
+    var post_send_local_failure_executor = FakeExecutor{ .first_outcome = .post_send_local_failure };
+    var post_send_local_failure_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, post_send_local_failure_executor.iface());
+    try std.testing.expectError(error.TestPreDecisionSetupFailure, post_send_local_failure_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), post_send_local_failure_executor.calls);
+
+    var forged_leader_executor = FakeExecutor{ .first_outcome = .forged_leader_unavailable };
+    var forged_leader_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, forged_leader_executor.iface());
+    try std.testing.expectError(error.GroupLeaderUnavailable, forged_leader_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), forged_leader_executor.calls);
+
+    var forged_missing_executor = FakeExecutor{ .first_outcome = .forged_unknown_group };
+    var forged_missing_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, forged_missing_executor.iface());
+    try std.testing.expectError(error.UnknownGroup, forged_missing_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), forged_missing_executor.calls);
+
+    var missing_executor = FakeExecutor{ .first_outcome = .unknown_group };
+    var missing_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, missing_executor.iface());
+    try missing_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 2), missing_executor.calls);
+
+    var unmarked_missing_executor = FakeExecutor{ .first_outcome = .unmarked_unknown_group };
+    var unmarked_missing_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, unmarked_missing_executor.iface());
+    try std.testing.expectError(error.UnexpectedHttpStatus, unmarked_missing_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), unmarked_missing_executor.calls);
+
+    var exhausted_begin_executor = AllNotProposedExecutor{};
+    var exhausted_begin_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, exhausted_begin_executor.iface());
+    try std.testing.expectError(error.PreDecisionNotProposed, exhausted_begin_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 3), exhausted_begin_executor.calls);
+
+    var expired_candidates_executor = AllNotProposedExecutor{};
+    var expired_candidates_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, expired_candidates_executor.iface());
+    try std.testing.expectError(error.PreDecisionNotProposed, expired_candidates_worker.beginGroupFromCandidates(
+        std.testing.allocator,
+        7,
+        "docs",
+        .{
+            .txn_id = txn_id,
+            .begin_timestamp = 42,
+            .participants = &.{"table2:docs:group:7"},
+        },
+        1,
+        null,
+        0,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), expired_candidates_executor.calls);
+
+    const CandidateSetupRouter = struct {
+        fail_group_nodes: bool = false,
+        fail_node_uri: ?u64 = null,
+
+        fn iface(self: *@This()) table_router.HostedGroupRouter {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .group_node_ids = groupNodeIds,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 99;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn groupNodeIds(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_group_nodes) return error.TestCandidateDiscoveryFailure;
+            return try alloc.dupe(u64, &.{ 1, 2, 3 });
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+            return if (node_id >= 1 and node_id <= 3) .active else .absent;
+        }
+
+        fn nodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_node_uri == node_id) return error.TestCandidateRouteFailure;
+            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+        }
+    };
+
+    var discovery_router = CandidateSetupRouter{ .fail_group_nodes = true };
+    var discovery_executor = FakeExecutor{};
+    var discovery_worker = HostedParticipantWorker.init(undefined, discovery_router.iface(), undefined, discovery_executor.iface());
+    try std.testing.expectError(error.PreDecisionNotProposed, discovery_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), discovery_executor.calls);
+
+    var initial_route_router = CandidateSetupRouter{ .fail_node_uri = 1 };
+    var initial_route_executor = FakeExecutor{};
+    var initial_route_worker = HostedParticipantWorker.init(undefined, initial_route_router.iface(), undefined, initial_route_executor.iface());
+    try std.testing.expectError(error.PreDecisionNotProposed, initial_route_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 0), initial_route_executor.calls);
+
+    var initial_encoding_executor = FakeExecutor{};
+    var initial_encoding_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, initial_encoding_executor.iface());
+    var initial_encoding_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.PreDecisionNotProposed, initial_encoding_worker.worker().beginGroup(initial_encoding_failing.allocator(), 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 0), initial_encoding_executor.calls);
+
+    var candidate_route_router = CandidateSetupRouter{ .fail_node_uri = 2 };
+    var candidate_route_executor = FakeExecutor{ .fallback_expected_node_id = 3 };
+    var candidate_route_worker = HostedParticipantWorker.init(undefined, candidate_route_router.iface(), undefined, candidate_route_executor.iface());
+    try candidate_route_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 2), candidate_route_executor.calls);
+
+    var encoding_failure_executor = AllNotProposedExecutor{};
+    var encoding_failure_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, encoding_failure_executor.iface());
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.PreDecisionNotProposed, encoding_failure_worker.beginGroupFromCandidates(
+        failing.allocator(),
+        7,
+        "docs",
+        .{
+            .txn_id = txn_id,
+            .begin_timestamp = 42,
+            .participants = &.{"table2:docs:group:7"},
+        },
+        1,
+        null,
+        std.math.maxInt(u64),
+    ));
+    try std.testing.expectEqual(@as(usize, 0), encoding_failure_executor.calls);
+
+    var exhausted_prepare_executor = AllNotProposedExecutor{};
+    var exhausted_prepare_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, exhausted_prepare_executor.iface());
+    try std.testing.expectError(error.GroupLeaderUnavailable, exhausted_prepare_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .req = .{ .writes = &.{.{ .key = "doc:1", .value = "{}" }} },
+    }));
+    try std.testing.expectEqual(@as(usize, 3), exhausted_prepare_executor.calls);
+
+    const LocalMissRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .group_node_ids = groupNodeIds,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 99;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .active;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 99;
+        }
+
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+            return try alloc.dupe(u64, &.{ 99, 2 });
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+            return if (node_id == 2) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+        }
+    };
+
+    const NullWrites = struct {
+        fn source() table_writes.TableWriteSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .batch = batch,
+                .txn_begin_group_local = begin,
+                .txn_prepare_group_local = prepare,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
+            return null;
+        }
+
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {
+            return null;
+        }
+    };
+
+    const DeadlineWrites = struct {
+        fn source() table_writes.TableWriteSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .batch = batch,
+                .txn_begin_group_local = begin,
+                .txn_prepare_group_local = prepare,
+                .txn_begin_group_local_with_pre_decision_context = beginWithContext,
+                .txn_prepare_group_local_with_pre_decision_context = prepareWithContext,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
+            return error.TestExpectedContextAwareBegin;
+        }
+
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {
+            return error.TestExpectedContextAwarePrepare;
+        }
+
+        fn beginWithContext(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, _: PreDecisionContext) anyerror!?void {
+            return error.PreDecisionDeadlineExceeded;
+        }
+
+        fn prepareWithContext(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest, _: PreDecisionContext) anyerror!?void {
+            return error.PreDecisionDeadlineExceeded;
+        }
+    };
+
+    const AmbiguousContextWrites = struct {
+        failure: anyerror,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .txn_begin_group_local_with_pre_decision_context = beginWithContext,
+                .txn_prepare_group_local_with_pre_decision_context = prepareWithContext,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+
+        fn beginWithContext(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, _: PreDecisionContext) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+
+        fn prepareWithContext(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest, _: PreDecisionContext) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+
+    const LegacyDeadlineWrites = struct {
+        fn source() table_writes.TableWriteSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .batch = batch,
+                .txn_begin_group_local = begin,
+                .txn_prepare_group_local = prepare,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8) anyerror!?void {
+            return error.DeadlineExceeded;
+        }
+
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest) anyerror!?void {
+            return error.DeadlineExceeded;
+        }
+    };
+
+    var local_miss_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
+    var local_miss_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), NullWrites.source(), local_miss_executor.iface());
+    try local_miss_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 1), local_miss_executor.calls);
+
+    var local_prepare_miss_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
+    var local_prepare_miss_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), NullWrites.source(), local_prepare_miss_executor.iface());
+    try local_prepare_miss_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .req = .{ .writes = &.{.{ .key = "doc:1", .value = "{}" }} },
+    });
+    try std.testing.expectEqual(@as(usize, 1), local_prepare_miss_executor.calls);
+
+    var local_deadline_begin_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
+    var local_deadline_begin_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), DeadlineWrites.source(), local_deadline_begin_executor.iface());
+    try local_deadline_begin_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 1), local_deadline_begin_executor.calls);
+
+    var local_deadline_prepare_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
+    var local_deadline_prepare_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), DeadlineWrites.source(), local_deadline_prepare_executor.iface());
+    try local_deadline_prepare_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .req = .{ .writes = &.{.{ .key = "doc:1", .value = "{}" }} },
+    });
+    try std.testing.expectEqual(@as(usize, 1), local_deadline_prepare_executor.calls);
+
+    var ambiguous_context_writes = AmbiguousContextWrites{ .failure = error.DeadlineExceeded };
+    var ambiguous_context_begin_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
+    var ambiguous_context_begin_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), ambiguous_context_writes.source(), ambiguous_context_begin_executor.iface());
+    try std.testing.expectError(error.DeadlineExceeded, ambiguous_context_begin_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 0), ambiguous_context_begin_executor.calls);
+
+    ambiguous_context_writes.failure = error.Timeout;
+    var ambiguous_context_prepare_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
+    var ambiguous_context_prepare_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), ambiguous_context_writes.source(), ambiguous_context_prepare_executor.iface());
+    try std.testing.expectError(error.Timeout, ambiguous_context_prepare_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .req = .{ .writes = &.{.{ .key = "doc:1", .value = "{}" }} },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), ambiguous_context_prepare_executor.calls);
+
+    var legacy_deadline_begin_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
+    var legacy_deadline_begin_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), LegacyDeadlineWrites.source(), legacy_deadline_begin_executor.iface());
+    try std.testing.expectError(error.DeadlineExceeded, legacy_deadline_begin_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 0), legacy_deadline_begin_executor.calls);
+
+    var legacy_deadline_prepare_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
+    var legacy_deadline_prepare_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), LegacyDeadlineWrites.source(), legacy_deadline_prepare_executor.iface());
+    try std.testing.expectError(error.DeadlineExceeded, legacy_deadline_prepare_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .req = .{ .writes = &.{.{ .key = "doc:1", .value = "{}" }} },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), legacy_deadline_prepare_executor.calls);
+
+    var expired_executor = FakeExecutor{};
+    var expired_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, expired_executor.iface());
+    expired_worker.pre_decision_timeout_ms = 0;
+    try std.testing.expectError(error.PreDecisionNotProposed, expired_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 0), expired_executor.calls);
+
+    var expired_prepare_executor = FakeExecutor{};
+    var expired_prepare_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, expired_prepare_executor.iface());
+    expired_prepare_worker.pre_decision_timeout_ms = 0;
+    try std.testing.expectError(error.Timeout, expired_prepare_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .req = .{},
+    }));
+    try std.testing.expectEqual(@as(usize, 0), expired_prepare_executor.calls);
 }
 
 fn fanoutWidth(options: ExecuteOptions, participant_count: usize) usize {
@@ -625,7 +1749,7 @@ fn executeMultiTableCommitOnce(
             .retain_terminal = options.retain_terminal,
             .participants = participant_ids,
         }) catch |err| switch (err) {
-            error.UnknownGroup => {
+            error.UnknownGroup, error.PreDecisionNotProposed => {
                 abort_on_error = false;
                 return .{ .conflict = participantUnavailableConflict(participant, .begin) };
             },
@@ -700,7 +1824,7 @@ fn executeMultiTableCommitOnce(
         if (firstFanoutError(fanout_slots[1..])) |failure_offset| {
             const participant_index = failure_offset + 1;
             const failure = fanout_slots[participant_index].err.?;
-            if (failure != error.UnknownGroup) {
+            if (!beginDefinitelyCreatedNoState(failure)) {
                 const participant = participants.items[participant_index];
                 std.log.warn("transaction begin failed table={s} group_id={} err={s}", .{
                     participant.table_name, participant.group_id, @errorName(failure),
@@ -717,7 +1841,7 @@ fn executeMultiTableCommitOnce(
                 fanout_slots,
             );
             return switch (failure) {
-                error.UnknownGroup => .{ .conflict = participantUnavailableConflict(participants.items[participant_index], .begin) },
+                error.UnknownGroup, error.PreDecisionNotProposed => .{ .conflict = participantUnavailableConflict(participants.items[participant_index], .begin) },
                 else => error.TransactionBeginFailed,
             };
         }
@@ -1087,7 +2211,7 @@ const BeginFanoutTask = struct {
             .participants = participant_ids,
         }) catch |err| {
             slot.err = err;
-            slot.may_have_transaction_state = err != error.UnknownGroup;
+            slot.may_have_transaction_state = !beginDefinitelyCreatedNoState(err);
             return;
         };
         slot.may_have_transaction_state = true;
@@ -2831,7 +3955,7 @@ test "stable distributed transaction retry resumes a durable commit decision" {
     try std.testing.expectEqual(@as(usize, 2), recorder.resolve_calls);
 }
 
-test "distributed txn coordinator aborts begun participants on prepare failure" {
+test "distributed txn coordinator aborts only participants that may have begun" {
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -2866,6 +3990,7 @@ test "distributed txn coordinator aborts begun participants on prepare failure" 
 
     const Recorder = struct {
         fail_begin: bool = false,
+        definite_begin_miss_group_id: ?u64 = null,
         resolves: std.ArrayListUnmanaged(db_mod.types.TxnStatus) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -2886,6 +4011,7 @@ test "distributed txn coordinator aborts begun participants on prepare failure" 
 
         fn begin(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, _: []const u8, _: TxnBeginRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.definite_begin_miss_group_id == group_id) return error.PreDecisionNotProposed;
             if (self.fail_begin and group_id == 7002) return error.InjectedBeginFailure;
         }
 
@@ -2946,6 +4072,42 @@ test "distributed txn coordinator aborts begun participants on prepare failure" 
     ));
     try std.testing.expectEqual(@as(usize, 2), recorder.resolves.items.len);
     for (recorder.resolves.items) |status| try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, status);
+
+    recorder.resolves.clearRetainingCapacity();
+    recorder.fail_begin = false;
+    recorder.definite_begin_miss_group_id = 7001;
+    try std.testing.expectError(error.IntentConflict, executeCrossGroup(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        "docs",
+        txn_id,
+        10_000,
+        10_001,
+        .{ .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"a\"}" }} },
+        null,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), recorder.resolves.items.len);
+
+    recorder.definite_begin_miss_group_id = 7002;
+    try std.testing.expectError(error.IntentConflict, executeCrossGroup(
+        std.testing.allocator,
+        FakeCatalog.iface(),
+        recorder.worker(),
+        "docs",
+        txn_id,
+        10_000,
+        10_001,
+        .{ .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"a\"}" },
+            .{ .key = "doc:z", .value = "{\"title\":\"z\"}" },
+        } },
+        null,
+    ));
+    // Only the coordinator, which did begin, receives the durable abort. The
+    // follower's explicit not-proposed result must not create phase-two work.
+    try std.testing.expectEqual(@as(usize, 1), recorder.resolves.items.len);
+    try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, recorder.resolves.items[0]);
 }
 
 test "distributed txn coordinator never restarts a transaction id on topology change" {

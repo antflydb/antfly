@@ -736,11 +736,7 @@ fn metadataRestoreJobLoad(ptr: *anyopaque, alloc: std.mem.Allocator) ![]restore_
 
 fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    try svc.proposeTransitionCommand(.{ .upsert_restore_job = .{ .key = key, .value = value } });
-    // `propose` only admits the command to the local Raft node. A successful
-    // job mutation must not become visible to the HTTP caller until a read
-    // barrier proves that this proposal is committed and applied locally.
-    try svc.ensureLinearizableRead();
+    _ = try svc.proposeTransitionCommandAndWaitApplied(.{ .upsert_restore_job = .{ .key = key, .value = value } });
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const committed = (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) orelse
         return error.RestoreJobCommitNotApplied;
@@ -750,8 +746,7 @@ fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8) !v
 
 fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8) !void {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    try svc.proposeTransitionCommand(.{ .remove_restore_job = .{ .key = key } });
-    try svc.ensureLinearizableRead();
+    _ = try svc.proposeTransitionCommandAndWaitApplied(.{ .remove_restore_job = .{ .key = key } });
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     if (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) |committed| {
         svc.alloc.free(committed);
@@ -762,8 +757,7 @@ fn metadataRestoreJobDelete(ptr: *anyopaque, key: []const u8) !void {
 fn metadataRestoreJobDeleteMany(ptr: *anyopaque, keys: []const []const u8) !void {
     if (keys.len == 0) return;
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    try svc.proposeTransitionCommand(.{ .remove_restore_jobs = .{ .keys = keys } });
-    try svc.ensureLinearizableRead();
+    _ = try svc.proposeTransitionCommandAndWaitApplied(.{ .remove_restore_jobs = .{ .keys = keys } });
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     for (keys) |key| {
         if (try store.getRestoreJobValue(svc.alloc, svc.metadata_group_id, key)) |committed| {
