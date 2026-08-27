@@ -588,7 +588,7 @@ also supported for local smoke coverage, but acceptance-rate conclusions should
 prefer official target+assistant pairs and the proper Gemma 4 chat template.
 
 The repo smoke wrapper is
-`scripts/test_metal_gemma4_assistant_speculative.sh`. It uses `--backend auto`
+`scripts/gemma4/test_metal_gemma4_assistant_speculative.sh`. It uses `--backend auto`
 by default so the normal backend selector can pick Metal when available; set
 `ANTFLY_INFERENCE_GEMMA4_ASSISTANT_BACKEND=metal` to force Metal for crash/debug runs.
 The official target currently needs the wrapper's default

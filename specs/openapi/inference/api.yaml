@@ -2828,6 +2828,10 @@ components:
           type: string
           nullable: true
           description: The generated message content (null when tool_calls is present)
+        reasoning_content:
+          type: string
+          nullable: true
+          description: Model reasoning emitted on a private reasoning channel, separate from public content
         tool_calls:
           type: array
           items:
@@ -2912,6 +2916,10 @@ components:
           type: string
           nullable: true
           description: Token content delta
+        reasoning_content:
+          type: string
+          nullable: true
+          description: Reasoning content delta, separate from public content
         tool_calls:
           type: array
           items:
@@ -2991,6 +2999,13 @@ components:
         - q4_k
         - q8
         - fp16
+    A4bResidencyMode:
+      type: string
+      description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+      enum:
+        - auto
+        - streamed
+        - resident
     BackendPriorityEntry:
       type: string
       description: |
@@ -3030,6 +3045,17 @@ components:
           $ref: '#/components/schemas/ModelFormat'
         quantization:
           $ref: '#/components/schemas/ModelQuantization'
+        residency_mode:
+          $ref: '#/components/schemas/A4bResidencyMode'
+          default: auto
+          description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
+        memory_budget_mb:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 1048576
+          default: 0
+          description: Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
     PromptCacheConfig:
       type: object
       description: Native generator prompt KV cache configuration.

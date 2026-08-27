@@ -4841,6 +4841,71 @@ pub const DB = struct {
         return self.snapshotLsmMaintenanceStatsLocked();
     }
 
+    pub const LsmOwnerKind = background_runtime_mod.LsmOwnerKind;
+
+    pub const LsmOwnerStats = struct {
+        kind: LsmOwnerKind,
+        name: []u8,
+        maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+        owner_overflow: bool = false,
+        retired_labels_collapsed_total: u64 = 0,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.name);
+            self.* = undefined;
+        }
+    };
+
+    fn snapshotLsmOwnerStatsLockedAlloc(self: *DB, alloc: Allocator) ![]LsmOwnerStats {
+        var owners = std.ArrayListUnmanaged(LsmOwnerStats).empty;
+        errdefer {
+            for (owners.items) |*owner| owner.deinit(alloc);
+            owners.deinit(alloc);
+        }
+        if (self.core.primary_store_owner.snapshotLsmMaintenanceStats()) |maintenance| {
+            try owners.ensureUnusedCapacity(alloc, 1);
+            const primary_name = try alloc.dupe(u8, "primary");
+            owners.appendAssumeCapacity(.{
+                .kind = .primary,
+                .name = primary_name,
+                .maintenance = maintenance,
+            });
+        }
+        var index_owners = try self.core.index_manager.snapshotLsmOwnerStatsAlloc(alloc);
+        var transferred: usize = 0;
+        defer {
+            for (index_owners[transferred..]) |*owner| owner.deinit(alloc);
+            alloc.free(index_owners);
+        }
+        for (index_owners) |owner| {
+            try owners.append(alloc, .{
+                .kind = switch (owner.kind) {
+                    .full_text => .full_text,
+                    .dense_vector => .dense_vector,
+                    else => unreachable,
+                },
+                .name = owner.name,
+                .maintenance = owner.maintenance,
+                .owner_overflow = owner.owner_overflow,
+                .retired_labels_collapsed_total = owner.retired_labels_collapsed_total,
+            });
+            transferred += 1;
+        }
+        return try owners.toOwnedSlice(alloc);
+    }
+
+    pub fn snapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) ![]LsmOwnerStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.snapshotLsmOwnerStatsLockedAlloc(alloc);
+    }
+
+    pub fn trySnapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) !?[]LsmOwnerStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return try self.snapshotLsmOwnerStatsLockedAlloc(alloc);
+    }
+
     pub fn trySnapshotLsmMaintenanceStats(self: *DB) ?lsm_backend_mod.Backend.MaintenanceStats {
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
@@ -13519,6 +13584,12 @@ pub const DB = struct {
         shadow_manager.setIo(self.backend_runtime.io());
         shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
         shadow_manager.registerReplacementIndex(self.core.store, cfg) catch |err| {
+            shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |transfer_err| {
+                std.log.warn("failed to preserve unopened shadow LSM clone attribution index={s} err={s}", .{
+                    cfg.name,
+                    @errorName(transfer_err),
+                });
+            };
             shadow_manager.deinit();
             if (resume_candidate) {
                 candidate_reopenable = false;
@@ -13528,7 +13599,15 @@ pub const DB = struct {
             return err;
         };
         var shadow_manager_open = true;
-        defer if (shadow_manager_open) shadow_manager.deinit();
+        defer if (shadow_manager_open) {
+            shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |err| {
+                std.log.warn("failed to preserve shadow LSM clone attribution index={s} err={s}", .{
+                    cfg.name,
+                    @errorName(err),
+                });
+            };
+            shadow_manager.deinit();
+        };
 
         // A scan cursor is useful only when there is a durable intent to own
         // it. Non-durable/internal one-shot rebuild callers retain the existing
@@ -14089,6 +14168,12 @@ pub const DB = struct {
             retired_generation = null;
         }
         if (shadow_manager_open) {
+            shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |err| {
+                std.log.warn("failed to preserve activated shadow LSM clone attribution index={s} err={s}", .{
+                    cfg.name,
+                    @errorName(err),
+                });
+            };
             shadow_manager.deinit();
             shadow_manager_open = false;
         }
@@ -19642,6 +19727,7 @@ pub const DB = struct {
 
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
             const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+            const generation_repair_pending = entry.index.generationRepairPending();
             const artifact_counter_required = try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, entry.config);
             const status_snapshot = try self.loadIndexStatusSnapshot(alloc, entry.config.name);
             const watermark_count = if (status_snapshot) |status_value|
@@ -19649,7 +19735,7 @@ pub const DB = struct {
             else
                 0;
             const watermark_regressed = watermark_count > entry.index.stats().active_count;
-            if (!artifact_backed and !watermark_regressed) continue;
+            if (!artifact_backed and !watermark_regressed and !generation_repair_pending) continue;
 
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
@@ -19680,6 +19766,7 @@ pub const DB = struct {
                 applied_sequence,
             );
             if (persisted_resume == null and
+                !generation_repair_pending and
                 !checkpoint_config_mismatch and
                 applied_sequence < target_sequence and
                 projection_checkpoint.status != .rebuilding and
@@ -19688,6 +19775,7 @@ pub const DB = struct {
                 continue;
             }
             const invalid_generation_error: ?[]const u8 = blk: {
+                if (generation_repair_pending) break :blk "dense_hbc_published_snapshot_incomplete";
                 if (checkpoint_config_mismatch) break :blk "dense_projection_config_mismatch";
                 if (projection_checkpoint.status == .repair_required) break :blk "dense_projection_checkpoint_repair_required";
                 if (entry.index.stats().active_count == 0) break :blk null;
@@ -24020,13 +24108,46 @@ pub const DB = struct {
         try self.applyGraphExpandStrategy(alloc, base, req.expand_strategy);
     }
 
+    /// Persist the fail-closed repair decision before reporting that the index
+    /// is rebuilding. The HBC marker is generation-scoped, so a failure from a
+    /// snapshot superseded before this callback arrived cannot quarantine the
+    /// current serving generation.
+    fn persistIncompleteHbcSnapshotRepair(
+        self: *DB,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+    ) !bool {
+        if (!entry.index.generationRepairPending()) return false;
+        _ = self.ensureAutomaticDenseGenerationRepairIntent(
+            self.alloc,
+            entry.config,
+            .projection_generation_invalid,
+            "dense_hbc_published_snapshot_incomplete",
+        ) catch |err| switch (err) {
+            error.DurableIndexRepairStateUnavailable => {
+                // Embedded/Lite runtimes intentionally have no durable repair
+                // owner. The query gate is already closed; their maintenance
+                // pass performs the same synchronous shadow replacement used
+                // for other automatic generation repairs.
+                std.log.warn("incomplete dense index quarantined without durable repair owner name={s}", .{entry.config.name});
+            },
+            else => return err,
+        };
+        return true;
+    }
+
     fn hbcSearchCallback(
         ctx: ?*anyopaque,
         entry: *index_manager_mod.IndexManager.DenseIndex,
         req: vectorindex_mod.SearchRequest,
     ) anyerror!vectorindex_mod.SearchResults {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.searchDenseEntryWithRequest(entry, req);
+        return self.core.index_manager.searchDenseEntryWithRequest(entry, req) catch |err| switch (err) {
+            error.IncompletePublishedSnapshot => {
+                if (!try self.persistIncompleteHbcSnapshotRepair(entry)) return err;
+                return error.IndexRebuilding;
+            },
+            else => return err,
+        };
     }
 
     fn hbcSearchProfiledCallback(
@@ -24035,7 +24156,13 @@ pub const DB = struct {
         req: vectorindex_mod.SearchRequest,
     ) anyerror!vectorindex_mod.ProfiledSearchResults {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
+        return self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req) catch |err| switch (err) {
+            error.IncompletePublishedSnapshot => {
+                if (!try self.persistIncompleteHbcSnapshotRepair(entry)) return err;
+                return error.IndexRebuilding;
+            },
+            else => return err,
+        };
     }
 
     fn exactDenseSearchCallback(
@@ -66102,6 +66229,18 @@ test "db batch persists per-index applied sequence watermark" {
     try std.testing.expectEqual(@as(u64, 0), index_lsm.immutable_memtables);
     try std.testing.expect(index_lsm.wal_checkpoint_current_segment > 0);
     try std.testing.expectEqual(@as(u64, 0), index_lsm.wal_checkpoint_lag_segments);
+
+    const owner_stats = (try db.trySnapshotLsmOwnerStatsAlloc(alloc)) orelse
+        return error.UnexpectedLsmOwnerStatsContention;
+    defer {
+        for (owner_stats) |*owner| owner.deinit(alloc);
+        alloc.free(owner_stats);
+    }
+    try std.testing.expectEqual(@as(usize, 2), owner_stats.len);
+    try std.testing.expectEqual(DB.LsmOwnerKind.primary, owner_stats[0].kind);
+    try std.testing.expectEqualStrings("primary", owner_stats[0].name);
+    try std.testing.expectEqual(DB.LsmOwnerKind.full_text, owner_stats[1].kind);
+    try std.testing.expectEqualStrings("ft_v1", owner_stats[1].name);
 }
 
 test "db managed projection checkpoints persist status and config identity" {
@@ -75799,6 +75938,58 @@ test "db forced generation repair completion is crash idempotent before api ackn
     try std.testing.expectEqual(@as(u64, 1), replayed.repaired);
     try std.testing.expectEqual(@as(u64, 1), replayed.indexes_rebuilt);
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
+}
+
+test "db incomplete HBC snapshot persists generation repair before maintenance" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var repair_id: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+
+        const stale_generation = dense.index.publishedGeneration();
+        dense.index.refreshPublishedSearchState();
+        dense.index.noteIncompletePublishedSnapshotForGeneration(stale_generation);
+        try std.testing.expect(!try db.persistIncompleteHbcSnapshotRepair(dense));
+        try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
+        try std.testing.expect(!db.core.index_manager.repairUnavailable("dense_idx"));
+
+        dense.index.noteIncompletePublishedSnapshot();
+
+        try std.testing.expect(try db.persistIncompleteHbcSnapshotRepair(dense));
+        try std.testing.expect(db.core.index_manager.repairUnavailable("dense_idx"));
+        repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
+        var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer repair.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Trigger.projection_generation_invalid, repair.intent.trigger);
+        try std.testing.expectEqualStrings("dense_hbc_published_snapshot_incomplete", repair.intent.last_error.?);
+    }
+
+    // The query-path decision must survive a process boundary even if the
+    // periodic repair-maintenance pass never ran in the detecting process.
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    try std.testing.expectEqual(
+        repair_id,
+        (try reopened.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expect(reopened.core.index_manager.repairUnavailable("dense_idx"));
 }
 
 test "db forced repair attaches to automatic generation intent idempotently" {

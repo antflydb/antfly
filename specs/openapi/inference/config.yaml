@@ -1178,6 +1178,15 @@ components:
       description: Optional quantization preference for loading a model.
       enum: [q4_k, q8, fp16]
 
+    A4bResidencyMode:
+      type: string
+      enum: [auto, streamed, resident]
+      description: |
+        Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0
+        Metal runtime. `auto` chooses full residency only when the complete
+        expert set and safety reserves fit the configured budget; otherwise
+        it uses bounded streaming.
+
     ModelRef:
       type: object
       description: |
@@ -1199,6 +1208,25 @@ components:
           $ref: "#/components/schemas/ModelFormat"
         quantization:
           $ref: "#/components/schemas/ModelQuantization"
+        residency_mode:
+          $ref: "#/components/schemas/A4bResidencyMode"
+          default: auto
+          description: |
+            Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0
+            Metal runtime. `auto` chooses full residency only when the complete
+            expert set and safety reserves fit the configured budget; otherwise
+            it uses bounded streaming. Other model geometries reject this field.
+        memory_budget_mb:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 1048576
+          default: 0
+          description: |
+            Per-model A4B memory envelope in MiB. Zero selects the conservative
+            2048 MiB streamed floor. Explicit values below 2048 fail model load;
+            `resident` also fails unless all experts and reserves fit. Other
+            model geometries reject this field.
 
     KernelJitMode:
       type: string
