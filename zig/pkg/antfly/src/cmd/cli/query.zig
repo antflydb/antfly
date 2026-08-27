@@ -505,12 +505,14 @@ test "semantic readiness requires compatible policy-aware coverage" {
 const LookupOptions = struct {
     table_name: ?[]const u8 = null,
     key: ?[]const u8 = null,
+    read_consistency: ?[]const u8 = null,
 };
 
 const LookupParseIssue = union(enum) {
     missing_value: []const u8,
     duplicate: []const u8,
     unknown: []const u8,
+    invalid_read_consistency: []const u8,
 };
 
 const LookupParseResult = union(enum) { value: LookupOptions, issue: LookupParseIssue };
@@ -525,6 +527,13 @@ fn parseLookupOptions(iterator: std.process.Args.Iterator) LookupParseResult {
         } else if (std.mem.eql(u8, arg, "--key") or std.mem.eql(u8, arg, "-k")) {
             if (options.key != null) return .{ .issue = .{ .duplicate = arg } };
             options.key = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+        } else if (std.mem.eql(u8, arg, "--read-consistency")) {
+            if (options.read_consistency != null) return .{ .issue = .{ .duplicate = arg } };
+            const value = args.next() orelse return .{ .issue = .{ .missing_value = arg } };
+            if (!std.mem.eql(u8, value, "read_index") and !std.mem.eql(u8, value, "stale")) {
+                return .{ .issue = .{ .invalid_read_consistency = value } };
+            }
+            options.read_consistency = value;
         } else {
             return .{ .issue = .{ .unknown = arg } };
         }
@@ -537,6 +546,7 @@ fn fatalLookupParseIssue(issue: LookupParseIssue) noreturn {
         .missing_value => |flag| cli.fatal("{s} requires a value", .{flag}),
         .duplicate => |flag| cli.fatal("{s} may only be provided once", .{flag}),
         .unknown => |flag| cli.fatal("unknown lookup option: {s}", .{flag}),
+        .invalid_read_consistency => |value| cli.fatal("invalid --read-consistency {s}; expected read_index or stale", .{value}),
     }
 }
 
@@ -549,17 +559,18 @@ pub fn lookup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
     const tbl = options.table_name orelse cli.fatal("--table is required", .{});
     const k = options.key orelse cli.fatal("--key is required", .{});
 
-    var resp = try client.lookupKey(tbl, k, .{});
+    var resp = try client.lookupKey(tbl, k, .{ .consistency = options.read_consistency });
     defer resp.deinit();
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);
     }
 }
 
-test "lookup parser rejects unknown duplicate and missing options" {
-    var valid_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a" };
+test "lookup parser accepts read consistency and rejects invalid options" {
+    var valid_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--read-consistency", "stale" };
     const valid = parseLookupOptions(std.process.Args.Iterator.init(.{ .vector = valid_argv[0..] }));
     try std.testing.expectEqualStrings("doc:a", valid.value.key.?);
+    try std.testing.expectEqualStrings("stale", valid.value.read_consistency.?);
 
     var unknown_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--typo" };
     const unknown = parseLookupOptions(std.process.Args.Iterator.init(.{ .vector = unknown_argv[0..] }));
@@ -572,6 +583,10 @@ test "lookup parser rejects unknown duplicate and missing options" {
     var missing_argv = [_][*:0]const u8{"--key"};
     const missing = parseLookupOptions(std.process.Args.Iterator.init(.{ .vector = missing_argv[0..] }));
     try std.testing.expectEqualStrings("--key", missing.issue.missing_value);
+
+    var invalid_consistency_argv = [_][*:0]const u8{ "--read-consistency", "eventual" };
+    const invalid_consistency = parseLookupOptions(std.process.Args.Iterator.init(.{ .vector = invalid_consistency_argv[0..] }));
+    try std.testing.expectEqualStrings("eventual", invalid_consistency.issue.invalid_read_consistency);
 }
 
 fn buildFullTextSearchValue(allocator: std.mem.Allocator, query: []const u8) std.json.Parsed(std.json.Value) {
