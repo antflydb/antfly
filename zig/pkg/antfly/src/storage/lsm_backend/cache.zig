@@ -48,10 +48,14 @@ pub const KindStats = struct {
     invalidations: u64 = 0,
     waits: u64 = 0,
     used_bytes: usize = 0,
+    peak_used_bytes: usize = 0,
 };
 
 pub const Stats = struct {
     used_bytes: usize = 0,
+    peak_used_bytes: usize = 0,
+    data_block_used_bytes: usize = 0,
+    data_block_peak_used_bytes: usize = 0,
     entry_count: usize = 0,
     run_state: KindStats = .{},
     run_table_raw: KindStats = .{},
@@ -194,7 +198,16 @@ pub const Cache = struct {
             };
         }
 
-        fn snapshot(self: *const AtomicStats, used_bytes: usize, entry_count: usize, kind_bytes: [@typeInfo(Kind).@"enum".fields.len]usize) Stats {
+        fn snapshot(
+            self: *const AtomicStats,
+            used_bytes: usize,
+            peak_used_bytes: usize,
+            data_block_used_bytes: usize,
+            data_block_peak_used_bytes: usize,
+            entry_count: usize,
+            kind_bytes: [@typeInfo(Kind).@"enum".fields.len]usize,
+            kind_peak_bytes: [@typeInfo(Kind).@"enum".fields.len]usize,
+        ) Stats {
             var run_state = self.run_state.snapshot();
             var run_table_raw = self.run_table_raw.snapshot();
             var run_table_index = self.run_table_index.snapshot();
@@ -205,8 +218,16 @@ pub const Cache = struct {
             run_table_index.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_index)];
             run_table_block.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_block)];
             run_table_physical_block.used_bytes = kind_bytes[@intFromEnum(Kind.run_table_physical_block)];
+            run_state.peak_used_bytes = kind_peak_bytes[@intFromEnum(Kind.run_state)];
+            run_table_raw.peak_used_bytes = kind_peak_bytes[@intFromEnum(Kind.run_table_raw)];
+            run_table_index.peak_used_bytes = kind_peak_bytes[@intFromEnum(Kind.run_table_index)];
+            run_table_block.peak_used_bytes = kind_peak_bytes[@intFromEnum(Kind.run_table_block)];
+            run_table_physical_block.peak_used_bytes = kind_peak_bytes[@intFromEnum(Kind.run_table_physical_block)];
             return .{
                 .used_bytes = used_bytes,
+                .peak_used_bytes = peak_used_bytes,
+                .data_block_used_bytes = data_block_used_bytes,
+                .data_block_peak_used_bytes = data_block_peak_used_bytes,
                 .entry_count = entry_count,
                 .run_state = run_state,
                 .run_table_raw = run_table_raw,
@@ -221,8 +242,18 @@ pub const Cache = struct {
     max_bytes: usize,
     shards: []Shard,
     used_bytes: std.atomic.Value(usize) = .init(0),
+    peak_used_bytes: std.atomic.Value(usize) = .init(0),
+    data_block_used_bytes: std.atomic.Value(usize) = .init(0),
+    data_block_peak_used_bytes: std.atomic.Value(usize) = .init(0),
     entry_count: std.atomic.Value(usize) = .init(0),
     kind_bytes: [@typeInfo(Kind).@"enum".fields.len]std.atomic.Value(usize) = .{
+        .init(0),
+        .init(0),
+        .init(0),
+        .init(0),
+        .init(0),
+    },
+    kind_peak_bytes: [@typeInfo(Kind).@"enum".fields.len]std.atomic.Value(usize) = .{
         .init(0),
         .init(0),
         .init(0),
@@ -327,8 +358,22 @@ pub const Cache = struct {
 
     pub fn snapshotStats(self: *const Cache) Stats {
         var by_kind: [@typeInfo(Kind).@"enum".fields.len]usize = undefined;
+        var peak_by_kind: [@typeInfo(Kind).@"enum".fields.len]usize = undefined;
         inline for (0..by_kind.len) |i| by_kind[i] = self.kind_bytes[i].load(.monotonic);
-        return self.stats.snapshot(self.currentBytes(), self.entryCount(), by_kind);
+        inline for (0..peak_by_kind.len) |i| {
+            peak_by_kind[i] = @max(by_kind[i], self.kind_peak_bytes[i].load(.monotonic));
+        }
+        const used_bytes = self.currentBytes();
+        const data_block_used_bytes = self.data_block_used_bytes.load(.monotonic);
+        return self.stats.snapshot(
+            used_bytes,
+            @max(used_bytes, self.peak_used_bytes.load(.monotonic)),
+            data_block_used_bytes,
+            @max(data_block_used_bytes, self.data_block_peak_used_bytes.load(.monotonic)),
+            self.entryCount(),
+            by_kind,
+            peak_by_kind,
+        );
     }
 
     pub fn valueAllocator(self: *const Cache) Allocator {
@@ -660,8 +705,15 @@ pub const Cache = struct {
         gop.key_ptr.* = entry.key();
         gop.value_ptr.* = entry;
         self.linkEntryLocked(shard, entry);
-        _ = self.used_bytes.fetchAdd(byte_cost, .monotonic);
-        _ = self.kind_bytes[@intFromEnum(kind)].fetchAdd(byte_cost, .monotonic);
+        const used_bytes = self.used_bytes.fetchAdd(byte_cost, .monotonic) + byte_cost;
+        updateAtomicMax(&self.peak_used_bytes, used_bytes);
+        const kind_index = @intFromEnum(kind);
+        const kind_bytes = self.kind_bytes[kind_index].fetchAdd(byte_cost, .monotonic) + byte_cost;
+        updateAtomicMax(&self.kind_peak_bytes[kind_index], kind_bytes);
+        if (isDataBlockKind(kind)) {
+            const data_block_bytes = self.data_block_used_bytes.fetchAdd(byte_cost, .monotonic) + byte_cost;
+            updateAtomicMax(&self.data_block_peak_used_bytes, data_block_bytes);
+        }
         _ = self.entry_count.fetchAdd(1, .monotonic);
         self.bumpInsert(kind);
         reservation_active = false;
@@ -755,12 +807,30 @@ pub const Cache = struct {
         self.unlinkEntryLocked(shard, entry);
         _ = self.used_bytes.fetchSub(entry.byte_cost, .monotonic);
         _ = self.kind_bytes[@intFromEnum(entry.kind)].fetchSub(entry.byte_cost, .monotonic);
+        if (isDataBlockKind(entry.kind)) {
+            _ = self.data_block_used_bytes.fetchSub(entry.byte_cost, .monotonic);
+        }
         _ = self.entry_count.fetchSub(1, .monotonic);
         self.bumpEviction(entry.kind);
         const byte_cost = entry.byte_cost;
         entry.deinit(self.allocator);
         self.allocator.destroy(entry);
         self.releaseResourceBytes(byte_cost);
+    }
+
+    fn isDataBlockKind(kind: Kind) bool {
+        return kind == .run_table_block or kind == .run_table_physical_block;
+    }
+
+    fn updateAtomicMax(counter: *std.atomic.Value(usize), value: usize) void {
+        var observed = counter.load(.monotonic);
+        while (observed < value) {
+            if (counter.cmpxchgWeak(observed, value, .monotonic, .monotonic)) |actual| {
+                observed = actual;
+                continue;
+            }
+            return;
+        }
     }
 
     fn nextAccess(self: *Cache) u64 {
@@ -1175,6 +1245,57 @@ test "cache policy serves table blocks transiently without consuming capacity" {
     try std.testing.expectEqual(@as(u64, 1), stats.transient_serves);
     try std.testing.expectEqual(@as(u64, 1), stats.policy_bypasses);
     try std.testing.expectEqual(@as(u64, 0), stats.inserts);
+}
+
+test "cache preserves simultaneous data block residency high water after eviction" {
+    const allocator = std.testing.allocator;
+    var cache = Cache.init(allocator, 1024 * 1024);
+    defer cache.deinit();
+
+    const decoded = try allocator.dupe(u8, "decoded block");
+    var decoded_handle = try cache.putRunTableBlock("run-peak", 1, 1, 0, @intCast(decoded.len), decoded);
+    const after_decoded = cache.snapshotStats();
+    try std.testing.expectEqual(after_decoded.data_block_used_bytes, after_decoded.data_block_peak_used_bytes);
+
+    const physical = try allocator.dupe(u8, "physical block");
+    var physical_handle = try cache.putRunTablePhysicalBlock("run-peak", 1, 1, 64, @intCast(physical.len), physical);
+    const simultaneous = cache.snapshotStats();
+    try std.testing.expectEqual(simultaneous.data_block_used_bytes, simultaneous.data_block_peak_used_bytes);
+    try std.testing.expect(simultaneous.data_block_peak_used_bytes > after_decoded.data_block_peak_used_bytes);
+
+    decoded_handle.release();
+    physical_handle.release();
+    cache.invalidatePath("run-peak");
+    const after_eviction = cache.snapshotStats();
+    try std.testing.expectEqual(@as(usize, 0), after_eviction.data_block_used_bytes);
+    try std.testing.expectEqual(simultaneous.data_block_peak_used_bytes, after_eviction.data_block_peak_used_bytes);
+}
+
+test "cache snapshot clamps concurrently sampled peaks to current residency" {
+    var cache = Cache.init(std.testing.allocator, 1024 * 1024);
+    defer cache.deinit();
+
+    // Model the small publication window between the current-byte increment
+    // and the corresponding atomic-max update.
+    cache.used_bytes.store(1024, .monotonic);
+    cache.peak_used_bytes.store(512, .monotonic);
+    cache.data_block_used_bytes.store(768, .monotonic);
+    cache.data_block_peak_used_bytes.store(256, .monotonic);
+    cache.kind_bytes[@intFromEnum(Kind.run_table_block)].store(768, .monotonic);
+    cache.kind_peak_bytes[@intFromEnum(Kind.run_table_block)].store(256, .monotonic);
+    defer {
+        cache.used_bytes.store(0, .monotonic);
+        cache.peak_used_bytes.store(0, .monotonic);
+        cache.data_block_used_bytes.store(0, .monotonic);
+        cache.data_block_peak_used_bytes.store(0, .monotonic);
+        cache.kind_bytes[@intFromEnum(Kind.run_table_block)].store(0, .monotonic);
+        cache.kind_peak_bytes[@intFromEnum(Kind.run_table_block)].store(0, .monotonic);
+    }
+
+    const stats = cache.snapshotStats();
+    try std.testing.expectEqual(stats.used_bytes, stats.peak_used_bytes);
+    try std.testing.expectEqual(stats.data_block_used_bytes, stats.data_block_peak_used_bytes);
+    try std.testing.expectEqual(stats.run_table_block.used_bytes, stats.run_table_block.peak_used_bytes);
 }
 
 test "cache pending load waiter survives finish removal" {
