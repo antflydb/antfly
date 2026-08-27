@@ -8158,7 +8158,8 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             } else |_| {}
         }
 
-        if (request.out_dim >= lm_head_q4_repack_min_out_dim) repack: {
+        const request_is_lm_head = if (@hasField(@TypeOf(request), "lm_head")) request.lm_head else false;
+        if (request_is_lm_head and request.out_dim >= lm_head_q4_repack_min_out_dim) repack: {
             const target = lmHeadQ4RepackFormat() orelse break :repack;
             if (try makeRuntimeQ4StorageFromQ6K(storage, request.in_dim, request.out_dim, target)) |q4k_storage| {
                 errdefer {
@@ -8198,6 +8199,56 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         const expected_bytes = std.math.mul(usize, request.in_dim, request.out_dim) catch return false;
         const expected_bf16_bytes = std.math.mul(usize, expected_bytes, @sizeOf(u16)) catch return false;
         if (bytes.len < expected_bf16_bytes) return false;
+        const prefer_q8 = if (@hasField(@TypeOf(request), "prefer_q8_over_dense_bf16"))
+            request.prefer_q8_over_dense_bf16
+        else
+            false;
+        // Dense-BF16 slots stream below the quant kernels' efficiency and
+        // dispatch off the planned encoder (a dense/MPS encoder break every
+        // frame). Slots that opt in are staged to Q8_0 instead: half the
+        // bytes on the planned quant-MMV route. Any failure falls back to
+        // the dense-BF16 path unchanged.
+        if (prefer_q8 and retain_dense_fallback) q8: {
+            const dense_f32_bytes = std.math.mul(usize, expected_bytes, @sizeOf(f32)) catch break :q8;
+            if (dense_f32_bytes > runtimeQ8StagingDenseMaxBytesForRequest(request)) break :q8;
+            const dense = std.heap.c_allocator.alloc(f32, expected_bytes) catch break :q8;
+            defer std.heap.c_allocator.free(dense);
+            for (dense, 0..) |*value, i| {
+                const bits = std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little);
+                value.* = @bitCast(@as(u32, bits) << 16);
+            }
+            const q8_storage = (makeRuntimeQ8StorageFromDense(dense, request.in_dim, request.out_dim) catch break :q8) orelse break :q8;
+            const bias_shape = [_]i32{@intCast(request.out_dim)};
+            const bias_tensor = MetalTensor.ownedCloneFrom(bias_base[0..request.out_dim], &bias_shape) catch {
+                q8_storage.deinit();
+                std.heap.c_allocator.destroy(q8_storage);
+                break :q8;
+            };
+            self.raw_linear_slot_dense_biases[request.slot] = bias_tensor;
+            if (termite_metal_decode_runtime_prepare_linear_bias(
+                runtime,
+                request.slot,
+                bias_base,
+                request.out_dim,
+            ) != 0) {
+                if (self.raw_linear_slot_dense_biases[request.slot]) |*stored_bias| stored_bias.deinit();
+                self.raw_linear_slot_dense_biases[request.slot] = null;
+                q8_storage.deinit();
+                std.heap.c_allocator.destroy(q8_storage);
+                break :q8;
+            }
+            std.log.info(
+                "dense-bf16 slot {d} staged to q8_0: rows={d} cols={d}",
+                .{ request.slot, request.out_dim, request.in_dim },
+            );
+            stats.decoder_runtime_prepare_linear_calls += 1;
+            self.raw_linear_slot_quantized_storage[request.slot] = q8_storage;
+            self.raw_linear_slot_kinds[request.slot] = .quantized;
+            self.raw_linear_slots_prepared[request.slot] = true;
+            self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+            self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+            return true;
+        }
         stats.decoder_runtime_prepare_linear_calls += 1;
         const use_no_copy = if (@hasField(@TypeOf(request), "dense_bf16_no_copy_safe"))
             request.dense_bf16_no_copy_safe
@@ -8266,7 +8317,13 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
     const dense_values = std.math.mul(usize, request.in_dim, request.out_dim) catch return false;
     const dense_bytes = std.math.mul(usize, dense_values, @sizeOf(f32)) catch return false;
     const dense_fallback_max_bytes = runtimeQ8StagingDenseMaxBytesForRequest(request);
-    if (retain_dense_fallback and dense_bytes <= dense_fallback_max_bytes) {
+    // Slots tagged prefer_q8_over_dense_bf16 want Q8 staging regardless of
+    // the generic size budget (the tag is per-slot and deliberate).
+    const request_prefers_q8 = if (@hasField(@TypeOf(request), "prefer_q8_over_dense_bf16"))
+        request.prefer_q8_over_dense_bf16
+    else
+        false;
+    if (retain_dense_fallback and (dense_bytes <= dense_fallback_max_bytes or request_prefers_q8)) {
         if (try makeRuntimeQ8StorageFromDense(prepared_weight[0..dense_values], request.in_dim, request.out_dim)) |q8_storage| {
             errdefer {
                 q8_storage.deinit();
@@ -8284,6 +8341,12 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                 bias_base,
                 request.out_dim,
             ) != 0) return false;
+            if (request_prefers_q8) {
+                std.log.info(
+                    "dense slot {d} staged to q8_0: rows={d} cols={d}",
+                    .{ request.slot, request.out_dim, request.in_dim },
+                );
+            }
             stats.decoder_runtime_prepare_linear_calls += 1;
             self.raw_linear_slot_quantized_storage[request.slot] = q8_storage;
             self.raw_linear_slot_kinds[request.slot] = .quantized;
@@ -8405,10 +8468,25 @@ fn lmHeadQ4RepackFormat() ?gguf_tensor_types.KnownTensorType {
     const value = c_std.getenv("TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK") orelse return null;
     const raw = std.mem.span(value);
     if (raw.len == 0 or std.mem.eql(u8, raw, "0") or
-        std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "off")) return null;
-    if (std.ascii.eqlIgnoreCase(raw, "q4_0")) return .Q4_0;
-    // "1"/"true"/"q4_k" and anything else default to Q4_K.
-    return .Q4_K;
+        std.ascii.eqlIgnoreCase(raw, "false") or
+        std.ascii.eqlIgnoreCase(raw, "no") or
+        std.ascii.eqlIgnoreCase(raw, "off")) return null;
+    if (std.ascii.eqlIgnoreCase(raw, "q4_0")) {
+        // Kept for A/B evidence only: measured instant-EOT quality collapse
+        // (symmetric no-min 4-bit on an embedding-tied head).
+        std.log.warn(
+            "TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK=q4_0 is a measured quality-collapse configuration; evidence runs only",
+            .{},
+        );
+        return .Q4_0;
+    }
+    if (std.mem.eql(u8, raw, "1") or
+        std.ascii.eqlIgnoreCase(raw, "true") or
+        std.ascii.eqlIgnoreCase(raw, "yes") or
+        std.ascii.eqlIgnoreCase(raw, "on") or
+        std.ascii.eqlIgnoreCase(raw, "q4_k")) return .Q4_K;
+    std.log.warn("invalid TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK={s}; repack disabled", .{raw});
+    return null;
 }
 
 /// Only vocab-sized tails qualify; ordinary projections keep their checkpoint
@@ -8443,8 +8521,10 @@ fn makeRuntimeQ4StorageFromQ6K(
     const blocks_per_row = in_dim / target_values_per_block;
     const repacked_row_bytes = blocks_per_row * target_block_bytes;
     const repacked = try std.heap.c_allocator.alloc(u8, out_dim * repacked_row_bytes);
-    errdefer std.heap.c_allocator.free(repacked);
-    const row_values = try std.heap.c_allocator.alloc(f32, in_dim);
+    const row_values = std.heap.c_allocator.alloc(f32, in_dim) catch |err| {
+        std.heap.c_allocator.free(repacked);
+        return err;
+    };
     defer std.heap.c_allocator.free(row_values);
 
     for (0..out_dim) |row| {
@@ -8464,8 +8544,12 @@ fn makeRuntimeQ4StorageFromQ6K(
         }
     }
 
-    const shape = try std.heap.c_allocator.dupe(i64, storage.shape);
-    errdefer std.heap.c_allocator.free(shape);
+    const shape = std.heap.c_allocator.dupe(i64, storage.shape) catch |err| {
+        std.heap.c_allocator.free(repacked);
+        return err;
+    };
+    // Ownership of repacked+shape transfers unconditionally: the callee frees
+    // both on its own failure, so no errdefer may stay armed across this call.
     return try makeRuntimeRepackedStorageFromOwnedBytes(repacked, shape, target, "termite-q4-lm-head");
 }
 
@@ -10723,10 +10807,40 @@ pub extern fn termite_metal_pipelined_decode_frame_device_default() c_int;
 
 /// Device-qualified default for pipelined decode frames: true only where the
 /// fast prepared frame qualified (M4-family). Explicit enable/disable env
-/// flags still take precedence at the call sites.
+/// flags still take precedence.
 pub fn pipelinedDecodeFrameDeviceDefault() bool {
+    if (comptime !build_options.enable_metal) return false;
     if (comptime @import("builtin").os.tag != .macos) return false;
     return termite_metal_pipelined_decode_frame_device_default() != 0;
+}
+
+/// Single home for the pipelined-decode-frame policy shared by the pipeline
+/// and the executor: the disable flag always wins, then an explicit enable,
+/// then the device-qualified default. Env reads are cached (decode-loop hot
+/// path).
+pub fn pipelinedDecodeFrameEnabledForFlags(
+    enable_requested: bool,
+    disable_requested: bool,
+    device_default: bool,
+) bool {
+    if (disable_requested) return false;
+    return enable_requested or device_default;
+}
+
+pub fn pipelinedDecodeFrameEnabled() bool {
+    return pipelinedDecodeFrameEnabledForFlags(
+        getenvFlagEnabled("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
+        getenvFlagEnabled("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
+        pipelinedDecodeFrameDeviceDefault(),
+    );
+}
+
+test "pipelined decode frames follow flags with device default" {
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, false));
+    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(false, false, true));
+    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false, false));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, true, true));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(true, true, true));
 }
 pub extern fn termite_metal_generated_pipeline_create(
     source: [*]const u8,

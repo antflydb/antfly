@@ -293,6 +293,8 @@ fn gemma4MtpAutoDraftDiscoveryEnabled() bool {
 /// Sibling MTP assistant dir for a Gemma4 QAT gguf artifact
 /// (`...-q4_0-gguf` -> `...-q4_0-unquantized-assistant`), or null when the
 /// model dir has no such sibling on disk. Caller owns the returned path.
+/// The name qualification mirrors registry.gemma4MtpAssistantCompanionRefAlloc
+/// so discovery only ever matches artifacts the companion pull can create.
 fn gemma4MtpAssistantSiblingPath(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -300,6 +302,9 @@ fn gemma4MtpAssistantSiblingPath(
 ) ?[]const u8 {
     const suffix = "-gguf";
     if (!std.mem.endsWith(u8, model_path, suffix)) return null;
+    const base_name = std.fs.path.basename(model_path);
+    if (std.ascii.indexOfIgnoreCase(base_name, "gemma-4-") == null) return null;
+    if (std.ascii.indexOfIgnoreCase(base_name, "-qat-") == null) return null;
     const sibling = std.fmt.allocPrint(
         allocator,
         "{s}-unquantized-assistant",
@@ -310,6 +315,16 @@ fn gemma4MtpAssistantSiblingPath(
         return null;
     };
     return sibling;
+}
+
+/// A discovered drafter must parse as a model before it may join the request:
+/// stale or partial sibling directories degrade to non-speculative generation
+/// rather than failing generate calls the client never asked to speculate.
+fn validateDiscoveredDraftDir(allocator: std.mem.Allocator, dir: []const u8) bool {
+    var draft_manifest = manifest_mod.loadFromDir(allocator, dir) catch return false;
+    defer draft_manifest.deinit();
+    _ = session_factory.loadGptConfigFromModelDir(allocator, dir, draft_manifest) catch return false;
+    return true;
 }
 
 fn validateQualifiedProfileDraft(
@@ -6000,9 +6015,47 @@ pub const Node = struct {
             });
         };
         const effective_draft_model_name = effectiveDraftModelName(requested_draft_model_name, speculation.policy);
+        // Auto-discovered MTP drafter, resolved before validation, admission,
+        // and the prompt estimate so they all see the same speculation state
+        // as the pipeline. The sibling's manifest/config are validated here so
+        // a stale or foreign directory degrades to non-speculative generation
+        // instead of failing the request.
+        var auto_draft_sibling: ?[]const u8 = null;
+        defer if (auto_draft_sibling) |path| ctx.allocator.free(path);
+        if (requested_draft_model_name == null and
+            speculation.policy == .auto and
+            gemma4MtpAutoDraftDiscoveryEnabled())
+        {
+            if (gemma4MtpAssistantSiblingPath(ctx.allocator, ctx.io, model_path)) |sibling| {
+                if (validateDiscoveredDraftDir(ctx.allocator, sibling)) {
+                    auto_draft_sibling = sibling;
+                } else {
+                    std.log.warn("ignoring invalid Gemma4 MTP assistant sibling {s}", .{sibling});
+                    ctx.allocator.free(sibling);
+                }
+            }
+        }
+        if (auto_draft_sibling != null) {
+            // The discovered drafter loads a second model backend; reserve the
+            // same speculation admission a client-requested draft would get.
+            // A discovered drafter is an optimization, not a client
+            // requirement: when capacity is unavailable the request degrades
+            // to non-speculative generation instead of a capacity rejection.
+            const speculative_units = generateAdmissionUnitsForSpeculation(admission_units, true, speculation.policy);
+            if (speculative_units > reserved_units) {
+                const extra_units = speculative_units - reserved_units;
+                if (self.reserveAdmissionUnits(extra_units)) {
+                    reserved_units += extra_units;
+                } else |_| {
+                    std.log.warn("skipping discovered MTP drafter: insufficient admission capacity", .{});
+                    ctx.allocator.free(auto_draft_sibling.?);
+                    auto_draft_sibling = null;
+                }
+            }
+        }
         validateQualifiedProfileDraft(
             self.config.kernel_jit.qualified_profile_path != null,
-            effective_draft_model_name,
+            effective_draft_model_name orelse auto_draft_sibling,
         ) catch {
             return ctx.status(400).json(.{
                 .@"error" = "UNSUPPORTED_FEATURE",
@@ -6056,7 +6109,7 @@ pub const Node = struct {
             .frequency_penalty = sampling.frequency_penalty,
             .presence_penalty = sampling.presence_penalty,
             .speculative_k = speculation.k,
-            .speculation_requested = requested_draft_model_name != null,
+            .speculation_requested = requested_draft_model_name != null or auto_draft_sibling != null,
             .speculation_policy = speculation.policy,
             .speculation_calibration = speculation.calibration,
             .prefill_chunk_size = 0,
@@ -6492,13 +6545,33 @@ pub const Node = struct {
             if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
         };
         if (model.native_generate_coordinator) |coordinator| {
-            native_generate_lease = try self.acquireNativeGenerateLease(coordinator, .{
-                .requested_units = admission_units,
+            native_generate_lease = self.acquireNativeGenerateLease(coordinator, .{
+                .requested_units = reserved_units,
                 .prompt_bytes = prompt_bytes,
                 .prompt_tokens = prompt_tokens,
                 .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
                 .max_tokens = configured_max_tokens,
-            });
+            }) catch |err| blk: {
+                // A discovered drafter is an optimization: give back its extra
+                // admission and retry single-model before surfacing capacity
+                // errors the client's own request never earned.
+                if (auto_draft_sibling != null and reserved_units > admission_units) {
+                    std.log.warn("skipping discovered MTP drafter: insufficient scheduler capacity", .{});
+                    self.releaseSlotUnits(reserved_units - admission_units);
+                    reserved_units = admission_units;
+                    ctx.allocator.free(auto_draft_sibling.?);
+                    auto_draft_sibling = null;
+                    config.speculation_requested = false;
+                    break :blk try self.acquireNativeGenerateLease(coordinator, .{
+                        .requested_units = reserved_units,
+                        .prompt_bytes = prompt_bytes,
+                        .prompt_tokens = prompt_tokens,
+                        .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
+                        .max_tokens = configured_max_tokens,
+                    });
+                }
+                return err;
+            };
         }
 
         const tok = model.getTokenizer();
@@ -6527,6 +6600,7 @@ pub const Node = struct {
         }
 
         var resolved_draft_model_path: ?[]const u8 = null;
+        var draft_was_discovered = false;
         if (effective_draft_model_name) |draft_model_name| {
             if (shouldResolveDraftModel(config.speculation_policy)) {
                 const draft_model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, draft_model_name, "generators") catch |err|
@@ -6540,79 +6614,124 @@ pub const Node = struct {
                 }
                 resolved_draft_model_path = draft_model_path;
             }
-        } else if (config.speculation_policy == .auto and gemma4MtpAutoDraftDiscoveryEnabled()) {
-            if (gemma4MtpAssistantSiblingPath(ctx.allocator, ctx.io, model_path)) |sibling| {
-                draft_model_path_storage = sibling;
-                resolved_draft_model_path = sibling;
-                // Scheduler batching and route exclusions must treat the
-                // discovered drafter exactly like a client-requested one.
-                config.speculation_requested = true;
-            }
+        } else if (auto_draft_sibling) |sibling| {
+            // Ownership moves to the request-scoped draft path storage;
+            // config.speculation_requested was already set at config build so
+            // admission, the estimate, and scheduler batching stayed
+            // consistent with the pipeline.
+            draft_model_path_storage = sibling;
+            resolved_draft_model_path = sibling;
+            auto_draft_sibling = null;
+            draft_was_discovered = true;
         }
-        if (resolved_draft_model_path) |draft_model_path| {
-            {
-                config.draft_model = draft_model_path;
-                var load_draft_backend = true;
-                if (config.speculation_policy == .auto) {
-                    var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err|
-                        return modelLoadFailureResponse(ctx, err);
-                    defer draft_manifest.deinit();
-                    const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err|
-                        return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
-                    if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
-                        draft_gpt_config = draft_cfg;
-                        load_draft_backend = false;
+        var draft_degraded = false;
+        if (resolved_draft_model_path) |draft_model_path| draft_setup: {
+            config.draft_model = draft_model_path;
+            var load_draft_backend = true;
+            if (config.speculation_policy == .auto) {
+                var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err| {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
                     }
+                    return modelLoadFailureResponse(ctx, err);
+                };
+                defer draft_manifest.deinit();
+                const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err| {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
+                    }
+                    return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
+                };
+                if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
+                    draft_gpt_config = draft_cfg;
+                    load_draft_backend = false;
                 }
-                if (load_draft_backend) {
-                    draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
-                        var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
-                        configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                        break :blk self.model_manager.acquireFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
-                            return modelLoadFailureResponse(ctx, err);
-                    } else self.model_manager.acquireFromDir(draft_model_path) catch |err|
+            }
+            if (load_draft_backend) {
+                draft_model_handle = if (backend_selection.native_choice != .auto) blk: {
+                    var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
+                    configureGenerateBackendPreference(&request_session_manager, backend_selection);
+                    break :blk self.model_manager.acquireFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err| {
+                        if (draft_was_discovered) {
+                            draft_degraded = true;
+                            break :draft_setup;
+                        }
                         return modelLoadFailureResponse(ctx, err);
-                    const draft_model = draft_model_handle.?.get();
-                    const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
-                        return ctx.status(400).json(.{
-                            .@"error" = "INVALID_MODEL",
-                            .message = "draft_model does not support generation",
-                        });
-                    const draft_tok = draft_model.getTokenizer();
-                    const target_special = tok.specialTokens();
-                    const draft_special = draft_tok.specialTokens();
-                    if (draft_tok.vocabSize() != tok.vocabSize() or
-                        draft_cfg.vocab_size != gpt_config.vocab_size or
-                        draft_special.cls_id != target_special.cls_id or
-                        draft_special.sep_id != target_special.sep_id or
-                        draft_special.pad_id != target_special.pad_id or
-                        draft_special.unk_id != target_special.unk_id)
-                    {
-                        return ctx.status(400).json(.{
-                            .@"error" = "INVALID_REQUEST",
-                            .message = "draft_model tokenizer is incompatible with target model",
-                        });
+                    };
+                } else self.model_manager.acquireFromDir(draft_model_path) catch |err| {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
                     }
+                    return modelLoadFailureResponse(ctx, err);
+                };
+                const draft_model = draft_model_handle.?.get();
+                const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
+                    }
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_MODEL",
+                        .message = "draft_model does not support generation",
+                    });
+                };
+                const draft_tok = draft_model.getTokenizer();
+                const target_special = tok.specialTokens();
+                const draft_special = draft_tok.specialTokens();
+                if (draft_tok.vocabSize() != tok.vocabSize() or
+                    draft_cfg.vocab_size != gpt_config.vocab_size or
+                    draft_special.cls_id != target_special.cls_id or
+                    draft_special.sep_id != target_special.sep_id or
+                    draft_special.pad_id != target_special.pad_id or
+                    draft_special.unk_id != target_special.unk_id)
+                {
+                    if (draft_was_discovered) {
+                        draft_degraded = true;
+                        break :draft_setup;
+                    }
+                    return ctx.status(400).json(.{
+                        .@"error" = "INVALID_REQUEST",
+                        .message = "draft_model tokenizer is incompatible with target model",
+                    });
+                }
 
-                    const actual_draft_backend: runtime.kv.pool.BackendKind = switch (draft_model.session.backend()) {
-                        .native => .native,
-                        .metal => .metal,
-                        .cuda => .cuda,
-                        .pjrt, .onnx, .wasm => return ctx.status(400).json(.{
+                const actual_draft_backend: runtime.kv.pool.BackendKind = switch (draft_model.session.backend()) {
+                    .native => .native,
+                    .metal => .metal,
+                    .cuda => .cuda,
+                    .pjrt, .onnx, .wasm => {
+                        if (draft_was_discovered) {
+                            draft_degraded = true;
+                            break :draft_setup;
+                        }
+                        return ctx.status(400).json(.{
                             .@"error" = "INVALID_MODEL",
                             .message = "draft_model does not use a supported generation backend",
-                        }),
-                    };
-                    const actual_draft_kv_dtype = session_factory.recommendedKvDTypeForSession(
-                        draft_model.session,
-                        actual_draft_backend,
-                    );
-                    draft_model_for_generation = draft_model;
-                    draft_backend_kind = actual_draft_backend;
-                    draft_kv_dtype = actual_draft_kv_dtype;
-                    draft_gpt_config = draft_cfg;
-                }
+                        });
+                    },
+                };
+                const actual_draft_kv_dtype = session_factory.recommendedKvDTypeForSession(
+                    draft_model.session,
+                    actual_draft_backend,
+                );
+                draft_model_for_generation = draft_model;
+                draft_backend_kind = actual_draft_backend;
+                draft_kv_dtype = actual_draft_kv_dtype;
+                draft_gpt_config = draft_cfg;
             }
+        }
+        if (draft_degraded) {
+            // A discovered drafter is best-effort: unwind it and continue as a
+            // plain single-model request instead of failing the generate call.
+            std.log.warn("skipping discovered MTP drafter: draft setup failed", .{});
+            config.draft_model = null;
+            config.speculation_requested = false;
+            if (draft_model_handle) |*handle| handle.release();
+            draft_model_handle = null;
+            draft_gpt_config = null;
         }
 
         const budget_backend_class: runtime.tier.memory.BackendClass =

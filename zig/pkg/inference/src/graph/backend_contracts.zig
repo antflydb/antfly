@@ -393,6 +393,13 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
     retain_dense_fallback: bool = true,
     disable_mapped_quant_weight: bool = false,
     dense_fallback_max_bytes: ?usize = null,
+    /// True only for the vocab-projection (lm_head) slot; gates head-specific
+    /// prepare transforms (the opt-in Q4 repack) so shape heuristics cannot
+    /// misfire on large FFN projections.
+    lm_head: bool = false,
+    /// Stage this dense-BF16 slot to Q8_0 at prepare time (half the bytes,
+    /// planned quant-MMV route instead of a dense encoder break).
+    prefer_q8_over_dense_bf16: bool = false,
     allow_direct_quant_fallback: bool = false,
     prefer_bf16_fallback: bool = false,
     prefer_f16_mps_fallback: bool = false,

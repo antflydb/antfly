@@ -21,6 +21,14 @@ const QuantizedStorage = metal_runtime.QuantizedStorage;
 const quant_codec = inference_internal.gguf.quant_codec;
 const ops = inference_internal.ops;
 
+fn q4RowBytes(in_dim: usize) u64 {
+    return @intCast(((in_dim + 31) / 32) * 18);
+}
+
+fn q6RowBytes(in_dim: usize) u64 {
+    return @intCast(((in_dim + 255) / 256) * 210);
+}
+
 const Mode = enum {
     linear,
     q6_linear,
@@ -1028,8 +1036,28 @@ pub fn main(init: std.process.Init) !void {
         if (q4_pair_mm_fallbacks != @as(u64, @intCast(cfg.expect_q4_pair_mm_fallbacks orelse 0))) return error.UnexpectedQ4MmFallbackCount;
     }
 
+    // Streamed bytes per op for roofline attribution: quant weight rows plus
+    // f32 activation traffic. Modes with mixed op sequences report null and
+    // omit the GB/s column rather than print a misleading figure.
+    const approx_op_bytes: ?u64 = switch (cfg.mode) {
+        .linear => q4RowBytes(cfg.in_dim) * cfg.out_dim +
+            4 * cfg.rows * (cfg.in_dim + cfg.out_dim),
+        .q6_linear, .q6_argmax => q6RowBytes(cfg.in_dim) * cfg.out_dim +
+            4 * cfg.rows * (cfg.in_dim + cfg.out_dim),
+        .pair => 2 * q4RowBytes(cfg.in_dim) * cfg.out_dim +
+            4 * cfg.rows * (cfg.in_dim + 2 * cfg.out_dim),
+        .ffn => 2 * q4RowBytes(cfg.in_dim) * cfg.out_dim +
+            q4RowBytes(cfg.out_dim) * cfg.in_dim +
+            4 * cfg.rows * (2 * cfg.in_dim + 3 * cfg.out_dim),
+        else => null,
+    };
+    const median_op_ns = @as(f64, @floatFromInt(median_ns)) / @as(f64, @floatFromInt(cfg.ops_per_frame));
+    const approx_gb_s: f64 = if (approx_op_bytes) |bytes|
+        (@as(f64, @floatFromInt(bytes)) / (median_op_ns / 1_000_000_000.0)) / 1_000_000_000.0
+    else
+        0.0;
     std.debug.print(
-        "metal_q4_0_linear mode={s} rows={d} in={d} out={d} kv_out={d} warmup={d} iters={d} ops_per_frame={d} median_frame_ms={d:.3} median_op_ms={d:.3} mean_frame_ms={d:.3} mean_op_ms={d:.3} min_frame_ms={d:.3} max_frame_ms={d:.3} total_ops={d}",
+        "metal_q4_0_linear mode={s} rows={d} in={d} out={d} kv_out={d} warmup={d} iters={d} ops_per_frame={d} median_frame_ms={d:.3} median_op_ms={d:.3} mean_frame_ms={d:.3} mean_op_ms={d:.3} min_frame_ms={d:.3} max_frame_ms={d:.3} total_ops={d} approx_op_bytes={d} approx_gb_s={d:.1}",
         .{
             cfg.mode.name(),
             cfg.rows,
@@ -1040,12 +1068,14 @@ pub fn main(init: std.process.Init) !void {
             cfg.measure_iters,
             cfg.ops_per_frame,
             @as(f64, @floatFromInt(median_ns)) / 1_000_000.0,
-            @as(f64, @floatFromInt(median_ns)) / @as(f64, @floatFromInt(cfg.ops_per_frame)) / 1_000_000.0,
+            median_op_ns / 1_000_000.0,
             @as(f64, @floatFromInt(mean_ns)) / 1_000_000.0,
             @as(f64, @floatFromInt(mean_ns)) / @as(f64, @floatFromInt(cfg.ops_per_frame)) / 1_000_000.0,
             @as(f64, @floatFromInt(min_ns)) / 1_000_000.0,
             @as(f64, @floatFromInt(max_ns)) / 1_000_000.0,
             total_ops,
+            approx_op_bytes orelse 0,
+            approx_gb_s,
         },
     );
     std.debug.print(

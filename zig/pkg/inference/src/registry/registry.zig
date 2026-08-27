@@ -460,15 +460,26 @@ pub const ModelRegistry = struct {
         // Gemma4 QAT gguf checkpoints ship a sibling MTP assistant repo that
         // enables self-speculative decoding; fetch it best-effort so the
         // drafter is on disk when speculation is enabled. Missing companion
-        // repos must not fail the primary pull.
+        // repos must not fail the primary pull. The companion never inherits
+        // the caller's task/capability overrides (it is a drafter, not a
+        // servable generator), and an already-installed companion is not
+        // re-fetched on primary re-pulls.
         if (try gemma4MtpAssistantCompanionRefAlloc(self.allocator, ref)) |companion_ref| {
             defer self.allocator.free(companion_ref);
-            self.pull(io, companion_ref, hub_config, tasks_csv, capabilities_csv, projector_selection) catch |err| {
-                std.log.warn(
-                    "optional Gemma4 MTP assistant pull failed for {s}: {s}",
-                    .{ companion_ref, @errorName(err) },
-                );
+            const companion_installed = blk: {
+                const companion_parsed = ModelRef.parse(companion_ref) catch break :blk false;
+                const companion_dest = modelInstallDirAlloc(self.allocator, resolved_models_dir, companion_parsed) catch break :blk false;
+                defer self.allocator.free(companion_dest);
+                break :blk isModelDir(io, companion_dest);
             };
+            if (!companion_installed) {
+                self.pull(io, companion_ref, hub_config, null, null, projector_selection) catch |err| {
+                    std.log.warn(
+                        "optional Gemma4 MTP assistant pull failed for {s}: {s}",
+                        .{ companion_ref, @errorName(err) },
+                    );
+                };
+            }
         }
     }
 

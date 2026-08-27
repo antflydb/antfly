@@ -1355,6 +1355,10 @@ typedef struct termite_metal_decode_runtime {
     uint64_t frame_submit_count;
     uint64_t frame_wait_nanos;
     uint64_t frame_gpu_nanos;
+    // Host wall time from frame begin to commit: the encode-CPU cost that
+    // residency sets / unretained command buffers would reduce (M0.3).
+    uint64_t active_frame_encode_started_nanos;
+    uint64_t last_frame_encode_cpu_nanos;
     CFMutableArrayRef active_frame_retained_resources;
     CFMutableArrayRef submitted_frame_retained_resources;
     // In-frame device-buffer reuse pool (TERMITE_METAL_BUFFER_REUSE). Holds
@@ -13833,43 +13837,52 @@ static termite_metal_q6_k_mmv_variant termite_metal_q6_k_mmv_variant_override(vo
     static int cached = -1;
     if (cached < 0) {
         const char *raw = getenv("TERMITE_METAL_Q6_K_MMV_VARIANT");
-        if (raw == NULL || raw[0] == '\0' || strcmp(raw, "auto") == 0) {
+        if (raw == NULL || raw[0] == '\0' || strcasecmp(raw, "auto") == 0) {
             cached = TERMITE_METAL_Q6_K_MMV_VARIANT_AUTO;
-        } else if (strcmp(raw, "nsg4") == 0) {
+        } else if (strcasecmp(raw, "nsg4") == 0) {
             cached = TERMITE_METAL_Q6_K_MMV_VARIANT_NSG4;
-        } else if (strcmp(raw, "nsg8") == 0) {
+        } else if (strcasecmp(raw, "nsg8") == 0) {
             cached = TERMITE_METAL_Q6_K_MMV_VARIANT_NSG8;
-        } else {
-            // "legacy", "nsg2", and unrecognized values all pin the shipped shape.
+        } else if (strcasecmp(raw, "legacy") == 0 || strcasecmp(raw, "nsg2") == 0) {
             cached = TERMITE_METAL_Q6_K_MMV_VARIANT_NSG2;
+        } else {
+            fprintf(stderr, "metal-runtime: invalid TERMITE_METAL_Q6_K_MMV_VARIANT=%s; using auto\n", raw);
+            cached = TERMITE_METAL_Q6_K_MMV_VARIANT_AUTO;
         }
     }
     return (termite_metal_q6_k_mmv_variant)cached;
 }
 
 // Rows==1 q4_k mmv variant policy: "v2" forces the ggml-style masked-nibble
-// kernel, "legacy" pins the shipped shape. AUTO qualifies v2 only for
-// M4-family vocab-sized tails, where the interleaved A/B in
-// GEMMA4_PERF_PLAN.md measured a repeatable win; other devices/shapes keep
-// the legacy shape until they earn their own decision.
+// kernel, "legacy" pins the shipped shape. AUTO qualifies v2 only for the
+// M4-family TAIL workload (the vocab head), where the interleaved A/B in
+// GEMMA4_PERF_PLAN.md measured a repeatable win; other devices/workloads keep
+// the legacy shape until they earn their own decision. Invalid values warn
+// and resolve to AUTO so evidence runs cannot silently measure the wrong
+// kernel.
 static bool termite_metal_q4_k_mmv_v2_selected(
     const termite_metal_decode_runtime *runtime,
+    termite_metal_q4_0_mmv_workload workload,
     uint32_t out_dim
 ) {
     static int cached = -1;
     if (cached < 0) {
         const char *raw = getenv("TERMITE_METAL_Q4_K_MMV_VARIANT");
-        if (raw == NULL || raw[0] == '\0' || strcmp(raw, "auto") == 0) {
+        if (raw == NULL || raw[0] == '\0' || strcasecmp(raw, "auto") == 0) {
             cached = 0;
-        } else if (strcmp(raw, "v2") == 0) {
+        } else if (strcasecmp(raw, "v2") == 0) {
             cached = 1;
+        } else if (strcasecmp(raw, "legacy") == 0) {
+            cached = 2;
         } else {
-            cached = 2; // "legacy" and unrecognized values pin the shipped shape.
+            fprintf(stderr, "metal-runtime: invalid TERMITE_METAL_Q4_K_MMV_VARIANT=%s; using auto\n", raw);
+            cached = 0;
         }
     }
     if (cached == 1) return true;
     if (cached == 2) return false;
-    return runtime != NULL && runtime->apple_m4_device && out_dim >= 32768u;
+    return runtime != NULL && runtime->apple_m4_device &&
+        workload == TERMITE_METAL_Q4_0_MMV_WORKLOAD_TAIL && out_dim >= 32768u;
 }
 
 // Rows==1 q6_k mmv variant policy. AUTO stays on the legacy nsg2 shape until
@@ -14187,8 +14200,9 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
         case TERMITE_METAL_QUANT_FORMAT_Q4_K:
             if (descriptor->rows == 1 &&
                 runtime->q4_k_reduce_v2_pipeline != nil &&
+                runtime->q4_k_reduce_v2_pipeline.maxTotalThreadsPerThreadgroup >= 64u &&
                 descriptor->in_dim % 256u == 0u &&
-                termite_metal_q4_k_mmv_v2_selected(runtime, descriptor->out_dim)) {
+                termite_metal_q4_k_mmv_v2_selected(runtime, descriptor->q4_0_mmv_workload, descriptor->out_dim)) {
                 // ggml-style masked-nibble row pair kernel: 64 threads cover the
                 // same 4 output rows the legacy 128-thread shape does.
                 pipeline = runtime->q4_k_reduce_v2_pipeline;
@@ -14247,11 +14261,13 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
                 termite_metal_q6_k_mmv_variant q6_k_variant =
                     termite_metal_q6_k_mmv_select(runtime, descriptor->out_dim);
                 if (q6_k_variant == TERMITE_METAL_Q6_K_MMV_VARIANT_NSG4 &&
-                    runtime->q6_k_reduce_nsg4_pipeline == nil) {
+                    (runtime->q6_k_reduce_nsg4_pipeline == nil ||
+                     runtime->q6_k_reduce_nsg4_pipeline.maxTotalThreadsPerThreadgroup < 128u)) {
                     q6_k_variant = TERMITE_METAL_Q6_K_MMV_VARIANT_NSG2;
                 }
                 if (q6_k_variant == TERMITE_METAL_Q6_K_MMV_VARIANT_NSG8 &&
-                    runtime->q6_k_reduce_nsg8_pipeline == nil) {
+                    (runtime->q6_k_reduce_nsg8_pipeline == nil ||
+                     runtime->q6_k_reduce_nsg8_pipeline.maxTotalThreadsPerThreadgroup < 256u)) {
                     q6_k_variant = TERMITE_METAL_Q6_K_MMV_VARIANT_NSG2;
                 }
                 use_reduce = YES;
@@ -19736,8 +19752,14 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
             runtime,
             TERMITE_METAL_Q4_0_MMV_WORKLOAD_TAIL,
             "TERMITE_METAL_Q4_0_MMV_TAIL_VARIANT");
+        // Default-on for the qualified M4 generation: interleaved A/B measured
+        // a repeatable win with bit-identical tokens on E2B and E4B, and the
+        // fusion removes ~84 dispatches/frame (2 matvecs + activation-multiply
+        // -> 1 pair kernel per FFN). Other devices stay opt-in until they earn
+        // their own measured decision.
         runtime->q4_0_pair_activation_fusion_enabled =
-            termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION")) &&
+            (termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION")) ||
+             runtime->apple_m4_device) &&
             !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_Q4_0_PAIR_ACTIVATION_FUSION"));
         runtime->q4_0_pair_activation_mm_enabled =
             termite_metal_env_flag_enabled(getenv("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM")) &&
@@ -48709,6 +48731,7 @@ static int termite_metal_decode_runtime_begin_frame_internal(
         }
         cb.label = @"termite_metal_decode_runtime_frame";
         runtime->active_frame_cb = cb;
+        runtime->active_frame_encode_started_nanos = termite_metal_clock_monotonic_nanos();
         runtime->frame_begin_count = termite_metal_u64_saturating_add(runtime->frame_begin_count, 1);
         if (prepared_request) {
             termite_metal_stage_timing_prepare_active_frame(runtime, TERMITE_METAL_FRAME_REGIME_DECODE);
@@ -48768,15 +48791,23 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
     if (termite_metal_trace_frame_lifecycle_enabled()) {
         fprintf(
             stderr,
-            "metal_frame_lifecycle: submit compute=%llu blit=%llu planned_scopes=%llu planned_barriers=%llu\n",
+            "metal_frame_lifecycle: submit compute=%llu blit=%llu planned_scopes=%llu planned_barriers=%llu encode_cpu_us=%llu\n",
             (unsigned long long)runtime->active_frame_compute_encoder_count,
             (unsigned long long)runtime->active_frame_blit_encoder_count,
             (unsigned long long)runtime->active_frame_planned_compute_scope_count,
-            (unsigned long long)runtime->active_frame_planned_barrier_count
+            (unsigned long long)runtime->active_frame_planned_barrier_count,
+            (unsigned long long)((termite_metal_clock_monotonic_nanos() - runtime->active_frame_encode_started_nanos) / 1000u)
         );
     }
     termite_metal_decode_runtime_print_planned_access_profile(runtime);
     runtime->last_frame_gpu_nanos = 0;
+    if (runtime->active_frame_encode_started_nanos != 0) {
+        const uint64_t encode_now = termite_metal_clock_monotonic_nanos();
+        runtime->last_frame_encode_cpu_nanos = encode_now > runtime->active_frame_encode_started_nanos
+            ? encode_now - runtime->active_frame_encode_started_nanos
+            : 0;
+        runtime->active_frame_encode_started_nanos = 0;
+    }
     [cb commit];
     runtime->frame_submit_count = termite_metal_u64_saturating_add(runtime->frame_submit_count, 1);
     runtime->submitted_frame_cb = cb;

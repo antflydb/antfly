@@ -1631,21 +1631,8 @@ fn gemma4MetalDirectGreedyDefault() bool {
     return true;
 }
 
-fn pipelinedMetalDecodeEnabledForFlags(
-    enable_requested: bool,
-    disable_requested: bool,
-    device_default: bool,
-) bool {
-    if (disable_requested) return false;
-    return enable_requested or device_default;
-}
-
 fn pipelinedMetalDecodeEnabled() bool {
-    return pipelinedMetalDecodeEnabledForFlags(
-        platform.env.getenvBool("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
-        platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
-        metal_runtime.pipelinedDecodeFrameDeviceDefault(),
-    );
+    return metal_runtime.pipelinedDecodeFrameEnabled();
 }
 
 fn gemma4MetalDirectGreedyEnabled() bool {
@@ -13143,15 +13130,10 @@ test "Metal pipelined greedy EOS policy honors ignore_eos" {
     try std.testing.expect(!pipeline.shouldStopOnEos(.{}, 6));
 }
 
-test "Gemma4 pipelined Metal decode frames follow flags with device default" {
-    // No flags: the device qualification decides.
-    try std.testing.expect(!pipelinedMetalDecodeEnabledForFlags(false, false, false));
-    try std.testing.expect(pipelinedMetalDecodeEnabledForFlags(false, false, true));
-    // Explicit enable wins on unqualified devices.
-    try std.testing.expect(pipelinedMetalDecodeEnabledForFlags(true, false, false));
-    // Disable always wins.
-    try std.testing.expect(!pipelinedMetalDecodeEnabledForFlags(false, true, true));
-    try std.testing.expect(!pipelinedMetalDecodeEnabledForFlags(true, true, true));
+test "Gemma4 pipelined Metal decode frames delegate to the shared policy" {
+    // Policy precedence (disable > enable > device default) is owned and
+    // tested by metal_runtime.pipelinedDecodeFrameEnabledForFlags.
+    try std.testing.expect(!metal_runtime.pipelinedDecodeFrameEnabledForFlags(false, true, true));
 }
 
 test "gemma4 mtp adaptive k starts with probe and ramps on accepted windows" {

@@ -1165,6 +1165,48 @@ def _verify_sha(value: Any, label: str, path: Path) -> str:
     return value
 
 
+def _sysctl(name: str) -> str:
+    try:
+        return subprocess.run(
+            ["sysctl", "-n", name], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+_NOMINAL_GB_S = {
+    "Apple M4 Max": 546.0,
+    "Apple M4 Pro": 273.0,
+    "Apple M4": 120.0,
+    "Apple M3 Max": 400.0,
+    "Apple M3 Pro": 150.0,
+    "Apple M3": 100.0,
+}
+
+
+def _nominal_bandwidth_gb_s(chip: str) -> float | None:
+    for prefix, gb_s in _NOMINAL_GB_S.items():
+        if chip.startswith(prefix):
+            return gb_s
+    return None
+
+
+def _thermal_speed_limit_pct() -> int | None:
+    try:
+        out = subprocess.run(
+            ["pmset", "-g", "therm"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if "CPU_Speed_Limit" in line:
+            try:
+                return int(line.split("=")[-1].strip())
+            except ValueError:
+                return None
+    return None
+
+
 def _load_metadata(root: Path) -> dict[str, Any]:
     path = root / "metadata.json"
     try:
@@ -1687,6 +1729,14 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "shared_parser_sha256": _file_sha256(SHARED_PARSER),
         "host": platform.platform(),
         "machine": platform.machine(),
+        # Machine-identity + thermal ledger (GEMMA4_PERF_PLAN.md M0.4): the
+        # roofline differs 2.3x between base M4 (120 GB/s) and M4 Pro
+        # (273 GB/s); summaries from different chips must never be compared.
+        "chip": _sysctl("machdep.cpu.brand_string"),
+        "hw_model": _sysctl("hw.model"),
+        "memsize_bytes": _sysctl("hw.memsize"),
+        "nominal_gb_s": _nominal_bandwidth_gb_s(_sysctl("machdep.cpu.brand_string")),
+        "thermal_speed_limit_pct_start": _thermal_speed_limit_pct(),
         "expected_metal_device": args.expected_metal_device,
         "model": str(model),
         "gguf": str(gguf),

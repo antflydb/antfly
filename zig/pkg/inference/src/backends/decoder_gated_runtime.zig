@@ -350,6 +350,13 @@ fn disableGemma4E4bFastResidencyRequested() bool {
     return getenvBool("TERMITE_METAL_DISABLE_GEMMA4_E4B_FAST_RESIDENCY");
 }
 
+/// Q8_0 staging of the PLE per-layer model projection (default on): halves
+/// the 55 MB/token dense-BF16 read and moves the dispatch onto the planned
+/// quant-MMV route instead of a dense encoder break every frame.
+fn pleModelProjQ8StagingEnabled() bool {
+    return !getenvBool("TERMITE_METAL_DISABLE_PLE_MODEL_PROJ_Q8");
+}
+
 fn shouldDisableMappedGemmaSharedKvQ(gpt_config: gpt_mod.Config, layer: usize) bool {
     return gpt_config.family == .gemma and
         gpt_config.num_kv_shared_layers != 0 and
@@ -4793,11 +4800,32 @@ fn prepareLinearNoBiasSlotForConfig(
     out_dim: usize,
     disable_mapped_quant_weight: bool,
 ) !bool {
+    return prepareLinearNoBiasSlotForConfigTagged(cb, allocator, gpt_config, slot, weight, in_dim, out_dim, disable_mapped_quant_weight, .{});
+}
+
+const PrepareSlotTags = struct {
+    lm_head: bool = false,
+    prefer_q8_over_dense_bf16: bool = false,
+};
+
+fn prepareLinearNoBiasSlotForConfigTagged(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_config: gpt_mod.Config,
+    slot: usize,
+    weight: ops.CT,
+    in_dim: usize,
+    out_dim: usize,
+    disable_mapped_quant_weight: bool,
+    tags: PrepareSlotTags,
+) !bool {
     const dense_fallback_max_bytes = gemma4E4bDenseFallbackMaxBytes(gpt_config);
     if (gpt_config.family != .qwen3) {
         return decoder_rms_runtime.prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, weight, in_dim, out_dim, .{
             .disable_mapped_quant_weight = disable_mapped_quant_weight,
             .dense_fallback_max_bytes = dense_fallback_max_bytes,
+            .lm_head = tags.lm_head,
+            .prefer_q8_over_dense_bf16 = tags.prefer_q8_over_dense_bf16,
         });
     }
 
@@ -4815,6 +4843,8 @@ fn prepareLinearNoBiasSlotForConfig(
     return decoder_rms_runtime.prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, dense, in_dim, out_dim, .{
         .disable_mapped_quant_weight = disable_mapped_quant_weight,
         .dense_fallback_max_bytes = dense_fallback_max_bytes,
+        .lm_head = tags.lm_head,
+        .prefer_q8_over_dense_bf16 = tags.prefer_q8_over_dense_bf16,
     });
 }
 
@@ -5214,7 +5244,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(
+        if (!(try prepareLinearNoBiasSlotForConfigTagged(
             cb,
             allocator,
             gpt_config,
@@ -5223,6 +5253,9 @@ pub fn prepareDecodeRuntime(
             gpt_config.hidden_size,
             ple_total_dim,
             false,
+            // The dense-BF16 model projection streams below quant-kernel
+            // efficiency and forces a dense encoder break every frame.
+            .{ .prefer_q8_over_dense_bf16 = pleModelProjQ8StagingEnabled() },
         ))) {
             timing_stats.prepare_ple_model_proj_failures += 1;
             return false;
@@ -5273,7 +5306,7 @@ pub fn prepareDecodeRuntime(
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.final_lookup_nanos += finished_at - started_at;
     started_at = monotonicNowNs();
-    if (!(try prepareLinearNoBiasSlotForConfig(
+    if (!(try prepareLinearNoBiasSlotForConfigTagged(
         cb,
         allocator,
         gpt_config,
@@ -5282,6 +5315,7 @@ pub fn prepareDecodeRuntime(
         gpt_config.hidden_size,
         gpt_config.vocab_size,
         false,
+        .{ .lm_head = true },
     ))) {
         timing_stats.prepare_final_norm_failures += 1;
         return false;
