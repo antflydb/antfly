@@ -147,6 +147,7 @@ pub const Config = struct {
     deepseek_v4_beta_slow: f32 = 0.0,
 
     // Gemma 4: shared KV cache and per-layer GQA.
+    gemma4_channel_protocol: bool = false,
     num_kv_shared_layers: u32 = 0,
     global_head_dim: u32 = 0,
     num_global_key_value_heads: u32 = 0,
@@ -303,6 +304,10 @@ pub const Config = struct {
 
     pub fn hasPle(self: Config) bool {
         return self.ple_hidden_size > 0;
+    }
+
+    pub fn usesGemma4Channels(self: Config) bool {
+        return self.gemma4_channel_protocol or (self.family == .gemma and self.hasPle());
     }
 
     pub fn layerUsesSlidingAttention(self: Config, layer_index: usize) bool {
@@ -629,6 +634,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (model_obj.get("model_type")) |v| {
         if (v == .string) {
             config.gemma4_mtp_assistant = isGemma4AssistantModelType(v.string);
+            config.gemma4_channel_protocol = isGemma4ModelType(v.string);
             config.family = detectFamily(v.string);
             applyFamilyDefaults(&config);
             if (isGemma4ModelType(v.string)) config.norm_weight_offset = 0.0;
@@ -636,6 +642,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     } else if (obj.get("model_type")) |v| {
         if (v == .string) {
             config.gemma4_mtp_assistant = isGemma4AssistantModelType(v.string);
+            config.gemma4_channel_protocol = isGemma4ModelType(v.string);
             config.family = detectFamily(v.string);
             applyFamilyDefaults(&config);
             if (isGemma4ModelType(v.string)) config.norm_weight_offset = 0.0;
@@ -1153,6 +1160,7 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
 
     var config = Config{
         .family = detectFamily(arch),
+        .gemma4_channel_protocol = isGemma4ModelType(arch),
         .gemma4_mtp_assistant = std.mem.eql(u8, arch, "gemma4_assistant") or
             std.mem.eql(u8, arch, "gemma4_unified_assistant") or
             std.mem.eql(u8, arch, "gemma4-assistant"),
@@ -1953,6 +1961,7 @@ test "parse gemma3 multimodal config" {
     ;
     const config = try parseConfig(allocator, json);
     try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(!config.usesGemma4Channels());
     try std.testing.expectEqual(@as(i32, 262144), config.image_token_index);
     try std.testing.expectEqual(@as(i32, 255999), config.boi_token_index);
     try std.testing.expectEqual(@as(i32, 256000), config.eoi_token_index);
@@ -2009,6 +2018,7 @@ test "parse functiongemma gemma3_text config" {
     ;
     const config = try parseConfig(allocator, json);
     try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(!config.usesGemma4Channels());
     try std.testing.expectEqual(@as(u32, 18), config.num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 4), config.num_attention_heads);
     try std.testing.expectEqual(@as(u32, 1), config.num_key_value_heads);
@@ -2463,6 +2473,7 @@ test "parse gemma4 config with shared kv and per-layer gqa" {
     ;
     const config = try parseConfig(allocator, json);
     try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(config.usesGemma4Channels());
     try std.testing.expectEqual(@as(u32, 3072), config.hidden_size);
     try std.testing.expectEqual(@as(u32, 36), config.num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 12), config.num_kv_shared_layers);
@@ -2511,6 +2522,7 @@ test "parse gemma4 text-only config defaults" {
     ;
     const config = try parseConfig(allocator, json);
     try std.testing.expectEqual(ModelFamily.gemma, config.family);
+    try std.testing.expect(config.usesGemma4Channels());
 
     // No shared KV or per-layer GQA when fields are absent (default 0).
     try std.testing.expectEqual(@as(u32, 0), config.num_kv_shared_layers);
@@ -2700,6 +2712,7 @@ test "parse GGUF tokenizer eos token metadata" {
     };
 
     const config = parseGgufMetadata(gguf_metadata.View.init(&file)).?;
+    try std.testing.expect(config.usesGemma4Channels());
     try std.testing.expectEqual(@as(i32, 1), config.eos_token_id);
     try std.testing.expect(config.isEosToken(1));
 }

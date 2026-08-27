@@ -205,7 +205,7 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
 
     pub fn runOnce(self: *SparseCompactionRuntime) !bool {
         var maybe_task: ?index_manager_mod.IndexManager.SparseCompactionTask = null;
-        if (!lockApplyExclusiveBackoff(self)) return false;
+        if (!try lockApplyExclusiveCancellable(self)) return false;
         maybe_task = self.index_manager.beginSparseCompactionTask() catch |err| {
             self.apply_mutex.unlockExclusive();
             return err;
@@ -225,11 +225,72 @@ pub const SparseCompactionRuntime = if (builtin.os.tag == .freestanding) struct 
         defer result.deinit(work_alloc);
 
         // A started task must retire before structural mutation can close its
-        // generation. The stopper waits without holding the apply lock.
-        lockApplyExclusive(self.apply_mutex);
-        defer self.apply_mutex.unlockExclusive();
-        _ = try self.index_manager.finishSparseCompactionTask(&task, &result);
+        // generation. Block std.Io cancellation only across that mandatory
+        // reacquire-and-finish section: lock acquisition remains cooperative,
+        // and a pending cancellation is re-observed immediately afterward.
+        var retirement = try MandatoryApplyRetirement.acquire(self);
+        defer retirement.deinit();
+        const finish_result = self.index_manager.finishSparseCompactionTask(&task, &result);
+        try retirement.releaseAndCheckCancellation();
+        _ = try finish_result;
         return true;
+    }
+};
+
+/// Owns the apply lock and cancellation protection needed to retire a task
+/// which has already begun. `deinit` makes every error path safe, while the
+/// successful path explicitly observes cancellation only after releasing the
+/// apply lock.
+const MandatoryApplyRetirement = struct {
+    io: Io,
+    apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    previous_cancel_protection: Io.CancelProtection,
+    apply_lock_held: bool = true,
+    cancellation_protected: bool = true,
+
+    fn acquire(runtime: *SparseCompactionRuntime) !MandatoryApplyRetirement {
+        const io = runtime.io orelse return error.MissingBackendRuntimeIo;
+        const previous_cancel_protection = io.swapCancelProtection(.blocked);
+        errdefer _ = io.swapCancelProtection(previous_cancel_protection);
+
+        const NeverCancelled = struct {
+            pub fn isCancelled(_: @This()) bool {
+                return false;
+            }
+        };
+        runtime.apply_mutex.lockExclusiveIo(
+            io,
+            @as(?NeverCancelled, null),
+        ) catch |err| switch (err) {
+            // Cancellation is blocked above and the explicit token is absent.
+            error.Canceled, error.Cancelled => unreachable,
+        };
+        return .{
+            .io = io,
+            .apply_mutex = runtime.apply_mutex,
+            .previous_cancel_protection = previous_cancel_protection,
+        };
+    }
+
+    fn deinit(self: *MandatoryApplyRetirement) void {
+        if (self.apply_lock_held) {
+            self.apply_mutex.unlockExclusive();
+            self.apply_lock_held = false;
+        }
+        if (self.cancellation_protected) {
+            _ = self.io.swapCancelProtection(self.previous_cancel_protection);
+            self.cancellation_protected = false;
+        }
+    }
+
+    fn releaseAndCheckCancellation(self: *MandatoryApplyRetirement) Io.Cancelable!void {
+        std.debug.assert(self.apply_lock_held);
+        std.debug.assert(self.cancellation_protected);
+        self.apply_mutex.unlockExclusive();
+        self.apply_lock_held = false;
+        _ = self.io.swapCancelProtection(self.previous_cancel_protection);
+        self.cancellation_protected = false;
+        try self.io.checkCancel();
     }
 };
 
@@ -237,6 +298,10 @@ fn workerMain(runtime: *SparseCompactionRuntime) void {
     while (true) {
         if (isShutdown(runtime)) return;
         const ran = runtime.runOnce() catch |err| {
+            // `std.Io` cancellation is a task-lifetime boundary, not a
+            // recoverable compaction failure. Do not consume its one-shot
+            // notification and re-enter the worker loop.
+            if (err == error.Canceled) return;
             if (builtin.os.tag != .freestanding) {
                 std.log.warn("sparse compaction worker failed: {s}", .{@errorName(err)});
             }
@@ -292,16 +357,26 @@ fn isShutdown(runtime: *SparseCompactionRuntime) bool {
     return runtime.shutdown;
 }
 
-fn lockApplyExclusiveBackoff(runtime: *SparseCompactionRuntime) bool {
-    while (!runtime.apply_mutex.tryLockExclusive()) {
-        if (isShutdown(runtime)) return false;
-        sleepMs(runtime, 1);
-    }
-    return true;
-}
+fn lockApplyExclusiveCancellable(runtime: *SparseCompactionRuntime) !bool {
+    const io = runtime.io orelse return false;
+    const Cancellation = struct {
+        runtime: *SparseCompactionRuntime,
 
-fn lockApplyExclusive(lock: *apply_rw_lock_mod.ApplyRwLock) void {
-    lock.lockExclusive();
+        pub fn isCancelled(self: @This()) bool {
+            return isShutdown(self.runtime);
+        }
+    };
+    runtime.apply_mutex.lockExclusiveIo(
+        io,
+        @as(?Cancellation, .{ .runtime = runtime }),
+    ) catch |err| switch (err) {
+        // The component stop token makes this optional pass a no-op. Backend
+        // task cancellation must propagate to the worker boundary instead of
+        // being consumed as an ordinary idle iteration.
+        error.Cancelled => return false,
+        error.Canceled => return error.Canceled,
+    };
+    return true;
 }
 
 fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
@@ -323,4 +398,158 @@ fn consumeTestStartFailure() bool {
         return true;
     }
     return false;
+}
+
+test "sparse compaction propagates backend cancellation before task start" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const Waiter = struct {
+        fn run(runtime: *SparseCompactionRuntime) Io.Cancelable!bool {
+            return lockApplyExclusiveCancellable(runtime);
+        }
+    };
+
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var apply_lock: apply_rw_lock_mod.ApplyRwLock = .{};
+    var runtime: SparseCompactionRuntime = .{
+        .alloc = std.testing.allocator,
+        .io = io,
+        .index_manager = undefined,
+        .apply_mutex = &apply_lock,
+        .config = .{ .enabled = true },
+    };
+
+    apply_lock.lockShared();
+    var shared_held = true;
+    var waiter = Io.async(io, Waiter.run, .{&runtime});
+    var waiter_active = true;
+    defer {
+        // Release the blocker first so cleanup cannot hang even if the
+        // cancellation assertion above the normal release path fails.
+        if (shared_held) apply_lock.unlockShared();
+        if (waiter_active) _ = waiter.cancel(io) catch {};
+    }
+    var waiter_joined = false;
+    for (0..5_000) |_| {
+        if (apply_lock.exclusive_waiters.load(.acquire) != 0) {
+            waiter_joined = true;
+            break;
+        }
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(waiter_joined);
+
+    const result = waiter.cancel(io);
+    waiter_active = false;
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expectEqual(@as(u64, 0), apply_lock.exclusive_waiters.load(.acquire));
+    apply_lock.unlockShared();
+    shared_held = false;
+    try std.testing.expect(apply_lock.tryLockExclusive());
+    apply_lock.unlockExclusive();
+}
+
+test "sparse compaction defers backend cancellation through mandatory retirement" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const Retirer = struct {
+        fn run(
+            runtime: *SparseCompactionRuntime,
+            cancellation_point_ready: *std.atomic.Value(bool),
+            release_blocker: *std.atomic.Value(bool),
+            retired: *std.atomic.Value(bool),
+        ) Io.Cancelable!void {
+            const io = runtime.io.?;
+            cancellation_point_ready.store(true, .release);
+            io.sleep(.fromSeconds(60), .awake) catch |err| switch (err) {
+                error.Canceled => io.recancel(),
+            };
+
+            // `recancel` guarantees the mandatory section begins with a real
+            // backend cancellation pending. Let the independent lock owner
+            // drain only after that invariant is established.
+            release_blocker.store(true, .release);
+            var retirement = MandatoryApplyRetirement.acquire(runtime) catch unreachable;
+            defer retirement.deinit();
+            retired.store(true, .release);
+            try retirement.releaseAndCheckCancellation();
+        }
+    };
+    const Blocker = struct {
+        apply_lock: *apply_rw_lock_mod.ApplyRwLock,
+        held: *std.atomic.Value(bool),
+        release: *const std.atomic.Value(bool),
+
+        fn run(ctx: *@This()) void {
+            ctx.apply_lock.lockShared();
+            ctx.held.store(true, .release);
+            while (!ctx.release.load(.acquire)) std.Thread.yield() catch {};
+            ctx.apply_lock.unlockShared();
+        }
+    };
+
+    var io_impl = Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .limited(1),
+    });
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var apply_lock: apply_rw_lock_mod.ApplyRwLock = .{};
+    var runtime: SparseCompactionRuntime = .{
+        .alloc = std.testing.allocator,
+        .io = io,
+        .index_manager = undefined,
+        .apply_mutex = &apply_lock,
+        .config = .{ .enabled = true },
+    };
+    var blocker_held = std.atomic.Value(bool).init(false);
+    var release_blocker = std.atomic.Value(bool).init(false);
+    var blocker_ctx = Blocker{
+        .apply_lock = &apply_lock,
+        .held = &blocker_held,
+        .release = &release_blocker,
+    };
+    const blocker_thread = try std.Thread.spawn(.{}, Blocker.run, .{&blocker_ctx});
+    var blocker_active = true;
+    defer if (blocker_active) {
+        release_blocker.store(true, .release);
+        blocker_thread.join();
+    };
+    while (!blocker_held.load(.acquire)) std.Thread.yield() catch {};
+
+    var cancellation_point_ready = std.atomic.Value(bool).init(false);
+    var retired = std.atomic.Value(bool).init(false);
+    var future = Io.async(io, Retirer.run, .{
+        &runtime,
+        &cancellation_point_ready,
+        &release_blocker,
+        &retired,
+    });
+    var future_active = true;
+    defer if (future_active) {
+        release_blocker.store(true, .release);
+        _ = future.cancel(io) catch {};
+    };
+    var cancellation_point_joined = false;
+    for (0..5_000) |_| {
+        if (cancellation_point_ready.load(.acquire)) {
+            cancellation_point_joined = true;
+            break;
+        }
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(cancellation_point_joined);
+
+    const result = future.cancel(io);
+    future_active = false;
+    release_blocker.store(true, .release);
+    blocker_thread.join();
+    blocker_active = false;
+
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expect(retired.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), apply_lock.exclusive_waiters.load(.acquire));
+    try std.testing.expect(apply_lock.tryLockExclusive());
+    apply_lock.unlockExclusive();
 }

@@ -293,6 +293,22 @@ pub fn validateCommittedRestoreIdentityWithIo(
     }
 }
 
+fn publishedRestoreAlreadyApplied(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    restore: RestoreSource,
+) !bool {
+    var generation_read = (try db_mod.generation_lifecycle.acquirePublishedGenerationRead(alloc, path)) orelse
+        return false;
+    defer generation_read.deinit();
+    validateCommittedRestoreIdentity(alloc, path, group_id, restore) catch |err| switch (err) {
+        error.RestoreIdentityMismatch => return false,
+        else => return err,
+    };
+    return true;
+}
+
 pub fn validateImportedRestoreIdentity(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -341,7 +357,9 @@ pub fn applyBackupRestoreFromRecordWithOptions(
     open_options: backups_api.OpenOptions,
 ) !void {
     try restore.validate();
-    try applyRestoreSnapshotToReplicaRoot(alloc, replica_root_dir, group_id, .{
+    const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    const source: RestoreSource = .{
         .backup_id = restore.backup_id,
         .artifact_backup_id = restore.artifact_backup_id,
         .location = restore.location,
@@ -350,7 +368,9 @@ pub fn applyBackupRestoreFromRecordWithOptions(
         .expected_artifact_size_bytes = restore.artifact_size_bytes,
         .expected_artifact_sha256 = restore.artifact_sha256,
         .open_options = open_options,
-    }, null);
+    };
+    if (try publishedRestoreAlreadyApplied(alloc, path, group_id, source)) return;
+    try applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, source, .{});
 }
 
 fn prepareRestoreSnapshotIfNeeded(
@@ -800,4 +820,49 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(escaped);
     try out.appendSlice(alloc, escaped);
+}
+
+test "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident" {
+    const alloc = std.testing.allocator;
+    const group_id: u64 = 1701;
+    const artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-bootstrap-idempotence", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    const marker_path = try std.fmt.allocPrint(alloc, "{s}/.restore-state", .{path});
+    defer alloc.free(marker_path);
+    try writeFile(marker_path,
+        \\{"format_version":1,"backup_id":"backup-1701","location":"s3://backup/antfly","artifact_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","snapshot_path":"backup-1701/groups/1701.afb","group_id":1701,"phase":"complete","primary_restored":true,"runtime_repair_complete":true,"last_error":""}
+    );
+
+    var resident_read = (try db_mod.generation_lifecycle.acquirePublishedGenerationRead(alloc, path)) orelse
+        return error.TestUnexpectedResult;
+    defer resident_read.deinit();
+
+    const exact: @import("../catalog.zig").BackupRestoreBootstrapRecord = .{
+        .backup_id = "backup-1701",
+        .artifact_backup_id = "artifact-1701",
+        .location = "s3://backup/antfly",
+        .snapshot_path = "backup-1701/groups/1701.afb",
+        .connection = "backup-store",
+        .artifact_size_bytes = 1,
+        .artifact_sha256 = artifact_sha256,
+    };
+    try applyBackupRestoreFromRecord(alloc, replica_root_dir, group_id, exact);
+
+    var aliased_source = exact;
+    aliased_source.artifact_backup_id = "artifact-1701-copy";
+    aliased_source.connection = "rotated-backup-store";
+    try applyBackupRestoreFromRecord(alloc, replica_root_dir, group_id, aliased_source);
+
+    var different = exact;
+    different.backup_id = "backup-1701-different";
+    try std.testing.expectError(
+        error.GenerationTransitionActive,
+        applyBackupRestoreFromRecord(alloc, replica_root_dir, group_id, different),
+    );
 }

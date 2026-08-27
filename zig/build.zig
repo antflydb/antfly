@@ -2963,6 +2963,7 @@ pub fn build(b: *std.Build) void {
     const api_restore_jobs_tests = b.addTest(.{
         .root_module = api_restore_jobs_test_mod,
         .filters = &.{
+            "replicated restore persistence maps private callback errors to stable unavailability",
             "failed destination authorization refresh reuses the idempotent restore job",
             "delayed replicated restore refresh cannot regress a running job",
             "restore job store is idempotent and fenced",
@@ -4083,6 +4084,7 @@ pub fn build(b: *std.Build) void {
             "host records backup restore bootstrap failure when no handler is available",
             "file replica catalog persists backup restore bootstrap records across reopen",
             "replica catalog rejects invalid backup restore authority and integrity bindings",
+            "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4388,6 +4390,9 @@ pub fn build(b: *std.Build) void {
         "data runtime local group status provider collects and caches group statuses",
         "data runtime storage ownership fingerprint excludes transient placement progress",
         "data descriptor factory separates bootstrap voters from transport peers",
+        "data runtime remote admin snapshot clone owns parser-backed slices",
+        "data runtime remote admin snapshot clone releases partial ownership",
+        "data runtime remote metadata status stabilizes parser-backed role",
         "data descriptor factory bootstraps pristine group from complete intent peer set",
         "placement peer collection preserves complete intent peers during partial projection",
         "placement topology refuses partial transition bootstrap voters",
@@ -6328,10 +6333,12 @@ pub fn build(b: *std.Build) void {
     const api_table_writes_production_regression_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{
+            "provisioned writer cache starts DB workers after stable entry installation",
             "table write source restore acquires lifecycle unless caller reserves it",
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned create succeeds when post-commit runtime status is fenced",
             "provisioned create reuses a generation opened by startup reconciliation",
+            "provisioned owner clone snapshot preserves retired runtime counters",
             "provisioned create installs managed enrichment despite a matching stale fingerprint",
             "runtime status refreshes aged live writer publications",
             "provisioned table write source runtime status serves cached snapshot during active same-table work",
@@ -6418,6 +6425,7 @@ pub fn build(b: *std.Build) void {
             "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",
             "write cache transition locks use stable cache roles instead of addresses",
+            "writer cache metric pin batch release compacts retired entries once",
             "writer cache bulk transition fences only its table",
             "provisioned read cache retirement is allocation-free after entry installation",
             "provisioned group storage prunes stale visible root generations",
@@ -7796,6 +7804,7 @@ pub fn build(b: *std.Build) void {
             "inference admission bridge charges combined native residency to resource manager",
             "standalone tokenizer bridge enforces growth and permits exact teardown",
             "standalone inference keep alive parses compound durations and zero",
+            "standalone preload bridge preserves A4B residency controls",
             "standalone data directory does not change the default models directory",
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked inference ABI rejects mismatched context and function-table prefixes",
@@ -8348,7 +8357,7 @@ pub fn build(b: *std.Build) void {
         "one percent filtered route preserves exact recall with candidate-linear IO",
         "dense index manager accepts external embedding indexes without enrichments",
         "production external scorers use bounded cache-first artifact batches",
-        "progressive filtered l2 traversal preserves exact top k and stops on leaf bounds",
+        "progressive filtered l2 traversal preserves exact top k without bound stops",
         "flat rabitq filtered traversal advances past its initial probe wave safely",
         "sorted unique vector id subtraction handles sparse and dense exclusions",
     };
@@ -10239,6 +10248,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    const hbc_isolate_build_options = b.addOptions();
+    hbc_isolate_build_options.addOption([]const u8, "lmdb_backend", @tagName(lmdb_backend));
+    hbc_isolate_build_options.addOption(bool, "lmdb_evented_async_io", lmdb_evented_async_io);
+    hbc_isolate_build_options.addOption(bool, "storage_sim_soak", false);
+    hbc_isolate_build_options.addOption(bool, "with_tla", with_tla);
+    hbc_isolate_build_options.addOption(bool, "link_libc", true);
+    hbc_isolate_build_options.addOption(bool, "standalone_runtime_focused_test", false);
+    hbc_isolate_build_options.addOption(bool, "lmdb_enabled", false);
+    hbc_isolate_build_options.addOption(bool, "bench_minimal_deps", true);
+    hbc_isolate_root_mod.addOptions("build_options", hbc_isolate_build_options);
     hbc_isolate_root_mod.addImport("lmdb_engine", lmdb_engine_mod);
     hbc_isolate_root_mod.addImport("bloom", bloom_mod);
     hbc_isolate_root_mod.addImport("antfly_vector", vector_mod);
@@ -10715,6 +10734,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     provisioned_dense_ingest_guardrail_mod.addImport("antfly-zig", lib_mod);
+    provisioned_dense_ingest_guardrail_mod.addImport("antfly_platform", platform_mod);
 
     const provisioned_dense_ingest_guardrail = b.addExecutable(.{
         .name = "provisioned_dense_ingest_guardrail",
@@ -10726,6 +10746,9 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_provisioned_dense_ingest_guardrail.addArgs(args);
     } else {
+        // Keep deterministic memory regressions fail-closed while allowing
+        // enough wall-clock headroom for slower CI hosts. The cache threshold
+        // is 768 MiB and the process-footprint threshold is 3 GiB.
         run_provisioned_dense_ingest_guardrail.addArgs(&.{
             "--docs",
             "50000",
@@ -10735,6 +10758,18 @@ pub fn build(b: *std.Build) void {
             "100",
             "--sync-level",
             "write",
+            "--max-bulk-clone-calls",
+            "0",
+            "--max-bulk-clone-bytes",
+            "0",
+            "--max-bulk-clone-peak-bytes",
+            "0",
+            "--max-data-block-cache-bytes",
+            "805306368",
+            "--max-peak-footprint-bytes",
+            "3221225472",
+            "--max-ingest-ms",
+            "60000",
         });
     }
     const build_provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail-build", "Build the provisioned table dense ingest guardrail without running it");

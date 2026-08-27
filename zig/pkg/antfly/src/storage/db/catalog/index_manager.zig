@@ -252,6 +252,47 @@ pub const ManagedIndexRef = struct {
     estimated_dense_vector_bytes: u64 = 0,
 };
 
+pub const LsmOwnerStats = struct {
+    kind: types.IndexKind,
+    name: []u8,
+    maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+    /// Distinguishes the bounded synthetic aggregate from a user index that
+    /// happens to have the same display name.
+    owner_overflow: bool = false,
+    retired_labels_collapsed_total: u64 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+fn accumulateCloneMaintenance(
+    dst: *lsm_backend_mod.Backend.MaintenanceStats,
+    src: lsm_backend_mod.Backend.MaintenanceStats,
+) void {
+    dst.mutable_snapshot_clone_calls +|= src.mutable_snapshot_clone_calls;
+    dst.mutable_snapshot_clone_bytes_total +|= src.mutable_snapshot_clone_bytes_total;
+    dst.mutable_snapshot_clone_peak_bytes = @max(dst.mutable_snapshot_clone_peak_bytes, src.mutable_snapshot_clone_peak_bytes);
+    for (&dst.mutable_snapshot_clone_by_reason, src.mutable_snapshot_clone_by_reason) |*dst_reason, src_reason| {
+        dst_reason.calls +|= src_reason.calls;
+        dst_reason.bytes_total +|= src_reason.bytes_total;
+        dst_reason.peak_bytes = @max(dst_reason.peak_bytes, src_reason.peak_bytes);
+    }
+    dst.bulk_ingest_current_scan_clone_peak_active_bytes = @max(
+        dst.bulk_ingest_current_scan_clone_peak_active_bytes,
+        src.bulk_ingest_current_scan_clone_peak_active_bytes,
+    );
+}
+
+fn cloneMaintenanceOnly(
+    src: lsm_backend_mod.Backend.MaintenanceStats,
+) lsm_backend_mod.Backend.MaintenanceStats {
+    var result = lsm_backend_mod.Backend.MaintenanceStats{};
+    accumulateCloneMaintenance(&result, src);
+    return result;
+}
+
 pub const IndexBatchOptions = struct {
     compact_text: bool = true,
     compact_text_segment_threshold: ?usize = null,
@@ -1175,6 +1216,8 @@ const SplitSide = enum {
 };
 
 pub const IndexManager = struct {
+    const max_retired_lsm_owner_stats: usize = 1024;
+    const retired_lsm_owner_overflow_name = "__retired_owner_overflow__";
     alloc: Allocator,
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
@@ -1224,6 +1267,9 @@ pub const IndexManager = struct {
     text_indexes: std.ArrayListUnmanaged(TextIndex),
     text_merge_scheduler: TextMergeScheduler,
     dense_indexes: std.ArrayListUnmanaged(DenseIndex),
+    retired_lsm_owner_stats: std.ArrayListUnmanaged(LsmOwnerStats) = .empty,
+    retired_lsm_owner_overflow_stats: [2]lsm_backend_mod.Backend.MaintenanceStats = .{ .{}, .{} },
+    retired_lsm_owner_labels_collapsed: [2]u64 = .{ 0, 0 },
     sparse_indexes: std.ArrayListUnmanaged(SparseIndex),
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
@@ -2449,6 +2495,60 @@ pub const IndexManager = struct {
         self.deinitTextIndexEntry(entry, false);
     }
 
+    fn archiveLsmOwnerStats(
+        self: *IndexManager,
+        kind: types.IndexKind,
+        name: []const u8,
+        maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+    ) void {
+        if (maintenance.mutable_snapshot_clone_calls == 0 and
+            maintenance.mutable_snapshot_clone_bytes_total == 0 and
+            maintenance.mutable_snapshot_clone_peak_bytes == 0 and
+            maintenance.bulk_ingest_current_scan_clone_peak_active_bytes == 0) return;
+        for (self.retired_lsm_owner_stats.items) |*retired| {
+            if (retired.kind != kind or !std.mem.eql(u8, retired.name, name)) continue;
+            accumulateCloneMaintenance(&retired.maintenance, maintenance);
+            return;
+        }
+        if (self.retired_lsm_owner_stats.items.len >= max_retired_lsm_owner_stats) {
+            const overflow_index: usize = switch (kind) {
+                .full_text => 0,
+                .dense_vector => 1,
+                else => unreachable,
+            };
+            accumulateCloneMaintenance(&self.retired_lsm_owner_overflow_stats[overflow_index], maintenance);
+            self.retired_lsm_owner_labels_collapsed[overflow_index] +|= 1;
+            return;
+        }
+        const owned_name = self.alloc.dupe(u8, name) catch |err| {
+            std.log.warn("failed to retain retired LSM owner name owner={s} err={s}", .{ name, @errorName(err) });
+            return;
+        };
+        self.retired_lsm_owner_stats.append(self.alloc, .{
+            .kind = kind,
+            .name = owned_name,
+            .maintenance = cloneMaintenanceOnly(maintenance),
+        }) catch |err| {
+            self.alloc.free(owned_name);
+            std.log.warn("failed to retain retired LSM owner metrics owner={s} err={s}", .{ name, @errorName(err) });
+        };
+    }
+
+    fn archiveTextIndexOwner(self: *IndexManager, entry: *TextIndex) void {
+        const stats = entry.persistent.snapshotLsmMaintenanceStats() orelse return;
+        self.archiveLsmOwnerStats(.full_text, entry.config.name, stats);
+    }
+
+    fn archiveDenseIndexOwner(self: *IndexManager, entry: *DenseIndex) void {
+        const stats = entry.index.snapshotLsmMaintenanceStats() orelse return;
+        self.archiveLsmOwnerStats(.dense_vector, entry.config.name, stats);
+    }
+
+    fn retireTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
+        self.archiveTextIndexOwner(entry);
+        self.freeTextIndexEntry(entry);
+    }
+
     fn abandonTextIndexEntryAfterCrash(self: *IndexManager, entry: *TextIndex) void {
         self.deinitTextIndexEntry(entry, true);
     }
@@ -2564,6 +2664,11 @@ pub const IndexManager = struct {
         self.deinitDenseIndexEntry(entry, false);
     }
 
+    fn retireDenseIndexEntry(self: *IndexManager, entry: *DenseIndex) void {
+        self.archiveDenseIndexOwner(entry);
+        self.freeDenseIndexEntry(entry);
+    }
+
     fn abandonDenseIndexEntryAfterCrash(self: *IndexManager, entry: *DenseIndex) void {
         self.deinitDenseIndexEntry(entry, true);
     }
@@ -2633,6 +2738,7 @@ pub const IndexManager = struct {
         errdefer index.close();
 
         index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
+        index.setIo(self.io);
         if (self.hbc_cache) |cache| index.attachSharedCache(cache);
         if (self.resource_manager) |manager| {
             index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
@@ -2871,6 +2977,8 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |*entry| {
             if (abandon_after_crash) self.abandonDenseIndexEntryAfterCrash(entry) else self.freeDenseIndexEntry(entry);
         }
+        for (self.retired_lsm_owner_stats.items) |*entry| entry.deinit(self.alloc);
+        self.retired_lsm_owner_stats.deinit(self.alloc);
         for (self.sparse_indexes.items) |*entry| {
             if (abandon_after_crash) self.abandonSparseIndexEntryAfterCrash(entry) else self.freeSparseIndexEntry(entry);
         }
@@ -3570,6 +3678,101 @@ pub const IndexManager = struct {
             }
         }
         return stats;
+    }
+
+    pub fn snapshotLsmOwnerStatsAlloc(self: *const IndexManager, alloc: Allocator) ![]LsmOwnerStats {
+        var owners = std.ArrayListUnmanaged(LsmOwnerStats).empty;
+        errdefer {
+            for (owners.items) |*owner| owner.deinit(alloc);
+            owners.deinit(alloc);
+        }
+        for (self.retired_lsm_owner_stats.items) |retired| {
+            try owners.append(alloc, .{
+                .kind = retired.kind,
+                .name = try alloc.dupe(u8, retired.name),
+                .maintenance = retired.maintenance,
+            });
+        }
+        const overflow_kinds = [_]types.IndexKind{ .full_text, .dense_vector };
+        for (overflow_kinds, 0..) |kind, i| {
+            if (self.retired_lsm_owner_labels_collapsed[i] == 0) continue;
+            try owners.append(alloc, .{
+                .kind = kind,
+                .name = try alloc.dupe(u8, retired_lsm_owner_overflow_name),
+                .maintenance = self.retired_lsm_owner_overflow_stats[i],
+                .owner_overflow = true,
+                .retired_labels_collapsed_total = self.retired_lsm_owner_labels_collapsed[i],
+            });
+        }
+        for (self.text_indexes.items) |*entry| {
+            const stats = entry.persistent.snapshotLsmMaintenanceStats() orelse continue;
+            for (owners.items) |*owner| {
+                if (owner.owner_overflow or owner.kind != .full_text or !std.mem.eql(u8, owner.name, entry.config.name)) continue;
+                accumulateCloneMaintenance(&owner.maintenance, stats);
+                break;
+            } else {
+                try owners.ensureUnusedCapacity(alloc, 1);
+                const name = try alloc.dupe(u8, entry.config.name);
+                owners.appendAssumeCapacity(.{
+                    .kind = .full_text,
+                    .name = name,
+                    .maintenance = stats,
+                });
+            }
+        }
+        for (self.dense_indexes.items) |*entry| {
+            const stats = entry.index.snapshotLsmMaintenanceStats() orelse continue;
+            for (owners.items) |*owner| {
+                if (owner.owner_overflow or owner.kind != .dense_vector or !std.mem.eql(u8, owner.name, entry.config.name)) continue;
+                accumulateCloneMaintenance(&owner.maintenance, stats);
+                break;
+            } else {
+                try owners.ensureUnusedCapacity(alloc, 1);
+                const name = try alloc.dupe(u8, entry.config.name);
+                owners.appendAssumeCapacity(.{
+                    .kind = .dense_vector,
+                    .name = name,
+                    .maintenance = stats,
+                });
+            }
+        }
+        return try owners.toOwnedSlice(alloc);
+    }
+
+    /// Preserve clone attribution from a short-lived shadow manager before it
+    /// is torn down. Snapshot first and then lock the destination so repair
+    /// cleanup never holds two catalog locks at once.
+    pub fn transferLsmOwnerCloneStatsTo(self: *IndexManager, destination: *IndexManager) !void {
+        if (self == destination) return;
+        const owners = owners_blk: {
+            self.catalog_mutex.lockShared();
+            defer self.catalog_mutex.unlockShared();
+            break :owners_blk try self.snapshotLsmOwnerStatsAlloc(self.alloc);
+        };
+        defer {
+            for (owners) |*owner| owner.deinit(self.alloc);
+            self.alloc.free(owners);
+        }
+
+        destination.catalog_mutex.lockExclusive();
+        defer destination.catalog_mutex.unlockExclusive();
+        for (owners) |owner| {
+            if (owner.owner_overflow) {
+                const overflow_index: usize = switch (owner.kind) {
+                    .full_text => 0,
+                    .dense_vector => 1,
+                    else => unreachable,
+                };
+                accumulateCloneMaintenance(
+                    &destination.retired_lsm_owner_overflow_stats[overflow_index],
+                    owner.maintenance,
+                );
+                destination.retired_lsm_owner_labels_collapsed[overflow_index] +|=
+                    owner.retired_labels_collapsed_total;
+                continue;
+            }
+            destination.archiveLsmOwnerStats(owner.kind, owner.name, owner.maintenance);
+        }
     }
 
     pub fn snapshotLsmWriteStats(self: *const IndexManager) lsm_backend_mod.Backend.WriteStats {
@@ -4485,6 +4688,7 @@ pub const IndexManager = struct {
 
     pub fn setIo(self: *IndexManager, io: ?std.Io) void {
         self.io = io;
+        for (self.dense_indexes.items) |*entry| entry.index.setIo(io);
     }
 
     pub fn checkpointIo(self: *const IndexManager) std.Io {
@@ -5431,7 +5635,7 @@ pub const IndexManager = struct {
                 );
                 self.text_merge_scheduler.removeIndex(self.alloc, name);
                 entry.detachAllMergeDeletionStates();
-                self.freeTextIndexEntry(entry);
+                self.retireTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
@@ -5465,7 +5669,7 @@ pub const IndexManager = struct {
                 defer artifact_cleanup.deinit();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
                 try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
-                self.freeDenseIndexEntry(entry);
+                self.retireDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
@@ -5605,6 +5809,11 @@ pub const IndexManager = struct {
     }
 
     pub fn destroyDetachedReplacementIndex(self: *IndexManager, entry: *DetachedIndex) void {
+        switch (entry.*) {
+            .full_text => |*index| self.archiveTextIndexOwner(index),
+            .dense_vector => |*index| self.archiveDenseIndexOwner(index),
+            else => {},
+        }
         entry.deinit(self);
     }
 
@@ -10904,6 +11113,7 @@ pub const IndexManager = struct {
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                 });
+                index.setIo(self.io);
                 index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
                 if (self.hbc_cache) |cache| index.attachSharedCache(cache);
                 if (self.resource_manager) |manager| {
@@ -12415,7 +12625,7 @@ pub const IndexManager = struct {
     fn removeInMemory(self: *IndexManager, name: []const u8) void {
         for (self.text_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
-                self.freeTextIndexEntry(entry);
+                self.retireTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
                 self.dropIndexLoadStateNoLock(name);
                 return;
@@ -12423,7 +12633,7 @@ pub const IndexManager = struct {
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
-                self.freeDenseIndexEntry(entry);
+                self.retireDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
                 self.dropIndexLoadStateNoLock(name);
                 return;
@@ -27970,6 +28180,134 @@ test "dense hbc batch options store vectors when no external loader can serve sk
     try std.testing.expect(!opts.defer_leaf_splits_to_bulk_finish);
     try std.testing.expectEqual(@as(usize, 0), opts.bulk_rebuild_leaf_min_members);
     try std.testing.expect(!opts.skip_vector_store);
+}
+
+test "retired LSM owner clone counters survive index generations" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "retired-lsm-owner-clones");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+
+    var first = lsm_backend_mod.Backend.MaintenanceStats{
+        .mutable_snapshot_clone_calls = 2,
+        .mutable_snapshot_clone_bytes_total = 4096,
+        .mutable_snapshot_clone_peak_bytes = 3072,
+        .bulk_ingest_current_scan_clone_peak_active_bytes = 2048,
+    };
+    first.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bulk_current_scan)] = .{
+        .calls = 2,
+        .bytes_total = 4096,
+        .peak_bytes = 3072,
+    };
+    manager.archiveLsmOwnerStats(.dense_vector, "embedding", first);
+    manager.archiveLsmOwnerStats(.dense_vector, "embedding", .{
+        .mutable_snapshot_clone_calls = 1,
+        .mutable_snapshot_clone_bytes_total = 512,
+        .mutable_snapshot_clone_peak_bytes = 512,
+        .bulk_ingest_current_scan_clone_peak_active_bytes = 256,
+    });
+
+    const owners = try manager.snapshotLsmOwnerStatsAlloc(alloc);
+    defer {
+        for (owners) |*owner| owner.deinit(alloc);
+        alloc.free(owners);
+    }
+    try std.testing.expectEqual(@as(usize, 1), owners.len);
+    try std.testing.expectEqual(types.IndexKind.dense_vector, owners[0].kind);
+    try std.testing.expectEqualStrings("embedding", owners[0].name);
+    try std.testing.expectEqual(@as(u64, 3), owners[0].maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 4608), owners[0].maintenance.mutable_snapshot_clone_bytes_total);
+    try std.testing.expectEqual(@as(u64, 3072), owners[0].maintenance.mutable_snapshot_clone_peak_bytes);
+    try std.testing.expectEqual(
+        @as(u64, 2048),
+        owners[0].maintenance.bulk_ingest_current_scan_clone_peak_active_bytes,
+    );
+}
+
+test "retired LSM owner clone attribution is bounded with loss-accounted overflow" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "bounded-retired-lsm-owner-clones");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+
+    // A user owner may legally have the synthetic aggregate's display name;
+    // identity must remain distinct even after the bounded tier fills.
+    manager.archiveLsmOwnerStats(.dense_vector, IndexManager.retired_lsm_owner_overflow_name, .{
+        .mutable_snapshot_clone_calls = 1,
+        .mutable_snapshot_clone_bytes_total = 64,
+        .mutable_snapshot_clone_peak_bytes = 64,
+    });
+    var name_buf: [64]u8 = undefined;
+    for (0..IndexManager.max_retired_lsm_owner_stats - 1) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "retired-{d}", .{i});
+        manager.archiveLsmOwnerStats(.dense_vector, name, .{
+            .mutable_snapshot_clone_calls = 1,
+            .mutable_snapshot_clone_bytes_total = 128,
+            .mutable_snapshot_clone_peak_bytes = 128,
+        });
+    }
+    for (0..2) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "collapsed-{d}", .{i});
+        manager.archiveLsmOwnerStats(.dense_vector, name, .{
+            .mutable_snapshot_clone_calls = 1,
+            .mutable_snapshot_clone_bytes_total = 128,
+            .mutable_snapshot_clone_peak_bytes = 128,
+        });
+    }
+
+    const owners = try manager.snapshotLsmOwnerStatsAlloc(alloc);
+    defer {
+        for (owners) |*owner| owner.deinit(alloc);
+        alloc.free(owners);
+    }
+    try std.testing.expectEqual(IndexManager.max_retired_lsm_owner_stats + 1, owners.len);
+    const overflow = for (owners) |owner| {
+        if (owner.owner_overflow) break owner;
+    } else return error.TestExpectedEqual;
+    const concrete = for (owners) |owner| {
+        if (!owner.owner_overflow and std.mem.eql(u8, owner.name, IndexManager.retired_lsm_owner_overflow_name)) break owner;
+    } else return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), concrete.maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 2), overflow.retired_labels_collapsed_total);
+    try std.testing.expectEqual(@as(u64, 2), overflow.maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 256), overflow.maintenance.mutable_snapshot_clone_bytes_total);
+}
+
+test "shadow manager transfers clone attribution before teardown" {
+    const alloc = std.testing.allocator;
+    var source_path_buf: [256]u8 = undefined;
+    var destination_path_buf: [256]u8 = undefined;
+    const source_path = indexManagerTmpPathWithSuffix(&source_path_buf, "shadow-clone-source");
+    const destination_path = indexManagerTmpPathWithSuffix(&destination_path_buf, "shadow-clone-destination");
+    defer cleanupIndexManagerDir(source_path);
+    defer cleanupIndexManagerDir(destination_path);
+
+    var source = try IndexManager.init(alloc, std.mem.span(source_path));
+    defer source.deinit();
+    var destination = try IndexManager.init(alloc, std.mem.span(destination_path));
+    defer destination.deinit();
+    source.archiveLsmOwnerStats(.dense_vector, "embedding", .{
+        .mutable_snapshot_clone_calls = 3,
+        .mutable_snapshot_clone_bytes_total = 1536,
+        .mutable_snapshot_clone_peak_bytes = 1024,
+    });
+
+    try source.transferLsmOwnerCloneStatsTo(&destination);
+    const owners = try destination.snapshotLsmOwnerStatsAlloc(alloc);
+    defer {
+        for (owners) |*owner| owner.deinit(alloc);
+        alloc.free(owners);
+    }
+    try std.testing.expectEqual(@as(usize, 1), owners.len);
+    try std.testing.expectEqualStrings("embedding", owners[0].name);
+    try std.testing.expectEqual(@as(u64, 3), owners[0].maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 1536), owners[0].maintenance.mutable_snapshot_clone_bytes_total);
 }
 
 test "dense replay keep mask keeps only the last write per doc and index" {

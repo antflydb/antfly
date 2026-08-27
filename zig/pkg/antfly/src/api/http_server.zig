@@ -6984,7 +6984,7 @@ pub const ApiHttpServer = struct {
             writer_lease_future.await(io);
             writer_lease_future_running = false;
             if (!cleanup_safe) {
-                std.log.err("table backup publication outcome ambiguous phase=commit class={s}; retaining fenced attempt", .{@errorName(err)});
+                std.log.warn("table backup publication outcome ambiguous phase=commit class={s}; retaining fenced attempt", .{@errorName(err)});
                 return error.BackupOutcomeAmbiguous;
             }
             backups_api.cleanupUnpublishedTableBackupAttemptAtLocation(
@@ -8598,6 +8598,7 @@ pub const ApiHttpServer = struct {
             error.CorruptInput => return error.CorruptInput,
             error.UnsupportedVersion => return error.UnsupportedVersion,
             error.Corrupted => return error.Corrupted,
+            error.IncompletePublishedSnapshot => return error.IncompletePublishedSnapshot,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -8778,6 +8779,7 @@ pub const ApiHttpServer = struct {
                 error.CorruptInput,
                 error.UnsupportedVersion,
                 error.Corrupted,
+                error.IncompletePublishedSnapshot,
                 => return err,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -8827,6 +8829,7 @@ pub const ApiHttpServer = struct {
             error.CorruptInput,
             error.UnsupportedVersion,
             error.Corrupted,
+            error.IncompletePublishedSnapshot,
             => return err,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
@@ -8904,6 +8907,7 @@ pub const ApiHttpServer = struct {
             error.CorruptInput,
             error.UnsupportedVersion,
             error.Corrupted,
+            error.IncompletePublishedSnapshot,
             => return err,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -11196,7 +11200,7 @@ pub const ApiHttpServer = struct {
             lease_heartbeat.stop_event.set(backup_io);
             lease_future.await(backup_io);
             lease_future_running = false;
-            std.log.err("cluster backup contains an ambiguous table outcome; retaining attempt for reconciliation", .{});
+            std.log.warn("cluster backup contains an ambiguous table outcome; retaining attempt for reconciliation", .{});
         } else {
             trace.enter(.partial_cleanup);
             // A partial aggregate is not a restore candidate. Reclaim every
@@ -12219,6 +12223,7 @@ pub const ApiHttpServer = struct {
             error.ModelNotFound => contextual_operations.json(try self.alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"), false),
             error.DocIdentityNamespaceMismatch => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .doc_identity_unavailable),
             error.IndexRebuilding => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .index_rebuilding),
+            error.IncompletePublishedSnapshot => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .index_rebuilding),
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .read_requires_primary),
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .standby_read_unavailable),
             error.DistributedQueryUnavailable => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .distributed_query_unavailable),
@@ -30174,6 +30179,7 @@ test "api http server preserves public query availability errors" {
         .{ .query_error = error.EmbedTransientFailure, .status = 503, .body = "", .json = true, .unavailable_code = "query_embedding_temporarily_unavailable", .unavailable_message = "query embedding temporarily unavailable" },
         .{ .query_error = error.TableNotFound, .status = 404, .body = "not found" },
         .{ .query_error = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
+        .{ .query_error = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
     };
     for (cases) |case| {
         var reads = FakeReads{ .query_error = case.query_error };

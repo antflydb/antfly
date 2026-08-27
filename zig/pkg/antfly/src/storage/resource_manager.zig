@@ -328,10 +328,10 @@ pub const Options = struct {
     query_embedding_cache_bytes: usize = 64 * 1024 * 1024,
     query_embedding_cache_ttl_ns: u64 = 5 * std.time.ns_per_min,
     query_embedding_max_inflight: usize = 16,
-    /// Allocates identity tables only as concurrent reservations/observers
-    /// exceed their previous high-water mark. Production owners should pass
-    /// their lifetime allocator; the page allocator keeps lightweight tests
-    /// source-compatible.
+    /// Allocates identity tables and the reclaimer registry only as concurrent
+    /// owners exceed their previous high-water mark. Production owners should
+    /// pass their lifetime allocator; the page allocator keeps lightweight
+    /// tests source-compatible.
     identity_allocator: std.mem.Allocator = std.heap.page_allocator,
 
     pub fn defaultBudgets() [slice_count]Budget {
@@ -632,7 +632,7 @@ const ObserverKey = struct {
 
 /// A cache-owned, synchronous shrink callback. ResourceManager never invokes
 /// it while holding either the accounting or reclaimer mutex. Unregistration
-/// retires the fixed slot and waits for its callback leases to drain, so an
+/// retires the stable slot and waits for its callback leases to drain, so an
 /// owner can destroy its callback context immediately after unregister returns.
 pub const ReclaimerFn = *const fn (context: *anyopaque, target_bytes: u64) u64;
 
@@ -658,12 +658,14 @@ pub const ReclaimerOptions = struct {
     weight: u32 = 1,
 };
 
-const max_reclaimers: usize = 128;
-
 pub const ResourceManager = struct {
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
-    reclaimers: [max_reclaimers]ReclaimerSlot = .{ReclaimerSlot{}} ** max_reclaimers,
+    // Slots are never compacted while the manager is live: an invocation can
+    // safely retain its index while its callback runs without holding the
+    // registry mutex. Empty slots are reused, and the list grows on the
+    // registration path instead of imposing a process-wide index-count cap.
+    reclaimers: std.ArrayListUnmanaged(ReclaimerSlot) = .empty,
     next_reclaimer_identity: u64 = 1,
     reclaimer_cursor: usize = 0,
     reclaim_requests: std.atomic.Value(u64) = .init(0),
@@ -746,7 +748,7 @@ pub const ResourceManager = struct {
     ) !u64 {
         lockAtomic(&self.reclaimer_mutex);
         defer self.reclaimer_mutex.unlock();
-        for (&self.reclaimers) |*slot| {
+        for (self.reclaimers.items) |*slot| {
             if (slot.identity != 0) continue;
             const identity = self.next_reclaimer_identity;
             self.next_reclaimer_identity +%= 1;
@@ -760,7 +762,17 @@ pub const ResourceManager = struct {
             };
             return identity;
         }
-        return error.TooManyResourceReclaimers;
+        const identity = self.next_reclaimer_identity;
+        self.next_reclaimer_identity +%= 1;
+        if (self.next_reclaimer_identity == 0) self.next_reclaimer_identity = 1;
+        try self.reclaimers.append(self.identity_allocator, .{
+            .identity = identity,
+            .slice = slice,
+            .context = context,
+            .reclaim = reclaim,
+            .weight = @max(@as(u32, 1), options.weight),
+        });
+        return identity;
     }
 
     pub fn unregisterReclaimer(self: *ResourceManager, identity: u64) void {
@@ -768,7 +780,7 @@ pub const ResourceManager = struct {
         while (true) {
             lockAtomic(&self.reclaimer_mutex);
             var found = false;
-            for (&self.reclaimers) |*slot| {
+            for (self.reclaimers.items) |*slot| {
                 if (slot.identity != identity) continue;
                 found = true;
                 slot.retiring = true;
@@ -788,7 +800,8 @@ pub const ResourceManager = struct {
     fn releaseReclaimerInvocation(self: *ResourceManager, invocation: ReclaimerInvocation) void {
         lockAtomic(&self.reclaimer_mutex);
         defer self.reclaimer_mutex.unlock();
-        const slot = &self.reclaimers[invocation.slot_index];
+        if (invocation.slot_index >= self.reclaimers.items.len) return;
+        const slot = &self.reclaimers.items[invocation.slot_index];
         if (slot.identity != invocation.identity) return;
         std.debug.assert(slot.in_flight > 0);
         slot.in_flight -= 1;
@@ -803,43 +816,71 @@ pub const ResourceManager = struct {
         const target_bytes = blk: {
             lockAtomic(&self.mutex);
             defer self.mutex.unlock();
-            const hard = self.memory.budget.hard_limit_bytes;
-            if (hard == 0) return 0;
-            const projected = self.memory.used_bytes +| additional_bytes;
-            if (projected <= hard) return 0;
-            break :blk projected - hard;
+            const memory_hard = self.memory.budget.hard_limit_bytes;
+            const memory_target = if (memory_hard == 0)
+                0
+            else
+                (self.memory.used_bytes +| additional_bytes) -| memory_hard;
+            const requester_state = &self.slices[sliceIndex(requester)];
+            const slice_hard = requester_state.budget.hard_limit_bytes;
+            // Dense scratch and HBC metadata both have reclaimers in their own
+            // slices. Do not evict unrelated caches for a hard-limit violation
+            // they cannot resolve.
+            const requester_slice_reclaimable = requester == .dense_search_working_set or
+                requester == .hbc_node_metadata_cache;
+            const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
+                0
+            else
+                (requester_state.used_bytes +| additional_bytes) -| slice_hard;
+            const target = @max(memory_target, slice_target);
+            if (target == 0) return 0;
+            break :blk target;
         };
 
         _ = self.reclaim_requests.fetchAdd(1, .monotonic);
         var reclaimed: u64 = 0;
-        var visited_identities: [max_reclaimers]u64 = undefined;
-        var visited_count: usize = 0;
         lockAtomic(&self.reclaimer_mutex);
-        const start_cursor = self.reclaimer_cursor;
-        self.reclaimer_cursor = (self.reclaimer_cursor + 1) % self.reclaimers.len;
+        const scan_len = self.reclaimers.items.len;
+        if (scan_len == 0) {
+            self.reclaimer_mutex.unlock();
+            return 0;
+        }
+        const start_cursor = self.reclaimer_cursor % scan_len;
+        self.reclaimer_cursor = (start_cursor + 1) % scan_len;
+        // A registration can reuse an empty slot while callbacks execute.
+        // Restrict this bounded pass to identities that existed at its start,
+        // so the pressure path neither revisits a slot nor allocates memory.
+        const identity_cutoff = self.next_reclaimer_identity -% 1;
         self.reclaimer_mutex.unlock();
-        // HBC exact vectors are the cheapest derivative, followed by LSM
-        // blocks. Two passes make this priority independent of registration
-        // order while still permitting either cache to borrow unused bytes.
-        for ([_]Slice{ .hbc_node_metadata_cache, .lsm_block_table_cache }) |candidate_slice| {
-            if (candidate_slice == requester) continue;
-            while (visited_count < max_reclaimers) {
+        // Idle search scratch is cheaper to reconstruct than cached index or
+        // table content. Include the requester's own search slice so one index
+        // can reuse capacity retained by another; callbacks use non-blocking
+        // owner locks and therefore skip an in-flight scratch handle safely.
+        for ([_]Slice{ .dense_search_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache }) |candidate_slice| {
+            if (candidate_slice == requester and
+                candidate_slice != .dense_search_working_set and
+                candidate_slice != .hbc_node_metadata_cache) continue;
+            var remaining_weight: u64 = 0;
+            lockAtomic(&self.reclaimer_mutex);
+            for (0..scan_len) |offset| {
+                const index = (start_cursor + offset) % scan_len;
+                const slot = &self.reclaimers.items[index];
+                if (slot.identity == 0 or slot.identity > identity_cutoff or
+                    slot.retiring or slot.slice != candidate_slice) continue;
+                remaining_weight +|= slot.weight;
+            }
+            self.reclaimer_mutex.unlock();
+
+            for (0..scan_len) |offset| {
                 lockAtomic(&self.reclaimer_mutex);
-                var remaining_weight: u64 = 0;
-                var selected_index: ?usize = null;
-                for (0..self.reclaimers.len) |offset| {
-                    const index = (start_cursor + offset) % self.reclaimers.len;
-                    const slot = &self.reclaimers[index];
-                    if (slot.identity == 0 or slot.retiring or slot.slice != candidate_slice) continue;
-                    if (std.mem.indexOfScalar(u64, visited_identities[0..visited_count], slot.identity) != null) continue;
-                    remaining_weight +|= slot.weight;
-                    if (selected_index == null) selected_index = index;
-                }
-                const index = selected_index orelse {
+                const index = (start_cursor + offset) % scan_len;
+                const slot = &self.reclaimers.items[index];
+                if (slot.identity == 0 or slot.identity > identity_cutoff or
+                    slot.retiring or slot.slice != candidate_slice)
+                {
                     self.reclaimer_mutex.unlock();
-                    break;
-                };
-                const slot = &self.reclaimers[index];
+                    continue;
+                }
                 const invocation = ReclaimerInvocation{
                     .slot_index = index,
                     .identity = slot.identity,
@@ -848,13 +889,12 @@ pub const ResourceManager = struct {
                     .weight = slot.weight,
                 };
                 slot.in_flight += 1;
-                visited_identities[visited_count] = slot.identity;
-                visited_count += 1;
                 const remaining_target = target_bytes -| reclaimed;
                 const fair_target = if (remaining_weight <= invocation.weight)
                     remaining_target
                 else
                     @max(@as(u64, 1), mulDivSaturating(remaining_target, invocation.weight, remaining_weight));
+                remaining_weight -|= invocation.weight;
                 self.reclaimer_mutex.unlock();
 
                 reclaimed +|= invocation.reclaim(invocation.context, fair_target);
@@ -970,6 +1010,15 @@ pub const ResourceManager = struct {
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
         _ = alloc;
+        lockAtomic(&self.reclaimer_mutex);
+        for (self.reclaimers.items) |slot| {
+            if (slot.identity != 0 or slot.in_flight != 0)
+                @panic("resource manager deinitialized with live reclaimers");
+        }
+        self.reclaimers.deinit(self.identity_allocator);
+        self.reclaimers = .empty;
+        self.reclaimer_mutex.unlock();
+
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         var it = self.capacity_domains.valueIterator();
@@ -1868,6 +1917,108 @@ pub const ResourceManager = struct {
             if (self.reclaimForAllocation(slice, next - current.*) == 0) return err;
             return self.adjustUsageOnce(slice, current, next);
         };
+    }
+
+    /// Atomically moves accounting between two observer-owned contributions in
+    /// the same slice. This is the ownership handoff used when a pre-admitted
+    /// retained reservation becomes a live cache object: the allocation is
+    /// never invisible, but it is also never double-counted in pressure or peak
+    /// telemetry. The destination identity may be created on this fallible path
+    /// before the object is published.
+    pub fn transferUsage(
+        self: *ResourceManager,
+        slice: Slice,
+        source: *u64,
+        source_next: u64,
+        destination: *u64,
+        destination_next: u64,
+    ) !void {
+        if (source == destination) return error.InvalidArgument;
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        const source_key = ObserverKey{ .slice = slice, .identity = @intFromPtr(source) };
+        const destination_key = ObserverKey{ .slice = slice, .identity = @intFromPtr(destination) };
+        const source_owned = self.observer_identities.get(source_key) orelse {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        };
+        if (source_owned.current != source.* or source_next > source_owned.current) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        const destination_previous = if (self.observer_identities.get(destination_key)) |owned| blk: {
+            if (owned.current != destination.*) {
+                self.memory.accounting_errors +|= 1;
+                return error.ResourceAccountingMismatch;
+            }
+            break :blk owned.current;
+        } else blk: {
+            if (destination.* != 0) {
+                self.memory.accounting_errors +|= 1;
+                return error.ResourceAccountingMismatch;
+            }
+            break :blk 0;
+        };
+
+        var inserted_destination = false;
+        if (destination_previous == 0 and destination_next != 0 and
+            !self.observer_identities.contains(destination_key))
+        {
+            const entry = try self.observer_identities.getOrPut(self.identity_allocator, destination_key);
+            entry.value_ptr.* = .{ .current = 0 };
+            inserted_destination = true;
+        }
+        errdefer {
+            if (inserted_destination) _ = self.observer_identities.remove(destination_key);
+        }
+
+        const previous_total = std.math.add(u64, source_owned.current, destination_previous) catch {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        };
+        const next_total = std.math.add(u64, source_next, destination_next) catch
+            return error.ResourceBudgetExceeded;
+        const state = &self.slices[sliceIndex(slice)];
+        if (previous_total > state.used_bytes or previous_total > self.memory.used_bytes) {
+            self.memory.accounting_errors +|= 1;
+            return error.ResourceAccountingMismatch;
+        }
+        const slice_next = std.math.add(u64, state.used_bytes - previous_total, next_total) catch
+            return error.ResourceBudgetExceeded;
+        const memory_next = std.math.add(u64, self.memory.used_bytes - previous_total, next_total) catch
+            return error.ResourceBudgetExceeded;
+        if (next_total > previous_total and
+            ((state.budget.hard_limit_bytes > 0 and slice_next > state.budget.hard_limit_bytes) or
+                (self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)))
+        {
+            state.hard_limit_rejections +|= 1;
+            if (self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
+                self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        }
+
+        if (source_next == 0) {
+            _ = self.observer_identities.remove(source_key);
+        } else {
+            self.observer_identities.getPtr(source_key).?.current = source_next;
+        }
+        if (destination_next == 0) {
+            _ = self.observer_identities.remove(destination_key);
+        } else {
+            self.observer_identities.getPtr(destination_key).?.current = destination_next;
+        }
+        source.* = source_next;
+        destination.* = destination_next;
+        state.used_bytes = slice_next;
+        self.memory.used_bytes = memory_next;
+        state.peak_bytes = @max(state.peak_bytes, slice_next);
+        self.memory.peak_bytes = @max(self.memory.peak_bytes, memory_next);
+        if (state.budget.soft_limit_bytes > 0 and slice_next > state.budget.soft_limit_bytes)
+            state.soft_limit_events +|= 1;
+        if (self.memory.budget.soft_limit_bytes > 0 and memory_next > self.memory.budget.soft_limit_bytes)
+            self.memory.soft_limit_events +|= 1;
+        self.pressure_change.advance();
     }
 
     fn adjustUsageOnce(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
@@ -3262,6 +3413,90 @@ test "foreground admission reclaims cache bytes and retries atomically" {
     try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
 }
 
+test "dense search admission reclaims retained scratch from its own slice" {
+    const ReclaimContext = struct {
+        manager: *ResourceManager,
+        accounted: u64,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.dense_search_working_set, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.dense_search_working_set)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var retained = ReclaimContext{ .manager = &manager, .accounted = 0 };
+    manager.observeUsage(.dense_search_working_set, &retained.accounted, 80);
+    const identity = try manager.registerReclaimer(.dense_search_working_set, &retained, ReclaimContext.reclaim);
+    defer manager.unregisterReclaimer(identity);
+
+    var active: u64 = 0;
+    try manager.adjustUsage(.dense_search_working_set, &active, 30);
+    try std.testing.expectEqual(@as(u64, 70), retained.accounted);
+    try std.testing.expectEqual(@as(u64, 30), active);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.dense_search_working_set).used_bytes);
+}
+
+test "HBC admission reclaims retained metadata from its own slice" {
+    const ReclaimContext = struct {
+        manager: *ResourceManager,
+        accounted: u64,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.hbc_node_metadata_cache, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+    var retained = ReclaimContext{ .manager = &manager, .accounted = 0 };
+    manager.observeUsage(.hbc_node_metadata_cache, &retained.accounted, 80);
+    const identity = try manager.registerReclaimer(.hbc_node_metadata_cache, &retained, ReclaimContext.reclaim);
+    defer manager.unregisterReclaimer(identity);
+
+    var active: u64 = 0;
+    try manager.adjustUsage(.hbc_node_metadata_cache, &active, 30);
+    try std.testing.expectEqual(@as(u64, 70), retained.accounted);
+    try std.testing.expectEqual(@as(u64, 30), active);
+    try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+}
+
+test "resource manager atomically transfers retained observer ownership" {
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .hard_limit_bytes = 80 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(std.testing.allocator);
+
+    var reservation: u64 = 0;
+    var directory: u64 = 0;
+    try manager.adjustUsage(.hbc_node_metadata_cache, &reservation, 80);
+    try manager.transferUsage(
+        .hbc_node_metadata_cache,
+        &reservation,
+        0,
+        &directory,
+        60,
+    );
+
+    const stats = manager.sliceStats(.hbc_node_metadata_cache);
+    try std.testing.expectEqual(@as(u64, 0), reservation);
+    try std.testing.expectEqual(@as(u64, 60), directory);
+    try std.testing.expectEqual(@as(u64, 60), stats.used_bytes);
+    try std.testing.expectEqual(@as(u64, 80), stats.peak_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.hard_limit_rejections);
+    manager.observeUsage(.hbc_node_metadata_cache, &directory, 0);
+}
+
 test "resource manager apportions reclaim across weighted cache owners" {
     const ReclaimContext = struct {
         manager: *ResourceManager,
@@ -3329,6 +3564,39 @@ test "resource manager invokes reclaimers without holding registry mutex" {
     try std.testing.expectEqual(@as(u64, 5), manager.reclaimForAllocation(.dense_apply_working_set, 10));
     try std.testing.expectEqual(@as(u64, 1), retiring.calls);
     try std.testing.expectEqual(@as(u64, 0), passive.calls);
+}
+
+test "resource manager grows reclaimer registry beyond 128 owners" {
+    const owner_count = 257;
+    const PassiveContext = struct {
+        calls: u64 = 0,
+
+        fn reclaim(raw: *anyopaque, _: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 0;
+        }
+    };
+
+    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 } });
+    defer manager.deinit(std.testing.allocator);
+    var contexts = [_]PassiveContext{.{}} ** owner_count;
+    var identities: [owner_count]u64 = undefined;
+    for (&contexts, 0..) |*context, index| {
+        identities[index] = try manager.registerReclaimer(
+            .hbc_node_metadata_cache,
+            context,
+            PassiveContext.reclaim,
+        );
+    }
+    defer for (identities) |identity| manager.unregisterReclaimer(identity);
+
+    var accounted: u64 = 0;
+    manager.observeUsage(.hbc_node_metadata_cache, &accounted, 100);
+    try std.testing.expectEqual(@as(u64, 0), manager.reclaimForAllocation(.dense_apply_working_set, 1));
+    var calls: u64 = 0;
+    for (contexts) |context| calls += context.calls;
+    try std.testing.expectEqual(@as(u64, owner_count), calls);
 }
 
 test "classified batch chooses foreground requester when cache slice is first" {

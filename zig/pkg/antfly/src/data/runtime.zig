@@ -1719,6 +1719,14 @@ pub const HealthSource = struct {
         const lsm_maintenance_stats = self.cachedLsmMaintenanceStats();
         try writeLsmMaintenanceSnapshotMetrics(writer, lsm_maintenance_stats);
         try writeLsmMaintenanceMetrics(writer, lsm_maintenance_stats.stats);
+        const lsm_owner_stats = try live_write_source.lsmOwnerStatsBestEffortAlloc(self.data_server.alloc);
+        defer {
+            for (lsm_owner_stats) |*owner| owner.deinit(self.data_server.alloc);
+            self.data_server.alloc.free(lsm_owner_stats);
+        }
+        try writeLsmOwnerCloneMetrics(writer, lsm_owner_stats);
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_owner_clone_registry_dropped_total", "counter", "LSM owner metric observations discarded after bounded runtime registry capacity", live_write_source.lsmOwnerCloneStatsDroppedTotal());
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_owner_clone_labels_collapsed_total", "counter", "Distinct retired LSM owner labels folded into bounded typed overflow attribution", live_write_source.lsmOwnerCloneLabelsCollapsedTotal());
         try writeLsmWriteMetrics(writer, live_write_source.lsmWriteStatsBestEffort());
         try writeTextMergeMetrics(writer, live_write_source.textMergeStatsBestEffort());
         var async_indexing_stats = live_write_source.asyncIndexingStatsBestEffort();
@@ -1820,6 +1828,60 @@ fn writeLsmMaintenanceSnapshotMetrics(writer: *std.Io.Writer, snapshot: HealthSo
     try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_age_seconds", "gauge", "Age of the cached LSM maintenance metrics snapshot", snapshot.age_ns / std.time.ns_per_s);
     try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_refreshes_total", "counter", "Cached LSM maintenance metrics snapshot refreshes completed", snapshot.refreshes);
     try health_metrics.appendPromMetric(writer, "antfly_metrics_lsm_snapshot_last_refresh_duration_ns", "gauge", "Duration of the most recent LSM maintenance metrics snapshot refresh in monotonic nanoseconds", snapshot.last_refresh_duration_ns);
+}
+
+fn writeLsmOwnerCloneMetrics(
+    writer: *std.Io.Writer,
+    owners: []const antfly.public_api.table_writes.LsmOwnerMetricStats,
+) !void {
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_calls_total", "counter", "LSM mutable snapshot clone calls attributed to each primary store or index");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_bytes_total", "counter", "Total LSM mutable snapshot clone bytes attributed to each primary store or index");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_peak_bytes", "gauge", "Peak single LSM mutable snapshot clone bytes attributed to each primary store or index");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_active_bytes", "gauge", "Active bulk-ingest current-scan clone bytes attributed to each primary store or index");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_peak_active_bytes", "gauge", "Peak bulk-ingest current-scan clone bytes attributed to each primary store or index");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_calls_total", "counter", "LSM mutable snapshot clone calls attributed by owner and reader class");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_bytes_total", "counter", "Total LSM mutable snapshot clone bytes attributed by owner and reader class");
+    try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_peak_bytes", "gauge", "Peak LSM mutable snapshot clone bytes attributed by owner and reader class");
+
+    for (owners) |owner| {
+        var group_buf: [32]u8 = undefined;
+        const group = try std.fmt.bufPrint(&group_buf, "{d}", .{owner.group_id});
+        const owner_kind = if (owner.owner_overflow)
+            switch (owner.owner_kind) {
+                .primary => "primary_overflow",
+                .full_text => "full_text_overflow",
+                .dense_vector => "dense_vector_overflow",
+            }
+        else switch (owner.owner_kind) {
+            .primary => "primary",
+            .full_text => "full_text",
+            .dense_vector => "dense_vector",
+        };
+        const labels = [_]health_metrics.PromLabel{
+            .{ .name = "table", .value = owner.table_name },
+            .{ .name = "group", .value = group },
+            .{ .name = "owner_kind", .value = owner_kind },
+            .{ .name = "owner", .value = owner.owner_name },
+        };
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_calls_total", &labels, owner.maintenance.mutable_snapshot_clone_calls);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_bytes_total", &labels, owner.maintenance.mutable_snapshot_clone_bytes_total);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_peak_bytes", &labels, owner.maintenance.mutable_snapshot_clone_peak_bytes);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_active_bytes", &labels, owner.maintenance.bulk_ingest_current_scan_clone_active_bytes);
+        try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_peak_active_bytes", &labels, owner.maintenance.bulk_ingest_current_scan_clone_peak_active_bytes);
+        for (owner.maintenance.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
+            const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+            const reason_labels = [_]health_metrics.PromLabel{
+                .{ .name = "table", .value = owner.table_name },
+                .{ .name = "group", .value = group },
+                .{ .name = "owner_kind", .value = owner_kind },
+                .{ .name = "owner", .value = owner.owner_name },
+                .{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) },
+            };
+            try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_calls_total", &reason_labels, reason_stats.calls);
+            try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_bytes_total", &reason_labels, reason_stats.bytes_total);
+            try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_mutable_snapshot_clone_reason_peak_bytes", &reason_labels, reason_stats.peak_bytes);
+        }
+    }
 }
 
 fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.MaintenanceStats) !void {
@@ -2394,13 +2456,20 @@ fn resourceMetricValue(stats: resource_manager_mod.SliceStats, field: ResourceMe
 
 fn writeLsmCacheMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.CacheStats) !void {
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_used_bytes", "gauge", "Shared LSM cache bytes currently resident", @intCast(stats.used_bytes));
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_peak_used_bytes", "gauge", "Lifetime peak shared LSM cache resident bytes", @intCast(stats.peak_used_bytes));
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_data_block_used_bytes", "gauge", "Decoded and physical LSM data-block bytes currently resident", @intCast(stats.data_block_used_bytes));
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_data_block_peak_used_bytes", "gauge", "Lifetime peak decoded and physical LSM data-block bytes resident at the same instant", @intCast(stats.data_block_peak_used_bytes));
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_entries", "gauge", "Shared LSM cache entry count", @intCast(stats.entry_count));
     try writeLsmCacheKindMetricFamily(writer, stats, .hits, "antfly_lsm_cache_hits_total", "counter", "Shared LSM cache hits");
     try writeLsmCacheKindMetricFamily(writer, stats, .misses, "antfly_lsm_cache_misses_total", "counter", "Shared LSM cache misses");
     try writeLsmCacheKindMetricFamily(writer, stats, .inserts, "antfly_lsm_cache_inserts_total", "counter", "Shared LSM cache inserts");
+    try writeLsmCacheKindMetricFamily(writer, stats, .transient_serves, "antfly_lsm_cache_transient_serves_total", "counter", "One-shot LSM cache loads served without admission");
+    try writeLsmCacheKindMetricFamily(writer, stats, .policy_bypasses, "antfly_lsm_cache_policy_bypasses_total", "counter", "LSM cache admissions bypassed by caller policy");
     try writeLsmCacheKindMetricFamily(writer, stats, .evictions, "antfly_lsm_cache_evictions_total", "counter", "Shared LSM cache evictions");
     try writeLsmCacheKindMetricFamily(writer, stats, .invalidations, "antfly_lsm_cache_invalidations_total", "counter", "Shared LSM cache invalidations");
     try writeLsmCacheKindMetricFamily(writer, stats, .waits, "antfly_lsm_cache_waits_total", "counter", "Shared LSM cache pending-load waits");
+    try writeLsmCacheKindMetricFamily(writer, stats, .used_bytes, "antfly_lsm_cache_kind_used_bytes", "gauge", "Shared LSM cache resident bytes by entry kind");
+    try writeLsmCacheKindMetricFamily(writer, stats, .peak_used_bytes, "antfly_lsm_cache_kind_peak_used_bytes", "gauge", "Lifetime peak shared LSM cache resident bytes by entry kind");
 }
 
 fn writeLsmNativeStorageMetrics(writer: *std.Io.Writer, stats: ?lsm_backend_mod.NativeStorageStats) !void {
@@ -2448,9 +2517,13 @@ const LsmCacheMetricField = enum {
     hits,
     misses,
     inserts,
+    transient_serves,
+    policy_bypasses,
     evictions,
     invalidations,
     waits,
+    used_bytes,
+    peak_used_bytes,
 };
 
 fn writeLsmCacheKindMetricFamily(
@@ -2486,9 +2559,13 @@ fn lsmCacheMetricValue(stats: lsm_backend_mod.CacheKindStats, field: LsmCacheMet
         .hits => stats.hits,
         .misses => stats.misses,
         .inserts => stats.inserts,
+        .transient_serves => stats.transient_serves,
+        .policy_bypasses => stats.policy_bypasses,
         .evictions => stats.evictions,
         .invalidations => stats.invalidations,
         .waits => stats.waits,
+        .used_bytes => @intCast(stats.used_bytes),
+        .peak_used_bytes => @intCast(stats.peak_used_bytes),
     };
 }
 
@@ -16735,7 +16812,7 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             self.noteMetadataReadSuccess(index);
-            return status;
+            return stabilizeMetadataStatus(status);
         }
         return last_err;
     }
@@ -17302,28 +17379,70 @@ fn remoteGroupReadyForTableLifecycle(
 }
 
 fn cloneAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: antfly.metadata_api.AdminSnapshot) !antfly.metadata_api.AdminSnapshot {
-    return .{
-        .status = snapshot.status,
+    var owned: antfly.metadata_api.AdminSnapshot = .{
+        .status = try cloneMetadataStatusOwned(alloc, snapshot.status),
         .reallocation_request = snapshot.reallocation_request,
-        .tables = try cloneTablesOwned(alloc, snapshot.tables),
-        .ranges = try cloneRangesOwned(alloc, snapshot.ranges),
-        .stores = try cloneStoresOwned(alloc, snapshot.stores),
-        .placement_intents = try clonePlacementIntentsOwned(alloc, snapshot.placement_intents),
-        .shuffle_join_leases = try cloneShuffleJoinLeasesOwned(alloc, snapshot.shuffle_join_leases),
-        .local_bootstrap_statuses = try cloneLocalBootstrapStatusesOwned(alloc, snapshot.local_bootstrap_statuses),
-        .restore_progresses = try cloneRestoreProgressesOwned(alloc, snapshot.restore_progresses),
-        .replication_source_statuses = try cloneReplicationSourceStatusesOwned(alloc, snapshot.replication_source_statuses),
-        .replication_source_action_hints = try cloneReplicationSourceActionHintsOwned(alloc, snapshot.replication_source_action_hints),
-        .extension_packages = try cloneExtensionPackagesOwned(alloc, snapshot.extension_packages),
-        .installed_extensions = try cloneInstalledExtensionsOwned(alloc, snapshot.installed_extensions),
-        .extension_members = try cloneExtensionMembersOwned(alloc, snapshot.extension_members),
-        .extension_dependencies = try cloneExtensionDependenciesOwned(alloc, snapshot.extension_dependencies),
-        .split_transitions = try cloneSplitTransitionsOwned(alloc, snapshot.split_transitions),
-        .merge_transitions = try cloneMergeTransitionsOwned(alloc, snapshot.merge_transitions),
-        .split_observations = try cloneSplitObservationsOwned(alloc, snapshot.split_observations),
-        .merge_observations = try cloneMergeObservationsOwned(alloc, snapshot.merge_observations),
-        .merged_group_statuses = try cloneMergedGroupStatusesOwned(alloc, snapshot.merged_group_statuses),
+        .tables = &.{},
+        .ranges = &.{},
+        .nodes = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
     };
+    errdefer freeAdminSnapshotOwned(alloc, &owned);
+    owned.tables = try cloneTablesOwned(alloc, snapshot.tables);
+    owned.ranges = try cloneRangesOwned(alloc, snapshot.ranges);
+    owned.nodes = try cloneNodesOwned(alloc, snapshot.nodes);
+    owned.stores = try cloneStoresOwned(alloc, snapshot.stores);
+    owned.placement_intents = try clonePlacementIntentsOwned(alloc, snapshot.placement_intents);
+    owned.shuffle_join_leases = try cloneShuffleJoinLeasesOwned(alloc, snapshot.shuffle_join_leases);
+    owned.local_bootstrap_statuses = try cloneLocalBootstrapStatusesOwned(alloc, snapshot.local_bootstrap_statuses);
+    owned.restore_progresses = try cloneRestoreProgressesOwned(alloc, snapshot.restore_progresses);
+    owned.replication_source_statuses = try cloneReplicationSourceStatusesOwned(alloc, snapshot.replication_source_statuses);
+    owned.replication_source_action_hints = try cloneReplicationSourceActionHintsOwned(alloc, snapshot.replication_source_action_hints);
+    owned.extension_packages = try cloneExtensionPackagesOwned(alloc, snapshot.extension_packages);
+    owned.installed_extensions = try cloneInstalledExtensionsOwned(alloc, snapshot.installed_extensions);
+    owned.extension_members = try cloneExtensionMembersOwned(alloc, snapshot.extension_members);
+    owned.extension_dependencies = try cloneExtensionDependenciesOwned(alloc, snapshot.extension_dependencies);
+    owned.split_transitions = try cloneSplitTransitionsOwned(alloc, snapshot.split_transitions);
+    owned.merge_transitions = try cloneMergeTransitionsOwned(alloc, snapshot.merge_transitions);
+    owned.split_observations = try cloneSplitObservationsOwned(alloc, snapshot.split_observations);
+    owned.merge_observations = try cloneMergeObservationsOwned(alloc, snapshot.merge_observations);
+    owned.merged_group_statuses = try cloneMergedGroupStatusesOwned(alloc, snapshot.merged_group_statuses);
+    return owned;
+}
+
+fn cloneMetadataStatusOwned(
+    alloc: std.mem.Allocator,
+    status: antfly.metadata_api.MetadataStatus,
+) !antfly.metadata_api.MetadataStatus {
+    var owned = status;
+    owned.metadata_raft_role = try alloc.dupe(u8, status.metadata_raft_role);
+    return owned;
+}
+
+fn stabilizeMetadataStatus(
+    status: antfly.metadata_api.MetadataStatus,
+) antfly.metadata_api.MetadataStatus {
+    var stable = status;
+    const stable_roles = [_][]const u8{
+        "absent",
+        "unknown",
+        "disabled",
+        "follower",
+        "pre_candidate",
+        "candidate",
+        "leader",
+    };
+    for (stable_roles) |role| {
+        if (std.mem.eql(u8, role, status.metadata_raft_role)) {
+            stable.metadata_raft_role = role;
+            return stable;
+        }
+    }
+    stable.metadata_raft_role = "unknown";
+    return stable;
 }
 
 fn retainCurrentReallocationRequestObservations(
@@ -18710,33 +18829,43 @@ fn freeStoreStatusReportOwned(alloc: std.mem.Allocator, report: *antfly.metadata
     report.* = undefined;
 }
 
+fn freeLocalBootstrapStatusOwned(alloc: std.mem.Allocator, record: antfly.raft.host.BootstrapStatus) void {
+    if (record.last_error) |value| alloc.free(value);
+    if (record.backup_id) |value| alloc.free(value);
+    if (record.snapshot_path) |value| alloc.free(value);
+}
+
+fn freeReplicationSourceActionHintOwned(
+    alloc: std.mem.Allocator,
+    record: antfly.metadata_api.ReplicationSourceActionHint,
+) void {
+    alloc.free(record.table_name);
+    alloc.free(record.action);
+    alloc.free(record.reason);
+    alloc.free(record.reseed_exact_cutover_path);
+}
+
 fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_api.AdminSnapshot) void {
+    alloc.free(snapshot.status.metadata_raft_role);
     for (snapshot.tables) |record| antfly.metadata.table_manager.freeTable(alloc, record);
     alloc.free(snapshot.tables);
     for (snapshot.ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
     alloc.free(snapshot.ranges);
+    for (snapshot.nodes) |record| antfly.metadata.table_manager.freeNode(alloc, record);
+    if (snapshot.nodes.len > 0) alloc.free(snapshot.nodes);
     for (snapshot.stores) |record| antfly.metadata.table_manager.freeStore(alloc, record);
     alloc.free(snapshot.stores);
-    for (snapshot.placement_intents) |intent| if (intent.peer_node_ids.len > 0) alloc.free(intent.peer_node_ids);
+    for (snapshot.placement_intents) |intent| antfly.raft.reconciler.freeIntentOwned(alloc, intent);
     alloc.free(snapshot.placement_intents);
     for (snapshot.shuffle_join_leases) |record| antfly.metadata.table_manager.freeShuffleJoinLease(alloc, record);
     if (snapshot.shuffle_join_leases.len > 0) alloc.free(snapshot.shuffle_join_leases);
-    for (snapshot.local_bootstrap_statuses) |record| {
-        if (record.last_error) |value| alloc.free(value);
-        if (record.backup_id) |value| alloc.free(value);
-        if (record.snapshot_path) |value| alloc.free(value);
-    }
+    for (snapshot.local_bootstrap_statuses) |record| freeLocalBootstrapStatusOwned(alloc, record);
     if (snapshot.local_bootstrap_statuses.len > 0) alloc.free(snapshot.local_bootstrap_statuses);
     for (snapshot.restore_progresses) |record| antfly.metadata.table_manager.freeRestoreProgress(alloc, record);
     if (snapshot.restore_progresses.len > 0) alloc.free(snapshot.restore_progresses);
     for (snapshot.replication_source_statuses) |record| antfly.metadata.table_manager.freeReplicationSourceStatus(alloc, record);
     if (snapshot.replication_source_statuses.len > 0) alloc.free(snapshot.replication_source_statuses);
-    for (snapshot.replication_source_action_hints) |record| {
-        alloc.free(record.table_name);
-        alloc.free(record.action);
-        alloc.free(record.reason);
-        alloc.free(record.reseed_exact_cutover_path);
-    }
+    for (snapshot.replication_source_action_hints) |record| freeReplicationSourceActionHintOwned(alloc, record);
     if (snapshot.replication_source_action_hints.len > 0) alloc.free(snapshot.replication_source_action_hints);
     for (snapshot.extension_packages) |record| {
         var owned = record;
@@ -18764,9 +18893,7 @@ fn freeAdminSnapshotOwned(alloc: std.mem.Allocator, snapshot: *antfly.metadata_a
     alloc.free(snapshot.merge_transitions);
     if (snapshot.split_observations.len > 0) alloc.free(snapshot.split_observations);
     if (snapshot.merge_observations.len > 0) alloc.free(snapshot.merge_observations);
-    if (snapshot.merged_group_statuses.len > 0) {
-        alloc.free(snapshot.merged_group_statuses);
-    }
+    freeMergedGroupStatusesOwned(alloc, snapshot.merged_group_statuses);
     snapshot.* = undefined;
 }
 
@@ -18787,20 +18914,37 @@ fn cloneLocalBootstrapStatusesOwned(
 ) ![]antfly.raft.host.BootstrapStatus {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.raft.host.BootstrapStatus, records.len);
-    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| freeLocalBootstrapStatusOwned(alloc, record);
+        alloc.free(out);
+    }
     for (records, 0..) |record, i| {
-        out[i] = .{
-            .group_id = record.group_id,
-            .kind = record.kind,
-            .phase = record.phase,
-            .attempts = record.attempts,
-            .last_updated_at_millis = record.last_updated_at_millis,
-            .last_error = if (record.last_error) |value| try alloc.dupe(u8, value) else null,
-            .backup_id = if (record.backup_id) |value| try alloc.dupe(u8, value) else null,
-            .snapshot_path = if (record.snapshot_path) |value| try alloc.dupe(u8, value) else null,
-        };
+        out[i] = try cloneLocalBootstrapStatusOwned(alloc, record);
+        initialized += 1;
     }
     return out;
+}
+
+fn cloneLocalBootstrapStatusOwned(
+    alloc: std.mem.Allocator,
+    record: antfly.raft.host.BootstrapStatus,
+) !antfly.raft.host.BootstrapStatus {
+    const last_error = if (record.last_error) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (last_error) |value| alloc.free(value);
+    const backup_id = if (record.backup_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (backup_id) |value| alloc.free(value);
+    const snapshot_path = if (record.snapshot_path) |value| try alloc.dupe(u8, value) else null;
+    return .{
+        .group_id = record.group_id,
+        .kind = record.kind,
+        .phase = record.phase,
+        .attempts = record.attempts,
+        .last_updated_at_millis = record.last_updated_at_millis,
+        .last_error = last_error,
+        .backup_id = backup_id,
+        .snapshot_path = snapshot_path,
+    };
 }
 
 fn cloneRestoreProgressesOwned(
@@ -18809,8 +18953,15 @@ fn cloneRestoreProgressesOwned(
 ) ![]antfly.metadata.table_manager.RestoreProgressRecord {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata.table_manager.RestoreProgressRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneRestoreProgress(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeRestoreProgress(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneRestoreProgress(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
@@ -18820,9 +18971,37 @@ fn cloneReplicationSourceStatusesOwned(
 ) ![]antfly.metadata.table_manager.ReplicationSourceStatusRecord {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata.table_manager.ReplicationSourceStatusRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneReplicationSourceStatus(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeReplicationSourceStatus(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneReplicationSourceStatus(alloc, record);
+        initialized += 1;
+    }
     return out;
+}
+
+fn cloneReplicationSourceActionHintOwned(
+    alloc: std.mem.Allocator,
+    record: antfly.metadata_api.ReplicationSourceActionHint,
+) !antfly.metadata_api.ReplicationSourceActionHint {
+    const table_name = try alloc.dupe(u8, record.table_name);
+    errdefer alloc.free(table_name);
+    const action = try alloc.dupe(u8, record.action);
+    errdefer alloc.free(action);
+    const reason = try alloc.dupe(u8, record.reason);
+    errdefer alloc.free(reason);
+    const reseed_exact_cutover_path = try alloc.dupe(u8, record.reseed_exact_cutover_path);
+    return .{
+        .table_id = record.table_id,
+        .table_name = table_name,
+        .source_ordinal = record.source_ordinal,
+        .action = action,
+        .reason = reason,
+        .reseed_exact_cutover_path = reseed_exact_cutover_path,
+    };
 }
 
 fn cloneReplicationSourceActionHintsOwned(
@@ -18831,38 +19010,72 @@ fn cloneReplicationSourceActionHintsOwned(
 ) ![]antfly.metadata_api.ReplicationSourceActionHint {
     if (records.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata_api.ReplicationSourceActionHint, records.len);
-    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| freeReplicationSourceActionHintOwned(alloc, record);
+        alloc.free(out);
+    }
     for (records, 0..) |record, i| {
-        out[i] = .{
-            .table_id = record.table_id,
-            .table_name = try alloc.dupe(u8, record.table_name),
-            .source_ordinal = record.source_ordinal,
-            .action = try alloc.dupe(u8, record.action),
-            .reason = try alloc.dupe(u8, record.reason),
-            .reseed_exact_cutover_path = try alloc.dupe(u8, record.reseed_exact_cutover_path),
-        };
+        out[i] = try cloneReplicationSourceActionHintOwned(alloc, record);
+        initialized += 1;
     }
     return out;
 }
 
 fn cloneTablesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.TableRecord) ![]antfly.metadata.table_manager.TableRecord {
     const out = try alloc.alloc(antfly.metadata.table_manager.TableRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneTable(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeTable(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneTable(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
 fn cloneRangesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.RangeRecord) ![]antfly.metadata.table_manager.RangeRecord {
     const out = try alloc.alloc(antfly.metadata.table_manager.RangeRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneRange(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeRange(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneRange(alloc, record);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneNodesOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.NodeRecord) ![]antfly.metadata.table_manager.NodeRecord {
+    if (records.len == 0) return &.{};
+    const out = try alloc.alloc(antfly.metadata.table_manager.NodeRecord, records.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeNode(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneNode(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
 fn cloneStoresOwned(alloc: std.mem.Allocator, records: []const antfly.metadata.table_manager.StoreRecord) ![]antfly.metadata.table_manager.StoreRecord {
     const out = try alloc.alloc(antfly.metadata.table_manager.StoreRecord, records.len);
-    errdefer alloc.free(out);
-    for (records, 0..) |record, i| out[i] = try antfly.metadata.table_manager.cloneStore(alloc, record);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| antfly.metadata.table_manager.freeStore(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try antfly.metadata.table_manager.cloneStore(alloc, record);
+        initialized += 1;
+    }
     return out;
 }
 
@@ -18884,12 +19097,27 @@ fn cloneMergedGroupStatusesOwned(
     alloc: std.mem.Allocator,
     statuses: []const antfly.metadata.reconciler.MergedGroupStatus,
 ) ![]antfly.metadata.reconciler.MergedGroupStatus {
+    if (statuses.len == 0) return &.{};
     const out = try alloc.alloc(antfly.metadata.reconciler.MergedGroupStatus, statuses.len);
-    errdefer alloc.free(out);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |status| alloc.free(status.doc_identity_lifecycle);
+        alloc.free(out);
+    }
     for (statuses, 0..) |status, i| {
         out[i] = status;
+        out[i].doc_identity_lifecycle = try alloc.dupe(u8, status.doc_identity_lifecycle);
+        initialized += 1;
     }
     return out;
+}
+
+fn freeMergedGroupStatusesOwned(
+    alloc: std.mem.Allocator,
+    statuses: []const antfly.metadata.reconciler.MergedGroupStatus,
+) void {
+    for (statuses) |status| alloc.free(status.doc_identity_lifecycle);
+    if (statuses.len > 0) alloc.free(statuses);
 }
 
 fn cloneExtensionPackagesOwned(
@@ -27134,6 +27362,203 @@ test "data runtime remote admin snapshot clone preserves replication status surf
     try std.testing.expectEqualStrings("b1", cloned.restore_progresses[0].backup_id);
 }
 
+test "data runtime remote admin snapshot clone owns parser-backed slices" {
+    const alloc = std.testing.allocator;
+    const source_raft_role = try alloc.dupe(u8, "leader");
+    defer alloc.free(source_raft_role);
+    const source_node_role = try alloc.dupe(u8, "data");
+    defer alloc.free(source_node_role);
+    const source_node_lifecycle = try alloc.dupe(u8, "active");
+    defer alloc.free(source_node_lifecycle);
+    const source_lifecycle = try alloc.dupe(u8, "preserving");
+    defer alloc.free(source_lifecycle);
+    var nodes = [_]antfly.metadata.table_manager.NodeRecord{.{
+        .node_id = 3,
+        .role = source_node_role,
+        .lifecycle = source_node_lifecycle,
+    }};
+    var merged_group_statuses = [_]antfly.metadata.reconciler.MergedGroupStatus{.{
+        .group_id = 11,
+        .doc_identity_lifecycle = source_lifecycle,
+    }};
+    var placement_intents = [_]antfly.raft.reconciler.PlacementIntent{.{
+        .record = .{
+            .group_id = 11,
+            .replica_id = 3,
+            .local_node_id = 3,
+            .metadata_version = 7,
+            .backup_restore_bootstrap = .{
+                .backup_id = "backup-11",
+                .artifact_backup_id = "artifact-11",
+                .location = "s3://backup/antfly",
+                .snapshot_path = "backup-11/groups/11.afb",
+                .connection = "backup-store",
+                .artifact_size_bytes = 4096,
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            },
+        },
+        .store_id = 3,
+        .peer_node_ids = &.{ 1, 2, 3 },
+        .learner_node_ids = &.{4},
+    }};
+    const snapshot: antfly.metadata_api.AdminSnapshot = .{
+        .status = .{
+            .metadata_group_id = 1,
+            .metadata_raft_role = source_raft_role,
+            .metrics = .{},
+        },
+        .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+        .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+        .nodes = nodes[0..],
+        .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+        .placement_intents = placement_intents[0..],
+        .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+        .merged_group_statuses = merged_group_statuses[0..],
+    };
+
+    var cloned = try cloneAdminSnapshotOwned(alloc, snapshot);
+    defer freeAdminSnapshotOwned(alloc, &cloned);
+
+    try std.testing.expect(cloned.status.metadata_raft_role.ptr != source_raft_role.ptr);
+    try std.testing.expectEqual(@as(usize, 1), cloned.nodes.len);
+    try std.testing.expect(cloned.nodes[0].role.ptr != source_node_role.ptr);
+    try std.testing.expect(cloned.nodes[0].lifecycle.ptr != source_node_lifecycle.ptr);
+    try std.testing.expect(cloned.merged_group_statuses[0].doc_identity_lifecycle.ptr != source_lifecycle.ptr);
+    try std.testing.expect(cloned.placement_intents[0].peer_node_ids.ptr != placement_intents[0].peer_node_ids.ptr);
+    try std.testing.expect(cloned.placement_intents[0].learner_node_ids.ptr != placement_intents[0].learner_node_ids.ptr);
+    try std.testing.expect(cloned.placement_intents[0].record.backup_restore_bootstrap.?.snapshot_path.ptr != placement_intents[0].record.backup_restore_bootstrap.?.snapshot_path.ptr);
+    @memset(source_raft_role, 'x');
+    @memset(source_node_role, 'x');
+    @memset(source_node_lifecycle, 'x');
+    @memset(source_lifecycle, 'x');
+    try std.testing.expectEqualStrings("leader", cloned.status.metadata_raft_role);
+    try std.testing.expectEqualStrings("data", cloned.nodes[0].role);
+    try std.testing.expectEqualStrings("active", cloned.nodes[0].lifecycle);
+    try std.testing.expectEqualStrings("preserving", cloned.merged_group_statuses[0].doc_identity_lifecycle);
+
+    var data = try antfly.public_api.cluster.dataFromSnapshot(alloc, &cloned);
+    defer data.deinit(alloc);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, data, .{});
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"doc_identity_lifecycle\":\"preserving\"") != null);
+}
+
+test "data runtime remote admin snapshot clone releases partial ownership" {
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var nodes = [_]antfly.metadata.table_manager.NodeRecord{.{
+                .node_id = 3,
+                .role = "data",
+                .lifecycle = "active",
+            }};
+            var merged_group_statuses = [_]antfly.metadata.reconciler.MergedGroupStatus{.{
+                .group_id = 11,
+                .doc_identity_lifecycle = "preserving",
+            }};
+            var stores = [_]antfly.metadata.table_manager.StoreRecord{
+                .{
+                    .store_id = 3,
+                    .node_id = 3,
+                    .api_url = "http://data-3",
+                    .raft_url = "http://data-3-raft",
+                    .failure_domain = "zone-a",
+                },
+                .{
+                    .store_id = 4,
+                    .node_id = 4,
+                    .api_url = "http://data-4",
+                    .raft_url = "http://data-4-raft",
+                    .failure_domain = "zone-b",
+                },
+            };
+            var local_bootstrap_statuses = [_]antfly.raft.host.BootstrapStatus{
+                .{
+                    .group_id = 11,
+                    .kind = .backup_db_snapshot_restore,
+                    .phase = .failed,
+                    .last_error = "first failed",
+                    .backup_id = "backup-11",
+                    .snapshot_path = "backup-11/groups/11.afb",
+                },
+                .{
+                    .group_id = 12,
+                    .kind = .backup_db_snapshot_restore,
+                    .phase = .failed,
+                    .last_error = "second failed",
+                    .backup_id = "backup-12",
+                    .snapshot_path = "backup-12/groups/12.afb",
+                },
+            };
+            var tables = [_]antfly.metadata.table_manager.TableRecord{
+                .{ .table_id = 7, .name = "docs", .description = "documents", .schema_json = "{}" },
+                .{ .table_id = 8, .name = "events", .description = "events", .schema_json = "{}" },
+            };
+            var ranges = [_]antfly.metadata.table_manager.RangeRecord{
+                .{ .group_id = 11, .table_id = 7, .start_key = "a", .end_key = "m", .restore_backup_id = "backup-11" },
+                .{ .group_id = 12, .table_id = 8, .start_key = "m", .end_key = "z", .restore_backup_id = "backup-12" },
+            };
+            var restore_progresses = [_]antfly.metadata.table_manager.RestoreProgressRecord{
+                .{ .table_id = 7, .node_id = 3, .group_id = 11, .backup_id = "backup-11", .location = "s3://backups", .phase = "repairing" },
+                .{ .table_id = 8, .node_id = 4, .group_id = 12, .backup_id = "backup-12", .location = "s3://backups", .phase = "complete" },
+            };
+            var replication_source_statuses = [_]antfly.metadata.table_manager.ReplicationSourceStatusRecord{
+                .{ .table_id = 7, .source_ordinal = 0, .source_kind = "postgres", .external_table = "docs", .phase = "streaming" },
+                .{ .table_id = 8, .source_ordinal = 1, .source_kind = "postgres", .external_table = "events", .phase = "snapshot" },
+            };
+            var replication_source_action_hints = [_]antfly.metadata_api.ReplicationSourceActionHint{
+                .{ .table_id = 7, .table_name = @constCast("docs"), .source_ordinal = 0, .action = "reseed", .reason = "slot mismatch", .reseed_exact_cutover_path = @constCast("/tables/docs/reseed") },
+                .{ .table_id = 8, .table_name = @constCast("events"), .source_ordinal = 1, .action = "reseed", .reason = "publication mismatch", .reseed_exact_cutover_path = @constCast("/tables/events/reseed") },
+            };
+            const snapshot: antfly.metadata_api.AdminSnapshot = .{
+                .status = .{
+                    .metadata_group_id = 1,
+                    .metadata_raft_role = "leader",
+                    .metrics = .{},
+                },
+                .tables = tables[0..],
+                .ranges = ranges[0..],
+                .nodes = nodes[0..],
+                .stores = stores[0..],
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .local_bootstrap_statuses = local_bootstrap_statuses[0..],
+                .restore_progresses = restore_progresses[0..],
+                .replication_source_statuses = replication_source_statuses[0..],
+                .replication_source_action_hints = replication_source_action_hints[0..],
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = merged_group_statuses[0..],
+            };
+            var cloned = try cloneAdminSnapshotOwned(alloc, snapshot);
+            defer freeAdminSnapshotOwned(alloc, &cloned);
+        }
+    };
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "data runtime remote metadata status stabilizes parser-backed role" {
+    const alloc = std.testing.allocator;
+    const source_role = try alloc.dupe(u8, "leader");
+    defer alloc.free(source_role);
+    const status = stabilizeMetadataStatus(.{
+        .metadata_group_id = 1,
+        .metadata_raft_role = source_role,
+        .metrics = .{},
+    });
+
+    try std.testing.expect(status.metadata_raft_role.ptr != source_role.ptr);
+    @memset(source_role, 'x');
+    try std.testing.expectEqualStrings("leader", status.metadata_raft_role);
+    const future = stabilizeMetadataStatus(.{
+        .metadata_group_id = 1,
+        .metadata_raft_role = "future_role",
+        .metrics = .{},
+    });
+    try std.testing.expectEqualStrings("unknown", future.metadata_raft_role);
+    try std.testing.expect(future.metadata_raft_role.ptr != "future_role".ptr);
+}
+
 test "data runtime metrics use prometheus labels for resource and cache dimensions" {
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
     var writer_buf: [262144]u8 = undefined;
@@ -27155,6 +27580,42 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "# HELP antfly_lsm_cache_hits_total") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_hits_total{kind=\"run_table_index\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_waits_total{kind=\"run_table_block\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_transient_serves_total{kind=\"run_table_block\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_policy_bypasses_total{kind=\"run_table_block\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_kind_used_bytes{kind=\"run_table_block\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_peak_used_bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_data_block_peak_used_bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_kind_peak_used_bytes{kind=\"run_table_block\"}") != null);
+
+    const owner_stats = [_]antfly.public_api.table_writes.LsmOwnerMetricStats{
+        .{
+            .table_name = @constCast("docs"),
+            .group_id = 17,
+            .owner_kind = .dense_vector,
+            .owner_name = @constCast("embedding"),
+            .maintenance = .{
+                .mutable_snapshot_clone_calls = 3,
+                .mutable_snapshot_clone_bytes_total = 4096,
+                .mutable_snapshot_clone_peak_bytes = 2048,
+                .bulk_ingest_current_scan_clone_peak_active_bytes = 1024,
+            },
+        },
+        .{
+            .table_name = @constCast("docs"),
+            .group_id = 17,
+            .owner_kind = .dense_vector,
+            .owner_name = @constCast("__retired_owner_overflow__"),
+            .owner_overflow = true,
+            .maintenance = .{ .mutable_snapshot_clone_calls = 5 },
+        },
+    };
+    writer = .fixed(&writer_buf);
+    try writeLsmOwnerCloneMetrics(&writer, &owner_stats);
+    const owner_output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_mutable_snapshot_clone_calls_total{table=\"docs\",group=\"17\",owner_kind=\"dense_vector\",owner=\"embedding\"} 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_mutable_snapshot_clone_calls_total{table=\"docs\",group=\"17\",owner_kind=\"dense_vector_overflow\",owner=\"__retired_owner_overflow__\"} 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_mutable_snapshot_clone_bytes_total{table=\"docs\",group=\"17\",owner_kind=\"dense_vector\",owner=\"embedding\"} 4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_bulk_ingest_current_scan_clone_peak_active_bytes{table=\"docs\",group=\"17\",owner_kind=\"dense_vector\",owner=\"embedding\"} 1024") != null);
 
     writer = .fixed(&writer_buf);
     try writeLsmNativeStorageMetrics(&writer, .{

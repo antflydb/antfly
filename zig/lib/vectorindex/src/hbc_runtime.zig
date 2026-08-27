@@ -595,8 +595,13 @@ pub fn acquireSearchScratch(self: anytype) !ScratchHandle {
 }
 
 pub fn refreshSearchScratchAccounting(self: anytype, handle: *ScratchHandle) void {
+    const next = handle.scratch.bytes();
+    if (next == handle.accounted_bytes) return;
+    if (comptime @hasDecl(@TypeOf(self.*), "reconcileSearchScratchBytes")) {
+        self.reconcileSearchScratchBytes(handle, next);
+        return;
+    }
     if (comptime @hasDecl(@TypeOf(self.*), "observeSearchWorkspaceBytes")) {
-        const next = handle.scratch.bytes();
         if (next > handle.accounted_bytes) {
             self.observeSearchWorkspaceBytes(self.search_workspace_bytes_accounted + (next - handle.accounted_bytes));
         } else if (next < handle.accounted_bytes) {
