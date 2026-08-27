@@ -17,6 +17,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const transactions_mod = @import("../storage/transactions.zig");
 const tracing = @import("../tracing/antfly_trace_writer.zig");
 const http_common = @import("../raft/transport/http_common.zig");
+const raft_host = @import("../raft/host.zig");
 const http_client_mod = @import("http_client.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
@@ -230,13 +231,23 @@ pub const HostedParticipantWorker = struct {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
+        const attempted_node_id = switch (route) {
+            .local => self.router.localNodeId(),
+            .remote => |remote| remote.node_id,
+        };
         switch (route) {
-            .local => _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants)) orelse return error.UnknownGroup,
+            .local => _ = (self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants) catch |err| {
+                if (!isPreDecisionLeaderUnavailable(err)) return err;
+                return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id);
+            }) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnBeginRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnBegin(remote.base_uri, group_id, table_name, body);
+                var response = client.fetchGroupTxnBegin(remote.base_uri, group_id, table_name, body) catch |err| {
+                    if (err != error.GroupLeaderUnavailable) return err;
+                    return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id);
+                };
                 response.deinit(alloc);
             },
         }
@@ -246,16 +257,118 @@ pub const HostedParticipantWorker = struct {
         const self: *HostedParticipantWorker = @ptrCast(@alignCast(ptr));
         var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader)) orelse return error.UnknownGroup;
         defer route.deinit(alloc);
+        const attempted_node_id = switch (route) {
+            .local => self.router.localNodeId(),
+            .remote => |remote| remote.node_id,
+        };
         switch (route) {
-            .local => _ = (try self.writes.txnPrepareGroupLocal(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req)) orelse return error.UnknownGroup,
+            .local => _ = (self.writes.txnPrepareGroupLocal(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req) catch |err| {
+                if (!isPreDecisionLeaderUnavailable(err)) return err;
+                return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id);
+            }) orelse return error.UnknownGroup,
             .remote => |remote| {
                 var client = self.httpClient(alloc);
                 const body = try encodeTxnPrepareRequest(alloc, req);
                 defer alloc.free(body);
-                var response = try client.fetchGroupTxnPrepare(remote.base_uri, group_id, table_name, body);
+                var response = client.fetchGroupTxnPrepare(remote.base_uri, group_id, table_name, body) catch |err| {
+                    if (err != error.GroupLeaderUnavailable) return err;
+                    return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id);
+                };
                 response.deinit(alloc);
             },
         }
+    }
+
+    fn beginGroupFromCandidates(
+        self: *HostedParticipantWorker,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: TxnBeginRequest,
+        attempted_node_id: u64,
+    ) !void {
+        const node_ids = (try self.router.groupNodeIds(alloc, group_id)) orelse return error.GroupLeaderUnavailable;
+        defer alloc.free(node_ids);
+        for (node_ids) |node_id| {
+            if (node_id == attempted_node_id) continue;
+            self.beginGroupAtNode(alloc, group_id, table_name, req, node_id) catch |err| {
+                if (isPreDecisionCandidateMiss(err)) continue;
+                return err;
+            };
+            return;
+        }
+        return error.GroupLeaderUnavailable;
+    }
+
+    fn beginGroupAtNode(
+        self: *HostedParticipantWorker,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: TxnBeginRequest,
+        node_id: u64,
+    ) !void {
+        if (node_id == self.router.localNodeId()) {
+            if (self.router.localStatus(group_id) != .active) return error.UnknownGroup;
+            _ = (try self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants)) orelse return error.UnknownGroup;
+            return;
+        }
+        if (self.router.nodeStatus(node_id, group_id)) |status| {
+            if (status != .active) return error.UnknownGroup;
+        }
+        const base_uri = (try self.router.nodeBaseUriForGroup(alloc, group_id, node_id)) orelse return error.UnknownGroup;
+        defer alloc.free(base_uri);
+        const body = try encodeTxnBeginRequest(alloc, req);
+        defer alloc.free(body);
+        var client = self.httpClient(alloc);
+        var response = try client.fetchGroupTxnBegin(base_uri, group_id, table_name, body);
+        response.deinit(alloc);
+    }
+
+    fn prepareGroupFromCandidates(
+        self: *HostedParticipantWorker,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: TxnPrepareRequest,
+        attempted_node_id: u64,
+    ) !void {
+        const node_ids = (try self.router.groupNodeIds(alloc, group_id)) orelse return error.GroupLeaderUnavailable;
+        defer alloc.free(node_ids);
+        for (node_ids) |node_id| {
+            if (node_id == attempted_node_id) continue;
+            self.prepareGroupAtNode(alloc, group_id, table_name, req, node_id) catch |err| {
+                if (isPreDecisionCandidateMiss(err)) continue;
+                return err;
+            };
+            return;
+        }
+        return error.GroupLeaderUnavailable;
+    }
+
+    fn prepareGroupAtNode(
+        self: *HostedParticipantWorker,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: TxnPrepareRequest,
+        node_id: u64,
+    ) !void {
+        if (node_id == self.router.localNodeId()) {
+            if (self.router.localStatus(group_id) != .active) return error.UnknownGroup;
+            _ = (try self.writes.txnPrepareGroupLocal(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req)) orelse return error.UnknownGroup;
+            return;
+        }
+        if (self.router.nodeStatus(node_id, group_id)) |status| {
+            if (status != .active) return error.UnknownGroup;
+        }
+        const base_uri = (try self.router.nodeBaseUriForGroup(alloc, group_id, node_id)) orelse return error.UnknownGroup;
+        defer alloc.free(base_uri);
+        const body = try encodeTxnPrepareRequest(alloc, req);
+        defer alloc.free(body);
+        var client = self.httpClient(alloc);
+        var response = try client.fetchGroupTxnPrepare(base_uri, group_id, table_name, body);
+        response.deinit(alloc);
     }
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
@@ -324,6 +437,20 @@ pub const HostedParticipantWorker = struct {
         }
     }
 };
+
+fn isPreDecisionLeaderUnavailable(err: anyerror) bool {
+    return switch (err) {
+        error.GroupLeaderUnavailable,
+        error.LeaderUnavailable,
+        error.MetadataSnapshotUnavailable,
+        => true,
+        else => false,
+    };
+}
+
+fn isPreDecisionCandidateMiss(err: anyerror) bool {
+    return isPreDecisionLeaderUnavailable(err) or err == error.UnknownGroup;
+}
 
 pub const LocalTableWriteParticipantWorker = struct {
     writes: table_writes.TableWriteSource,
@@ -443,6 +570,120 @@ test "distributed txn classifies local and transported visibility outcomes ident
     try std.testing.expect(!isPostCommitVisibilityError(error.GroupLeaderUnavailable));
     try std.testing.expect(isTerminalVisibilityRepair(error.EnrichmentWorkerFailed));
     try std.testing.expect(!isTerminalVisibilityRepair(error.CommitVisibilityNotSatisfied));
+}
+
+test "hosted participant rediscovery retries only pre-decision leader unavailability" {
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .group_node_ids = groupNodeIds,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 99;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_host.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, _: u64) ?u64 {
+            return 1;
+        }
+
+        fn groupNodeIds(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u64 {
+            return try alloc.dupe(u64, &.{ 1, 2, 3 });
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, _: u64) raft_host.HostedReplicaStatus {
+            return if (node_id >= 1 and node_id <= 3) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
+            return try std.fmt.allocPrint(alloc, "http://node-{d}", .{node_id});
+        }
+    };
+
+    const FakeExecutor = struct {
+        fail_with_status: u16 = 503,
+        expect_service_auth: bool = false,
+        calls: usize = 0,
+        first_body: [4096]u8 = undefined,
+        first_body_len: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            var service_auth_headers: usize = 0;
+            for (req.headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) continue;
+                service_auth_headers += 1;
+                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+            }
+            try std.testing.expectEqual(@as(usize, if (self.expect_service_auth) 1 else 0), service_auth_headers);
+            if (self.calls == 1) {
+                try std.testing.expect(std.mem.indexOf(u8, req.uri, "http://node-1/") != null);
+                try std.testing.expect(req.body.len <= self.first_body.len);
+                @memcpy(self.first_body[0..req.body.len], req.body);
+                self.first_body_len = req.body.len;
+                return .{ .status = self.fail_with_status };
+            }
+            try std.testing.expectEqual(@as(usize, 2), self.calls);
+            try std.testing.expect(std.mem.indexOf(u8, req.uri, "http://node-2/") != null);
+            try std.testing.expectEqualStrings(self.first_body[0..self.first_body_len], req.body);
+            return .{ .status = 200 };
+        }
+    };
+
+    const txn_id = try parseTxnIdHex("00112233445566778899aabbccddeeff");
+    var begin_executor = FakeExecutor{};
+    var begin_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, begin_executor.iface());
+    try begin_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 2), begin_executor.calls);
+
+    var prepare_executor = FakeExecutor{};
+    var prepare_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, prepare_executor.iface());
+    try prepare_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .req = .{ .writes = &.{.{ .key = "doc:1", .value = "{}" }} },
+    });
+    try std.testing.expectEqual(@as(usize, 2), prepare_executor.calls);
+
+    var authenticated_executor = FakeExecutor{ .expect_service_auth = true };
+    var authenticated_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, authenticated_executor.iface());
+    _ = authenticated_worker.withInternalServiceAuth("cluster-secret", "cluster-a");
+    try authenticated_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    });
+    try std.testing.expectEqual(@as(usize, 2), authenticated_executor.calls);
+
+    var ambiguous_executor = FakeExecutor{ .fail_with_status = 500 };
+    var ambiguous_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, ambiguous_executor.iface());
+    try std.testing.expectError(error.UnexpectedHttpStatus, ambiguous_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), ambiguous_executor.calls);
 }
 
 fn fanoutWidth(options: ExecuteOptions, participant_count: usize) usize {
