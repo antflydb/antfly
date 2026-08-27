@@ -4030,20 +4030,34 @@ pub const Reader = struct {
             defer self.alloc.free(encoded);
             const header = try image_lib.jpeg2000.decodeHeaderBytes(self.alloc, encoded);
             if (header.width != width or header.height != height) return error.UnsupportedPdfRendering;
+            const full_sample_count = std.math.mul(usize, pixel_count, header.components) catch
+                return error.PdfDecodeWorkingSetTooLarge;
             if (image_mask) {
                 if (header.components != 1 or header.bits_per_component != 1 or header.is_signed or !header.supportsDecodeU8())
                     return error.UnsupportedPdfRendering;
+                const full_mask_rgba_len = std.math.mul(usize, pixel_count, 4) catch
+                    return error.PdfDecodeWorkingSetTooLarge;
                 const discard_levels = if (can_reduce_resolution)
                     jpeg2000DiscardLevelsForTarget(width, height, self.image_decode_target)
                 else
                     0;
-                var decoded_mask = if (discard_levels > 0)
-                    image_lib.jpeg2000.decodeU8BytesAtResolution(self.alloc, encoded, discard_levels) catch |err| switch (err) {
-                        error.UnsupportedReducedMultiTileDecode, error.UnsupportedReducedSubsampledDecode => try image_lib.jpeg2000.decodeU8Bytes(self.alloc, encoded),
+                var decoded_mask = if (discard_levels > 0) reduced: {
+                    break :reduced image_lib.jpeg2000.decodeU8BytesAtResolution(self.alloc, encoded, discard_levels) catch |err| switch (err) {
+                        error.UnsupportedReducedMultiTileDecode, error.UnsupportedReducedSubsampledDecode => {
+                            // A reduced decode can legitimately be unsupported
+                            // for some codestream layouts. Prove that the full
+                            // retained result fits before paying for fallback;
+                            // the scoped decode allocator separately caps the
+                            // codec's data-dependent scratch peak.
+                            try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, full_sample_count, full_mask_rgba_len });
+                            break :reduced try image_lib.jpeg2000.decodeU8Bytes(self.alloc, encoded);
+                        },
                         else => return err,
-                    }
-                else
-                    try image_lib.jpeg2000.decodeU8Bytes(self.alloc, encoded);
+                    };
+                } else full: {
+                    try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, full_sample_count, full_mask_rgba_len });
+                    break :full try image_lib.jpeg2000.decodeU8Bytes(self.alloc, encoded);
+                };
                 defer decoded_mask.deinit();
                 const mask_pixel_count = std.math.mul(usize, decoded_mask.width, decoded_mask.height) catch return error.PdfDecodeWorkingSetTooLarge;
                 if (decoded_mask.components != 1 or decoded_mask.pixels.len != mask_pixel_count)
@@ -4071,11 +4085,15 @@ pub const Reader = struct {
                 // before doing any full decode so unsupported layouts fail
                 // without wasted work.
                 if (header.is_signed or !header.supportsDecodeU16()) return error.UnsupportedPdfRendering;
+                const full_sample_bytes = std.math.mul(usize, full_sample_count, @sizeOf(u16)) catch
+                    return error.PdfDecodeWorkingSetTooLarge;
+                const full_normalized_len = if (indexed_color_space) 0 else full_sample_count;
+                try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, full_sample_bytes, full_normalized_len, rgba_len });
                 var decoded_u16 = try image_lib.jpeg2000.decodeU16Bytes(self.alloc, encoded);
                 defer decoded_u16.deinit();
                 if (decoded_u16.width != width or decoded_u16.height != height) return error.UnsupportedPdfRendering;
                 const sample_bytes = std.math.mul(usize, decoded_u16.pixels.len, @sizeOf(u16)) catch return error.PdfDecodeWorkingSetTooLarge;
-                const normalized_len = decoded_u16.pixels.len;
+                const normalized_len = if (indexed_color_space) 0 else decoded_u16.pixels.len;
                 const renderer_scratch_len = if (decoded_u16.jp2_color.alphaLayout(decoded_u16.components)) |alpha_layout|
                     std.math.mul(usize, pixel_count, alpha_layout.color_count) catch return error.PdfDecodeWorkingSetTooLarge
                 else
@@ -4115,15 +4133,22 @@ pub const Reader = struct {
                 jpeg2000DiscardLevelsForTarget(width, height, self.image_decode_target)
             else
                 0;
-            var decoded_u8 = if (discard_levels > 0)
-                image_lib.jpeg2000.decodeU8BytesAtResolution(self.alloc, encoded, discard_levels) catch |err| switch (err) {
-                    error.UnsupportedReducedMultiTileDecode, error.UnsupportedReducedSubsampledDecode => try image_lib.jpeg2000.decodeU8Bytes(self.alloc, encoded),
+            var decoded_at_reduced_resolution = discard_levels > 0;
+            var decoded_u8 = if (discard_levels > 0) reduced: {
+                break :reduced image_lib.jpeg2000.decodeU8BytesAtResolution(self.alloc, encoded, discard_levels) catch |err| switch (err) {
+                    error.UnsupportedReducedMultiTileDecode, error.UnsupportedReducedSubsampledDecode => {
+                        try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, full_sample_count, rgba_len });
+                        decoded_at_reduced_resolution = false;
+                        break :reduced try image_lib.jpeg2000.decodeU8Bytes(self.alloc, encoded);
+                    },
                     else => return err,
-                }
-            else
-                try image_lib.jpeg2000.decodeU8Bytes(self.alloc, encoded);
+                };
+            } else full: {
+                try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, full_sample_count, rgba_len });
+                break :full try image_lib.jpeg2000.decodeU8Bytes(self.alloc, encoded);
+            };
             defer decoded_u8.deinit();
-            if ((discard_levels == 0 and (decoded_u8.width != width or decoded_u8.height != height)) or decoded_u8.width == 0 or decoded_u8.height == 0)
+            if ((!decoded_at_reduced_resolution and (decoded_u8.width != width or decoded_u8.height != height)) or decoded_u8.width == 0 or decoded_u8.height == 0)
                 return error.UnsupportedPdfRendering;
             const decoded_pixel_count = std.math.mul(usize, decoded_u8.width, decoded_u8.height) catch return error.PdfDecodeWorkingSetTooLarge;
             const decoded_rgba_len = std.math.mul(usize, decoded_pixel_count, 4) catch return error.PdfDecodeWorkingSetTooLarge;
@@ -14433,6 +14458,97 @@ test "reader preserves native JPX samples for Indexed color spaces" {
         0,   255, 0,   255,
         0,   0,   255, 255,
     }, decoded.rgba);
+}
+
+test "reader bounds full-resolution JPX fallback when reduced multi-tile decode is unsupported" {
+    const alloc = std.testing.allocator;
+    const width: u32 = 128;
+    const height: u32 = 128;
+    const pixels = try alloc.alloc(u8, width * height * 3);
+    defer alloc.free(pixels);
+    @memset(pixels, 0);
+    const params = image_lib.jpeg2000.EncodeParams{
+        .width = width,
+        .height = height,
+        .components = 3,
+        .tile_width = 64,
+        .tile_height = 64,
+        .decomposition_levels = 2,
+        .wavelet_transform = 1,
+        .multiple_component_transform = false,
+        .format = .jp2,
+    };
+    const jp2_bytes = try image_lib.jpeg2000.encodeU8Bytes(alloc, pixels, &params);
+    defer alloc.free(jp2_bytes);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width {d} /Height {d} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /JPXDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ width, height, jp2_bytes.len, jp2_bytes },
+        ),
+    };
+    defer alloc.free(objects[4]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 1024 * 1024,
+        .max_working_set_bytes = 64 * 1024,
+    });
+    defer reader.deinit();
+    reader.image_decode_target = .{ .max_dimension = 32 };
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+
+    try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, reader.decodeImageToRgbaAlloc(&image));
+}
+
+test "reader bounds full-resolution indexed JPX before native sample decode" {
+    const alloc = std.testing.allocator;
+    const width: u32 = 128;
+    const height: u32 = 128;
+    const pixels = try alloc.alloc(u16, width * height);
+    defer alloc.free(pixels);
+    @memset(pixels, 0);
+    const params = image_lib.jpeg2000.EncodeParams{
+        .width = width,
+        .height = height,
+        .components = 1,
+        .bits_per_component = 4,
+        .decomposition_levels = 2,
+        .wavelet_transform = 1,
+        .multiple_component_transform = false,
+        .format = .jp2,
+    };
+    const jp2_bytes = try image_lib.jpeg2000.encodeU16Bytes(alloc, pixels, &params);
+    defer alloc.free(jp2_bytes);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width {d} /Height {d} /ColorSpace [/Indexed /DeviceRGB 0 <000000>] /BitsPerComponent 4 /Filter /JPXDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ width, height, jp2_bytes.len, jp2_bytes },
+        ),
+    };
+    defer alloc.free(objects[4]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 1024 * 1024,
+        .max_working_set_bytes = 32 * 1024,
+    });
+    defer reader.deinit();
+    reader.image_decode_target = .{ .max_dimension = 32 };
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+
+    try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, reader.decodeImageToRgbaAlloc(&image));
 }
 
 test "reader decodes JPX stencil masks and applies Decode" {
