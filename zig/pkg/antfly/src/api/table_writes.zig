@@ -6757,7 +6757,9 @@ pub const ProvisionedTableWriteSource = struct {
         for (self.active_table_activities.items) |entry| {
             if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
             if (entry.group_id == null) continue;
-            if (entry.operation_waiters > 0 or entry.transition_waiters > 0 or (entry.operation_active and !entry.operation_allows_reads)) return true;
+            if (entry.transition_waiters > 0 or
+                (entry.operation_active and !entry.operation_allows_reads) or
+                (!entry.operation_active and entry.operation_waiters > 0)) return true;
         }
         return false;
     }
@@ -33943,11 +33945,31 @@ test "resident group write releases queued reads before remote completion" {
             while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
         }
     };
+    const WriterWorker = struct {
+        source: *ProvisionedTableWriteSource,
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.source.beginGroupOperation("docs", 7001);
+            defer self.source.endGroupOperation("docs", 7001);
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
 
     var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-resident-write-read-liveness", NoCatalog.iface());
     source.beginGroupOperation("docs", 7001);
     var operation_active = true;
     defer if (operation_active) source.endGroupOperation("docs", 7001);
+
+    var queued_writer = WriterWorker{ .source = &source };
+    const writer_thread = try std.Thread.spawn(.{}, WriterWorker.run, .{&queued_writer});
+    defer {
+        queued_writer.release.store(true, .release);
+        writer_thread.join();
+    }
+    while (source.testingGroupOperationWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
     var worker = ReaderWorker{ .source = &source };
     const thread = try std.Thread.spawn(.{}, ReaderWorker.run, .{&worker});
@@ -33963,7 +33985,10 @@ test "resident group write releases queued reads before remote completion" {
     try std.testing.expect(!worker.entered.load(.acquire));
 
     // Resident DB reads are safe once DB's local apply lock owns ordering.
-    // Keep the group operation active to model a synchronous HA wait.
+    // Keep the group operation active to model a synchronous HA wait. A
+    // queued writer must remain serialized without extending that read outage;
+    // after the active writer exits, writer preference blocks new admissions
+    // until the queued writer acquires the group.
     source.allowGroupOperationReads("docs", 7001);
     while (!worker.entered.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(!source.tryBeginGroupOperation("docs", 7001));
@@ -33971,6 +33996,7 @@ test "resident group write releases queued reads before remote completion" {
     worker.release.store(true, .release);
     source.endGroupOperation("docs", 7001);
     operation_active = false;
+    while (!queued_writer.entered.load(.acquire)) std.atomic.spinLoopHint();
 }
 
 test "provisioned table transition activity excludes writers but preserves reads" {
