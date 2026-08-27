@@ -10410,6 +10410,8 @@ fn lowerGraphDocumentFilter(
             if (range.min == null and range.max == null) return error.InvalidQueryRequest;
             if (range.min) |bound| if (!std.math.isFinite(bound)) return error.InvalidQueryRequest;
             if (range.max) |bound| if (!std.math.isFinite(bound)) return error.InvalidQueryRequest;
+            if (range.min != null and range.max != null and range.min.? > range.max.?)
+                return error.InvalidQueryRequest;
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "path", .{ .string = range.path });
             if (range.min) |bound| try body.put(alloc, "min", .{ .float = bound });
@@ -10434,16 +10436,22 @@ fn lowerGraphDocumentFilter(
             const range = value.date_range;
             try validateGraphDocumentPath(range.path);
             if (range.start == null and range.end == null) return error.InvalidQueryRequest;
+            var start_ns: ?u64 = null;
+            var end_ns: ?u64 = null;
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "path", .{ .string = range.path });
             if (range.start) |bound| {
                 const timestamp = (try parseRfc3339ToNs(bound)) orelse return error.InvalidQueryRequest;
+                start_ns = timestamp;
                 try body.put(alloc, "start_ns", try graphJsonU64(alloc, timestamp));
             }
             if (range.end) |bound| {
                 const timestamp = (try parseRfc3339ToNs(bound)) orelse return error.InvalidQueryRequest;
+                end_ns = timestamp;
                 try body.put(alloc, "end_ns", try graphJsonU64(alloc, timestamp));
             }
+            if (start_ns != null and end_ns != null and start_ns.? > end_ns.?)
+                return error.InvalidQueryRequest;
             if (range.inclusive_start) |inclusive| try body.put(alloc, "inclusive_start", .{ .bool = inclusive });
             if (range.inclusive_end) |inclusive| try body.put(alloc, "inclusive_end", .{ .bool = inclusive });
             break :blk try graphStoredWrappedPredicate(alloc, "date_range", .{ .object = body });

@@ -18,7 +18,8 @@ class GraphDocumentDateRangeFilter:
     Attributes:
         date_range (GraphDocumentDateRangeBody): At least one of start or end is required and enforced by every Antfly
             execution boundary. Bounds are RFC 3339 instants in Antfly's unsigned Unix-nanosecond domain, from
-            1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z inclusive.
+            1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z inclusive. When both are present, start must not
+            exceed end after offset normalization.
     """
 
     date_range: GraphDocumentDateRangeBody

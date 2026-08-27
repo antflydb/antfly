@@ -107,6 +107,8 @@ def graph_numeric_range_filter(
         _require_finite_number(min_value, "graph numeric range min_value")
     if max_value is not None:
         _require_finite_number(max_value, "graph numeric range max_value")
+    if min_value is not None and max_value is not None and min_value > max_value:
+        raise AntflyException("graph numeric range min_value must not exceed max_value")
     _require_optional_bool(inclusive_min, "graph numeric range inclusive_min")
     _require_optional_bool(inclusive_max, "graph numeric range inclusive_max")
     return GraphDocumentNumericRangeFilter(
@@ -163,6 +165,8 @@ def graph_date_range_filter(
         raise AntflyException("graph date range requires start or end")
     normalized_start = _normalize_graph_datetime(start, "graph date range start") if start is not None else None
     normalized_end = _normalize_graph_datetime(end, "graph date range end") if end is not None else None
+    if normalized_start is not None and normalized_end is not None and normalized_start > normalized_end:
+        raise AntflyException("graph date range start must not exceed end")
     _require_optional_bool(inclusive_start, "graph date range inclusive_start")
     _require_optional_bool(inclusive_end, "graph date range inclusive_end")
     return GraphDocumentDateRangeFilter(

@@ -1062,7 +1062,7 @@ pub const GraphIndex = struct {
             try self.scanOutgoingEdges(alloc, &results, key, edge_type);
         }
         if (direction == .in or direction == .both) {
-            try self.scanIncomingEdges(alloc, &results, key, edge_type);
+            try self.scanIncomingEdges(alloc, &results, key, edge_type, direction == .both);
         }
 
         return try results.toOwnedSlice(alloc);
@@ -1091,7 +1091,7 @@ pub const GraphIndex = struct {
                 try self.scanOutgoingEdges(alloc, &results, key, edge_type);
             }
             if (direction == .in or direction == .both) {
-                try self.scanIncomingEdges(alloc, &results, key, edge_type);
+                try self.scanIncomingEdges(alloc, &results, key, edge_type, direction == .both);
             }
         }
         return try results.toOwnedSlice(alloc);
@@ -1180,6 +1180,7 @@ pub const GraphIndex = struct {
                     @intCast(type_index),
                     phase,
                     if (active_resume) scan_cursor else null,
+                    direction == .both and phase == .in,
                     limits,
                 );
                 if (capped) |cursor| {
@@ -1275,6 +1276,7 @@ pub const GraphIndex = struct {
         type_index: u32,
         phase: EdgeDirection,
         scan_cursor: ?EdgeScanCursor,
+        skip_mirrored_self_loops: bool,
         limits: EdgePageLimits,
     ) !?EdgeScanCursor {
         std.debug.assert(phase != .both);
@@ -1314,7 +1316,7 @@ pub const GraphIndex = struct {
             if (phase == .out)
                 try appendEdgeFromKV(alloc, results, entry.key, entry.value)
             else
-                try appendReverseEdgeFromKV(alloc, results, entry.key, entry.value);
+                try appendReverseEdgeFromKV(alloc, results, entry.key, entry.value, skip_mirrored_self_loops);
             if (results.items.len != before) {
                 const appended = results.items[results.items.len - 1];
                 const edge_bytes = edgeOwnedBytes(appended);
@@ -1486,7 +1488,14 @@ pub const GraphIndex = struct {
         }
     }
 
-    fn scanIncomingEdges(self: *GraphIndex, alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), key: []const u8, edge_type: []const u8) !void {
+    fn scanIncomingEdges(
+        self: *GraphIndex,
+        alloc: Allocator,
+        results: *std.ArrayListUnmanaged(Edge),
+        key: []const u8,
+        edge_type: []const u8,
+        skip_mirrored_self_loops: bool,
+    ) !void {
         const prefix = try reverseEdgePrefixAlloc(alloc, key, self.index_name, edge_type);
         defer alloc.free(prefix);
 
@@ -1499,14 +1508,14 @@ pub const GraphIndex = struct {
         const first = (try cur.seekAtOrAfter(prefix)) orelse return;
 
         if (std.mem.startsWith(u8, first.key, prefix)) {
-            try appendReverseEdgeFromKV(alloc, results, first.key, first.value);
+            try appendReverseEdgeFromKV(alloc, results, first.key, first.value, skip_mirrored_self_loops);
         } else {
             return;
         }
 
         while (try cur.next()) |entry| {
             if (!std.mem.startsWith(u8, entry.key, prefix)) break;
-            try appendReverseEdgeFromKV(alloc, results, entry.key, entry.value);
+            try appendReverseEdgeFromKV(alloc, results, entry.key, entry.value, skip_mirrored_self_loops);
         }
     }
 
@@ -1516,9 +1525,21 @@ pub const GraphIndex = struct {
         try appendParsedEdge(alloc, results, parsed, value);
     }
 
-    fn appendReverseEdgeFromKV(alloc: Allocator, results: *std.ArrayListUnmanaged(Edge), key: []const u8, value: []const u8) !void {
+    fn appendReverseEdgeFromKV(
+        alloc: Allocator,
+        results: *std.ArrayListUnmanaged(Edge),
+        key: []const u8,
+        value: []const u8,
+        skip_mirrored_self_loops: bool,
+    ) !void {
         var parsed = (try parseReverseEdgeKeyAlloc(alloc, key)) orelse return;
         defer parsed.deinit(alloc);
+        // A physical self-loop is indexed once in each adjacency direction so
+        // independent `out` and `in` reads remain complete. A `both` read has
+        // already emitted the outgoing copy, so suppress only its mirrored
+        // reverse-index representation. Reciprocal non-self edges remain
+        // distinct because their physical source/target identities differ.
+        if (skip_mirrored_self_loops and std.mem.eql(u8, parsed.source, parsed.target)) return;
         try appendParsedEdge(alloc, results, parsed, value);
     }
 
@@ -1932,6 +1953,43 @@ test "graph addEdge and getEdges out" {
     try std.testing.expectEqual(@as(usize, 2), edges.len);
     try std.testing.expectEqualStrings("doc1", edges[0].source);
     try std.testing.expectApproxEqAbs(@as(f64, 0.9), edges[0].weight, 0.001);
+}
+
+test "graph both direction emits one physical self loop and preserves reciprocal edges" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "both-self-loop-store");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "both-self-loop-rev");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    defer graph.close();
+
+    try graph.addEdge("same", "same", "loop", 1, 0, 0, "{}");
+    try graph.addEdge("same", "other", "rel", 1, 0, 0, "{}");
+    try graph.addEdge("other", "same", "rel", 1, 0, 0, "{}");
+
+    const outgoing = try graph.getEdges(alloc, "same", "", .out);
+    defer GraphIndex.freeEdges(alloc, outgoing);
+    try std.testing.expectEqual(@as(usize, 2), outgoing.len);
+
+    const incoming = try graph.getEdges(alloc, "same", "", .in);
+    defer GraphIndex.freeEdges(alloc, incoming);
+    try std.testing.expectEqual(@as(usize, 2), incoming.len);
+
+    const both = try graph.getEdges(alloc, "same", "", .both);
+    defer GraphIndex.freeEdges(alloc, both);
+    try std.testing.expectEqual(@as(usize, 3), both.len);
+
+    const loop = try graph.getEdgesByTypesBounded(alloc, "same", &.{"loop"}, .both, 1, 4096);
+    defer GraphIndex.freeEdges(alloc, loop);
+    try std.testing.expectEqual(@as(usize, 1), loop.len);
+    try std.testing.expectEqualStrings("same", loop[0].source);
+    try std.testing.expectEqualStrings("same", loop[0].target);
 }
 
 test "graph durable writes reject invalid edge types before mutation" {

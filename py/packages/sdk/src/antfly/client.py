@@ -96,6 +96,22 @@ def _require_graph_edge_types(value: object, path: str) -> None:
             raise AntflyException(f"{path} must encode to at most {MAX_GRAPH_EDGE_TYPE_UTF8_BYTES} UTF-8 bytes")
 
 
+def _validate_graph_edges(edges: object, path: str) -> None:
+    if not isinstance(edges, list):
+        return
+    for index, edge in enumerate(edges):
+        if not isinstance(edge, Mapping):
+            continue
+        edge_path = f"{path}[{index}]"
+        _require_graph_identifier(edge.get("from"), f"{edge_path}.from")
+        _require_graph_identifier(edge.get("to"), f"{edge_path}.to")
+        if "direction" in edge:
+            direction = edge["direction"]
+            if not isinstance(direction, str) or direction not in {"out", "in", "both"}:
+                raise AntflyException(f"{edge_path}.direction must be out, in, or both")
+        _require_graph_edge_types(edge.get("types"), f"{edge_path}.types")
+
+
 def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, path: str) -> None:
     _require_graph_identifier(match.get("anchor"), f"{path}.match.anchor")
 
@@ -120,17 +136,7 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
             where_groups.append((optional_match.get("where"), f"{optional_path}.where", 0))
 
     for edges, edges_path in edge_groups:
-        if not isinstance(edges, list):
-            continue
-        for index, edge in enumerate(edges):
-            if not isinstance(edge, Mapping):
-                continue
-            _require_graph_identifier(edge.get("from"), f"{edges_path}[{index}].from")
-            _require_graph_identifier(edge.get("to"), f"{edges_path}[{index}].to")
-            direction = edge.get("direction")
-            if direction is not None and (not isinstance(direction, str) or direction not in {"out", "in", "both"}):
-                raise AntflyException(f"{edges_path}[{index}].direction must be out, in, or both")
-            _require_graph_edge_types(edge.get("types"), f"{edges_path}[{index}].types")
+        _validate_graph_edges(edges, edges_path)
 
     while where_groups:
         where, where_path, depth = where_groups.pop()
@@ -151,16 +157,7 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
                     _require_graph_identifier(operand.get("alias"), f"{where_path}.not_equal.{side}.alias")
         not_exists = where.get("not_exists")
         if isinstance(not_exists, Mapping):
-            edge_groups = [(not_exists.get("edges"), f"{where_path}.not_exists.edges")]
-            for edges, edges_path in edge_groups:
-                if not isinstance(edges, list):
-                    continue
-                for index, edge in enumerate(edges):
-                    if not isinstance(edge, Mapping):
-                        continue
-                    _require_graph_identifier(edge.get("from"), f"{edges_path}[{index}].from")
-                    _require_graph_identifier(edge.get("to"), f"{edges_path}[{index}].to")
-                    _require_graph_edge_types(edge.get("types"), f"{edges_path}[{index}].types")
+            _validate_graph_edges(not_exists.get("edges"), f"{where_path}.not_exists.edges")
 
     if not isinstance(result, Mapping):
         return

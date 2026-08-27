@@ -1053,7 +1053,9 @@ test "graph document filter admission enforces generated schema constraints" {
     try expectInvalidGraphDocumentFilter("{\"ids\":[]}");
     try expectInvalidGraphDocumentFilter("{\"ids\":[\"a\",\"a\"]}");
     try expectInvalidGraphDocumentFilter("{\"numeric_range\":{\"path\":\"/score\"}}");
+    try expectInvalidGraphDocumentFilter("{\"numeric_range\":{\"path\":\"/score\",\"min\":2,\"max\":1}}");
     try expectInvalidGraphDocumentFilter("{\"date_range\":{\"path\":\"/at\",\"start\":\"not-a-date\"}}");
+    try expectInvalidGraphDocumentFilter("{\"date_range\":{\"path\":\"/at\",\"start\":\"2026-01-02T00:00:00Z\",\"end\":\"2026-01-01T00:00:00Z\"}}");
     try expectInvalidGraphDocumentFilter("{\"disjuncts\":[]}");
     try expectInvalidGraphDocumentFilter("{\"disjuncts\":[{\"match_all\":{}}],\"min\":2}");
 }

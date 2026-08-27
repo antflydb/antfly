@@ -1491,7 +1491,7 @@ pub const GraphDocumentBoolFieldFilter = struct {
     bool_field: GraphDocumentBoolFieldBody,
 };
 
-/// At least one of start or end is required and enforced by every Antfly execution boundary. Bounds are RFC 3339 instants in Antfly's unsigned Unix-nanosecond domain, from 1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z inclusive.
+/// At least one of start or end is required and enforced by every Antfly execution boundary. Bounds are RFC 3339 instants in Antfly's unsigned Unix-nanosecond domain, from 1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z inclusive. When both are present, start must not exceed end after offset normalization.
 pub const GraphDocumentDateRangeBody = struct {
     /// RFC 6901 JSON Pointer to the stored-document value.
     path: []const u8,
@@ -1714,7 +1714,7 @@ pub const GraphDocumentMatchNoneFilter = struct {
     match_none: std.json.Value,
 };
 
-/// At least one of min or max is required and enforced by every Antfly execution boundary.
+/// At least one of min or max is required and enforced by every Antfly execution boundary. When both are present, min must not exceed max.
 pub const GraphDocumentNumericRangeBody = struct {
     /// RFC 6901 JSON Pointer to the stored-document value.
     path: []const u8,

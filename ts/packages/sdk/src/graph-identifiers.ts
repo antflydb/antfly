@@ -79,7 +79,7 @@ function requireGraphDocumentPath(path: unknown): asserts path is string {
   }
 }
 
-function requireRfc3339DateTime(value: unknown, path: string): asserts value is string {
+function requireRfc3339DateTime(value: unknown, path: string): bigint {
   if (typeof value !== "string") {
     throw new TypeError(`${path} must be an RFC 3339 date-time with a UTC offset`);
   }
@@ -139,6 +139,7 @@ function requireRfc3339DateTime(value: unknown, path: string): asserts value is 
         "(1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z)"
     );
   }
+  return unixNs;
 }
 
 function daysFromCivil(year: number, month: number, day: number): bigint {
@@ -211,6 +212,9 @@ export function graphNumericRangeFilter(
   ) {
     throw new TypeError("graph numeric range bounds must be finite numbers");
   }
+  if (options.min !== undefined && options.max !== undefined && options.min > options.max) {
+    throw new TypeError("graph numeric range min must not exceed max");
+  }
   const inclusiveMin = optionalBoolean(options.inclusiveMin, "graph numeric range inclusiveMin");
   const inclusiveMax = optionalBoolean(options.inclusiveMax, "graph numeric range inclusiveMax");
   return {
@@ -268,8 +272,17 @@ export function graphDateRangeFilter(
   if (options.start === undefined && options.end === undefined) {
     throw new TypeError("graph date range requires start or end");
   }
-  if (options.start !== undefined) requireRfc3339DateTime(options.start, "graph date range start");
-  if (options.end !== undefined) requireRfc3339DateTime(options.end, "graph date range end");
+  const startNs =
+    options.start === undefined
+      ? undefined
+      : requireRfc3339DateTime(options.start, "graph date range start");
+  const endNs =
+    options.end === undefined
+      ? undefined
+      : requireRfc3339DateTime(options.end, "graph date range end");
+  if (startNs !== undefined && endNs !== undefined && startNs > endNs) {
+    throw new TypeError("graph date range start must not exceed end");
+  }
   const inclusiveStart = optionalBoolean(options.inclusiveStart, "graph date range inclusiveStart");
   const inclusiveEnd = optionalBoolean(options.inclusiveEnd, "graph date range inclusiveEnd");
   return {

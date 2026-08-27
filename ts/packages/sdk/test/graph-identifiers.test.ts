@@ -168,6 +168,9 @@ describe("graph identifier policy", () => {
       },
     });
     expect(() => graphNumericRangeFilter("/score", {})).toThrow("requires min or max");
+    expect(() => graphNumericRangeFilter("/score", { min: 2, max: 1 })).toThrow(
+      "min must not exceed max"
+    );
     expect(() => graphTermRangeFilter("score", { min: "a" })).toThrow("RFC 6901");
     expect(() => graphDateRangeFilter("/created~2at", { end: "2026-01-01T00:00:00Z" })).toThrow(
       "RFC 6901"
@@ -178,6 +181,12 @@ describe("graph identifier policy", () => {
     expect(() => graphDateRangeFilter("/created_at", { start: "2026-01-01T00:00:00" })).toThrow(
       "with a UTC offset"
     );
+    expect(() =>
+      graphDateRangeFilter("/created_at", {
+        start: "2026-01-02T00:00:00Z",
+        end: "2026-01-01T00:00:00Z",
+      })
+    ).toThrow("start must not exceed end");
     expect(() =>
       graphNumericRangeFilter("/score", { min: 1, path: "not-a-pointer" } as never)
     ).toThrow("unsupported property");

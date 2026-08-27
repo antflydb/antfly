@@ -363,6 +363,10 @@ Fixed single-hop relationships preserve physical self-loops, so distinct aliases
 may bind the same node unless `where.not_equal` excludes that binding. Variable-
 length relationships remain node-simple except for explicit repeated-alias cycle
 closure.
+Edge direction is relative to `from` and defaults to `out`. Use `direction: "in"`
+to traverse a stored relationship in reverse, or `direction: "both"` to treat one
+stored relationship as undirected. A physical self-loop still contributes only
+one relationship binding under `both`.
 Top-level full-text, semantic, and filter clauses shape the retrieval result only;
 they do not implicitly narrow `MATCH`. Put source constraints on the node named by
 `match.anchor`. Row-level authorization still applies to every anchor and reached

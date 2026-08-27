@@ -6168,6 +6168,8 @@ fn allocPublicSegmentEdgesBounded(
     if (table != null) return try alloc.alloc(graph_mod.Edge, 0);
     const adjacency = cached.adjacency_index.find(cached.segment, key) orelse
         return try alloc.alloc(graph_mod.Edge, 0);
+    // Charge physical adjacency work even when a mirrored self-loop is later
+    // suppressed from the logical result.
     const scanned = (if (direction == .out or direction == .both) adjacency.out_edges.len else 0) +
         (if (direction == .in or direction == .both) adjacency.in_edges.len else 0);
     try budget.admitEdges(scanned);
@@ -6188,6 +6190,7 @@ fn allocPublicSegmentEdgesBounded(
         if (edge_count > max_edges or owned_bytes > max_owned_bytes) return error.QueryCandidateBudgetExceeded;
     };
     if (direction == .in or direction == .both) for (adjacency.in_edges) |edge| {
+        if (isMirroredBothSelfLoop(direction, adjacency.node_id, edge)) continue;
         if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
         edge_count = std.math.add(usize, edge_count, 1) catch return error.QueryCandidateBudgetExceeded;
         var edge_bytes: usize = @sizeOf(graph_mod.Edge);
@@ -6221,6 +6224,7 @@ fn allocPublicSegmentEdgesBounded(
     }
     if (direction == .in or direction == .both) {
         for (adjacency.in_edges) |edge| {
+            if (isMirroredBothSelfLoop(direction, adjacency.node_id, edge)) continue;
             if (!patternEdgeTypeRequested(edge.edge_type, edge_types)) continue;
             edges[initialized] = try clonePublicSegmentEdge(
                 alloc,
@@ -6234,6 +6238,14 @@ fn allocPublicSegmentEdgesBounded(
         }
     }
     return edges;
+}
+
+fn isMirroredBothSelfLoop(
+    direction: graph_mod.EdgeDirection,
+    node_id: []const u8,
+    edge: graph_segment_mod.Edge,
+) bool {
+    return direction == .both and std.mem.eql(u8, node_id, edge.neighbor_id);
 }
 
 fn clonePublicSegmentEdge(
@@ -12097,6 +12109,71 @@ test "serverless public graph reader preserves qualified endpoint identity" {
             graph_pattern_mod.default_max_explored_edge_bytes,
         ),
     );
+}
+
+test "serverless exact match counts one physical self loop for both direction" {
+    const alloc = std.testing.allocator;
+    var segment = graph_segment_mod.Segment{
+        .adjacencies = try alloc.alloc(graph_segment_mod.Adjacency, 1),
+    };
+    segment.adjacencies[0] = .{
+        .node_id = try alloc.dupe(u8, "same"),
+        .out_edges = try alloc.alloc(graph_segment_mod.Edge, 1),
+        .in_edges = try alloc.alloc(graph_segment_mod.Edge, 1),
+    };
+    segment.adjacencies[0].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, "same"),
+        .edge_type = try alloc.dupe(u8, "LOOP"),
+        .weight = 1,
+    };
+    segment.adjacencies[0].in_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, "same"),
+        .edge_type = try alloc.dupe(u8, "LOOP"),
+        .weight = 1,
+    };
+    defer graph_segment_mod.freeSegment(alloc, &segment);
+
+    var adjacency_index = try graph_segment_mod.AdjacencyIndex.init(alloc, segment);
+    defer adjacency_index.deinit(alloc);
+    const cached = CachedPublicGraphSegment{
+        .index_name = @constCast("g"),
+        .segment = segment,
+        .adjacency_index = adjacency_index,
+    };
+    var read_budget = ServerlessGraphReadBudget{ .cancellation = .none };
+    const reader = ServerlessPatternEdgeReader{
+        .cached = &cached,
+        .budget = &read_budget,
+        .source_table = "docs",
+    };
+    const nodes = [_]graph_pattern_mod.MatchNode{ .{ .alias = "a" }, .{ .alias = "b" } };
+    const match_edges = [_]graph_pattern_mod.MatchEdge{.{
+        .from = "a",
+        .to = "b",
+        .step = .{ .types = &.{"LOOP"}, .direction = .both },
+    }};
+    const pattern = graph_pattern_mod.ConjunctivePattern{
+        .anchor_alias = "a",
+        .nodes = &nodes,
+        .edges = &match_edges,
+    };
+    const aggregate_specs = [_]graph_pattern_mod.CountAggregateSpec{.{}};
+    const aggregates = try graph_pattern_mod.aggregateConjunctivePatternWithEdgeReader(
+        alloc,
+        reader,
+        &.{"same"},
+        pattern,
+        &aggregate_specs,
+        .{},
+    );
+    defer {
+        for (aggregates) |*aggregate| aggregate.deinit(alloc);
+        alloc.free(aggregates);
+    }
+    try std.testing.expectEqual(@as(u128, 1), aggregates[0].value);
+    // The work budget reflects both physical adjacency entries even though the
+    // logical relationship is emitted once.
+    try std.testing.expectEqual(@as(usize, 2), read_budget.edges_scanned);
 }
 
 test "serverless conjunctive anchors are enumerated in borrowed bounded pages" {

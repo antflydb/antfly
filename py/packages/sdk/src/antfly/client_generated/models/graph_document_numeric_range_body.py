@@ -12,14 +12,15 @@ T = TypeVar("T", bound="GraphDocumentNumericRangeBody")
 
 @_attrs_define
 class GraphDocumentNumericRangeBody:
-    """At least one of min or max is required and enforced by every Antfly execution boundary.
+    """At least one of min or max is required and enforced by every Antfly execution boundary. When both are present, min
+    must not exceed max.
 
-    Attributes:
-        path (str): RFC 6901 JSON Pointer to the stored-document value.
-        min_ (float | Unset):
-        max_ (float | Unset):
-        inclusive_min (bool | Unset):  Default: True.
-        inclusive_max (bool | Unset):  Default: False.
+        Attributes:
+            path (str): RFC 6901 JSON Pointer to the stored-document value.
+            min_ (float | Unset):
+            max_ (float | Unset):
+            inclusive_min (bool | Unset):  Default: True.
+            inclusive_max (bool | Unset):  Default: False.
     """
 
     path: str

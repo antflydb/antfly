@@ -17,7 +17,7 @@ class GraphDocumentNumericRangeFilter:
     """
     Attributes:
         numeric_range (GraphDocumentNumericRangeBody): At least one of min or max is required and enforced by every
-            Antfly execution boundary.
+            Antfly execution boundary. When both are present, min must not exceed max.
     """
 
     numeric_range: GraphDocumentNumericRangeBody

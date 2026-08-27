@@ -487,12 +487,20 @@ class TestAntflyClient:
             graph_term_range_filter("score", min_value="a")
         with pytest.raises(AntflyException, match="finite number"):
             graph_numeric_range_filter("/score", min_value=True)
+        with pytest.raises(AntflyException, match="min_value must not exceed max_value"):
+            graph_numeric_range_filter("/score", min_value=2, max_value=1)
         with pytest.raises(AntflyException, match="must be a boolean"):
             graph_numeric_range_filter("/score", min_value=1, inclusive_min="false")  # type: ignore[arg-type]
         with pytest.raises(AntflyException, match="must be a string"):
             graph_term_range_filter("/status", min_value=1)  # type: ignore[arg-type]
         with pytest.raises(AntflyException, match="timezone-aware"):
             graph_date_range_filter("/created_at", start=datetime(2026, 1, 1))
+        with pytest.raises(AntflyException, match="start must not exceed end"):
+            graph_date_range_filter(
+                "/created_at",
+                start=datetime(2026, 1, 2, tzinfo=UTC),
+                end=datetime(2026, 1, 1, tzinfo=UTC),
+            )
         with pytest.raises(AntflyException, match="supported Unix-nanosecond range"):
             graph_date_range_filter("/created_at", start=datetime(1969, 12, 31, tzinfo=UTC))
         with pytest.raises(AntflyException, match="supported Unix-nanosecond range"):
@@ -590,6 +598,18 @@ class TestAntflyClient:
 
         with pytest.raises(AntflyException, match="direction must be out, in, or both"):
             client.query(table="docs", graph_queries={"people": query})
+
+        anti_join_query = {
+            "match": {
+                "anchor": "person",
+                "nodes": {"person": {}, "author": {}},
+                "edges": [],
+                "where": {"not_exists": {"edges": [{"from": "person", "to": "author", "direction": "sideways"}]}},
+            },
+            "return": {"bindings": ["person"]},
+        }
+        with pytest.raises(AntflyException, match=r"not_exists\.edges\[0\]\.direction must be out, in, or both"):
+            client.query(table="docs", graph_queries={"people": anti_join_query})
 
     @pytest.mark.parametrize(
         ("start", "error"),

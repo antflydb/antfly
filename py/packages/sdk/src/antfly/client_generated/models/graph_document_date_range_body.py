@@ -16,7 +16,8 @@ T = TypeVar("T", bound="GraphDocumentDateRangeBody")
 class GraphDocumentDateRangeBody:
     """At least one of start or end is required and enforced by every Antfly execution boundary. Bounds are RFC 3339
     instants in Antfly's unsigned Unix-nanosecond domain, from 1970-01-01T00:00:00Z through
-    2554-07-21T23:34:33.709551615Z inclusive.
+    2554-07-21T23:34:33.709551615Z inclusive. When both are present, start must not exceed end after offset
+    normalization.
 
         Attributes:
             path (str): RFC 6901 JSON Pointer to the stored-document value.
