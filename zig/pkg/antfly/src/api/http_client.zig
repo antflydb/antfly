@@ -2389,6 +2389,10 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         server_budget_ms: ?u32,
     ) !TxnPreDecisionOutcome {
+        // Establish the strongest safe default before URI construction,
+        // request signing, or any other client-local allocation can fail.
+        // The executor advances this state at its actual send boundary.
+        if (delivery_tracker) |tracker| tracker.markNotSent();
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2420,6 +2424,9 @@ pub const ApiHttpClient = struct {
             .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
+        // Receiving any response proves that the request crossed the send
+        // boundary, even when a custom executor does not update the tracker.
+        if (delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
         switch (resp.status) {
             200 => return .applied,
@@ -2476,6 +2483,9 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         server_budget_ms: ?u32,
     ) !TxnPreDecisionOutcome {
+        // Match begin's delivery contract so callers can distinguish local
+        // request construction failures from an ambiguous transmitted write.
+        if (delivery_tracker) |tracker| tracker.markNotSent();
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2507,6 +2517,7 @@ pub const ApiHttpClient = struct {
             .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
+        if (delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
         switch (resp.status) {
             200 => return .applied,
@@ -3402,6 +3413,37 @@ test "api http client preserves retryable group transaction unavailability" {
     executor.marked_not_proposed = false;
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupTxnBegin(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupTxnPrepare(base_uri, 7, "docs", "{}"));
+
+    // Delivery provenance starts before client-local URI construction. An
+    // allocation failure here must never be mistaken for an ambiguous send by
+    // transaction coordination.
+    var begin_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var begin_setup_client = ApiHttpClient.init(begin_failing.allocator(), executor.executor());
+    var begin_delivery: http_common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.OutOfMemory, begin_setup_client.fetchGroupTxnBeginOutcomeWithDeliveryTracking(
+        base_uri,
+        7,
+        "docs",
+        "{}",
+        &begin_delivery,
+        1_000,
+        500,
+    ));
+    try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.not_sent, begin_delivery.load());
+
+    var prepare_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var prepare_setup_client = ApiHttpClient.init(prepare_failing.allocator(), executor.executor());
+    var prepare_delivery: http_common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.OutOfMemory, prepare_setup_client.fetchGroupTxnPrepareOutcomeWithDeliveryTracking(
+        base_uri,
+        7,
+        "docs",
+        "{}",
+        &prepare_delivery,
+        1_000,
+        500,
+    ));
+    try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.not_sent, prepare_delivery.load());
 }
 
 fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
