@@ -7,14 +7,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const version_3_magic = "AGS3";
+const version_4_magic = "AGS4";
 const header_len = version_3_magic.len + @sizeOf(u64);
 pub const hard_max_edges_per_document: usize = 1_000_000;
 pub const hard_max_relation_items_per_artifact: usize = 1_000_000;
 pub const hard_max_manifest_bytes: usize = 64 * 1024 * 1024;
-/// Aggregate guardrails for one precedence-reconciliation pass. A visible-edge
-/// limit alone cannot bound work when many sources contain the same identities.
-pub const hard_max_reconcile_entries: usize = 4_000_000;
-pub const hard_max_reconcile_bytes: usize = 256 * 1024 * 1024;
 
 pub fn effectiveEdgeLimit(configured: u32) usize {
     return if (configured == 0) hard_max_edges_per_document else @min(@as(usize, configured), hard_max_edges_per_document);
@@ -24,6 +21,9 @@ pub const Format = enum {
     /// v0.2.0 persisted only an edge count followed by length-prefixed keys.
     v0_2_0,
     v3,
+    /// Generation-fenced key manifest. Payloads live in per-edge contender
+    /// records so large graphs do not duplicate every source payload here.
+    v4,
 };
 
 pub const Entry = struct {
@@ -66,22 +66,6 @@ pub const EntryIterator = struct {
     }
 };
 
-pub const ReconcileBudget = struct {
-    max_entries: usize = hard_max_reconcile_entries,
-    max_bytes: usize = hard_max_reconcile_bytes,
-    entries: usize = 0,
-    bytes: usize = 0,
-
-    pub fn charge(self: *ReconcileBudget, raw: []const u8) !void {
-        const count = try v3EntryCount(raw);
-        const next_entries = std.math.add(usize, self.entries, count) catch return error.ResourceLimitExceeded;
-        const next_bytes = std.math.add(usize, self.bytes, raw.len) catch return error.ResourceLimitExceeded;
-        if (next_entries > self.max_entries or next_bytes > self.max_bytes) return error.ResourceLimitExceeded;
-        self.entries = next_entries;
-        self.bytes = next_bytes;
-    }
-};
-
 pub fn freeEntries(alloc: Allocator, entries: []Entry) void {
     for (entries) |*entry| entry.deinit(alloc);
     if (entries.len > 0) alloc.free(entries);
@@ -97,6 +81,20 @@ pub fn format(raw: []const u8) !Format {
     if (std.mem.startsWith(u8, raw, version_3_magic)) {
         if (raw.len < header_len) return error.InvalidGraphAssetState;
         return .v3;
+    }
+    if (std.mem.startsWith(u8, raw, version_4_magic)) {
+        if (raw.len < header_len) return error.InvalidGraphAssetState;
+        var pos: usize = header_len;
+        const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+        if (@as(usize, count) > hard_max_edges_per_document) return error.ResourceLimitExceeded;
+        if (@as(usize, count) > (raw.len - pos) / @sizeOf(u32)) return error.InvalidGraphAssetState;
+        for (0..count) |_| {
+            const key_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+            if (key_len > raw.len - pos) return error.InvalidGraphAssetState;
+            pos += key_len;
+        }
+        if (pos != raw.len) return error.InvalidGraphAssetState;
+        return .v4;
     }
     // The only released predecessor is v0.2.0's unversioned key-only
     // encoding. Validate the whole payload before treating arbitrary bytes as
@@ -137,22 +135,61 @@ pub fn decodeV020KeysAlloc(alloc: Allocator, raw: []const u8) ![][]u8 {
     return keys;
 }
 
-/// Stores the owning graph generation and the complete payload for each edge.
-/// Payload retention is required to restore the next-precedence source without
-/// rescanning when several sources emit the same logical edge key.
+pub fn decodeKeysAlloc(alloc: Allocator, raw: []const u8) ![][]u8 {
+    return switch (try format(raw)) {
+        .v0_2_0 => try decodeV020KeysAlloc(alloc, raw),
+        .v3 => blk: {
+            var entries = try entryIterator(raw);
+            const keys = if (entries.remaining > 0) try alloc.alloc([]u8, entries.remaining) else break :blk &.{};
+            var initialized: usize = 0;
+            errdefer {
+                for (keys[0..initialized]) |key| alloc.free(key);
+                alloc.free(keys);
+            }
+            for (keys) |*key| {
+                const entry = (try entries.next()) orelse return error.InvalidGraphAssetState;
+                key.* = try alloc.dupe(u8, entry.key);
+                initialized += 1;
+            }
+            break :blk keys;
+        },
+        .v4 => blk: {
+            var pos: usize = header_len;
+            const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+            const keys = if (count > 0) try alloc.alloc([]u8, count) else break :blk &.{};
+            var initialized: usize = 0;
+            errdefer {
+                for (keys[0..initialized]) |key| alloc.free(key);
+                alloc.free(keys);
+            }
+            for (keys) |*key| {
+                const key_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
+                if (key_len > raw.len - pos) return error.InvalidGraphAssetState;
+                key.* = try alloc.dupe(u8, raw[pos..][0..key_len]);
+                pos += key_len;
+                initialized += 1;
+            }
+            if (pos != raw.len) return error.InvalidGraphAssetState;
+            break :blk keys;
+        },
+    };
+}
+
+/// Stores the owning graph generation and edge keys. Complete payloads are
+/// retained by per-edge contender records, keeping this deletion manifest
+/// compact even when edge metadata is large.
 pub fn encodeAlloc(alloc: Allocator, generation: u64, writes: anytype) ![]u8 {
     if (writes.len > hard_max_edges_per_document) return error.ResourceLimitExceeded;
     var encoded_len: usize = header_len + @sizeOf(u32);
     for (writes) |write| {
-        encoded_len = std.math.add(usize, encoded_len, 2 * @sizeOf(u32)) catch return error.ResourceLimitExceeded;
+        encoded_len = std.math.add(usize, encoded_len, @sizeOf(u32)) catch return error.ResourceLimitExceeded;
         encoded_len = std.math.add(usize, encoded_len, write.key.len) catch return error.ResourceLimitExceeded;
-        encoded_len = std.math.add(usize, encoded_len, write.value.len) catch return error.ResourceLimitExceeded;
         if (encoded_len > hard_max_manifest_bytes) return error.ResourceLimitExceeded;
     }
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
     try out.ensureTotalCapacityPrecise(alloc, encoded_len);
-    try out.appendSlice(alloc, version_3_magic);
+    try out.appendSlice(alloc, version_4_magic);
     var generation_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &generation_bytes, generation, .big);
     try out.appendSlice(alloc, &generation_bytes);
@@ -160,8 +197,6 @@ pub fn encodeAlloc(alloc: Allocator, generation: u64, writes: anytype) ![]u8 {
     for (writes) |write| {
         try appendLength(&out, alloc, write.key.len);
         try out.appendSlice(alloc, write.key);
-        try appendLength(&out, alloc, write.value.len);
-        try out.appendSlice(alloc, write.value);
     }
     return try out.toOwnedSlice(alloc);
 }
@@ -199,14 +234,9 @@ pub fn entryIterator(raw: []const u8) !EntryIterator {
     return .{ .raw = raw, .pos = pos, .remaining = count };
 }
 
-fn v3EntryCount(raw: []const u8) !usize {
-    const iterator = try entryIterator(raw);
-    return iterator.remaining;
-}
-
 pub fn containsKey(raw: []const u8, target_key: []const u8) !bool {
     const state_format = try format(raw);
-    var pos: usize = if (state_format == .v3) header_len else 0;
+    var pos: usize = if (state_format == .v3 or state_format == .v4) header_len else 0;
     const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
     if (@as(usize, count) > hard_max_edges_per_document) return error.ResourceLimitExceeded;
     const minimum_entry_bytes: usize = if (state_format == .v3) 2 * @sizeOf(u32) else @sizeOf(u32);
@@ -231,7 +261,7 @@ pub fn containsKey(raw: []const u8, target_key: []const u8) !bool {
 pub fn coverageGeneration(raw: []const u8) !?u64 {
     return switch (try format(raw)) {
         .v0_2_0 => null,
-        .v3 => std.mem.readInt(u64, raw[version_3_magic.len..][0..@sizeOf(u64)], .big),
+        .v3, .v4 => std.mem.readInt(u64, raw[version_3_magic.len..][0..@sizeOf(u64)], .big),
     };
 }
 
@@ -252,7 +282,7 @@ fn appendLength(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: usize
     try appendU32Big(out, alloc, @intCast(value));
 }
 
-test "graph asset state v3 round trip preserves generation and payloads" {
+test "graph asset state v4 round trip preserves generation and keys without payload duplication" {
     const alloc = std.testing.allocator;
     const Pair = struct { key: []const u8, value: []const u8 };
     const raw = try encodeAlloc(alloc, 42, &[_]Pair{
@@ -260,12 +290,30 @@ test "graph asset state v3 round trip preserves generation and payloads" {
         .{ .key = "edge:b", .value = "payload:b" },
     });
     defer alloc.free(raw);
+    try std.testing.expectEqual(Format.v4, try format(raw));
+    const keys = try decodeKeysAlloc(alloc, raw);
+    defer freeKeys(alloc, keys);
+    try std.testing.expectEqualStrings("edge:a", keys[0]);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "payload:a") == null);
+    try std.testing.expect(try containsKey(raw, "edge:b"));
+    try std.testing.expectEqual(@as(u64, 42), (try coverageGeneration(raw)).?);
+}
+
+test "graph asset state reads payload-bearing v3 manifests" {
+    const alloc = std.testing.allocator;
+    const raw = version_3_magic ++
+        [_]u8{ 0, 0, 0, 0, 0, 0, 0, 42 } ++
+        [_]u8{ 0, 0, 0, 1 } ++
+        [_]u8{ 0, 0, 0, 6 } ++ "edge:a" ++
+        [_]u8{ 0, 0, 0, 9 } ++ "payload:a";
+    try std.testing.expectEqual(Format.v3, try format(raw));
     const entries = try decodeAlloc(alloc, raw);
     defer freeEntries(alloc, entries);
     try std.testing.expectEqualStrings("edge:a", entries[0].key);
     try std.testing.expectEqualStrings("payload:a", entries[0].value);
-    try std.testing.expect(try containsKey(raw, "edge:b"));
-    try std.testing.expectEqual(@as(u64, 42), (try coverageGeneration(raw)).?);
+    const keys = try decodeKeysAlloc(alloc, raw);
+    defer freeKeys(alloc, keys);
+    try std.testing.expectEqualStrings("edge:a", keys[0]);
 }
 
 test "graph asset state reads v0.2.0 key-only manifests" {
@@ -291,18 +339,4 @@ test "graph asset state rejects excessive entry counts before allocation" {
 test "graph asset state applies a finite safety limit when zero is configured" {
     try std.testing.expectEqual(hard_max_edges_per_document, effectiveEdgeLimit(0));
     try std.testing.expectEqual(@as(usize, 25), effectiveEdgeLimit(25));
-}
-
-test "graph reconciliation budget bounds overlapping manifest work" {
-    const alloc = std.testing.allocator;
-    const Pair = struct { key: []const u8, value: []const u8 };
-    const raw = try encodeAlloc(alloc, 42, &[_]Pair{
-        .{ .key = "edge:a", .value = "payload:a" },
-        .{ .key = "edge:b", .value = "payload:b" },
-    });
-    defer alloc.free(raw);
-
-    var budget = ReconcileBudget{ .max_entries = 3, .max_bytes = raw.len * 2 };
-    try budget.charge(raw);
-    try std.testing.expectError(error.ResourceLimitExceeded, budget.charge(raw));
 }

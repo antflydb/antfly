@@ -1093,9 +1093,7 @@ test "index wait prefers authoritative readiness contract" {
             .queryable = false,
             .complete = false,
             .incarnation = "g-000000000000002a",
-            .target_revision = 11,
-            .published_revision = 10,
-            .pending_reasons = &.{"publication"},
+            .pending_reasons = &.{.publication},
         },
     });
     try std.testing.expectEqualStrings("pending", summary.state);
@@ -1111,9 +1109,7 @@ test "index wait prefers authoritative readiness contract" {
             .queryable = true,
             .complete = false,
             .incarnation = "g-000000000000002a",
-            .target_revision = 11,
-            .published_revision = 7,
-            .pending_reasons = &.{ "coverage", "publication" },
+            .pending_reasons = &.{ .coverage, .publication },
         },
     });
     try std.testing.expectEqualStrings("queryable_partial", summary.state);
@@ -1134,9 +1130,7 @@ test "index wait prefers authoritative readiness contract" {
             .queryable = true,
             .complete = false,
             .incarnation = "g-000000000000002a",
-            .target_revision = 11,
-            .published_revision = 10,
-            .pending_reasons = &.{"coverage"},
+            .pending_reasons = &.{.coverage},
         },
     });
     try std.testing.expectEqualStrings("ready", summary.state);
@@ -1155,8 +1149,6 @@ test "index wait prefers authoritative readiness contract" {
             .queryable = true,
             .complete = true,
             .incarnation = "g-000000000000002a",
-            .target_revision = 11,
-            .published_revision = 11,
             .pending_reasons = &.{},
         },
     });
@@ -1172,8 +1164,6 @@ test "index wait prefers authoritative readiness contract" {
             .queryable = false,
             .complete = false,
             .incarnation = "g-000000000000002a",
-            .target_revision = 11,
-            .published_revision = 11,
             .pending_reasons = &.{},
         },
     });

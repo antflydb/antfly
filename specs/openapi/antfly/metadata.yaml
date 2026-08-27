@@ -8769,7 +8769,14 @@ components:
       content:
         application/json:
           schema:
-            $ref: "#/components/schemas/IndexMutationServiceUnavailableError"
+            # Create-table, create-index, and restore also share infrastructure
+            # failures (metadata leadership, HA admission, and restore-worker
+            # capacity). Keep the narrow typed retry contract first, then fall
+            # back to the public error envelope for generators that probe
+            # alternatives in declaration order.
+            anyOf:
+              - $ref: "#/components/schemas/IndexMutationServiceUnavailableError"
+              - $ref: "#/components/schemas/Error"
     BackupMetadataUnavailable:
       description: Backup could not establish the required metadata authority before starting side effects.
       headers:

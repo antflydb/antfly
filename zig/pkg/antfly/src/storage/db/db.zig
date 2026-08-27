@@ -32,6 +32,7 @@ const backend_erased_mod = @import("../backend_erased.zig");
 const db_config = @import("config.zig");
 const generation_lifecycle = @import("generation_lifecycle.zig");
 const graph_asset_state = @import("graph_asset_state.zig");
+const graph_edge_contender = @import("graph_edge_contender.zig");
 const graph_state_name = @import("graph_state_name.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
@@ -31779,16 +31780,16 @@ fn loadGraphAssetStateKeysAlloc(
     defer alloc.free(raw);
     if (try graph_asset_state.coverageGeneration(raw)) |generation| {
         if (generation != expected_generation) return null;
-        const entries = try graph_asset_state.decodeAlloc(alloc, raw);
-        defer graph_asset_state.freeEntries(alloc, entries);
-        const keys = if (entries.len > 0) try alloc.alloc([]const u8, entries.len) else return &.{};
+        const decoded_keys = try graph_asset_state.decodeKeysAlloc(alloc, raw);
+        defer graph_asset_state.freeKeys(alloc, decoded_keys);
+        const keys = if (decoded_keys.len > 0) try alloc.alloc([]const u8, decoded_keys.len) else return &.{};
         var initialized: usize = 0;
         errdefer {
             for (keys[0..initialized]) |key| alloc.free(@constCast(key));
             alloc.free(keys);
         }
-        for (keys, entries) |*key, entry| {
-            key.* = try alloc.dupe(u8, entry.key);
+        for (keys, decoded_keys) |*key, decoded_key| {
+            key.* = try alloc.dupe(u8, decoded_key);
             initialized += 1;
         }
         return keys;
@@ -31842,56 +31843,6 @@ const GraphEdgeWinners = struct {
     }
 };
 
-fn addGraphStateManifest(
-    alloc: Allocator,
-    store: ?*docstore_mod.DocStore,
-    winners: *GraphEdgeWinners,
-    budget: *graph_asset_state.ReconcileBudget,
-    state_key: []const u8,
-    source_priority: usize,
-    raw: []const u8,
-    expected_generation: u64,
-) !void {
-    _ = store;
-    const generation = try graph_asset_state.coverageGeneration(raw);
-    // A v0.2 manifest proves only a public index name, not an incarnation.
-    // Retain its key list for the next source replay's delete set, but never
-    // bless generation-less edge payloads into the current generation.
-    if (generation == null or generation.? != expected_generation) return;
-    try budget.charge(raw);
-
-    var entries = try graph_asset_state.entryIterator(raw);
-    while (try entries.next()) |entry| {
-        const key = entry.key;
-        const payload = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(
-            alloc,
-            entry.value,
-            expected_generation,
-        )) orelse continue;
-        errdefer alloc.free(payload);
-        if (winners.map.getPtr(key)) |winner| {
-            if (source_priority > winner.source_priority or
-                (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt))
-            {
-                alloc.free(payload);
-                continue;
-            }
-            const owner = try alloc.dupe(u8, state_key);
-            errdefer alloc.free(owner);
-            alloc.free(winner.owner_state_key);
-            alloc.free(winner.payload);
-            winner.* = .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority };
-            continue;
-        }
-
-        const owned_key = try alloc.dupe(u8, key);
-        errdefer alloc.free(owned_key);
-        const owner = try alloc.dupe(u8, state_key);
-        errdefer alloc.free(owner);
-        try winners.map.put(alloc, owned_key, .{ .owner_state_key = owner, .payload = payload, .source_priority = source_priority });
-    }
-}
-
 fn graphStateSourcePriorityAlloc(
     alloc: Allocator,
     state_key: []const u8,
@@ -31906,63 +31857,229 @@ fn graphStateSourcePriorityAlloc(
     return graph_state_name.materializedSourcePriority(state_name, sources);
 }
 
-fn loadGraphEdgeWinners(
+const GraphContenderChange = struct {
+    state_key: []const u8,
+    source_priority: usize,
+    payload: ?[]const u8,
+};
+
+const GraphContenderChanges = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(GraphContenderChange));
+
+const GraphContenderReconcileResult = struct {
+    winners: GraphEdgeWinners = .{},
+    writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty,
+    deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+    visible_count: usize = 0,
+
+    fn deinit(self: *GraphContenderReconcileResult, alloc: Allocator) void {
+        self.winners.deinit(alloc);
+        for (self.writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        self.writes.deinit(alloc);
+        for (self.deletes.items) |key| alloc.free(@constCast(key));
+        self.deletes.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn appendGraphContenderChange(
     alloc: Allocator,
-    store: *docstore_mod.DocStore,
-    doc_key: []const u8,
-    index_name: []const u8,
-    current_state_key: []const u8,
-    current_state_value: []const u8,
-    pending_writes: []const docstore_mod.KVPair,
-    retired_alias_keys: []const []const u8,
-    sources: []const index_manager_mod.GraphArtifactSource,
-    expected_generation: u64,
-) !GraphEdgeWinners {
-    var overrides = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-    defer overrides.deinit(alloc);
-    try overrides.append(alloc, .{ .key = current_state_key, .value = current_state_value });
-    try overrides.appendSlice(alloc, pending_writes);
-    return try loadGraphEdgeWinnersWithOverrides(alloc, store, doc_key, index_name, overrides.items, retired_alias_keys, sources, expected_generation);
+    changes: *GraphContenderChanges,
+    edge_key: []const u8,
+    state_key: []const u8,
+    source_priority: usize,
+    payload: ?[]const u8,
+) !void {
+    const gop = try changes.getOrPut(alloc, edge_key);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    for (gop.value_ptr.items) |*change| {
+        if (!std.mem.eql(u8, change.state_key, state_key)) continue;
+        change.source_priority = source_priority;
+        change.payload = payload;
+        return;
+    }
+    try gop.value_ptr.append(alloc, .{
+        .state_key = state_key,
+        .source_priority = source_priority,
+        .payload = payload,
+    });
 }
 
-fn loadGraphEdgeWinnersWithOverrides(
+fn graphContenderStateChanged(changes: []const GraphContenderChange, state_key: []const u8) bool {
+    for (changes) |change| {
+        if (std.mem.eql(u8, change.state_key, state_key)) return true;
+    }
+    return false;
+}
+
+fn considerGraphEdgeWinner(
+    alloc: Allocator,
+    winners: *GraphEdgeWinners,
+    edge_key: []const u8,
+    state_key: []const u8,
+    source_priority: usize,
+    payload: []const u8,
+) !void {
+    if (winners.map.getPtr(edge_key)) |winner| {
+        if (source_priority > winner.source_priority or
+            (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt)) return;
+        const owner = try alloc.dupe(u8, state_key);
+        errdefer alloc.free(owner);
+        const owned_payload = try alloc.dupe(u8, payload);
+        alloc.free(winner.owner_state_key);
+        alloc.free(winner.payload);
+        winner.* = .{ .owner_state_key = owner, .payload = owned_payload, .source_priority = source_priority };
+        return;
+    }
+    const owned_edge = try alloc.dupe(u8, edge_key);
+    errdefer alloc.free(owned_edge);
+    const owner = try alloc.dupe(u8, state_key);
+    errdefer alloc.free(owner);
+    const owned_payload = try alloc.dupe(u8, payload);
+    errdefer alloc.free(owned_payload);
+    try winners.map.put(alloc, owned_edge, .{
+        .owner_state_key = owner,
+        .payload = owned_payload,
+        .source_priority = source_priority,
+    });
+}
+
+fn reconcileGraphEdgeContenders(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
     doc_key: []const u8,
     index_name: []const u8,
-    state_overrides: []const docstore_mod.KVPair,
-    retired_alias_keys: []const []const u8,
+    expected_generation: u64,
+    changes: *GraphContenderChanges,
+) !GraphContenderReconcileResult {
+    var result = GraphContenderReconcileResult{};
+    errdefer result.deinit(alloc);
+
+    const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, doc_key, index_name);
+    defer alloc.free(count_key);
+    const raw_count = store.get(alloc, count_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (raw_count) |raw| alloc.free(raw);
+    const count_present = raw_count != null and (try graph_edge_contender.decodeVisibleCount(raw_count.?, expected_generation)) != null;
+    result.visible_count = if (raw_count) |raw| (try graph_edge_contender.decodeVisibleCount(raw, expected_generation)) orelse 0 else 0;
+    var saw_current_contender = false;
+    var bulk_existing_edges = std.StringHashMapUnmanaged(void).empty;
+    defer bulk_existing_edges.deinit(alloc);
+    const bulk_scan = count_present and graph_edge_contender.shouldBulkScan(changes.count(), result.visible_count);
+    if (bulk_scan) {
+        const index_prefix = try internal_keys.graphEdgeContenderIndexPrefixAlloc(alloc, doc_key, index_name);
+        defer alloc.free(index_prefix);
+        const existing = try store.scanPrefix(alloc, index_prefix);
+        defer docstore_mod.DocStore.freeResults(alloc, existing);
+        for (existing) |contender| {
+            if (std.mem.eql(u8, contender.key, count_key)) continue;
+            const view = (try graph_edge_contender.decode(contender.value, expected_generation)) orelse continue;
+            const edge_key = changes.getKey(view.edge_key) orelse continue;
+            const edge_changes = changes.get(edge_key).?;
+            const expected_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, view.state_key);
+            defer alloc.free(expected_key);
+            if (!std.mem.eql(u8, contender.key, expected_key)) return error.InvalidGraphEdgeContender;
+            const authenticated = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(alloc, view.payload, expected_generation)) orelse return error.InvalidGraphEdgeContender;
+            defer alloc.free(authenticated);
+            saw_current_contender = true;
+            try bulk_existing_edges.put(alloc, edge_key, {});
+            if (graphContenderStateChanged(edge_changes.items, view.state_key)) continue;
+            try considerGraphEdgeWinner(alloc, &result.winners, edge_key, view.state_key, view.source_priority, authenticated);
+        }
+    }
+
+    var it = changes.iterator();
+    while (it.next()) |entry| {
+        const edge_key = entry.key_ptr.*;
+        const edge_changes = entry.value_ptr.items;
+        var existed_before = bulk_existing_edges.contains(edge_key);
+        if (!bulk_scan and count_present) {
+            const prefix = try internal_keys.graphEdgeContenderEdgePrefixAlloc(alloc, doc_key, index_name, edge_key);
+            defer alloc.free(prefix);
+            const existing = try store.scanPrefix(alloc, prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, existing);
+            for (existing) |contender| {
+                const view = (try graph_edge_contender.decode(contender.value, expected_generation)) orelse continue;
+                if (!std.mem.eql(u8, view.edge_key, edge_key)) return error.InvalidGraphEdgeContender;
+                const expected_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, view.state_key);
+                defer alloc.free(expected_key);
+                if (!std.mem.eql(u8, contender.key, expected_key)) return error.InvalidGraphEdgeContender;
+                const authenticated = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(alloc, view.payload, expected_generation)) orelse return error.InvalidGraphEdgeContender;
+                defer alloc.free(authenticated);
+                saw_current_contender = true;
+                existed_before = true;
+                if (graphContenderStateChanged(edge_changes, view.state_key)) continue;
+                try considerGraphEdgeWinner(alloc, &result.winners, edge_key, view.state_key, view.source_priority, authenticated);
+            }
+        }
+
+        for (edge_changes) |change| {
+            const contender_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, change.state_key);
+            if (change.payload) |payload| {
+                const authenticated = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(alloc, payload, expected_generation)) orelse return error.InvalidGraphEdgeContender;
+                defer alloc.free(authenticated);
+                const contender_value = try graph_edge_contender.encodeAlloc(alloc, expected_generation, change.source_priority, edge_key, change.state_key, authenticated);
+                try result.writes.append(alloc, .{ .key = contender_key, .value = contender_value });
+                try considerGraphEdgeWinner(alloc, &result.winners, edge_key, change.state_key, change.source_priority, authenticated);
+            } else {
+                try result.deletes.append(alloc, contender_key);
+            }
+        }
+
+        const exists_after = result.winners.map.contains(edge_key);
+        if (!existed_before and exists_after) {
+            result.visible_count = std.math.add(usize, result.visible_count, 1) catch return error.ResourceLimitExceeded;
+        } else if (existed_before and !exists_after) {
+            if (result.visible_count == 0) return error.InvalidGraphEdgeContenderCount;
+            result.visible_count -= 1;
+        }
+    }
+    if (saw_current_contender and !count_present) return error.InvalidGraphEdgeContenderCount;
+
+    const encoded_count = try graph_edge_contender.encodeVisibleCount(expected_generation, result.visible_count);
+    try result.writes.append(alloc, .{
+        .key = try alloc.dupe(u8, count_key),
+        .value = try alloc.dupe(u8, &encoded_count),
+    });
+    return result;
+}
+
+fn reconcileSingleGraphStateContenders(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    doc_key: []const u8,
+    index_name: []const u8,
+    state_key: []const u8,
+    retired_alias_key: []const u8,
+    previous_keys: []const []const u8,
+    legacy_previous_keys: []const []const u8,
+    graph_writes: []const docstore_mod.KVPair,
     sources: []const index_manager_mod.GraphArtifactSource,
     expected_generation: u64,
-) !GraphEdgeWinners {
-    var winners = GraphEdgeWinners{};
-    errdefer winners.deinit(alloc);
-    var budget = graph_asset_state.ReconcileBudget{};
-    const prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(alloc, doc_key, index_name);
-    defer alloc.free(prefix);
-    const existing = try store.scanPrefix(alloc, prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, existing);
-    var override_values = std.StringHashMapUnmanaged([]const u8).empty;
-    defer override_values.deinit(alloc);
-    for (state_overrides) |override| try override_values.put(alloc, override.key, override.value);
-    for (existing) |entry| {
-        if (containsDeleteKey(retired_alias_keys, entry.key)) continue;
-        var raw: []const u8 = entry.value;
-        if (override_values.get(entry.key)) |override| {
-            raw = override;
-            _ = override_values.remove(entry.key);
-        }
-        const source_priority = try graphStateSourcePriorityAlloc(alloc, entry.key, prefix, sources) orelse continue;
-        try addGraphStateManifest(alloc, store, &winners, &budget, entry.key, source_priority, raw, expected_generation);
+) !GraphContenderReconcileResult {
+    var changes = GraphContenderChanges.empty;
+    defer {
+        var it = changes.valueIterator();
+        while (it.next()) |items| items.deinit(alloc);
+        changes.deinit(alloc);
     }
-    var override_it = override_values.iterator();
-    while (override_it.next()) |override| {
-        if (!std.mem.startsWith(u8, override.key_ptr.*, prefix)) continue;
-        if (containsDeleteKey(retired_alias_keys, override.key_ptr.*)) continue;
-        const source_priority = try graphStateSourcePriorityAlloc(alloc, override.key_ptr.*, prefix, sources) orelse continue;
-        try addGraphStateManifest(alloc, store, &winners, &budget, override.key_ptr.*, source_priority, override.value_ptr.*, expected_generation);
+    const state_prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(alloc, doc_key, index_name);
+    defer alloc.free(state_prefix);
+    const source_priority = try graphStateSourcePriorityAlloc(alloc, state_key, state_prefix, sources) orelse return error.InvalidGraphStateName;
+    for (previous_keys) |edge_key| {
+        try appendGraphContenderChange(alloc, &changes, edge_key, retired_alias_key, source_priority, null);
+        try appendGraphContenderChange(alloc, &changes, edge_key, state_key, source_priority, null);
     }
-    return winners;
+    for (legacy_previous_keys) |edge_key| {
+        try appendGraphContenderChange(alloc, &changes, edge_key, retired_alias_key, source_priority, null);
+        try appendGraphContenderChange(alloc, &changes, edge_key, state_key, source_priority, null);
+    }
+    for (graph_writes) |write| try appendGraphContenderChange(alloc, &changes, write.key, state_key, source_priority, write.value);
+    return try reconcileGraphEdgeContenders(alloc, store, doc_key, index_name, expected_generation, &changes);
 }
 
 fn readU32Big(bytes: []const u8, pos: *usize) !u32 {
@@ -34161,27 +34278,34 @@ fn reconcilePrecomputedGraphGroup(
     owned_delete_keys: *std.ArrayListUnmanaged([]u8),
     changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    const overrides = try scratch.alloc(docstore_mod.KVPair, group.updates.items.len);
-    const retired_alias_keys = try scratch.alloc([]const u8, group.updates.items.len);
     var affected = std.ArrayListUnmanaged([]const u8).empty;
     var affected_set = std.StringHashMapUnmanaged(void).empty;
-    for (group.updates.items, 0..) |update, i| {
-        overrides[i] = .{ .key = update.state_key, .value = update.state_value };
-        retired_alias_keys[i] = update.retired_alias_key;
+    var contender_changes = GraphContenderChanges.empty;
+    defer {
+        var it = contender_changes.valueIterator();
+        while (it.next()) |changes| changes.deinit(scratch);
+        contender_changes.deinit(scratch);
+    }
+    const state_prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(scratch, group.doc_key, group.index_name);
+    for (group.updates.items) |update| {
+        const source_priority = try graphStateSourcePriorityAlloc(scratch, update.state_key, state_prefix, group.sources) orelse return error.InvalidGraphStateName;
         for (update.previous_keys) |key| {
             if (try affected_set.fetchPut(scratch, key, {}) == null) try affected.append(scratch, key);
+            try appendGraphContenderChange(scratch, &contender_changes, key, update.retired_alias_key, source_priority, null);
+            try appendGraphContenderChange(scratch, &contender_changes, key, update.state_key, source_priority, null);
         }
         for (update.graph_writes) |write| {
             if (try affected_set.fetchPut(scratch, write.key, {}) == null) try affected.append(scratch, write.key);
+            try appendGraphContenderChange(scratch, &contender_changes, write.key, update.state_key, source_priority, write.value);
         }
     }
 
-    var winners = try loadGraphEdgeWinnersWithOverrides(scratch, self.core.store, group.doc_key, group.index_name, overrides, retired_alias_keys, group.sources, group.generation);
-    defer winners.deinit(scratch);
-    if (group.enforce_edge_limit and winners.map.count() > group.edge_limit) return error.ResourceLimitExceeded;
+    var reconciled = try reconcileGraphEdgeContenders(scratch, self.core.store, group.doc_key, group.index_name, group.generation, &contender_changes);
+    defer reconciled.deinit(scratch);
+    if (group.enforce_edge_limit and reconciled.visible_count > group.edge_limit) return error.ResourceLimitExceeded;
     for (affected.items) |edge_key| {
         try appendUniqueOwnedKey(self.alloc, changed_artifact_keys, edge_key);
-        if (winners.map.get(edge_key)) |winner| {
+        if (reconciled.winners.map.get(edge_key)) |winner| {
             removePendingDeleteKey(self.alloc, delete_keys, owned_delete_keys, edge_key);
             const owned_key = try self.alloc.dupe(u8, edge_key);
             var owned_key_owned = true;
@@ -34198,6 +34322,25 @@ fn reconcilePrecomputedGraphGroup(
             try owned_delete_keys.append(self.alloc, owned_key);
             try delete_keys.append(self.alloc, owned_key);
         }
+    }
+    for (reconciled.writes.items) |write| {
+        removePendingDeleteKey(self.alloc, delete_keys, owned_delete_keys, write.key);
+        const owned_key = try self.alloc.dupe(u8, write.key);
+        var key_owned = true;
+        errdefer if (key_owned) self.alloc.free(owned_key);
+        const owned_value = try self.alloc.dupe(u8, write.value);
+        var value_owned = true;
+        errdefer if (value_owned) self.alloc.free(owned_value);
+        try owned_graph_artifact_writes.append(self.alloc, .{ .key = owned_key, .value = owned_value });
+        key_owned = false;
+        value_owned = false;
+        try upsertPendingStoreWrite(self.alloc, store_writes, pending_graph_positions, owned_key, owned_value);
+    }
+    for (reconciled.deletes.items) |key| {
+        if (containsStoreWriteKey(reconciled.writes.items, key) or containsOwnedKey(owned_delete_keys.items, key)) continue;
+        const owned_key = try self.alloc.dupe(u8, key);
+        try owned_delete_keys.append(self.alloc, owned_key);
+        try delete_keys.append(self.alloc, owned_key);
     }
     for (group.updates.items) |update| {
         const state_key = try self.alloc.dupe(u8, update.state_key);
@@ -35664,6 +35807,10 @@ fn collectEnrichmentArtifactDeleteKeysForDocContext(
     const graph_asset_state_prefix = try internal_keys.graphAssetStateRootPrefixAlloc(alloc, doc_key);
     defer alloc.free(graph_asset_state_prefix);
     try collectDeleteKeysForPrefix(alloc, store, graph_asset_state_prefix, delete_keys, owned_delete_keys, null);
+
+    const graph_edge_contender_prefix = try internal_keys.graphEdgeContenderRootPrefixAlloc(alloc, doc_key);
+    defer alloc.free(graph_edge_contender_prefix);
+    try collectDeleteKeysForPrefix(alloc, store, graph_edge_contender_prefix, delete_keys, owned_delete_keys, null);
 }
 
 fn collectDeleteKeysForPrefix(
@@ -41948,15 +42095,27 @@ fn materializeGraphSourceArtifactsForIndex(
         };
         var state_value_owned = true;
         defer if (state_value_owned) alloc.free(state_value);
-        var winners = loadGraphEdgeWinners(alloc, store, artifact_ref.document_id, index_name, state_key, state_value, &.{}, &.{legacy_state_key}, sources, generation) catch |err| switch (err) {
+        var reconciled = reconcileSingleGraphStateContenders(
+            alloc,
+            store,
+            artifact_ref.document_id,
+            index_name,
+            state_key,
+            legacy_state_key,
+            previous_keys orelse &.{},
+            legacy_previous_keys orelse &.{},
+            writes.items[0..graph_write_count],
+            sources,
+            generation,
+        ) catch |err| switch (err) {
             error.ResourceLimitExceeded => {
                 if (try recordGraphResourceLimitForRepair(options, index_name, artifact_ref, artifact_key)) return error.ArtifactRepairRequired;
                 return err;
             },
             else => return err,
         };
-        defer winners.deinit(alloc);
-        if (raw != null and winners.map.count() > graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) {
+        defer reconciled.deinit(alloc);
+        if (raw != null and reconciled.visible_count > graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) {
             if (try recordGraphResourceLimitForRepair(options, index_name, artifact_ref, artifact_key)) return error.ArtifactRepairRequired;
             return error.ResourceLimitExceeded;
         }
@@ -41969,7 +42128,7 @@ fn materializeGraphSourceArtifactsForIndex(
         if (legacy_previous_keys) |keys| for (keys) |key| try appendUniqueOwnedKey(alloc, &affected, key);
         for (writes.items[0..graph_write_count]) |write| try appendUniqueOwnedKey(alloc, &affected, write.key);
         for (affected.items) |edge_key| {
-            if (winners.map.get(edge_key)) |winner| {
+            if (reconciled.winners.map.get(edge_key)) |winner| {
                 const payload = try alloc.dupe(u8, winner.payload);
                 var payload_owned = true;
                 errdefer if (payload_owned) alloc.free(payload);
@@ -41982,6 +42141,17 @@ fn materializeGraphSourceArtifactsForIndex(
         }
         try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, state_key, state_value);
         state_value_owned = false;
+        for (reconciled.writes.items) |write| {
+            const value = try alloc.dupe(u8, write.value);
+            var value_owned = true;
+            errdefer if (value_owned) alloc.free(value);
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, write.key, value);
+            value_owned = false;
+        }
+        for (reconciled.deletes.items) |key| {
+            if (containsStoreWriteKey(writes.items, key) or containsDeleteKey(deletes.items, key)) continue;
+            try deletes.append(alloc, try alloc.dupe(u8, key));
+        }
         if (!containsDeleteKey(deletes.items, legacy_state_key)) {
             try deletes.append(alloc, try alloc.dupe(u8, legacy_state_key));
         }
@@ -42102,9 +42272,21 @@ fn materializeMentionEdgesForResolutionKey(
     const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
     var state_value_owned = true;
     defer if (state_value_owned) alloc.free(state_value);
-    var winners = try loadGraphEdgeWinners(alloc, store, parsed_key.doc_key, index_name, state_key, state_value, &.{}, &.{legacy_state_key}, index_manager.graphArtifactSources(index_name), generation);
-    defer winners.deinit(alloc);
-    if (raw_resolution != null and winners.map.count() > graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) return error.ResourceLimitExceeded;
+    var reconciled = try reconcileSingleGraphStateContenders(
+        alloc,
+        store,
+        parsed_key.doc_key,
+        index_name,
+        state_key,
+        legacy_state_key,
+        previous_keys orelse &.{},
+        legacy_previous_keys orelse &.{},
+        writes.items[0..graph_write_count],
+        index_manager.graphArtifactSources(index_name),
+        generation,
+    );
+    defer reconciled.deinit(alloc);
+    if (raw_resolution != null and reconciled.visible_count > graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) return error.ResourceLimitExceeded;
     var affected = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (affected.items) |key| alloc.free(key);
@@ -42114,7 +42296,7 @@ fn materializeMentionEdgesForResolutionKey(
     if (legacy_previous_keys) |keys| for (keys) |key| try appendUniqueOwnedKey(alloc, &affected, key);
     for (writes.items[0..graph_write_count]) |write| try appendUniqueOwnedKey(alloc, &affected, write.key);
     for (affected.items) |edge_key| {
-        if (winners.map.get(edge_key)) |winner| {
+        if (reconciled.winners.map.get(edge_key)) |winner| {
             const payload = try alloc.dupe(u8, winner.payload);
             var payload_owned = true;
             errdefer if (payload_owned) alloc.free(payload);
@@ -42127,6 +42309,17 @@ fn materializeMentionEdgesForResolutionKey(
     }
     try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, state_key, state_value);
     state_value_owned = false;
+    for (reconciled.writes.items) |write| {
+        const value = try alloc.dupe(u8, write.value);
+        var value_owned = true;
+        errdefer if (value_owned) alloc.free(value);
+        try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, write.key, value);
+        value_owned = false;
+    }
+    for (reconciled.deletes.items) |key| {
+        if (containsStoreWriteKey(writes.items, key) or containsDeleteKey(deletes.items, key)) continue;
+        try deletes.append(alloc, try alloc.dupe(u8, key));
+    }
     if (!containsDeleteKey(deletes.items, legacy_state_key)) try deletes.append(alloc, try alloc.dupe(u8, legacy_state_key));
 
     const mention_state_name = try mentionArtifactStateNameAlloc(alloc, source.artifact_name, cfg.resolution_artifact);
@@ -53173,32 +53366,7 @@ test "db lsm generated chunked enrichment publishes replay stream state" {
     try std.testing.expect(result.total_hits > 0);
 }
 
-test "graph state winner arbitration ignores stale index generations" {
-    const alloc = std.testing.allocator;
-    const stale_payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 41, 1, 0, 0, "{}");
-    defer alloc.free(stale_payload);
-    const stale = try encodeGraphAssetStateKeysAlloc(alloc, 41, &.{
-        docstore_mod.KVPair{ .key = "edge:a", .value = stale_payload },
-    });
-    defer alloc.free(stale);
-    const current_payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, 42, 1, 0, 0, "{}");
-    defer alloc.free(current_payload);
-    const current = try encodeGraphAssetStateKeysAlloc(alloc, 42, &.{
-        docstore_mod.KVPair{ .key = "edge:a", .value = current_payload },
-    });
-    defer alloc.free(current);
-
-    var winners = GraphEdgeWinners{};
-    defer winners.deinit(alloc);
-    var budget = graph_asset_state.ReconcileBudget{};
-    try addGraphStateManifest(alloc, null, &winners, &budget, "state:stale", 0, stale, 42);
-    try std.testing.expectEqual(@as(usize, 0), winners.map.count());
-
-    try addGraphStateManifest(alloc, null, &winners, &budget, "state:current", 1, current, 42);
-    try std.testing.expectEqualSlices(u8, current_payload, winners.map.get("edge:a").?.payload);
-}
-
-test "graph state winner arbitration rejects unauthenticated v0.2.0 manifests but retains their delete set" {
+test "graph state migration retains the v0.2.0 delete set" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -53208,17 +53376,6 @@ test "graph state winner arbitration rejects unauthenticated v0.2.0 manifests bu
 
     const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
     defer alloc.free(edge_key);
-    const legacy_edge =
-        "AFENRCH\x00" ++
-        "\x01\x00\x05\x00" ++
-        "\x00\x00\x00\x00\x00\x00\x00\x00" ++
-        "\x23\x00\x00\x00" ++
-        "\x00\x00\x00\x00\x00\x00\xf8\x3f" ++
-        "\x0a\x00\x00\x00\x00\x00\x00\x00" ++
-        "\x14\x00\x00\x00\x00\x00\x00\x00" ++
-        "\x07\x00\x00\x00{\"k\":1}";
-    try store.put(edge_key, legacy_edge);
-
     var legacy_state = std.ArrayListUnmanaged(u8).empty;
     defer legacy_state.deinit(alloc);
     try appendU32Big(&legacy_state, alloc, 1);
@@ -53226,23 +53383,6 @@ test "graph state winner arbitration rejects unauthenticated v0.2.0 manifests bu
     try legacy_state.appendSlice(alloc, edge_key);
     const legacy_state_key = "state:v0.2.0";
     try store.put(legacy_state_key, legacy_state.items);
-
-    var winners = GraphEdgeWinners{};
-    defer winners.deinit(alloc);
-    var budget = graph_asset_state.ReconcileBudget{};
-    try addGraphStateManifest(alloc, &store, &winners, &budget, legacy_state_key, 0, legacy_state.items, 42);
-    try std.testing.expectEqual(@as(usize, 0), winners.map.count());
-
-    const authenticated_state = try encodeGraphAssetStateKeysAlloc(alloc, 42, &.{
-        .{ .key = edge_key, .value = legacy_edge },
-    });
-    defer alloc.free(authenticated_state);
-    try addGraphStateManifest(alloc, &store, &winners, &budget, "state:current", 0, authenticated_state, 42);
-    const authenticated = winners.map.get(edge_key) orelse return error.TestUnexpectedResult;
-    var decoded = try enrichment_artifact_codec.decodeGraphEdgeAlloc(alloc, authenticated.payload);
-    defer decoded.deinit(alloc);
-    try std.testing.expectEqual(@as(u64, 42), decoded.generation);
-    try std.testing.expectEqual(@as(f64, 1.5), decoded.weight);
 
     const retained_keys = (try loadGraphAssetStateKeysAlloc(alloc, &store, legacy_state_key, 42)) orelse return error.TestUnexpectedResult;
     defer {
@@ -55369,6 +55509,23 @@ test "db multi-source graph precedence falls back after winner deletion and reop
             try std.testing.expectEqual(@as(f64, 2), edges[0].weight);
             try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"winner\":\"primary\"") != null);
         }
+        const generation = (db.core.index_manager.graphIndex("relations_graph") orelse return error.TestUnexpectedResult).config.coverage_generation;
+        const contender_count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, "doc:a", "relations_graph");
+        defer alloc.free(contender_count_key);
+        {
+            const raw_count = try db.core.store.get(alloc, contender_count_key);
+            defer alloc.free(raw_count);
+            try std.testing.expectEqual(@as(?usize, 1), try graph_edge_contender.decodeVisibleCount(raw_count, generation));
+        }
+        const logical_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+        defer alloc.free(logical_edge_key);
+        const contender_prefix = try internal_keys.graphEdgeContenderEdgePrefixAlloc(alloc, "doc:a", "relations_graph", logical_edge_key);
+        defer alloc.free(contender_prefix);
+        {
+            const contenders = try db.core.store.scanPrefix(alloc, contender_prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, contenders);
+            try std.testing.expectEqual(@as(usize, 2), contenders.len);
+        }
 
         // Removing the higher-precedence artifact must reveal the retained
         // lower-precedence payload instead of deleting the logical edge.
@@ -55388,6 +55545,11 @@ test "db multi-source graph precedence falls back after winner deletion and reop
         try std.testing.expectEqual(@as(usize, 1), edges.len);
         try std.testing.expectEqual(@as(f64, 1), edges[0].weight);
         try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"winner\":\"fallback\"") != null);
+        {
+            const contenders = try db.core.store.scanPrefix(alloc, contender_prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, contenders);
+            try std.testing.expectEqual(@as(usize, 1), contenders.len);
+        }
         try db.sync(true);
     }
 
@@ -55991,7 +56153,7 @@ test "db async asset producer mention edges come from resolution artifacts" {
 
     const canonical_state = try db.core.store.get(alloc, canonical_state_key);
     defer alloc.free(canonical_state);
-    try std.testing.expectEqual(graph_asset_state.Format.v3, try graph_asset_state.format(canonical_state));
+    try std.testing.expectEqual(graph_asset_state.Format.v4, try graph_asset_state.format(canonical_state));
 
     const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
     defer alloc.free(graph_edge_key);

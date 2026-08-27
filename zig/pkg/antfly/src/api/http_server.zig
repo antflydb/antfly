@@ -31092,7 +31092,7 @@ test "api http server serves table index metadata routes" {
 
         fn snapshot() metadata_api.AdminSnapshot {
             const indexes_json =
-                "{\"search_idx\":{\"type\":\"full_text\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384,\"enrichments\":[{\"name\":\"body_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"body_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"body_chunks_v1\",\"expected_dims\":384}]},\"alg\":{\"type\":\"algebraic\"}}";
+                "{\"search_idx\":{\"type\":\"full_text\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384,\"sources\":[{\"artifact\":\"body_dense_v1\"}],\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"enrichments\":[{\"name\":\"body_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"body_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"body_chunks_v1\",\"expected_dims\":384}]},\"alg\":{\"type\":\"algebraic\"}}";
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{
@@ -31213,7 +31213,7 @@ test "api http server serves table index metadata routes" {
     try std.testing.expectEqual(@as(u16, 404), algebraic_child_resp.status);
 }
 
-test "api http server index status is cache only" {
+test "api http server index status falls back when the metadata cache is cold" {
     const FakeSource = struct {
         admin_snapshot_calls: usize = 0,
         cached_snapshot_calls: usize = 0,
@@ -31242,7 +31242,7 @@ test "api http server index status is cache only" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}}",
+                    .indexes_json = "{\"embed_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":384}}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -31270,9 +31270,9 @@ test "api http server index status is cache only" {
         .uri = "/tables/docs/indexes/embed_idx",
     });
     defer detail_resp.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u16, 404), detail_resp.status);
+    try std.testing.expectEqual(@as(u16, 200), detail_resp.status);
     try std.testing.expectEqual(@as(usize, 1), source.cached_snapshot_calls);
-    try std.testing.expectEqual(@as(usize, 0), source.admin_snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.admin_snapshot_calls);
 }
 
 test "api http server reports table storage empty from read visibility" {
@@ -31615,8 +31615,12 @@ test "api http server storage status does not block on a direct lsm probe" {
     try std.testing.expectEqual(@as(u32, 0), reads.lsm_status_calls.load(.monotonic));
 }
 
-test "api http server serves local index runtime backfill status" {
+test "api http server serves local index runtime status" {
     const alloc = std.testing.allocator;
+    const index_config_json = "{\"type\":\"full_text\"}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, alloc, index_config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexes_api.indexRuntimeIdentity(alloc, "search_idx", parsed_config.value)).?;
     const LocalIndexStatusResponse = struct {
         const Stats = struct {
             rebuilding: ?bool = null,
@@ -31650,12 +31654,8 @@ test "api http server serves local index runtime backfill status" {
         .name = "search_idx",
         .kind = .full_text,
         .config_json = "{}",
+        .coverage_generation = identity.incarnation,
     });
-
-    const index_root = try std.fmt.allocPrint(alloc, "{s}/indexes/search_idx", .{path});
-    defer alloc.free(index_root);
-    const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
-    try rebuild_state.update("doc:a");
 
     var read_source = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.noopReadableLeaseRequester());
 
@@ -31682,7 +31682,7 @@ test "api http server serves local index runtime backfill status" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\"}}",
+                    .indexes_json = "{\"search_idx\":" ++ index_config_json ++ "}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -33636,6 +33636,10 @@ test "api runtime status quarantine wins same-producer status generation" {
 
 test "api index status uses read runtime status without consulting write source" {
     const alloc = std.testing.allocator;
+    const index_config_json = "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, alloc, index_config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexes_api.indexRuntimeIdentity(alloc, "vec", parsed_config.value)).?;
 
     const Response = struct {
         const Stats = struct {
@@ -33679,7 +33683,7 @@ test "api index status uses read runtime status without consulting write source"
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"vec\":" ++ index_config_json ++ "}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -33704,6 +33708,7 @@ test "api index status uses read runtime status without consulting write source"
 
     const FakeReads = struct {
         status_calls: std.atomic.Value(u32) = .init(0),
+        identity: indexes_api.IndexRuntimeIdentity,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -33742,6 +33747,9 @@ test "api index status uses read runtime status without consulting write source"
                 .replay_applied_sequence = 3,
                 .replay_target_sequence = 7,
                 .replay_catch_up_required = true,
+                .coverage_generation = self.identity.incarnation,
+                .coverage_config_hash = self.identity.config_hash,
+                .coverage_identity_ready = true,
             };
 
             const items = try inner_alloc.alloc(runtime_status.LocalTableRuntimeStatus, 1);
@@ -33820,7 +33828,7 @@ test "api index status uses read runtime status without consulting write source"
     };
 
     var source = FakeSource{};
-    var reads = FakeReads{};
+    var reads = FakeReads{ .identity = identity };
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
 
@@ -33837,9 +33845,8 @@ test "api index status uses read runtime status without consulting write source"
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.doc_count);
     try std.testing.expectEqual(@as(?u64, 9), parsed.value.status.total_indexed);
     try std.testing.expectEqual(@as(?u64, 17), parsed.value.status.node_count);
-    // This legacy-shaped observation has no generation-scoped coverage
-    // witness. Preserve its authoritative replay debt instead of inferring
-    // readiness from physical index cardinality alone.
+    // A current-generation cached observation is authoritative for replay
+    // debt, so the status fast path does not need to consult the writer.
     try std.testing.expectEqual(@as(?u64, 3), parsed.value.status.replay_applied_sequence);
     try std.testing.expectEqual(@as(?u64, 7), parsed.value.status.replay_target_sequence);
     try std.testing.expectEqual(@as(?bool, true), parsed.value.status.replay_catch_up_required);
@@ -34221,6 +34228,10 @@ test "api index status prefers current same-name incarnation from write source" 
 
 test "api index status uses propagated remote store runtime status" {
     const alloc = std.testing.allocator;
+    const index_config_json = "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, alloc, index_config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexes_api.indexRuntimeIdentity(alloc, "vec", parsed_config.value)).?;
 
     const Response = struct {
         const Stats = struct {
@@ -34242,6 +34253,11 @@ test "api index status uses propagated remote store runtime status" {
     };
 
     const FakeSource = struct {
+        identity: indexes_api.IndexRuntimeIdentity,
+        index_reports: [1]metadata_table_manager.RuntimeIndexStatusReport = undefined,
+        group_reports: [1]metadata_table_manager.RuntimeGroupStatusReport = undefined,
+        stores: [1]metadata_table_manager.StoreRecord = undefined,
+
         fn iface(self: *@This()) StatusSource {
             return .{
                 .ptr = self,
@@ -34258,13 +34274,14 @@ test "api index status uses propagated remote store runtime status" {
             return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"vec\":" ++ index_config_json ++ "}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -34273,31 +34290,7 @@ test "api index status uses propagated remote store runtime status" {
                     .start_key = "",
                     .end_key = null,
                 }})[0..]),
-                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{.{
-                    .store_id = 20,
-                    .node_id = 30,
-                    .runtime_statuses = @constCast((&[_]metadata_table_manager.RuntimeGroupStatusReport{.{
-                        .table_id = 1,
-                        .table_name = "docs",
-                        .group_id = 10,
-                        .store_id = 20,
-                        .node_id = 30,
-                        .updated_at_ns = 99,
-                        .freshness = "fresh",
-                        .doc_count = 12,
-                        .index_count = 1,
-                        .async_dense_catch_up_active = true,
-                        .indexes = @constCast((&[_]metadata_table_manager.RuntimeIndexStatusReport{.{
-                            .name = "vec",
-                            .kind = "dense_vector",
-                            .doc_count = 12,
-                            .node_count = 19,
-                            .replay_applied_sequence = 4,
-                            .replay_target_sequence = 8,
-                            .replay_catch_up_required = true,
-                        }})[0..]),
-                    }})[0..]),
-                }})[0..]),
+                .stores = self.stores[0..],
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
@@ -34369,7 +34362,37 @@ test "api index status uses propagated remote store runtime status" {
         }
     };
 
-    var source = FakeSource{};
+    var source = FakeSource{ .identity = identity };
+    source.index_reports[0] = .{
+        .name = "vec",
+        .kind = "dense_vector",
+        .doc_count = 12,
+        .node_count = 19,
+        .replay_applied_sequence = 4,
+        .replay_target_sequence = 8,
+        .replay_catch_up_required = true,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
+    };
+    source.group_reports[0] = .{
+        .table_id = 1,
+        .table_name = "docs",
+        .group_id = 10,
+        .store_id = 20,
+        .node_id = 30,
+        .updated_at_ns = 99,
+        .freshness = "fresh",
+        .doc_count = 12,
+        .index_count = 1,
+        .async_dense_catch_up_active = true,
+        .indexes = source.index_reports[0..],
+    };
+    source.stores[0] = .{
+        .store_id = 20,
+        .node_id = 30,
+        .runtime_statuses = source.group_reports[0..],
+    };
     var reads = FakeReads{};
     var writes = FakeWrites{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
@@ -34702,7 +34725,7 @@ test "api index status ignores propagated runtime status from removed owner" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
@@ -34868,7 +34891,7 @@ test "api index status reports missing remote shard as not ready" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"dimension\":3}}",
+                    .indexes_json = "{\"vec\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{

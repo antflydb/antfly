@@ -2377,7 +2377,6 @@ fn aggregateIndexStatusIndexed(
     }
     if (!found and expected_group_ids.len == 0) return null;
     if (active_count > 0) aggregate.backfill_progress = active_progress_sum / @as(f64, @floatFromInt(active_count));
-    normalizeReadyFullTextAggregate(&aggregate);
     normalizeReadyEmbeddingsAggregate(&aggregate);
     return aggregate;
 }
@@ -2389,19 +2388,6 @@ fn coverageIdentityMatches(item: anytype, expected_generation: u64, expected_con
         if (!@hasField(@TypeOf(item), "coverage_generation") or item.coverage_generation != expected_generation) return false;
     }
     return true;
-}
-
-fn normalizeReadyFullTextAggregate(aggregate: *AggregatedIndexStatus) void {
-    const kind = aggregate.kind orelse return;
-    if (kind != .full_text) return;
-    if (aggregate.reported_group_count == 0 or aggregate.missing_group_count > 0 or aggregate.stale_group_count > 0 or aggregate.remote_unknown_group_count > 0) return;
-    if (aggregate.replay_target_sequence == 0 or aggregate.replay_applied_sequence < aggregate.replay_target_sequence) return;
-    if (aggregate.table_doc_count == 0 or aggregate.doc_count < aggregate.table_doc_count) return;
-
-    aggregate.replay_catch_up_required = false;
-    aggregate.catch_up_active = false;
-    aggregate.backfill_active = false;
-    aggregate.backfill_progress = 1.0;
 }
 
 fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
@@ -4023,22 +4009,28 @@ fn appendSingleIndexRuntimeStatus(
             }
         }
     }
-    if (!index_replay_present and (catch_up_active or catch_up_target_sequence > catch_up_applied_sequence)) {
+    const catch_up_pending = catch_up_active or catch_up_target_sequence > catch_up_applied_sequence;
+    if (catch_up_pending) {
         replay_catch_up_required = true;
         backfill_active = true;
-        replay_target_sequence = @max(replay_target_sequence, catch_up_target_sequence);
-        if (catch_up_applied_sequence != 0) {
-            replay_applied_sequence = if (replay_applied_sequence == 0)
-                catch_up_applied_sequence
-            else
-                @min(replay_applied_sequence, catch_up_applied_sequence);
-        }
-        if (replay_target_sequence > 0) {
-            backfill_progress = @min(
-                0.999,
-                @as(f64, @floatFromInt(replay_applied_sequence)) /
-                    @as(f64, @floatFromInt(replay_target_sequence)),
-            );
+        // Generation-native replay watermarks remain authoritative when they
+        // exist. Only legacy observations without that ledger project the
+        // generic catch-up stage into replay compatibility fields.
+        if (!index_replay_present) {
+            replay_target_sequence = @max(replay_target_sequence, catch_up_target_sequence);
+            if (catch_up_applied_sequence != 0) {
+                replay_applied_sequence = if (replay_applied_sequence == 0)
+                    catch_up_applied_sequence
+                else
+                    @min(replay_applied_sequence, catch_up_applied_sequence);
+            }
+            if (replay_target_sequence > 0) {
+                backfill_progress = @min(
+                    0.999,
+                    @as(f64, @floatFromInt(replay_applied_sequence)) /
+                        @as(f64, @floatFromInt(replay_target_sequence)),
+                );
+            }
         }
     }
     if (catch_up_active and catch_up_phase == .idle and replay_catch_up_required) catch_up_phase = .replay;
@@ -5340,7 +5332,7 @@ test "index status encoder projects inline enrichment configs as names" {
             .table_id = 7,
             .name = "docs",
             .indexes_json =
-            \\{"document_text":{"type":"full_text","enrichments":[{"name":"document_units_v1","kind":"asset"},{"name":"document_chunks_v1","kind":"chunk"}]},"document_vectors":{"type":"embeddings","enrichments":[{"name":"document_chunk_dense_v1","kind":"embedding"}]}}
+            \\{"document_text":{"type":"full_text","enrichments":[{"name":"document_units_v1","kind":"asset"},{"name":"document_chunks_v1","kind":"chunk"}]},"document_vectors":{"type":"embeddings","external":true,"dimension":3,"enrichments":[{"name":"document_chunk_dense_v1","kind":"embedding"}]}}
             ,
             .placement_role = "data",
         }})[0..]),
@@ -6125,7 +6117,7 @@ test "index encoders preserve sibling replay debt during serviceable repair" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"8\":{") != null);
 }
 
-test "full text aggregate clears stale completed replay backfill flag" {
+test "full text aggregate preserves explicit current backfill state" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = try std.testing.allocator.dupe(u8, "full_text_index_v1"),
         .kind = .full_text,
@@ -6143,7 +6135,7 @@ test "full text aggregate clears stale completed replay backfill flag" {
 
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 7,
-        .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
         .stats = .{
             .doc_count = 1000,
             .index_count = 1,
@@ -6152,15 +6144,20 @@ test "full text aggregate clears stale completed replay backfill flag" {
     }};
 
     const aggregate = aggregateIndexStatus(runtimes[0..], "full_text_index_v1", &.{7}, 0) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 1), aggregate.stale_group_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.stale_group_count);
     try std.testing.expectEqual(@as(u64, 1), aggregate.replay_applied_sequence);
     try std.testing.expectEqual(@as(u64, 1), aggregate.replay_target_sequence);
-    try std.testing.expect(!aggregate.replay_catch_up_required);
-    try std.testing.expect(!aggregate.backfill_active);
-    try std.testing.expectEqual(@as(f64, 1.0), aggregate.backfill_progress);
+    try std.testing.expect(aggregate.replay_catch_up_required);
+    try std.testing.expect(aggregate.backfill_active);
+    try std.testing.expectEqual(@as(f64, 0.0), aggregate.backfill_progress);
 }
 
 test "index status keeps generic catch-up lag pending when replay sequence is equal" {
+    const config_json = "{\"type\":\"full_text\"}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(std.testing.allocator, "search_idx", parsed_config.value)).?;
+
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -6176,6 +6173,9 @@ test "index status keeps generic catch-up lag pending when replay sequence is eq
         .catch_up_target_sequence = 100,
         .backfill_active = false,
         .backfill_progress = 1.0,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
     };
     defer std.testing.allocator.free(indexes[0].name);
 
@@ -6183,6 +6183,7 @@ test "index status keeps generic catch-up lag pending when replay sequence is eq
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{ .doc_count = 42, .index_count = 1, .indexes = indexes },
     };
     var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
@@ -6192,7 +6193,7 @@ test "index status keeps generic catch-up lag pending when replay sequence is eq
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"search_idx\":{\"type\":\"full_text\"}}",
+            .indexes_json = "{\"search_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -6206,9 +6207,11 @@ test "index status keeps generic catch-up lag pending when replay sequence is eq
     defer std.testing.allocator.free(encoded);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":100") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":100") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_applied_sequence\":40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_target_sequence\":100") != null);
 }
 
 test "index encoders aggregate preserved synthetic shard counters" {
@@ -6315,7 +6318,7 @@ test "single embeddings index encoder fences stale runtime materialization" {
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"}}}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -6987,6 +6990,11 @@ test "external embeddings index readiness does not require table doc coverage" {
 }
 
 test "embeddings index status reports dense catch-up phase separately from published visibility" {
+    const config_json = "{\"type\":\"embeddings\",\"dimension\":384,\"external\":true}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(std.testing.allocator, "dense_idx", parsed_config.value)).?;
+
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -7002,6 +7010,9 @@ test "embeddings index status reports dense catch-up phase separately from publi
         .catch_up_phase = .idle,
         .catch_up_applied_sequence = 700,
         .catch_up_target_sequence = 701,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
     };
     defer std.testing.allocator.free(indexes[0].name);
 
@@ -7009,6 +7020,7 @@ test "embeddings index status reports dense catch-up phase separately from publi
     defer std.testing.allocator.free(local_items);
     local_items[0] = .{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
         .stats = .{
             .doc_count = 25_000,
             .index_count = 1,
@@ -7030,7 +7042,7 @@ test "embeddings index status reports dense catch-up phase separately from publi
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":384,\"external\":true}}",
+            .indexes_json = "{\"dense_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -7512,6 +7524,11 @@ test "embeddings index replay completion without artifact visibility is not read
 }
 
 test "empty embeddings index status is ready without dense artifact visibility" {
+    const config_json = "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(std.testing.allocator, "semantic_idx", parsed_config.value)).?;
+
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -7525,6 +7542,9 @@ test "empty embeddings index status is ready without dense artifact visibility" 
         .replay_catch_up_required = false,
         .backfill_active = true,
         .backfill_progress = 0.0,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
     };
     defer std.testing.allocator.free(indexes[0].name);
 
@@ -7554,7 +7574,7 @@ test "empty embeddings index status is ready without dense artifact visibility" 
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .indexes_json = "{\"semantic_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),

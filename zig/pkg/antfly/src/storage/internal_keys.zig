@@ -33,6 +33,11 @@ pub const document_unit_record_kind: u8 = 0x35;
 pub const derived_coverage_kind: u8 = 0x36;
 pub const document_unit_navigation_summary_kind: u8 = 0x37;
 pub const document_unit_navigation_block_kind: u8 = 0x38;
+/// Private reverse ownership index for graph-edge precedence. Records are
+/// grouped by logical edge, then by the source-state that emitted it.
+pub const graph_edge_contender_kind: u8 = 0x39;
+pub const graph_edge_contender_count_kind: u8 = 0x00;
+pub const graph_edge_contender_record_kind: u8 = 0x01;
 pub const derived_coverage_outcome_marker_kind: u8 = 0x00;
 pub const derived_coverage_outcome_count_kind: u8 = 0xff;
 
@@ -302,6 +307,73 @@ pub fn graphAssetStateIndexPrefixAlloc(alloc: Allocator, doc_key: []const u8, in
     try appendDocumentPrefix(&list, alloc, doc_key);
     try list.append(alloc, graph_asset_state_kind);
     try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphEdgeContenderRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_edge_contender_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphEdgeContenderIndexPrefixAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphEdgeContenderCountKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, graph_edge_contender_count_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphEdgeContenderEdgePrefixAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    index_name: []const u8,
+    edge_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, graph_edge_contender_record_kind);
+    var edge_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(edge_key, &edge_digest, .{});
+    try appendEncodedComponent(&list, alloc, &edge_digest);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn graphEdgeContenderKeyAlloc(
+    alloc: Allocator,
+    doc_key: []const u8,
+    index_name: []const u8,
+    edge_key: []const u8,
+    state_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, graph_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    try list.append(alloc, graph_edge_contender_record_kind);
+    var edge_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(edge_key, &edge_digest, .{});
+    try appendEncodedComponent(&list, alloc, &edge_digest);
+    var state_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(state_key, &state_digest, .{});
+    try appendEncodedComponent(&list, alloc, &state_digest);
     return try list.toOwnedSlice(alloc);
 }
 
@@ -1259,6 +1331,30 @@ pub fn matchesGraphAssetStateIndexName(key: []const u8, index_name: []const u8) 
     return componentEquals(key, index_start, index_name);
 }
 
+pub fn isGraphEdgeContenderKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != graph_edge_contender_kind) return false;
+    pos += 1;
+    const index_term = findComponentTerminator(key, pos) orelse return false;
+    pos = index_term + 2;
+    if (pos >= key.len) return false;
+    if (key[pos] == graph_edge_contender_count_kind) return pos + 1 == key.len;
+    if (key[pos] != graph_edge_contender_record_kind) return false;
+    pos += 1;
+    const edge_term = findComponentTerminator(key, pos) orelse return false;
+    pos = edge_term + 2;
+    const state_term = findComponentTerminator(key, pos) orelse return false;
+    return state_term + 2 == key.len;
+}
+
+pub fn matchesGraphEdgeContenderIndexName(key: []const u8, index_name: []const u8) bool {
+    if (!isGraphEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    return componentEquals(key, doc_term + 2 + 1, index_name);
+}
+
 pub fn componentEquals(key: []const u8, start: usize, raw: []const u8) bool {
     const term = findComponentTerminator(key, start) orelse return false;
     var in_pos = start;
@@ -2005,6 +2101,27 @@ test "graph asset state key matches exact index name" {
     try std.testing.expect(isGraphAssetStateKey(full.items));
     try std.testing.expect(matchesGraphAssetStateIndexName(full.items, "gr_v1"));
     try std.testing.expect(!matchesGraphAssetStateIndexName(full.items, "gr_v10"));
+}
+
+test "graph edge contender keys are edge and state scoped" {
+    const alloc = std.testing.allocator;
+    const edge_key = try graphEdgeArtifactKeyAlloc(alloc, "doc:a", "gr_v1", "links", "doc:b");
+    defer alloc.free(edge_key);
+    const state_key = try graphAssetStateIndexPrefixAlloc(alloc, "doc:a", "gr_v1");
+    defer alloc.free(state_key);
+    const key = try graphEdgeContenderKeyAlloc(alloc, "doc:a", "gr_v1", edge_key, state_key);
+    defer alloc.free(key);
+    try std.testing.expect(isGraphEdgeContenderKey(key));
+    try std.testing.expect(matchesGraphEdgeContenderIndexName(key, "gr_v1"));
+    try std.testing.expect(!matchesGraphEdgeContenderIndexName(key, "gr_v10"));
+
+    const prefix = try graphEdgeContenderEdgePrefixAlloc(alloc, "doc:a", "gr_v1", edge_key);
+    defer alloc.free(prefix);
+    try std.testing.expect(std.mem.startsWith(u8, key, prefix));
+
+    const count_key = try graphEdgeContenderCountKeyAlloc(alloc, "doc:a", "gr_v1");
+    defer alloc.free(count_key);
+    try std.testing.expect(isGraphEdgeContenderKey(count_key));
 }
 
 test "graph edge artifact key round trip with arbitrary source and target ids" {

@@ -64,8 +64,9 @@ def _parse_response(
     | CreatedGraphIndex
     | Error
     | Error
-    | UnsupportedIndexCapabilityError
     | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
     | None
 ):
@@ -160,7 +161,23 @@ def _parse_response(
         return response_500
 
     if response.status_code == 503:
-        response_503 = IndexMutationServiceUnavailableError.from_dict(response.json())
+
+        def _parse_response_503(data: object) -> Error | IndexMutationServiceUnavailableError:
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                response_503_type_0 = IndexMutationServiceUnavailableError.from_dict(data)
+
+                return response_503_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            if not isinstance(data, dict):
+                raise TypeError()
+            response_503_type_1 = Error.from_dict(data)
+
+            return response_503_type_1
+
+        response_503 = _parse_response_503(response.json())
 
         return response_503
 
@@ -179,8 +196,9 @@ def _build_response(
     | CreatedGraphIndex
     | Error
     | Error
-    | UnsupportedIndexCapabilityError
     | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
 ]:
     return Response(
@@ -207,8 +225,9 @@ def sync_detailed(
     | CreatedGraphIndex
     | Error
     | Error
-    | UnsupportedIndexCapabilityError
     | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
 ]:
     """Add an index to a table
@@ -225,7 +244,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | UnsupportedIndexCapabilityError | IndexMutationServiceUnavailableError | StorageResourceExhaustedError]
+        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | StorageResourceExhaustedError]
     """
 
     kwargs = _get_kwargs(
@@ -257,8 +276,9 @@ def sync(
     | CreatedGraphIndex
     | Error
     | Error
-    | UnsupportedIndexCapabilityError
     | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
     | None
 ):
@@ -276,7 +296,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | UnsupportedIndexCapabilityError | IndexMutationServiceUnavailableError | StorageResourceExhaustedError
+        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | StorageResourceExhaustedError
     """
 
     return sync_detailed(
@@ -303,8 +323,9 @@ async def asyncio_detailed(
     | CreatedGraphIndex
     | Error
     | Error
-    | UnsupportedIndexCapabilityError
     | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
 ]:
     """Add an index to a table
@@ -321,7 +342,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | UnsupportedIndexCapabilityError | IndexMutationServiceUnavailableError | StorageResourceExhaustedError]
+        Response[CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | StorageResourceExhaustedError]
     """
 
     kwargs = _get_kwargs(
@@ -351,8 +372,9 @@ async def asyncio(
     | CreatedGraphIndex
     | Error
     | Error
-    | UnsupportedIndexCapabilityError
     | IndexMutationServiceUnavailableError
+    | Error
+    | UnsupportedIndexCapabilityError
     | StorageResourceExhaustedError
     | None
 ):
@@ -370,7 +392,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | UnsupportedIndexCapabilityError | IndexMutationServiceUnavailableError | StorageResourceExhaustedError
+        CreatedAlgebraicIndex | CreatedEmbeddingsIndex | CreatedFullTextIndex | CreatedGraphIndex | Error | Error | IndexMutationServiceUnavailableError | Error | UnsupportedIndexCapabilityError | StorageResourceExhaustedError
     """
 
     return (

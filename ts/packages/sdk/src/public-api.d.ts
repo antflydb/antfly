@@ -14171,7 +14171,7 @@ export interface components {
                 [name: string]: unknown;
             };
             content: {
-                "application/json": components["schemas"]["IndexMutationServiceUnavailableError"];
+                "application/json": components["schemas"]["IndexMutationServiceUnavailableError"] | components["schemas"]["Error"];
             };
         };
         /** @description Backup could not establish the required metadata authority before starting side effects. */

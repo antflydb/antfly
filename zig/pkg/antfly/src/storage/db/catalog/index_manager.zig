@@ -5474,7 +5474,8 @@ pub const IndexManager = struct {
                 if (!should_delete) should_delete = cleanupRecordMatchesEmbedding(state.record, candidate);
                 if (!should_delete) if (state.graph_index_name) |index_name| {
                     should_delete = internal_keys.matchesGraphEdgeIndexName(candidate, index_name) or
-                        internal_keys.matchesGraphAssetStateIndexName(candidate, index_name);
+                        internal_keys.matchesGraphAssetStateIndexName(candidate, index_name) or
+                        internal_keys.matchesGraphEdgeContenderIndexName(candidate, index_name);
                 };
                 if (should_delete) try state.deletes.append(state.manager.alloc, try state.manager.alloc.dupe(u8, candidate));
 

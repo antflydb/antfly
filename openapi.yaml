@@ -26392,7 +26392,9 @@ components:
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/IndexMutationServiceUnavailableError'
+            anyOf:
+              - $ref: '#/components/schemas/IndexMutationServiceUnavailableError'
+              - $ref: '#/components/schemas/Error'
     BackupMetadataUnavailable:
       description: Backup could not establish the required metadata authority before starting side effects.
       headers:
