@@ -1010,6 +1010,7 @@ pub const StatusSource = struct {
             manifest: *const backups_api.TableBackupManifest,
         ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
+        drop_table_exact: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         update_schema_versioned: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!u32 = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
@@ -1087,6 +1088,18 @@ pub const StatusSource = struct {
         try tables_api.validateTableMutationName(table_name);
         const fn_ptr = self.vtable.drop_table orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
+    }
+
+    /// Drops metadata and returns the exact group set fenced by the committed
+    /// mutation when the backend supports it. The empty legacy result is safe:
+    /// callers must never reconstruct destructive cleanup targets from a stale
+    /// snapshot after this point.
+    pub fn dropTableExact(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8) !metadata_table_topology_mutations.DropResult {
+        try tables_api.validateTableMutationName(table_name);
+        if (self.vtable.drop_table_exact) |fn_ptr|
+            return try BoundaryAbi.call("drop_table_exact", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
+        try self.dropTable(alloc, table_name);
+        return .{ .table_id = 0, .expected_transition_generation = 0, .group_ids = try alloc.alloc(u64, 0) };
     }
 
     /// Returns the generation committed by an authoritative backend when the
@@ -1375,6 +1388,7 @@ pub const StatusSource = struct {
         var vtable = makeServiceVTable(metadata_service.MetadataHttpService);
         vtable.create_table = HttpRoutedTableMutations.createTable;
         vtable.drop_table = HttpRoutedTableMutations.dropTable;
+        vtable.drop_table_exact = HttpRoutedTableMutations.dropTableExact;
         return vtable;
     }
 
@@ -1401,16 +1415,24 @@ pub const StatusSource = struct {
         }
 
         fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
+            var result = try HttpRoutedTableMutations.dropTableExact(ptr, alloc, table_name);
+            defer result.deinit(alloc);
+        }
+
+        fn dropTableExact(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult {
             const svc = cast(ptr);
             const deadline_ns = platform_time.monotonicNs() +|
                 @as(u64, raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+            var result: ?metadata_table_topology_mutations.DropResult = null;
             const ops: DropOps = .{
                 .svc = svc,
                 .alloc = alloc,
                 .request = .{ .deadline_ns = deadline_ns },
                 .table_name = table_name,
+                .result = &result,
             };
             try runRoutedTableMutation(svc, ops);
+            return result orelse error.MetadataMutationOutcomeUnknown;
         }
 
         const PreparedCreate = struct {
@@ -1493,9 +1515,10 @@ pub const StatusSource = struct {
             alloc: std.mem.Allocator,
             request: api_operation.RequestContext,
             table_name: []const u8,
+            result: *?metadata_table_topology_mutations.DropResult,
 
             fn local(self: @This()) anyerror!void {
-                try metadata_table_topology_mutations.drop(
+                self.result.* = try metadata_table_topology_mutations.drop(
                     self.svc,
                     self.alloc,
                     self.request,
@@ -1511,11 +1534,9 @@ pub const StatusSource = struct {
                 const orchestration_url = peer.orchestration_url orelse return error.NotLeader;
                 std.log.info("forwarding table drop to metadata leader table={s} leader={d}", .{ self.table_name, peer.node_id });
                 var client = self.svc.tableMutationForwardClient();
-                try client.forwardTableMutation(
+                self.result.* = try client.forwardTableDropMutationExact(
                     orchestration_url,
-                    .drop_table,
                     self.table_name,
-                    null,
                     forwarding,
                 );
             }
@@ -12264,16 +12285,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn executeMcpDropTable(self: *ApiHttpServer, table_name: []const u8) !contextual_operations.OwnedResponse {
-        var group_ids: ?[]u64 = null;
-        defer if (group_ids) |values| self.alloc.free(values);
-        if (self.table_writes != null) {
-            if (try self.source.adminSnapshot()) |snapshot_value| {
-                var snapshot = snapshot_value;
-                defer self.source.freeAdminSnapshot(&snapshot);
-                group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, table_name);
-            }
-        }
-        self.source.dropTable(self.alloc, table_name) catch |err| return switch (err) {
+        var drop_result = self.source.dropTableExact(self.alloc, table_name) catch |err| return switch (err) {
             error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table name"),
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
             error.TableTransitionActive, error.TableGenerationChanged => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
@@ -12287,16 +12299,29 @@ pub const ApiHttpServer = struct {
             else
                 return err,
         };
+        defer drop_result.deinit(self.alloc);
+        var repair_required = false;
         if (self.table_writes) |writes| {
-            _ = writes.dropTable(self.alloc, table_name, group_ids orelse &.{}) catch |err| switch (err) {
+            _ = writes.dropTable(self.alloc, table_name, drop_result.group_ids) catch |err| switch (err) {
                 error.TableNotFound => null,
-                else => return err,
+                else => {
+                    repair_required = true;
+                    std.log.warn("MCP drop table committed with local cleanup repair required table={s} err={s}", .{ table_name, @errorName(err) });
+                },
             };
         }
         self.waitForTableVisibility(table_name, .absent) catch |err| switch (err) {
-            error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table delete did not converge"),
+            error.TableVisibilityTimeout => repair_required = true,
             else => return err,
         };
+        if (repair_required) {
+            const body = try std.json.Stringify.valueAlloc(
+                self.alloc,
+                .{ .status = "committed_repair_required" },
+                .{},
+            );
+            return contextual_operations.jsonWithStatus(202, body, false);
+        }
         return try contextual_operations.textAlloc(self.alloc, 204, "");
     }
 
@@ -35211,6 +35236,7 @@ test "api http server drop table waits for metadata lifecycle absence" {
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
                     .drop_table = dropTable,
+                    .drop_table_exact = dropTableExact,
                     .wait_table_lifecycle = waitTableLifecycle,
                 },
             };
@@ -35256,6 +35282,15 @@ test "api http server drop table waits for metadata lifecycle absence" {
             self.created = false;
         }
 
+        fn dropTableExact(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8) !metadata_table_topology_mutations.DropResult {
+            try dropTable(ptr, inner_alloc, table_name);
+            return .{
+                .table_id = 1,
+                .expected_transition_generation = 4,
+                .group_ids = try inner_alloc.dupe(u64, &.{10}),
+            };
+        }
+
         fn waitTableLifecycle(ptr: *anyopaque, table_name: []const u8, expected: TableVisibility) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
@@ -35265,12 +35300,16 @@ test "api http server drop table waits for metadata lifecycle absence" {
     };
 
     const FakeWrites = struct {
+        observed_group_id: ?u64 = null,
+        fail_cleanup: bool = false,
+
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .local_runtime_statuses = localRuntimeStatuses,
                     .batch = batch,
+                    .drop_table = dropTable,
                 },
             };
         }
@@ -35281,6 +35320,14 @@ test "api http server drop table waits for metadata lifecycle absence" {
 
         fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
             return;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, group_ids: []const u64) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(@as(usize, 1), group_ids.len);
+            self.observed_group_id = group_ids[0];
+            if (self.fail_cleanup) return error.InjectedCleanupFailure;
         }
     };
 
@@ -35295,6 +35342,18 @@ test "api http server drop table waits for metadata lifecycle absence" {
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 204), resp.status);
     try std.testing.expectEqual(@as(u32, 1), source.lifecycle_wait_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(?u64, 10), writes.observed_group_id);
+
+    source.created = true;
+    writes.fail_cleanup = true;
+    var repair_response = try executeHttpxTestRequest(&server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs",
+    });
+    defer repair_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), repair_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, repair_response.body, "committed_repair_required") != null);
+    try std.testing.expectEqual(@as(u32, 2), source.lifecycle_wait_calls.load(.monotonic));
 }
 
 test "api http server get missing index returns 404 without runtime status lookup" {

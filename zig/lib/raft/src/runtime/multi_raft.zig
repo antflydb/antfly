@@ -35,6 +35,10 @@ pub const RuntimeConfig = struct {
     max_transport_bytes_per_round: usize = std.math.maxInt(usize),
     max_pending_apply_tasks: usize = std.math.maxInt(usize),
     max_pending_apply_bytes: usize = std.math.maxInt(usize),
+    /// Hard ceiling for the cloned payload of any one Ready. Pending queue
+    /// byte limits remain soft for liveness, but a single item may never turn
+    /// that exception into an unbounded allocation.
+    max_single_ready_bytes: usize = std.math.maxInt(usize),
     max_apply_tasks_per_round: usize = std.math.maxInt(usize),
     applied_log_retained_entries: u64 = 4096,
     applied_log_compaction_min_interval_entries: u64 = 4096,
@@ -1039,9 +1043,30 @@ pub const MultiRaft = struct {
         }
 
         const capacity_check_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
+        const apply_ready_bytes = ready_pressure.snapshot_bytes +|
+            ready_pressure.committed_entry_bytes +|
+            approxReadStatesSize(ready.read_states);
+        const single_ready_bytes = ready_pressure.message_bytes +| apply_ready_bytes;
+        if (single_ready_bytes > self.cfg.max_single_ready_bytes) {
+            if (diagnostics) |diag| {
+                diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
+                if (ready_pressure.message_bytes > 0) {
+                    diag.denied_by_transport_capacity = true;
+                } else {
+                    diag.denied_by_apply_capacity = true;
+                }
+            }
+            if (ready_pressure.message_bytes > 0) {
+                self.metrics.transport_queue_denials += 1;
+            } else {
+                self.metrics.apply_queue_denials += 1;
+            }
+            self.scheduler.deferReady(group_id);
+            return false;
+        }
         const outbound_capacity_available = self.hasOutboundCapacity(
-            outbox.items.items.len + ready_pressure.message_count,
-            outbox.approxBytes() + ready_pressure.message_bytes,
+            outbox.items.items.len +| ready_pressure.message_count,
+            outbox.approxBytes() +| ready_pressure.message_bytes,
         );
         // A byte ceiling must bound backlog, not make a single bounded Ready
         // impossible forever. When both queues are empty, admit one oversized
@@ -1063,7 +1088,7 @@ pub const MultiRaft = struct {
         const new_apply_tasks: usize = if (ready.snapshot != null or ready.committed_entries.len > 0 or ready.read_states.len > 0) 1 else 0;
         const apply_capacity_available = self.hasApplyCapacity(
             new_apply_tasks,
-            ready_pressure.snapshot_bytes + ready_pressure.committed_entry_bytes + approxReadStatesSize(ready.read_states),
+            apply_ready_bytes,
         );
         const apply_single_ready_progress = self.pending_apply.items.len == 0 and
             new_apply_tasks <= self.cfg.max_pending_apply_tasks;
@@ -1679,15 +1704,15 @@ pub const MultiRaft = struct {
     }
 
     fn hasOutboundCapacity(self: *const MultiRaft, total_messages: usize, total_bytes: usize) bool {
-        return self.pending_outbox.items.items.len + total_messages <= self.cfg.max_pending_outbound_messages and
-            self.pending_outbox.approxBytes() + total_bytes <= self.cfg.max_pending_outbound_bytes;
+        return self.pending_outbox.items.items.len +| total_messages <= self.cfg.max_pending_outbound_messages and
+            self.pending_outbox.approxBytes() +| total_bytes <= self.cfg.max_pending_outbound_bytes;
     }
 
     fn hasApplyCapacity(self: *const MultiRaft, new_tasks: usize, new_bytes: usize) bool {
         var pending_bytes: usize = 0;
-        for (self.pending_apply.items) |task| pending_bytes += task.approx_bytes;
-        return self.pending_apply.items.len + new_tasks <= self.cfg.max_pending_apply_tasks and
-            pending_bytes + new_bytes <= self.cfg.max_pending_apply_bytes;
+        for (self.pending_apply.items) |task| pending_bytes +|= task.approx_bytes;
+        return self.pending_apply.items.len +| new_tasks <= self.cfg.max_pending_apply_tasks and
+            pending_bytes +| new_bytes <= self.cfg.max_pending_apply_bytes;
     }
 
     fn flushPendingTransport(self: *MultiRaft) !void {

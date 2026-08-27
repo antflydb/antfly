@@ -20,6 +20,7 @@ const tables_api = @import("../api/tables.zig");
 const metadata_authority = @import("authority.zig");
 const metadata_service = @import("service.zig");
 const metadata_table_manager = @import("table_manager.zig");
+const topology_protocol = @import("topology_protocol.zig");
 
 fn afterAdmission(_: anyerror) anyerror {
     // Once Raft returned a receipt, no local failure can prove that the entry
@@ -52,6 +53,8 @@ fn runPostCommitControlRound(
         );
     };
 }
+
+pub const DropResult = topology_protocol.DropResult;
 
 pub fn create(
     svc: *metadata_service.MetadataHttpService,
@@ -110,14 +113,14 @@ pub fn drop(
     alloc: std.mem.Allocator,
     request: operation.RequestContext,
     table_name: []const u8,
-) !void {
+) !DropResult {
     svc.lockCatalogMutation();
     var catalog_locked = true;
     defer if (catalog_locked) svc.unlockCatalogMutation();
     try request.ensureActive();
     try svc.ensureTableTopologyProtocolReadyWithContext(request);
     try svc.ensureLinearizableReadWithContext(request);
-    const admission = try svc.captureTableDropAdmission(alloc, table_name);
+    var admission = try svc.captureTableDropAdmission(alloc, table_name);
     defer admission.deinit(alloc);
 
     try request.ensureActive();
@@ -142,4 +145,11 @@ pub fn drop(
     svc.unlockCatalogMutation();
     catalog_locked = false;
     runPostCommitControlRound(svc, "drop", table_name);
+    const result = DropResult{
+        .table_id = admission.table_id,
+        .expected_transition_generation = admission.expected_transition_generation,
+        .group_ids = admission.range_group_ids,
+    };
+    admission.range_group_ids = &.{};
+    return result;
 }

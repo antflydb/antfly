@@ -111,6 +111,7 @@ pub const AdminSource = struct {
         ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         drop_table_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) anyerror!void = null,
+        drop_table_exact_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) anyerror!table_topology_mutations.DropResult = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
@@ -229,6 +230,18 @@ pub const AdminSource = struct {
             return try drop(self.ptr, alloc, request, table_name);
         try request.ensureActive();
         return try self.dropTable(alloc, table_name);
+    }
+
+    pub fn dropTableExactWithContext(
+        self: AdminSource,
+        alloc: std.mem.Allocator,
+        request: operation.RequestContext,
+        table_name: []const u8,
+    ) !table_topology_mutations.DropResult {
+        if (self.vtable.drop_table_exact_with_context) |drop|
+            return try drop(self.ptr, alloc, request, table_name);
+        try self.dropTableWithContext(alloc, request, table_name);
+        return .{ .table_id = 0, .expected_transition_generation = 0, .group_ids = try alloc.alloc(u64, 0) };
     }
 
     pub fn updateSchema(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -423,6 +436,7 @@ pub const AdminSource = struct {
                 .restore_table = metadataHttpServiceRestoreTable,
                 .drop_table = metadataHttpServiceDropTable,
                 .drop_table_with_context = metadataHttpServiceDropTableWithContext,
+                .drop_table_exact_with_context = metadataHttpServiceDropTableExactWithContext,
                 .update_schema = metadataHttpServiceUpdateSchema,
                 .create_index = metadataHttpServiceCreateIndex,
                 .drop_index = metadataHttpServiceDropIndex,
@@ -925,7 +939,13 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceDropTableWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try table_topology_mutations.drop(svc, alloc, request, table_name);
+        var result = try table_topology_mutations.drop(svc, alloc, request, table_name);
+        defer result.deinit(alloc);
+    }
+
+    fn metadataHttpServiceDropTableExactWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8) !table_topology_mutations.DropResult {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try table_topology_mutations.drop(svc, alloc, request, table_name);
     }
 
     fn metadataHttpServiceUpdateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
@@ -2018,7 +2038,7 @@ pub const MetadataHttpServer = struct {
             .drop_table => blk: {
                 if (forwarded.value.definition_json != null)
                     return ctx.status(400).text("drop table definition must be absent");
-                break :blk try self.executeMetadataDropTable(ctx, forwarded_request, forwarded.value.table_name);
+                break :blk try self.executeMetadataDropTableForwarded(ctx, forwarded_request, forwarded.value.table_name);
             },
         };
         if (response.status.code >= 200 and response.status.code < 300) {
@@ -2104,6 +2124,37 @@ pub const MetadataHttpServer = struct {
             else => return metadataMutationError(ctx, err),
         };
         return ctx.status(204).text("");
+    }
+
+    fn executeMetadataDropTableForwarded(
+        self: *MetadataHttpServer,
+        ctx: *httpx.Context,
+        request_context: operation.RequestContext,
+        table_name: []const u8,
+    ) !httpx.Response {
+        var result = self.source.dropTableExactWithContext(
+            ctx.allocator,
+            request_context,
+            table_name,
+        ) catch |err| switch (err) {
+            error.TableNotFound => return ctx.status(404).text("table not found"),
+            error.TableTransitionActive => return ctx.status(409).text("table transition active"),
+            error.ExtensionOwnedObject => {
+                try ctx.setHeader(
+                    routes.Routes.table_mutation_error_header,
+                    routes.Routes.table_mutation_error_extension_owned,
+                );
+                return ctx.status(409).text("table is owned by an extension");
+            },
+            error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
+            else => return metadataMutationError(ctx, err),
+        };
+        defer result.deinit(ctx.allocator);
+        return ctx.json(.{
+            .table_id = result.table_id,
+            .expected_transition_generation = result.expected_transition_generation,
+            .group_ids = result.group_ids,
+        });
     }
 
     fn metadataUpdateTableSchema(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {

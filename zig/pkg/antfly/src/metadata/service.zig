@@ -100,9 +100,12 @@ pub const TableDropAdmission = struct {
     expected_name: []u8,
     expected_transition_generation: u64,
     range_membership: metadata_topology_protocol.RangeMembership,
+    range_group_ids: []u64,
 
-    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.range_group_ids);
         alloc.free(self.expected_name);
+        self.* = undefined;
     }
 };
 
@@ -111,16 +114,19 @@ fn tableDropAdmissionFromProjection(
     table: *const metadata_table_manager.TableRecord,
     fence: metadata_storage.raft_apply_store.TableTransitionFence,
     extension_owned: bool,
+    range_group_ids: []const u64,
 ) !TableDropAdmission {
     if (fence.active()) return error.TableTransitionActive;
     if (extension_owned) return error.ExtensionOwnedObject;
     const expected_name = try alloc.dupe(u8, table.name);
     errdefer alloc.free(expected_name);
+    const owned_range_group_ids = try alloc.dupe(u64, range_group_ids);
     return .{
         .table_id = table.table_id,
         .expected_name = expected_name,
         .expected_transition_generation = fence.generation,
         .range_membership = fence.membership(table.table_id),
+        .range_group_ids = owned_range_group_ids,
     };
 }
 
@@ -141,8 +147,12 @@ test "metadata service table drop admission binds compact range membership to on
         &tables[0],
         fence,
         false,
+        &.{ 301, 302 },
     );
-    defer admission.deinit(std.testing.allocator);
+    defer {
+        var owned_admission = admission;
+        owned_admission.deinit(std.testing.allocator);
+    }
     try std.testing.expectEqual(@as(u64, 7), admission.table_id);
     try std.testing.expectEqual(@as(u64, 9), admission.expected_transition_generation);
     try std.testing.expectEqualStrings("docs", admission.expected_name);
@@ -155,6 +165,7 @@ test "metadata service table drop admission binds compact range membership to on
             &tables[0],
             .{ .generation = 9, .active_count = 1 },
             false,
+            &.{},
         ),
     );
     try std.testing.expectError(
@@ -164,6 +175,7 @@ test "metadata service table drop admission binds compact range membership to on
             &tables[0],
             fence,
             true,
+            &.{},
         ),
     );
 }
@@ -6133,6 +6145,7 @@ pub const MetadataHttpService = struct {
                 &projection.table,
                 projection.fence,
                 projection.extension_owned,
+                projection.range_group_ids,
             );
         }
         return error.InvalidDerivedCatalogIndex;

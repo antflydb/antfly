@@ -2834,7 +2834,7 @@ pub const ApiHttpClient = struct {
             .uri = uri,
         });
         defer resp.deinit(self.alloc);
-        if (resp.status != 204) return error.UnexpectedHttpStatus;
+        if (resp.status != 204 and resp.status != 202) return error.UnexpectedHttpStatus;
         return .{};
     }
 

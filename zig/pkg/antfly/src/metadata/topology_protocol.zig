@@ -31,6 +31,26 @@ pub const max_create_definition_bytes: usize = 2 * 1024 * 1024;
 /// Defense in depth on the final encoded Raft command. This includes the
 /// definition, generated range records, and codec overhead.
 pub const max_transition_command_bytes: usize = 3 * 1024 * 1024;
+/// Largest legacy v1 membership vector that could fit in a command accepted
+/// by the topology proposal path. The decoder checks this before allocating,
+/// so a corrupt persisted frame cannot turn a compact metadata entry into an
+/// unbounded second allocation during apply.
+pub const max_legacy_drop_range_count: usize = max_transition_command_bytes / @sizeOf(u64);
+
+/// Exact post-commit cleanup contract returned to the node that originated a
+/// table drop. It is deliberately not embedded in the Raft command: the log
+/// carries the fixed-size membership proof while this owned result is routed
+/// only to the local storage owner.
+pub const DropResult = struct {
+    table_id: u64,
+    expected_transition_generation: u64,
+    group_ids: []u64,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.group_ids);
+        self.* = undefined;
+    }
+};
 
 pub const range_membership_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
 

@@ -23,6 +23,7 @@ const metadata_api = @import("api.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_transition_state = @import("transition_state.zig");
+const topology_protocol = @import("topology_protocol.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
@@ -486,6 +487,39 @@ pub const MetadataHttpClient = struct {
         definition_json: ?[]const u8,
         forwarding: raft_mutation_forwarding.Context,
     ) !void {
+        var result = try self.forwardTableMutationResult(
+            base_uri,
+            kind,
+            table_name,
+            definition_json,
+            forwarding,
+        );
+        if (result) |*owned| owned.deinit(self.alloc);
+    }
+
+    pub fn forwardTableDropMutationExact(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+        forwarding: raft_mutation_forwarding.Context,
+    ) !topology_protocol.DropResult {
+        return (try self.forwardTableMutationResult(
+            base_uri,
+            .drop_table,
+            table_name,
+            null,
+            forwarding,
+        )) orelse error.MetadataMutationOutcomeUnknown;
+    }
+
+    fn forwardTableMutationResult(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        kind: routes.TableMutationKind,
+        table_name: []const u8,
+        definition_json: ?[]const u8,
+        forwarding: raft_mutation_forwarding.Context,
+    ) !?topology_protocol.DropResult {
         try tables_api.validateTableMutationName(table_name);
         const body = try std.json.Stringify.valueAlloc(self.alloc, routes.ForwardedTableMutation{
             .kind = kind,
@@ -546,9 +580,27 @@ pub const MetadataHttpClient = struct {
             return error.CreateTableRequestTooLarge;
         if (outcome == .not_proposed and resp.status == 426)
             return error.TableTopologyProtocolUpgradeRequired;
-        if (outcome == .committed and
-            ((kind == .create_table and resp.status == 201) or
-                (kind == .drop_table and resp.status == 204))) return;
+        if (outcome == .committed and kind == .create_table and resp.status == 201)
+            return null;
+        if (outcome == .committed and kind == .drop_table and resp.status == 200) {
+            const WireResult = struct {
+                table_id: u64,
+                expected_transition_generation: u64,
+                group_ids: []const u64,
+            };
+            var parsed = std.json.parseFromSlice(
+                WireResult,
+                self.alloc,
+                resp.body,
+                .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
+            ) catch return error.MetadataMutationOutcomeUnknown;
+            defer parsed.deinit();
+            return .{
+                .table_id = parsed.value.table_id,
+                .expected_transition_generation = parsed.value.expected_transition_generation,
+                .group_ids = try self.alloc.dupe(u64, parsed.value.group_ids),
+            };
+        }
         return switch (resp.status) {
             400 => if (kind == .create_table) error.InvalidCreateTableRequest else error.InvalidTableName,
             404 => error.TableNotFound,
@@ -1381,6 +1433,7 @@ test "metadata http client forwards table create and drop to the internal route"
         expected_uri_suffix: []const u8,
         expected_body: ?[]const u8,
         success_status: u16,
+        success_body: []const u8 = "",
         expect_service_auth: bool = false,
         attempts: usize = 0,
 
@@ -1420,7 +1473,11 @@ test "metadata http client forwards table create and drop to the internal route"
             };
             errdefer headers[0].deinit(alloc);
             headers[0].value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed);
-            return .{ .status = self.success_status, .headers = headers };
+            return .{
+                .status = self.success_status,
+                .headers = headers,
+                .body = try alloc.dupe(u8, self.success_body),
+            };
         }
     };
 
@@ -1440,7 +1497,8 @@ test "metadata http client forwards table create and drop to the internal route"
         .expected_method = .POST,
         .expected_uri_suffix = routes.Routes.internal_forwarded_table_mutation,
         .expected_body = null,
-        .success_status = 204,
+        .success_status = 200,
+        .success_body = "{\"table_id\":7,\"expected_transition_generation\":11,\"group_ids\":[301,302]}",
     };
     var drop_client = MetadataHttpClient.init(std.testing.allocator, drop_exec.executor());
     try drop_client.dropTableForwarded("http://127.0.0.1:9000", "sales%2Farchive");

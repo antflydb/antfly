@@ -78,8 +78,14 @@ pub const TableDropProjection = struct {
     table: metadata.TableRecord,
     fence: TableTransitionFence,
     extension_owned: bool,
+    /// Exact range ids covered by `fence.range_membership` in the same read
+    /// transaction. The mutation keeps the compact proof on the Raft log;
+    /// callers retain these ids only as the post-commit storage cleanup
+    /// contract.
+    range_group_ids: []u64,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.range_group_ids);
         metadata_table_manager.freeTable(alloc, self.table);
         self.* = undefined;
     }
@@ -652,6 +658,21 @@ test "table topology mutation legacy drop decoder derives its allocation bound f
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expect(decoded.apply_table_topology.drop.range_contract == .legacy_group_ids);
     try std.testing.expectEqual(@as(usize, 65_537), decoded.apply_table_topology.drop.range_contract.legacy_group_ids.len);
+}
+
+test "table topology mutation decoder rejects frames above the legal command ceiling" {
+    const encoded = try std.testing.allocator.alloc(
+        u8,
+        topology_protocol.max_transition_command_bytes + 1,
+    );
+    defer std.testing.allocator.free(encoded);
+    @memset(encoded, 0);
+    @memcpy(encoded[0..transition_magic.len], transition_magic);
+    encoded[transition_magic.len] = @intFromEnum(TransitionTag.apply_table_topology);
+    try std.testing.expectError(
+        error.InvalidMetadataTransitionEncoding,
+        decodeTransitionCommand(std.testing.allocator, encoded),
+    );
 }
 
 test "table topology mutation atomically creates and drops catalog ranges" {
@@ -2363,6 +2384,18 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
 
+        const indexed_range_group_ids = try self.indexedTableRangeIdsTxn(&txn, group_id, table_id);
+        defer self.alloc.free(indexed_range_group_ids);
+        if (!try self.indexedRangeMembershipMatchesTxn(
+            &txn,
+            group_id,
+            table_id,
+            indexed_range_group_ids,
+            fence.membership(table_id),
+        )) return error.InvalidDerivedCatalogIndex;
+        const range_group_ids = try alloc.dupe(u64, indexed_range_group_ids);
+        errdefer alloc.free(range_group_ids);
+
         var owner_prefix_buf: [640]u8 = undefined;
         const owner_prefix = try extensionTableOwnerIndexPrefixForTable(
             &owner_prefix_buf,
@@ -2380,6 +2413,7 @@ pub const RaftApplyStore = struct {
             .table = table,
             .fence = fence,
             .extension_owned = extension_owned,
+            .range_group_ids = range_group_ids,
         };
     }
 
@@ -5999,6 +6033,8 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             },
         },
         .apply_table_topology => blk: {
+            if (encoded.len > topology_protocol.max_transition_command_bytes)
+                return error.InvalidMetadataTransitionEncoding;
             const kind = try readInt(encoded, &pos, u8);
             if (kind == 1) {
                 const table = try readFramedTableRecord(alloc, encoded, &pos);
@@ -6031,7 +6067,8 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 errdefer alloc.free(expected_name);
                 const expected_transition_generation = try readInt(encoded, &pos, u64);
                 const range_count = try readInt(encoded, &pos, u32);
-                if (range_count > (encoded.len - pos) / @sizeOf(u64))
+                if (range_count > topology_protocol.max_legacy_drop_range_count or
+                    range_count > (encoded.len - pos) / @sizeOf(u64))
                     return error.InvalidMetadataTransitionEncoding;
                 const range_group_ids = try alloc.alloc(u64, range_count);
                 errdefer alloc.free(range_group_ids);

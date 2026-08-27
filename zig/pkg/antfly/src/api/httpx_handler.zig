@@ -4294,16 +4294,7 @@ pub const AntflyApiHandler = struct {
         const alloc = ctx.allocator;
         const decoded_table_name = (try decodePathParamOrBadRequest(ctx, table_name)) orelse return ctx.text("invalid path parameter");
         defer alloc.free(decoded_table_name);
-        var local_drop_group_ids: ?[]u64 = null;
-        defer if (local_drop_group_ids) |group_ids| alloc.free(group_ids);
-        if (self.api_server.table_writes != null) {
-            if (try self.api_server.source.adminSnapshot()) |snapshot_value| {
-                var snapshot = snapshot_value;
-                defer self.api_server.source.freeAdminSnapshot(&snapshot);
-                local_drop_group_ids = try ApiHttpServer.tableGroupIdsFromSnapshot(alloc, &snapshot, decoded_table_name);
-            }
-        }
-        self.api_server.source.dropTable(alloc, decoded_table_name) catch |err| switch (err) {
+        var drop_result = self.api_server.source.dropTableExact(alloc, decoded_table_name) catch |err| switch (err) {
             error.TableNotFound => {
                 _ = ctx.status(404);
                 return ctx.text("not found");
@@ -4340,24 +4331,32 @@ pub const AntflyApiHandler = struct {
                 return err;
             },
         };
+        defer drop_result.deinit(alloc);
+        var repair_required = false;
         if (self.api_server.table_writes) |write_source| {
-            const group_ids = local_drop_group_ids orelse &.{};
-            _ = write_source.dropTable(alloc, decoded_table_name, group_ids) catch |err| switch (err) {
+            _ = write_source.dropTable(alloc, decoded_table_name, drop_result.group_ids) catch |err| switch (err) {
                 error.TableNotFound => null,
                 else => {
-                    std.log.err("public drop table local cleanup failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
-                    return err;
+                    // Metadata is already committed. The storage owner first
+                    // atomically renames each group into durable trash and its
+                    // cleanup worker is idempotent, so surface repair debt
+                    // without inviting the client to replay the DDL.
+                    repair_required = true;
+                    std.log.warn("public drop table committed with local cleanup repair required table={s} err={s}", .{ decoded_table_name, @errorName(err) });
                 },
             };
         }
         self.api_server.waitForTableVisibility(decoded_table_name, .absent) catch |err| switch (err) {
             error.TableVisibilityTimeout => {
-                std.log.err("public drop table metadata visibility timed out table={s}", .{decoded_table_name});
-                _ = ctx.status(500);
-                return ctx.text("table delete did not converge");
+                repair_required = true;
+                std.log.warn("public drop table committed with visibility repair required table={s}", .{decoded_table_name});
             },
             else => return err,
         };
+        if (repair_required) {
+            _ = ctx.status(202);
+            return ctx.json(.{ .status = "committed_repair_required" });
+        }
         _ = ctx.status(204);
         return ctx.text("");
     }
