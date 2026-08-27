@@ -400,10 +400,13 @@ describe("CreateIndexDialog", () => {
 
     expect(screen.getByText(/could not verify artifact-source support/i)).toBeTruthy();
     expect(screen.queryByText(/unavailable on this deployment/i)).toBeNull();
+    fireEvent.click(screen.getByRole("radio", { name: "Graph" }));
+    expect(screen.queryByText(/artifact-backed graph sources are unavailable/i)).toBeNull();
+    expect(screen.getByPlaceholderText("related")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(retry).toHaveBeenCalledOnce();
 
-    fireEvent.click(screen.getByRole("switch"));
+    fireEvent.click(screen.getAllByRole("switch")[0]);
     fireEvent.change(screen.getByLabelText("Advanced index JSON"), {
       target: {
         value:
@@ -413,5 +416,25 @@ describe("CreateIndexDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create" }));
 
     await waitFor(() => expect(mocks.createIndex).toHaveBeenCalledOnce());
+  });
+
+  it("does not report artifact-backed graph sources as unsupported while capability discovery loads", () => {
+    render(
+      <CreateIndexDialog
+        open
+        onClose={() => undefined}
+        tableName="docs"
+        onIndexCreated={() => undefined}
+        schema={null}
+        artifactSourcesSupported={undefined}
+      />
+    );
+
+    expect(
+      screen.getByText(/checking whether this deployment supports artifact-backed indexes/i)
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("radio", { name: "Graph" }));
+    expect(screen.queryByText(/artifact-backed graph sources are unavailable/i)).toBeNull();
+    expect(screen.getByPlaceholderText("related")).toBeTruthy();
   });
 });

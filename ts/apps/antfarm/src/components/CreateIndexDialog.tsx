@@ -614,14 +614,14 @@ const IndexKindForm: React.FC<{
                 </FormItem>
               )}
             />
-          ) : (
+          ) : artifactSourcesSupported === false ? (
             <Alert>
               <AlertDescription>
                 This deployment supports graph indexes over document fields. Artifact-backed graph
                 sources are unavailable.
               </AlertDescription>
             </Alert>
-          )}
+          ) : null}
 
           {graphSourceType === "document_fields" ? (
             <div className="space-y-3">
