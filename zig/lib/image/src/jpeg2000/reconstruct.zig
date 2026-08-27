@@ -198,18 +198,102 @@ pub fn reconstructU16Sample(sample: i32, bits_per_component: u8, is_signed: bool
     return @intCast(clamped);
 }
 
-fn roundF32PlaneToI32(dst: []i32, src: []const f32) void {
+fn roundedF32FitsI32(value: f32) bool {
+    const rounded = @round(value);
+    // 2^31 is exactly representable as f32 but is one past i32 max, so the
+    // upper comparison must remain strict. These comparisons also reject NaN
+    // and infinities without a separate branch.
+    return rounded >= -2147483648.0 and rounded < 2147483648.0;
+}
+
+fn roundF32PlaneToI32(dst: []i32, src: []const f32) !void {
     std.debug.assert(dst.len == src.len);
 
     var i: usize = 0;
     while (i + simd_lanes_f32_i32 <= src.len) : (i += simd_lanes_f32_i32) {
+        // Validate the SIMD block before conversion so @intFromFloat can never
+        // trap on attacker-controlled irreversible coefficients. Valid pixels
+        // still use the vectorized conversion below.
         const values: F32x8 = src[i..][0..simd_lanes_f32_i32].*;
-        dst[i..][0..simd_lanes_f32_i32].* = @as(I32x8, @intFromFloat(@round(values)));
+        const rounded = @round(values);
+        const lower: F32x8 = @splat(-2147483648.0);
+        const upper: F32x8 = @splat(2147483648.0);
+        if (!@reduce(.And, rounded >= lower) or !@reduce(.And, rounded < upper))
+            return error.InvalidReconstructedSample;
+        dst[i..][0..simd_lanes_f32_i32].* = @as(I32x8, @intFromFloat(rounded));
     }
 
     while (i < src.len) : (i += 1) {
+        if (!roundedF32FitsI32(src[i])) return error.InvalidReconstructedSample;
         dst[i] = @intFromFloat(@round(src[i]));
     }
+}
+
+test "irreversible sample rounding validates SIMD and scalar boundaries" {
+    const valid = [_]f32{
+        -2147483648.0,
+        2147483520.0,
+        -1.5,
+        1.5,
+        0.0,
+        42.25,
+        -42.25,
+        127.0,
+    };
+    var converted: [valid.len]i32 = undefined;
+    try roundF32PlaneToI32(&converted, &valid);
+    try std.testing.expectEqual(std.math.minInt(i32), converted[0]);
+    try std.testing.expectEqual(@as(i32, 2147483520), converted[1]);
+    try std.testing.expectEqual(@as(i32, -2), converted[2]);
+    try std.testing.expectEqual(@as(i32, 2), converted[3]);
+
+    var invalid_simd = [_]f32{0.0} ** simd_lanes_f32_i32;
+    invalid_simd[simd_lanes_f32_i32 - 1] = 2147483648.0;
+    var simd_output: [simd_lanes_f32_i32]i32 = undefined;
+    try std.testing.expectError(
+        error.InvalidReconstructedSample,
+        roundF32PlaneToI32(&simd_output, &invalid_simd),
+    );
+
+    const invalid_scalar = [_]f32{std.math.nan(f32)};
+    var scalar_output: [1]i32 = undefined;
+    try std.testing.expectError(
+        error.InvalidReconstructedSample,
+        roundF32PlaneToI32(&scalar_output, &invalid_scalar),
+    );
+}
+
+test "small-scale custom MCT cannot overflow irreversible reconstruction" {
+    const scale: f32 = 1e-7;
+    const inverse_scale: f32 = 1.0 / scale;
+    const forward = [_]f32{
+        scale, 0,     0,
+        0,     scale, 0,
+        0,     0,     scale,
+    };
+    const inverse = [_]f32{
+        inverse_scale, 0,             0,
+        0,             inverse_scale, 0,
+        0,             0,             inverse_scale,
+    };
+    const offsets = [_]f32{ 0, 0, 0 };
+    const matrix = color_transform.CustomMctMatrix{
+        .num_components = 3,
+        .forward = &forward,
+        .inverse = &inverse,
+        .offsets = &offsets,
+    };
+    var p0 = [_]f32{256.0};
+    var p1 = [_]f32{256.0};
+    var p2 = [_]f32{256.0};
+    const planes = [_][]f32{ &p0, &p1, &p2 };
+    try color_transform.applyCustomMctInverse(matrix, &planes);
+
+    var converted: [1]i32 = undefined;
+    try std.testing.expectError(
+        error.InvalidReconstructedSample,
+        roundF32PlaneToI32(&converted, &p0),
+    );
 }
 
 fn applyReversibleMctOnEqualComponentGrid(state: *const codestream.State, planes: [][]i32) void {
@@ -888,7 +972,7 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
 
     for (state.header.components, 0..) |_, component_index| {
         if (irreversible[component_index]) {
-            roundF32PlaneToI32(planes[component_index], f32_planes[component_index]);
+            try roundF32PlaneToI32(planes[component_index], f32_planes[component_index]);
         }
     }
 
@@ -1488,7 +1572,7 @@ pub const StreamingPlaneAssembler = struct {
             )[0..float_plane.len];
             const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
             if (coding_style.wavelet_transform == 0) {
-                roundF32PlaneToI32(plane, float_plane);
+                try roundF32PlaneToI32(plane, float_plane);
             }
             planes[component_index] = plane;
         }
