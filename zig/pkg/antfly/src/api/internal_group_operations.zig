@@ -282,6 +282,10 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.MetadataSnapshotUnavailable,
+            => return error.GroupLeaderUnavailable,
             else => return error.Internal,
         }) orelse return error.NotFound;
     }
@@ -300,6 +304,10 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TxnNotFound => return error.NotFound,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.MetadataSnapshotUnavailable,
+            => return error.GroupLeaderUnavailable,
             else => return error.Internal,
         }) orelse return error.NotFound;
     }
@@ -761,6 +769,82 @@ pub const Operations = struct {
         };
     }
 };
+
+test "internal transaction operations preserve pre-decision leader unavailability" {
+    const Source = struct {
+        fn iface() table_writes.TableWriteSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .batch = batch,
+                    .txn_begin_group_local = txnBegin,
+                    .txn_prepare_group_local = txnPrepare,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            return null;
+        }
+
+        fn txnBegin(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: u64,
+            _: bool,
+            _: []const []const u8,
+        ) anyerror!?void {
+            return error.LeaderUnavailable;
+        }
+
+        fn txnPrepare(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: db_mod.types.TransactionIntentRequest,
+        ) anyerror!?void {
+            return error.MetadataSnapshotUnavailable;
+        }
+    };
+
+    const Validator = struct {
+        fn validate(_: *anyopaque, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
+    };
+
+    const operations = Operations{
+        .reads = null,
+        .shard_db_adapter = null,
+        .writes = Source.iface(),
+        .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
+    };
+    const txn_id = [_]u8{0x42} ** 16;
+    try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnBegin(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+    try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnPrepare(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .req = .{} },
+    ));
+}
 
 const RepairCancelProbe = struct {
     alloc: std.mem.Allocator,

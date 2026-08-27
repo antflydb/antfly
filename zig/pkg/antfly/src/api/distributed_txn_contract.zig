@@ -8,6 +8,13 @@
 
 const db_types = @import("../storage/db/types.zig");
 
+/// A pre-decision participant may be tried at another replica only when the
+/// responding node proves that it did not admit the mutation. A dedicated
+/// transaction header keeps that proof distinct from routed batch forwarding
+/// and lets clients fail closed across proxies and rolling upgrades.
+pub const pre_decision_outcome_header = "X-Antfly-Txn-Pre-Decision-Outcome";
+pub const pre_decision_not_proposed_v1 = "not-proposed-v1";
+
 pub const TableCommitRequest = struct {
     table_name: []const u8,
     writes: []const db_types.TransactionWrite = &.{},

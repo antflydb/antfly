@@ -62,6 +62,7 @@ const table_writes = @import("table_writes.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const transactions_api = @import("transactions.zig");
 const distributed_txn = @import("distributed_txn.zig");
+const distributed_txn_contract = @import("distributed_txn_contract.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
 const generating_runtime = @import("../generating/mod.zig");
@@ -2090,7 +2091,11 @@ pub const AntflyApiHandler = struct {
         return ctx.json(.{ .inserted = result.inserted, .deleted = result.deleted, .transformed = result.transformed });
     }
 
-    fn internalTxnErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error) !httpx.Response {
+    fn internalTxnErrorResponse(
+        ctx: *httpx.Context,
+        err: internal_group_operations.Error,
+        pre_decision: bool,
+    ) !httpx.Response {
         return switch (err) {
             error.InvalidArgument => textResponse(ctx, 400, "invalid transaction request"),
             error.DecisionConflict => textResponse(ctx, 409, "decision conflict"),
@@ -2106,9 +2111,18 @@ pub const AntflyApiHandler = struct {
             error.EnrichmentRetryInProgress,
             => textResponse(ctx, 202, "committed_visibility_pending"),
             error.EnrichmentWorkerFailed => textResponse(ctx, 202, "committed_repair_required"),
+            error.GroupLeaderUnavailable => blk: {
+                if (txnErrorProvesNotProposed(err, pre_decision))
+                    try ctx.setHeader(distributed_txn_contract.pre_decision_outcome_header, distributed_txn_contract.pre_decision_not_proposed_v1);
+                break :blk textResponse(ctx, 503, "group leader unavailable");
+            },
             error.Unavailable => textResponse(ctx, 503, "transaction unavailable"),
             else => textResponse(ctx, 500, "internal server error"),
         };
+    }
+
+    fn txnErrorProvesNotProposed(err: internal_group_operations.Error, pre_decision: bool) bool {
+        return pre_decision and err == error.GroupLeaderUnavailable;
     }
 
     fn internalTxnBegin(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -2118,7 +2132,7 @@ pub const AntflyApiHandler = struct {
         var input = distributed_txn.parseTxnBeginRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnBeginRequest(ctx.allocator, &input);
         self.internalGroupOperations().txnBegin(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
-            return internalTxnErrorResponse(ctx, err);
+            return internalTxnErrorResponse(ctx, err, true);
         return ctx.json(struct {}{});
     }
 
@@ -2129,7 +2143,7 @@ pub const AntflyApiHandler = struct {
         var input = distributed_txn.parseTxnPrepareRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnPrepareRequest(ctx.allocator, &input);
         self.internalGroupOperations().txnPrepare(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
-            return internalTxnErrorResponse(ctx, err);
+            return internalTxnErrorResponse(ctx, err, true);
         return ctx.json(struct {}{});
     }
 
@@ -2139,7 +2153,7 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         const input = distributed_txn.parseTxnResolveRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         self.internalGroupOperations().txnResolve(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
-            return internalTxnErrorResponse(ctx, err);
+            return internalTxnErrorResponse(ctx, err, false);
         return ctx.json(struct {}{});
     }
 
@@ -2149,7 +2163,7 @@ pub const AntflyApiHandler = struct {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "invalid transaction request");
         const txn_id = distributed_txn.parseTxnStatusRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         const status = self.internalGroupOperations().txnStatus(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, txn_id) catch |err|
-            return internalTxnErrorResponse(ctx, err);
+            return internalTxnErrorResponse(ctx, err, false);
         return ctx.json(distributed_txn.TxnStatusResponse{ .status = status });
     }
 
@@ -2160,7 +2174,7 @@ pub const AntflyApiHandler = struct {
         var input = distributed_txn.parseTxnAcknowledgeRequest(ctx.allocator, body) catch return textResponse(ctx, 400, "invalid transaction request");
         defer distributed_txn.freeTxnAcknowledgeRequest(ctx.allocator, &input);
         self.internalGroupOperations().txnAcknowledge(ctx.allocator, operationContext(ctx, null), params.group_id, params.table_name, input) catch |err|
-            return internalTxnErrorResponse(ctx, err);
+            return internalTxnErrorResponse(ctx, err, false);
         return ctx.json(struct {}{});
     }
 
@@ -5967,6 +5981,9 @@ test "typed internal HTTP errors preserve conflict semantics" {
     try std.testing.expectEqual(@as(u16, 409), stale_cursor.status);
     try std.testing.expectEqualStrings("HierarchyCursorStale", stale_cursor.message);
     try std.testing.expect(AntflyApiHandler.sharedInternalHttpErrorSpec(error.NotFound) == null);
+    try std.testing.expect(AntflyApiHandler.txnErrorProvesNotProposed(error.GroupLeaderUnavailable, true));
+    try std.testing.expect(!AntflyApiHandler.txnErrorProvesNotProposed(error.GroupLeaderUnavailable, false));
+    try std.testing.expect(!AntflyApiHandler.txnErrorProvesNotProposed(error.Unavailable, true));
 }
 
 test "HA mutation middleware fails closed for unregistered HTTP methods" {

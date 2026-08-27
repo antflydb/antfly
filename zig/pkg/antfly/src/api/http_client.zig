@@ -27,6 +27,7 @@ const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const routes = @import("http_routes.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const txn_api = @import("distributed_txn.zig");
+const txn_contract = @import("distributed_txn_contract.zig");
 const table_writes_api = @import("table_writes.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const transactions_api = @import("transactions.zig");
@@ -2339,6 +2340,23 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !EmptyResponse {
+        return try self.fetchGroupTxnBeginWithDeliveryTracking(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            null,
+        );
+    }
+
+    pub fn fetchGroupTxnBeginWithDeliveryTracking(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
+    ) !EmptyResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2355,13 +2373,17 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .delivery_tracker = delivery_tracker,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => return .{},
             404 => return error.UnknownGroup,
             409 => return remoteGroupConflictError(resp.body),
-            503 => return error.GroupLeaderUnavailable,
+            503 => if (isTxnPreDecisionNotProposedResponse(resp))
+                return error.GroupLeaderUnavailable
+            else
+                return error.UnexpectedHttpStatus,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2372,6 +2394,23 @@ pub const ApiHttpClient = struct {
         group_id: u64,
         table_name: []const u8,
         body: []const u8,
+    ) !EmptyResponse {
+        return try self.fetchGroupTxnPrepareWithDeliveryTracking(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            null,
+        );
+    }
+
+    pub fn fetchGroupTxnPrepareWithDeliveryTracking(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
     ) !EmptyResponse {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -2389,13 +2428,17 @@ pub const ApiHttpClient = struct {
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .delivery_tracker = delivery_tracker,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
             200 => return .{},
             404 => return error.UnknownGroup,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
-            503 => return error.GroupLeaderUnavailable,
+            503 => if (isTxnPreDecisionNotProposedResponse(resp))
+                return error.GroupLeaderUnavailable
+            else
+                return error.UnexpectedHttpStatus,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -3250,15 +3293,28 @@ test "api http client encodes lookup route and query components" {
 
 test "api http client preserves retryable group transaction unavailability" {
     const UnavailableExecutor = struct {
+        marked_not_proposed: bool = true,
+
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
         }
 
-        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
-            return .{
-                .status = 503,
-                .body = try alloc.dupe(u8, "group leader unavailable"),
-            };
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const pre_decision = std.mem.endsWith(u8, req.uri, routes.Routes.txn_begin_suffix) or
+                std.mem.endsWith(u8, req.uri, routes.Routes.txn_prepare_suffix);
+            if (pre_decision and self.marked_not_proposed) {
+                return try http_route_helpers.textResponseWithHeaders(
+                    alloc,
+                    503,
+                    "group leader unavailable",
+                    &.{.{
+                        .name = txn_contract.pre_decision_outcome_header,
+                        .value = txn_contract.pre_decision_not_proposed_v1,
+                    }},
+                );
+            }
+            return try http_route_helpers.textResponse(alloc, 503, "group leader unavailable");
         }
     };
 
@@ -3270,6 +3326,10 @@ test "api http client preserves retryable group transaction unavailability" {
     try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnResolve(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnAcknowledge(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnStatus(base_uri, 7, "docs", "{}"));
+
+    executor.marked_not_proposed = false;
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupTxnBegin(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupTxnPrepare(base_uri, 7, "docs", "{}"));
 }
 
 fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
@@ -3282,6 +3342,12 @@ fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
         }
     }
     return false;
+}
+
+fn isTxnPreDecisionNotProposedResponse(resp: http_common.HttpResponse) bool {
+    if (resp.status != 503) return false;
+    const outcome = resp.header(txn_contract.pre_decision_outcome_header) orelse return false;
+    return std.mem.eql(u8, outcome, txn_contract.pre_decision_not_proposed_v1);
 }
 
 fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
