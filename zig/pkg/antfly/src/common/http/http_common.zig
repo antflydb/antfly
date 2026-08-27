@@ -130,6 +130,12 @@ pub const RequestDeliveryTracker = struct {
 
     state: std.atomic.Value(u8) = .init(@intFromEnum(State.unknown)),
 
+    /// Enter an executor whose send boundary is not yet known. The executor
+    /// may subsequently prove `not_sent` or advance to `may_have_been_sent`.
+    pub fn markUnknown(self: *RequestDeliveryTracker) void {
+        self.state.store(@intFromEnum(State.unknown), .release);
+    }
+
     pub fn markNotSent(self: *RequestDeliveryTracker) void {
         self.state.store(@intFromEnum(State.not_sent), .release);
     }
@@ -242,9 +248,43 @@ pub const RequestExecutor = struct {
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn execute(self: RequestExecutor, alloc: std.mem.Allocator, req: HttpRequest) !HttpResponse {
+        // Caller-side request construction may establish `not_sent`, but that
+        // proof ends when control crosses an arbitrary executor boundary. A
+        // tracking-aware executor can restore `not_sent` during its own local
+        // setup and must advance the state before transmission. An executor
+        // that does not implement tracking therefore remains safely unknown.
+        if (req.delivery_tracker) |tracker| tracker.markUnknown();
         return try BoundaryAbi.call("execute", self.boundary_dispatch, self.vtable.execute, .{ self.ptr, alloc, req });
     }
 };
+
+test "request executor invalidates caller-side delivery proof at its boundary" {
+    const ObservingExecutor = struct {
+        observed: ?RequestDeliveryTracker.State = null,
+
+        fn iface(self: *@This()) RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: HttpRequest) anyerror!HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+            self.observed = tracker.load();
+            return error.Timeout;
+        }
+    };
+
+    var tracker: RequestDeliveryTracker = .{};
+    tracker.markNotSent();
+    var observing = ObservingExecutor{};
+    try std.testing.expectError(error.Timeout, observing.iface().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = "http://127.0.0.1/internal",
+        .delivery_tracker = &tracker,
+    }));
+    try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, observing.observed.?);
+    try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, tracker.load());
+}
 
 test "http common types compile" {
     _ = Method;
