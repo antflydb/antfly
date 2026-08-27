@@ -4826,6 +4826,7 @@ pub const DB = struct {
         kind: LsmOwnerKind,
         name: []u8,
         maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+        owner_overflow: bool = false,
         retired_labels_collapsed_total: u64 = 0,
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -4864,6 +4865,7 @@ pub const DB = struct {
                 },
                 .name = owner.name,
                 .maintenance = owner.maintenance,
+                .owner_overflow = owner.owner_overflow,
                 .retired_labels_collapsed_total = owner.retired_labels_collapsed_total,
             });
             transferred += 1;

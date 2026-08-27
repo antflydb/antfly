@@ -66,6 +66,7 @@ pub const LsmOwnerMetricStats = struct {
     group_id: u64,
     owner_kind: db_mod.LsmOwnerKind,
     owner_name: []u8,
+    owner_overflow: bool = false,
     maintenance: lsm_backend.Backend.MaintenanceStats,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -148,6 +149,7 @@ fn appendLiveLsmOwnerStatsAlloc(
                         entry.group_id,
                         owner.kind,
                         owner.name,
+                        owner.owner_overflow,
                         clone_stats,
                     );
                 }
@@ -167,7 +169,8 @@ fn appendLiveLsmOwnerStatsAlloc(
                 continue;
             }
             for (result.items) |*existing| {
-                if (existing.group_id != entry.group_id or existing.owner_kind != owner.kind) continue;
+                if (existing.group_id != entry.group_id or existing.owner_kind != owner.kind or
+                    existing.owner_overflow != owner.owner_overflow) continue;
                 if (!std.mem.eql(u8, existing.table_name, entry.table_name)) continue;
                 if (!std.mem.eql(u8, existing.owner_name, owner.name)) continue;
                 accumulateLsmOwnerCloneMaintenance(&existing.maintenance, visible_maintenance);
@@ -182,6 +185,7 @@ fn appendLiveLsmOwnerStatsAlloc(
                     .group_id = entry.group_id,
                     .owner_kind = owner.kind,
                     .owner_name = owner.name,
+                    .owner_overflow = owner.owner_overflow,
                     .maintenance = visible_maintenance,
                 });
                 transferred += 1;
@@ -190,17 +194,69 @@ fn appendLiveLsmOwnerStatsAlloc(
     }
 }
 
-fn observeWriteCacheLsmOwnerStatsBestEffort(
-    result: *std.ArrayListUnmanaged(LsmOwnerMetricStats),
+const PinnedLsmOwnerEntries = struct {
+    cache: *ProvisionedTableWriteCache,
+    storage: []*ProvisionedTableWriteCache.Entry,
+    count: usize,
+
+    fn entries(self: @This()) []*ProvisionedTableWriteCache.Entry {
+        return self.storage[0..self.count];
+    }
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.cache.releaseEntries(self.entries());
+        alloc.free(self.storage);
+        self.* = undefined;
+    }
+};
+
+/// Take short-lived leases while holding the lifecycle mutex, then release it
+/// before any DB snapshot, allocation-heavy aggregation, or runtime-registry
+/// work. Closing entries are deliberately excluded: their final blocking
+/// archive is authoritative, and the close queue is not lease-aware.
+fn pinWriteCacheLsmOwnerEntriesBestEffort(
     alloc: std.mem.Allocator,
     cache: *ProvisionedTableWriteCache,
-    runtime: ?*db_mod.background_runtime.BackendRuntime,
-) !void {
-    if (!cache.entry_lifecycle_mutex.tryLock()) return;
-    defer cache.entry_lifecycle_mutex.unlock();
-    try appendLiveLsmOwnerStatsAlloc(result, alloc, cache.entries.items, runtime);
-    try appendLiveLsmOwnerStatsAlloc(result, alloc, cache.retired_entries.items, runtime);
-    try appendLiveLsmOwnerStatsAlloc(result, alloc, cache.closing_entries.items, runtime);
+) !?PinnedLsmOwnerEntries {
+    var storage: ?[]*ProvisionedTableWriteCache.Entry = null;
+    errdefer if (storage) |entries| alloc.free(entries);
+
+    while (true) {
+        if (!cache.entry_lifecycle_mutex.tryLock()) {
+            if (storage) |entries| alloc.free(entries);
+            return null;
+        }
+        const entry_count = std.math.add(
+            usize,
+            cache.entries.items.len,
+            cache.retired_entries.items.len,
+        ) catch {
+            cache.entry_lifecycle_mutex.unlock();
+            return error.OutOfMemory;
+        };
+        if (storage == null or storage.?.len < entry_count) {
+            cache.entry_lifecycle_mutex.unlock();
+            const replacement = try alloc.alloc(*ProvisionedTableWriteCache.Entry, entry_count);
+            if (storage) |entries| alloc.free(entries);
+            storage = replacement;
+            continue;
+        }
+
+        var pinned: usize = 0;
+        for (cache.entries.items) |entry| {
+            entry.active_leases += 1;
+            storage.?[pinned] = entry;
+            pinned += 1;
+        }
+        for (cache.retired_entries.items) |entry| {
+            entry.active_leases += 1;
+            storage.?[pinned] = entry;
+            pinned += 1;
+        }
+        cache.entry_lifecycle_mutex.unlock();
+        std.debug.assert(pinned == entry_count);
+        return .{ .cache = cache, .storage = storage.?, .count = entry_count };
+    }
 }
 
 fn publishRuntimeStatusGroupForTest(
@@ -1084,6 +1140,7 @@ pub const ProvisionedTableWriteCache = struct {
                     self.group_id,
                     owner.kind,
                     owner.name,
+                    owner.owner_overflow,
                     clone_stats,
                 ) catch |err| {
                     std.log.warn("failed to retain LSM owner clone metrics table={s} group={} owner={s} err={s}", .{
@@ -3327,9 +3384,7 @@ pub const ProvisionedTableWriteCache = struct {
         return true;
     }
 
-    fn releaseEntry(self: *ProvisionedTableWriteCache, entry: *Entry) void {
-        lockAtomic(&self.entry_lifecycle_mutex);
-        defer self.entry_lifecycle_mutex.unlock();
+    fn releaseEntryAssumeLifecycleLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
         std.debug.assert(entry.active_leases > 0);
         entry.active_leases -= 1;
         if (entry.active_leases == 0 and entry.retired) {
@@ -3337,6 +3392,18 @@ pub const ProvisionedTableWriteCache = struct {
                 std.log.err("failed to queue retired writer-cache entry for close: {}", .{err});
             };
         }
+    }
+
+    fn releaseEntries(self: *ProvisionedTableWriteCache, entries: []const *Entry) void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        for (entries) |entry| self.releaseEntryAssumeLifecycleLocked(entry);
+    }
+
+    fn releaseEntry(self: *ProvisionedTableWriteCache, entry: *Entry) void {
+        lockAtomic(&self.entry_lifecycle_mutex);
+        defer self.entry_lifecycle_mutex.unlock();
+        self.releaseEntryAssumeLifecycleLocked(entry);
     }
 
     fn retireEntryLocked(self: *ProvisionedTableWriteCache, entry: *Entry) void {
@@ -11373,18 +11440,39 @@ pub const ProvisionedTableWriteSource = struct {
             result.deinit(alloc);
         }
 
+        var write_pins: ?PinnedLsmOwnerEntries = null;
+        defer if (write_pins) |*pinned| pinned.deinit(alloc);
+        var startup_pins: ?PinnedLsmOwnerEntries = null;
+        defer if (startup_pins) |*pinned| pinned.deinit(alloc);
         if (self.local_db_mutex.tryLock()) {
-            defer self.local_db_mutex.unlock();
             const write_cache = self.write_cache;
             const startup_cache = self.startup_write_cache;
             if (write_cache) |cache| {
-                try observeWriteCacheLsmOwnerStatsBestEffort(&result, alloc, cache, self.backend_runtime);
+                write_pins = pinWriteCacheLsmOwnerEntriesBestEffort(alloc, cache) catch |err| {
+                    self.local_db_mutex.unlock();
+                    return err;
+                };
             }
             if (startup_cache) |cache| {
                 if (write_cache == null or write_cache.? != cache) {
-                    try observeWriteCacheLsmOwnerStatsBestEffort(&result, alloc, cache, self.backend_runtime);
+                    startup_pins = pinWriteCacheLsmOwnerEntriesBestEffort(alloc, cache) catch |err| {
+                        self.local_db_mutex.unlock();
+                        return err;
+                    };
                 }
             }
+            self.local_db_mutex.unlock();
+        }
+
+        if (write_pins) |*pinned| {
+            try appendLiveLsmOwnerStatsAlloc(&result, alloc, pinned.entries(), self.backend_runtime);
+            pinned.deinit(alloc);
+            write_pins = null;
+        }
+        if (startup_pins) |*pinned| {
+            try appendLiveLsmOwnerStatsAlloc(&result, alloc, pinned.entries(), self.backend_runtime);
+            pinned.deinit(alloc);
+            startup_pins = null;
         }
 
         if (self.backend_runtime) |runtime| {
@@ -11396,7 +11484,8 @@ pub const ProvisionedTableWriteSource = struct {
             for (cumulative) |owner| {
                 const maintenance = archivedLsmOwnerMaintenance(owner.stats);
                 for (result.items) |*existing| {
-                    if (existing.group_id != owner.group_id or existing.owner_kind != owner.owner_kind) continue;
+                    if (existing.group_id != owner.group_id or existing.owner_kind != owner.owner_kind or
+                        existing.owner_overflow != owner.owner_overflow) continue;
                     if (!std.mem.eql(u8, existing.table_name, owner.table_name)) continue;
                     if (!std.mem.eql(u8, existing.owner_name, owner.owner_name)) continue;
                     accumulateLsmOwnerCloneMaintenance(&existing.maintenance, maintenance);
@@ -11411,6 +11500,7 @@ pub const ProvisionedTableWriteSource = struct {
                         .group_id = owner.group_id,
                         .owner_kind = owner.owner_kind,
                         .owner_name = owner_name,
+                        .owner_overflow = owner.owner_overflow,
                         .maintenance = maintenance,
                     });
                 }
@@ -11422,6 +11512,11 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn lsmOwnerCloneStatsDroppedTotal(self: *ProvisionedTableWriteSource) u64 {
         const runtime = self.backend_runtime orelse return 0;
         return runtime.retiredLsmOwnerCloneStatsDroppedTotal();
+    }
+
+    pub fn lsmOwnerCloneLabelsCollapsedTotal(self: *ProvisionedTableWriteSource) u64 {
+        const runtime = self.backend_runtime orelse return 0;
+        return runtime.retiredLsmOwnerCloneLabelsCollapsedTotal();
     }
 
     pub fn lsmNativeStorageStatsBestEffort(self: *ProvisionedTableWriteSource) ?lsm_backend.NativeStorageStats {
@@ -16970,6 +17065,7 @@ test "provisioned owner clone snapshot preserves retired runtime counters" {
         17,
         .dense_vector,
         "embedding",
+        false,
         archived,
     );
 
@@ -41996,6 +42092,18 @@ test "provisioned create reuses a generation opened by startup reconciliation" {
         });
         var read_txn = try startup_owner.db.core.store.beginReadTxn();
         read_txn.abort();
+
+        var metric_pins = (try pinWriteCacheLsmOwnerEntriesBestEffort(alloc, &startup_write_cache)) orelse
+            return error.TestUnexpectedResult;
+        var metric_pins_open = true;
+        defer if (metric_pins_open) metric_pins.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), metric_pins.entries().len);
+        try std.testing.expect(startup_write_cache.entry_lifecycle_mutex.tryLock());
+        const pinned_active_leases = metric_pins.entries()[0].active_leases;
+        startup_write_cache.entry_lifecycle_mutex.unlock();
+        try std.testing.expectEqual(@as(usize, 2), pinned_active_leases);
+        metric_pins.deinit(alloc);
+        metric_pins_open = false;
 
         const owner_stats = try source.lsmOwnerStatsBestEffortAlloc(alloc);
         defer {

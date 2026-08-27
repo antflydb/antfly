@@ -1668,7 +1668,8 @@ pub const HealthSource = struct {
             self.data_server.alloc.free(lsm_owner_stats);
         }
         try writeLsmOwnerCloneMetrics(writer, lsm_owner_stats);
-        try health_metrics.appendPromMetric(writer, "antfly_lsm_owner_clone_registry_dropped_total", "counter", "LSM owner attribution labels collapsed into bounded overflow or dropped after runtime registry capacity", live_write_source.lsmOwnerCloneStatsDroppedTotal());
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_owner_clone_registry_dropped_total", "counter", "LSM owner metric observations discarded after bounded runtime registry capacity", live_write_source.lsmOwnerCloneStatsDroppedTotal());
+        try health_metrics.appendPromMetric(writer, "antfly_lsm_owner_clone_labels_collapsed_total", "counter", "Distinct retired LSM owner labels folded into bounded typed overflow attribution", live_write_source.lsmOwnerCloneLabelsCollapsedTotal());
         try writeLsmWriteMetrics(writer, live_write_source.lsmWriteStatsBestEffort());
         try writeTextMergeMetrics(writer, live_write_source.textMergeStatsBestEffort());
         var async_indexing_stats = live_write_source.asyncIndexingStatsBestEffort();
@@ -1788,7 +1789,13 @@ fn writeLsmOwnerCloneMetrics(
     for (owners) |owner| {
         var group_buf: [32]u8 = undefined;
         const group = try std.fmt.bufPrint(&group_buf, "{d}", .{owner.group_id});
-        const owner_kind = switch (owner.owner_kind) {
+        const owner_kind = if (owner.owner_overflow)
+            switch (owner.owner_kind) {
+                .primary => "primary_overflow",
+                .full_text => "full_text_overflow",
+                .dense_vector => "dense_vector_overflow",
+            }
+        else switch (owner.owner_kind) {
             .primary => "primary",
             .full_text => "full_text",
             .dense_vector => "dense_vector",
@@ -25165,22 +25172,33 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_data_block_peak_used_bytes") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_kind_peak_used_bytes{kind=\"run_table_block\"}") != null);
 
-    const owner_stats = [_]antfly.public_api.table_writes.LsmOwnerMetricStats{.{
-        .table_name = @constCast("docs"),
-        .group_id = 17,
-        .owner_kind = .dense_vector,
-        .owner_name = @constCast("embedding"),
-        .maintenance = .{
-            .mutable_snapshot_clone_calls = 3,
-            .mutable_snapshot_clone_bytes_total = 4096,
-            .mutable_snapshot_clone_peak_bytes = 2048,
-            .bulk_ingest_current_scan_clone_peak_active_bytes = 1024,
+    const owner_stats = [_]antfly.public_api.table_writes.LsmOwnerMetricStats{
+        .{
+            .table_name = @constCast("docs"),
+            .group_id = 17,
+            .owner_kind = .dense_vector,
+            .owner_name = @constCast("embedding"),
+            .maintenance = .{
+                .mutable_snapshot_clone_calls = 3,
+                .mutable_snapshot_clone_bytes_total = 4096,
+                .mutable_snapshot_clone_peak_bytes = 2048,
+                .bulk_ingest_current_scan_clone_peak_active_bytes = 1024,
+            },
         },
-    }};
+        .{
+            .table_name = @constCast("docs"),
+            .group_id = 17,
+            .owner_kind = .dense_vector,
+            .owner_name = @constCast("__retired_owner_overflow__"),
+            .owner_overflow = true,
+            .maintenance = .{ .mutable_snapshot_clone_calls = 5 },
+        },
+    };
     writer = .fixed(&writer_buf);
     try writeLsmOwnerCloneMetrics(&writer, &owner_stats);
     const owner_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_mutable_snapshot_clone_calls_total{table=\"docs\",group=\"17\",owner_kind=\"dense_vector\",owner=\"embedding\"} 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_mutable_snapshot_clone_calls_total{table=\"docs\",group=\"17\",owner_kind=\"dense_vector_overflow\",owner=\"__retired_owner_overflow__\"} 5") != null);
     try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_mutable_snapshot_clone_bytes_total{table=\"docs\",group=\"17\",owner_kind=\"dense_vector\",owner=\"embedding\"} 4096") != null);
     try std.testing.expect(std.mem.indexOf(u8, owner_output, "antfly_lsm_owner_bulk_ingest_current_scan_clone_peak_active_bytes{table=\"docs\",group=\"17\",owner_kind=\"dense_vector\",owner=\"embedding\"} 1024") != null);
 

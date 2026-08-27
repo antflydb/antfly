@@ -256,6 +256,9 @@ pub const LsmOwnerStats = struct {
     kind: types.IndexKind,
     name: []u8,
     maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+    /// Distinguishes the bounded synthetic aggregate from a user index that
+    /// happens to have the same display name.
+    owner_overflow: bool = false,
     retired_labels_collapsed_total: u64 = 0,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -3697,13 +3700,14 @@ pub const IndexManager = struct {
                 .kind = kind,
                 .name = try alloc.dupe(u8, retired_lsm_owner_overflow_name),
                 .maintenance = self.retired_lsm_owner_overflow_stats[i],
+                .owner_overflow = true,
                 .retired_labels_collapsed_total = self.retired_lsm_owner_labels_collapsed[i],
             });
         }
         for (self.text_indexes.items) |*entry| {
             const stats = entry.persistent.snapshotLsmMaintenanceStats() orelse continue;
             for (owners.items) |*owner| {
-                if (owner.kind != .full_text or !std.mem.eql(u8, owner.name, entry.config.name)) continue;
+                if (owner.owner_overflow or owner.kind != .full_text or !std.mem.eql(u8, owner.name, entry.config.name)) continue;
                 accumulateCloneMaintenance(&owner.maintenance, stats);
                 break;
             } else {
@@ -3719,7 +3723,7 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |*entry| {
             const stats = entry.index.snapshotLsmMaintenanceStats() orelse continue;
             for (owners.items) |*owner| {
-                if (owner.kind != .dense_vector or !std.mem.eql(u8, owner.name, entry.config.name)) continue;
+                if (owner.owner_overflow or owner.kind != .dense_vector or !std.mem.eql(u8, owner.name, entry.config.name)) continue;
                 accumulateCloneMaintenance(&owner.maintenance, stats);
                 break;
             } else {
@@ -3753,7 +3757,7 @@ pub const IndexManager = struct {
         destination.catalog_mutex.lockExclusive();
         defer destination.catalog_mutex.unlockExclusive();
         for (owners) |owner| {
-            if (owner.retired_labels_collapsed_total != 0) {
+            if (owner.owner_overflow) {
                 const overflow_index: usize = switch (owner.kind) {
                     .full_text => 0,
                     .dense_vector => 1,
@@ -28153,9 +28157,24 @@ test "retired LSM owner clone attribution is bounded with loss-accounted overflo
     var manager = try IndexManager.init(alloc, std.mem.span(path));
     defer manager.deinit();
 
+    // A user owner may legally have the synthetic aggregate's display name;
+    // identity must remain distinct even after the bounded tier fills.
+    manager.archiveLsmOwnerStats(.dense_vector, IndexManager.retired_lsm_owner_overflow_name, .{
+        .mutable_snapshot_clone_calls = 1,
+        .mutable_snapshot_clone_bytes_total = 64,
+        .mutable_snapshot_clone_peak_bytes = 64,
+    });
     var name_buf: [64]u8 = undefined;
-    for (0..IndexManager.max_retired_lsm_owner_stats + 2) |i| {
+    for (0..IndexManager.max_retired_lsm_owner_stats - 1) |i| {
         const name = try std.fmt.bufPrint(&name_buf, "retired-{d}", .{i});
+        manager.archiveLsmOwnerStats(.dense_vector, name, .{
+            .mutable_snapshot_clone_calls = 1,
+            .mutable_snapshot_clone_bytes_total = 128,
+            .mutable_snapshot_clone_peak_bytes = 128,
+        });
+    }
+    for (0..2) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "collapsed-{d}", .{i});
         manager.archiveLsmOwnerStats(.dense_vector, name, .{
             .mutable_snapshot_clone_calls = 1,
             .mutable_snapshot_clone_bytes_total = 128,
@@ -28170,8 +28189,12 @@ test "retired LSM owner clone attribution is bounded with loss-accounted overflo
     }
     try std.testing.expectEqual(IndexManager.max_retired_lsm_owner_stats + 1, owners.len);
     const overflow = for (owners) |owner| {
-        if (std.mem.eql(u8, owner.name, IndexManager.retired_lsm_owner_overflow_name)) break owner;
+        if (owner.owner_overflow) break owner;
     } else return error.TestExpectedEqual;
+    const concrete = for (owners) |owner| {
+        if (!owner.owner_overflow and std.mem.eql(u8, owner.name, IndexManager.retired_lsm_owner_overflow_name)) break owner;
+    } else return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), concrete.maintenance.mutable_snapshot_clone_calls);
     try std.testing.expectEqual(@as(u64, 2), overflow.retired_labels_collapsed_total);
     try std.testing.expectEqual(@as(u64, 2), overflow.maintenance.mutable_snapshot_clone_calls);
     try std.testing.expectEqual(@as(u64, 256), overflow.maintenance.mutable_snapshot_clone_bytes_total);
