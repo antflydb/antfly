@@ -31,6 +31,13 @@ pub const TypeGenerator = struct {
     used_imports: std.StringArrayHashMapUnmanaged(void) = .{},
     /// Extra top-level helper types emitted while generating named schema types.
     extra_type_reexports: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// All public Zig type identifiers reserved by components or generated
+    /// helpers. OpenAPI component names are reserved before emission so helper
+    /// naming is deterministic and independent of schema traversal order.
+    reserved_type_names: std.StringHashMapUnmanaged(void) = .empty,
+    /// Stable semantic helper key -> allocated public Zig type identifier.
+    auxiliary_type_names: std.StringHashMapUnmanaged([]const u8) = .empty,
+    type_names_initialized: bool = false,
 
     pub fn init(arena: Allocator, w: *SourceWriter, resolver: *Resolver) TypeGenerator {
         return .{ .arena = arena, .w = w, .resolver = resolver };
@@ -40,6 +47,8 @@ pub const TypeGenerator = struct {
     pub fn generateAll(self: *TypeGenerator, doc: *const types.OpenApiDoc) !void {
         const components = doc.components orelse return;
         const schemas = components.schemas;
+
+        try self.initializeTypeNames(schemas.keys());
 
         // Zig named declarations can reference later declarations, so schema
         // emission does not need dependency ordering. Keeping this lexical makes
@@ -83,11 +92,9 @@ pub const TypeGenerator = struct {
         // intent before composition handling so a transparent oneOf wrapper
         // cannot accidentally turn a forward-compatible raw surface into a
         // best-effort structural union.
-        if (schema.extensions.get("x-zig-type")) |override| {
-            if (!std.mem.eql(u8, override, "std.json.Value"))
-                return error.InvalidOpenApiSchema;
+        if (try zigTypeOverride(schema)) |override| {
             if (schema.description) |desc| try self.w.docComment(desc);
-            try self.w.line("pub const {s} = std.json.Value;", .{type_name});
+            try self.w.line("pub const {s} = {s};", .{ type_name, override });
             return;
         }
 
@@ -105,8 +112,9 @@ pub const TypeGenerator = struct {
         // external modules all agree. A separately named payload keeps enum and
         // object namespaces usable while the public component remains optional.
         if (schema.isNullable()) {
-            const payload_type_name = try std.fmt.allocPrint(self.arena, "{s}Value", .{type_name});
-            try self.ensureAuxiliaryTypeNameAvailable(payload_type_name);
+            const preferred_payload_name = try std.fmt.allocPrint(self.arena, "{s}Value", .{type_name});
+            const payload_key = try std.fmt.allocPrint(self.arena, "nullable-payload:{s}", .{type_name});
+            const payload_type_name = try self.allocateAuxiliaryTypeName(payload_key, preferred_payload_name);
             var payload_schema = try self.nonNullableSchema(schema);
             payload_schema.description = null;
             try self.generateNamedType(payload_type_name, payload_schema);
@@ -114,6 +122,16 @@ pub const TypeGenerator = struct {
             try self.w.blank();
             if (schema.description) |desc| try self.w.docComment(desc);
             try self.w.line("pub const {s} = ?{s};", .{ type_name, payload_type_name });
+            return;
+        }
+
+        // OpenAPI 3.1 type arrays can contain more than one non-null JSON type.
+        // A single Zig primitive would silently narrow the accepted wire
+        // domain, so retain the value losslessly until a first-class generated
+        // union representation exists.
+        if (schemaHasMultipleNonNullTypes(schema)) {
+            if (schema.description) |desc| try self.w.docComment(desc);
+            try self.w.line("pub const {s} = std.json.Value;", .{type_name});
             return;
         }
 
@@ -221,16 +239,54 @@ pub const TypeGenerator = struct {
         return payload;
     }
 
-    fn ensureAuxiliaryTypeNameAvailable(self: *TypeGenerator, candidate: []const u8) !void {
-        if (self.resolver.doc.components) |components| {
-            for (components.schemas.keys()) |schema_name| {
-                const existing = try naming.toTypeName(self.arena, schema_name);
-                if (std.mem.eql(u8, existing, candidate)) return error.InvalidOpenApiSchema;
-            }
+    fn schemaHasMultipleNonNullTypes(schema: types.Schema) bool {
+        const schema_type = schema.schema_type orelse return false;
+        return switch (schema_type) {
+            .single => false,
+            .array => |members| blk: {
+                var count: usize = 0;
+                for (members) |member| {
+                    if (std.mem.eql(u8, member, "null")) continue;
+                    count += 1;
+                    if (count > 1) break :blk true;
+                }
+                break :blk false;
+            },
+        };
+    }
+
+    fn zigTypeOverride(schema: types.Schema) error{InvalidOpenApiSchema}!?[]const u8 {
+        const override = schema.extensions.get("x-zig-type") orelse return null;
+        if (!std.mem.eql(u8, override, "std.json.Value")) return error.InvalidOpenApiSchema;
+        return override;
+    }
+
+    fn initializeTypeNames(self: *TypeGenerator, schema_names: []const []const u8) !void {
+        if (self.type_names_initialized) return;
+        for (schema_names) |schema_name| {
+            const type_name = try naming.toTypeName(self.arena, schema_name);
+            const entry = try self.reserved_type_names.getOrPut(self.arena, type_name);
+            if (entry.found_existing) return error.InvalidOpenApiSchema;
+            entry.value_ptr.* = {};
         }
-        for (self.extra_type_reexports.items) |existing| {
-            if (std.mem.eql(u8, existing, candidate)) return error.InvalidOpenApiSchema;
+        self.type_names_initialized = true;
+    }
+
+    fn allocateAuxiliaryTypeName(
+        self: *TypeGenerator,
+        semantic_key: []const u8,
+        preferred: []const u8,
+    ) ![]const u8 {
+        if (self.auxiliary_type_names.get(semantic_key)) |existing| return existing;
+
+        var candidate = preferred;
+        var suffix: usize = 2;
+        while (self.reserved_type_names.contains(candidate)) : (suffix += 1) {
+            candidate = try std.fmt.allocPrint(self.arena, "{s}{d}", .{ preferred, suffix });
         }
+        try self.reserved_type_names.put(self.arena, candidate, {});
+        try self.auxiliary_type_names.put(self.arena, semantic_key, candidate);
+        return candidate;
     }
 
     /// Generate a Zig enum from a string enum schema.
@@ -382,7 +438,13 @@ pub const TypeGenerator = struct {
 
     fn inlineEnumTypeName(self: *TypeGenerator, owner_type_name: []const u8, prop_name: []const u8) ![]const u8 {
         const prop_type_name = try naming.toTypeName(self.arena, prop_name);
-        return std.fmt.allocPrint(self.arena, "{s}{s}", .{ owner_type_name, prop_type_name });
+        const preferred = try std.fmt.allocPrint(self.arena, "{s}{s}", .{ owner_type_name, prop_type_name });
+        const semantic_key = try std.fmt.allocPrint(
+            self.arena,
+            "inline-enum:{s}:{s}",
+            .{ owner_type_name, prop_name },
+        );
+        return self.allocateAuxiliaryTypeName(semantic_key, preferred);
     }
 
     fn zigTypeForStructField(self: *TypeGenerator, owner_type_name: []const u8, prop_name: []const u8, prop_sor: types.SchemaOrRef) ![]const u8 {
@@ -407,23 +469,17 @@ pub const TypeGenerator = struct {
             },
         }
 
-        const nullability = self.schemaOrRefNullability(prop_sor);
-        // Named nullable components and inline nullable oneOf aliases already
-        // carry `?` in zig_type. Other inline nullable schemas still need the
-        // field occurrence to supply it. An external mapped type owns its own
-        // nullability, while its required presence is handled by serialization.
-        const type_carries_null = switch (prop_sor) {
-            .schema => |s| nullableOneOfInner(s.one_of) != null,
-            .ref => nullability == .nullable,
-        };
+        const representation = self.schemaOrRefRepresentation(prop_sor);
 
         if (is_required) {
-            if (nullability == .nullable and !type_carries_null) {
+            if (representation.nullability == .nullable and
+                representation.null_representation == .none)
+            {
                 try self.w.line("{s}: ?{s},", .{ field, zig_type });
             } else {
                 try self.w.line("{s}: {s},", .{ field, zig_type });
             }
-        } else if (type_carries_null) {
+        } else if (representation.null_representation == .zig_optional) {
             try self.w.line("{s}: {s} = null,", .{ field, zig_type });
         } else {
             try self.w.line("{s}: ?{s} = null,", .{ field, zig_type });
@@ -602,7 +658,7 @@ pub const TypeGenerator = struct {
         if (allow_required) {
             for (schema.properties.keys(), schema.properties.values()) |prop_name, prop_sor| {
                 if (!required_fields.contains(prop_name)) continue;
-                if (self.schemaOrRefNullability(prop_sor) != .non_nullable) return true;
+                if (self.schemaOrRefRepresentation(prop_sor).nullability != .non_nullable) return true;
             }
         }
 
@@ -614,18 +670,59 @@ pub const TypeGenerator = struct {
     }
 
     const SchemaNullability = enum { non_nullable, nullable, unknown };
+    const NullRepresentation = enum {
+        /// The occurrence must add `?` when JSON null needs representation.
+        none,
+        /// The generated Zig type expression already carries `?`.
+        zig_optional,
+        /// The type represents JSON null internally (for example
+        /// `std.json.Value`) but still needs an outer `?` when property absence
+        /// must be represented.
+        intrinsic,
+        /// An external mapped type whose document is deliberately unavailable.
+        unknown,
+    };
+    const SchemaRepresentation = struct {
+        nullability: SchemaNullability,
+        null_representation: NullRepresentation,
+    };
 
     /// Whether a property schema permits JSON null. OpenAPI represents this
     /// through 3.0 `nullable`, a 3.1 type array, or a nullable composition.
     /// Local component aliases are resolved recursively. External schemas are
     /// unknown by construction; callers must preserve required-field presence
     /// conservatively instead of assuming that an unresolved type rejects null.
-    fn schemaOrRefNullability(self: *TypeGenerator, schema_or_ref: types.SchemaOrRef) SchemaNullability {
-        const schema = self.resolver.resolveSchema(schema_or_ref) catch return .unknown;
-        return if (schema.isNullable() or nullableOneOfInner(schema.one_of) != null)
+    fn schemaOrRefRepresentation(self: *TypeGenerator, schema_or_ref: types.SchemaOrRef) SchemaRepresentation {
+        const schema = self.resolver.resolveSchema(schema_or_ref) catch return .{
+            .nullability = .unknown,
+            .null_representation = .unknown,
+        };
+        const nullability: SchemaNullability = if (schema.isNullable() or nullableOneOfInner(schema.one_of) != null)
             .nullable
         else
             .non_nullable;
+
+        const null_representation: NullRepresentation = switch (schema_or_ref) {
+            .schema => if (schema.extensions.get("x-zig-type") != null)
+                .intrinsic
+            else if (nullableOneOfInner(schema.one_of) != null)
+                .zig_optional
+            else if (schemaHasMultipleNonNullTypes(schema))
+                .intrinsic
+            else
+                .none,
+            .ref => if (schema.extensions.get("x-zig-type") != null or
+                (schemaHasMultipleNonNullTypes(schema) and !schema.isNullable()))
+                .intrinsic
+            else if (nullability == .nullable)
+                .zig_optional
+            else
+                .none,
+        };
+        return .{
+            .nullability = nullability,
+            .null_representation = null_representation,
+        };
     }
 
     /// Generate a union(enum) from oneOf with discriminator.
@@ -1228,7 +1325,7 @@ pub const TypeGenerator = struct {
         try self.w.line("}}", .{});
     }
 
-    const GenError = error{ OutOfMemory, MissingExternalImportMapping };
+    const GenError = error{ OutOfMemory, MissingExternalImportMapping, InvalidOpenApiSchema };
 
     /// Get the Zig type string for a SchemaOrRef.
     pub fn zigTypeForSchemaOrRef(self: *TypeGenerator, sor: types.SchemaOrRef) GenError![]const u8 {
@@ -1299,6 +1396,8 @@ pub const TypeGenerator = struct {
 
     /// Get the Zig type string for an inline schema.
     fn zigTypeForSchema(self: *TypeGenerator, schema: types.Schema) GenError![]const u8 {
+        if (try zigTypeOverride(schema)) |override| return override;
+
         // OpenAPI 3.0 wraps a nullable $ref in a single-member allOf because
         // nullable is otherwise ignored next to $ref. Preserve the referenced
         // type instead of degrading the field to std.json.Value.
@@ -1315,6 +1414,8 @@ pub const TypeGenerator = struct {
         if (try self.nullableOneOfType(schema.one_of)) |inner_type| {
             return std.fmt.allocPrint(self.arena, "?{s}", .{inner_type});
         }
+
+        if (schemaHasMultipleNonNullTypes(schema)) return "std.json.Value";
 
         // String enum → will be a named type, but when used inline just emit Value
         if (schema.enum_values.len > 0) {
@@ -1438,6 +1539,9 @@ test "zigTypeForSchema primitives" {
     // 3.1 type arrays should also work
     try std.testing.expectEqualStrings("[]const u8", try gen.zigTypeForSchema(.{ .schema_type = .{ .array = &.{ "string", "null" } } }));
     try std.testing.expectEqualStrings("i64", try gen.zigTypeForSchema(.{ .schema_type = .{ .array = &.{ "integer", "null" } } }));
+    try std.testing.expectEqualStrings("std.json.Value", try gen.zigTypeForSchema(.{
+        .schema_type = .{ .array = &.{ "string", "integer", "null" } },
+    }));
 }
 
 test "named free-form object preserves arbitrary JSON" {
@@ -1501,6 +1605,90 @@ test "explicit Zig raw JSON override wins over nested structural unions" {
 
     try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const RawQuery = std.json.Value;") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const RawQuery = union(enum) {") == null);
+}
+
+test "nullable raw JSON override distinguishes required null from optional absence" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var override_extensions = std.StringArrayHashMapUnmanaged([]const u8){};
+    try override_extensions.put(arena, "x-zig-type", "std.json.Value");
+    var props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try props.put(arena, "required_raw", .{
+        .ref = .{ .ref_string = "#/components/schemas/NullableRaw" },
+    });
+    try props.put(arena, "optional_raw", .{
+        .ref = .{ .ref_string = "#/components/schemas/NullableRaw" },
+    });
+    try props.put(arena, "required_inline_raw", .{ .schema = .{
+        .nullable = true,
+        .extensions = override_extensions,
+    } });
+    try props.put(arena, "optional_inline_raw", .{ .schema = .{
+        .nullable = true,
+        .extensions = override_extensions,
+    } });
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "NullableRaw", .{ .schema = .{
+        .nullable = true,
+        .extensions = override_extensions,
+    } });
+    try schemas.put(arena, "Envelope", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
+        .properties = props,
+        .required = &.{ "required_raw", "required_inline_raw" },
+    } });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+
+    const output = w.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const NullableRaw = std.json.Value;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "required_raw: NullableRaw,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "optional_raw: ?NullableRaw = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "required_inline_raw: std.json.Value,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "optional_inline_raw: ?std.json.Value = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.required_raw);") != null);
+}
+
+test "nullable helper allocation preserves colliding component names" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "Flexible", .{ .schema = .{
+        .schema_type = .{ .array = &.{ "string", "integer", "null" } },
+    } });
+    try schemas.put(arena, "FlexibleValue", .{ .schema = .{
+        .schema_type = .{ .single = "integer" },
+    } });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.1.0",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+
+    const output = w.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const FlexibleValue = i64;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const FlexibleValue2 = std.json.Value;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const Flexible = ?FlexibleValue2;") != null);
+    try std.testing.expectEqualStrings("FlexibleValue2", gen.extra_type_reexports.items[0]);
 }
 
 test "named typed map preserves additional property values" {

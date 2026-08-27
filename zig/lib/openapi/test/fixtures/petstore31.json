@@ -123,6 +123,35 @@
             "description": "Required but nullable error details"
           }
         }
+      },
+      "Flexible": {
+        "type": ["string", "integer", "null"],
+        "description": "A lossless multi-type value whose helper name collides with a component"
+      },
+      "FlexibleValue": {
+        "type": "integer"
+      },
+      "NullableRaw": {
+        "type": ["object", "null"],
+        "x-zig-type": "std.json.Value"
+      },
+      "RepresentationEnvelope": {
+        "type": "object",
+        "required": ["required_flexible", "required_raw", "required_inline_raw"],
+        "properties": {
+          "required_flexible": { "$ref": "#/components/schemas/Flexible" },
+          "optional_flexible": { "$ref": "#/components/schemas/Flexible" },
+          "required_raw": { "$ref": "#/components/schemas/NullableRaw" },
+          "optional_raw": { "$ref": "#/components/schemas/NullableRaw" },
+          "required_inline_raw": {
+            "type": ["object", "null"],
+            "x-zig-type": "std.json.Value"
+          },
+          "optional_inline_raw": {
+            "type": ["object", "null"],
+            "x-zig-type": "std.json.Value"
+          }
+        }
       }
     }
   }
