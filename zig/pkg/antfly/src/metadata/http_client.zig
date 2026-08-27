@@ -553,7 +553,15 @@ pub const MetadataHttpClient = struct {
             400 => if (kind == .create_table) error.InvalidCreateTableRequest else error.InvalidTableName,
             404 => error.TableNotFound,
             405 => error.UnsupportedOperation,
-            409 => if (kind == .create_table) error.TableAlreadyExists else error.TableTransitionActive,
+            409 => if (kind == .create_table)
+                error.TableAlreadyExists
+            else if (responseHeader(resp, routes.Routes.table_mutation_error_header)) |value|
+                if (std.mem.eql(u8, value, routes.Routes.table_mutation_error_extension_owned))
+                    error.ExtensionOwnedObject
+                else
+                    error.TableTransitionActive
+            else
+                error.TableTransitionActive,
             else => error.MetadataMutationOutcomeUnknown,
         };
     }
@@ -1571,6 +1579,52 @@ test "metadata http client preserves transport ambiguity for forwarded table mut
         client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
     );
     try std.testing.expectEqual(@as(usize, 1), dropping.attempts);
+}
+
+test "metadata http client preserves extension ownership across forwarding" {
+    const ExtensionOwnedExecutor = struct {
+        fn ownedHeader(alloc: std.mem.Allocator, name: []const u8, value: []const u8) !http_common.Header {
+            const owned_name = try alloc.dupe(u8, name);
+            errdefer alloc.free(owned_name);
+            return .{
+                .name = owned_name,
+                .value = try alloc.dupe(u8, value),
+            };
+        }
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const headers = try alloc.alloc(http_common.Header, 2);
+            var initialized: usize = 0;
+            errdefer {
+                for (headers[0..initialized]) |*header| header.deinit(alloc);
+                alloc.free(headers);
+            }
+            headers[initialized] = try ownedHeader(
+                alloc,
+                routes.Routes.raft_mutation_outcome_header,
+                routes.Routes.raft_mutation_outcome_unknown,
+            );
+            initialized += 1;
+            headers[initialized] = try ownedHeader(
+                alloc,
+                routes.Routes.table_mutation_error_header,
+                routes.Routes.table_mutation_error_extension_owned,
+            );
+            initialized += 1;
+            return .{ .status = 409, .headers = headers };
+        }
+    };
+
+    var executor = ExtensionOwnedExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.ExtensionOwnedObject,
+        client.dropTableForwarded("http://127.0.0.1:9000", "memories"),
+    );
 }
 
 test "metadata http client preserves unrecognized server outcomes for forwarded table mutations" {

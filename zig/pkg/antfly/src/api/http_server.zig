@@ -12135,7 +12135,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
-        if (body.len > tables_api.max_table_create_transport_bytes)
+        if (body.len > tables_api.max_table_create_body_bytes)
             return try contextual_operations.textAlloc(self.alloc, 413, "create table request too large");
         var request = table_contract.parseCreateTableRequest(self.alloc, body) catch |err|
             return try contextual_operations.textAlloc(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, body));
@@ -12213,10 +12213,14 @@ pub const ApiHttpServer = struct {
             error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
             error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
+            error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),
             error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
             error.MetadataMutationOutcomeUnknown => try contextualRetryableTextResponse(self.alloc, 503, "table mutation outcome is unknown; observe table state before retrying"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
-            else => return err,
+            else => if (metadata_authority.isRetryableError(err))
+                try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later")
+            else
+                return err,
         };
         const local_handled = if (self.table_writes) |writes|
             (try writes.createTable(self.alloc, table_name, request)) != null
@@ -12272,12 +12276,16 @@ pub const ApiHttpServer = struct {
         self.source.dropTable(self.alloc, table_name) catch |err| return switch (err) {
             error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table name"),
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
-            error.TableTransitionActive => try contextual_operations.textAlloc(self.alloc, 409, "table transition active"),
+            error.TableTransitionActive, error.TableGenerationChanged => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
+            error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),
             error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table is owned by an extension"),
             error.MetadataMutationOutcomeUnknown => try contextualRetryableTextResponse(self.alloc, 503, "table mutation outcome is unknown; observe table state before retrying"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
-            else => return err,
+            else => if (metadata_authority.isRetryableError(err))
+                try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later")
+            else
+                return err,
         };
         if (self.table_writes) |writes| {
             _ = writes.dropTable(self.alloc, table_name, group_ids orelse &.{}) catch |err| switch (err) {
@@ -33277,6 +33285,113 @@ test "api http server create table with local writes waits for projected presenc
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
+}
+
+test "api http server rejects oversized table definitions before parsing across public and MCP" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        create_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .create_table = createTable,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+        }
+    };
+
+    const oversized = try alloc.alloc(u8, tables_api.max_table_create_body_bytes + 1);
+    defer alloc.free(oversized);
+    @memset(oversized, ' ');
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+
+    var public_response = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = oversized,
+    });
+    defer public_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 413), public_response.status);
+
+    var mcp_response = try server.executeMcpCreateTable("docs", oversized, null);
+    defer mcp_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 413), mcp_response.status);
+    try std.testing.expectEqual(@as(usize, 0), source.create_calls);
+}
+
+test "api http server reports exhausted table mutation authority consistently" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        create_calls: usize = 0,
+        drop_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .create_table = createTable,
+                .drop_table = dropTable,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.create_calls += 1;
+            return error.MetadataLinearizableReadTimeout;
+        }
+
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.drop_calls += 1;
+            return error.NotLeader;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    server.metadata_mutation_retry_policy = .{ .poll_ns = 0, .max_attempts = 2 };
+
+    var public_create = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer public_create.deinit(alloc);
+    try expectPublicMetadataNotLeaderResponse(public_create);
+
+    var public_drop = try executeHttpxTestRequest(&server, .{
+        .method = .DELETE,
+        .uri = "/tables/docs",
+    });
+    defer public_drop.deinit(alloc);
+    try expectPublicMetadataNotLeaderResponse(public_drop);
+
+    var mcp_create = try server.executeMcpCreateTable("docs", "{}", null);
+    defer mcp_create.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), mcp_create.status);
+    try std.testing.expectEqualStrings("1", mcp_create.headers[0].value);
+
+    var mcp_drop = try server.executeMcpDropTable("docs");
+    defer mcp_drop.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), mcp_drop.status);
+    try std.testing.expectEqualStrings("1", mcp_drop.headers[0].value);
+    try std.testing.expectEqual(@as(usize, 3), source.create_calls);
+    try std.testing.expectEqual(@as(usize, 2), source.drop_calls);
 }
 
 test "schema projection expectation uses backend committed generation" {

@@ -4067,9 +4067,9 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid create table request");
         };
         // Reject oversized requests before JSON allocation, credential
-        // sealing, or remote embedding-model probes. The same transport cap
-        // is enforced by metadata forwarding and Raft admission.
-        if (body_data.len > tables_api.max_table_create_transport_bytes) {
+        // sealing, or remote embedding-model probes. Forwarding has a larger
+        // envelope allowance, but the user definition itself is capped here.
+        if (body_data.len > tables_api.max_table_create_body_bytes) {
             _ = ctx.status(413);
             return ctx.text("create table request too large");
         }
@@ -4212,7 +4212,7 @@ pub const AntflyApiHandler = struct {
                             sleepNs(self.api_server.metadataMutationRetryPollNs());
                             continue;
                         }
-                        return error.NotLeader;
+                        return metadataNotLeaderResponse(ctx);
                     }
                     std.log.err("public create table metadata create failed table={s} err={}", .{ decoded_table_name, err });
                     return err;
@@ -4325,12 +4325,17 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("metadata cluster upgrade in progress; retry later");
             },
+            error.NotLeader => {
+                return metadataNotLeaderResponse(ctx);
+            },
             error.MetadataMutationOutcomeUnknown => {
                 try ctx.setHeader("Retry-After", "1");
                 _ = ctx.status(503);
                 return ctx.text("table mutation outcome is unknown; observe table state before retrying");
             },
             else => {
+                if (metadata_authority.isRetryableError(err))
+                    return metadataNotLeaderResponse(ctx);
                 std.log.err("public drop table metadata remove failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
                 return err;
             },

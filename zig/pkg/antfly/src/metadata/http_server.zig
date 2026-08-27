@@ -2093,7 +2093,13 @@ pub const MetadataHttpServer = struct {
         self.tableOperations().drop(ctx.allocator, request_context, table_name) catch |err| switch (err) {
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
-            error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
+            error.ExtensionOwnedObject => {
+                try ctx.setHeader(
+                    routes.Routes.table_mutation_error_header,
+                    routes.Routes.table_mutation_error_extension_owned,
+                );
+                return ctx.status(409).text("table is owned by an extension");
+            },
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
             else => return metadataMutationError(ctx, err),
         };
@@ -3620,7 +3626,7 @@ test "metadata http server serves status and filtered admin routes" {
     try std.testing.expect(std.mem.indexOf(u8, active_resp.body.?, "\"transition_id\":9010") != null);
 }
 
-test "metadata http server maps extension-owned object mutations to method not allowed" {
+test "metadata http server preserves extension-owned table drop conflicts" {
     const FakeSource = struct {
         fn iface(_: *@This()) AdminSource {
             return .{
@@ -3694,7 +3700,11 @@ test "metadata http server maps extension-owned object mutations to method not a
 
     var drop_table_resp = try server.executeTypedHandlerForTest(.DELETE, "/internal/v1/tables/memories", &table_params, MetadataHttpServer.metadataDropTable);
     defer drop_table_resp.deinit();
-    try std.testing.expectEqual(@as(u16, 405), drop_table_resp.status.code);
+    try std.testing.expectEqual(@as(u16, 409), drop_table_resp.status.code);
+    try std.testing.expectEqualStrings(
+        routes.Routes.table_mutation_error_extension_owned,
+        drop_table_resp.headers.get(routes.Routes.table_mutation_error_header).?,
+    );
 }
 
 test "metadata http server replaces a table definition through compare-and-swap" {
