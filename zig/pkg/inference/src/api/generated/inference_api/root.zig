@@ -5,6 +5,7 @@ pub const types = @import("types.zig");
 pub const server = @import("server.zig");
 pub const ServerRouter = server.ServerRouter;
 
+pub const A4bResidencyMode = types.A4bResidencyMode;
 pub const AdmissionConfig = types.AdmissionConfig;
 pub const AudioChunkConfig = types.AudioChunkConfig;
 pub const BackendPriorityEntry = types.BackendPriorityEntry;

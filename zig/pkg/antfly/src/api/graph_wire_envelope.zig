@@ -40,8 +40,10 @@ pub fn parseEnvelopeAlloc(
     expected_operations: anytype,
 ) !ParsedEnvelope {
     const envelope = std.mem.trim(u8, raw, &std.ascii.whitespace);
-    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, envelope, .{}) catch
-        return error.InvalidGraphWireEnvelope;
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, envelope, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidGraphWireEnvelope,
+    };
     errdefer parsed.deinit();
     if (parsed.value != .object or parsed.value.object.count() != 1)
         return error.InvalidGraphWireEnvelope;
@@ -66,8 +68,10 @@ pub fn parseEnvelopeAlloc(
 /// Optional explicit nulls have omission semantics, matching generated request
 /// models, while two populated dialects fail closed before graph execution.
 pub fn captureRequestEnvelopeAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
-        return error.InvalidGraphWireEnvelope;
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidGraphWireEnvelope,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidGraphWireEnvelope;
 
@@ -150,5 +154,37 @@ test "graph wire envelope validates dialect and exact operation set once" {
             "{\"graph_queries\":{\"walk\":{}},\"graph_searches\":{}}",
             &expected,
         ),
+    );
+}
+
+fn expectEnvelopeCaptureAllocationSafe(alloc: std.mem.Allocator) !void {
+    const captured = try captureRequestEnvelopeAlloc(
+        alloc,
+        "{\"graph_queries\":{\"walk\":{}},\"limit\":1}",
+    );
+    defer alloc.free(captured);
+}
+
+fn expectEnvelopeParseAllocationSafe(alloc: std.mem.Allocator) !void {
+    const Named = struct { name: []const u8 };
+    const expected = [_]Named{.{ .name = "walk" }};
+    var parsed = try parseEnvelopeAlloc(
+        alloc,
+        "{\"graph_queries\":{\"walk\":{}}}",
+        &expected,
+    );
+    defer parsed.deinit();
+}
+
+test "graph wire envelope preserves allocator failures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expectEnvelopeCaptureAllocationSafe,
+        .{},
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        expectEnvelopeParseAllocationSafe,
+        .{},
     );
 }

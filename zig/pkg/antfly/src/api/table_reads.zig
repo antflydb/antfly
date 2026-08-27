@@ -17043,7 +17043,10 @@ fn appendGraphQueriesField(
         alloc,
         graph_queries_proxy_json,
         graph_queries,
-    ) catch return error.UnsupportedQueryRequest;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.UnsupportedQueryRequest,
+    };
     defer parsed.deinit();
     const operations = parsed.operations();
 

@@ -12272,16 +12272,16 @@ func haSeedArtifactPVCStorage(name string, pvc *antflyv1.HASeedArtifactPVCSpec, 
 		return nil, nil
 	}
 	return []corev1.VolumeMount{{
-		Name:      name,
-		MountPath: pvc.MountPath,
-		ReadOnly:  readOnly,
-	}}, []corev1.Volume{{
-		Name: name,
-		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-			ClaimName: pvc.ClaimName,
+			Name:      name,
+			MountPath: pvc.MountPath,
 			ReadOnly:  readOnly,
-		}},
-	}}
+		}}, []corev1.Volume{{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: pvc.ClaimName,
+				ReadOnly:  readOnly,
+			}},
+		}}
 }
 
 func haSeedArtifactForAction(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactSpec {

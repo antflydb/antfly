@@ -434,7 +434,10 @@ fn graphResponseFormat(
         alloc,
         req.graph_queries_proxy_json,
         req.graph_queries,
-    ) catch return error.InvalidRemoteResponse;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidRemoteResponse,
+    };
     defer parsed.deinit();
     return parsed.dialect;
 }
@@ -3416,8 +3419,12 @@ pub fn encodeQueryResponses(
         hits[i] = try toOpenApiHit(arena, req, hit);
     }
 
-    const graph_results = if (req.graph_queries.len > 0)
-        try buildGraphQueryResults(arena, req, meta, result)
+    const graph_dialect = if (req.graph_queries.len > 0)
+        try graphResponseFormat(arena, req)
+    else
+        null;
+    const graph_results = if (graph_dialect) |dialect|
+        try buildGraphQueryResults(arena, req, meta, result, dialect)
     else
         null;
     const aggregations = if (meta.aggregation_results.len > 0)
@@ -3442,6 +3449,7 @@ pub fn encodeQueryResponses(
 
     return .{
         .identity_read_generation = result.identity_read_generation orelse req.identity_read_generation,
+        .graph_dialect = graph_dialect,
         // OpenAPI optional response fields are absent unless populated; they
         // are not nullable. Keeping nulls out also preserves the compact wire
         // shape now that hierarchy is represented by generated response types.
@@ -5342,10 +5350,10 @@ fn buildGraphQueryResults(
     req: db_mod.types.SearchRequest,
     meta: QueryResponseMeta,
     result: db_mod.types.SearchResult,
+    response_format: GraphResponseFormat,
 ) !std.json.ArrayHashMap(indexes_openapi.GraphResult) {
     var out: std.json.ArrayHashMap(indexes_openapi.GraphResult) = .{};
     errdefer out.deinit(alloc);
-    const response_format = try graphResponseFormat(alloc, req);
 
     for (req.graph_queries) |requested| {
         var occurrences: usize = 0;
@@ -5761,6 +5769,7 @@ test "graph aggregate response fails closed on missing or inexact results" {
         .{ .graph_queries = &named_queries },
         .{},
         .{ .alloc = alloc, .hits = &.{}, .total_hits = 0, .graph_results = &.{} },
+        .canonical,
     ));
     try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
         alloc,
@@ -5840,6 +5849,7 @@ test "graph response encoding requires exactly one result per traversal operatio
             .total_hits = 0,
             .graph_results = @constCast(unknown_results[0..]),
         },
+        .canonical,
     ));
 }
 
@@ -5957,6 +5967,7 @@ test "deprecated graph search preserves its response envelope" {
         },
     );
     defer encoded.deinit(alloc);
+    try std.testing.expectEqual(GraphResponseFormat.legacy, encoded.graph_dialect.?);
 
     var parsed = try ant_json.parseFromSlice(std.json.Value, alloc, encoded.json, .{});
     defer parsed.deinit();

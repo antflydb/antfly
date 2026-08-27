@@ -175,25 +175,6 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
 }
 
-/// Detect the deprecated public dialect only when the request can contain its
-/// member name. Ordinary canonical queries pay two bounded byte scans and no
-/// allocation; exact or escaped candidates receive one structural parse so a
-/// string value cannot create a false deprecation signal and escaped JSON
-/// member names retain the same semantics as admission.
-fn queryBodyUsesLegacyGraphSearchesAlloc(alloc: std.mem.Allocator, body: []const u8) !bool {
-    if (std.mem.indexOf(u8, body, "graph_searches") == null and
-        std.mem.indexOfScalar(u8, body, '\\') == null)
-    {
-        return false;
-    }
-    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
-        return error.InvalidQueryRequest;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidQueryRequest;
-    const graph_searches = parsed.value.object.get("graph_searches") orelse return false;
-    return graph_searches != .null;
-}
-
 fn appendOwnedResponseHeader(
     alloc: std.mem.Allocator,
     response: *contextual_operations.OwnedResponse,
@@ -231,35 +212,39 @@ fn markLegacyGraphSearchResponse(
     std.log.info("deprecated graph_searches request accepted surface=stateful replacement=graph_queries", .{});
 }
 
-test "legacy graph search deprecation detection is structural and escape-safe" {
-    const alloc = std.testing.allocator;
-    try std.testing.expect(!try queryBodyUsesLegacyGraphSearchesAlloc(alloc, "{}"));
-    try std.testing.expect(!try queryBodyUsesLegacyGraphSearchesAlloc(
-        alloc,
-        "{\"query\":{\"term\":\"graph_searches\"}}",
-    ));
-    try std.testing.expect(!try queryBodyUsesLegacyGraphSearchesAlloc(
-        alloc,
-        "{\"graph_searches\":null}",
-    ));
-    try std.testing.expect(try queryBodyUsesLegacyGraphSearchesAlloc(
-        alloc,
-        "{\"graph_searches\":{\"walk\":{}}}",
-    ));
-    try std.testing.expect(try queryBodyUsesLegacyGraphSearchesAlloc(
-        alloc,
-        "{\"graph_\\u0073earches\":{\"walk\":{}}}",
-    ));
+/// Convert an executed query response into its public HTTP representation.
+/// Dialect provenance is carried from admission through response encoding, so
+/// emitting compatibility telemetry never reparses or can invalidate completed
+/// query work.
+fn publicQuerySuccessResponse(
+    alloc: std.mem.Allocator,
+    query_response: query_api.QueryResponse,
+) !contextual_operations.OwnedResponse {
+    var response = contextual_operations.json(query_response.json, false);
+    errdefer response.deinit(alloc);
+    if (query_response.graph_dialect == .legacy) {
+        try markLegacyGraphSearchResponse(alloc, &response);
+    }
+    return response;
 }
 
-test "legacy graph search responses carry an owned deprecation signal" {
+test "admitted graph dialect drives the owned deprecation signal" {
     const alloc = std.testing.allocator;
-    var response = contextual_operations.json(try alloc.dupe(u8, "{}"), false);
-    defer response.deinit(alloc);
-    try markLegacyGraphSearchResponse(alloc, &response);
-    try std.testing.expectEqual(@as(usize, 1), response.headers.len);
-    try std.testing.expectEqualStrings(graph_wire_envelope.deprecation_header_name, response.headers[0].name);
-    try std.testing.expectEqualStrings(graph_wire_envelope.deprecation_header_value, response.headers[0].value);
+    var canonical = try publicQuerySuccessResponse(alloc, .{
+        .json = try alloc.dupe(u8, "{}"),
+        .graph_dialect = .canonical,
+    });
+    defer canonical.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), canonical.headers.len);
+
+    var legacy = try publicQuerySuccessResponse(alloc, .{
+        .json = try alloc.dupe(u8, "{}"),
+        .graph_dialect = .legacy,
+    });
+    defer legacy.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), legacy.headers.len);
+    try std.testing.expectEqualStrings(graph_wire_envelope.deprecation_header_name, legacy.headers[0].name);
+    try std.testing.expectEqualStrings(graph_wire_envelope.deprecation_header_value, legacy.headers[0].value);
 }
 
 fn mcpSampleDocumentsJsonAlloc(alloc: std.mem.Allocator, ndjson: []const u8) ![]u8 {
@@ -2817,7 +2802,7 @@ pub const ApiHttpServer = struct {
 
     fn joinCtxExecuteQueryDispatch(ptr: *anyopaque, alloc: std.mem.Allocator, source: table_reads.TableReadSource, table_name: []const u8, body: []const u8, row_filter_json: ?[]const u8, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.executePublicTableQueryDispatchWithIdentity(
+        const response = try self.executePublicTableQueryDispatchWithIdentity(
             alloc,
             source,
             table_name,
@@ -2827,6 +2812,7 @@ pub const ApiHttpServer = struct {
             execution_deadline_ns,
             cancellation,
         );
+        return response.json;
     }
 
     fn joinCtxBuildOwnedSearchRequest(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, query_value: std.json.Value, execution_deadline_ns: ?u64, cancellation: ?CancellationToken) anyerror!query_api.OwnedQueryRequest {
@@ -8466,7 +8452,7 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         const source = self.table_reads orelse return error.NotFound;
         try ensureTableOperationActive(request);
-        return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation) catch |err| switch (err) {
+        const response = self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null, request.cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.InvalidFilterQueryRequest => return error.InvalidFilterQueryRequest,
             error.InvalidExclusionQueryRequest => return error.InvalidExclusionQueryRequest,
@@ -8518,6 +8504,7 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
+        return response.json;
     }
 
     fn executePublicTableQueryDispatch(
@@ -8529,7 +8516,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
     ) ![]u8 {
         const execution_deadline_ns = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body);
-        return try self.executePublicTableQueryDispatchWithIdentity(
+        const response = try self.executePublicTableQueryDispatchWithIdentity(
             alloc,
             source,
             table_name,
@@ -8539,6 +8526,7 @@ pub const ApiHttpServer = struct {
             execution_deadline_ns,
             null,
         );
+        return response.json;
     }
 
     fn executePublicTableQueryDispatchWithReadinessRetry(
@@ -8550,7 +8538,7 @@ pub const ApiHttpServer = struct {
         row_filter_json: ?[]const u8,
         authenticated_identity: ?AuthenticatedIdentity,
         cancellation: ?CancellationToken,
-    ) ![]u8 {
+    ) !query_api.QueryResponse {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const start_ns = platform_time.monotonicNs();
@@ -8640,11 +8628,11 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request_deadline_ns: ?u64,
         cancellation: ?CancellationToken,
-    ) ![]u8 {
+    ) !query_api.QueryResponse {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
-            var result = self.executePlainPublicTableQuery(
+            const result = self.executePlainPublicTableQuery(
                 alloc,
                 source,
                 table_name,
@@ -8712,8 +8700,7 @@ pub const ApiHttpServer = struct {
                     return error.InternalFailure;
                 },
             };
-            defer result.deinit(alloc);
-            return try alloc.dupe(u8, result.json);
+            return result;
         }
 
         var contract_req = parsePublicTableQueryBody(alloc, body) catch return error.InvalidQueryRequest;
@@ -8774,7 +8761,7 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         }) |json| {
-            return json;
+            return .{ .json = json };
         }
 
         const join_req = distributed_join.parseSupportedJoinRequestWithSecrets(alloc, body, self.cfg.secret_store) catch |err| switch (err) {
@@ -8793,10 +8780,10 @@ pub const ApiHttpServer = struct {
                 try applyAuthenticatedIdentityToJoinRequest(alloc, identity, &parsed_join.join);
             }
             const join_ctx = self.joinContext().withExecutionDeadline(request_deadline_ns).withCancellation(cancellation);
-            return distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources);
+            return .{ .json = try distributed_join.executeSupportedJoinedPublicTableQueryRequest(join_ctx, &self.join_job_store, alloc, source, table_name, body, row_filter_json, parsed_join.join, parsed_join.foreign_sources) };
         }
 
-        var result = self.executePlainPublicTableQuery(
+        const result = self.executePlainPublicTableQuery(
             alloc,
             source,
             table_name,
@@ -8864,8 +8851,7 @@ pub const ApiHttpServer = struct {
                 return error.InternalFailure;
             },
         };
-        defer result.deinit(alloc);
-        return try alloc.dupe(u8, result.json);
+        return result;
     }
 
     fn shouldDispatchPlainPublicSearch(alloc: std.mem.Allocator, body: []const u8) !bool {
@@ -11712,7 +11698,7 @@ pub const ApiHttpServer = struct {
         defer if (row_filter_json) |value| self.alloc.free(value);
         const source = self.table_reads orelse return error.TableNotFound;
         db_mod.resetLastSortRejectionDiagnostic();
-        const response_body = try self.executePublicTableQueryDispatchWithReadinessRetry(
+        var query_response = try self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
             table_name,
@@ -11721,8 +11707,8 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
             null,
         );
-        defer self.alloc.free(response_body);
-        return try result_alloc.dupe(u8, response_body);
+        defer query_response.deinit(self.alloc);
+        return try result_alloc.dupe(u8, query_response.json);
     }
 
     pub fn executeMcpApplicationOperation(
@@ -12248,7 +12234,7 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
         db_mod.resetLastSortRejectionDiagnostic();
         graph_query_diagnostic.reset();
-        const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
+        const query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
             self.alloc,
             source,
             table_name,
@@ -12257,12 +12243,7 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
             if (cancellation) |value| value.token() else null,
         ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
-        var response = contextual_operations.json(response_body, false);
-        errdefer response.deinit(self.alloc);
-        if (try queryBodyUsesLegacyGraphSearchesAlloc(self.alloc, body)) {
-            try markLegacyGraphSearchResponse(self.alloc, &response);
-        }
-        return response;
+        return try publicQuerySuccessResponse(self.alloc, query_response);
     }
 
     fn handlePublicTableMultiQuery(
@@ -12327,7 +12308,7 @@ pub const ApiHttpServer = struct {
             const source = self.table_reads orelse return try contextual_operations.textAlloc(self.alloc, 404, "not found");
             db_mod.resetLastSortRejectionDiagnostic();
             graph_query_diagnostic.reset();
-            const response_body = self.executePublicTableQueryDispatchWithReadinessRetry(
+            var query_response = self.executePublicTableQueryDispatchWithReadinessRetry(
                 self.alloc,
                 source,
                 table_name,
@@ -12336,11 +12317,11 @@ pub const ApiHttpServer = struct {
                 authenticated_identity,
                 if (cancellation) |value| value.token() else null,
             ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
-            defer self.alloc.free(response_body);
+            defer query_response.deinit(self.alloc);
             accepted_legacy_graph_search = accepted_legacy_graph_search or
-                try queryBodyUsesLegacyGraphSearchesAlloc(self.alloc, line);
+                query_response.graph_dialect == .legacy;
 
-            var parsed = std.json.parseFromSlice(std.json.Value, arena, response_body, .{
+            var parsed = std.json.parseFromSlice(std.json.Value, arena, query_response.json, .{
                 .allocate = .alloc_always,
             }) catch return try contextual_operations.textAlloc(self.alloc, 500, "query failed");
             defer parsed.deinit();
