@@ -233,11 +233,12 @@ remain intentionally distinct production domains. Remaining distributed work
 no longer starts with that substitution: the production-owned v12 history now
 joins the real metadata quorum, three `DataServer`/data-Raft owners, public
 clients, two tables, serverless catalog, and a metadata-driven active split on
-one `VoprIo`, and its complete deep gate exact-replays. The next step is to put
-the v13 graph under v12's replicated split and v9's nine-fault breadth, then
-add co-resident HA, deeper fault overlap, joins/global queries, and workload
-breadth. This is a composition/fidelity gap, not a missing deterministic-
-distributed foundation.
+one `VoprIo`, and its complete deep gate exact-replays. V14 now puts the v13
+graph under that split and exact-replays public work before, during, and after
+cutover. The next step is to put v9's nine-fault breadth on those production
+owners, then add co-resident HA, deeper fault overlap, joins/global queries,
+and workload breadth. This is a composition/fidelity gap, not a missing
+deterministic-distributed foundation.
 
 ## Conformance Status
 
@@ -355,7 +356,7 @@ References:
 - [Deterministic simulation testing](https://antithesis.com/docs/resources/deterministic_simulation_testing/)
 - [Assertions](https://antithesis.com/docs/product/writing_tests/assertions/)
 - [Controlling faults](https://antithesis.com/docs/product/writing_tests/controlling_faults/)
-- [Fault types and node scope](https://antithesis.com/docs/product/fault_injection/fault_types/)
+- [Fault types and node scope](https://antithesis.com/docs/product/writing_tests/controlling_faults/fault_types/)
 - [Multi-container test templates](https://antithesis.com/docs/product/writing_tests/test_templates/first_test/)
 - [Debugging](https://antithesis.com/docs/product/debugging/)
 
@@ -1312,7 +1313,7 @@ VOPR work has found concrete production and harness defects:
   `StdHttpExecutor` and listener for data-Raft when its backend exposed general
   `std.Io` but no specialized Raft lanes. `DataServerConfig` now accepts a
   caller-owned request executor and external-listener ownership, allowing the
-  v11/v12/v13 production modes to keep the real Raft HTTP codec and handler on `VoprIo` with no
+  v11/v12/v13/v14 production modes to keep the real Raft HTTP codec and handler on `VoprIo` with no
   hidden Threaded transport. The production defaults remain unchanged.
 - Serverless public-catalog teardown published `public_live = false` only after
   poisoning its client, listener, and status owners. Parent-history
@@ -2412,10 +2413,10 @@ ownership is released.
 | P1 integrated | Complete serverless workflow | `serverless-workflow-vopr-test` covers durable claim/fencing, build, compaction, publication, and query-visible catalog cutover with duplicate workers, lease takeover, ambiguous completion, retry, cancellation, crash recovery, stale-enricher generation rejection, and progress-conflict fencing under exact replay through production orchestration. In full-cluster v9 the same fixture borrows the cluster `VoprIo`, serves its worker-owned object catalog through the production serverless HTTP stack, and proves public table/head/document visibility. Cross-domain fault overlap and multi-worker placement remain follow-up depth. |
 | P1 integrated | DB and index request races | `db-index-race-vopr-test` exact-replays cross-index admission, same-index FIFO fairness, delete/materialize linearizations, published-reader/catalog-writer capture, cancellation, shutdown, and cleanup through production-safe seams rather than native test threads. |
 | P1 ongoing | Managed-index publication and public readiness | Compose the current dense-index generation and API readiness contracts on one `VoprIo`: atomic versus progressive publication, backfill and dense-replay watermarks, partial coverage, rate-limit recovery, alias/catalog cutover, public-query visibility, cancellation, and crash/restart between durable generation, catalog publication, and readiness reporting. The DB/index race and generation-lifecycle gates prove constituent ownership and publication seams; they do not yet prove this end-to-end readiness state machine. |
-| P0 integrated active-transition/static-graph seams | Full-cluster distributed composition | Full-cluster v9 exact-replays the registered three-node metadata/hosted-data/serverless deployment under nine public graph, transport, restart, topology, HTTP, stale-generation, and resource-pressure modes. The focused DataServer checkpoint separately proves three-owner replicated merge-to-split execution, leader change, sparse predecessor-fenced post-bootstrap delta, owner restart, routed terminal retry, and every-replica convergence. V11 instantiates the real metadata quorum, three production `DataServer`/data-Raft runtimes, real HTTP/Raft transport, public clients, two tables, and the production serverless catalog; its ReleaseSafe smoke gate passes 30/30. V12 completes metadata-driven active split prepare/bootstrap/finalize, publication, and the post-split read; its complete 320,000-transition gate passes 15/15. V13 separately completes a depth-two public graph across those production owners with current-owner routing and combined Raft/derived-state visibility; its complete gate passes 15/15. These promote the named seams, not the whole roadmap. Next compose graph, split, and v9 faults, then add disjoint placement, bounded retained-history paging, DB/derived-state snapshot rehydration, derived graph/index equality, partitions, HA/data-plane co-residency, disk/socket pressure, richer cross-domain faults, and multi-worker placement. |
+| P0 integrated combined active-transition/graph seam | Full-cluster distributed composition | Full-cluster v9 exact-replays the registered three-node metadata/hosted-data/serverless deployment under nine public graph, transport, restart, topology, HTTP, stale-generation, and resource-pressure modes. The focused DataServer checkpoint separately proves three-owner replicated merge-to-split execution, leader change, sparse predecessor-fenced post-bootstrap delta, owner restart, routed terminal retry, and every-replica convergence. V11 instantiates the real metadata quorum, three production `DataServer`/data-Raft runtimes, real HTTP/Raft transport, public clients, two tables, and the production serverless catalog; its ReleaseSafe smoke gate passes 30/30. V12 completes metadata-driven active split prepare/bootstrap/finalize, publication, and the post-split read; its dedicated gate passed 15/15 at its cited checkpoint. V13 completes a depth-two public graph across those production owners with current-owner routing and combined Raft/derived-state visibility. V14 composes both and passes 15/15 on the current tree: the graph enters during a nonterminal split, may only complete fully or fail closed, and completes after cutover across three ranges. These promote the named seams, not the whole roadmap. Next add v9 faults to v14, then add disjoint placement, bounded retained-history paging, DB/derived-state snapshot rehydration, derived graph/index equality, partitions, HA/data-plane co-residency, disk/socket pressure, richer cross-domain faults, and multi-worker placement. |
 | P0 ongoing | Repository-wide strong-read contract | V13 proves an owner-specific synchronous DataServer barrier: matching ReadState apply plus derived-state visibility, bounded by the request timeout/cancellation. Audit every remaining `ReadableLeaseRequester`, especially `ManagedHostService`, `ManagedHttpHostService`, and production no-op construction sites. Split “request initiated” from “read safe” in the type system or make every non-stale implementation await an applied index; add follower, leader-change, timeout, cancellation, and derived-state VOPR regressions before another public source relies on this abstraction. |
 | P0 integrated | Query-embedding cache | `query-embedding-cache-vopr-test` exact-replays concurrent-miss coalescing, waiter cancellation, deadlines, in-flight admission, TTL, byte-budget/LRU eviction, pinned hits, and cleanup through the production cache on one `VoprIo`. |
-| P1 partially integrated | Distributed graph/public-query boundaries | `distributed-query-vopr-test` exact-replays production cross-range planning, two-shard fanout with and without document hydration, topology change between plan and fanout, one-retry success, retry exhaustion, stale per-shard generation rejection, cancellation with outstanding shard work, and cross-table authorization. Full-cluster v9 joins public HTTP to hosted two-range graph fanout and depth-two assembly under restart, transport, and topology faults. Production-owner v13 joins public HTTP to real `DataServer` routing and graph execution and exact-replays the repaired complete traversal. Public range-split churn, replicated transition execution, cancellation, authorization changes, public hydration, and v9's fault breadth are not yet composed with v13; distributed joins and global queries also remain and are not claimed by this row. |
+| P1 partially integrated | Distributed graph/public-query boundaries | `distributed-query-vopr-test` exact-replays production cross-range planning, two-shard fanout with and without document hydration, topology change between plan and fanout, one-retry success, retry exhaustion, stale per-shard generation rejection, cancellation with outstanding shard work, and cross-table authorization. Full-cluster v9 joins public HTTP to hosted two-range graph fanout and depth-two assembly under restart, transport, and topology faults. Production-owner v14 joins public HTTP to real `DataServer` routing, active split, and post-cutover graph execution and exact-replays the repaired complete/fail-closed contract. Cancellation, authorization changes, public hydration, and v9's fault breadth are not yet composed with v14; distributed joins and global queries also remain and are not claimed by this row. |
 | P1 integrated | Generation and reranking chains | `generation-reranking-vopr-test` exact-replays generation success, retry/backoff on borrowed `std.Io`, timeout and rate-limit fallback, cancellation, reranking success, malformed count/non-finite results, timeout, and cancellation through production chain and local-provider boundaries. Remote HTTP provider parsing remains covered by `provider-boundary-vopr-test` and `media-runtime-vopr-test`, not duplicated here. |
 | P1 ongoing | Remote-content credential use boundary | Join the integrated live-reference configuration/store contract to a real scraping or object-fetch request. Resolve access key, secret, session token, and header references immediately before provider use; rotate while an old request is in flight; retry and cancel through borrowed `std.Io`; and prove that snapshots retain references while each new request observes one coherent secret generation. The current config lifecycle proves publication and the production resolver independently, while `lib/scraping` still copies credential strings at its lower request-construction seam. |
 | P2 integrated | Multi-table and cross-node workload dimensions | The full-cluster history provisions two independently replicated tables and drives four concurrent clients through three public nodes. A tenant sentinel must remain visible in its table and absent from the other table while both share the same scheduler, HTTP transport, sockets, and node resources. This proves table isolation and routing interference, not authenticated tenant identity. |
@@ -2641,12 +2642,13 @@ The shortest current summary is:
    30/30. V12 adds hosted-adapter prepare/bootstrap, terminal cutover,
    publication, and the post-split public read. After retry jitter became a
    stable per-node input, its complete 320,000-transition deep gate passes
-   15/15 with fresh-state exact replay. V13 separately exact-replays a depth-two
-   public graph on those production owners after repairing public owner routing
-   and combined Raft/derived-index visibility. Next compose v13 graph, v12
-   split, and v9 fault breadth; then add disjoint placement, retained-history
-   pressure, snapshot/derived-state recovery, and partitions.
-2. **Deepen public distributed operations.** Add range-split churn, public
+   15/15 with fresh-state exact replay at its cited checkpoint. V13 exact-
+   replays a depth-two public graph on those production owners after repairing
+   public owner routing and combined Raft/derived-index visibility. V14 now
+   composes the graph and split and passes its current-tree 15/15 complete
+   gate. Next add v9 fault breadth to v14; then add disjoint placement,
+   retained-history pressure, snapshot/derived-state recovery, and partitions.
+2. **Deepen public distributed operations.** Add public
    hydration, cancellation, authorization changes, joins, and global queries;
    every incomplete fanout must continue to fail closed. The former partial-
    200 production traversal now has focused regressions and a green exact-
@@ -2712,9 +2714,11 @@ The detailed backlog behind that summary is:
    finalized and published split state plus the post-split read. Model v6 fixes
    the first socket-derived retry-owner chain; stable per-node transition retry
    jitter closes the later host-entropy escape. The complete 320,000-transition
-   ReleaseSafe gate passes 15/15 under record and fresh-state replay. Next keep
-   the v13 production-owner graph/serverless clients and faults co-scheduled
-   with that transition and remove the current co-location assumption with
+   ReleaseSafe gate passed 15/15 under record and fresh-state replay at its
+   cited checkpoint. V14 now keeps the production-owner graph and serverless
+   clients co-scheduled with that transition and passes 15/15 on the current
+   tree. Next add v9's transport/restart/resource fault modes and remove the
+   current co-location assumption with
    disjoint donor/receiver replica sets, page
    retained delete-history replay within an explicit resource budget, inject
    partitions, and prove snapshot install rehydrates each live DB owner and its
@@ -2731,11 +2735,12 @@ The detailed backlog behind that summary is:
    retry. A ninth mode now performs a production-coordinator merge across the
    actual donor/receiver leader roots, requires topology retry exhaustion to
    fail closed, finalizes the merge, and requires a complete recovered graph.
-   V13 now also routes the same complete depth-two shape across production
+   V13 routes the same complete depth-two shape across production
    `DataServer`/data-Raft owners and exact-replays the repaired ReadState/full-
-   index visibility contract. Next combine that seam with item 1's active
-   split, add v9's transport/restart/resource modes, and compose cancellation, authorization
-   change, and public document hydration. Add
+   index visibility contract. V14 composes that seam with item 1's active
+   split and proves complete-or-fail-closed behavior in flight plus complete
+   traversal after cutover. Next add v9's transport/restart/resource modes and
+   compose cancellation, authorization change, and public document hydration. Add
    distributed joins and global queries with the same fail-closed publication
    rule; introduce an explicit partial-response schema only if product semantics
    ever require partial results. At the same public seam, add a managed-index
@@ -2901,12 +2906,14 @@ V12 completes the metadata-driven split, cutover, and post-split public read.
 Model v6 removes one general outbound-retry identity chain, and stable per-node
 retry jitter closes the remaining host-entropy escape. Its complete
 320,000-transition ReleaseSafe deep gate passes 15/15 with fresh-state exact
-replay, final properties, cleanup, and leak checks. V13 separately runs the
-depth-two public graph through production `DataServer` owners and passes 15/15
-with the same complete oracle. That history found and repaired cached-refresh,
+replay, final properties, cleanup, and leak checks at its cited checkpoint.
+V13 runs the depth-two public graph through production `DataServer` owners and
+passes 15/15 with the same complete oracle. That history found and repaired cached-refresh,
 non-owner public routing, asynchronous ReadIndex, stale-fallback, and derived-
-index visibility defects; it does not yet overlap the active split or v9 fault
-modes. Continue by
+index visibility defects. V14 now overlaps that graph with the active split,
+requires complete-or-fail-closed behavior while the transition is nonterminal,
+requires complete traversals after post-cutover publication, and passes its
+current-tree 15/15 gate. It does not yet overlap v9 fault modes. Continue by
 extending coverage through disjoint placement, bounded transfer, partitions, and
 projection/DB/derived-state snapshot recovery; then by running public graph requests
 under those replicated topology transitions, cancellation, authorization, and
