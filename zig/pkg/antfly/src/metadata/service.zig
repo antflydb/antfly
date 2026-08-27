@@ -88,6 +88,75 @@ pub const MetadataProposalReceipt = struct {
     index: u64,
 };
 
+const MetadataProposalApplyObservation = enum {
+    pending,
+    applied,
+    superseded,
+};
+
+fn acceptedMetadataProposalIndex(accepted_index: ?u64, dispatch_error: ?anyerror) !u64 {
+    if (accepted_index) |index| return index;
+    if (dispatch_error) |err| return err;
+    return error.NotLeader;
+}
+
+fn observeMetadataProposalApply(
+    status: ?raft_engine.core.Status,
+    applied_entry_term: ?u64,
+    receipt: MetadataProposalReceipt,
+) MetadataProposalApplyObservation {
+    const raft_status = status orelse return .superseded;
+    if (raft_status.applied_index >= receipt.index) {
+        return if (applied_entry_term != null and applied_entry_term.? == receipt.term)
+            .applied
+        else
+            .superseded;
+    }
+    const still_receipt_leader = raft_status.soft.role == .leader and
+        raft_status.soft.leader_id != null and
+        raft_status.soft.leader_id.? == raft_status.id and
+        raft_status.hard.current_term == receipt.term;
+    return if (still_receipt_leader) .pending else .superseded;
+}
+
+test "metadata proposal receipt requires the accepted term at the applied index" {
+    const receipt: MetadataProposalReceipt = .{ .term = 3, .index = 9 };
+    var status: raft_engine.core.Status = .{
+        .id = 1,
+        .group_id = 1,
+        .soft = .{ .role = .leader, .leader_id = 1 },
+        .hard = .{ .current_term = 3, .commit_index = 9 },
+        .conf_state = .{},
+        .applied_index = 8,
+    };
+
+    try std.testing.expectEqual(.pending, observeMetadataProposalApply(status, null, receipt));
+    status.applied_index = 9;
+    try std.testing.expectEqual(.applied, observeMetadataProposalApply(status, 3, receipt));
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, 4, receipt));
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, null, receipt));
+
+    status.applied_index = 8;
+    status.soft = .{ .role = .follower, .leader_id = 2 };
+    status.hard.current_term = 4;
+    try std.testing.expectEqual(.superseded, observeMetadataProposalApply(status, null, receipt));
+}
+
+test "metadata proposal receipt survives a post-acceptance dispatch failure" {
+    try std.testing.expectEqual(
+        @as(u64, 17),
+        try acceptedMetadataProposalIndex(17, error.OutOfMemory),
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        acceptedMetadataProposalIndex(null, error.OutOfMemory),
+    );
+    try std.testing.expectError(
+        error.NotLeader,
+        acceptedMetadataProposalIndex(null, null),
+    );
+}
+
 pub fn sameAdminSnapshotFence(before: AdminSnapshotFence, after: AdminSnapshotFence) bool {
     return before.metadata_group_id == after.metadata_group_id and
         std.meta.eql(before.metadata_incarnation, after.metadata_incarnation) and
@@ -3920,8 +3989,21 @@ pub const MetadataHttpService = struct {
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
         var accepted_index: ?u64 = null;
-        try self.raft.host.http_host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index);
-        const index = accepted_index orelse return error.NotLeader;
+        var dispatch_error: ?anyerror = null;
+        self.raft.host.http_host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
+            dispatch_error = err;
+        };
+        const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
+        if (dispatch_error) |err| {
+            // Once the local leader assigned an index the proposal was
+            // accepted. Replication-message construction can still fail after
+            // that point; retain the receipt and let normal Raft progress retry
+            // delivery rather than reporting a false rejection to the caller.
+            std.log.warn(
+                "metadata proposal accepted before dispatch failure group_id={} index={} err={s}",
+                .{ self.metadata_group_id, index, @errorName(err) },
+            );
+        }
         self.lifecycle_signal.notify(null);
         return .{ .term = raft_status.hard.current_term, .index = index };
     }
@@ -3947,17 +4029,20 @@ pub const MetadataHttpService = struct {
             try request.ensureActive();
             self.lockRuntime();
             const maybe_raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id);
-            const applied = if (maybe_raft_status) |raft_status| raft_status.applied_index >= receipt.index else false;
-            const still_receipt_leader = if (maybe_raft_status) |raft_status|
-                raft_status.soft.role == .leader and
-                    raft_status.soft.leader_id != null and
-                    raft_status.soft.leader_id.? == raft_status.id and
-                    raft_status.hard.current_term == receipt.term
+            const applied_entry_term = if (maybe_raft_status) |raft_status|
+                if (raft_status.applied_index >= receipt.index)
+                    self.raft.host.http_host.raftTermAt(self.metadata_group_id, receipt.index) catch null
+                else
+                    null
             else
-                false;
+                null;
+            const observation = observeMetadataProposalApply(maybe_raft_status, applied_entry_term, receipt);
             self.unlockRuntime();
-            if (applied) return;
-            if (!still_receipt_leader) return error.NotLeader;
+            switch (observation) {
+                .applied => return,
+                .superseded => return error.NotLeader,
+                .pending => {},
+            }
             try self.runRaftProgressOnly();
             platform_clock.Clock.real().sleepMs(metadata_proposal_apply_poll_ms);
         }
