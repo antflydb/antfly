@@ -503,6 +503,11 @@ class AntflyClient:
         if num_shards is not None:
             body["num_shards"] = num_shards
         if indexes is not None:
+            for index_name, config in indexes.items():
+                try:
+                    validate_create_index_request_relationships(config)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"invalid index {index_name!r}: {exc}") from exc
             body["indexes"] = indexes
         if schema is not None:
             body["schema"] = schema

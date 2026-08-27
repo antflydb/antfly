@@ -224,6 +224,25 @@ class TestAntflyClient:
         assert "table already exists" in str(exc_info.value)
 
     @patch("antfly.client.Client")
+    def test_create_table_rejects_invalid_inline_index_before_transport(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(ValueError, match=r"invalid index 'semantic'.*embedding_name"):
+            client.create_table(
+                name="test_table",
+                indexes={
+                    "semantic": {
+                        "type": "embeddings",
+                        "source_artifact_name": "document_chunks_v1",
+                    }
+                },
+            )
+
+        mock_httpx.stream.assert_not_called()
+
+    @patch("antfly.client.Client")
     def test_create_index_uses_path_identity_and_returns_config(self, mock_client_class: MagicMock) -> None:
         mock_httpx = MagicMock()
         created = {"name": "thumbnail", "type": "embeddings", "dimension": 512}

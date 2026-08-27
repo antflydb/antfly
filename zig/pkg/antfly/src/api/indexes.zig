@@ -1076,18 +1076,14 @@ fn appendIndexStatusWithIdentity(
         embeddingsIsSparse(config)
     else
         false;
-    const graph_source_status = if (index_type == .graph)
-        graphSourcesStatus(config)
-    else
-        null;
     const coverage_generation = if (runtime_identity) |identity| identity.coverage_generation else 0;
     const coverage_config_hash = if (runtime_identity) |identity| identity.coverage_config_hash else 0;
     try out.appendSlice(alloc, "{\"config\":");
     try appendIndexConfig(alloc, out, index_name, config);
     try out.appendSlice(alloc, ",\"status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, expected_group_ids, local_statuses, status_lookup, false);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, expected_group_ids, local_statuses, status_lookup, false);
     try out.appendSlice(alloc, ",\"shard_status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, expected_group_ids, local_statuses, status_lookup, true);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, expected_group_ids, local_statuses, status_lookup, true);
     try out.append(alloc, '}');
 }
 
@@ -1589,64 +1585,6 @@ fn embeddingsIsSparse(config: std.json.Value) bool {
     };
 }
 
-const GraphSourceStatus = struct {
-    artifact: []const u8,
-    path: []const u8 = "",
-    format: []const u8 = "extraction_relation",
-};
-
-const GraphSourcesStatus = struct {
-    sources: []const std.json.Value = &.{},
-    single_source: ?std.json.Value = null,
-};
-
-fn graphSourceStatusFromValue(source: std.json.Value) ?GraphSourceStatus {
-    if (source != .object) return null;
-    const artifact = source.object.get("artifact") orelse return null;
-    if (artifact != .string or artifact.string.len == 0) return null;
-    return .{
-        .artifact = artifact.string,
-        .path = if (source.object.get("path")) |value| switch (value) {
-            .string => value.string,
-            else => "",
-        } else "",
-        .format = if (source.object.get("format")) |value| switch (value) {
-            .string => value.string,
-            else => "extraction_relation",
-        } else "extraction_relation",
-    };
-}
-
-fn graphSourcesStatus(config: std.json.Value) ?GraphSourcesStatus {
-    if (config != .object) return null;
-    if (config.object.get("sources")) |sources| {
-        if (sources == .array and sources.array.items.len > 0) return .{ .sources = sources.array.items };
-    }
-    const source = config.object.get("source") orelse return null;
-    if (source != .object) return null;
-    return .{ .single_source = source };
-}
-
-fn appendGraphSourceStatusObject(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    source: GraphSourceStatus,
-) !void {
-    try out.append(alloc, '{');
-    try appendJsonString(alloc, out, "artifact");
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, out, source.artifact);
-    try out.append(alloc, ',');
-    try appendJsonString(alloc, out, "path");
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, out, source.path);
-    try out.append(alloc, ',');
-    try appendJsonString(alloc, out, "format");
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, out, source.format);
-    try out.append(alloc, '}');
-}
-
 fn indexTypeName(index_type: ApiIndexType) []const u8 {
     return switch (index_type) {
         .full_text => "full_text",
@@ -1775,7 +1713,6 @@ fn appendIndexRuntimeStatus(
     embeddings_sparse: bool,
     coverage_generation: u64,
     coverage_config_hash: u64,
-    graph_source_status: ?GraphSourcesStatus,
     expected_group_ids: []const u64,
     local_statuses: ?*const runtime_status.LocalTableRuntimeStatuses,
     status_lookup: *const RuntimeStatusLookup,
@@ -1808,7 +1745,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.source_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item_runtime.stats.source_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, item_runtime.stats.async_indexing, if (index_type == .embeddings) item_runtime.stats.enrichment else null, item_runtime.stats.resolution, item_runtime.stats.promotion, item_runtime.stats.resolver_replay, item_runtime.metadata, runtime_status.statusHasRuntimeFacts(item_runtime));
             }
         }
         if (expected_group_ids.len > 0) {
@@ -1821,7 +1758,7 @@ fn appendIndexRuntimeStatus(
                 defer alloc.free(key);
                 try appendJsonString(alloc, out, key);
                 try out.append(alloc, ':');
-                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, .{}, null, null, null, .{}, .{
+                try appendSingleIndexRuntimeStatus(alloc, out, index_type, missing, 0, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, .{}, null, null, null, .{}, .{
                     .source = .synthetic_config,
                     .freshness = .missing,
                 }, false);
@@ -1842,7 +1779,7 @@ fn appendIndexRuntimeStatus(
         try appendMinimalIndexRuntimeStatus(alloc, out, index_type);
         return;
     };
-    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, graph_source_status, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
+    try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
 }
 
 fn appendMinimalIndexRuntimeStatus(
@@ -2799,7 +2736,6 @@ test "derived coverage aggregation rejects mixed config observations" {
         false,
         0,
         41,
-        null,
         aggregate.async_indexing,
         aggregate.enrichment,
         aggregate.resolution,
@@ -2827,7 +2763,6 @@ test "derived coverage aggregation rejects mixed config observations" {
         false,
         0,
         41,
-        null,
         .{},
         null,
         null,
@@ -2866,7 +2801,6 @@ test "rebuild quarantine remains an explicit failed public index status" {
         false,
         0,
         0,
-        null,
         .{},
         null,
         null,
@@ -2907,7 +2841,6 @@ test "index status exposes compact repair state without internal diagnostics" {
         false,
         0,
         0,
-        null,
         .{},
         null,
         null,
@@ -2979,7 +2912,6 @@ test "complete partial embeddings coverage is ready after active generation proo
         false,
         42,
         99,
-        null,
         .{ .dense_catch_up = .{
             .active = true,
             .phase = .replay,
@@ -3041,7 +2973,6 @@ test "progressive embeddings readiness exposes a queryable partial generation" {
         false,
         42,
         99,
-        null,
         .{},
         .{
             .enabled = true,
@@ -3116,7 +3047,6 @@ test "repair-free embeddings aggregate retains live dense catch-up" {
         false,
         42,
         99,
-        null,
         aggregate.async_indexing,
         aggregate.enrichment,
         aggregate.resolution,
@@ -3231,7 +3161,6 @@ test "serviceable repair preserves sibling shard dense catch-up fallback" {
         false,
         42,
         99,
-        null,
         aggregate.async_indexing,
         aggregate.enrichment,
         aggregate.resolution,
@@ -3316,7 +3245,6 @@ test "derived coverage aggregation rejects stale index incarnations" {
         false,
         42,
         99,
-        null,
         aggregate.async_indexing,
         aggregate.enrichment,
         aggregate.resolution,
@@ -3341,7 +3269,6 @@ test "derived coverage aggregation rejects stale index incarnations" {
         false,
         42,
         99,
-        null,
         .{},
         .{
             .enabled = true,
@@ -3413,7 +3340,6 @@ test "derived coverage rejects unknown freshness for aggregate and shard views" 
         false,
         0,
         41,
-        null,
         .{},
         null,
         null,
@@ -3869,7 +3795,6 @@ fn appendSingleIndexRuntimeStatus(
     embeddings_sparse: bool,
     coverage_generation: u64,
     coverage_config_hash: u64,
-    graph_source_status: ?GraphSourcesStatus,
     async_indexing: db_mod.types.AsyncIndexingStats,
     enrichment: ?db_mod.types.EnrichmentStats,
     resolution: ?db_mod.types.ReplayStageStats,
@@ -4163,23 +4088,6 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"result_nodes\":");
         try appendIntValue(alloc, out, item.algebraic_graph_traversal_result_node_count);
         try out.appendSlice(alloc, "}}");
-        if (graph_source_status) |status| {
-            try out.appendSlice(alloc, ",\"source_artifacts\":[");
-            var first = true;
-            if (status.single_source) |source_value| {
-                if (graphSourceStatusFromValue(source_value)) |source| {
-                    try appendGraphSourceStatusObject(alloc, out, source);
-                    first = false;
-                }
-            }
-            for (status.sources) |source_value| {
-                const source = graphSourceStatusFromValue(source_value) orelse continue;
-                if (!first) try out.append(alloc, ',');
-                first = false;
-                try appendGraphSourceStatusObject(alloc, out, source);
-            }
-            try out.append(alloc, ']');
-        }
     }
     if (index_type == .algebraic) try appendAlgebraicIndexStatsFields(alloc, out, item);
     try out.appendSlice(alloc, ",\"replay_applied_sequence\":");
@@ -5592,7 +5500,7 @@ test "index encoders expose algebraic graph traversal health" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"algebraic_graph\":{\"traversal\":{\"attempted\":3,\"proven\":2,\"rejected\":1,\"fallback\":4,\"result_nodes\":9}}") != null);
 }
 
-test "index encoders expose graph artifact source materialization status" {
+test "index encoders expose graph sources once in normalized config" {
     const alloc = std.testing.allocator;
     const indexes = try alloc.alloc(db_mod.types.DBIndexStats, 1);
     defer alloc.free(indexes);
@@ -5635,7 +5543,8 @@ test "index encoders expose graph artifact source materialization status" {
 
     const encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "relations_graph", &local_status)).?;
     defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifacts\":[{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"},{\"artifact\":\"graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"config\":{\"name\":\"relations_graph\",\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"},{\"artifact\":\"graph_v1\",\"path\":\"$.graph\",\"format\":\"extraction_graph\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"source_artifacts\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"shard_status\":{\"7\":{") != null);
 }
 

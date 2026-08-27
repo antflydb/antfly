@@ -3861,7 +3861,7 @@ pub fn build(b: *std.Build) void {
         "merged index metadata validates artifact consumer references",
         "graph config accepts canonical single-source mappings without a discriminator",
         "created graph index response projects closed nested schemas",
-        "index encoders expose graph artifact source materialization status",
+        "index encoders expose graph sources once in normalized config",
         "api http client round-trips public status and internal capability routes",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",

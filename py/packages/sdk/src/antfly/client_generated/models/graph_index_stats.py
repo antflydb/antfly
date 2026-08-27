@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
     from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
     from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
-    from ..models.graph_source_artifact_status import GraphSourceArtifactStatus
     from ..models.index_readiness_status import IndexReadinessStatus
     from ..models.index_repair_status import IndexRepairStatus
 
@@ -35,8 +34,6 @@ class GraphIndexStats:
         error (str | Unset): Error message if stats could not be retrieved
         total_edges (int | Unset): Total number of edges in the graph
         edge_types (GraphIndexStatsEdgeTypes | Unset): Count of edges per edge type
-        source_artifacts (list[GraphSourceArtifactStatus] | Unset): Configured artifact sources in deterministic
-            precedence order. Catch-up and repair state is reported by the enclosing index status.
         rebuilding (bool | Unset): Whether the index is currently rebuilding
         repair (IndexRepairStatus | Unset): Compact user-facing state for an automatic index repair. Detailed
             diagnostics are available from the admin API and metrics.
@@ -94,7 +91,6 @@ class GraphIndexStats:
     error: str | Unset = UNSET
     total_edges: int | Unset = UNSET
     edge_types: GraphIndexStatsEdgeTypes | Unset = UNSET
-    source_artifacts: list[GraphSourceArtifactStatus] | Unset = UNSET
     rebuilding: bool | Unset = UNSET
     repair: IndexRepairStatus | Unset = UNSET
     backfill_active: bool | Unset = UNSET
@@ -154,13 +150,6 @@ class GraphIndexStats:
         edge_types: dict[str, Any] | Unset = UNSET
         if not isinstance(self.edge_types, Unset):
             edge_types = self.edge_types.to_dict()
-
-        source_artifacts: list[dict[str, Any]] | Unset = UNSET
-        if not isinstance(self.source_artifacts, Unset):
-            source_artifacts = []
-            for source_artifacts_item_data in self.source_artifacts:
-                source_artifacts_item = source_artifacts_item_data.to_dict()
-                source_artifacts.append(source_artifacts_item)
 
         rebuilding = self.rebuilding
 
@@ -277,8 +266,6 @@ class GraphIndexStats:
             field_dict["total_edges"] = total_edges
         if edge_types is not UNSET:
             field_dict["edge_types"] = edge_types
-        if source_artifacts is not UNSET:
-            field_dict["source_artifacts"] = source_artifacts
         if rebuilding is not UNSET:
             field_dict["rebuilding"] = rebuilding
         if repair is not UNSET:
@@ -377,7 +364,6 @@ class GraphIndexStats:
         from ..models.graph_index_stats_resolution import GraphIndexStatsResolution
         from ..models.graph_index_stats_resolver_replay import GraphIndexStatsResolverReplay
         from ..models.graph_index_stats_source_artifact import GraphIndexStatsSourceArtifact
-        from ..models.graph_source_artifact_status import GraphSourceArtifactStatus
         from ..models.index_readiness_status import IndexReadinessStatus
         from ..models.index_repair_status import IndexRepairStatus
 
@@ -401,15 +387,6 @@ class GraphIndexStats:
             edge_types = UNSET
         else:
             edge_types = GraphIndexStatsEdgeTypes.from_dict(_edge_types)
-
-        _source_artifacts = d.pop("source_artifacts", UNSET)
-        source_artifacts: list[GraphSourceArtifactStatus] | Unset = UNSET
-        if _source_artifacts is not UNSET:
-            source_artifacts = []
-            for source_artifacts_item_data in _source_artifacts:
-                source_artifacts_item = GraphSourceArtifactStatus.from_dict(source_artifacts_item_data)
-
-                source_artifacts.append(source_artifacts_item)
 
         rebuilding = d.pop("rebuilding", UNSET)
 
@@ -538,7 +515,6 @@ class GraphIndexStats:
             error=error,
             total_edges=total_edges,
             edge_types=edge_types,
-            source_artifacts=source_artifacts,
             rebuilding=rebuilding,
             repair=repair,
             backfill_active=backfill_active,

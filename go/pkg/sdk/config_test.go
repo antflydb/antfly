@@ -1,9 +1,15 @@
 package sdk
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 
 func TestNewEmbedderConfigSupportsAntfly(t *testing.T) {
@@ -82,6 +88,54 @@ func TestValidateIndexRequestRelationshipsEnforcesOpenAPIContract(t *testing.T) 
 		IndexTypeEmbeddings,
 	); err != nil {
 		t.Fatalf("defaulted false external must remain compatible with sources: %v", err)
+	}
+}
+
+func TestCreateTableRejectsInvalidInlineIndexBeforeTransport(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	var index CreateIndexRequest
+	if err := json.Unmarshal([]byte(`{"type":"embeddings","source_artifact_name":"document_chunks_v1"}`), &index); err != nil {
+		t.Fatalf("unmarshal invalid fixture: %v", err)
+	}
+	err = client.CreateTable(context.Background(), "documents", CreateTableRequest{
+		Indexes: map[string]CreateIndexRequest{"semantic": index},
+	})
+	if err == nil || !strings.Contains(err.Error(), `validating index "semantic"`) || !strings.Contains(err.Error(), "embedding_name") {
+		t.Fatalf("CreateTable error = %v, want index-scoped relationship error", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("transport requests = %d, want 0", got)
+	}
+}
+
+func TestCreatedGraphIndexReadContractPreservesSourceMapping(t *testing.T) {
+	var created oapi.CreatedIndex
+	if err := json.Unmarshal([]byte(`{"name":"relations_graph","type":"graph","sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"}]}`), &created); err != nil {
+		t.Fatalf("unmarshal created graph index: %v", err)
+	}
+	name, err := createdIndexName(created)
+	if err != nil {
+		t.Fatalf("createdIndexName: %v", err)
+	}
+	if name != "relations_graph" {
+		t.Fatalf("name = %q, want relations_graph", name)
+	}
+	graph, err := created.AsCreatedGraphIndex()
+	if err != nil {
+		t.Fatalf("AsCreatedGraphIndex: %v", err)
+	}
+	if len(graph.Sources) != 1 || graph.Sources[0].Artifact != "relations_v1" || graph.Sources[0].Path != "$.relations[*]" {
+		t.Fatalf("graph sources were not preserved: %#v", graph.Sources)
 	}
 }
 

@@ -983,6 +983,14 @@ export class AntflyClient {
      * Create a new table
      */
     create: async (tableName: string, config: CreateTableRequest = {}) => {
+      for (const [indexName, indexConfig] of Object.entries(config.indexes ?? {})) {
+        try {
+          validateCreateIndexRequestRelationships(indexConfig);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new TypeError(`Invalid index ${JSON.stringify(indexName)}: ${detail}`);
+        }
+      }
       const { data, error } = await this.client.POST("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
         body: config,

@@ -546,6 +546,19 @@ pub fn validate_create_index_request_relationships(
     Ok(())
 }
 
+/// Validate every inline index before sending a create-table request.
+pub fn validate_create_table_request_relationships(
+    request: &types::CreateTableRequest,
+) -> Result<(), IndexConfigError> {
+    let mut indexes = request.indexes.iter().collect::<Vec<_>>();
+    indexes.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    for (name, config) in indexes {
+        validate_create_index_request_relationships(config)
+            .map_err(|error| IndexConfigError(format!("invalid index {name:?}: {error}")))?;
+    }
+    Ok(())
+}
+
 include!(concat!(env!("OUT_DIR"), "/client.rs"));
 
 /// Build an Antfly inference embedder without exposing generated union variant names.
@@ -667,6 +680,7 @@ mod tests {
         artifact_embedding_index_config, artifact_full_text_index_config,
         artifact_full_text_index_config_with_options, graph_index_sources, normalize_base_url,
         types, validate_create_index_request_relationships,
+        validate_create_table_request_relationships,
     };
 
     #[test]
@@ -906,6 +920,24 @@ mod tests {
                 .to_string()
                 .contains("authoritative embedding enrichment")
         );
+    }
+
+    #[test]
+    fn create_table_relationship_validator_scopes_inline_index_errors() {
+        let request: types::CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "indexes": {
+                "semantic": {
+                    "type": "embeddings",
+                    "source_artifact_name": "document_chunks_v1"
+                }
+            }
+        }))
+        .expect("deserialize invalid table fixture");
+
+        let error = validate_create_table_request_relationships(&request)
+            .expect_err("inline index must be validated before transport");
+        assert!(error.to_string().contains("semantic"));
+        assert!(error.to_string().contains("embedding_name"));
     }
 
     #[test]

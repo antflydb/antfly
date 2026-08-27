@@ -144,19 +144,6 @@ components:
         nodes: { $ref: "#/components/schemas/GraphArtifactNodeMappingConfig" }
         edge: { $ref: "#/components/schemas/GraphArtifactEdgeMappingConfig" }
         context: { $ref: "#/components/schemas/GraphArtifactContextConfig" }
-    GraphSourceArtifactStatus:
-      type: object
-      additionalProperties: false
-      required: [artifact, path, format]
-      description: "Configured graph artifact source projected in deterministic precedence order."
-      properties:
-        artifact:
-          type: string
-          description: "Canonical artifact source identity."
-        path: { type: string }
-        format:
-          type: string
-          enum: [extraction_relation, extraction_graph]
     GraphArtifactProducerSourceConfig:
       type: object
       additionalProperties: false
@@ -320,6 +307,10 @@ components:
               enum: [algebraic]
     CreateIndexRequest:
       description: "Type-safe configuration for a new index. The index name is owned by the request path."
+      x-antfly-sdk-alternative:
+        description: "SDK builders also accept the named IndexConfig form and convert it to this path-identified request. This is an alternative construction API, not a deprecated wire request."
+        schema:
+          $ref: "#/components/schemas/IndexConfig"
       oneOf:
         - $ref: "#/components/schemas/CreateFullTextIndexRequest"
         - $ref: "#/components/schemas/CreateEmbeddingsIndexRequest"
@@ -2120,11 +2111,6 @@ components:
             type: integer
             format: uint64
           description: "Count of edges per edge type"
-        source_artifacts:
-          type: array
-          items:
-            $ref: "#/components/schemas/GraphSourceArtifactStatus"
-          description: "Configured artifact sources in deterministic precedence order. Catch-up and repair state is reported by the enclosing index status."
         rebuilding:
           x-go-type-skip-optional-pointer: true
           type: boolean

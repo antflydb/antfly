@@ -1702,7 +1702,7 @@ pub const IndexRuntimeCapabilities = struct {
 
 pub const IndexStatus = struct {
     shard_status: std.json.ArrayHashMap(antfly_indexes_openapi.IndexStats),
-    config: antfly_indexes_openapi.IndexConfig,
+    config: antfly_indexes_openapi.CreatedIndex,
     status: antfly_indexes_openapi.IndexStats,
 };
 
@@ -3355,7 +3355,7 @@ pub const Table = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
+    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.CreatedIndex),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.
@@ -3625,7 +3625,7 @@ pub const TableStatus = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
+    indexes: std.json.ArrayHashMap(antfly_indexes_openapi.CreatedIndex),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.

@@ -3701,7 +3701,7 @@ components:
           type: object
           additionalProperties:
             x-go-type-skip-optional-pointer: false
-            $ref: "indexes.yaml#/components/schemas/IndexConfig"
+            $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         shards: # map[types.ID]*ShardInfo
           type: object
           additionalProperties:
@@ -4127,7 +4127,7 @@ components:
           additionalProperties:
             $ref: "indexes.yaml#/components/schemas/IndexStats"
         config:
-          $ref: "indexes.yaml#/components/schemas/IndexConfig"
+          $ref: "indexes.yaml#/components/schemas/CreatedIndex"
         status:
           $ref: "indexes.yaml#/components/schemas/IndexStats"
     LsmStorageStatus:

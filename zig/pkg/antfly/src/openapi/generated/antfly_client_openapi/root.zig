@@ -242,7 +242,6 @@ pub const GraphQueryResult = types.GraphQueryResult;
 pub const GraphQueryType = types.GraphQueryType;
 pub const GraphResolverConfig = types.GraphResolverConfig;
 pub const GraphResultNode = types.GraphResultNode;
-pub const GraphSourceArtifactStatus = types.GraphSourceArtifactStatus;
 pub const GraphTemplateValue = types.GraphTemplateValue;
 pub const GroundTruth = types.GroundTruth;
 pub const HierarchyAncestor = types.HierarchyAncestor;

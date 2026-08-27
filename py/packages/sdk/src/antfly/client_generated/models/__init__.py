@@ -344,8 +344,6 @@ from .graph_resolver_config_source_artifact_kind import GraphResolverConfigSourc
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
-from .graph_source_artifact_status import GraphSourceArtifactStatus
-from .graph_source_artifact_status_format import GraphSourceArtifactStatusFormat
 from .ground_truth import GroundTruth
 from .hierarchy_ancestor import HierarchyAncestor
 from .hierarchy_ancestor_document import HierarchyAncestorDocument
@@ -1198,8 +1196,6 @@ __all__ = (
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
-    "GraphSourceArtifactStatus",
-    "GraphSourceArtifactStatusFormat",
     "GroundTruth",
     "HierarchyAncestor",
     "HierarchyAncestorDocument",

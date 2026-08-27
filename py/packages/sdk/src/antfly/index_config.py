@@ -20,6 +20,9 @@ def _relationship_field_active(value: Any) -> bool:
 def validate_create_index_request_relationships(config: Mapping[str, Any]) -> None:
     """Validate the cross-field relationships published by the OpenAPI contract."""
 
+    if not isinstance(config, Mapping):
+        raise TypeError("index config must be an object")
+
     index_type = config.get("type")
     has_sources = _relationship_field_active(config.get("sources"))
     if index_type == "full_text" and has_sources and _relationship_field_active(config.get("artifact_name")):

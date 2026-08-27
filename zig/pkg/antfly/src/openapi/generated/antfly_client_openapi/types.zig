@@ -4431,8 +4431,6 @@ pub const GraphIndexStats = struct {
     total_edges: ?i64 = null,
     /// Count of edges per edge type
     edge_types: ?std.json.ArrayHashMap(i64) = null,
-    /// Configured artifact sources in deterministic precedence order. Catch-up and repair state is reported by the enclosing index status.
-    source_artifacts: ?[]const GraphSourceArtifactStatus = null,
     /// Whether the index is currently rebuilding
     rebuilding: ?bool = null,
     repair: ?IndexRepairStatus = null,
@@ -4657,14 +4655,6 @@ pub const GraphResultNode = struct {
     evidence: ?std.json.Value = null,
     /// Connected edges (when include_edges=true)
     edges: ?[]const Edge = null,
-};
-
-/// Configured graph artifact source projected in deterministic precedence order.
-pub const GraphSourceArtifactStatus = struct {
-    /// Canonical artifact source identity.
-    artifact: []const u8,
-    path: []const u8,
-    format: []const u8,
 };
 
 /// A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item.
@@ -5147,7 +5137,7 @@ pub const IndexStats = union(enum) {
 
 pub const IndexStatus = struct {
     shard_status: std.json.ArrayHashMap(IndexStats),
-    config: IndexConfig,
+    config: CreatedIndex,
     status: IndexStats,
 };
 
@@ -9029,7 +9019,7 @@ pub const Table = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(IndexConfig),
+    indexes: std.json.ArrayHashMap(CreatedIndex),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.
@@ -9317,7 +9307,7 @@ pub const TableStatus = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(IndexConfig),
+    indexes: std.json.ArrayHashMap(CreatedIndex),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?TableSchema = null,
     /// Present only when the table is migrating between schema versions. Absent means the table is stable.

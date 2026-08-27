@@ -21,7 +21,8 @@ from antfly.client_generated.models.graph_artifact_producer_source_config import
 from antfly.client_generated.models.graph_artifact_producer_source_config_type import (
     GraphArtifactProducerSourceConfigType,
 )
-from antfly.client_generated.models.graph_source_artifact_status import GraphSourceArtifactStatus
+from antfly.client_generated.models.index_status import IndexStatus
+from antfly.client_generated.models.table_indexes import TableIndexes
 
 
 def test_created_graph_index_exposes_artifact_mapping_and_planning() -> None:
@@ -77,17 +78,30 @@ def test_created_graph_index_exposes_artifact_mapping_and_planning() -> None:
     assert created.to_dict()["algebraic_planning"]["bounded_traversal"]["law"] == ("provenance_semiring")
 
 
-def test_graph_source_status_uses_canonical_artifact_identity() -> None:
-    current = GraphSourceArtifactStatus.from_dict(
+def test_graph_index_read_models_preserve_discriminated_source_config() -> None:
+    graph = {
+        "name": "relations_graph",
+        "type": "graph",
+        "sources": [
+            {
+                "artifact": "relations_v1",
+                "path": "$.relations[*]",
+                "format": "extraction_relation",
+            }
+        ],
+    }
+
+    status = IndexStatus.from_dict(
         {
-            "artifact": "relations_v1",
-            "path": "$.relations[*]",
-            "format": "extraction_relation",
+            "config": graph,
+            "status": {"index_type": "graph"},
+            "shard_status": {},
         }
     )
-    assert current.artifact == "relations_v1"
-    assert current.to_dict() == {
-        "artifact": "relations_v1",
-        "path": "$.relations[*]",
-        "format": "extraction_relation",
-    }
+    table_indexes = TableIndexes.from_dict({"relations_graph": graph})
+
+    assert isinstance(status.config, CreatedGraphIndex)
+    assert status.config.to_dict()["sources"] == graph["sources"]
+    table_graph = table_indexes["relations_graph"]
+    assert isinstance(table_graph, CreatedGraphIndex)
+    assert table_graph.to_dict()["sources"] == graph["sources"]

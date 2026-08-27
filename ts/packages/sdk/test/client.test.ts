@@ -293,6 +293,22 @@ describe("AntflyClient", () => {
       });
     });
 
+    it("rejects invalid inline indexes before creating a table", async () => {
+      const config = {
+        indexes: {
+          semantic: {
+            type: "embeddings",
+            source_artifact_name: "document_chunks_v1",
+          },
+        },
+      } as CreateTableRequest;
+
+      await expect(client.tables.create("new_table", config)).rejects.toThrow(
+        'Invalid index "semantic": Embedding source_artifact_name requires a non-empty embedding_name.'
+      );
+      expect(mockPost).not.toHaveBeenCalled();
+    });
+
     it("should query a specific table", async () => {
       const mockResponse = {
         responses: [
