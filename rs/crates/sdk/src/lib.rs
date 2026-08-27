@@ -461,6 +461,91 @@ pub fn new_client_with_token(
     Ok(new_client(base_url, http_client))
 }
 
+fn relationship_field_active(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> bool {
+    object
+        .get(field)
+        .is_some_and(|value| !value.is_null() && value.as_bool() != Some(false))
+}
+
+/// Validate the cross-field request relationships published through Antfly's
+/// OpenAPI vendor extensions before sending a create-index request.
+pub fn validate_create_index_request_relationships(
+    request: &types::CreateIndexRequest,
+) -> Result<(), IndexConfigError> {
+    let value = serde_json::to_value(request)
+        .map_err(|error| IndexConfigError(format!("serialize create index request: {error}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| IndexConfigError("index config must be an object".into()))?;
+    let has_sources = relationship_field_active(object, "sources");
+    match object.get("type").and_then(serde_json::Value::as_str) {
+        Some("full_text") if has_sources && relationship_field_active(object, "artifact_name") => {
+            return Err(IndexConfigError(
+                "index sources cannot be combined with artifact_name".into(),
+            ));
+        }
+        Some("graph") if has_sources && relationship_field_active(object, "source") => {
+            return Err(IndexConfigError(
+                "index sources cannot be combined with source".into(),
+            ));
+        }
+        Some("embeddings") => {
+            if has_sources {
+                for field in [
+                    "external",
+                    "field",
+                    "template",
+                    "chunker",
+                    "embedding_name",
+                    "source_artifact_name",
+                ] {
+                    if relationship_field_active(object, field) {
+                        return Err(IndexConfigError(format!(
+                            "index sources cannot be combined with {field}"
+                        )));
+                    }
+                }
+            }
+            if relationship_field_active(object, "source_artifact_name")
+                && !relationship_field_active(object, "embedding_name")
+            {
+                return Err(IndexConfigError(
+                    "embedding source_artifact_name requires a non-empty embedding_name".into(),
+                ));
+            }
+            if let (Some(embedding_name), Some(source_artifact_name), Some(enrichments)) = (
+                object
+                    .get("embedding_name")
+                    .and_then(serde_json::Value::as_str),
+                object
+                    .get("source_artifact_name")
+                    .and_then(serde_json::Value::as_str),
+                object
+                    .get("enrichments")
+                    .and_then(serde_json::Value::as_array),
+            ) && enrichments.iter().any(|candidate| {
+                candidate.get("kind").and_then(serde_json::Value::as_str) == Some("embedding")
+                    && candidate.get("name").and_then(serde_json::Value::as_str)
+                        == Some(embedding_name)
+                    && candidate
+                        .get("source_artifact_name")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(source_artifact_name)
+            }) {
+                return Err(IndexConfigError(
+                    "embedding source_artifact_name must match the authoritative embedding enrichment"
+                        .into(),
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 include!(concat!(env!("OUT_DIR"), "/client.rs"));
 
 /// Build an Antfly inference embedder without exposing generated union variant names.
@@ -581,7 +666,7 @@ mod tests {
         GraphNodeMappingSpec, GraphNodeModel, GraphTemplateOrNumber, antfly_embedder,
         artifact_embedding_index_config, artifact_full_text_index_config,
         artifact_full_text_index_config_with_options, graph_index_sources, normalize_base_url,
-        types,
+        types, validate_create_index_request_relationships,
     };
 
     #[test]
@@ -781,6 +866,46 @@ mod tests {
         assert_eq!(value["dimension"], 512);
         assert_eq!(value["coverage_policy"], "partial");
         assert!(value.get("name").is_none());
+    }
+
+    #[test]
+    fn create_index_relationship_validator_rejects_orphaned_source_artifact() {
+        let invalid: types::CreateIndexRequest = types::CreateEmbeddingsIndexRequest {
+            source_artifact_name: Some("chunks_v1".parse().expect("valid artifact name")),
+            ..Default::default()
+        }
+        .into();
+        let error = validate_create_index_request_relationships(&invalid)
+            .expect_err("source artifact must require embedding name");
+        assert!(error.to_string().contains("embedding_name"));
+
+        let valid: types::CreateIndexRequest = types::CreateEmbeddingsIndexRequest {
+            embedding_name: Some("dense_v1".parse().expect("valid embedding name")),
+            source_artifact_name: Some("chunks_v1".parse().expect("valid artifact name")),
+            ..Default::default()
+        }
+        .into();
+        validate_create_index_request_relationships(&valid)
+            .expect("released v0.2 singular form remains valid");
+
+        let mismatch: types::CreateIndexRequest = serde_json::from_value(serde_json::json!({
+            "type": "embeddings",
+            "embedding_name": "dense_v1",
+            "source_artifact_name": "wrong_chunks_v1",
+            "enrichments": [{
+                "name": "dense_v1",
+                "kind": "embedding",
+                "source_artifact_name": "chunks_v1"
+            }]
+        }))
+        .expect("deserialize mismatched request fixture");
+        let error = validate_create_index_request_relationships(&mismatch)
+            .expect_err("inline enrichment mismatch must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("authoritative embedding enrichment")
+        );
     }
 
     #[test]

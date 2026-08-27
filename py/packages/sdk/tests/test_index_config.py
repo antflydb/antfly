@@ -10,6 +10,7 @@ from antfly import (
     artifact_full_text_index_config,
     artifact_index_sources,
     graph_index_sources,
+    validate_create_index_request_relationships,
 )
 from antfly.client_generated.models.artifact_index_source import ArtifactIndexSource
 from antfly.client_generated.models.created_embeddings_index_config import (
@@ -124,3 +125,46 @@ def test_graph_sources_reject_duplicates_and_invalid_values() -> None:
         graph_index_sources(GraphArtifactSource("relations", nodes=GraphNodeMapping(source="{{ source }}")))
     with pytest.raises(ValueError, match="nodes.target"):
         graph_index_sources(GraphArtifactSource("relations", nodes=GraphNodeMapping(target=float("inf"))))
+
+
+def test_validates_openapi_index_request_relationships() -> None:
+    with pytest.raises(ValueError, match="requires a non-empty embedding_name"):
+        validate_create_index_request_relationships({"type": "embeddings", "source_artifact_name": "chunks_v1"})
+    with pytest.raises(ValueError, match="external"):
+        validate_create_index_request_relationships(
+            {
+                "type": "embeddings",
+                "external": True,
+                "sources": [{"artifact": "dense_v1"}],
+            }
+        )
+    with pytest.raises(ValueError, match="authoritative embedding enrichment"):
+        validate_create_index_request_relationships(
+            {
+                "type": "embeddings",
+                "embedding_name": "dense_v1",
+                "source_artifact_name": "wrong_chunks_v1",
+                "enrichments": [
+                    {
+                        "name": "dense_v1",
+                        "kind": "embedding",
+                        "source_artifact_name": "chunks_v1",
+                    }
+                ],
+            }
+        )
+    with pytest.raises(ValueError, match="artifact_name"):
+        validate_create_index_request_relationships(
+            {
+                "type": "full_text",
+                "artifact_name": "chunks_v1",
+                "sources": [{"artifact": "chunks_v2"}],
+            }
+        )
+    validate_create_index_request_relationships(
+        {
+            "type": "embeddings",
+            "external": False,
+            "sources": [{"artifact": "dense_v1"}],
+        }
+    )

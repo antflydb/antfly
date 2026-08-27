@@ -284,6 +284,20 @@ class TestAntflyClient:
             client.indexes.create("docs", "search", {"name": "other", "type": "full_text"})
 
     @patch("antfly.client.Client")
+    def test_create_index_rejects_invalid_relationships_before_transport(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(ValueError, match="requires a non-empty embedding_name"):
+            client.indexes.create(
+                "docs",
+                "vectors",
+                {"type": "embeddings", "source_artifact_name": "chunks_v1"},
+            )
+        mock_httpx.stream.assert_not_called()
+
+    @patch("antfly.client.Client")
     def test_create_index_preserves_storage_admission_retry(self, mock_client_class: MagicMock) -> None:
         mock_httpx = MagicMock()
         response = configure_response(

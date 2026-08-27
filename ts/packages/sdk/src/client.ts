@@ -4,6 +4,7 @@
  */
 
 import createClient, { type Client } from "openapi-fetch";
+import { validateCreateIndexRequestRelationships } from "./index-config.js";
 import type { paths } from "./public-api.js";
 import type {
   AntflyAuth,
@@ -1532,6 +1533,7 @@ export class AntflyClient {
      * Create a new index
      */
     create: async (tableName: string, indexName: string, config: CreateIndexRequest) => {
+      validateCreateIndexRequestRelationships(config);
       const { data, error, response } = await this.client.POST(
         "/db/v1/tables/{tableName}/indexes/{indexName}",
         {

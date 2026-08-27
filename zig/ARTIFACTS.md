@@ -415,15 +415,15 @@ v0.2.0 public API and are rejected rather than introduced as compatibility
 surface area.
 
 The embeddings root field `embedding_name` is a supported single-source
-convenience input. The index-level `source_artifact_name` is also supported: it
-selects the upstream artifact consumed by that single embedding producer, while
-`embedding_name`/`sources` select the producer output consumed by the vector
-index. Multi-source configurations put `source_artifact_name` on each matching
-embedding enrichment because producer inputs can differ. Normalized responses
-represent canonical consumed-output identity through `sources`. When a v0.2
-single-source request uses `embedding_name` and `source_artifact_name`, those
-released fields remain alongside `sources` so v0.2 clients can inspect and
-round-trip the effective configuration.
+convenience input. The v0.2 index-level `source_artifact_name` field is
+deprecated because the matching embedding enrichment is the authoritative
+owner of that relationship. Compatibility requests may still supply it with
+`embedding_name`, but it must exactly match the enrichment or admission fails.
+New clients put `source_artifact_name` only on each matching embedding
+enrichment because producer inputs can differ. Normalized responses represent
+canonical consumed-output identity through `sources`; v0.2 singular fields
+remain alongside it when originally supplied so existing clients can inspect
+and round-trip the configuration.
 
 For example, one full-text index can search both extracted units and derived
 chunks:

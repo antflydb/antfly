@@ -41,6 +41,7 @@ from .index_config import (
     artifact_full_text_index_config,
     artifact_index_sources,
     graph_index_sources,
+    validate_create_index_request_relationships,
 )
 
 __version__ = "0.1.0"
@@ -84,5 +85,6 @@ __all__ = [
     "artifact_full_text_index_config",
     "artifact_index_sources",
     "graph_index_sources",
+    "validate_create_index_request_relationships",
     "__version__",
 ]

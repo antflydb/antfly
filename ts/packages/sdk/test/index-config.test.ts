@@ -4,6 +4,7 @@ import {
   artifactFullTextIndexConfig,
   artifactIndexSources,
   graphIndexSources,
+  validateCreateIndexRequestRelationships,
 } from "../src/index-config.js";
 
 describe("artifact embedding index configuration", () => {
@@ -78,6 +79,57 @@ describe("artifact embedding index configuration", () => {
         dimension: 384,
       })
     ).toThrow(/dimension/);
+  });
+
+  it("enforces OpenAPI index request relationships before transport", () => {
+    expect(() =>
+      validateCreateIndexRequestRelationships({
+        type: "embeddings",
+        source_artifact_name: "chunks_v1",
+      })
+    ).toThrow(/requires a non-empty embedding_name/);
+    expect(() =>
+      validateCreateIndexRequestRelationships({
+        type: "embeddings",
+        external: true,
+        sources: [{ artifact: "dense_v1" }],
+      })
+    ).toThrow(/external/);
+    expect(() =>
+      validateCreateIndexRequestRelationships({
+        type: "embeddings",
+        embedding_name: "dense_v1",
+        source_artifact_name: "wrong_chunks_v1",
+        enrichments: [
+          {
+            name: "dense_v1",
+            kind: "embedding",
+            source_artifact_name: "chunks_v1",
+          },
+        ],
+      })
+    ).toThrow(/authoritative embedding enrichment/);
+    expect(() =>
+      validateCreateIndexRequestRelationships({
+        type: "full_text",
+        artifact_name: "chunks_v1",
+        sources: [{ artifact: "chunks_v2" }],
+      })
+    ).toThrow(/artifact_name/);
+    expect(() =>
+      validateCreateIndexRequestRelationships({
+        type: "graph",
+        source: { artifact: "relations_v1" },
+        sources: [{ artifact: "relations_v2" }],
+      })
+    ).toThrow(/source/);
+    expect(() =>
+      validateCreateIndexRequestRelationships({
+        type: "embeddings",
+        external: false,
+        sources: [{ artifact: "dense_v1" }],
+      })
+    ).not.toThrow();
   });
 
   it("preserves graph source mappings and defensively copies metadata", () => {

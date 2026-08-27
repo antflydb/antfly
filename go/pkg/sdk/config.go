@@ -180,24 +180,20 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 	}
 	switch typed := config.(type) {
 	case IndexConfig:
-		if typed.Type == IndexTypeEmbeddings {
-			if err := validateSingleSourceEmbeddingRequest(data); err != nil {
-				return nil, err
-			}
+		if err := validateIndexRequestRelationships(data, typed.Type); err != nil {
+			return nil, err
 		}
 		return newCreateIndexRequestFromIndexConfig(data, typed.Type)
 	case *IndexConfig:
 		if typed == nil {
 			return nil, fmt.Errorf("index config must not be nil")
 		}
-		if typed.Type == IndexTypeEmbeddings {
-			if err := validateSingleSourceEmbeddingRequest(data); err != nil {
-				return nil, err
-			}
+		if err := validateIndexRequestRelationships(data, typed.Type); err != nil {
+			return nil, err
 		}
 		return newCreateIndexRequestFromIndexConfig(data, typed.Type)
 	case EmbeddingsIndexConfig, CreateEmbeddingsIndexRequest:
-		if err := validateSingleSourceEmbeddingRequest(data); err != nil {
+		if err := validateIndexRequestRelationships(data, IndexTypeEmbeddings); err != nil {
 			return nil, err
 		}
 		var variant oapi.CreateEmbeddingsIndexRequest
@@ -212,7 +208,7 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 		if typed == nil {
 			return nil, fmt.Errorf("embeddings create index request must not be nil")
 		}
-		if err := validateSingleSourceEmbeddingRequest(data); err != nil {
+		if err := validateIndexRequestRelationships(data, IndexTypeEmbeddings); err != nil {
 			return nil, err
 		}
 		variant := *typed
@@ -221,6 +217,9 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 			return nil, fmt.Errorf("set embeddings create index request: %w", err)
 		}
 	case FullTextIndexConfig, CreateFullTextIndexRequest:
+		if err := validateIndexRequestRelationships(data, IndexTypeFullText); err != nil {
+			return nil, err
+		}
 		var variant oapi.CreateFullTextIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
 			return nil, fmt.Errorf("build full-text create index request: %w", err)
@@ -233,12 +232,18 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 		if typed == nil {
 			return nil, fmt.Errorf("full-text create index request must not be nil")
 		}
+		if err := validateIndexRequestRelationships(data, IndexTypeFullText); err != nil {
+			return nil, err
+		}
 		variant := *typed
 		variant.Type = oapi.CreateFullTextIndexRequestTypeFullText
 		if err := request.FromCreateFullTextIndexRequest(variant); err != nil {
 			return nil, fmt.Errorf("set full-text create index request: %w", err)
 		}
 	case GraphIndexConfig, CreateGraphIndexRequest:
+		if err := validateIndexRequestRelationships(data, IndexTypeGraph); err != nil {
+			return nil, err
+		}
 		var variant oapi.CreateGraphIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
 			return nil, fmt.Errorf("build graph create index request: %w", err)
@@ -250,6 +255,9 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 	case *CreateGraphIndexRequest:
 		if typed == nil {
 			return nil, fmt.Errorf("graph create index request must not be nil")
+		}
+		if err := validateIndexRequestRelationships(data, IndexTypeGraph); err != nil {
+			return nil, err
 		}
 		variant := *typed
 		variant.Type = oapi.CreateGraphIndexRequestTypeGraph
@@ -280,16 +288,61 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 	return request, nil
 }
 
-func validateSingleSourceEmbeddingRequest(data []byte) error {
-	var fields struct {
-		EmbeddingName      string `json:"embedding_name"`
-		SourceArtifactName string `json:"source_artifact_name"`
+func relationshipFieldActive(fields map[string]json.RawMessage, name string) bool {
+	raw, ok := fields[name]
+	if !ok {
+		return false
 	}
+	value := strings.TrimSpace(string(raw))
+	return value != "" && value != "null" && value != "false"
+}
+
+func validateIndexRequestRelationships(data []byte, indexType IndexType) error {
+	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
-		return fmt.Errorf("decode embeddings index config: %w", err)
+		return fmt.Errorf("decode %s index config: %w", indexType, err)
 	}
-	if fields.SourceArtifactName != "" && strings.TrimSpace(fields.EmbeddingName) == "" {
-		return fmt.Errorf("source_artifact_name requires a non-empty embedding_name")
+	hasSources := relationshipFieldActive(fields, "sources")
+	switch indexType {
+	case IndexTypeFullText:
+		if hasSources && relationshipFieldActive(fields, "artifact_name") {
+			return fmt.Errorf("sources cannot be combined with artifact_name")
+		}
+	case IndexTypeGraph:
+		if hasSources && relationshipFieldActive(fields, "source") {
+			return fmt.Errorf("sources cannot be combined with source")
+		}
+	case IndexTypeEmbeddings:
+		if hasSources {
+			for _, field := range []string{"external", "field", "template", "chunker", "embedding_name", "source_artifact_name"} {
+				if relationshipFieldActive(fields, field) {
+					return fmt.Errorf("sources cannot be combined with %s", field)
+				}
+			}
+		}
+		if relationshipFieldActive(fields, "source_artifact_name") && !relationshipFieldActive(fields, "embedding_name") {
+			return fmt.Errorf("source_artifact_name requires a non-empty embedding_name")
+		}
+		var embeddingFields struct {
+			EmbeddingName      string `json:"embedding_name"`
+			SourceArtifactName string `json:"source_artifact_name"`
+			Enrichments        []struct {
+				Name               string `json:"name"`
+				Kind               string `json:"kind"`
+				SourceArtifactName string `json:"source_artifact_name"`
+			} `json:"enrichments"`
+		}
+		if err := json.Unmarshal(data, &embeddingFields); err != nil {
+			return fmt.Errorf("decode embeddings index relationships: %w", err)
+		}
+		if embeddingFields.EmbeddingName != "" && embeddingFields.SourceArtifactName != "" {
+			for _, enrichment := range embeddingFields.Enrichments {
+				if enrichment.Kind == "embedding" && enrichment.Name == embeddingFields.EmbeddingName &&
+					enrichment.SourceArtifactName != embeddingFields.SourceArtifactName {
+					return fmt.Errorf("source_artifact_name must match the authoritative embedding enrichment")
+				}
+			}
+		}
 	}
 	return nil
 }

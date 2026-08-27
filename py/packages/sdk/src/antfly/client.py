@@ -36,6 +36,7 @@ from antfly.client_generated.models import (
 from antfly.client_generated.types import UNSET
 
 from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError, StorageResourceExhaustedError
+from .index_config import validate_create_index_request_relationships
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
@@ -237,6 +238,7 @@ class IndexOperations:
             raise ValueError("index name is owned by the path; pass it as the name argument")
         if not isinstance(payload.get("type"), str) or not payload["type"]:
             raise ValueError("index config requires a non-empty type")
+        validate_create_index_request_relationships(payload)
         result = self._client._request(
             "POST",
             f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}",

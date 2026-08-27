@@ -13,6 +13,55 @@ _GRAPH_ARTIFACT_PATH = re.compile(r"^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\
 _GRAPH_MATERIALIZED_SOURCE = re.compile(r"^\{\{\s*(_doc\.key|_artifact\.value(?:\..+)?)\s*\}\}$")
 
 
+def _relationship_field_active(value: Any) -> bool:
+    return value is not None and value is not False
+
+
+def validate_create_index_request_relationships(config: Mapping[str, Any]) -> None:
+    """Validate the cross-field relationships published by the OpenAPI contract."""
+
+    index_type = config.get("type")
+    has_sources = _relationship_field_active(config.get("sources"))
+    if index_type == "full_text" and has_sources and _relationship_field_active(config.get("artifact_name")):
+        raise ValueError("index sources cannot be combined with artifact_name")
+    if index_type == "graph" and has_sources and _relationship_field_active(config.get("source")):
+        raise ValueError("index sources cannot be combined with source")
+    if index_type != "embeddings":
+        return
+
+    if has_sources:
+        for field in (
+            "external",
+            "field",
+            "template",
+            "chunker",
+            "embedding_name",
+            "source_artifact_name",
+        ):
+            if _relationship_field_active(config.get(field)):
+                raise ValueError(f"index sources cannot be combined with {field}")
+    if _relationship_field_active(config.get("source_artifact_name")) and not _relationship_field_active(
+        config.get("embedding_name")
+    ):
+        raise ValueError("embedding source_artifact_name requires a non-empty embedding_name")
+    embedding_name = config.get("embedding_name")
+    source_artifact_name = config.get("source_artifact_name")
+    enrichments = config.get("enrichments")
+    if isinstance(embedding_name, str) and isinstance(source_artifact_name, str) and isinstance(enrichments, list):
+        enrichment = next(
+            (
+                candidate
+                for candidate in enrichments
+                if isinstance(candidate, Mapping)
+                and candidate.get("kind") == "embedding"
+                and candidate.get("name") == embedding_name
+            ),
+            None,
+        )
+        if enrichment is not None and enrichment.get("source_artifact_name") != source_artifact_name:
+            raise ValueError("embedding source_artifact_name must match the authoritative embedding enrichment")
+
+
 def _validate_artifacts(artifacts: Sequence[object]) -> None:
     if not artifacts:
         raise ValueError("at least one artifact source is required")

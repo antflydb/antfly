@@ -230,7 +230,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
     sources: ?[]const ArtifactIndexSource = null,
     /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
-    /// Optional source artifact consumed by the embedding enrichment named by embedding_name. Only valid when embedding_name is also set; the matching enrichment defines the materialized source.
+    /// Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -389,7 +389,7 @@ pub const CreatedEmbeddingsIndex = struct {
     sources: ?[]const ArtifactIndexSource = null,
     /// Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources.
     embedding_name: ?[]const u8 = null,
-    /// Released v0.2 descriptive source read field, preserved when supplied with embedding_name.
+    /// Deprecated v0.2 descriptive source read field, preserved when supplied with embedding_name. The matching enrichment is authoritative.
     source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
@@ -416,7 +416,7 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     sources: ?[]const ArtifactIndexSource = null,
     /// Released v0.2 single-source read field, preserved when that request form created the index. Canonical source identity is also returned through sources.
     embedding_name: ?[]const u8 = null,
-    /// Released v0.2 descriptive source read field, preserved when supplied with embedding_name.
+    /// Deprecated v0.2 descriptive source read field, preserved when supplied with embedding_name. The matching enrichment is authoritative.
     source_artifact_name: ?[]const u8 = null,
     template: ?[]const u8 = null,
     distance_metric: ?DistanceMetric = null,
@@ -860,7 +860,7 @@ pub const EmbeddingsIndexConfig = struct {
     sources: ?[]const ArtifactIndexSource = null,
     /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
-    /// Optional source artifact consumed by the embedding enrichment named by embedding_name. Only valid when embedding_name is also set; the matching enrichment defines the materialized source.
+    /// Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -1599,7 +1599,7 @@ pub const IndexConfig = struct {
     dimension: ?i64 = null,
     /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
-    /// Optional source artifact consumed by the embedding enrichment named by embedding_name. Only valid when embedding_name is also set; the matching enrichment defines the materialized source.
+    /// Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name is required and this value must exactly match the source_artifact_name on the authoritative embedding enrichment. New clients should declare the relationship only on that enrichment.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,

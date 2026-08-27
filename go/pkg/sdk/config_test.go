@@ -56,6 +56,35 @@ func TestNewCreateIndexRequestRejectsOrphanedEmbeddingSourceArtifact(t *testing.
 	}
 }
 
+func TestValidateIndexRequestRelationshipsEnforcesOpenAPIContract(t *testing.T) {
+	tests := []struct {
+		name      string
+		indexType IndexType
+		body      string
+		want      string
+	}{
+		{"embedding dependency", IndexTypeEmbeddings, `{"source_artifact_name":"chunks_v1"}`, "embedding_name"},
+		{"embedding source conflict", IndexTypeEmbeddings, `{"sources":[{"artifact":"dense_v1"}],"external":true}`, "external"},
+		{"full text source conflict", IndexTypeFullText, `{"sources":[{"artifact":"chunks_v1"}],"artifact_name":"chunks_v2"}`, "artifact_name"},
+		{"graph source conflict", IndexTypeGraph, `{"sources":[{"artifact":"relations_v1"}],"source":{"artifact":"relations_v2"}}`, "source"},
+		{"embedding source mismatch", IndexTypeEmbeddings, `{"embedding_name":"dense_v1","source_artifact_name":"wrong_chunks_v1","enrichments":[{"name":"dense_v1","kind":"embedding","source_artifact_name":"chunks_v1"}]}`, "authoritative embedding enrichment"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateIndexRequestRelationships([]byte(tt.body), tt.indexType)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("validateIndexRequestRelationships error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+	if err := validateIndexRequestRelationships(
+		[]byte(`{"sources":[{"artifact":"dense_v1"}],"external":false}`),
+		IndexTypeEmbeddings,
+	); err != nil {
+		t.Fatalf("defaulted false external must remain compatible with sources: %v", err)
+	}
+}
+
 func TestNewCreateIndexRequestPreservesFullTypedRequest(t *testing.T) {
 	request, err := NewCreateIndexRequest(CreateEmbeddingsIndexRequest{
 		Description: "semantic product search",

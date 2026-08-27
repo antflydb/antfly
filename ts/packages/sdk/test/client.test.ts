@@ -874,6 +874,16 @@ describe("AntflyClient", () => {
       ).rejects.toThrow("unexpected empty response");
     });
 
+    it("rejects invalid index field relationships before transport", async () => {
+      await expect(
+        client.indexes.create("wikipedia", "thumbnail", {
+          type: "embeddings",
+          source_artifact_name: "thumbnail_chunks_v1",
+        })
+      ).rejects.toThrow("requires a non-empty embedding_name");
+      expect(mockPost).not.toHaveBeenCalled();
+    });
+
     it("preserves storage admission retry metadata", async () => {
       mockPost.mockResolvedValueOnce({
         data: undefined,

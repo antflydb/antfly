@@ -439,7 +439,55 @@ fn validatePublicIndexObject(object: anytype) !void {
         return error.InvalidCreateIndexRequest;
     try validatePublicInlineArtifactEnrichments(object);
     try validatePublicIndexFields(object, index_type);
+    try validatePublicIndexFieldRelationships(object, index_type);
     try validatePublicNestedIndexFields(object, index_type);
+}
+
+fn publicRelationshipFieldActive(object: anytype, field: []const u8) bool {
+    const value = indexObjectGet(object, field) orelse return false;
+    return switch (value) {
+        .null => false,
+        // Defaulted false is semantically absent for an opt-in mode such as
+        // `external`; generated clients commonly serialize that default.
+        .bool => |enabled| enabled,
+        else => true,
+    };
+}
+
+fn validatePublicIndexFieldRelationships(object: anytype, index_type: public_index_contract.Kind) !void {
+    const has_sources = publicRelationshipFieldActive(object, "sources");
+    switch (index_type) {
+        .full_text => {
+            if (has_sources and publicRelationshipFieldActive(object, "artifact_name"))
+                return error.InvalidCreateIndexRequest;
+        },
+        .graph => {
+            if (has_sources and publicRelationshipFieldActive(object, "source"))
+                return error.InvalidCreateIndexRequest;
+        },
+        .embeddings => {
+            if (has_sources) {
+                const conflicts = [_][]const u8{
+                    "external",
+                    "field",
+                    "template",
+                    "chunker",
+                    "embedding_name",
+                    "source_artifact_name",
+                };
+                for (conflicts) |field| {
+                    if (publicRelationshipFieldActive(object, field))
+                        return error.InvalidCreateIndexRequest;
+                }
+            }
+            if (publicRelationshipFieldActive(object, "source_artifact_name") and
+                !publicRelationshipFieldActive(object, "embedding_name"))
+            {
+                return error.InvalidCreateIndexRequest;
+            }
+        },
+        .algebraic => {},
+    }
 }
 
 fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_contract.Kind) !void {
@@ -452,13 +500,6 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
         );
     }
     const source = if (@hasField(Object, "map")) object.map.get("source") else object.get("source");
-    if (sources != null and source != null and sources.? != .null and source.? != .null)
-        return error.InvalidCreateIndexRequest;
-    if (index_type == .full_text) {
-        const artifact_name = indexObjectGet(object, "artifact_name");
-        if (sources != null and artifact_name != null and sources.? != .null and artifact_name.? != .null)
-            return error.InvalidCreateIndexRequest;
-    }
     if (index_type == .embeddings) {
         const chunker = if (@hasField(Object, "map")) object.map.get("chunker") else object.get("chunker");
         if (chunker) |value| {
@@ -1154,6 +1195,10 @@ test "table contract rejects ambiguous index source spellings" {
         "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"sources\":[{\"artifact\":\"relations_v2\"}]}",
         "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\"},\"nodes\":{\"model\":\"document\"},\"sources\":[{\"artifact\":\"relations_v2\"}]}",
         "{\"type\":\"graph\",\"source\":{\"artifact\":\"relations_v1\",\"nodes\":{\"model\":\"document\"}},\"nodes\":{\"model\":\"external\"}}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"source_artifact_name\":\"chunks_v1\"}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"embedding_name\":\"dense_v1\",\"sources\":[{\"artifact\":\"dense_v2\"}]}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"field\":\"body\",\"sources\":[{\"artifact\":\"dense_v1\"}]}",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"external\":true,\"sources\":[{\"artifact\":\"dense_v1\"}]}",
     };
     for (invalid) |body| {
         try std.testing.expectError(
@@ -1161,6 +1206,15 @@ test "table contract rejects ambiguous index source spellings" {
             parseCreateIndexRequest(std.testing.allocator, "ambiguous", body),
         );
     }
+
+    // Generated clients commonly serialize defaulted false booleans. That is
+    // not an active external mode and must remain compatible with sources.
+    const defaulted_external = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "vectors",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"external\":false,\"sources\":[{\"artifact\":\"dense_v1\"}]}",
+    );
+    defer std.testing.allocator.free(defaulted_external);
 }
 
 test "table contract rejects unknown fields in closed nested index objects" {

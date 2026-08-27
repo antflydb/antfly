@@ -47,8 +47,8 @@ class CreatedEmbeddingsIndex:
             members.
         embedding_name (str | Unset): Released v0.2 single-source read field, preserved when that request form created
             the index. Canonical source identity is also returned through sources.
-        source_artifact_name (str | Unset): Released v0.2 descriptive source read field, preserved when supplied with
-            embedding_name.
+        source_artifact_name (str | Unset): Deprecated v0.2 descriptive source read field, preserved when supplied with
+            embedding_name. The matching enrichment is authoritative.
         template (str | Unset):
         distance_metric (DistanceMetric | Unset): Distance metric for the vector index (dense only). Use "cosine" for
             models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot

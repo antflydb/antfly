@@ -24,11 +24,36 @@ fn main() {
         .expect("failed to generate client");
 
     let ast = syn::parse2(tokens).expect("failed to parse generated tokens");
-    let code = prettyplease::unparse(&ast);
+    let mut code = prettyplease::unparse(&ast);
+    inject_create_index_validation(&mut code);
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("client.rs");
     fs::write(&out_path, code).expect("failed to write generated client");
+}
+
+/// Progenitor cannot express Antfly's cross-field OpenAPI extensions. Keep the
+/// generated transport ergonomic by validating the one affected operation
+/// before reqwest allocates or sends a request. The guarded anchors make a
+/// generator-shape change fail during compilation instead of silently dropping
+/// client-side validation.
+fn inject_create_index_validation(code: &mut String) {
+    let method = "    pub async fn create_index<'a>(";
+    let method_start = code
+        .find(method)
+        .expect("generated client must contain create_index");
+    assert!(
+        code[method_start + method.len()..].find(method).is_none(),
+        "generated client must contain exactly one create_index"
+    );
+    let request_start = code[method_start..]
+        .find("        let url = format!(")
+        .map(|offset| method_start + offset)
+        .expect("generated create_index must build its URL before sending");
+    code.insert_str(
+        request_start,
+        "        crate::validate_create_index_request_relationships(body)\n            .map_err(|error| Error::InvalidRequest(error.to_string()))?;\n",
+    );
 }
 
 /// OpenAPI descriptions document wire payloads and templates, not Rust source.

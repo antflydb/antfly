@@ -1,5 +1,6 @@
 import type {
   ArtifactIndexSource,
+  CreateIndexRequest,
   EmbedderConfig,
   EmbeddingsIndexConfig,
   EnrichmentConfig,
@@ -11,6 +12,68 @@ const MAX_ARTIFACT_SOURCES = 64;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function relationshipFieldActive(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== false;
+}
+
+/**
+ * Enforces the cross-field request relationships published through Antfly's
+ * OpenAPI vendor extensions. The server remains authoritative, while this
+ * keeps direct SDK calls from paying for a guaranteed failed request.
+ */
+export function validateCreateIndexRequestRelationships(
+  config: CreateIndexRequest | IndexConfig | Record<string, unknown>
+): void {
+  if (!isRecord(config)) throw new TypeError("index config must be an object");
+  const object = config as Record<string, unknown>;
+  const hasSources = relationshipFieldActive(object.sources);
+  if (object.type === "full_text" && hasSources && relationshipFieldActive(object.artifact_name)) {
+    throw new TypeError("Index sources cannot be combined with artifact_name.");
+  }
+  if (object.type === "graph" && hasSources && relationshipFieldActive(object.source)) {
+    throw new TypeError("Index sources cannot be combined with source.");
+  }
+  if (object.type !== "embeddings") return;
+
+  if (hasSources) {
+    for (const field of [
+      "external",
+      "field",
+      "template",
+      "chunker",
+      "embedding_name",
+      "source_artifact_name",
+    ] as const) {
+      if (relationshipFieldActive(object[field])) {
+        throw new TypeError(`Index sources cannot be combined with ${field}.`);
+      }
+    }
+  }
+  if (
+    relationshipFieldActive(object.source_artifact_name) &&
+    !relationshipFieldActive(object.embedding_name)
+  ) {
+    throw new TypeError("Embedding source_artifact_name requires a non-empty embedding_name.");
+  }
+  if (
+    typeof object.embedding_name === "string" &&
+    typeof object.source_artifact_name === "string" &&
+    Array.isArray(object.enrichments)
+  ) {
+    const enrichment = object.enrichments.find(
+      (candidate) =>
+        isRecord(candidate) &&
+        candidate.kind === "embedding" &&
+        candidate.name === object.embedding_name
+    );
+    if (isRecord(enrichment) && enrichment.source_artifact_name !== object.source_artifact_name) {
+      throw new TypeError(
+        "Embedding source_artifact_name must match the authoritative embedding enrichment."
+      );
+    }
+  }
 }
 
 function validateRequiredString(value: unknown, path: string): asserts value is string {

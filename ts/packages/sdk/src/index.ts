@@ -56,6 +56,7 @@ export {
   artifactFullTextIndexConfig,
   artifactIndexSources,
   graphIndexSources,
+  validateCreateIndexRequestRelationships,
 } from "./index-config.js";
 export {
   InferenceAPIError,

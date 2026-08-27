@@ -1,4 +1,8 @@
-import { graphIndexSources, type IndexConfig } from "@antfly/sdk";
+import {
+  graphIndexSources,
+  type IndexConfig,
+  validateCreateIndexRequestRelationships,
+} from "@antfly/sdk";
 
 export function parseAdvancedIndexConfig(source: string): IndexConfig {
   let value: unknown;
@@ -47,18 +51,6 @@ export function parseAdvancedIndexConfig(source: string): IndexConfig {
       });
     }
   }
-  const mutuallyExclusiveWithSources =
-    config.type === "full_text"
-      ? ["artifact_name"]
-      : config.type === "graph"
-        ? ["source"]
-        : ["external", "field", "template", "chunker", "embedding_name", "source_artifact_name"];
-  if (config.sources !== undefined) {
-    const conflict = mutuallyExclusiveWithSources.find((field) => config[field] !== undefined);
-    if (conflict) {
-      throw new Error(`Index sources cannot be combined with ${conflict}.`);
-    }
-  }
   if (config.type === "embeddings") {
     for (const field of ["embedding_name", "source_artifact_name"] as const) {
       if (
@@ -68,10 +60,8 @@ export function parseAdvancedIndexConfig(source: string): IndexConfig {
         throw new Error(`Embedding ${field} must be a non-empty string.`);
       }
     }
-    if (config.source_artifact_name !== undefined && config.embedding_name === undefined) {
-      throw new Error("Embedding source_artifact_name requires a non-empty embedding_name.");
-    }
   }
+  validateCreateIndexRequestRelationships(config);
   return value as IndexConfig;
 }
 

@@ -497,9 +497,18 @@ fn validateEmbeddingArtifactReferences(
     else
         0;
     if (object.get("embedding_name")) |value| {
-        if (value != .string) return error.InvalidEnrichmentConfig;
+        if (value != .string or value.string.len == 0) return error.InvalidEnrichmentConfig;
         const cfg = findArtifactEnrichmentConfig(configs, .embedding, value.string) orelse return error.InvalidEnrichmentConfig;
         try validateEmbeddingArtifactShape(cfg, sparse, dims);
+        if (object.get("source_artifact_name")) |source| {
+            if (source != .string or source.string.len == 0 or
+                !std.mem.eql(u8, source.string, cfg.source_artifact_name))
+            {
+                return error.InvalidEnrichmentConfig;
+            }
+        }
+    } else if (object.get("source_artifact_name") != null) {
+        return error.InvalidEnrichmentConfig;
     }
 
     const sources = object.get("sources") orelse return;
@@ -5280,6 +5289,30 @@ test "merged index metadata validates artifact consumer references" {
     );
     defer std.testing.allocator.free(valid);
     try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, valid);
+
+    const singular_catalog =
+        \\{"enrichments":[{"name":"document_units_v1","kind":"asset","field":"url"},{"name":"document_chunks_v1","kind":"chunk","field":"text","source_artifact_name":"document_units_v1","chunk_size":512},{"name":"document_chunk_dense_v1","kind":"embedding","field":"text","source_artifact_name":"document_chunks_v1","expected_dims":3}]}
+    ;
+    const valid_singular = try addIndexToTableIndexesJson(
+        std.testing.allocator,
+        singular_catalog,
+        "document_vectors",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"embedding_name\":\"document_chunk_dense_v1\",\"source_artifact_name\":\"document_chunks_v1\"}",
+    );
+    defer std.testing.allocator.free(valid_singular);
+    try validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, valid_singular);
+
+    const mismatched_singular = try addIndexToTableIndexesJson(
+        std.testing.allocator,
+        singular_catalog,
+        "document_vectors",
+        "{\"type\":\"embeddings\",\"dimension\":3,\"embedding_name\":\"document_chunk_dense_v1\",\"source_artifact_name\":\"wrong_chunks_v1\"}",
+    );
+    defer std.testing.allocator.free(mismatched_singular);
+    try std.testing.expectError(
+        error.InvalidEnrichmentConfig,
+        validateArtifactEnrichmentsForTableIndexesJson(std.testing.allocator, mismatched_singular),
+    );
 
     const missing_embedding = try addIndexToTableIndexesJson(
         std.testing.allocator,

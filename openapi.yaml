@@ -18329,9 +18329,11 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           minLength: 1
-          description: Optional source artifact consumed by the embedding enrichment named by embedding_name.
-            Only valid when embedding_name is also set; the matching enrichment defines the materialized
-            source.
+          deprecated: true
+          x-deprecated-reason: Set source_artifact_name only on the matching embedding enrichment.
+          description: Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name
+            is required and this value must exactly match the source_artifact_name on the authoritative
+            embedding enrichment. New clients should declare the relationship only on that enrichment.
         template:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -23013,7 +23015,10 @@ components:
         source_artifact_name:
           type: string
           readOnly: true
-          description: Released v0.2 descriptive source read field, preserved when supplied with embedding_name.
+          deprecated: true
+          x-deprecated-reason: Use the matching embedding enrichment's source_artifact_name; it is authoritative.
+          description: Deprecated v0.2 descriptive source read field, preserved when supplied with embedding_name.
+            The matching enrichment is authoritative.
         template:
           type: string
         distance_metric:
