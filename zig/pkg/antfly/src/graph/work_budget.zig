@@ -209,6 +209,53 @@ pub const RetainedLease = struct {
     pub fn consume(self: *RetainedLease) void {
         self.* = .{};
     }
+
+    /// Reserve the full replacement allocation while the allocation it
+    /// supersedes is still live. Call commit only after the allocator has
+    /// installed the replacement; otherwise deinit rolls the peak reservation
+    /// back to the original retained total.
+    pub fn reserveReplacement(
+        self: *RetainedLease,
+        replaced_bytes: usize,
+        replacement_bytes: usize,
+    ) !AllocationReplacement {
+        if (replaced_bytes > self.bytes) return error.InvalidRetainedReplacement;
+        const prior_bytes = self.bytes;
+        const peak_bytes = std.math.add(usize, prior_bytes, replacement_bytes) catch
+            return if (self.budget) |budget|
+                budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes)
+            else
+                error.InvalidRetainedReplacement;
+        try self.resize(peak_bytes);
+        return .{
+            .lease = self,
+            .prior_bytes = prior_bytes,
+            .replaced_bytes = replaced_bytes,
+            .replacement_bytes = replacement_bytes,
+        };
+    }
+};
+
+pub const AllocationReplacement = struct {
+    lease: *RetainedLease,
+    prior_bytes: usize,
+    replaced_bytes: usize,
+    replacement_bytes: usize,
+    committed: bool = false,
+
+    /// Transfer the peak reservation to the newly installed allocation and
+    /// release the bytes owned by the superseded allocation.
+    pub fn commit(self: *AllocationReplacement) void {
+        std.debug.assert(!self.committed);
+        const retained_bytes = self.prior_bytes - self.replaced_bytes + self.replacement_bytes;
+        self.lease.resize(retained_bytes) catch unreachable;
+        self.committed = true;
+    }
+
+    pub fn deinit(self: *AllocationReplacement) void {
+        if (!self.committed) self.lease.resize(self.prior_bytes) catch unreachable;
+        self.* = undefined;
+    }
 };
 
 fn edgeOwnedBytes(edges: []const graph_mod.Edge) !usize {
@@ -246,6 +293,34 @@ test "retained expansion state has an explicit byte ceiling" {
     try budget.retainStateBytes(4);
     budget.releaseStateBytes(4);
     try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+}
+
+test "retained lease accounts allocation replacement peak" {
+    var budget = WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 12;
+    var lease = try RetainedLease.init(&budget, 4);
+    defer lease.deinit();
+
+    var replacement = try lease.reserveReplacement(4, 8);
+    defer replacement.deinit();
+    try std.testing.expectEqual(@as(usize, 12), budget.retained_state_bytes);
+    replacement.commit();
+    try std.testing.expectEqual(@as(usize, 8), budget.retained_state_bytes);
+    try std.testing.expectEqual(@as(usize, 8), lease.bytes);
+}
+
+test "retained lease rejects allocation replacement peak without leaking" {
+    var budget = WorkBudget.init(1, 1);
+    budget.max_retained_state_bytes = 11;
+    var lease = try RetainedLease.init(&budget, 4);
+    defer lease.deinit();
+
+    try std.testing.expectError(
+        error.GraphWorkBudgetExceeded,
+        lease.reserveReplacement(4, 8),
+    );
+    try std.testing.expectEqual(@as(usize, 4), budget.retained_state_bytes);
+    try std.testing.expectEqual(@as(usize, 4), lease.bytes);
 }
 
 test "hash map retained bytes track capacity rather than entry count" {

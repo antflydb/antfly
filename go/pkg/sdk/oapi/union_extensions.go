@@ -87,3 +87,52 @@ func decodeStrictJSON(encoded []byte, value any) error {
 	}
 	return nil
 }
+
+type graphPathEndpointWire GraphPathEndpoint
+
+// UnmarshalJSON preserves the OpenAPI distinction between an omitted optional
+// table qualifier and explicit null without requiring callers to retain a
+// second shadow copy of a graph result.
+func (t *GraphPathEndpoint) UnmarshalJSON(encoded []byte) error {
+	var decoded graphPathEndpointWire
+	if err := decodeGraphIdentityJSON(encoded, &decoded); err != nil {
+		return err
+	}
+	*t = GraphPathEndpoint(decoded)
+	return nil
+}
+
+type graphBindingNodeWire GraphBindingNode
+
+func (t *GraphBindingNode) UnmarshalJSON(encoded []byte) error {
+	var decoded graphBindingNodeWire
+	if err := decodeGraphIdentityJSON(encoded, &decoded); err != nil {
+		return err
+	}
+	*t = GraphBindingNode(decoded)
+	return nil
+}
+
+type graphResultNodeWire GraphResultNode
+
+func (t *GraphResultNode) UnmarshalJSON(encoded []byte) error {
+	var decoded graphResultNodeWire
+	if err := decodeGraphIdentityJSON(encoded, &decoded); err != nil {
+		return err
+	}
+	*t = GraphResultNode(decoded)
+	return nil
+}
+
+func decodeGraphIdentityJSON(encoded []byte, value any) error {
+	var presence struct {
+		Table json.RawMessage `json:"table"`
+	}
+	if err := json.Unmarshal(encoded, &presence); err != nil {
+		return err
+	}
+	if len(presence.Table) != 0 && bytes.Equal(bytes.TrimSpace(presence.Table), []byte("null")) {
+		return errors.New("graph node table must be omitted or non-null")
+	}
+	return decodeStrictJSON(encoded, value)
+}

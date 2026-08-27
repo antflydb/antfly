@@ -3821,6 +3821,8 @@ pub fn build(b: *std.Build) void {
         "path weight overflow has a stable public diagnostic",
         "anchor scans have an independent request-wide budget",
         "retained expansion state has an explicit byte ceiling",
+        "retained lease accounts allocation replacement peak",
+        "retained lease rejects allocation replacement peak without leaking",
         "traversal preflights live frontier admission before ownership transfer",
         "traversal ancestry and returned paths share retained state budget",
         "projected MATCH rows reserve and release retained output bytes",

@@ -5191,6 +5191,19 @@ const PublicDocumentBodyPrefetch = struct {
     }
 };
 
+fn deduplicateSortedDocumentPrefetches(
+    locators: []PublicDocumentBodyPrefetch,
+) []PublicDocumentBodyPrefetch {
+    if (locators.len < 2) return locators;
+    var unique_count: usize = 1;
+    for (locators[1..]) |candidate| {
+        if (candidate.document_index == locators[unique_count - 1].document_index) continue;
+        locators[unique_count] = candidate;
+        unique_count += 1;
+    }
+    return locators[0..unique_count];
+}
+
 const PublicDocumentRefsAllocation = struct {
     items: []PublicDocumentRef,
     retained_bytes: usize,
@@ -5298,6 +5311,23 @@ const PublicGraphRequestCache = struct {
         try self.retained_lease.resize(total);
     }
 
+    fn ensureRetainedListCapacity(
+        self: *PublicGraphRequestCache,
+        comptime T: type,
+        list: *std.ArrayListUnmanaged(T),
+        required_capacity: usize,
+    ) !void {
+        if (required_capacity <= list.capacity) return;
+        const replaced_bytes = std.math.mul(usize, list.capacity, @sizeOf(T)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        const replacement_bytes = std.math.mul(usize, required_capacity, @sizeOf(T)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        var replacement = try self.retained_lease.reserveReplacement(replaced_bytes, replacement_bytes);
+        defer replacement.deinit();
+        try list.ensureTotalCapacityPrecise(self.handler.alloc, required_capacity);
+        replacement.commit();
+    }
+
     fn documents(self: *PublicGraphRequestCache) ![]const PublicDocumentRef {
         if (self.published_documents == null) {
             self.published_documents = try self.allocPublishedDocumentRefs();
@@ -5357,24 +5387,26 @@ const PublicGraphRequestCache = struct {
     ) !void {
         const max_coalesced_bytes: usize = 4 * 1024 * 1024;
         const max_gap_bytes: u64 = 64 * 1024;
-        const locator_bytes = std.math.mul(usize, docs.len, @sizeOf(PublicDocumentBodyPrefetch)) catch
+        var pending_count: usize = 0;
+        for (docs) |candidate| {
+            if (self.pendingDocumentBodyPrefetch(candidate, filter_prefix) != null) pending_count += 1;
+        }
+        const locator_bytes = std.math.mul(usize, pending_count, @sizeOf(PublicDocumentBodyPrefetch)) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         var locator_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, locator_bytes);
         defer locator_lease.deinit();
-        const locators = try self.handler.alloc.alloc(PublicDocumentBodyPrefetch, docs.len);
+        const locators = try self.handler.alloc.alloc(PublicDocumentBodyPrefetch, pending_count);
         defer self.handler.alloc.free(locators);
         var locator_count: usize = 0;
         for (docs) |candidate| {
-            if (filter_prefix.len > 0 and !std.mem.startsWith(u8, candidate.doc_id, filter_prefix)) continue;
-            const document_index = self.published_document_index.get(candidate.doc_id) orelse continue;
-            const locator = switch (self.published_documents.?[document_index].body) {
-                .artifact => |value| value,
-                .owned, .cached, .deleted, .moved => continue,
-            };
-            locators[locator_count] = .{ .document_index = document_index, .locator = locator };
-            locator_count += 1;
+            if (self.pendingDocumentBodyPrefetch(candidate, filter_prefix)) |pending| {
+                locators[locator_count] = pending;
+                locator_count += 1;
+            }
         }
+        std.debug.assert(locator_count == pending_count);
         std.mem.sort(PublicDocumentBodyPrefetch, locators[0..locator_count], {}, PublicDocumentBodyPrefetch.lessThan);
+        locator_count = deduplicateSortedDocumentPrefetches(locators[0..locator_count]).len;
 
         var cursor: usize = 0;
         while (cursor < locator_count) {
@@ -5394,17 +5426,11 @@ const PublicGraphRequestCache = struct {
             }
             const range_len_u64 = range_end - first_locator.offset;
             const range_len = std.math.cast(usize, range_len_u64) orelse return error.InvalidDocumentSegment;
-            if (self.published_body_blocks.items.len == self.published_body_blocks.capacity) {
-                const metadata_bytes = @sizeOf([]u8);
-                try self.reserveRetained(metadata_bytes);
-                self.published_body_blocks.ensureTotalCapacityPrecise(
-                    self.handler.alloc,
-                    self.published_body_blocks.items.len + 1,
-                ) catch |err| {
-                    self.retained_lease.resize(self.retained_lease.bytes - metadata_bytes) catch unreachable;
-                    return err;
-                };
-            }
+            try self.ensureRetainedListCapacity(
+                []u8,
+                &self.published_body_blocks,
+                self.published_body_blocks.items.len + 1,
+            );
             try self.reserveRetained(range_len);
             const block = self.session.fetchArtifactRangeAlloc(
                 first_locator.artifact_index,
@@ -5437,6 +5463,20 @@ const PublicGraphRequestCache = struct {
             }
             cursor = end_cursor;
         }
+    }
+
+    fn pendingDocumentBodyPrefetch(
+        self: *PublicGraphRequestCache,
+        candidate: PublicDocumentRef,
+        filter_prefix: []const u8,
+    ) ?PublicDocumentBodyPrefetch {
+        if (filter_prefix.len > 0 and !std.mem.startsWith(u8, candidate.doc_id, filter_prefix)) return null;
+        const document_index = self.published_document_index.get(candidate.doc_id) orelse return null;
+        const locator = switch (self.published_documents.?[document_index].body) {
+            .artifact => |value| value,
+            .owned, .cached, .deleted, .moved => return null,
+        };
+        return .{ .document_index = document_index, .locator = locator };
     }
 
     fn allocPublishedDocumentRefs(self: *PublicGraphRequestCache) ![]PublicDocumentRef {
@@ -5817,10 +5857,6 @@ const PublicGraphRequestCache = struct {
         }
         persistent_bytes = std.math.add(usize, persistent_bytes, index_name.len) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
-        if (self.segments.items.len == self.segments.capacity) {
-            persistent_bytes = std.math.add(usize, persistent_bytes, @sizeOf(CachedPublicGraphSegment)) catch
-                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
-        }
         const prior_retained = self.retained_lease.bytes;
         try self.reserveRetained(persistent_bytes);
         errdefer self.retained_lease.resize(prior_retained) catch unreachable;
@@ -5860,8 +5896,11 @@ const PublicGraphRequestCache = struct {
         }
         const owned_name = try self.handler.alloc.dupe(u8, index_name);
         errdefer self.handler.alloc.free(owned_name);
-        if (self.segments.items.len == self.segments.capacity)
-            try self.segments.ensureTotalCapacityPrecise(self.handler.alloc, self.segments.items.len + 1);
+        try self.ensureRetainedListCapacity(
+            CachedPublicGraphSegment,
+            &self.segments,
+            self.segments.items.len + 1,
+        );
         self.segments.appendAssumeCapacity(.{
             .index_name = owned_name,
             .segment = segment,
@@ -6288,11 +6327,14 @@ test "serverless document body prefetch order is artifact monotonic" {
         .{ .document_index = 0, .locator = .{ .artifact_index = 1, .offset = 90, .len = 5 } },
         .{ .document_index = 1, .locator = .{ .artifact_index = 0, .offset = 40, .len = 5 } },
         .{ .document_index = 2, .locator = .{ .artifact_index = 1, .offset = 10, .len = 5 } },
+        .{ .document_index = 2, .locator = .{ .artifact_index = 1, .offset = 10, .len = 5 } },
     };
     std.mem.sort(PublicDocumentBodyPrefetch, &locators, {}, PublicDocumentBodyPrefetch.lessThan);
-    try std.testing.expectEqual(@as(usize, 0), locators[0].locator.artifact_index);
-    try std.testing.expectEqual(@as(u64, 10), locators[1].locator.offset);
-    try std.testing.expectEqual(@as(u64, 90), locators[2].locator.offset);
+    const unique = deduplicateSortedDocumentPrefetches(&locators);
+    try std.testing.expectEqual(@as(usize, 3), unique.len);
+    try std.testing.expectEqual(@as(usize, 0), unique[0].locator.artifact_index);
+    try std.testing.expectEqual(@as(u64, 10), unique[1].locator.offset);
+    try std.testing.expectEqual(@as(u64, 90), unique[2].locator.offset);
 }
 
 test "serverless detects document filters on required and optional external aliases" {
