@@ -5722,9 +5722,7 @@ pub const DB = struct {
         }
         for (child_batch.artifact_delete_keys) |key| {
             try delete_keys.append(self.alloc, key);
-            if (internal_keys.isAssetArtifactKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
-                try appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, key);
-            }
+            try appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, key);
         }
 
         try appendPrecomputedGraphSourceArtifacts(
@@ -5769,6 +5767,15 @@ pub const DB = struct {
         defer sync_targets.deinit(self.alloc);
         const replay_payload = try encodeChangeRecordPayload(&self.batchContext(), derived_batch, sequence);
         defer self.alloc.free(replay_payload);
+
+        try appendArtifactSourceRevisionWritesFromReplay(
+            self.alloc,
+            replay_payload,
+            sequence,
+            &store_writes,
+            &owned_store_keys,
+            &owned_store_values,
+        );
 
         try appendDenseArtifactCounterMutations(
             self.alloc,
@@ -6505,6 +6512,16 @@ pub const DB = struct {
         defer self.alloc.free(replay_payload);
         const append_derived_replay = !opts.suppress_derived_replay_append and
             !elide_semantic_noop_replay;
+        if (append_derived_replay) {
+            try appendArtifactSourceRevisionWritesFromReplay(
+                self.alloc,
+                replay_payload,
+                sequence,
+                &store_writes,
+                &owned_store_keys,
+                &owned_store_values,
+            );
+        }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.build_derived_ns, build_derived_start_ns);
 
         const store_write_start_ns = monotonicTimeNs();
@@ -20988,6 +21005,45 @@ pub const DB = struct {
         };
     }
 
+    fn artifactSourceTargetSequence(self: *DB, alloc: Allocator, artifact_name: []const u8, published_sequence: u64, aggregate_target_sequence: u64) !u64 {
+        const key = try internal_keys.artifactSourceRevisionKeyAlloc(alloc, artifact_name);
+        defer alloc.free(key);
+        const raw = self.core.store.get(alloc, key) catch |err| switch (err) {
+            // Old stores and imported replay tails predate source markers.
+            // Attribute their aggregate debt conservatively to every source;
+            // this may delay a per-source ready signal but can never produce a
+            // false one. New commits immediately establish exact markers.
+            error.NotFound => return @max(published_sequence, aggregate_target_sequence),
+            else => return err,
+        };
+        defer alloc.free(raw);
+        if (raw.len != @sizeOf(u64)) return error.InvalidArtifactSourceRevision;
+        return @max(published_sequence, std.mem.readInt(u64, raw[0..8], .big));
+    }
+
+    fn populateIndexSourceReplayStats(self: *DB, alloc: Allocator, index_name: []const u8, published_sequence: u64, aggregate_target_sequence: u64, item: *types.DBIndexStats) !void {
+        const names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
+        defer if (names.len > 0) alloc.free(names);
+        if (names.len == 0) return;
+
+        const statuses = try alloc.alloc(types.IndexSourceReplayStatus, names.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (statuses[0..initialized]) |status| alloc.free(status.artifact_name);
+            for (names[initialized..]) |name| alloc.free(name);
+            alloc.free(statuses);
+        }
+        for (names) |name| {
+            statuses[initialized] = .{
+                .artifact_name = name,
+                .published_sequence = published_sequence,
+                .target_sequence = try self.artifactSourceTargetSequence(alloc, name, published_sequence, aggregate_target_sequence),
+            };
+            initialized += 1;
+        }
+        item.source_replay = statuses;
+    }
+
     fn applyProjectionCheckpointStats(item: *types.DBIndexStats, checkpoint: apply_state.ProjectionCheckpoint, target_sequence: u64) void {
         item.projection_checkpoint_status = projectionCheckpointStatusName(checkpoint.status);
         item.projection_checkpoint_applied_sequence = checkpoint.applied_sequence;
@@ -21102,6 +21158,8 @@ pub const DB = struct {
 
     fn freeDBIndexStatsItem(alloc: Allocator, item: types.DBIndexStats) void {
         alloc.free(item.name);
+        for (item.source_replay) |source| alloc.free(source.artifact_name);
+        if (item.source_replay.len > 0) alloc.free(item.source_replay);
         if (item.load_error) |value| alloc.free(value);
         if (item.index_repair_last_error) |value| alloc.free(value);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
@@ -21670,6 +21728,10 @@ pub const DB = struct {
                 if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
             }
             normalizeReplayStatusFromDurableCheckpoint(item);
+            for (item.source_replay) |*source| {
+                source.published_sequence = @max(source.published_sequence, item.replay_applied_sequence);
+                source.target_sequence = @max(source.target_sequence, source.published_sequence);
+            }
             item.checkpoint_replay_tail_sequence_count = item.replay_target_sequence -| item.projection_checkpoint_applied_sequence;
         }
     }
@@ -21814,6 +21876,14 @@ pub const DB = struct {
                         item.algebraic_recommendation_count = status_value.recommendation_count;
                     }
                 },
+            }
+            for (item.source_replay) |*source| {
+                source.target_sequence = try self.artifactSourceTargetSequence(
+                    stats_alloc,
+                    source.artifact_name,
+                    source.published_sequence,
+                    item.replay_target_sequence,
+                );
             }
         }
         runtime_stats.doc_count = visible_doc_count;
@@ -22045,6 +22115,7 @@ pub const DB = struct {
                 .catch_up_target_sequence = target_sequence,
             };
             errdefer freeDBIndexStatsItem(alloc, item);
+            try self.populateIndexSourceReplayStats(alloc, cfg.name, applied_sequence, target_sequence, &item);
             initializeDerivedCoverageIdentity(cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
             try self.applyDurableIndexRepairStats(
@@ -22235,6 +22306,7 @@ pub const DB = struct {
                 item.catch_up_active = false;
                 break;
             }
+            try self.populateIndexSourceReplayStats(alloc, cfg.name, item.replay_applied_sequence, item.replay_target_sequence, &item);
             applyProjectionCheckpointStats(&item, try self.core.loadProjectionCheckpoint(alloc, cfg.name), item.replay_target_sequence);
             try self.applyDurableIndexRepairStats(
                 alloc,
@@ -22472,6 +22544,7 @@ pub const DB = struct {
                 .catch_up_target_sequence = target_sequence,
             };
             errdefer freeDBIndexStatsItem(alloc, item);
+            try self.populateIndexSourceReplayStats(alloc, cfg.name, applied_sequence, target_sequence, &item);
             initializeDerivedCoverageIdentity(cfg, &item);
             try self.applyStatusOnlyRebuildStateStats(alloc, cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
@@ -27530,6 +27603,10 @@ fn encodeThinReplayRecordPayload(
     }
     for (deleted_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
+        // Artifact removals advance the same source stream as upserts. Keep
+        // them in the artifact-key lane so source-specific readiness cannot
+        // report complete while a consumer still owes a delete.
+        try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .dense_vector);
         try appendUniqueReplayRecordHint(alloc, &target_hints, .sparse_vector);
@@ -27553,6 +27630,58 @@ fn encodeThinReplayRecordPayload(
     };
     defer change_journal_mod.deinitRecord(alloc, &record);
     return try change_journal_mod.encodeRecord(alloc, record);
+}
+
+fn appendArtifactSourceRevisionWritesFromReplay(
+    alloc: Allocator,
+    payload: []const u8,
+    sequence: u64,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) !void {
+    var decoded = try change_journal_mod.decodeBinaryRecordBorrowed(alloc, payload);
+    defer decoded.deinit();
+    if (decoded.record.sequence != sequence) return error.InvalidDerivedSequence;
+
+    var artifact_names = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (artifact_names.items) |name| alloc.free(name);
+        artifact_names.deinit(alloc);
+    }
+    for (decoded.record.changed_artifact_keys) |artifact_key| {
+        if (try internal_keys.artifactNameView(artifact_key)) |artifact_name| {
+            try appendUniqueOwnedKey(alloc, &artifact_names, artifact_name);
+            continue;
+        }
+        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse continue;
+        defer artifact_ref.deinit(alloc);
+        try appendUniqueOwnedKey(alloc, &artifact_names, artifact_ref.name);
+    }
+    std.mem.sort([]u8, artifact_names.items, {}, struct {
+        fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+            return std.mem.order(u8, lhs, rhs) == .lt;
+        }
+    }.lessThan);
+
+    for (artifact_names.items) |artifact_name| {
+        const key = try internal_keys.artifactSourceRevisionKeyAlloc(alloc, artifact_name);
+        var key_transferred = false;
+        errdefer if (!key_transferred) alloc.free(key);
+        const value = try alloc.alloc(u8, @sizeOf(u64));
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value);
+        std.mem.writeInt(u64, value[0..8], sequence, .big);
+        try owned_keys.append(alloc, key);
+        key_transferred = true;
+        try owned_values.append(alloc, value);
+        value_transferred = true;
+        // Preserve the key order required by the bulk-ingest append fast path.
+        // Replay metadata sorts between user rows and identity metadata.
+        var insert_at: usize = 0;
+        while (insert_at < writes.items.len and std.mem.order(u8, writes.items[insert_at].key, key) != .gt) : (insert_at += 1) {}
+        try writes.insert(alloc, insert_at, .{ .key = key, .value = value });
+    }
 }
 
 fn appendUniqueOwnedKey(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), key: []const u8) !void {
@@ -35433,7 +35562,7 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     const sequence = ctx.store.reserveNextReplaySequence(1);
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);
-    try ctx.store.appendReplayOpaque(ctx.alloc, sequence, payload);
+    try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence);
     try mirrorHAReplayPayloadCommitContext(ctx, payload);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     return sequence;
@@ -35448,9 +35577,38 @@ fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, rec
     const payload = try change_journal_mod.encodeRecord(ctx.alloc, decoded.record);
     defer ctx.alloc.free(payload);
 
-    try ctx.store.appendReplayOpaque(ctx.alloc, sequence, payload);
+    try appendReplayWithArtifactSourceRevisionsContext(ctx, payload, sequence);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     return sequence;
+}
+
+fn appendReplayWithArtifactSourceRevisionsContext(ctx: *const BatchExecutionContext, payload: []const u8, sequence: u64) !void {
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer writes.deinit(ctx.alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |key| ctx.alloc.free(key);
+        owned_keys.deinit(ctx.alloc);
+    }
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| ctx.alloc.free(value);
+        owned_values.deinit(ctx.alloc);
+    }
+    try appendArtifactSourceRevisionWritesFromReplay(
+        ctx.alloc,
+        payload,
+        sequence,
+        &writes,
+        &owned_keys,
+        &owned_values,
+    );
+    try ctx.store.putBatchWithReplay(
+        ctx.io,
+        writes.items,
+        &.{},
+        .{ .sequence = sequence, .payload = payload },
+    );
 }
 
 fn encodeChangeRecordPayload(ctx: *const BatchExecutionContext, batch: derived_types.DerivedBatch, sequence: u64) ![]u8 {
@@ -58163,10 +58321,17 @@ test "db document artifact child range batch atomically tracks dense artifact co
     const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 1, 0, 0 });
     defer alloc.free(payload);
 
-    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+    const first_sequence = try db.applyDocumentArtifactChildRangeBatch(.{
         .artifact_writes = &.{.{ .key = artifact_key, .value = payload }},
         .sync_level = .write,
     });
+    const source_revision_key = try internal_keys.artifactSourceRevisionKeyAlloc(alloc, "chunk_dense_v1");
+    defer alloc.free(source_revision_key);
+    {
+        const raw = try db.core.store.get(alloc, source_revision_key);
+        defer alloc.free(raw);
+        try std.testing.expectEqual(first_sequence, std.mem.readInt(u64, raw[0..8], .big));
+    }
     try std.testing.expectEqual(
         @as(?u64, 1),
         try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "semantic_idx"),
@@ -58184,14 +58349,30 @@ test "db document artifact child range batch atomically tracks dense artifact co
         try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "semantic_idx"),
     );
 
-    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+    const delete_sequence = try db.applyDocumentArtifactChildRangeBatch(.{
         .artifact_delete_keys = &.{artifact_key},
         .sync_level = .write,
     });
+    {
+        const raw = try db.core.store.get(alloc, source_revision_key);
+        defer alloc.free(raw);
+        try std.testing.expectEqual(delete_sequence, std.mem.readInt(u64, raw[0..8], .big));
+    }
     try std.testing.expectEqual(
         @as(?u64, 0),
         try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "semantic_idx"),
     );
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var semantic_stats: ?types.DBIndexStats = null;
+    for (stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "semantic_idx")) semantic_stats = item;
+    }
+    const semantic = semantic_stats orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), semantic.source_replay.len);
+    try std.testing.expectEqualStrings("chunk_dense_v1", semantic.source_replay[0].artifact_name);
+    try std.testing.expectEqual(delete_sequence, semantic.source_replay[0].target_sequence);
+    try std.testing.expect(semantic.source_replay[0].published_sequence < semantic.source_replay[0].target_sequence);
 }
 
 test "db dispatches generated document child range artifacts to remote owner" {

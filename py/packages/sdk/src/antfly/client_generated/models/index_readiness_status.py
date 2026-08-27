@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
 from ..models.index_readiness_state import IndexReadinessState
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.index_source_readiness_status import IndexSourceReadinessStatus
+
 
 T = TypeVar("T", bound="IndexReadinessStatus")
 
@@ -26,6 +30,9 @@ class IndexReadinessStatus:
         target_revision (int | Unset): Highest captured source/replay revision required by this readiness observation.
         published_revision (int | Unset): Highest revision published to the query-visible index represented by this
             observation.
+        sources (list[IndexSourceReadinessStatus] | Unset): Operational readiness for each configured artifact stream.
+            Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks,
+            not a restatement of index configuration.
     """
 
     state: IndexReadinessState
@@ -35,6 +42,7 @@ class IndexReadinessStatus:
     incarnation: str | Unset = UNSET
     target_revision: int | Unset = UNSET
     published_revision: int | Unset = UNSET
+    sources: list[IndexSourceReadinessStatus] | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         state = self.state.value
@@ -50,6 +58,13 @@ class IndexReadinessStatus:
         target_revision = self.target_revision
 
         published_revision = self.published_revision
+
+        sources: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.sources, Unset):
+            sources = []
+            for sources_item_data in self.sources:
+                sources_item = sources_item_data.to_dict()
+                sources.append(sources_item)
 
         field_dict: dict[str, Any] = {}
 
@@ -67,11 +82,15 @@ class IndexReadinessStatus:
             field_dict["target_revision"] = target_revision
         if published_revision is not UNSET:
             field_dict["published_revision"] = published_revision
+        if sources is not UNSET:
+            field_dict["sources"] = sources
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.index_source_readiness_status import IndexSourceReadinessStatus
+
         d = dict(src_dict)
         state = IndexReadinessState(d.pop("state"))
 
@@ -87,6 +106,15 @@ class IndexReadinessStatus:
 
         published_revision = d.pop("published_revision", UNSET)
 
+        _sources = d.pop("sources", UNSET)
+        sources: list[IndexSourceReadinessStatus] | Unset = UNSET
+        if _sources is not UNSET:
+            sources = []
+            for sources_item_data in _sources:
+                sources_item = IndexSourceReadinessStatus.from_dict(sources_item_data)
+
+                sources.append(sources_item)
+
         index_readiness_status = cls(
             state=state,
             queryable=queryable,
@@ -95,6 +123,7 @@ class IndexReadinessStatus:
             incarnation=incarnation,
             target_revision=target_revision,
             published_revision=published_revision,
+            sources=sources,
         )
 
         return index_readiness_status

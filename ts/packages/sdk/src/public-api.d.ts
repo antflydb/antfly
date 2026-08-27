@@ -10042,6 +10042,26 @@ export interface components {
          * @enum {string}
          */
         IndexReadinessState: "pending" | "queryable_partial" | "ready" | "failed";
+        IndexSourceReadinessStatus: {
+            /** @description Configured artifact stream identity. */
+            artifact: string;
+            /** @enum {string} */
+            state: "pending" | "ready" | "failed";
+            /** @description Whether this source is published through its captured target revision on every expected shard. */
+            complete: boolean;
+            /**
+             * Format: uint64
+             * @description Highest committed revision captured for this artifact stream.
+             */
+            target_revision: number;
+            /**
+             * Format: uint64
+             * @description Highest revision the query-visible index has durably processed for this artifact stream.
+             */
+            published_revision: number;
+            /** @description Stable, machine-readable blockers for this source. Empty when state is ready. */
+            pending_reasons: string[];
+        };
         IndexReadinessStatus: {
             state: components["schemas"]["IndexReadinessState"];
             /** @description Whether the published generation can safely answer queries. */
@@ -10062,6 +10082,8 @@ export interface components {
             published_revision?: number;
             /** @description Stable, machine-readable blockers. Empty when state is ready. */
             pending_reasons: string[];
+            /** @description Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks, not a restatement of index configuration. */
+            sources?: components["schemas"]["IndexSourceReadinessStatus"][];
         };
         /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
         IndexRepairStatus: {

@@ -1078,13 +1078,48 @@ fn appendIndexStatusWithIdentity(
         false;
     const coverage_generation = if (runtime_identity) |identity| identity.coverage_generation else 0;
     const coverage_config_hash = if (runtime_identity) |identity| identity.coverage_config_hash else 0;
+    var source_name_buffer: [64][]const u8 = undefined;
+    const configured_sources = configuredArtifactSourceNames(config, index_type, &source_name_buffer);
     try out.appendSlice(alloc, "{\"config\":");
     try appendIndexConfig(alloc, out, index_name, config);
     try out.appendSlice(alloc, ",\"status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, expected_group_ids, local_statuses, status_lookup, false);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, configured_sources, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, expected_group_ids, local_statuses, status_lookup, false);
     try out.appendSlice(alloc, ",\"shard_status\":");
-    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, expected_group_ids, local_statuses, status_lookup, true);
+    try appendIndexRuntimeStatus(alloc, out, index_name, index_type, configured_sources, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, expected_group_ids, local_statuses, status_lookup, true);
     try out.append(alloc, '}');
+}
+
+fn configuredArtifactSourceNames(config: std.json.Value, index_type: ApiIndexType, buffer: *[64][]const u8) []const []const u8 {
+    if (config != .object) return &.{};
+    var count: usize = 0;
+    if (config.object.get("sources")) |sources| if (sources == .array) {
+        for (sources.array.items) |source| {
+            if (count == buffer.len or source != .object) break;
+            const artifact = source.object.get("artifact") orelse continue;
+            if (artifact != .string or artifact.string.len == 0) continue;
+            buffer[count] = artifact.string;
+            count += 1;
+        }
+    };
+    if (count != 0) return buffer[0..count];
+
+    const singular = switch (index_type) {
+        .full_text => config.object.get("artifact_name"),
+        .embeddings => config.object.get("embedding_name"),
+        .graph => blk: {
+            const source = config.object.get("source") orelse break :blk null;
+            if (source != .object) break :blk null;
+            break :blk source.object.get("artifact");
+        },
+        .algebraic => null,
+    };
+    if (singular) |artifact| {
+        if (artifact == .string and artifact.string.len > 0) {
+            buffer[0] = artifact.string;
+            return buffer[0..1];
+        }
+    }
+    return &.{};
 }
 
 fn appendIndexConfig(
@@ -1709,6 +1744,7 @@ fn appendIndexRuntimeStatus(
     out: *std.ArrayListUnmanaged(u8),
     index_name: []const u8,
     index_type: ApiIndexType,
+    configured_sources: []const []const u8,
     embeddings_coverage_policy: EmbeddingsCoveragePolicy,
     embeddings_sparse: bool,
     coverage_generation: u64,
@@ -1749,7 +1785,8 @@ fn appendIndexRuntimeStatus(
             }
         }
         if (expected_group_ids.len > 0) {
-            const missing = missingAggregateIndexStatus(1);
+            var missing = missingAggregateIndexStatus(1);
+            canonicalizeConfiguredSourceReplay(&missing, configured_sources);
             for (expected_group_ids, 0..) |group_id, i| {
                 if (emitted_expected[i]) continue;
                 if (emitted) try out.append(alloc, ',');
@@ -1775,10 +1812,11 @@ fn appendIndexRuntimeStatus(
         missingAggregateIndexStatus(expected_group_ids.len)
     else
         null;
-    const item = aggregate orelse {
-        try appendMinimalIndexRuntimeStatus(alloc, out, index_type);
+    var item = aggregate orelse {
+        try appendMinimalIndexRuntimeStatus(alloc, out, index_type, configured_sources);
         return;
     };
+    canonicalizeConfiguredSourceReplay(&item, configured_sources);
     try appendSingleIndexRuntimeStatus(alloc, out, index_type, item, item.table_doc_count, embeddings_coverage_policy, embeddings_sparse, coverage_generation, coverage_config_hash, item.async_indexing, if (index_type == .embeddings) item.enrichment else null, item.resolution, item.promotion, item.resolver_replay, null, item.runtime_present);
 }
 
@@ -1786,10 +1824,13 @@ fn appendMinimalIndexRuntimeStatus(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     index_type: ApiIndexType,
+    configured_sources: []const []const u8,
 ) !void {
     try out.appendSlice(alloc, "{\"index_type\":");
     try appendJsonString(alloc, out, indexTypeName(index_type));
-    try out.appendSlice(alloc, ",\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"target_revision\":0,\"published_revision\":0,\"pending_reasons\":[\"runtime_unavailable\"]}}");
+    try out.appendSlice(alloc, ",\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"target_revision\":0,\"published_revision\":0,\"pending_reasons\":[\"runtime_unavailable\"]");
+    try appendConfiguredSourceReadinessStatuses(alloc, out, configured_sources, false, false, false);
+    try out.appendSlice(alloc, "}}");
 }
 
 /// Collapse the durable repair state machine into the small vocabulary that is
@@ -1943,6 +1984,8 @@ const AggregatedIndexStatus = struct {
     coverage_config_mismatch_count: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
+    source_replay: [64]db_mod.types.IndexSourceReplayStatus = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "" }} ** 64,
+    source_replay_count: usize = 0,
     replay_catch_up_required: bool = false,
     catch_up_active: bool = false,
     catch_up_phase: db_mod.types.DenseCatchUpStats.Phase = .idle,
@@ -1991,6 +2034,62 @@ const AggregatedIndexStatus = struct {
     algebraic_capability_lifecycle_status: ?[]const u8 = null,
     algebraic_active_progress: ?db_mod.types.AlgebraicProgressStatus = null,
 };
+
+fn canonicalizeConfiguredSourceReplay(aggregate: *AggregatedIndexStatus, configured_sources: []const []const u8) void {
+    var ordered = [_]db_mod.types.IndexSourceReplayStatus{.{ .artifact_name = "" }} ** 64;
+    var ordered_count: usize = 0;
+    for (configured_sources) |artifact_name| {
+        if (ordered_count == ordered.len) break;
+        var status: db_mod.types.IndexSourceReplayStatus = .{ .artifact_name = artifact_name, .observation_count = 0 };
+        for (aggregate.source_replay[0..aggregate.source_replay_count]) |existing| {
+            if (!std.mem.eql(u8, existing.artifact_name, artifact_name)) continue;
+            status = existing;
+            break;
+        }
+        ordered[ordered_count] = status;
+        ordered_count += 1;
+    }
+    for (aggregate.source_replay[0..aggregate.source_replay_count]) |existing| {
+        var present = false;
+        for (ordered[0..ordered_count]) |candidate| {
+            if (std.mem.eql(u8, candidate.artifact_name, existing.artifact_name)) {
+                present = true;
+                break;
+            }
+        }
+        if (present or ordered_count == ordered.len) continue;
+        ordered[ordered_count] = existing;
+        ordered_count += 1;
+    }
+    aggregate.source_replay = ordered;
+    aggregate.source_replay_count = ordered_count;
+}
+
+fn accumulateSourceReplayStatus(aggregate: *AggregatedIndexStatus, source: db_mod.types.IndexSourceReplayStatus) void {
+    for (aggregate.source_replay[0..aggregate.source_replay_count]) |*existing| {
+        if (!std.mem.eql(u8, existing.artifact_name, source.artifact_name)) continue;
+        existing.published_sequence +|= source.published_sequence;
+        existing.target_sequence +|= source.target_sequence;
+        existing.observation_count +|= source.observation_count;
+        return;
+    }
+    if (aggregate.source_replay_count == aggregate.source_replay.len) return;
+    aggregate.source_replay[aggregate.source_replay_count] = source;
+    aggregate.source_replay_count += 1;
+}
+
+test "source replay aggregation preserves identity across shards" {
+    var aggregate: AggregatedIndexStatus = .{};
+    accumulateSourceReplayStatus(&aggregate, .{ .artifact_name = "document_vectors", .published_sequence = 8, .target_sequence = 8 });
+    accumulateSourceReplayStatus(&aggregate, .{ .artifact_name = "chunk_vectors", .published_sequence = 8, .target_sequence = 13 });
+    accumulateSourceReplayStatus(&aggregate, .{ .artifact_name = "document_vectors", .published_sequence = 5, .target_sequence = 5 });
+    accumulateSourceReplayStatus(&aggregate, .{ .artifact_name = "chunk_vectors", .published_sequence = 5, .target_sequence = 9 });
+    try std.testing.expectEqual(@as(usize, 2), aggregate.source_replay_count);
+    try std.testing.expectEqual(@as(u64, 13), aggregate.source_replay[0].published_sequence);
+    try std.testing.expectEqual(@as(u64, 13), aggregate.source_replay[0].target_sequence);
+    try std.testing.expectEqual(@as(u64, 13), aggregate.source_replay[1].published_sequence);
+    try std.testing.expectEqual(@as(u64, 22), aggregate.source_replay[1].target_sequence);
+}
 
 fn expectedGroupIndex(expected_group_ids: []const u64, group_id: u64) ?usize {
     for (expected_group_ids, 0..) |expected, i| {
@@ -2141,6 +2240,7 @@ fn aggregateIndexStatusIndexed(
         aggregate.root_node = if (materialization_count == 1) item.root_node else 0;
         aggregate.replay_applied_sequence += public_item.replay_applied_sequence;
         aggregate.replay_target_sequence += public_item.replay_target_sequence;
+        for (public_item.source_replay) |source| accumulateSourceReplayStatus(&aggregate, source);
         if (public_item.replay_catch_up_required) aggregate.replay_catch_up_required = true;
         if (item.enrichment_failed) aggregate.enrichment_failed = true;
         if (item.repair_degraded) aggregate.repair_degraded = true;
@@ -4228,6 +4328,10 @@ fn appendIndexReadinessStatus(
     active_generation_serviceable: bool,
 ) !void {
     const Item = @TypeOf(item);
+    const expected_source_observations: u64 = if (@hasField(Item, "fresh_group_count"))
+        @max(1, item.fresh_group_count)
+    else
+        1;
     const observation_fresh = runtime_present and if (metadata) |md|
         md.freshness == .fresh
     else if (@hasField(Item, "runtime_fresh"))
@@ -4304,7 +4408,134 @@ fn appendIndexReadinessStatus(
     if (coverage_pending) try appendReason(alloc, out, "coverage", &emitted);
     if (replay_catch_up_required or catch_up_active) try appendReason(alloc, out, "replay", &emitted);
     if (publication_pending) try appendReason(alloc, out, "publication", &emitted);
-    try out.appendSlice(alloc, "]}");
+    try out.append(alloc, ']');
+    if (@hasField(Item, "source_replay")) {
+        if (@hasField(Item, "source_replay_count")) {
+            try appendIndexSourceReadinessStatuses(
+                alloc,
+                out,
+                item.source_replay[0..item.source_replay_count],
+                observation_fresh,
+                topology_complete,
+                failed,
+                expected_source_observations,
+            );
+        } else {
+            try appendIndexSourceReadinessStatuses(
+                alloc,
+                out,
+                item.source_replay,
+                observation_fresh,
+                topology_complete,
+                failed,
+                expected_source_observations,
+            );
+        }
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendIndexSourceReadinessStatuses(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    sources: []const db_mod.types.IndexSourceReplayStatus,
+    observation_fresh: bool,
+    topology_complete: bool,
+    index_failed: bool,
+    expected_observation_count: u64,
+) !void {
+    if (sources.len == 0) return;
+    try out.appendSlice(alloc, ",\"sources\":[");
+    for (sources, 0..) |source, i| {
+        if (i != 0) try out.append(alloc, ',');
+        const replay_pending = source.published_sequence < source.target_sequence;
+        const source_observation_complete = source.observation_count >= expected_observation_count;
+        const pending = !index_failed and (!observation_fresh or !topology_complete or !source_observation_complete or replay_pending);
+        const state = if (index_failed) "failed" else if (pending) "pending" else "ready";
+        try out.appendSlice(alloc, "{\"artifact\":");
+        try appendJsonString(alloc, out, source.artifact_name);
+        try out.appendSlice(alloc, ",\"state\":");
+        try appendJsonString(alloc, out, state);
+        try out.appendSlice(alloc, ",\"complete\":");
+        try out.appendSlice(alloc, if (!index_failed and !pending) "true" else "false");
+        try out.appendSlice(alloc, ",\"target_revision\":");
+        try appendIntValue(alloc, out, source.target_sequence);
+        try out.appendSlice(alloc, ",\"published_revision\":");
+        try appendIntValue(alloc, out, source.published_sequence);
+        try out.appendSlice(alloc, ",\"pending_reasons\":[");
+        var emitted = false;
+        if (index_failed) {
+            try appendJsonString(alloc, out, "index_failed");
+            emitted = true;
+        }
+        if (!observation_fresh) {
+            if (emitted) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, "runtime_unavailable");
+            emitted = true;
+        }
+        if (!topology_complete) {
+            if (emitted) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, "shard_observation_incomplete");
+            emitted = true;
+        }
+        if (!source_observation_complete) {
+            if (emitted) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, "source_observation_incomplete");
+            emitted = true;
+        }
+        if (replay_pending) {
+            if (emitted) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, "publication");
+        }
+        try out.appendSlice(alloc, "]}");
+    }
+    try out.append(alloc, ']');
+}
+
+fn appendConfiguredSourceReadinessStatuses(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    configured_sources: []const []const u8,
+    observation_fresh: bool,
+    topology_complete: bool,
+    index_failed: bool,
+) !void {
+    var statuses: [64]db_mod.types.IndexSourceReplayStatus = undefined;
+    const count = @min(configured_sources.len, statuses.len);
+    for (configured_sources[0..count], 0..) |artifact_name, i| statuses[i] = .{ .artifact_name = artifact_name, .observation_count = 0 };
+    try appendIndexSourceReadinessStatuses(alloc, out, statuses[0..count], observation_fresh, topology_complete, index_failed, 1);
+}
+
+test "source readiness distinguishes lagging artifact streams" {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    const sources = [_]db_mod.types.IndexSourceReplayStatus{
+        .{ .artifact_name = "document_vectors", .published_sequence = 41, .target_sequence = 41 },
+        .{ .artifact_name = "chunk_vectors", .published_sequence = 41, .target_sequence = 52 },
+    };
+    try appendIndexSourceReadinessStatuses(std.testing.allocator, &out, &sources, true, true, false, 1);
+    try std.testing.expectEqualStrings(
+        ",\"sources\":[{\"artifact\":\"document_vectors\",\"state\":\"ready\",\"complete\":true,\"target_revision\":41,\"published_revision\":41,\"pending_reasons\":[]},{\"artifact\":\"chunk_vectors\",\"state\":\"pending\",\"complete\":false,\"target_revision\":52,\"published_revision\":41,\"pending_reasons\":[\"publication\"]}]",
+        out.items,
+    );
+}
+
+test "runtime unavailable readiness preserves canonical configured sources" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"document_vectors\"},{\"artifact\":\"chunk_vectors\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+    var names_buffer: [64][]const u8 = undefined;
+    const names = configuredArtifactSourceNames(parsed.value, .embeddings, &names_buffer);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    try appendMinimalIndexRuntimeStatus(std.testing.allocator, &out, .embeddings, names);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"artifact\":\"document_vectors\",\"state\":\"pending\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"artifact\":\"chunk_vectors\",\"state\":\"pending\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"source_observation_incomplete\"") != null);
 }
 
 fn appendResolverReplayDiagnosticsStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), stats: db_mod.types.ResolverReplayDiagnostics) !void {

@@ -725,6 +725,47 @@ components:
           items:
             type: string
           description: "Stable, machine-readable blockers. Empty when state is ready."
+        sources:
+          type: array
+          description: "Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks, not a restatement of index configuration."
+          items:
+            $ref: '#/components/schemas/IndexSourceReadinessStatus'
+    IndexSourceReadinessStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+        - state
+        - complete
+        - target_revision
+        - published_revision
+        - pending_reasons
+      properties:
+        artifact:
+          type: string
+          description: "Configured artifact stream identity."
+        state:
+          type: string
+          enum:
+            - pending
+            - ready
+            - failed
+        complete:
+          type: boolean
+          description: "Whether this source is published through its captured target revision on every expected shard."
+        target_revision:
+          type: integer
+          format: uint64
+          description: "Highest committed revision captured for this artifact stream."
+        published_revision:
+          type: integer
+          format: uint64
+          description: "Highest revision the query-visible index has durably processed for this artifact stream."
+        pending_reasons:
+          type: array
+          items:
+            type: string
+          description: "Stable, machine-readable blockers for this source. Empty when state is ready."
     IndexRepairStatus:
       type: object
       description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.

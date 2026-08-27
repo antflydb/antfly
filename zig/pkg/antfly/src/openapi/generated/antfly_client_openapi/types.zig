@@ -5083,6 +5083,8 @@ pub const IndexReadinessStatus = struct {
     published_revision: ?i64 = null,
     /// Stable, machine-readable blockers. Empty when state is ready.
     pending_reasons: []const []const u8,
+    /// Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks, not a restatement of index configuration.
+    sources: ?[]const IndexSourceReadinessStatus = null,
 };
 
 /// Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
@@ -5097,6 +5099,20 @@ pub const IndexRepairStatus = struct {
 pub const IndexRuntimeCapabilities = struct {
     /// Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments.
     artifact_sources: bool,
+};
+
+pub const IndexSourceReadinessStatus = struct {
+    /// Configured artifact stream identity.
+    artifact: []const u8,
+    state: []const u8,
+    /// Whether this source is published through its captured target revision on every expected shard.
+    complete: bool,
+    /// Highest committed revision captured for this artifact stream.
+    target_revision: i64,
+    /// Highest revision the query-visible index has durably processed for this artifact stream.
+    published_revision: i64,
+    /// Stable, machine-readable blockers for this source. Empty when state is ready.
+    pending_reasons: []const []const u8,
 };
 
 /// Statistics for an index

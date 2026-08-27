@@ -271,6 +271,7 @@ pub const IndexReadinessState = types.IndexReadinessState;
 pub const IndexReadinessStatus = types.IndexReadinessStatus;
 pub const IndexRepairStatus = types.IndexRepairStatus;
 pub const IndexRuntimeCapabilities = types.IndexRuntimeCapabilities;
+pub const IndexSourceReadinessStatus = types.IndexSourceReadinessStatus;
 pub const IndexStats = types.IndexStats;
 pub const IndexStatus = types.IndexStatus;
 pub const IndexType = types.IndexType;

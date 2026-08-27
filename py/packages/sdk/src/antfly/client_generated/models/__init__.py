@@ -386,6 +386,8 @@ from .index_readiness_status import IndexReadinessStatus
 from .index_repair_status import IndexRepairStatus
 from .index_repair_status_state import IndexRepairStatusState
 from .index_runtime_capabilities import IndexRuntimeCapabilities
+from .index_source_readiness_status import IndexSourceReadinessStatus
+from .index_source_readiness_status_state import IndexSourceReadinessStatusState
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
@@ -1239,6 +1241,8 @@ __all__ = (
     "IndexRepairStatus",
     "IndexRepairStatusState",
     "IndexRuntimeCapabilities",
+    "IndexSourceReadinessStatus",
+    "IndexSourceReadinessStatusState",
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",

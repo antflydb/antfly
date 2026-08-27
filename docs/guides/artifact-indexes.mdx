@@ -127,9 +127,13 @@ Creation starts materialization and replay; it does not imply complete coverage.
 Poll `GET /db/v1/tables/{table}/indexes/{index}` and use
 `readiness.queryable` for serving eligibility and `readiness.complete` for full
 coverage. `pending_reasons` and captured/applied revisions are aggregate
-diagnostics for the complete configured source set. Inspect the canonical
-`config.sources` list to identify that set; current readiness does not attribute
-lag to an individual source. Do not infer readiness from replay counters alone.
+diagnostics for the complete configured source set. Artifact-backed indexes also
+return `readiness.sources` in configuration order. Each entry identifies the
+artifact stream and reports its captured target revision, published revision,
+state, and blockers, so operators can distinguish (for example) document-vector
+lag from chunk-vector lag without inspecting internal replay state. These
+watermarks are operational diagnostics; continue to use `queryable` and
+`complete` as the serving and convergence authorities.
 
 Changing source membership, projection fields, analyzer semantics, embedding
 space, or graph mapping changes index semantics and requires a new materialized

@@ -68,6 +68,10 @@ pub const enrichment_terminal_failure_issue_kind: u8 = 0x3b;
 /// Durable incarnation token for one live coalesced terminal enrichment issue.
 pub const enrichment_terminal_failure_generation_kind: u8 = 0x3c;
 pub const enrichment_terminal_failure_generation_counter_kind: u8 = 0x3d;
+/// Latest committed derived-log revision that changed an artifact stream.
+/// The artifact name is length-prefixed so arbitrary user names cannot alias
+/// another replay metadata protocol or one another.
+pub const artifact_source_revision_kind: u8 = 0x3e;
 pub const enrichment_terminal_failure_generation_counter_key = [_]u8{
     replay_namespace,
     0xff,
@@ -1494,6 +1498,43 @@ pub fn parseEmbeddingArtifactKeyView(key: []const u8) !?struct { doc_key: []cons
     return .{ .doc_key = doc_key, .artifact_name = artifact_name };
 }
 
+/// Returns a borrowed artifact stream name for the common unescaped key path.
+/// Derived embeddings return their terminal embedding name rather than the
+/// chunk/asset source name. Callers that accept arbitrary binary components
+/// must fall back to the allocating decoder when this returns null.
+pub fn artifactNameView(key: []const u8) !?[]const u8 {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != artifact_kind) return null;
+    pos += 1;
+
+    const type_term = findComponentTerminator(key, pos) orelse return null;
+    const artifact_type = (try decodeBodyView(key[pos..type_term])) orelse return null;
+    pos = type_term + 2;
+    const name_term = findComponentTerminator(key, pos) orelse return null;
+    const base_name = (try decodeBodyView(key[pos..name_term])) orelse return null;
+    pos = name_term + 2;
+    if (pos == key.len) return base_name;
+
+    if (std.mem.eql(u8, artifact_type, "graph") or std.mem.eql(u8, artifact_type, "resolution")) return base_name;
+    if (pos < key.len and key[pos] == document_unit_record_kind) {
+        pos += 1;
+        const unit_term = findComponentTerminator(key, pos) orelse return null;
+        pos = unit_term + 2;
+    }
+    if (pos < key.len and key[pos] == chunk_record_kind) {
+        if (pos + 1 + @sizeOf(u32) > key.len) return null;
+        pos += 1 + @sizeOf(u32);
+    }
+    if (pos == key.len) return base_name;
+    if (key[pos] != derived_embedding_kind) return null;
+    pos += 1;
+    const derived_term = findComponentTerminator(key, pos) orelse return null;
+    if (derived_term + 2 != key.len) return null;
+    return (try decodeBodyView(key[pos..derived_term])) orelse null;
+}
+
 pub fn parseGraphEdgeArtifactKeyAlloc(
     alloc: Allocator,
     key: []const u8,
@@ -1566,6 +1607,15 @@ pub fn replayRangeUpper(hint_ordinal: u8) [2]u8 {
 
 pub fn replayLatestSequenceKey(hint_ordinal: u8) [4]u8 {
     return .{ replay_namespace, 0xff, replay_meta_latest_sequence_kind, hint_ordinal };
+}
+
+pub fn artifactSourceRevisionKeyAlloc(alloc: Allocator, artifact_name: []const u8) ![]u8 {
+    var key = try alloc.alloc(u8, 3 + encodedComponentLen(artifact_name));
+    key[0] = replay_namespace;
+    key[1] = 0xff;
+    key[2] = artifact_source_revision_kind;
+    _ = encodeComponent(key[3..], artifact_name);
+    return key;
 }
 
 pub fn identityDocToOrdinalKeyAlloc(alloc: Allocator, doc_id: []const u8) ![]u8 {
@@ -1902,6 +1952,20 @@ test "parseEmbeddingArtifactKeyAlloc returns null for non-embedding" {
     const doc_key = try documentKeyAlloc(alloc, "doc1");
     defer alloc.free(doc_key);
     try std.testing.expectEqual(null, try parseEmbeddingArtifactKeyAlloc(alloc, doc_key));
+}
+
+test "artifact name view resolves direct and derived streams without allocation" {
+    const alloc = std.testing.allocator;
+    const direct = try embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "document_vectors");
+    defer alloc.free(direct);
+    try std.testing.expectEqualStrings("document_vectors", (try artifactNameView(direct)).?);
+
+    const chunk = try chunkArtifactKeyAlloc(alloc, "doc:a", "document_chunks", 7);
+    defer alloc.free(chunk);
+    try std.testing.expectEqualStrings("document_chunks", (try artifactNameView(chunk)).?);
+    const derived = try derivedEmbeddingArtifactKeyAlloc(alloc, chunk, "chunk_vectors");
+    defer alloc.free(derived);
+    try std.testing.expectEqualStrings("chunk_vectors", (try artifactNameView(derived)).?);
 }
 
 test "graph edge artifact key round trip" {

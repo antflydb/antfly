@@ -2848,6 +2848,18 @@ pub const AlgebraicProgressStatus = struct {
     target_rows: u64 = 0,
 };
 
+/// Source-specific replay watermarks for an artifact-backed index. The
+/// published watermark is the index's durable applied cursor: it proves that
+/// every configured source has been processed through that revision. The
+/// target is maintained transactionally per artifact stream by the writer.
+pub const IndexSourceReplayStatus = struct {
+    artifact_name: []const u8,
+    published_sequence: u64 = 0,
+    target_sequence: u64 = 0,
+    // Internal distributed-status proof; not part of the public contract.
+    observation_count: u64 = 1,
+};
+
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
@@ -2903,6 +2915,7 @@ pub const DBIndexStats = struct {
     projection_checkpoint_config_hash: u64 = 0,
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
+    source_replay: []IndexSourceReplayStatus = &.{},
     checkpoint_replay_tail_sequence_count: u64 = 0,
     replay_catch_up_required: bool = false,
     catch_up_active: bool = false,
@@ -3503,6 +3516,8 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
     freeResolverReplayDiagnostics(alloc, stats.resolver_replay);
     for (stats.indexes) |item| {
         alloc.free(item.name);
+        for (item.source_replay) |source| alloc.free(source.artifact_name);
+        if (item.source_replay.len > 0) alloc.free(item.source_replay);
         if (item.load_error) |value| alloc.free(value);
         if (item.index_repair_last_error) |value| alloc.free(value);
         if (item.algebraic_last_error_doc_key) |value| alloc.free(value);

@@ -6579,6 +6579,51 @@ pub const IndexManager = struct {
         return refs;
     }
 
+    /// Returns the canonical artifact streams consumed by an index. Both the
+    /// single-source and multi-source configuration forms are intentionally
+    /// represented by the same runtime contract.
+    pub fn artifactSourceNamesForIndexAlloc(self: *const IndexManager, alloc: Allocator, name: []const u8) ![][]u8 {
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (names.items) |value| alloc.free(value);
+            names.deinit(alloc);
+        }
+
+        for (self.text_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            if (entry.source_artifact_names.len > 0) {
+                for (entry.source_artifact_names) |value| try names.append(alloc, try alloc.dupe(u8, value));
+            } else if (entry.chunk_name) |value| {
+                try names.append(alloc, try alloc.dupe(u8, value));
+            }
+            return try names.toOwnedSlice(alloc);
+        }
+        for (self.dense_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            if (entry.embedding_names.len > 0) {
+                for (entry.embedding_names) |value| try names.append(alloc, try alloc.dupe(u8, value));
+            } else if (!entry.external and !entry.managed_direct_field) {
+                if (entry.embedding_name) |value| try names.append(alloc, try alloc.dupe(u8, value));
+            }
+            return try names.toOwnedSlice(alloc);
+        }
+        for (self.sparse_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            if (entry.embedding_names.len > 0) {
+                for (entry.embedding_names) |value| try names.append(alloc, try alloc.dupe(u8, value));
+            } else if (!entry.external and !entry.managed_direct_field) {
+                if (entry.embedding_name) |value| try names.append(alloc, try alloc.dupe(u8, value));
+            }
+            return try names.toOwnedSlice(alloc);
+        }
+        for (self.graph_indexes.items) |entry| {
+            if (!std.mem.eql(u8, entry.config.name, name)) continue;
+            for (entry.artifact_sources) |source| try names.append(alloc, try alloc.dupe(u8, source.artifact_name));
+            return try names.toOwnedSlice(alloc);
+        }
+        return try names.toOwnedSlice(alloc);
+    }
+
     pub fn getEnrichment(self: *const IndexManager, kind: enrichment_catalog.EnrichmentType, name: []const u8) ?*const enrichment_catalog.EnrichmentConfig {
         return self.getEnrichmentExcluding(kind, name, null);
     }

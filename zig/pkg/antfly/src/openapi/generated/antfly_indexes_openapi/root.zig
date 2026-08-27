@@ -68,6 +68,7 @@ pub const IndexPublicationPolicy = types.IndexPublicationPolicy;
 pub const IndexReadinessState = types.IndexReadinessState;
 pub const IndexReadinessStatus = types.IndexReadinessStatus;
 pub const IndexRepairStatus = types.IndexRepairStatus;
+pub const IndexSourceReadinessStatus = types.IndexSourceReadinessStatus;
 pub const IndexStats = types.IndexStats;
 pub const IndexType = types.IndexType;
 pub const MergeConfig = types.MergeConfig;
