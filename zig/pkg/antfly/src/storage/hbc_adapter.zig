@@ -1290,9 +1290,24 @@ pub const Cache = struct {
         }
     }
 
-    fn ensureVectorLookupStatsLocked(self: *Cache, stripe: usize, namespace: u64) !void {
-        const entry = try self.vector_lookup_stats[stripe].getOrPut(self.alloc, namespace);
-        if (!entry.found_existing) entry.value_ptr.* = .{};
+    fn ensureVectorLookupStatsLocked(self: *Cache, namespace: u64) !void {
+        // Stripe entries are installed and removed as one namespace-wide set,
+        // so stripe zero is the allocation-free fast-path sentinel after the
+        // first registration or successful vector admission.
+        if (self.vector_lookup_stats[0].contains(namespace)) return;
+        var created: [CacheRwLock.vector_read_stripe_count]bool =
+            .{false} ** CacheRwLock.vector_read_stripe_count;
+        errdefer for (&self.vector_lookup_stats, 0..) |*lookup_stats, stripe| {
+            if (created[stripe]) std.debug.assert(lookup_stats.remove(namespace));
+        };
+
+        for (&self.vector_lookup_stats, 0..) |*lookup_stats, stripe| {
+            const entry = try lookup_stats.getOrPut(self.alloc, namespace);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{};
+                created[stripe] = true;
+            }
+        }
     }
 
     pub fn invalidateNamespace(self: *Cache, namespace: u64) void {
@@ -1324,9 +1339,14 @@ pub const Cache = struct {
             return false;
         };
         if (!stats_entry.found_existing) stats_entry.value_ptr.* = .{};
+        self.ensureVectorLookupStatsLocked(namespace) catch {
+            if (!stats_entry.found_existing) _ = self.namespace_stats.remove(namespace);
+            self.alloc.free(stable_path);
+            return false;
+        };
 
         const entry = self.namespace_paths.getOrPut(self.alloc, namespace) catch {
-            if (!stats_entry.found_existing) _ = self.namespace_stats.remove(namespace);
+            if (!stats_entry.found_existing) self.removeNamespaceStateIfUnusedLocked(namespace);
             self.alloc.free(stable_path);
             return false;
         };
@@ -1688,7 +1708,7 @@ pub const Cache = struct {
             return vector_data;
         };
         errdefer self.rollbackAdmissionLocked(admission);
-        try self.ensureVectorLookupStatsLocked(CacheRwLock.vectorReadStripe(namespace, vector_id), namespace);
+        try self.ensureVectorLookupStatsLocked(namespace);
         try self.recordClockSlot(&self.vector_clock, &self.vector_slots, key);
         errdefer removeSlot(&self.vector_clock, &self.vector_slots, key);
         try self.vector_cache.put(self.alloc, key, entry);
@@ -11695,6 +11715,26 @@ test "hbc shared vector publication coalesces concurrent duplicate fills" {
     try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0, 3.0, 4.0 }, borrowed.view());
 }
 
+test "hbc shared vector lookup stats preserve compulsory and cross-stripe misses" {
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const registered_path = "/tmp/hbc-vector-lookup-stats";
+    const registered_namespace = hbcCacheNamespace(registered_path);
+    try std.testing.expect(cache.registerNamespacePath(registered_namespace, registered_path));
+    try std.testing.expect(cache.borrowVector(registered_namespace, 42) == null);
+    try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(registered_namespace).vector.misses);
+
+    const direct_namespace = hbcCacheNamespace("/tmp/hbc-vector-lookup-stats-direct");
+    const cached_id: u64 = 1;
+    _ = try cache.cacheVector(direct_namespace, cached_id, &.{ 1.0, 2.0, 3.0, 4.0 });
+    const cached_stripe = CacheRwLock.vectorReadStripe(direct_namespace, cached_id);
+    var missing_id: u64 = cached_id + 1;
+    while (CacheRwLock.vectorReadStripe(direct_namespace, missing_id) == cached_stripe) missing_id += 1;
+    try std.testing.expect(cache.borrowVector(direct_namespace, missing_id) == null);
+    try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(direct_namespace).vector.misses);
+}
+
 test "hbc shared cache contention experiment" {
     const Experiment = struct {
         const Mode = enum { hot, hot_no_touch, miss, insert, insert_sampled, bypass_copy };
@@ -12148,6 +12188,9 @@ test "hbc shared cache bounds namespace state across path churn" {
 
     try std.testing.expectEqual(@as(usize, 0), cache.namespace_paths.count());
     try std.testing.expectEqual(@as(usize, 0), cache.namespace_stats.count());
+    for (&cache.vector_lookup_stats) |*lookup_stats| {
+        try std.testing.expectEqual(@as(usize, 0), lookup_stats.count());
+    }
 }
 
 test "hbc cache reports byte usage to resource manager" {
