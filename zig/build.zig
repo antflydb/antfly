@@ -2961,6 +2961,7 @@ pub fn build(b: *std.Build) void {
             "restore idempotency keys are scoped by principal and resource",
             "successful restore completion wins a racing cancellation",
             "retryable restore contention durably requeues progress and honors cancellation",
+            "restore ownership loss requeues only the exact running attempt",
             "delayed restore contention yields FIFO capacity to unrelated jobs",
             "restore job runnable queue drains incrementally and preserves insertion order",
             "replicated restore leadership rebuild preserves FIFO and recovers running attempts",
@@ -6474,6 +6475,7 @@ pub fn build(b: *std.Build) void {
             "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard",
             "db incomplete deferred restore import recovers before runtime repair",
             "db restore state uses strict structured content identity markers",
+            "restore job ownership failures remain retryable",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

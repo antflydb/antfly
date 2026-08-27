@@ -13162,7 +13162,7 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
         errdefer self.unmarkScheduledRestoreJob(job_id);
         const work = try self.alloc.create(RestoreJobWork);
-        work.* = .{ .server = self, .job_id = job_id };
+        work.* = .{ .server = self, .job_id = job_id, .owner_id = owner_id };
         runtime.durable_jobs.submit(.{
             .owner_id = owner_id,
             .class = .maintenance,
@@ -13230,7 +13230,7 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
     }
 
-    fn runRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
+    fn runRestoreJob(self: *ApiHttpServer, job_id: u64, attempt_id_out: *u64) !void {
         if (!self.restoreExecutionPermitted()) {
             try self.restore_job_store.requeuePending(job_id);
             return;
@@ -13241,6 +13241,7 @@ pub const ApiHttpServer = struct {
         defer parsed.deinit();
         const state = parsed.value;
         if (state.phase != .running) return;
+        attempt_id_out.* = state.attempt_id;
         var location = backups_api.openBackupLocationWithOptions(self.alloc, state.location, .{
             .secret_store = self.cfg.secret_store,
             .node_config = self.cfg.node_config,
@@ -13676,19 +13677,52 @@ test "restore retry deadline wakeup is interruptible without polling" {
 const RestoreJobWork = struct {
     server: *ApiHttpServer,
     job_id: u64,
+    owner_id: u64,
+    attempt_id: u64 = 0,
 
     fn run(ptr: *anyopaque) !void {
         const self: *RestoreJobWork = @ptrCast(@alignCast(ptr));
-        self.server.runRestoreJob(self.job_id) catch |err| {
+        self.server.runRestoreJob(self.job_id, &self.attempt_id) catch |err| {
             // Leadership rebuilds recover running attempts into the durable
             // FIFO. The old owner must never turn a correctly fenced attempt
             // into a terminal failure while leadership is moving.
-            if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return;
+            if (restoreJobErrorIsFenced(err)) {
+                self.requeueExactAttempt(err);
+                return;
+            }
             std.log.err("restore job execution failed job_id={d} err={s}", .{ self.job_id, @errorName(err) });
             self.server.restore_job_store.failRunningById(self.server.alloc, self.job_id, @errorName(err)) catch |persist_err| {
                 std.log.err("failed to persist restore job failure job_id={d} err={s}", .{ self.job_id, @errorName(persist_err) });
             };
         };
+    }
+
+    fn requeueExactAttempt(self: *RestoreJobWork, cause: anyerror) void {
+        var retry_delay_ms: u64 = 100;
+        while (!self.server.restore_jobs_closing.load(.acquire)) {
+            const requeued = self.server.restore_job_store.requeueRunningAttempt(
+                self.server.alloc,
+                self.job_id,
+                self.attempt_id,
+                @errorName(cause),
+            ) catch |err| {
+                // A stable owner must not strand a running job merely because
+                // its checkpoint store is temporarily unavailable. Keep one
+                // bounded worker asleep instead of spinning or consuming a
+                // fresh durable-job slot on every retry.
+                if (self.server.restore_job_owner_id.load(.acquire) != self.owner_id) return;
+                std.log.warn("restore attempt requeue deferred job_id={d} attempt_id={d} err={s}", .{
+                    self.job_id,
+                    self.attempt_id,
+                    @errorName(err),
+                });
+                sleepNs(retry_delay_ms * std.time.ns_per_ms);
+                retry_delay_ms = @min(retry_delay_ms * 2, 5_000);
+                continue;
+            };
+            _ = requeued;
+            return;
+        }
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -13697,6 +13731,19 @@ const RestoreJobWork = struct {
         self.server.alloc.destroy(self);
     }
 };
+
+fn restoreJobErrorIsFenced(err: anyerror) bool {
+    return err == error.RestoreJobFenced or
+        err == error.RestoreJobPersistenceUnavailable or
+        metadata_authority.isRetryableError(err);
+}
+
+test "restore job ownership failures remain retryable" {
+    try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobFenced));
+    try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobPersistenceUnavailable));
+    try std.testing.expect(restoreJobErrorIsFenced(error.NotLeader));
+    try std.testing.expect(!restoreJobErrorIsFenced(error.InvalidArguments));
+}
 
 fn restoreJobIdFromPath(path: []const u8) ?u64 {
     const prefix = routes.Routes.restore ++ "/jobs/";

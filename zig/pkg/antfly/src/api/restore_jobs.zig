@@ -27,6 +27,25 @@ const max_cluster_failure_details: usize = 8;
 const max_cluster_failure_table_name_bytes: usize = 256;
 const max_cluster_failure_error_bytes: usize = 256;
 const restore_job_format_version: u32 = 4;
+const restore_retry_min_ms: u64 = 100;
+const restore_retry_max_ms: u64 = 5_000;
+
+fn restoreRetryDelayMs(job_id: u64, attempt_id: u64) u64 {
+    const exponent: u6 = @intCast(@min(attempt_id -| 1, 6));
+    const exponential_ms: u64 = @min(
+        restore_retry_min_ms << exponent,
+        restore_retry_max_ms * 4 / 5,
+    );
+    var mixed = job_id ^ (attempt_id *% 0x9e3779b97f4a7c15);
+    mixed ^= mixed >> 30;
+    mixed *%= 0xbf58476d1ce4e5b9;
+    mixed ^= mixed >> 27;
+    const jitter_span: u64 = exponential_ms / 2 + 1;
+    return @min(
+        restore_retry_max_ms,
+        exponential_ms * 3 / 4 + mixed % jitter_span,
+    );
+}
 
 pub const Scope = enum { table, cluster };
 pub const Phase = enum { queued, running, succeeded, failed, cancelled };
@@ -1349,6 +1368,58 @@ pub const Store = struct {
         return encoded;
     }
 
+    /// Requeues only the worker attempt that actually lost execution
+    /// authority. A replacement owner may already have recovered and begun a
+    /// newer attempt; in that case this is a no-op instead of fencing the new
+    /// owner. The durable delay prevents leadership churn from hot-looping the
+    /// bounded restore worker pool.
+    pub fn requeueRunningAttempt(
+        self: *Store,
+        alloc: std.mem.Allocator,
+        job_id: u64,
+        attempt_id: u64,
+        err_name: []const u8,
+    ) !bool {
+        if (attempt_id == 0) return false;
+        self.lock();
+        defer self.mutex.unlock();
+        const current = self.jobs.get(job_id) orelse return false;
+        var parsed = try std.json.parseFromSlice(
+            JobState,
+            alloc,
+            current,
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+        if (parsed.value.phase != .running or parsed.value.attempt_id != attempt_id) return false;
+        if (parsed.value.cancel_requested) {
+            const cancelled = try self.updateLocked(alloc, parsed.value, .{
+                .phase = .cancelled,
+                .last_error = "cancel_requested",
+            });
+            alloc.free(cancelled);
+            return true;
+        }
+
+        self.compactPendingFullyLocked();
+        try self.pending.ensureUnusedCapacity(self.alloc, 1);
+        const dispatch_sequence = try self.allocateDispatchSequenceLocked();
+        const not_before_ms = nowMillis() +| restoreRetryDelayMs(job_id, attempt_id);
+        const encoded = try self.updateLocked(alloc, parsed.value, .{
+            .phase = .queued,
+            .dispatch_sequence = dispatch_sequence,
+            .not_before_ms = not_before_ms,
+            .last_error = err_name,
+        });
+        defer alloc.free(encoded);
+        try self.insertPendingSortedLocked(.{
+            .job_id = job_id,
+            .dispatch_sequence = dispatch_sequence,
+            .not_before_ms = not_before_ms,
+        });
+        return true;
+    }
+
     fn finishAs(self: *Store, alloc: std.mem.Allocator, expected: JobState, phase: Phase, result_json: ?[]const u8, last_error: ?[]const u8) ![]u8 {
         self.lock();
         defer self.mutex.unlock();
@@ -2518,6 +2589,60 @@ test "retryable restore contention durably requeues progress and honors cancella
         "cancel_requested",
         parsed_cancelled.value.last_error.?,
     );
+}
+
+test "restore ownership loss requeues only the exact running attempt" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const created = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "ownership-loss",
+        .location = "s3://archive/ownership-loss",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:cluster",
+    });
+    defer std.testing.allocator.free(created);
+    var parsed_created = try std.json.parseFromSlice(JobState, std.testing.allocator, created, .{});
+    defer parsed_created.deinit();
+    const running_one = (try store.begin(std.testing.allocator, parsed_created.value.job_id)).?;
+    defer std.testing.allocator.free(running_one);
+    var parsed_one = try std.json.parseFromSlice(JobState, std.testing.allocator, running_one, .{});
+    defer parsed_one.deinit();
+
+    try std.testing.expect(try store.requeueRunningAttempt(
+        std.testing.allocator,
+        parsed_one.value.job_id,
+        parsed_one.value.attempt_id,
+        "NotLeader",
+    ));
+    const queued = (try store.load(std.testing.allocator, parsed_one.value.job_id)).?;
+    defer std.testing.allocator.free(queued);
+    var parsed_queued = try std.json.parseFromSlice(JobState, std.testing.allocator, queued, .{});
+    defer parsed_queued.deinit();
+    try std.testing.expectEqual(Phase.queued, parsed_queued.value.phase);
+    try std.testing.expect(parsed_queued.value.not_before_ms > 0);
+
+    const running_two = (try store.begin(std.testing.allocator, parsed_one.value.job_id)).?;
+    defer std.testing.allocator.free(running_two);
+    var parsed_two = try std.json.parseFromSlice(JobState, std.testing.allocator, running_two, .{});
+    defer parsed_two.deinit();
+    try std.testing.expectEqual(parsed_one.value.attempt_id + 1, parsed_two.value.attempt_id);
+    try std.testing.expect(!try store.requeueRunningAttempt(
+        std.testing.allocator,
+        parsed_one.value.job_id,
+        parsed_one.value.attempt_id,
+        "stale-owner",
+    ));
+    const still_running = (try store.load(std.testing.allocator, parsed_one.value.job_id)).?;
+    defer std.testing.allocator.free(still_running);
+    var parsed_still_running = try std.json.parseFromSlice(JobState, std.testing.allocator, still_running, .{});
+    defer parsed_still_running.deinit();
+    try std.testing.expectEqual(Phase.running, parsed_still_running.value.phase);
+    try std.testing.expectEqual(parsed_two.value.attempt_id, parsed_still_running.value.attempt_id);
 }
 
 test "delayed restore contention yields FIFO capacity to unrelated jobs" {
