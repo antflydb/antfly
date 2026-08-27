@@ -350,9 +350,16 @@ pub const StdHttpExecutor = struct {
             }
             if (deadline) |value| {
                 if (std.Io.Clock.Timestamp.now(io, .awake).compare(.gte, value)) {
-                    Task.cancelAndDrain(&group, &state, io, alloc);
+                    const result = cancelAndFinishControlledRequest(
+                        &group,
+                        &state,
+                        io,
+                        alloc,
+                        value,
+                        req.cancellation,
+                    );
                     group_active = false;
-                    return error.Timeout;
+                    return result;
                 }
             }
 
@@ -415,6 +422,22 @@ pub const StdHttpExecutor = struct {
             }
         }
         return try state.result;
+    }
+
+    fn cancelAndFinishControlledRequest(
+        group: *std.Io.Group,
+        state: *ControlledRequestState,
+        task_io: std.Io,
+        response_alloc: std.mem.Allocator,
+        deadline: std.Io.Clock.Timestamp,
+        cancellation: ?*const common.RequestCancellation,
+    ) !common.HttpResponse {
+        // Cancellation joins the task. Do not discard its result here: the
+        // transport may have completed before the absolute deadline but been
+        // preempted before publishing `done`. Completion-time arbitration
+        // below is the single authority for retaining or draining ownership.
+        group.cancel(task_io);
+        return finishControlledRequest(state, response_alloc, deadline, cancellation);
     }
 
     fn drainControlledResult(state: *ControlledRequestState, response_alloc: std.mem.Allocator) void {
@@ -644,6 +667,29 @@ test "std http executor owns a finite controlled request worker budget" {
 }
 
 test "controlled HTTP completion time arbitrates the absolute deadline" {
+    const BlockedCompletionTask = struct {
+        fn run(
+            state: *StdHttpExecutor.ControlledRequestState,
+            task_io: std.Io,
+            published: *std.atomic.Value(bool),
+            release: *std.atomic.Value(bool),
+        ) std.Io.Cancelable!void {
+            state.completed_at = std.Io.Clock.Timestamp.now(task_io, .awake);
+            published.store(true, .release);
+            while (!release.load(.acquire)) std.Thread.yield() catch {};
+            state.done.set(task_io);
+        }
+    };
+
+    const ReleaseTask = struct {
+        release: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 25);
+            self.release.store(true, .release);
+        }
+    };
+
     const io = std.testing.io;
     const completed_before_deadline = std.Io.Clock.Timestamp.now(io, .awake);
     const future_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
@@ -692,6 +738,64 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
         future_deadline,
         null,
     ));
+
+    // Exercise the real cancel/join path with the worker paused after
+    // publishing its completion timestamp but before signaling `done`. Even
+    // though the waiter observes the later deadline, the on-time result must
+    // survive cancellation and retain its ownership exactly once.
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+    const task_io = executor.io_impl.io();
+    var raced = StdHttpExecutor.ControlledRequestState{};
+    raced.result = common.HttpResponse{
+        .status = 200,
+        .body = try std.testing.allocator.dupe(u8, "raced"),
+    };
+    var raced_owned = true;
+    defer if (raced_owned) StdHttpExecutor.drainControlledResult(&raced, std.testing.allocator);
+    var published = std.atomic.Value(bool).init(false);
+    var release = std.atomic.Value(bool).init(false);
+    var group: std.Io.Group = .init;
+    try group.concurrent(task_io, BlockedCompletionTask.run, .{
+        &raced,
+        task_io,
+        &published,
+        &release,
+    });
+    var group_active = true;
+    defer if (group_active) {
+        release.store(true, .release);
+        group.cancel(task_io);
+    };
+    while (!published.load(.acquire)) std.Thread.yield() catch {};
+
+    const race_deadline = std.Io.Clock.Timestamp.fromNow(task_io, .{
+        .raw = std.Io.Duration.fromMilliseconds(25),
+        .clock = .awake,
+    });
+    sleepTestMs(task_io, 50);
+    try std.testing.expect(std.Io.Clock.Timestamp.now(task_io, .awake).compare(.gte, race_deadline));
+    try std.testing.expect(!raced.done.isSet());
+
+    var release_task = ReleaseTask{ .release = &release };
+    const release_thread = try std.Thread.spawn(.{}, ReleaseTask.run, .{&release_task});
+    var release_thread_joined = false;
+    defer if (!release_thread_joined) release_thread.join();
+    const raced_result = StdHttpExecutor.cancelAndFinishControlledRequest(
+        &group,
+        &raced,
+        task_io,
+        std.testing.allocator,
+        race_deadline,
+        null,
+    );
+    raced_owned = false;
+    group_active = false;
+    release_thread.join();
+    release_thread_joined = true;
+    var raced_response = try raced_result;
+    defer raced_response.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("raced", raced_response.body);
 }
 
 test "std http executor forwards only end-to-end request headers" {
