@@ -1696,7 +1696,7 @@ pub const IncompleteDetails = struct {
 
 /// Deployment-level index capabilities clients can inspect before submitting index mutations.
 pub const IndexRuntimeCapabilities = struct {
-    /// Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments.
+    /// Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments and during distributed rolling upgrades until every live data store reports protocol support.
     artifact_sources: bool,
 };
 

@@ -3037,7 +3037,7 @@ export interface components {
         ClusterHealth: "unknown" | "healthy" | "unhealthy" | "degraded" | "error";
         /** @description Deployment-level index capabilities clients can inspect before submitting index mutations. */
         IndexRuntimeCapabilities: {
-            /** @description Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments. */
+            /** @description Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments and during distributed rolling upgrades until every live data store reports protocol support. */
             artifact_sources: boolean;
         };
         ClusterStatus: {
@@ -10049,16 +10049,6 @@ export interface components {
             state: "pending" | "ready" | "failed";
             /** @description Whether this source is published through its captured target revision on every expected shard. */
             complete: boolean;
-            /**
-             * Format: uint64
-             * @description Highest committed revision captured for this artifact stream.
-             */
-            target_revision: number;
-            /**
-             * Format: uint64
-             * @description Highest revision the query-visible index has durably processed for this artifact stream.
-             */
-            published_revision: number;
             /** @description Stable, machine-readable blockers for this source. Empty when state is ready. */
             pending_reasons: string[];
         };
@@ -10070,16 +10060,6 @@ export interface components {
             complete: boolean;
             /** @description Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents. */
             incarnation?: string;
-            /**
-             * Format: uint64
-             * @description Highest captured source/replay revision required by this readiness observation.
-             */
-            target_revision?: number;
-            /**
-             * Format: uint64
-             * @description Highest revision published to the query-visible index represented by this observation.
-             */
-            published_revision?: number;
             /** @description Stable, machine-readable blockers. Empty when state is ready. */
             pending_reasons: string[];
             /** @description Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks, not a restatement of index configuration. */

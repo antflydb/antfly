@@ -5077,10 +5077,6 @@ pub const IndexReadinessStatus = struct {
     complete: bool,
     /// Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
-    /// Highest captured source/replay revision required by this readiness observation.
-    target_revision: ?i64 = null,
-    /// Highest revision published to the query-visible index represented by this observation.
-    published_revision: ?i64 = null,
     /// Stable, machine-readable blockers. Empty when state is ready.
     pending_reasons: []const []const u8,
     /// Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks, not a restatement of index configuration.
@@ -5097,7 +5093,7 @@ pub const IndexRepairStatus = struct {
 
 /// Deployment-level index capabilities clients can inspect before submitting index mutations.
 pub const IndexRuntimeCapabilities = struct {
-    /// Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments.
+    /// Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments and during distributed rolling upgrades until every live data store reports protocol support.
     artifact_sources: bool,
 };
 
@@ -5107,10 +5103,6 @@ pub const IndexSourceReadinessStatus = struct {
     state: []const u8,
     /// Whether this source is published through its captured target revision on every expected shard.
     complete: bool,
-    /// Highest committed revision captured for this artifact stream.
-    target_revision: i64,
-    /// Highest revision the query-visible index has durably processed for this artifact stream.
-    published_revision: i64,
     /// Stable, machine-readable blockers for this source. Empty when state is ready.
     pending_reasons: []const []const u8,
 };
