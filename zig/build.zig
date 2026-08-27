@@ -7280,7 +7280,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_vopr_test_step.dependOn(&run_production_cluster_graph_split_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run production DataServer deployment smoke and deep active-reconfiguration histories",
+        "Run production DataServer smoke, active-reconfiguration, graph, and graph-during-split histories",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
