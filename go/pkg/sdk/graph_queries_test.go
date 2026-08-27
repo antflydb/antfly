@@ -801,6 +801,12 @@ func TestGraphIdentifiersMatchVersionedWirePolicy(t *testing.T) {
 func TestGraphMatchEdgeValidationMatchesServerDefaultsAndBudgets(t *testing.T) {
 	zero := 0.0
 	negative := -1.0
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Direction: EdgeDirectionBoth}); err != nil {
+		t.Fatalf("both direction must be accepted: %v", err)
+	}
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Direction: EdgeDirection("sideways")}); err == nil {
+		t.Fatal("expected invalid graph edge direction to fail")
+	}
 	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MinHops: 2}); err == nil {
 		t.Fatal("expected omitted max_hops to default to one and reject min_hops=2")
 	}

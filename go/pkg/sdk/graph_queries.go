@@ -1576,6 +1576,10 @@ func validateGraphMatchEdgeShape(edge GraphMatchEdge) error {
 	if !validGraphIdentifier(edge.From) || !validGraphIdentifier(edge.To) {
 		return invalidGraphIdentifier("graph edge aliases")
 	}
+	if edge.Direction != "" && edge.Direction != EdgeDirectionOut &&
+		edge.Direction != EdgeDirectionIn && edge.Direction != EdgeDirectionBoth {
+		return fmt.Errorf("antfly: graph edge direction must be out, in, or both")
+	}
 	minHops, maxHops := edge.MinHops, edge.MaxHops
 	if minHops == 0 {
 		minHops = 1

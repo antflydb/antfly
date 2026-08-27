@@ -127,6 +127,9 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
                 continue
             _require_graph_identifier(edge.get("from"), f"{edges_path}[{index}].from")
             _require_graph_identifier(edge.get("to"), f"{edges_path}[{index}].to")
+            direction = edge.get("direction")
+            if direction is not None and (not isinstance(direction, str) or direction not in {"out", "in", "both"}):
+                raise AntflyException(f"{edges_path}[{index}].direction must be out, in, or both")
             _require_graph_edge_types(edge.get("types"), f"{edges_path}[{index}].types")
 
     while where_groups:

@@ -1418,23 +1418,21 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
             "Person",
             {
                 "IS_LOCATED_IN": [{"target": "city-1"}],
-                # The canonical graph DSL is directed. Materialize both arcs
-                # for LSQB's undirected KNOWS relationship.
-                "KNOWS": [{"target": "person-b"}, {"target": "person-c"}],
+                "KNOWS": [{"target": "person-b"}],
             },
         ),
         "person-b": doc(
             "Person",
             {
                 "IS_LOCATED_IN": [{"target": "city-2"}],
-                "KNOWS": [{"target": "person-a"}, {"target": "person-c"}],
+                "KNOWS": [{"target": "person-c"}],
             },
         ),
         "person-c": doc(
             "Person",
             {
                 "IS_LOCATED_IN": [{"target": "city-3"}],
-                "KNOWS": [{"target": "person-a"}, {"target": "person-b"}],
+                "KNOWS": [{"target": "person-a"}],
             },
         ),
         "forum": doc(
@@ -1463,11 +1461,10 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
         ),
         "post-q2": doc("Post", {"HAS_CREATOR": [{"target": "person-b"}]}),
         "chain-a": doc("Person", {"KNOWS": [{"target": "chain-b"}]}),
-        "chain-b": doc("Person", {"KNOWS": [{"target": "chain-a"}, {"target": "chain-c"}]}),
+        "chain-b": doc("Person", {"KNOWS": [{"target": "chain-c"}]}),
         "chain-c": doc(
             "Person",
             {
-                "KNOWS": [{"target": "chain-b"}],
                 "HAS_INTEREST": [{"target": "interest-tag"}],
             },
         ),
@@ -1563,7 +1560,7 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 "post": node("Post"),
             },
             [
-                {"from": "person1", "to": "person2", "types": ["KNOWS"]},
+                {"from": "person1", "to": "person2", "direction": "both", "types": ["KNOWS"]},
                 {"from": "comment", "to": "person1", "types": ["HAS_CREATOR"]},
                 {"from": "comment", "to": "post", "types": ["REPLY_OF"]},
                 {"from": "post", "to": "person2", "types": ["HAS_CREATOR"]},
@@ -1586,9 +1583,9 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 {"from": "city2", "to": "country", "types": ["IS_PART_OF"]},
                 {"from": "person3", "to": "city3", "types": ["IS_LOCATED_IN"]},
                 {"from": "city3", "to": "country", "types": ["IS_PART_OF"]},
-                {"from": "person1", "to": "person2", "types": ["KNOWS"]},
-                {"from": "person2", "to": "person3", "types": ["KNOWS"]},
-                {"from": "person3", "to": "person1", "types": ["KNOWS"]},
+                {"from": "person1", "to": "person2", "direction": "both", "types": ["KNOWS"]},
+                {"from": "person2", "to": "person3", "direction": "both", "types": ["KNOWS"]},
+                {"from": "person3", "to": "person1", "direction": "both", "types": ["KNOWS"]},
             ],
         ),
         "q4": count_query(
@@ -1628,8 +1625,8 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 "tag": node("Tag"),
             },
             [
-                {"from": "person1", "to": "person2", "types": ["KNOWS"]},
-                {"from": "person2", "to": "person3", "types": ["KNOWS"]},
+                {"from": "person1", "to": "person2", "direction": "both", "types": ["KNOWS"]},
+                {"from": "person2", "to": "person3", "direction": "both", "types": ["KNOWS"]},
                 {"from": "person3", "to": "tag", "types": ["HAS_INTEREST"]},
             ],
             where=neq("person1", "person3"),
@@ -1682,8 +1679,8 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                 "tag": node("Tag"),
             },
             [
-                {"from": "person1", "to": "person2", "types": ["KNOWS"]},
-                {"from": "person2", "to": "person3", "types": ["KNOWS"]},
+                {"from": "person1", "to": "person2", "direction": "both", "types": ["KNOWS"]},
+                {"from": "person2", "to": "person3", "direction": "both", "types": ["KNOWS"]},
                 {"from": "person3", "to": "tag", "types": ["HAS_INTEREST"]},
             ],
             where={
@@ -1694,6 +1691,7 @@ def test_stateful_graph_lsqb_q1_q9_exact_conformance(backup_api):
                                 {
                                     "from": "person1",
                                     "to": "person3",
+                                    "direction": "both",
                                     "types": ["KNOWS"],
                                 }
                             ]

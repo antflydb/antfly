@@ -29,21 +29,24 @@ T = TypeVar("T", bound="GraphDocumentFilterBoolean")
 
 @_attrs_define
 class GraphDocumentFilterBoolean:
-    """
-    Attributes:
-        must (GraphDocumentFilterConjunction | Unset):
-        should (GraphDocumentFilterDisjunction | Unset):
-        must_not (GraphDocumentFilterDisjunction | Unset):
-        filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
-            GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
-            GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
-            GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
-            GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter | Unset): A non-scoring
-            stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and
-            deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
-            Fuzzy predicates require an explicit fuzziness. Range predicates use numeric_range, term_range, or date_range
-            wrappers, and every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates
-            belong in GraphMatch.where.
+    """Stored-document boolean predicate. `must` and `filter` are required clauses; `should` uses its disjunction
+    threshold; and `must_not` negates its thresholded disjunction as one group. Thus a `must_not.min` of N excludes a
+    document only when at least N of that group's clauses match.
+
+        Attributes:
+            must (GraphDocumentFilterConjunction | Unset):
+            should (GraphDocumentFilterDisjunction | Unset):
+            must_not (GraphDocumentFilterDisjunction | Unset):
+            filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
+                GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
+                GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
+                GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
+                GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter | Unset): A non-scoring
+                stored-document predicate embedded at a graph node. It uses structurally distinct stored-field predicates and
+                deliberately excludes analyzer-backed full-text clauses such as match, phrase, multi_match, and query_string.
+                Fuzzy predicates require an explicit fuzziness. Range predicates use numeric_range, term_range, or date_range
+                wrappers, and every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates
+                belong in GraphMatch.where.
     """
 
     must: GraphDocumentFilterConjunction | Unset = UNSET

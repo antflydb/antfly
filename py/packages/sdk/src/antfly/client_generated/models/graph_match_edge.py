@@ -5,6 +5,7 @@ from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.edge_direction import EdgeDirection
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="GraphMatchEdge")
@@ -12,14 +13,14 @@ T = TypeVar("T", bound="GraphMatchEdge")
 
 @_attrs_define
 class GraphMatchEdge:
-    """Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those
-    aliases; model an undirected relationship by indexing both directed edges. A fixed single-hop relationship preserves
-    physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses
-    node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when
-    closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects
-    planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven.
-    Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table
-    boundary.
+    """Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse
+    the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop
+    relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-
+    length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge
+    path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless
+    execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes
+    cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias
+    at each table boundary.
 
         Attributes:
             from_ (str): User-visible graph alias or named result under Antfly graph identifier policy v1 (Unicode 15.0.0).
@@ -30,6 +31,10 @@ class GraphMatchEdge:
                 Identifiers are exact UTF-8 strings and are not normalized. Ordinary internal ASCII spaces are allowed. The
                 value must not equal `*`, begin with `$`, have leading or trailing spaces, contain non-ASCII Unicode
                 White_Space, or contain Unicode Cc control or Cf format code points. UTF-8 encoding is limited to 512 bytes.
+            direction (EdgeDirection | Unset): Direction of edges to query:
+                - out: Outgoing edges from the node
+                - in: Incoming edges to the node
+                - both: Both outgoing and incoming edges
             types (list[str] | Unset): Empty or omitted matches every edge type; otherwise at most 64 unique types totaling
                 at most 64 KiB.
             min_hops (int | Unset):  Default: 1.
@@ -40,6 +45,7 @@ class GraphMatchEdge:
 
     from_: str
     to: str
+    direction: EdgeDirection | Unset = UNSET
     types: list[str] | Unset = UNSET
     min_hops: int | Unset = 1
     max_hops: int | Unset = 1
@@ -50,6 +56,10 @@ class GraphMatchEdge:
         from_ = self.from_
 
         to = self.to
+
+        direction: str | Unset = UNSET
+        if not isinstance(self.direction, Unset):
+            direction = self.direction.value
 
         types: list[str] | Unset = UNSET
         if not isinstance(self.types, Unset):
@@ -71,6 +81,8 @@ class GraphMatchEdge:
                 "to": to,
             }
         )
+        if direction is not UNSET:
+            field_dict["direction"] = direction
         if types is not UNSET:
             field_dict["types"] = types
         if min_hops is not UNSET:
@@ -91,6 +103,13 @@ class GraphMatchEdge:
 
         to = d.pop("to")
 
+        _direction = d.pop("direction", UNSET)
+        direction: EdgeDirection | Unset
+        if isinstance(_direction, Unset):
+            direction = UNSET
+        else:
+            direction = EdgeDirection(_direction)
+
         types = cast(list[str], d.pop("types", UNSET))
 
         min_hops = d.pop("min_hops", UNSET)
@@ -104,6 +123,7 @@ class GraphMatchEdge:
         graph_match_edge = cls(
             from_=from_,
             to=to,
+            direction=direction,
             types=types,
             min_hops=min_hops,
             max_hops=max_hops,

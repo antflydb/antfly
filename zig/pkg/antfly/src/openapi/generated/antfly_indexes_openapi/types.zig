@@ -1657,6 +1657,7 @@ pub const GraphDocumentFilter = union(enum) {
     }
 };
 
+/// Stored-document boolean predicate. `must` and `filter` are required clauses; `should` uses its disjunction threshold; and `must_not` negates its thresholded disjunction as one group. Thus a `must_not.min` of N excludes a document only when at least N of that group's clauses match.
 pub const GraphDocumentFilterBoolean = struct {
     must: ?GraphDocumentFilterConjunction = null,
     should: ?GraphDocumentFilterDisjunction = null,
@@ -1670,7 +1671,7 @@ pub const GraphDocumentFilterConjunction = struct {
 
 pub const GraphDocumentFilterDisjunction = struct {
     disjuncts: []const GraphDocumentFilter,
-    /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+    /// Minimum number of disjuncts that must match. Omit for conventional context-sensitive disjunction semantics; set to 0 to impose no matching-clause requirement. Under `must_not`, the complete thresholded disjunction is negated as one group.
     min: ?i64 = null,
 };
 
@@ -1955,10 +1956,12 @@ pub const GraphMatch = struct {
     }
 };
 
-/// Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
+/// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
 pub const GraphMatchEdge = struct {
     from: antfly_graph_identifier_openapi.GraphIdentifier,
     to: antfly_graph_identifier_openapi.GraphIdentifier,
+    /// Stored-edge direction relative to `from`; defaults to `out`.
+    direction: ?EdgeDirection = null,
     /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
     types: ?[]const GraphEdgeType = null,
     min_hops: ?i64 = null,
@@ -1972,6 +1975,13 @@ pub const GraphMatchEdge = struct {
         try jw.write(self.from);
         try jw.objectField("to");
         try jw.write(self.to);
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("direction");
+            try jw.write(@as(?u8, null));
+        }
         if (self.types) |value| {
             try jw.objectField("types");
             try jw.write(value);

@@ -103,6 +103,33 @@ describe("graph identifier policy", () => {
     ).toThrow(message);
   });
 
+  it("validates graph match edge direction", () => {
+    expect(() =>
+      validateGraphQueryIdentifiers({
+        people: {
+          match: {
+            anchor: "person",
+            nodes: { person: {}, author: {} },
+            edges: [{ from: "person", to: "author", direction: "both" }],
+          },
+          return: { bindings: ["person"] },
+        },
+      })
+    ).not.toThrow();
+    expect(() =>
+      validateGraphQueryIdentifiers({
+        people: {
+          match: {
+            anchor: "person",
+            nodes: { person: {}, author: {} },
+            edges: [{ from: "person", to: "author", direction: "sideways" }],
+          },
+          return: { bindings: ["person"] },
+        },
+      } as never)
+    ).toThrow("direction must be out, in, or both");
+  });
+
   it.each([false, true])("rejects distinct presence on count(*) (%s)", (distinct) => {
     expect(() =>
       validateGraphQueryIdentifiers({

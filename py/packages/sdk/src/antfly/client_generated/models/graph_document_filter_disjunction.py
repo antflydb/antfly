@@ -36,8 +36,9 @@ class GraphDocumentFilterDisjunction:
             GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
             GraphDocumentNumericRangeFilter | GraphDocumentPrefixFilter | GraphDocumentRegexpFilter |
             GraphDocumentTermFilter | GraphDocumentTermRangeFilter | GraphDocumentWildcardFilter]):
-        min_ (int | Unset): Minimum number of disjuncts that must match. Omit for conventional disjunction semantics;
-            set to 0 to make a pure disjunction optional.
+        min_ (int | Unset): Minimum number of disjuncts that must match. Omit for conventional context-sensitive
+            disjunction semantics; set to 0 to impose no matching-clause requirement. Under `must_not`, the complete
+            thresholded disjunction is negated as one group.
     """
 
     disjuncts: list[

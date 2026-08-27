@@ -290,6 +290,14 @@ function validateEdges(value: unknown, path: string): void {
     if (!edge) return;
     requireIdentifier(edge.from, `${path}[${index}].from`);
     requireIdentifier(edge.to, `${path}[${index}].to`);
+    if (
+      edge.direction !== undefined &&
+      edge.direction !== "out" &&
+      edge.direction !== "in" &&
+      edge.direction !== "both"
+    ) {
+      throw new TypeError(`${path}[${index}].direction must be out, in, or both`);
+    }
     validateEdgeTypes(edge.types, `${path}[${index}].types`);
   });
 }

@@ -577,6 +577,20 @@ class TestAntflyClient:
         with pytest.raises(AntflyException, match=error):
             client.query(table="docs", graph_queries={"people": query})
 
+    def test_query_rejects_invalid_graph_match_edge_direction(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        query = {
+            "match": {
+                "anchor": "person",
+                "nodes": {"person": {}, "author": {}},
+                "edges": [{"from": "person", "to": "author", "direction": "sideways"}],
+            },
+            "return": {"bindings": ["person"]},
+        }
+
+        with pytest.raises(AntflyException, match="direction must be out, in, or both"):
+            client.query(table="docs", graph_queries={"people": query})
+
     @pytest.mark.parametrize(
         ("start", "error"),
         [

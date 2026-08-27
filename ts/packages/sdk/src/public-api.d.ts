@@ -12034,10 +12034,11 @@ export interface components {
             disjuncts: components["schemas"]["GraphDocumentFilter"][];
             /**
              * Format: uint32
-             * @description Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
+             * @description Minimum number of disjuncts that must match. Omit for conventional context-sensitive disjunction semantics; set to 0 to impose no matching-clause requirement. Under `must_not`, the complete thresholded disjunction is negated as one group.
              */
             min?: number;
         };
+        /** @description Stored-document boolean predicate. `must` and `filter` are required clauses; `should` uses its disjunction threshold; and `must_not` negates its thresholded disjunction as one group. Thus a `must_not.min` of N excludes a document only when at least N of that group's clauses match. */
         GraphDocumentFilterBoolean: {
             must?: components["schemas"]["GraphDocumentFilterConjunction"];
             should?: components["schemas"]["GraphDocumentFilterDisjunction"];
@@ -12053,10 +12054,12 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on aliases qualified with a different table because its published snapshot contains only the queried table. Explicitly qualifying an alias with the queried table is equivalent to omitting `table`. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
-        /** @description Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
+        /** @description Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
         GraphMatchEdge: {
             from: components["schemas"]["GraphIdentifier"];
             to: components["schemas"]["GraphIdentifier"];
+            /** @description Stored-edge direction relative to `from`; defaults to `out`. */
+            direction?: components["schemas"]["EdgeDirection"];
             /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
             types?: components["schemas"]["GraphEdgeType"][];
             /** @default 1 */

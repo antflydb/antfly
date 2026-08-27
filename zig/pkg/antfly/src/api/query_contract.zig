@@ -10076,7 +10076,7 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
             .to = to,
             .step = .{
                 .types = types,
-                .direction = .out,
+                .direction = parseGraphDirection(edge.direction),
                 .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
                 .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
                 .min_weight = edge.min_weight,
@@ -10336,42 +10336,18 @@ fn graphCountAggregateParts(value: indexes_openapi.GraphCountAggregate) !ParsedG
 
 fn parseGraphFilterValue(alloc: std.mem.Allocator, value: ?indexes_openapi.GraphDocumentFilter) !graph_pattern_mod.NodeFilter {
     const filter = value orelse return .{};
-    const encoded = try jsonStringifyAlloc(alloc, filter);
-    defer alloc.free(encoded);
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, encoded, .{}) catch
-        return error.InvalidQueryRequest;
-    defer parsed.deinit();
-    // Graph filters run against stored documents, not a full-text index. Keep
-    // the public graph contract honest by rejecting analyzer-backed MATCH at
-    // admission instead of silently giving it storage-only semantics. Bound
-    // the generic tree before this recursive inspection; the normalizer also
-    // validates the tree, but this ordering is what makes recursion safe.
-    try validatePublicQueryTraversalBudgetAlloc(alloc, parsed.value);
-    try validateGraphDocumentFilterContract(parsed.value);
-    return .{ .filter_query_json = try normalizePublicStoredFilterQueryAlloc(alloc, parsed.value) };
-}
-
-fn validateGraphDocumentFilterContract(value: std.json.Value) !void {
-    switch (value) {
-        .array => |array| {
-            for (array.items) |child| {
-                try validateGraphDocumentFilterContract(child);
-            }
-        },
-        .object => |object| {
-            if (object.get("path")) |path| {
-                if (path != .string or !validGraphDocumentJsonPointer(path.string))
-                    return error.InvalidQueryRequest;
-            }
-            if (object.get("match") != null) return error.UnsupportedQueryRequest;
-            if (object.get("date_range")) |range| try validateCanonicalGraphDateRange(range);
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                try validateGraphDocumentFilterContract(entry.value_ptr.*);
-            }
-        },
-        else => {},
-    }
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var budget = GraphFilterLoweringBudget{};
+    const canonical = try lowerGraphDocumentFilter(arena.allocator(), filter, 0, &budget);
+    db_mod.validateStructuredFilterValueAlloc(arena.allocator(), canonical) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.UnsupportedQueryRequest => error.UnsupportedQueryRequest,
+            else => error.InvalidQueryRequest,
+        };
+    };
+    return .{ .filter_query_json = try jsonStringifyAlloc(alloc, canonical) };
 }
 
 fn validGraphDocumentJsonPointer(path: []const u8) bool {
@@ -10385,24 +10361,263 @@ fn validGraphDocumentJsonPointer(path: []const u8) bool {
     return true;
 }
 
-fn validateCanonicalGraphDateRange(value: std.json.Value) !void {
-    if (value != .object) return error.InvalidQueryRequest;
-    const raw_start = value.object.get("start");
-    const raw_end = value.object.get("end");
-    // Generated optional properties are serialized as JSON null. Treat null
-    // exactly like omission so a one-sided range remains valid across the
-    // generated-model boundary while a genuinely boundless range fails.
-    const start = if (raw_start != null and raw_start.? != .null) raw_start else null;
-    const end = if (raw_end != null and raw_end.? != .null) raw_end else null;
-    if (start == null and end == null) return error.InvalidQueryRequest;
-    if (start) |bound| {
-        if (bound != .string or (try parseRfc3339ToNs(bound.string)) == null)
-            return error.InvalidQueryRequest;
+const GraphFilterLoweringBudget = struct {
+    remaining_nodes: usize = public_query_max_tree_nodes,
+};
+
+fn lowerGraphDocumentFilter(
+    alloc: std.mem.Allocator,
+    filter: indexes_openapi.GraphDocumentFilter,
+    depth: usize,
+    budget: *GraphFilterLoweringBudget,
+) anyerror!std.json.Value {
+    if (depth > public_query_max_tree_depth or budget.remaining_nodes == 0)
+        return error.InvalidQueryRequest;
+    budget.remaining_nodes -= 1;
+
+    return switch (filter) {
+        .graph_document_term_filter => |value| blk: {
+            try validateGraphDocumentPath(value.path);
+            break :blk try graphStoredStringPredicate(alloc, "term", "term", value.path, value.term);
+        },
+        .graph_document_prefix_filter => |value| blk: {
+            try validateGraphDocumentPath(value.path);
+            break :blk try graphStoredStringPredicate(alloc, "prefix", "prefix", value.path, value.prefix);
+        },
+        .graph_document_regexp_filter => |value| blk: {
+            try validateGraphDocumentPath(value.path);
+            break :blk try graphStoredStringPredicate(alloc, "regexp", "pattern", value.path, value.regexp);
+        },
+        .graph_document_wildcard_filter => |value| blk: {
+            try validateGraphDocumentPath(value.path);
+            break :blk try graphStoredStringPredicate(alloc, "wildcard", "pattern", value.path, value.wildcard);
+        },
+        .graph_document_fuzzy_filter => |value| blk: {
+            try validateGraphDocumentPath(value.path);
+            const fuzziness = try parseBleveFuzziness(value.fuzziness, 1);
+            const prefix_length = try parseBlevePrefixLength(value.prefix_length);
+            var body = std.json.ObjectMap.empty;
+            try body.put(alloc, "path", .{ .string = value.path });
+            try body.put(alloc, "query", .{ .string = value.term });
+            try body.put(alloc, "max_edits", .{ .integer = fuzziness.max_edits });
+            try body.put(alloc, "prefix_length", .{ .integer = prefix_length });
+            if (fuzziness.auto_fuzzy) try body.put(alloc, "auto_fuzzy", .{ .bool = true });
+            break :blk try graphStoredWrappedPredicate(alloc, "fuzzy", .{ .object = body });
+        },
+        .graph_document_numeric_range_filter => |value| blk: {
+            const range = value.numeric_range;
+            try validateGraphDocumentPath(range.path);
+            if (range.min == null and range.max == null) return error.InvalidQueryRequest;
+            if (range.min) |bound| if (!std.math.isFinite(bound)) return error.InvalidQueryRequest;
+            if (range.max) |bound| if (!std.math.isFinite(bound)) return error.InvalidQueryRequest;
+            var body = std.json.ObjectMap.empty;
+            try body.put(alloc, "path", .{ .string = range.path });
+            if (range.min) |bound| try body.put(alloc, "min", .{ .float = bound });
+            if (range.max) |bound| try body.put(alloc, "max", .{ .float = bound });
+            if (range.inclusive_min) |inclusive| try body.put(alloc, "inclusive_min", .{ .bool = inclusive });
+            if (range.inclusive_max) |inclusive| try body.put(alloc, "inclusive_max", .{ .bool = inclusive });
+            break :blk try graphStoredWrappedPredicate(alloc, "numeric_range", .{ .object = body });
+        },
+        .graph_document_term_range_filter => |value| blk: {
+            const range = value.term_range;
+            try validateGraphDocumentPath(range.path);
+            if (range.min == null and range.max == null) return error.InvalidQueryRequest;
+            var body = std.json.ObjectMap.empty;
+            try body.put(alloc, "path", .{ .string = range.path });
+            if (range.min) |bound| try body.put(alloc, "min", .{ .string = bound });
+            if (range.max) |bound| try body.put(alloc, "max", .{ .string = bound });
+            if (range.inclusive_min) |inclusive| try body.put(alloc, "inclusive_min", .{ .bool = inclusive });
+            if (range.inclusive_max) |inclusive| try body.put(alloc, "inclusive_max", .{ .bool = inclusive });
+            break :blk try graphStoredWrappedPredicate(alloc, "term_range", .{ .object = body });
+        },
+        .graph_document_date_range_filter => |value| blk: {
+            const range = value.date_range;
+            try validateGraphDocumentPath(range.path);
+            if (range.start == null and range.end == null) return error.InvalidQueryRequest;
+            var body = std.json.ObjectMap.empty;
+            try body.put(alloc, "path", .{ .string = range.path });
+            if (range.start) |bound| {
+                const timestamp = (try parseRfc3339ToNs(bound)) orelse return error.InvalidQueryRequest;
+                try body.put(alloc, "start_ns", try graphJsonU64(alloc, timestamp));
+            }
+            if (range.end) |bound| {
+                const timestamp = (try parseRfc3339ToNs(bound)) orelse return error.InvalidQueryRequest;
+                try body.put(alloc, "end_ns", try graphJsonU64(alloc, timestamp));
+            }
+            if (range.inclusive_start) |inclusive| try body.put(alloc, "inclusive_start", .{ .bool = inclusive });
+            if (range.inclusive_end) |inclusive| try body.put(alloc, "inclusive_end", .{ .bool = inclusive });
+            break :blk try graphStoredWrappedPredicate(alloc, "date_range", .{ .object = body });
+        },
+        .graph_document_ids_filter => |value| blk: {
+            if (value.ids.len == 0 or value.ids.len > 10_000) return error.InvalidQueryRequest;
+            var seen = std.StringHashMapUnmanaged(void).empty;
+            var ids = std.json.Array.init(alloc);
+            for (value.ids) |id| {
+                const result = try seen.getOrPut(alloc, id);
+                if (result.found_existing) return error.InvalidQueryRequest;
+                try ids.append(.{ .string = id });
+            }
+            break :blk try graphStoredWrappedPredicate(alloc, "doc_id", .{ .array = ids });
+        },
+        .graph_document_bool_field_filter => |value| blk: {
+            try validateGraphDocumentPath(value.bool_field.path);
+            var body = std.json.ObjectMap.empty;
+            try body.put(alloc, "path", .{ .string = value.bool_field.path });
+            try body.put(alloc, "value", .{ .bool = value.bool_field.value });
+            break :blk try graphStoredWrappedPredicate(alloc, "bool_field", .{ .object = body });
+        },
+        .graph_document_match_all_filter => |value| blk: {
+            try validateGraphEmptyObject(value.match_all);
+            break :blk try graphStoredEmptyPredicate(alloc, "match_all");
+        },
+        .graph_document_match_none_filter => |value| blk: {
+            try validateGraphEmptyObject(value.match_none);
+            break :blk try graphStoredEmptyPredicate(alloc, "match_none");
+        },
+        .graph_document_filter_conjunction => |value| try lowerGraphConjunction(alloc, value.*, depth, budget),
+        .graph_document_filter_disjunction => |value| try lowerGraphDisjunction(alloc, value.*, depth, budget),
+        .graph_document_filter_boolean => |value| try lowerGraphBoolean(alloc, value.*, depth, budget),
+    };
+}
+
+fn validateGraphDocumentPath(path: []const u8) !void {
+    if (!validGraphDocumentJsonPointer(path)) return error.InvalidQueryRequest;
+}
+
+fn validateGraphEmptyObject(value: std.json.Value) !void {
+    if (value != .object or value.object.count() != 0) return error.InvalidQueryRequest;
+}
+
+fn graphStoredWrappedPredicate(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    body: std.json.Value,
+) !std.json.Value {
+    var root = std.json.ObjectMap.empty;
+    try root.put(alloc, name, body);
+    return .{ .object = root };
+}
+
+fn graphStoredStringPredicate(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    value_name: []const u8,
+    path: []const u8,
+    value: []const u8,
+) !std.json.Value {
+    var body = std.json.ObjectMap.empty;
+    try body.put(alloc, "path", .{ .string = path });
+    try body.put(alloc, value_name, .{ .string = value });
+    return graphStoredWrappedPredicate(alloc, name, .{ .object = body });
+}
+
+fn graphStoredEmptyPredicate(alloc: std.mem.Allocator, name: []const u8) !std.json.Value {
+    return graphStoredWrappedPredicate(alloc, name, .{ .object = std.json.ObjectMap.empty });
+}
+
+fn graphJsonU64(alloc: std.mem.Allocator, value: u64) !std.json.Value {
+    if (value <= std.math.maxInt(i64)) return .{ .integer = @intCast(value) };
+    return .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{value}) };
+}
+
+fn lowerGraphFilterArray(
+    alloc: std.mem.Allocator,
+    filters: []const indexes_openapi.GraphDocumentFilter,
+    depth: usize,
+    budget: *GraphFilterLoweringBudget,
+) anyerror!std.json.Array {
+    if (filters.len == 0 or filters.len > 64) return error.InvalidQueryRequest;
+    var out = std.json.Array.init(alloc);
+    try out.ensureTotalCapacity(filters.len);
+    for (filters) |filter| {
+        out.appendAssumeCapacity(try lowerGraphDocumentFilter(alloc, filter, depth + 1, budget));
     }
-    if (end) |bound| {
-        if (bound != .string or (try parseRfc3339ToNs(bound.string)) == null)
-            return error.InvalidQueryRequest;
+    return out;
+}
+
+fn lowerGraphConjunction(
+    alloc: std.mem.Allocator,
+    conjunction: indexes_openapi.GraphDocumentFilterConjunction,
+    depth: usize,
+    budget: *GraphFilterLoweringBudget,
+) anyerror!std.json.Value {
+    const conjuncts = try lowerGraphFilterArray(alloc, conjunction.conjuncts, depth, budget);
+    return graphStoredWrappedPredicate(alloc, "conjuncts", .{ .array = conjuncts });
+}
+
+fn lowerGraphDisjunction(
+    alloc: std.mem.Allocator,
+    disjunction: indexes_openapi.GraphDocumentFilterDisjunction,
+    depth: usize,
+    budget: *GraphFilterLoweringBudget,
+) anyerror!std.json.Value {
+    const disjuncts = try lowerGraphFilterArray(alloc, disjunction.disjuncts, depth, budget);
+    const minimum = disjunction.min orelse
+        return graphStoredWrappedPredicate(alloc, "disjuncts", .{ .array = disjuncts });
+    if (minimum < 0 or minimum > 64 or @as(usize, @intCast(minimum)) > disjuncts.items.len)
+        return error.InvalidQueryRequest;
+    var body = std.json.ObjectMap.empty;
+    // The stored-filter contract intentionally gives a pure SHOULD a semantic
+    // floor of one. An explicit graph `min: 0` means optional, so make the
+    // match-all requirement explicit instead of weakening that shared safety
+    // invariant for every stored-filter caller.
+    if (minimum == 0) {
+        var must = std.json.Array.init(alloc);
+        try must.append(try graphStoredEmptyPredicate(alloc, "match_all"));
+        try body.put(alloc, "must", .{ .array = must });
     }
+    try body.put(alloc, "should", .{ .array = disjuncts });
+    try body.put(alloc, "minimum_should_match", .{ .integer = minimum });
+    return graphStoredWrappedPredicate(alloc, "bool", .{ .object = body });
+}
+
+fn lowerGraphBoolean(
+    alloc: std.mem.Allocator,
+    boolean: indexes_openapi.GraphDocumentFilterBoolean,
+    depth: usize,
+    budget: *GraphFilterLoweringBudget,
+) anyerror!std.json.Value {
+    if (boolean.must == null and boolean.should == null and
+        boolean.must_not == null and boolean.filter == null)
+        return error.InvalidQueryRequest;
+
+    var body = std.json.ObjectMap.empty;
+    var has_required = false;
+    if (boolean.must) |must| {
+        try body.put(alloc, "must", .{ .array = try lowerGraphFilterArray(alloc, must.conjuncts, depth, budget) });
+        has_required = true;
+    }
+    if (boolean.filter) |filter| {
+        var filters = std.json.Array.init(alloc);
+        try filters.append(try lowerGraphDocumentFilter(alloc, filter, depth + 1, budget));
+        try body.put(alloc, "filter", .{ .array = filters });
+        has_required = true;
+    }
+    if (boolean.should) |should| {
+        const items = try lowerGraphFilterArray(alloc, should.disjuncts, depth, budget);
+        if (should.min) |minimum| {
+            if (minimum < 0 or minimum > 64 or @as(usize, @intCast(minimum)) > items.items.len)
+                return error.InvalidQueryRequest;
+            if (minimum == 0 and !has_required) {
+                var must = std.json.Array.init(alloc);
+                try must.append(try graphStoredEmptyPredicate(alloc, "match_all"));
+                try body.put(alloc, "must", .{ .array = must });
+                has_required = true;
+            }
+            try body.put(alloc, "minimum_should_match", .{ .integer = minimum });
+        }
+        try body.put(alloc, "should", .{ .array = items });
+    }
+    if (boolean.must_not) |must_not| {
+        var items = std.json.Array.init(alloc);
+        if (must_not.min) |_| {
+            try items.append(try lowerGraphDisjunction(alloc, must_not, depth, budget));
+        } else {
+            items = try lowerGraphFilterArray(alloc, must_not.disjuncts, depth, budget);
+        }
+        try body.put(alloc, "must_not", .{ .array = items });
+    }
+    return graphStoredWrappedPredicate(alloc, "bool", .{ .object = body });
 }
 
 fn parseGraphDirection(value: ?indexes_openapi.EdgeDirection) graph_mod.EdgeDirection {

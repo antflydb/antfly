@@ -17,6 +17,7 @@ const ant_json = @import("antfly-json");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const db_mod = @import("../storage/db/mod.zig");
+const graph_mod = @import("../graph/graph.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const query_contract = @import("query_contract.zig");
@@ -576,7 +577,7 @@ test "parse supported graph queries alloc clones edge types and keys" {
     try std.testing.expect(items[0].query.start_nodes.identities[0].table == null);
     try std.testing.expect(items[0].query.params.node_filter.filter_query_json != null);
     try std.testing.expectEqualStrings(
-        "{\"term\":{\"path\":\"tenant\",\"term\":\"visible\"}}",
+        "{\"term\":{\"path\":\"/tenant\",\"term\":\"visible\"}}",
         items[0].query.params.node_filter.filter_query_json.?,
     );
 }
@@ -983,6 +984,97 @@ test "parse supported graph queries accepts pattern node filter queries" {
         error.InvalidQueryRequest,
         parseSupportedGraphQueriesAlloc(alloc, malformed_path.value),
     );
+}
+
+test "graph document filters preserve explicit boolean thresholds" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{
+        \\  "graph_queries": {"walk": {
+        \\    "index": "graph_idx",
+        \\    "match": {"anchor": "a", "nodes": {
+        \\      "a": {"filter": {"should": {"disjuncts": [
+        \\        {"term": "gold", "path": "/tier"}
+        \\      ], "min": 0}}},
+        \\      "b": {"filter": {"must_not": {"disjuncts": [
+        \\        {"term": "blocked", "path": "/status"},
+        \\        {"term": "private", "path": "/visibility"}
+        \\      ], "min": 2}}}
+        \\    }, "edges": [{"from": "a", "to": "b"}]},
+        \\    "return": {"bindings": ["a", "b"]}
+        \\  }}
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    defer freeNamedGraphQueries(alloc, items);
+
+    var optional_should = try ant_json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        items[0].query.match_pattern.?.nodes[0].filter.filter_query_json.?,
+        .{},
+    );
+    defer optional_should.deinit();
+    const optional_bool = optional_should.value.object.get("bool").?.object;
+    try std.testing.expectEqual(@as(i64, 0), optional_bool.get("minimum_should_match").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), optional_bool.get("must").?.array.items.len);
+    try std.testing.expect(optional_bool.get("must").?.array.items[0].object.get("match_all") != null);
+
+    var threshold_not = try ant_json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        items[0].query.match_pattern.?.nodes[1].filter.filter_query_json.?,
+        .{},
+    );
+    defer threshold_not.deinit();
+    const must_not = threshold_not.value.object.get("bool").?.object.get("must_not").?.array;
+    try std.testing.expectEqual(@as(usize, 1), must_not.items.len);
+    const nested_bool = must_not.items[0].object.get("bool").?.object;
+    try std.testing.expectEqual(@as(i64, 2), nested_bool.get("minimum_should_match").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), nested_bool.get("should").?.array.items.len);
+}
+
+fn expectInvalidGraphDocumentFilter(filter_json: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"graph_queries\":{{\"walk\":{{\"index\":\"graph_idx\",\"match\":{{\"anchor\":\"a\",\"nodes\":{{\"a\":{{\"filter\":{s}}}}},\"edges\":[]}},\"return\":{{\"bindings\":[\"a\"]}}}}}}}}",
+        .{filter_json},
+    );
+    defer alloc.free(body);
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+}
+
+test "graph document filter admission enforces generated schema constraints" {
+    try expectInvalidGraphDocumentFilter("{\"ids\":[]}");
+    try expectInvalidGraphDocumentFilter("{\"ids\":[\"a\",\"a\"]}");
+    try expectInvalidGraphDocumentFilter("{\"numeric_range\":{\"path\":\"/score\"}}");
+    try expectInvalidGraphDocumentFilter("{\"date_range\":{\"path\":\"/at\",\"start\":\"not-a-date\"}}");
+    try expectInvalidGraphDocumentFilter("{\"disjuncts\":[]}");
+    try expectInvalidGraphDocumentFilter("{\"disjuncts\":[{\"match_all\":{}}],\"min\":2}");
+}
+
+test "graph match edges preserve explicit direction" {
+    const alloc = std.testing.allocator;
+    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
+        \\{"graph_queries":{"walk":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{},"b":{},"c":{}},"edges":[
+        \\  {"from":"a","to":"b"},
+        \\  {"from":"b","to":"c","direction":"in"},
+        \\  {"from":"c","to":"a","direction":"both"}
+        \\]},"return":{"bindings":["a"]}}}}
+    , .{});
+    defer parsed.deinit();
+
+    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    defer freeNamedGraphQueries(alloc, items);
+    const edges = items[0].query.match_pattern.?.edges;
+    try std.testing.expectEqual(graph_mod.EdgeDirection.out, edges[0].step.direction);
+    try std.testing.expectEqual(graph_mod.EdgeDirection.in, edges[1].step.direction);
+    try std.testing.expectEqual(graph_mod.EdgeDirection.both, edges[2].step.direction);
 }
 
 test "graph node filters reject analyzer-backed text clauses" {
