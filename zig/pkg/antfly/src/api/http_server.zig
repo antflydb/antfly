@@ -723,6 +723,21 @@ pub const RestoreExecutionGuard = struct {
     is_current: *const fn (ptr: *anyopaque, leadership_term: u64) bool,
 };
 
+fn restoreWorkerAuthorityMatches(
+    current_owner_id: u64,
+    current_leadership_term: u64,
+    expected_owner_id: u64,
+    expected_leadership_term: u64,
+    guard: ?RestoreExecutionGuard,
+) bool {
+    if (current_owner_id != expected_owner_id or
+        current_leadership_term != expected_leadership_term)
+        return false;
+    const active_guard = guard orelse return true;
+    return expected_leadership_term != 0 and
+        active_guard.is_current(active_guard.ptr, expected_leadership_term);
+}
+
 /// Process-local admission shared by every protocol adapter that invokes the
 /// public application operations below.
 pub const RequestAdmission = @import("../common/request_admission.zig").RequestAdmission;
@@ -11553,6 +11568,24 @@ pub const ApiHttpServer = struct {
         return term != 0 and guard.is_current(guard.ptr, term);
     }
 
+    /// Worker authority is narrower than general restore admission: delayed
+    /// completion paths must still belong to the exact durable-job owner and
+    /// metadata leadership term captured at submission. This fences a worker
+    /// from an earlier term even if this process later becomes leader again.
+    fn restoreWorkerAuthorityCurrent(self: *ApiHttpServer, owner_id: u64, leadership_term: u64) bool {
+        if (self.restore_jobs_closing.load(.acquire) or
+            self.restore_dispatch_paused.load(.acquire) or
+            self.restore_job_owner_id.load(.acquire) != owner_id)
+            return false;
+        return restoreWorkerAuthorityMatches(
+            self.restore_job_owner_id.load(.acquire),
+            self.restore_leadership_term.load(.acquire),
+            owner_id,
+            leadership_term,
+            self.cfg.restore_execution_guard,
+        );
+    }
+
     pub fn executeExtensionHostBatch(
         self: *ApiHttpServer,
         result_alloc: std.mem.Allocator,
@@ -13150,6 +13183,7 @@ pub const ApiHttpServer = struct {
     fn submitRestoreJob(self: *ApiHttpServer, job_id: u64) !void {
         const runtime = self.cfg.backend_runtime orelse return error.AsyncRestoreUnavailable;
         const owner_id = self.restore_job_owner_id.load(.acquire);
+        const leadership_term = self.restore_leadership_term.load(.acquire);
         if (runtime.threaded_jobs == null or owner_id == 0)
             return error.AsyncRestoreUnavailable;
         platform_sync.lockYielding(&self.restore_schedule_mutex);
@@ -13172,7 +13206,12 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
         errdefer self.unmarkScheduledRestoreJob(job_id);
         const work = try self.alloc.create(RestoreJobWork);
-        work.* = .{ .server = self, .job_id = job_id, .owner_id = owner_id };
+        work.* = .{
+            .server = self,
+            .job_id = job_id,
+            .owner_id = owner_id,
+            .leadership_term = leadership_term,
+        };
         runtime.durable_jobs.submit(.{
             .owner_id = owner_id,
             .class = .maintenance,
@@ -13251,6 +13290,7 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         event: *std.Io.Event,
         owner_id: u64,
+        leadership_term: u64,
         delay_ms: u64,
     ) bool {
         const io = self.sharedApiIo() orelse {
@@ -13258,15 +13298,12 @@ pub const ApiHttpServer = struct {
             // compatibility path tightly bounded so ownership drain latency is
             // never coupled to the five-second production backoff.
             sleepNs(@min(delay_ms, restore_jobs.restore_retry_min_ms) * @as(u64, std.time.ns_per_ms));
-            return !self.restore_jobs_closing.load(.acquire) and
-                self.restore_job_owner_id.load(.acquire) == owner_id;
+            return self.restoreWorkerAuthorityCurrent(owner_id, leadership_term);
         };
         event.reset();
 
         platform_sync.lockYielding(&self.restore_schedule_mutex);
-        if (self.restore_jobs_closing.load(.acquire) or
-            self.restore_job_owner_id.load(.acquire) != owner_id)
-        {
+        if (!self.restoreWorkerAuthorityCurrent(owner_id, leadership_term)) {
             self.restore_schedule_mutex.unlock();
             return false;
         }
@@ -13284,8 +13321,7 @@ pub const ApiHttpServer = struct {
             // Preserve correctness if that invariant is violated without
             // spinning or extending leadership drain by the full backoff.
             io.sleep(std.Io.Duration.fromMilliseconds(@intCast(@min(delay_ms, restore_jobs.restore_retry_min_ms))), .awake) catch return false;
-            return !self.restore_jobs_closing.load(.acquire) and
-                self.restore_job_owner_id.load(.acquire) == owner_id;
+            return self.restoreWorkerAuthorityCurrent(owner_id, leadership_term);
         };
         defer {
             platform_sync.lockYielding(&self.restore_schedule_mutex);
@@ -13295,8 +13331,7 @@ pub const ApiHttpServer = struct {
         }
 
         _ = waitForRestoreBackoffEvent(io, event, delay_ms) catch return false;
-        return !self.restore_jobs_closing.load(.acquire) and
-            self.restore_job_owner_id.load(.acquire) == owner_id;
+        return self.restoreWorkerAuthorityCurrent(owner_id, leadership_term);
     }
 
     fn unmarkScheduledRestoreJob(self: *ApiHttpServer, job_id: u64) void {
@@ -13798,32 +13833,49 @@ const RestoreJobWork = struct {
     server: *ApiHttpServer,
     job_id: u64,
     owner_id: u64,
+    leadership_term: u64,
     attempt_id: u64 = 0,
     retry_wakeup: std.Io.Event = .unset,
 
     fn run(ptr: *anyopaque) !void {
         const self: *RestoreJobWork = @ptrCast(@alignCast(ptr));
-        self.server.runRestoreJob(self.job_id, &self.attempt_id) catch |err| {
-            // Leadership rebuilds recover running attempts into the durable
-            // FIFO. The old owner must never turn a correctly fenced attempt
-            // into a terminal failure while leadership is moving.
-            if (restoreJobErrorIsFenced(err)) {
-                self.requeueExactAttempt(err);
+        var retry_delay_ms = restore_jobs.restore_retry_min_ms;
+        while (self.authorityCurrent()) {
+            self.attempt_id = 0;
+            self.server.runRestoreJob(self.job_id, &self.attempt_id) catch |err| {
+                // Leadership rebuilds recover running attempts into the durable
+                // FIFO. The old owner must never turn a correctly fenced attempt
+                // into a terminal failure while leadership is moving.
+                if (restoreJobErrorIsFenced(err)) {
+                    if (!self.recoverExactAttempt(err, &retry_delay_ms)) return;
+                    if (!self.waitForRetry(&retry_delay_ms)) {
+                        // A same-owner I/O cancellation must not strand the
+                        // queued predecessor. Leadership loss is rebuilt from
+                        // replicated state by the new owner.
+                        if (self.authorityCurrent())
+                            self.server.restore_job_store.requeuePending(self.job_id) catch {};
+                        return;
+                    }
+                    continue;
+                }
+                std.log.err("restore job execution failed job_id={d} attempt_id={d} err={s}", .{
+                    self.job_id,
+                    self.attempt_id,
+                    @errorName(err),
+                });
+                self.failExactAttempt(err, &retry_delay_ms);
                 return;
-            }
-            std.log.err("restore job execution failed job_id={d} err={s}", .{ self.job_id, @errorName(err) });
-            self.server.restore_job_store.failRunningById(self.server.alloc, self.job_id, @errorName(err)) catch |persist_err| {
-                std.log.err("failed to persist restore job failure job_id={d} err={s}", .{ self.job_id, @errorName(persist_err) });
             };
-        };
+            return;
+        }
     }
 
-    fn requeueExactAttempt(self: *RestoreJobWork, cause: anyerror) void {
-        var retry_delay_ms = restore_jobs.restore_retry_min_ms;
-        while (!self.server.restore_jobs_closing.load(.acquire) and
-            self.server.restore_job_owner_id.load(.acquire) == self.owner_id)
-        {
-            const requeued = self.server.restore_job_store.recoverDispatchedAttempt(
+    /// Returns true only when begin did not commit and this same worker should
+    /// retry the queued predecessor after backoff. Every other durable outcome
+    /// releases the worker slot.
+    fn recoverExactAttempt(self: *RestoreJobWork, cause: anyerror, retry_delay_ms: *u64) bool {
+        while (self.authorityCurrent()) {
+            const outcome = self.server.restore_job_store.recoverDispatchedAttempt(
                 self.server.alloc,
                 self.job_id,
                 self.attempt_id,
@@ -13833,23 +13885,53 @@ const RestoreJobWork = struct {
                 // its checkpoint store is temporarily unavailable. Keep one
                 // bounded worker asleep instead of spinning or consuming a
                 // fresh durable-job slot on every retry.
-                if (self.server.restore_job_owner_id.load(.acquire) != self.owner_id) return;
                 std.log.warn("restore attempt requeue deferred job_id={d} attempt_id={d} err={s}", .{
                     self.job_id,
                     self.attempt_id,
                     @errorName(err),
                 });
-                if (!self.server.waitForRestoreBackoff(
-                    &self.retry_wakeup,
-                    self.owner_id,
-                    retry_delay_ms,
-                )) return;
-                retry_delay_ms = @min(retry_delay_ms * 2, restore_jobs.restore_retry_max_ms);
+                if (!self.waitForRetry(retry_delay_ms)) return false;
                 continue;
             };
-            _ = requeued;
+            return outcome == .retry_queued;
+        }
+        return false;
+    }
+
+    fn failExactAttempt(self: *RestoreJobWork, cause: anyerror, retry_delay_ms: *u64) void {
+        while (self.authorityCurrent()) {
+            _ = self.server.restore_job_store.failRunningAttempt(
+                self.server.alloc,
+                self.job_id,
+                self.attempt_id,
+                @errorName(cause),
+            ) catch |err| {
+                std.log.warn("restore attempt terminalization deferred job_id={d} attempt_id={d} err={s}", .{
+                    self.job_id,
+                    self.attempt_id,
+                    @errorName(err),
+                });
+                if (!self.waitForRetry(retry_delay_ms)) return;
+                continue;
+            };
             return;
         }
+    }
+
+    fn waitForRetry(self: *RestoreJobWork, retry_delay_ms: *u64) bool {
+        const delay_ms = retry_delay_ms.*;
+        const elapsed = self.server.waitForRestoreBackoff(
+            &self.retry_wakeup,
+            self.owner_id,
+            self.leadership_term,
+            delay_ms,
+        );
+        retry_delay_ms.* = @min(delay_ms * 2, restore_jobs.restore_retry_max_ms);
+        return elapsed;
+    }
+
+    fn authorityCurrent(self: *const RestoreJobWork) bool {
+        return self.server.restoreWorkerAuthorityCurrent(self.owner_id, self.leadership_term);
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -13870,6 +13952,27 @@ test "restore job ownership failures remain retryable" {
     try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobPersistenceUnavailable));
     try std.testing.expect(restoreJobErrorIsFenced(error.NotLeader));
     try std.testing.expect(!restoreJobErrorIsFenced(error.InvalidArguments));
+}
+
+test "restore worker authority is fenced across leadership reacquisition" {
+    const GuardState = struct {
+        current_term: std.atomic.Value(u64) = .init(7),
+
+        fn isCurrent(ptr: *anyopaque, term: u64) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.current_term.load(.acquire) == term;
+        }
+    };
+    var state: GuardState = .{};
+    const guard: RestoreExecutionGuard = .{ .ptr = &state, .is_current = GuardState.isCurrent };
+
+    try std.testing.expect(restoreWorkerAuthorityMatches(41, 7, 41, 7, guard));
+    state.current_term.store(9, .release);
+    // The process-local durable-job owner may not have rotated yet, but the
+    // captured term is already stale and cannot finalize an attempt.
+    try std.testing.expect(!restoreWorkerAuthorityMatches(41, 7, 41, 7, guard));
+    try std.testing.expect(!restoreWorkerAuthorityMatches(41, 9, 41, 7, guard));
+    try std.testing.expect(restoreWorkerAuthorityMatches(41, 0, 41, 0, null));
 }
 
 fn restoreJobIdFromPath(path: []const u8) ?u64 {

@@ -679,6 +679,14 @@ pub const Store = struct {
             const current = self.jobs.get(job_id) orelse continue;
             var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
+            if (parsed.value.cancel_requested) {
+                const encoded = try self.updateLocked(alloc, parsed.value, .{
+                    .phase = .cancelled,
+                    .last_error = "cancel_requested",
+                });
+                alloc.free(encoded);
+                continue;
+            }
             const dispatch_sequence = try self.allocateDispatchSequenceLocked();
             const not_before_ms = nowMillis() +| restoreRetryDelayMs(job_id, parsed.value.attempt_id);
             const encoded = try self.updateLocked(alloc, parsed.value, .{
@@ -1331,20 +1339,32 @@ pub const Store = struct {
         return result.encoded;
     }
 
+    pub const DispatchRecovery = enum {
+        /// The queued predecessor is still durable because begin did not
+        /// commit. The current worker retains scheduling ownership and retries
+        /// after backoff instead of allocating another durable job.
+        retry_queued,
+        /// The exact running attempt was durably returned to the shared FIFO.
+        requeued,
+        /// Cancellation won and the exact attempt was made terminal.
+        cancelled,
+        /// The durable record no longer belongs to this worker.
+        stale,
+    };
+
     /// Restores dispatcher ownership after a retryable worker failure. A queued
-    /// record is reindexed only when no attempt was proposed or its next attempt
-    /// matches this worker's proposal. Running records are fenced exactly, so a
-    /// stale owner cannot requeue a replacement attempt.
+    /// predecessor remains owned by the current worker; running records are
+    /// fenced exactly, so a stale owner cannot requeue a replacement attempt.
     pub fn recoverDispatchedAttempt(
         self: *Store,
         alloc: std.mem.Allocator,
         job_id: u64,
         attempt_id: u64,
         err_name: []const u8,
-    ) !bool {
+    ) !DispatchRecovery {
         self.lock();
         defer self.mutex.unlock();
-        const current = self.jobs.get(job_id) orelse return false;
+        const current = self.jobs.get(job_id) orelse return .stale;
         var parsed = try std.json.parseFromSlice(
             JobState,
             alloc,
@@ -1354,19 +1374,14 @@ pub const Store = struct {
         defer parsed.deinit();
         if (parsed.value.phase == .queued) {
             if (attempt_id != 0 and parsed.value.attempt_id +| 1 != attempt_id)
-                return false;
-            try self.insertPendingSortedLocked(.{
-                .job_id = job_id,
-                .dispatch_sequence = parsed.value.dispatch_sequence,
-                .not_before_ms = parsed.value.not_before_ms,
-            });
-            return true;
+                return .stale;
+            return .retry_queued;
         }
         if (attempt_id == 0 or
             parsed.value.phase != .running or
             parsed.value.attempt_id != attempt_id)
         {
-            return false;
+            return .stale;
         }
         if (parsed.value.cancel_requested) {
             const cancelled = try self.updateLocked(alloc, parsed.value, .{
@@ -1374,7 +1389,7 @@ pub const Store = struct {
                 .last_error = "cancel_requested",
             });
             alloc.free(cancelled);
-            return true;
+            return .cancelled;
         }
 
         self.compactPendingFullyLocked();
@@ -1393,7 +1408,7 @@ pub const Store = struct {
             .dispatch_sequence = dispatch_sequence,
             .not_before_ms = not_before_ms,
         });
-        return true;
+        return .requeued;
     }
 
     pub fn finish(self: *Store, alloc: std.mem.Allocator, expected: JobState, result_json: []const u8) ![]u8 {
@@ -1408,15 +1423,19 @@ pub const Store = struct {
         return try self.finishAs(alloc, expected, .failed, result_json, err_name);
     }
 
-    pub fn failRunningById(self: *Store, alloc: std.mem.Allocator, job_id: u64, err_name: []const u8) !void {
+    /// Terminalizes only the exact running attempt owned by the caller. A
+    /// delayed worker from an older attempt is a no-op after leadership recovery
+    /// or another dispatcher has begun a replacement attempt.
+    pub fn failRunningAttempt(self: *Store, alloc: std.mem.Allocator, job_id: u64, attempt_id: u64, err_name: []const u8) !bool {
         self.lock();
         defer self.mutex.unlock();
-        const current = self.jobs.get(job_id) orelse return;
+        const current = self.jobs.get(job_id) orelse return false;
         var parsed = try std.json.parseFromSlice(JobState, alloc, current, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        if (parsed.value.phase != .running) return;
+        if (attempt_id == 0 or parsed.value.phase != .running or parsed.value.attempt_id != attempt_id) return false;
         const encoded = try self.updateLocked(alloc, parsed.value, .{ .phase = .failed, .last_error = err_name });
         alloc.free(encoded);
+        return true;
     }
 
     /// Return one exact running attempt to the durable FIFO after a
@@ -2672,7 +2691,7 @@ test "restore ownership loss requeues only the exact running attempt" {
     var parsed_one = try std.json.parseFromSlice(JobState, std.testing.allocator, running_one, .{});
     defer parsed_one.deinit();
 
-    try std.testing.expect(try store.recoverDispatchedAttempt(
+    try std.testing.expectEqual(Store.DispatchRecovery.requeued, try store.recoverDispatchedAttempt(
         std.testing.allocator,
         parsed_one.value.job_id,
         parsed_one.value.attempt_id,
@@ -2690,7 +2709,7 @@ test "restore ownership loss requeues only the exact running attempt" {
     var parsed_two = try std.json.parseFromSlice(JobState, std.testing.allocator, running_two, .{});
     defer parsed_two.deinit();
     try std.testing.expectEqual(parsed_one.value.attempt_id + 1, parsed_two.value.attempt_id);
-    try std.testing.expect(!try store.recoverDispatchedAttempt(
+    try std.testing.expectEqual(Store.DispatchRecovery.stale, try store.recoverDispatchedAttempt(
         std.testing.allocator,
         parsed_one.value.job_id,
         parsed_one.value.attempt_id,
@@ -2702,9 +2721,22 @@ test "restore ownership loss requeues only the exact running attempt" {
     defer parsed_still_running.deinit();
     try std.testing.expectEqual(Phase.running, parsed_still_running.value.phase);
     try std.testing.expectEqual(parsed_two.value.attempt_id, parsed_still_running.value.attempt_id);
+
+    try std.testing.expect(!try store.failRunningAttempt(
+        std.testing.allocator,
+        parsed_one.value.job_id,
+        parsed_one.value.attempt_id,
+        "stale-owner",
+    ));
+    try std.testing.expect(try store.failRunningAttempt(
+        std.testing.allocator,
+        parsed_two.value.job_id,
+        parsed_two.value.attempt_id,
+        "terminal",
+    ));
 }
 
-test "restore dispatch recovery reindexes a job when begin persistence fails" {
+test "restore dispatch recovery retains worker ownership when begin persistence fails" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
     var store = Store.initWithIo(std.testing.allocator, std.testing.io);
@@ -2739,7 +2771,7 @@ test "restore dispatch recovery reindexes a job when begin persistence fails" {
     try std.testing.expectEqual(@as(u64, 1), proposed_attempt_id);
     persistence.fail_put_private = false;
 
-    try std.testing.expect(try store.recoverDispatchedAttempt(
+    try std.testing.expectEqual(Store.DispatchRecovery.retry_queued, try store.recoverDispatchedAttempt(
         std.testing.allocator,
         parsed_created.value.job_id,
         proposed_attempt_id,
@@ -2747,7 +2779,13 @@ test "restore dispatch recovery reindexes a job when begin persistence fails" {
     ));
     const recovered = try store.takePendingIds(std.testing.allocator, 1);
     defer std.testing.allocator.free(recovered);
-    try std.testing.expectEqualSlices(u64, &.{parsed_created.value.job_id}, recovered);
+    try std.testing.expectEqual(@as(usize, 0), recovered.len);
+
+    const running = (try store.begin(std.testing.allocator, parsed_created.value.job_id)).?;
+    defer std.testing.allocator.free(running);
+    var parsed_running = try std.json.parseFromSlice(JobState, std.testing.allocator, running, .{});
+    defer parsed_running.deinit();
+    try std.testing.expectEqual(proposed_attempt_id, parsed_running.value.attempt_id);
 }
 
 test "restore retry jitter is stable and honors production bounds" {
@@ -2955,6 +2993,44 @@ test "replicated restore leadership rebuild preserves FIFO and recovers running 
     try std.testing.expectEqual(Phase.queued, parsed_recovered.value.phase);
     try std.testing.expect(parsed_recovered.value.not_before_ms > 0);
     try std.testing.expect(parsed_recovered.value.dispatch_sequence > parsed_running.value.dispatch_sequence);
+}
+
+test "replicated restore leadership terminalizes cancellation of a running attempt" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+
+    const created = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "cancelled-leader-change",
+        .location = "s3://archive/cancelled-leader-change",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:cluster",
+    });
+    defer std.testing.allocator.free(created);
+    var parsed_created = try std.json.parseFromSlice(JobState, std.testing.allocator, created, .{});
+    defer parsed_created.deinit();
+    const job_id = parsed_created.value.job_id;
+
+    const dispatched = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(dispatched);
+    const running = (try store.begin(std.testing.allocator, job_id)).?;
+    defer std.testing.allocator.free(running);
+    const cancellation = (try store.cancel(std.testing.allocator, job_id)).?;
+    std.testing.allocator.free(cancellation);
+
+    try store.prepareReplicatedLeadership(std.testing.allocator);
+    const loaded = (try store.load(std.testing.allocator, job_id)).?;
+    defer std.testing.allocator.free(loaded);
+    var parsed = try std.json.parseFromSlice(JobState, std.testing.allocator, loaded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(Phase.cancelled, parsed.value.phase);
+    try std.testing.expectEqualStrings("cancel_requested", parsed.value.last_error.?);
+    const pending = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(pending);
+    try std.testing.expectEqual(@as(usize, 0), pending.len);
 }
 
 test "replicated restore expiry deletion preserves foreign boundary failure" {
