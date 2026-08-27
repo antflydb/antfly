@@ -248,6 +248,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   activeTableName.current = tableName;
   const indexesRequestSequence = useRef(0);
   const tableMetadataRequestSequence = useRef(0);
+  const artifactSourcesCapabilityRequestSequence = useRef(0);
   const queryAbortController = useRef<AbortController | null>(null);
   const navigate = useNavigate();
   const [indexes, setIndexes] = useState<IndexStatus[]>([]);
@@ -265,7 +266,6 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     undefined
   );
   const [artifactSourcesCapabilityError, setArtifactSourcesCapabilityError] = useState(false);
-  const [artifactSourcesCapabilityRequest, setArtifactSourcesCapabilityRequest] = useState(0);
   const [openDropDialog, setOpenDropDialog] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState<IndexStatus | null>(null);
   const [query, setQuery] = useState("");
@@ -276,28 +276,32 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [selectedFields, setSelectedFields] = useState<string[]>([]);
   const [includeProfile, setIncludeProfile] = useState(false);
 
-  useEffect(() => {
-    let active = true;
+  const refreshArtifactSourcesCapability = useCallback(() => {
+    const requestSequence = ++artifactSourcesCapabilityRequestSequence.current;
     setArtifactSourcesSupported(undefined);
     setArtifactSourcesCapabilityError(false);
     void client
       .getStatus()
       .then((status) => {
-        if (active) {
+        if (requestSequence === artifactSourcesCapabilityRequestSequence.current) {
           setArtifactSourcesSupported(status.index_capabilities?.artifact_sources === true);
           setArtifactSourcesCapabilityError(false);
         }
       })
       .catch(() => {
-        if (active) {
+        if (requestSequence === artifactSourcesCapabilityRequestSequence.current) {
           setArtifactSourcesSupported(undefined);
           setArtifactSourcesCapabilityError(true);
         }
       });
+  }, [client]);
+
+  useEffect(() => {
+    refreshArtifactSourcesCapability();
     return () => {
-      active = false;
+      artifactSourcesCapabilityRequestSequence.current++;
     };
-  }, [artifactSourcesCapabilityRequest, client]);
+  }, [refreshArtifactSourcesCapability]);
 
   // Derive search modes from input content instead of toggles
   const hasSemanticQuery = query.trim().length > 0 && queryIndexes.length > 0;
@@ -1564,9 +1568,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         schema={tableSchema}
         artifactSourcesSupported={artifactSourcesSupported}
         artifactSourcesCapabilityError={artifactSourcesCapabilityError}
-        onRetryArtifactSourcesCapability={() =>
-          setArtifactSourcesCapabilityRequest((request) => request + 1)
-        }
+        onRetryArtifactSourcesCapability={refreshArtifactSourcesCapability}
       />
       <Dialog open={openDropDialog} onOpenChange={setOpenDropDialog}>
         <DialogContent className="max-w-[450px]">
