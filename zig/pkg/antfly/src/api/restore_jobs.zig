@@ -154,7 +154,7 @@ pub const ReplicatedPersistence = extern struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    pub const abi_version: u32 = 1;
+    pub const abi_version: u32 = 2;
 
     pub const OwnedRow = struct { key: []u8, value: []u8 };
     pub const AbiRow = extern struct {
@@ -181,24 +181,27 @@ pub const ReplicatedPersistence = extern struct {
             ptr: *anyopaque,
             key: runtime_memory_abi.Bytes,
             value: runtime_memory_abi.Bytes,
+            leadership_term: u64,
         ) callconv(.c) runtime_error_abi.Status,
         delete: *const fn (
             ptr: *anyopaque,
             key: runtime_memory_abi.Bytes,
+            leadership_term: u64,
         ) callconv(.c) runtime_error_abi.Status,
         delete_many: *const fn (
             ptr: *anyopaque,
             alloc: *const runtime_memory_abi.Allocator,
             keys: ?[*]const runtime_memory_abi.Bytes,
             key_count: usize,
+            leadership_term: u64,
         ) callconv(.c) runtime_error_abi.Status,
     };
     pub const LocalVTable = struct {
         load: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]OwnedRow,
         get: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8) anyerror!?[]u8,
-        put: *const fn (ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void,
-        delete: *const fn (ptr: *anyopaque, key: []const u8) anyerror!void,
-        delete_many: *const fn (ptr: *anyopaque, keys: []const []const u8) anyerror!void,
+        put: *const fn (ptr: *anyopaque, key: []const u8, value: []const u8, leadership_term: u64) anyerror!void,
+        delete: *const fn (ptr: *anyopaque, key: []const u8, leadership_term: u64) anyerror!void,
+        delete_many: *const fn (ptr: *anyopaque, keys: []const []const u8, leadership_term: u64) anyerror!void,
     };
 
     pub fn fromLocal(ptr: *anyopaque, comptime local: LocalVTable) ReplicatedPersistence {
@@ -274,16 +277,18 @@ pub const ReplicatedPersistence = extern struct {
                 ptr: *anyopaque,
                 key: runtime_memory_abi.Bytes,
                 value: runtime_memory_abi.Bytes,
+                leadership_term: u64,
             ) callconv(.c) runtime_error_abi.Status {
-                local.put(ptr, key.slice(), value.slice()) catch |err| return fail("put", err);
+                local.put(ptr, key.slice(), value.slice(), leadership_term) catch |err| return fail("put", err);
                 return .ok;
             }
 
             fn delete(
                 ptr: *anyopaque,
                 key: runtime_memory_abi.Bytes,
+                leadership_term: u64,
             ) callconv(.c) runtime_error_abi.Status {
-                local.delete(ptr, key.slice()) catch |err| return fail("delete", err);
+                local.delete(ptr, key.slice(), leadership_term) catch |err| return fail("delete", err);
                 return .ok;
             }
 
@@ -292,6 +297,7 @@ pub const ReplicatedPersistence = extern struct {
                 allocator: *const runtime_memory_abi.Allocator,
                 keys_ptr: ?[*]const runtime_memory_abi.Bytes,
                 key_count: usize,
+                leadership_term: u64,
             ) callconv(.c) runtime_error_abi.Status {
                 if (!allocator.valid())
                     return fail("delete_many", error.UnsupportedVersion);
@@ -300,7 +306,7 @@ pub const ReplicatedPersistence = extern struct {
                 defer alloc.free(keys);
                 const abi_keys = if (key_count == 0) &.{} else keys_ptr.?[0..key_count];
                 for (abi_keys, 0..) |key, index| keys[index] = key.slice();
-                local.delete_many(ptr, keys) catch |err| return fail("delete_many", err);
+                local.delete_many(ptr, keys, leadership_term) catch |err| return fail("delete_many", err);
                 return .ok;
             }
         };
@@ -336,17 +342,17 @@ pub const ReplicatedPersistence = extern struct {
         return if (out.present != 0) out.bytes.slice() else null;
     }
 
-    pub fn put(self: ReplicatedPersistence, key: []const u8, value: []const u8) !void {
+    pub fn put(self: ReplicatedPersistence, key: []const u8, value: []const u8, leadership_term: u64) !void {
         try self.validateVersion();
-        try statusToError(self.vtable.put(self.ptr, .fromSlice(key), .fromSlice(value)));
+        try statusToError(self.vtable.put(self.ptr, .fromSlice(key), .fromSlice(value), leadership_term));
     }
 
-    pub fn delete(self: ReplicatedPersistence, key: []const u8) !void {
+    pub fn delete(self: ReplicatedPersistence, key: []const u8, leadership_term: u64) !void {
         try self.validateVersion();
-        try statusToError(self.vtable.delete(self.ptr, .fromSlice(key)));
+        try statusToError(self.vtable.delete(self.ptr, .fromSlice(key), leadership_term));
     }
 
-    pub fn deleteMany(self: ReplicatedPersistence, alloc: std.mem.Allocator, keys: []const []const u8) !void {
+    pub fn deleteMany(self: ReplicatedPersistence, alloc: std.mem.Allocator, keys: []const []const u8, leadership_term: u64) !void {
         try self.validateVersion();
         const abi_keys = try alloc.alloc(runtime_memory_abi.Bytes, keys.len);
         defer alloc.free(abi_keys);
@@ -358,6 +364,7 @@ pub const ReplicatedPersistence = extern struct {
             &abi_allocator,
             if (abi_keys.len == 0) null else abi_keys.ptr,
             abi_keys.len,
+            leadership_term,
         ));
     }
 
@@ -405,6 +412,9 @@ pub const Store = struct {
     opened: ?*OpenedStore = null,
     runtime: ?*backend_erased.Store = null,
     replicated: ?ReplicatedPersistence = null,
+    /// Captured metadata leadership term used for every replicated mutation.
+    /// The persistence adapter atomically compares this term at Raft admission.
+    replicated_leadership_term: u64 = 0,
     retained_bytes: usize = 0,
     next_prune_at_ms: u64 = 0,
 
@@ -634,10 +644,12 @@ pub const Store = struct {
     /// Called once for each newly acquired metadata leadership term. Running
     /// attempts from the old leader are fenced by incrementing their attempt on
     /// the next begin and returned to the durable FIFO.
-    pub fn prepareReplicatedLeadership(self: *Store, alloc: std.mem.Allocator) !void {
+    pub fn prepareReplicatedLeadership(self: *Store, alloc: std.mem.Allocator, leadership_term: u64) !void {
         self.lock();
         defer self.mutex.unlock();
         const persistence = self.replicated orelse return;
+        if (leadership_term == 0) return error.NotLeader;
+        self.replicated_leadership_term = leadership_term;
         self.clearInMemoryLocked();
         const rows = try persistence.load(self.alloc);
         defer ReplicatedPersistence.freeRows(self.alloc, rows);
@@ -656,7 +668,11 @@ pub const Store = struct {
         var expired_offset: usize = 0;
         while (expired_offset < expired_keys.items.len) {
             const end = @min(expired_offset + restore_job_prune_batch_size, expired_keys.items.len);
-            try persistence.deleteMany(self.alloc, expired_keys.items[expired_offset..end]);
+            try persistence.deleteMany(
+                self.alloc,
+                expired_keys.items[expired_offset..end],
+                self.replicated_leadership_term,
+            );
             expired_offset = end;
         }
         self.sortPendingLocked();
@@ -1793,7 +1809,8 @@ pub const Store = struct {
             try txn.put(key, value);
             return txn.commit();
         }
-        if (self.replicated) |replicated| return replicated.put(key, value);
+        if (self.replicated) |replicated|
+            return replicated.put(key, value, self.replicated_leadership_term);
         return error.RestoreJobPersistenceUnavailable;
     }
 
@@ -1808,7 +1825,8 @@ pub const Store = struct {
             };
             return txn.commit();
         }
-        if (self.replicated) |replicated| return replicated.delete(key);
+        if (self.replicated) |replicated|
+            return replicated.delete(key, self.replicated_leadership_term);
         return error.RestoreJobPersistenceUnavailable;
     }
 
@@ -1832,7 +1850,8 @@ pub const Store = struct {
             };
             return txn.commit();
         }
-        if (self.replicated) |replicated| return replicated.deleteMany(self.alloc, keys);
+        if (self.replicated) |replicated|
+            return replicated.deleteMany(self.alloc, keys, self.replicated_leadership_term);
         return error.RestoreJobPersistenceUnavailable;
     }
 
@@ -2194,6 +2213,8 @@ const TestReplicatedPersistence = struct {
     fail_load_private: bool = false,
     fail_put_private: bool = false,
     fail_delete_many: bool = false,
+    required_leadership_term: ?u64 = null,
+    last_mutation_term: u64 = 0,
 
     fn init(alloc: std.mem.Allocator) TestReplicatedPersistence {
         return .{ .alloc = alloc };
@@ -2251,8 +2272,12 @@ const TestReplicatedPersistence = struct {
         return result;
     }
 
-    fn put(ptr: *anyopaque, key: []const u8, value: []const u8) !void {
+    fn put(ptr: *anyopaque, key: []const u8, value: []const u8, leadership_term: u64) !void {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
+        self.last_mutation_term = leadership_term;
+        if (self.required_leadership_term) |required| {
+            if (leadership_term != required) return error.NotLeader;
+        }
         if (self.fail_put_private) return error.TestRestoreJobPutPrivateFailure;
         const owned_value = try self.alloc.dupe(u8, value);
         errdefer self.alloc.free(owned_value);
@@ -2266,18 +2291,22 @@ const TestReplicatedPersistence = struct {
         try self.rows.put(self.alloc, owned_key, owned_value);
     }
 
-    fn delete(ptr: *anyopaque, key: []const u8) !void {
+    fn delete(ptr: *anyopaque, key: []const u8, leadership_term: u64) !void {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
+        self.last_mutation_term = leadership_term;
+        if (self.required_leadership_term) |required| {
+            if (leadership_term != required) return error.NotLeader;
+        }
         if (self.rows.fetchRemove(key)) |removed| {
             self.alloc.free(removed.key);
             self.alloc.free(removed.value);
         }
     }
 
-    fn deleteMany(ptr: *anyopaque, keys: []const []const u8) !void {
+    fn deleteMany(ptr: *anyopaque, keys: []const []const u8, leadership_term: u64) !void {
         const self: *TestReplicatedPersistence = @ptrCast(@alignCast(ptr));
         if (self.fail_delete_many) return error.RestoreJobPersistenceUnavailable;
-        for (keys) |key| try delete(ptr, key);
+        for (keys) |key| try delete(ptr, key, leadership_term);
     }
 };
 
@@ -2367,7 +2396,7 @@ test "replicated restore persistence maps private callback errors to stable unav
     persistence.fail_put_private = true;
     try std.testing.expectError(
         error.RestoreJobPersistenceUnavailable,
-        replicated.put("restore/jobs/1", "{}"),
+        replicated.put("restore/jobs/1", "{}", 7),
     );
 }
 
@@ -2736,7 +2765,57 @@ test "restore ownership loss requeues only the exact running attempt" {
     ));
 }
 
-test "restore dispatch recovery retains worker ownership when begin persistence fails" {
+test "replicated restore mutations are rejected after leadership term changes" {
+    var persistence = TestReplicatedPersistence.init(std.testing.allocator);
+    defer persistence.deinit();
+    persistence.required_leadership_term = 7;
+    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+    try store.attachReplicated(persistence.persistence());
+    try store.prepareReplicatedLeadership(std.testing.allocator, 7);
+
+    const created = try store.start(std.testing.allocator, .{
+        .scope = .cluster,
+        .backup_id = "term-fence",
+        .location = "s3://archive/term-fence",
+        .connection = "archive-reader",
+        .idempotency_namespace = "principal:admin:cluster",
+    });
+    defer std.testing.allocator.free(created);
+    var parsed_created = try std.json.parseFromSlice(JobState, std.testing.allocator, created, .{});
+    defer parsed_created.deinit();
+    const dispatched = try store.takePendingIds(std.testing.allocator, 1);
+    defer std.testing.allocator.free(dispatched);
+    const running = (try store.begin(std.testing.allocator, parsed_created.value.job_id)).?;
+    defer std.testing.allocator.free(running);
+    var parsed_running = try std.json.parseFromSlice(JobState, std.testing.allocator, running, .{});
+    defer parsed_running.deinit();
+    try std.testing.expectEqual(@as(u64, 7), persistence.last_mutation_term);
+
+    // Model the node reacquiring leadership in a newer term before the old
+    // worker reaches the persistence callback. The old store token must be
+    // rejected at the mutation boundary, leaving the running record intact.
+    persistence.required_leadership_term = 9;
+    try std.testing.expectError(
+        error.NotLeader,
+        store.failRunningAttempt(
+            std.testing.allocator,
+            parsed_running.value.job_id,
+            parsed_running.value.attempt_id,
+            "stale-worker",
+        ),
+    );
+    const still_running = (try store.load(std.testing.allocator, parsed_running.value.job_id)).?;
+    defer std.testing.allocator.free(still_running);
+    var parsed_still_running = try std.json.parseFromSlice(JobState, std.testing.allocator, still_running, .{});
+    defer parsed_still_running.deinit();
+    try std.testing.expectEqual(Phase.running, parsed_still_running.value.phase);
+
+    try store.prepareReplicatedLeadership(std.testing.allocator, 9);
+    try std.testing.expectEqual(@as(u64, 9), persistence.last_mutation_term);
+}
+
+test "restore dispatch recovery retains worker ownership when begin fails" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
     var store = Store.initWithIo(std.testing.allocator, std.testing.io);
@@ -2757,6 +2836,24 @@ test "restore dispatch recovery retains worker ownership when begin persistence 
     const dispatched = try store.takePendingIds(std.testing.allocator, 1);
     defer std.testing.allocator.free(dispatched);
     try std.testing.expectEqualSlices(u64, &.{parsed_created.value.job_id}, dispatched);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var unestablished_attempt_id: u64 = 99;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        store.beginAttempt(
+            failing.allocator(),
+            parsed_created.value.job_id,
+            &unestablished_attempt_id,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), unestablished_attempt_id);
+    try std.testing.expectEqual(Store.DispatchRecovery.retry_queued, try store.recoverDispatchedAttempt(
+        std.testing.allocator,
+        parsed_created.value.job_id,
+        unestablished_attempt_id,
+        "OutOfMemory",
+    ));
 
     persistence.fail_put_private = true;
     var proposed_attempt_id: u64 = 0;
@@ -2977,9 +3074,9 @@ test "replicated restore leadership rebuild preserves FIFO and recovers running 
         .expires_at_ms = 0,
     });
     defer std.testing.allocator.free(expired);
-    try TestReplicatedPersistence.put(&persistence, expired_key, expired);
+    try TestReplicatedPersistence.put(&persistence, expired_key, expired, 0);
 
-    try store.prepareReplicatedLeadership(std.testing.allocator);
+    try store.prepareReplicatedLeadership(std.testing.allocator, 7);
     try std.testing.expect(!persistence.rows.contains(expired_key));
     const recovered = try store.takePendingIds(std.testing.allocator, 3);
     defer std.testing.allocator.free(recovered);
@@ -3021,7 +3118,7 @@ test "replicated restore leadership terminalizes cancellation of a running attem
     const cancellation = (try store.cancel(std.testing.allocator, job_id)).?;
     std.testing.allocator.free(cancellation);
 
-    try store.prepareReplicatedLeadership(std.testing.allocator);
+    try store.prepareReplicatedLeadership(std.testing.allocator, 7);
     const loaded = (try store.load(std.testing.allocator, job_id)).?;
     defer std.testing.allocator.free(loaded);
     var parsed = try std.json.parseFromSlice(JobState, std.testing.allocator, loaded, .{});
@@ -3061,11 +3158,11 @@ test "replicated restore expiry deletion preserves foreign boundary failure" {
         .expires_at_ms = 0,
     });
     defer std.testing.allocator.free(expired);
-    try TestReplicatedPersistence.put(&persistence, expired_key, expired);
+    try TestReplicatedPersistence.put(&persistence, expired_key, expired, 0);
 
     try std.testing.expectError(
         error.RestoreJobPersistenceUnavailable,
-        store.prepareReplicatedLeadership(std.testing.allocator),
+        store.prepareReplicatedLeadership(std.testing.allocator, 7),
     );
     try std.testing.expect(persistence.rows.contains(expired_key));
 }

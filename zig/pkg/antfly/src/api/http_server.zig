@@ -2515,7 +2515,7 @@ pub const ApiHttpServer = struct {
         self.scheduled_restore_jobs.clearRetainingCapacity();
         self.restore_schedule_mutex.unlock();
         self.restore_jobs_resumed.store(false, .release);
-        try self.restore_job_store.prepareReplicatedLeadership(self.alloc);
+        try self.restore_job_store.prepareReplicatedLeadership(self.alloc, leadership_term);
         self.restore_job_owner_id.store(try runtime.allocOwnerId(), .release);
         self.restore_leadership_term.store(leadership_term, .release);
         self.restore_dispatch_paused.store(false, .release);
@@ -13340,7 +13340,13 @@ pub const ApiHttpServer = struct {
         self.restore_schedule_mutex.unlock();
     }
 
-    fn runRestoreJob(self: *ApiHttpServer, job_id: u64, attempt_id_out: *u64) !void {
+    fn runRestoreJob(
+        self: *ApiHttpServer,
+        job_id: u64,
+        attempt_id_out: *u64,
+        begin_established_out: *bool,
+    ) !void {
+        begin_established_out.* = false;
         if (!self.restoreExecutionPermitted()) {
             try self.restore_job_store.requeuePending(job_id);
             return;
@@ -13353,6 +13359,10 @@ pub const ApiHttpServer = struct {
         defer self.alloc.free(begin.encoded);
         if (begin.attempt_id == 0) return;
         std.debug.assert(attempt_id_out.* == begin.attempt_id);
+        // From here onward the exact running attempt is durable. Errors before
+        // this boundary still belong to the queued predecessor and must never
+        // be sent through running-only terminalization.
+        begin_established_out.* = true;
         var parsed = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const state = parsed.value;
@@ -13842,11 +13852,19 @@ const RestoreJobWork = struct {
         var retry_delay_ms = restore_jobs.restore_retry_min_ms;
         while (self.authorityCurrent()) {
             self.attempt_id = 0;
-            self.server.runRestoreJob(self.job_id, &self.attempt_id) catch |err| {
+            var begin_established = false;
+            self.server.runRestoreJob(
+                self.job_id,
+                &self.attempt_id,
+                &begin_established,
+            ) catch |err| {
                 // Leadership rebuilds recover running attempts into the durable
                 // FIFO. The old owner must never turn a correctly fenced attempt
                 // into a terminal failure while leadership is moving.
-                if (restoreJobErrorIsFenced(err)) {
+                // Every begin-stage error is recoverable regardless of its
+                // error class: no execution side effect exists yet, and the
+                // dispatcher has already removed the queued entry.
+                if (restoreJobFailureRequiresRecovery(begin_established, err)) {
                     if (!self.recoverExactAttempt(err, &retry_delay_ms)) return;
                     if (!self.waitForRetry(&retry_delay_ms)) {
                         // A same-owner I/O cancellation must not strand the
@@ -13947,11 +13965,17 @@ fn restoreJobErrorIsFenced(err: anyerror) bool {
         metadata_authority.isRetryableError(err);
 }
 
+fn restoreJobFailureRequiresRecovery(begin_established: bool, err: anyerror) bool {
+    return !begin_established or restoreJobErrorIsFenced(err);
+}
+
 test "restore job ownership failures remain retryable" {
     try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobFenced));
     try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobPersistenceUnavailable));
     try std.testing.expect(restoreJobErrorIsFenced(error.NotLeader));
     try std.testing.expect(!restoreJobErrorIsFenced(error.InvalidArguments));
+    try std.testing.expect(restoreJobFailureRequiresRecovery(false, error.OutOfMemory));
+    try std.testing.expect(!restoreJobFailureRequiresRecovery(true, error.OutOfMemory));
 }
 
 test "restore worker authority is fenced across leadership reacquisition" {

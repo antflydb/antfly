@@ -4037,6 +4037,27 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null);
+    }
+
+    /// Admits a transition only while this node is still leader in the
+    /// caller's captured term. The comparison and Raft admission share the
+    /// runtime lock, closing the check-then-propose window for background work
+    /// that can outlive a leadership change.
+    pub fn proposeTransitionCommandWithReceiptInTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: u64,
+    ) !MetadataProposalReceipt {
+        if (expected_term == 0) return error.NotLeader;
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term);
+    }
+
+    fn proposeTransitionCommandWithReceiptInExpectedTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: ?u64,
+    ) !MetadataProposalReceipt {
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
         const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
@@ -4047,6 +4068,9 @@ pub const MetadataHttpService = struct {
             return error.NotLeader;
         if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or raft_status.soft.leader_id.? != raft_status.id) {
             return error.NotLeader;
+        }
+        if (expected_term) |term| {
+            if (raft_status.hard.current_term != term) return error.NotLeader;
         }
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
@@ -4169,6 +4193,16 @@ pub const MetadataHttpService = struct {
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
         const receipt = try self.proposeTransitionCommandWithReceipt(command);
+        try self.waitForTransitionApplied(receipt);
+        return receipt;
+    }
+
+    pub fn proposeTransitionCommandAndWaitAppliedInTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: u64,
+    ) !MetadataProposalReceipt {
+        const receipt = try self.proposeTransitionCommandWithReceiptInTerm(command, expected_term);
         try self.waitForTransitionApplied(receipt);
         return receipt;
     }
