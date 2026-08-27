@@ -2862,6 +2862,11 @@ pub const ProvisionedTableReadSource = struct {
         return if (self.group_visible_root_generation) |generation_source| generation_source.visibleRootGenerationForGroup(group_id) else backend_current_root_generation;
     }
 
+    fn monotonicNs(self: *const ProvisionedTableReadSource) u64 {
+        const io_impl = self.io_impl orelse return platform_time.monotonicNs();
+        return @intCast(std.Io.Clock.now(.awake, io_impl.io()).nanoseconds);
+    }
+
     fn managedReadRuntimeConfig(self: *const ProvisionedTableReadSource) ManagedReadRuntimeConfig {
         return .{
             .backend_runtime = self.backend_runtime,
@@ -3362,7 +3367,7 @@ pub const ProvisionedTableReadSource = struct {
         const group_ids = prepared.group_ids;
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        const start_ns = platform_time.monotonicNs();
+        const start_ns = self.monotonicNs();
         if (group_ids.len == 1 and !distributed_graph.supportsCrossRange(req)) {
             var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.managedReadRuntimeConfig(), table_name, req, .stale, prepared.activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
@@ -3378,7 +3383,7 @@ pub const ProvisionedTableReadSource = struct {
             defer result.deinit();
             const response_req = execution.request;
             var meta: query_api.QueryResponseMeta = .{
-                .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
+                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
                 .shard_count = 1,
                 .dense_search = execution.dense_profile,
             };
@@ -3426,7 +3431,7 @@ pub const ProvisionedTableReadSource = struct {
             try self.reacquirePinnedSpanRead(alloc, table_name, readPreparationKindForQuery(req), &prepared);
 
             var meta: query_api.QueryResponseMeta = .{
-                .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
+                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
                 .shard_count = @intCast(group_ids.len),
                 .merged = true,
             };
@@ -3454,7 +3459,7 @@ pub const ProvisionedTableReadSource = struct {
         try checkQueryDeadline(req);
         defer merged.deinit();
         var meta: query_api.QueryResponseMeta = .{
-            .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
+            .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
             .shard_count = @intCast(group_ids.len),
             .merged = group_ids.len > 1,
         };
@@ -3696,7 +3701,7 @@ pub const ProvisionedTableReadSource = struct {
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = req }, consistency, readPreparationKindForQuery(req), 0);
             defer if (read_activity) |*activity| activity.deinit();
-            const start_ns = platform_time.monotonicNs();
+            const start_ns = self.monotonicNs();
             var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale, read_activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
                     if (read_activity) |*activity| activity.deinit();
@@ -3712,7 +3717,7 @@ pub const ProvisionedTableReadSource = struct {
             defer result.deinit();
             const response_req = execution.request;
             var meta: query_api.QueryResponseMeta = .{
-                .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
+                .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
                 .shard_count = 1,
                 .dense_search = execution.dense_profile,
             };
@@ -4712,14 +4717,14 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (self.local_source) |local| return try local.queryGroupLocal(alloc, group_id, table_name, req, consistency);
-        const start_ns = platform_time.monotonicNs();
+        const start_ns = self.monotonicNs();
         var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency, false);
         defer execution.releaseDb();
         var result = execution.result;
         defer result.deinit();
         const response_req = execution.request;
         var meta: query_api.QueryResponseMeta = .{
-            .took_ms = @intCast(@divTrunc(platform_time.monotonicNs() - start_ns, std.time.ns_per_ms)),
+            .took_ms = @intCast(@divTrunc(self.monotonicNs() - start_ns, std.time.ns_per_ms)),
             .shard_count = 1,
             .dense_search = execution.dense_profile,
         };

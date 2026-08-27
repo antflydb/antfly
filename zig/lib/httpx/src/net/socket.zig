@@ -166,7 +166,11 @@ pub const Socket = struct {
     /// Connects to the given address and returns a connected TCP socket.
     pub fn connect(addr: Address, io: Io) !Self {
         const stream = try addr.connect(io, .{ .mode = .stream });
-        return .{ .handle = stream.socket.handle, .io = io };
+        return .{
+            .handle = stream.socket.handle,
+            .io = io,
+            .native_timeouts = isThreadedNetworkIo(io),
+        };
     }
 
     /// Resolves a host and tries each concrete address in resolver order.
@@ -221,7 +225,11 @@ pub const Socket = struct {
 
     /// Creates a socket from a raw handle (e.g. from accept).
     pub fn fromHandle(handle: net.Socket.Handle, io: Io) Self {
-        return .{ .handle = handle, .io = io };
+        return .{
+            .handle = handle,
+            .io = io,
+            .native_timeouts = isThreadedNetworkIo(io),
+        };
     }
 
     /// Closes the socket.
@@ -1506,6 +1514,12 @@ test "Socket recv timeout returns error.Timeout" {
     var accepted = try listener.accept();
     defer accepted.socket.close();
 
+    // Host Threaded sockets use the kernel deadline rather than consuming two
+    // executor tasks to race every read against a sleeping timer. Besides
+    // avoiding per-operation scheduling overhead, this keeps a saturated
+    // async lane from running the timer eagerly before the read is submitted.
+    try std.testing.expect(client.native_timeouts);
+    try std.testing.expect(accepted.socket.native_timeouts);
     try accepted.socket.setRecvTimeout(50);
 
     var recv_buf: [8]u8 = undefined;
