@@ -373,11 +373,19 @@ def decode_query_responses(
     expected_graph_operations: frozenset[str] | None = None,
     expected_graph_queries: Mapping[str, object] | None = None,
 ) -> QueryResponses:
-    """Validate graph results against the request dialect, then decode them."""
+    """Validate graph results against the request dialect, then decode them.
+
+    Supplying canonical graph query contracts selects the canonical dialect;
+    callers cannot accidentally validate those contracts against a legacy
+    graph_searches response while leaving ``graph_dialect`` at ``"auto"``.
+    """
     if expected_graph_operations is not None and expected_graph_queries is not None:
         raise ValueError("expected_graph_operations and expected_graph_queries are mutually exclusive")
     expected_names = expected_graph_operations
     if expected_graph_queries is not None:
+        if graph_dialect not in {"auto", "canonical"}:
+            raise ValueError("expected_graph_queries requires the canonical graph dialect")
+        graph_dialect = "canonical"
         expected_names = frozenset(expected_graph_queries)
 
     response = _object(value, "response")

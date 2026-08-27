@@ -627,7 +627,7 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 		}
 		return result
 	}
-	canonical := decode(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`)
+	canonical := decode(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"application_field":{"nested":[1,true,null]}},"evidence":{"source":"edge"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)
 	legacy := decode(`{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":0}`)
 	var traversal GraphQuery
 	if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]}}}`), &traversal); err != nil {
@@ -635,6 +635,10 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 	}
 	var aggregation GraphQuery
 	if err := json.Unmarshal([]byte(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"rows":{"count":"*"}}}}`), &aggregation); err != nil {
+		t.Fatal(err)
+	}
+	var bindings GraphQuery
+	if err := json.Unmarshal([]byte(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{},"b":{}},"edges":[{"from":"a","to":"b"}]},"return":{"bindings":["a","b"]}}`), &bindings); err != nil {
 		t.Fatal(err)
 	}
 
@@ -701,6 +705,62 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 				GraphResults: map[string]GraphResult{"count": decode(`{"kind":"aggregates","aggregates":{"rows":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}`)},
 			}}},
 			contains: "exact aggregate graph results cannot be truncated",
+		},
+		{
+			name:     "canonical payload requires all structural fields",
+			requests: canonicalRequest,
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[],"stats":{"returned_items":0,"truncated":false}}`)},
+			}}},
+			contains: "requires kind, nodes, and paths",
+		},
+		{
+			name:     "canonical payload rejects unknown protocol fields",
+			requests: canonicalRequest,
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false},"unexpected":true}`)},
+			}}},
+			contains: "unknown field",
+		},
+		{
+			name:     "canonical payload validates stats against items",
+			requests: canonicalRequest,
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)},
+			}}},
+			contains: "returned_items does not match",
+		},
+		{
+			name:     "canonical payload validates path invariants",
+			requests: canonicalRequest,
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[{"key":"b","depth":0}],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`)},
+			}}},
+			contains: "length, nodes, and edges do not align",
+		},
+		{
+			name:     "canonical payload binds aliases to projection",
+			requests: []QueryRequest{{GraphQueries: map[string]GraphQuery{"matched": bindings}}},
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"matched": decode(`{"kind":"bindings","rows":[{"a":{"key":"a"},"c":null}],"stats":{"returned_items":1,"truncated":false}}`)},
+			}}},
+			contains: "unrequested alias",
+		},
+		{
+			name:     "canonical payload binds aggregate names to projection",
+			requests: []QueryRequest{{GraphQueries: map[string]GraphQuery{"count": aggregation}}},
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"count": decode(`{"kind":"aggregates","aggregates":{"other":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":false}}`)},
+			}}},
+			contains: "do not match requested names",
+		},
+		{
+			name:     "hydrated fields remain opaque objects",
+			requests: canonicalRequest,
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":"not-an-object"}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)},
+			}}},
+			contains: "expected an object or null",
 		},
 		{
 			name:     "non graph request rejects graph results",
@@ -798,6 +858,19 @@ func TestCanonicalGraphResultRejectsRowsOverSchemaPropertyLimit(t *testing.T) {
 }
 
 func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
+	decodeQuery := func(encoded string) GraphQuery {
+		t.Helper()
+		var query GraphQuery
+		if err := json.Unmarshal([]byte(encoded), &query); err != nil {
+			t.Fatal(err)
+		}
+		return query
+	}
+	queriesByResultKind := map[string]GraphQuery{
+		"nodes":      decodeQuery(`{"index":"graph","traverse":{"start":{"keys":["a"]}}}`),
+		"bindings":   decodeQuery(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"bindings":["a"]}}`),
+		"aggregates": decodeQuery(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"count":{"count":"*"}}}}`),
+	}
 	malformed := []string{
 		`{"kind":"nodes"}`,
 		`{"kind":"nodes","nodes":[],"paths":[]}`,
@@ -847,6 +920,24 @@ func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 			}
 			if _, err := DecodeGraphResult(result); err == nil {
 				t.Fatal("expected canonical graph result to be rejected")
+			}
+
+			var discriminator struct {
+				Kind string `json:"kind"`
+			}
+			if err := json.Unmarshal([]byte(encoded), &discriminator); err != nil {
+				t.Fatal(err)
+			}
+			query, ok := queriesByResultKind[discriminator.Kind]
+			if !ok {
+				t.Fatalf("test is missing a request contract for result kind %q", discriminator.Kind)
+			}
+			responses := QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"result": result},
+			}}}
+			requests := []QueryRequest{{GraphQueries: map[string]GraphQuery{"result": query}}}
+			if err := validateQueryGraphResponses(requests, &responses); err == nil {
+				t.Fatal("expected automatic query response validation to reject canonical graph result")
 			}
 		})
 	}

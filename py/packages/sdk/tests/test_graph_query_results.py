@@ -87,6 +87,25 @@ def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
             "shortest_path": {"from": {"key": "a"}, "to": {"key": "b"}},
         }
     }
+    with pytest.raises(AntflyException, match="canonical graph results require a discriminator"):
+        decode_query_responses(
+            _query_response(
+                {"type": "shortest_path", "total": 1},
+                operation="path",
+            ),
+            expected_graph_queries=path_query,
+        )
+
+    with pytest.raises(ValueError, match="requires the canonical graph dialect"):
+        decode_query_responses(
+            _query_response(
+                {"type": "shortest_path", "total": 1},
+                operation="path",
+            ),
+            graph_dialect="legacy",
+            expected_graph_queries=path_query,
+        )
+
     with pytest.raises(AntflyException, match="must be 'nodes' for the requested operation"):
         decode_query_responses(
             _query_response(
@@ -97,7 +116,6 @@ def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
                 },
                 operation="path",
             ),
-            graph_dialect="canonical",
             expected_graph_queries=path_query,
         )
 

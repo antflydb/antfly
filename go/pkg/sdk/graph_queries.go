@@ -9,6 +9,7 @@
 package sdk
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -201,11 +202,12 @@ func DecodeLegacyGraphResult(result GraphResult) (LegacyGraphQueryResult, error)
 	return decodeLegacyGraphQueryResult(result, envelope)
 }
 
-// validateQueryGraphResponses binds each graph result envelope to the request
-// that selected its wire dialect and result shape. Keep this automatic check
+// validateQueryGraphResponses binds each graph result to the request that
+// selected its wire dialect and result shape. Keep this automatic check
 // allocation-light: callers that consume a result use DecodeGraphResultForQuery
-// for the one full payload decode. In particular, do not eagerly materialize up
-// to 10,000 hydrated documents here only to discard them before returning.
+// for the one full payload decode. The validation representation retains graph
+// structure but discards opaque hydrated JSON objects instead of materializing
+// up to 10,000 documents only to discard them before returning.
 func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses) error {
 	hasGraphRequest := false
 	for _, request := range requests {
@@ -232,7 +234,7 @@ func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses
 				return fmt.Errorf("antfly: response %d: %w", responseIndex, err)
 			}
 			for name, raw := range response.GraphResults {
-				if err := validateCanonicalGraphResultEnvelope(request.GraphQueries[name], raw); err != nil {
+				if err := validateCanonicalGraphResultForQuery(request.GraphQueries[name], raw); err != nil {
 					return fmt.Errorf("antfly: response %d graph result %q: %w", responseIndex, name, err)
 				}
 			}
@@ -334,7 +336,7 @@ func canonicalGraphResultEnvelope(result graphResultEnvelopeDecoder) (graphQuery
 	return envelope, *kind, nil
 }
 
-func validateCanonicalGraphResultEnvelope(query GraphQuery, result GraphResult) error {
+func validateCanonicalGraphResultForQuery(query GraphQuery, result GraphResult) error {
 	contract, err := canonicalGraphResultContractForQuery(query)
 	if err != nil {
 		return err
@@ -346,10 +348,291 @@ func validateCanonicalGraphResultEnvelope(query GraphQuery, result GraphResult) 
 	if kind != contract.kind {
 		return fmt.Errorf("antfly: graph operation requires result kind %q, got %q", contract.kind, kind)
 	}
-	if kind == string(GraphAggregatesResultKindAggregates) && *envelope.Stats.Truncated {
-		return fmt.Errorf("antfly: exact aggregate graph results cannot be truncated")
+	return validateCanonicalGraphResultPayload(contract, result, envelope)
+}
+
+// graphOpaqueJSONObject validates the outer JSON type while deliberately not
+// retaining object contents. Hydrated documents, evidence, and edge metadata
+// are schema-defined opaque JSON objects; their keys are not graph protocol
+// fields and must not be subjected to DisallowUnknownFields.
+type graphOpaqueJSONObject struct{}
+
+func (*graphOpaqueJSONObject) UnmarshalJSON(encoded []byte) error {
+	trimmed := bytes.TrimSpace(encoded)
+	if bytes.Equal(trimmed, []byte("null")) || len(trimmed) > 0 && trimmed[0] == '{' {
+		return nil
+	}
+	return fmt.Errorf("expected an object or null")
+}
+
+// graphOptionalNonNullString preserves the distinction between an omitted
+// table qualifier and explicit null without allocating a pointer per identity.
+type graphOptionalNonNullString struct {
+	value   string
+	present bool
+}
+
+func (value *graphOptionalNonNullString) UnmarshalJSON(encoded []byte) error {
+	if bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) {
+		return fmt.Errorf("graph node table must be omitted or non-null")
+	}
+	if err := json.Unmarshal(encoded, &value.value); err != nil {
+		return err
+	}
+	value.present = true
+	return nil
+}
+
+func (value *graphOptionalNonNullString) pointer() *string {
+	if !value.present {
+		return nil
+	}
+	return &value.value
+}
+
+type graphBindingNodeValidation struct {
+	Document graphOpaqueJSONObject      `json:"document,omitempty"`
+	Key      string                     `json:"key"`
+	Table    graphOptionalNonNullString `json:"table,omitempty"`
+}
+
+type graphBindingsResultValidation struct {
+	Kind  GraphBindingsResultKind                  `json:"kind"`
+	Rows  []map[string]*graphBindingNodeValidation `json:"rows"`
+	Stats GraphQueryStats                          `json:"stats"`
+}
+
+type graphAggregatesResultValidation struct {
+	Aggregates map[string]GraphAggregateValue `json:"aggregates"`
+	Kind       GraphAggregatesResultKind      `json:"kind"`
+	Stats      GraphQueryStats                `json:"stats"`
+}
+
+type graphPathEdgeValidation struct {
+	Direction GraphPathEdgeDirection `json:"direction"`
+	From      GraphPathEndpoint      `json:"from"`
+	Metadata  graphOpaqueJSONObject  `json:"metadata,omitempty"`
+	To        GraphPathEndpoint      `json:"to"`
+	Type      string                 `json:"type"`
+	Weight    float64                `json:"weight"`
+}
+
+type graphPathValidation struct {
+	Edges          []graphPathEdgeValidation `json:"edges"`
+	Length         int                       `json:"length"`
+	Nodes          []GraphPathEndpoint       `json:"nodes"`
+	ObjectiveValue float64                   `json:"objective_value"`
+	WeightMode     PathWeightMode            `json:"weight_mode"`
+	WeightSum      float64                   `json:"weight_sum"`
+}
+
+type graphResultNodeValidation struct {
+	Depth      int                        `json:"depth"`
+	Document   graphOpaqueJSONObject      `json:"document,omitempty"`
+	Evidence   graphOpaqueJSONObject      `json:"evidence,omitempty"`
+	Key        string                     `json:"key"`
+	Path       []GraphPathEndpoint        `json:"path,omitempty"`
+	PathEdges  []graphPathEdgeValidation  `json:"path_edges,omitempty"`
+	Provenance []string                   `json:"provenance,omitempty"`
+	Table      graphOptionalNonNullString `json:"table,omitempty"`
+}
+
+type graphNodesResultValidation struct {
+	Kind  GraphNodesResultKind        `json:"kind"`
+	Nodes []graphResultNodeValidation `json:"nodes"`
+	Paths []graphPathValidation       `json:"paths"`
+	Stats GraphQueryStats             `json:"stats"`
+}
+
+func validateCanonicalGraphResultPayload(
+	contract canonicalGraphResultContract,
+	result strictGraphResultDecoder,
+	envelope graphQueryResultEnvelope,
+) error {
+	switch contract.kind {
+	case string(GraphBindingsResultKindBindings):
+		return validateBindingsResultPayload(contract, result, envelope)
+	case string(GraphAggregatesResultKindAggregates):
+		return validateAggregatesResultPayload(contract, result, envelope)
+	case string(GraphNodesResultKindNodes):
+		return validateNodesResultPayload(result, envelope)
+	default:
+		return fmt.Errorf("antfly: unknown canonical graph result discriminator %q", contract.kind)
+	}
+}
+
+func validateBindingsResultPayload(contract canonicalGraphResultContract, result strictGraphResultDecoder, envelope graphQueryResultEnvelope) error {
+	var value graphBindingsResultValidation
+	if err := result.DecodeStrictInto(&value); err != nil {
+		return fmt.Errorf("antfly: invalid bindings graph result: %w", err)
+	}
+	if value.Kind != GraphBindingsResultKindBindings || value.Rows == nil {
+		return fmt.Errorf("antfly: bindings graph result requires kind and rows")
+	}
+	if len(value.Rows) > maxGraphHydratedBindings {
+		return fmt.Errorf("antfly: bindings graph result exceeds %d rows", maxGraphHydratedBindings)
+	}
+	expected := make(map[string]struct{}, len(contract.names))
+	for _, name := range contract.names {
+		expected[name] = struct{}{}
+	}
+	for rowIndex, row := range value.Rows {
+		if len(row) == 0 || len(row) > maxGraphMatchNodes {
+			return fmt.Errorf("antfly: bindings graph result row %d must contain between 1 and %d properties", rowIndex, maxGraphMatchNodes)
+		}
+		if len(row) != len(expected) {
+			return fmt.Errorf("antfly: bindings graph result row %d does not match the requested projection", rowIndex)
+		}
+		for alias, binding := range row {
+			if !validGraphIdentifier(alias) {
+				return fmt.Errorf("antfly: bindings graph result row %d has an invalid alias", rowIndex)
+			}
+			if _, ok := expected[alias]; !ok {
+				return fmt.Errorf("antfly: bindings graph result row %d contains unrequested alias %q", rowIndex, alias)
+			}
+			if binding != nil {
+				if err := validateDecodedGraphIdentity(binding.Key, binding.Table.pointer()); err != nil {
+					return fmt.Errorf("antfly: bindings graph result row %d alias %q: %w", rowIndex, alias, err)
+				}
+			}
+		}
+	}
+	return validateDecodedGraphStats(envelope, len(value.Rows), true)
+}
+
+func validateAggregatesResultPayload(contract canonicalGraphResultContract, result strictGraphResultDecoder, envelope graphQueryResultEnvelope) error {
+	var value graphAggregatesResultValidation
+	if err := result.DecodeStrictInto(&value); err != nil {
+		return fmt.Errorf("antfly: invalid aggregates graph result: %w", err)
+	}
+	if value.Kind != GraphAggregatesResultKindAggregates || len(value.Aggregates) == 0 || len(value.Aggregates) > maxGraphCountAggregates {
+		return fmt.Errorf("antfly: aggregates graph result requires between 1 and %d aggregates", maxGraphCountAggregates)
+	}
+	actual := make([]string, 0, len(value.Aggregates))
+	for name, aggregate := range value.Aggregates {
+		if !validGraphIdentifier(name) {
+			return fmt.Errorf("antfly: aggregates graph result has an invalid name")
+		}
+		if !bool(aggregate.Exact) || !isUnsignedDecimal(aggregate.Value) {
+			return fmt.Errorf("antfly: aggregate %q must contain an exact decimal value", name)
+		}
+		actual = append(actual, name)
+	}
+	sort.Strings(actual)
+	if !slices.Equal(actual, contract.names) {
+		return fmt.Errorf("antfly: aggregate graph result names %v do not match requested names %v", actual, contract.names)
+	}
+	return validateDecodedGraphStats(envelope, len(value.Aggregates), false)
+}
+
+func validateNodesResultPayload(result strictGraphResultDecoder, envelope graphQueryResultEnvelope) error {
+	var value graphNodesResultValidation
+	if err := result.DecodeStrictInto(&value); err != nil {
+		return fmt.Errorf("antfly: invalid nodes graph result: %w", err)
+	}
+	if value.Kind != GraphNodesResultKindNodes || value.Nodes == nil || value.Paths == nil {
+		return fmt.Errorf("antfly: nodes graph result requires kind, nodes, and paths")
+	}
+	if len(value.Nodes) > maxGraphHydratedBindings || len(value.Paths) > maxGraphHydratedBindings {
+		return fmt.Errorf("antfly: nodes graph result exceeds %d items", maxGraphHydratedBindings)
+	}
+	for i := range value.Nodes {
+		if err := validateGraphResultNodePayload(&value.Nodes[i]); err != nil {
+			return fmt.Errorf("antfly: nodes graph result node %d: %w", i, err)
+		}
+	}
+	for i := range value.Paths {
+		if err := validateGraphPathPayload(&value.Paths[i]); err != nil {
+			return fmt.Errorf("antfly: nodes graph result path %d: %w", i, err)
+		}
+	}
+	if len(value.Paths) > 0 {
+		if len(value.Nodes) != len(value.Paths) {
+			return fmt.Errorf("antfly: path graph result requires one terminal node per path")
+		}
+		for i := range value.Paths {
+			terminal := value.Paths[i].Nodes[len(value.Paths[i].Nodes)-1]
+			node := &value.Nodes[i]
+			if !sameDecodedGraphEndpoint(terminal, GraphPathEndpoint{Key: node.Key, Table: node.Table.pointer()}) {
+				return fmt.Errorf("antfly: path graph result node %d does not match its path terminal", i)
+			}
+		}
+	}
+	primaryItems := len(value.Nodes)
+	if len(value.Paths) > 0 {
+		primaryItems = len(value.Paths)
+	}
+	return validateDecodedGraphStats(envelope, primaryItems, true)
+}
+
+func validateGraphResultNodePayload(node *graphResultNodeValidation) error {
+	if err := validateDecodedGraphIdentity(node.Key, node.Table.pointer()); err != nil {
+		return err
+	}
+	if node.Depth < 0 || node.Depth > maxGraphMatchEdges {
+		return fmt.Errorf("graph node depth must be between 0 and %d", maxGraphMatchEdges)
+	}
+	if node.Path != nil {
+		if len(node.Path) == 0 || len(node.Path) > maxGraphMatchEdges+1 {
+			return fmt.Errorf("graph node path must contain between 1 and %d nodes", maxGraphMatchEdges+1)
+		}
+		if node.Depth != len(node.Path)-1 {
+			return fmt.Errorf("graph node depth must equal path length minus one")
+		}
+		for _, endpoint := range node.Path {
+			if err := validateDecodedGraphIdentity(endpoint.Key, endpoint.Table); err != nil {
+				return err
+			}
+		}
+		if !sameDecodedGraphEndpoint(node.Path[len(node.Path)-1], GraphPathEndpoint{Key: node.Key, Table: node.Table.pointer()}) {
+			return fmt.Errorf("graph node path must terminate at the result node")
+		}
+	}
+	if node.PathEdges != nil {
+		if node.Path == nil || len(node.PathEdges)+1 != len(node.Path) {
+			return fmt.Errorf("graph node path_edges must align with path")
+		}
+		for i := range node.PathEdges {
+			if err := validateGraphPathEdgePayload(&node.PathEdges[i], node.Path[i], node.Path[i+1], false); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+func validateGraphPathPayload(path *graphPathValidation) error {
+	if path.Nodes == nil || path.Edges == nil || len(path.Nodes) == 0 || len(path.Nodes) > maxGraphMatchEdges+1 {
+		return fmt.Errorf("graph path requires bounded nodes and edges")
+	}
+	if path.Length != len(path.Edges) || len(path.Nodes) != len(path.Edges)+1 {
+		return fmt.Errorf("graph path length, nodes, and edges do not align")
+	}
+	for _, endpoint := range path.Nodes {
+		if err := validateDecodedGraphIdentity(endpoint.Key, endpoint.Table); err != nil {
+			return err
+		}
+	}
+	var sum float64
+	product := 1.0
+	for i := range path.Edges {
+		if err := validateGraphPathEdgePayload(&path.Edges[i], path.Nodes[i], path.Nodes[i+1], path.WeightMode == PathWeightModeMaxWeight); err != nil {
+			return err
+		}
+		sum += path.Edges[i].Weight
+		product *= path.Edges[i].Weight
+		if math.IsInf(sum, 0) || math.IsNaN(sum) || math.IsInf(product, 0) || math.IsNaN(product) {
+			return fmt.Errorf("graph path score overflow")
+		}
+	}
+	return validateGraphPathScore(path.WeightMode, len(path.Edges), path.WeightSum, path.ObjectiveValue, sum, product)
+}
+
+func validateGraphPathEdgePayload(edge *graphPathEdgeValidation, from, to GraphPathEndpoint, maxWeightMode bool) error {
+	if !sameDecodedGraphEndpoint(edge.From, from) || !sameDecodedGraphEndpoint(edge.To, to) {
+		return fmt.Errorf("graph path edge does not match adjacent nodes")
+	}
+	return validateGraphPathEdgeFields(edge.Direction, edge.Type, edge.Weight, maxWeightMode)
 }
 
 func validateGraphResultNames[T any](requested map[string]T, received map[string]GraphResult) error {
@@ -672,13 +955,37 @@ func validateDecodedGraphPath(path GraphPath) error {
 		}
 		return fmt.Errorf("graph path score overflow")
 	}
-	if !finiteNonNegative(path.WeightSum) || !finiteNonNegative(path.ObjectiveValue) || !graphFloatEqual(path.WeightSum, sum) {
+	return validateGraphPathScore(path.WeightMode, len(path.Edges), path.WeightSum, path.ObjectiveValue, sum, product)
+}
+
+func validateDecodedGraphPathEdge(edge GraphPathEdge, from, to GraphPathEndpoint, maxWeightMode bool) error {
+	if !sameDecodedGraphEndpoint(edge.From, from) || !sameDecodedGraphEndpoint(edge.To, to) {
+		return fmt.Errorf("graph path edge does not match adjacent nodes")
+	}
+	return validateGraphPathEdgeFields(edge.Direction, string(edge.Type), edge.Weight, maxWeightMode)
+}
+
+func validateGraphPathEdgeFields(direction GraphPathEdgeDirection, edgeType string, weight float64, maxWeightMode bool) error {
+	if !direction.Valid() {
+		return fmt.Errorf("graph path edge direction must be out or in")
+	}
+	if edgeType == "" || len(edgeType) > maxGraphEdgeTypeBytes || !utf8.ValidString(edgeType) {
+		return fmt.Errorf("graph path edge type must encode to between 1 and %d UTF-8 bytes", maxGraphEdgeTypeBytes)
+	}
+	if !finiteNonNegative(weight) || maxWeightMode && weight > 1 {
+		return fmt.Errorf("graph path edge has an invalid weight")
+	}
+	return nil
+}
+
+func validateGraphPathScore(weightMode PathWeightMode, edgeCount int, weightSum, objectiveValue, sum, product float64) error {
+	if !finiteNonNegative(weightSum) || !finiteNonNegative(objectiveValue) || !graphFloatEqual(weightSum, sum) {
 		return fmt.Errorf("graph path has inconsistent weight_sum")
 	}
 	var objective float64
-	switch path.WeightMode {
+	switch weightMode {
 	case PathWeightModeMinHops:
-		objective = float64(len(path.Edges))
+		objective = float64(edgeCount)
 	case PathWeightModeMinWeight:
 		objective = sum
 	case PathWeightModeMaxWeight:
@@ -686,24 +993,8 @@ func validateDecodedGraphPath(path GraphPath) error {
 	default:
 		return fmt.Errorf("graph path has an unknown weight_mode")
 	}
-	if !graphFloatEqual(path.ObjectiveValue, objective) {
+	if !graphFloatEqual(objectiveValue, objective) {
 		return fmt.Errorf("graph path has an inconsistent objective_value")
-	}
-	return nil
-}
-
-func validateDecodedGraphPathEdge(edge GraphPathEdge, from, to GraphPathEndpoint, maxWeightMode bool) error {
-	if !edge.Direction.Valid() {
-		return fmt.Errorf("graph path edge direction must be out or in")
-	}
-	if edge.Type == "" || len(edge.Type) > maxGraphEdgeTypeBytes || !utf8.ValidString(edge.Type) {
-		return fmt.Errorf("graph path edge type must encode to between 1 and %d UTF-8 bytes", maxGraphEdgeTypeBytes)
-	}
-	if !sameDecodedGraphEndpoint(edge.From, from) || !sameDecodedGraphEndpoint(edge.To, to) {
-		return fmt.Errorf("graph path edge does not match adjacent nodes")
-	}
-	if !finiteNonNegative(edge.Weight) || maxWeightMode && edge.Weight > 1 {
-		return fmt.Errorf("graph path edge has an invalid weight")
 	}
 	return nil
 }
