@@ -184,7 +184,7 @@ pub fn encodeU8Bytes(
     params: *const EncodeParams,
 ) ![]u8 {
     const w: usize, const h: usize, const num_components: usize, const tile_width: usize, const tile_height: usize = try validateEncodeParams(params, pixels.len);
-    try validateCustomMctInvertible(allocator, params);
+    try validateCustomMctInvertible(allocator, params, 128.0);
 
     const planes = try buildUnsignedPlanesU8(allocator, pixels, w, h, num_components);
     defer freePlanes(allocator, planes);
@@ -199,7 +199,8 @@ pub fn encodeU16Bytes(
 ) ![]u8 {
     const w: usize, const h: usize, const num_components: usize, const tile_width: usize, const tile_height: usize = try validateEncodeParams(params, pixels.len);
     if (params.bits_per_component == 0 or params.bits_per_component > 16) return error.UnsupportedSamplePrecision;
-    try validateCustomMctInvertible(allocator, params);
+    const max_centered_sample: f64 = @floatFromInt(@as(u32, 1) << @intCast(params.bits_per_component - 1));
+    try validateCustomMctInvertible(allocator, params, max_centered_sample);
 
     const planes = try buildUnsignedPlanesU16(allocator, pixels, w, h, num_components, params.bits_per_component);
     defer freePlanes(allocator, planes);
@@ -266,13 +267,29 @@ fn validateEncodeParams(params: *const EncodeParams, pixel_len: usize) !struct {
     return .{ w, h, num_components, tile_width, tile_height };
 }
 
-fn validateCustomMctInvertible(allocator: std.mem.Allocator, params: *const EncodeParams) !void {
+fn validateCustomMctInvertible(
+    allocator: std.mem.Allocator,
+    params: *const EncodeParams,
+    max_abs_input: f64,
+) !void {
     const matrix = params.custom_mct orelse return;
     const inverse = color_transform.invertMctMatrixGaussJordan(matrix.forward, matrix.num_components, allocator) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidCustomMct,
     };
-    allocator.free(inverse);
+    defer allocator.free(inverse);
+
+    // Bound every possible centered input, not just the caller's current
+    // pixels. This keeps the tile-local f32 MCT from overflowing after plane
+    // allocation and gives invalid parameter sets deterministic API errors.
+    const n: usize = matrix.num_components;
+    for (0..n) |row| {
+        var row_norm: f64 = 0.0;
+        for (0..n) |col| row_norm += @abs(@as(f64, matrix.forward[row * n + col]));
+        const max_output = row_norm * max_abs_input;
+        if (!std.math.isFinite(max_output) or max_output > std.math.floatMax(f32))
+            return error.InvalidCustomMct;
+    }
 }
 
 fn buildUnsignedPlanesU8(
@@ -603,7 +620,7 @@ fn forward97Pipeline(
     }
 
     for (f32_planes, 0..) |plane, comp_idx| {
-        quantize97Plane(plane, tile_planes[comp_idx], tile_width, tile_height, params);
+        try quantize97Plane(plane, tile_planes[comp_idx], tile_width, tile_height, params);
     }
 }
 
@@ -647,12 +664,12 @@ fn quantize97Plane(
     width: usize,
     height: usize,
     params: *const EncodeParams,
-) void {
+) !void {
     const decomp: u8 = params.decomposition_levels;
     if (decomp == 0) {
         // No DWT pass: the whole plane is LL (deepest level treated as 0).
         const delta = quantization.irreversibleSubbandStepsize(.ll, 0);
-        quantizeSubbandRegion(src_f32, dst_i32, width, 0, 0, width, height, delta);
+        try quantizeSubbandRegion(src_f32, dst_i32, width, 0, 0, width, height, delta);
         return;
     }
 
@@ -678,17 +695,17 @@ fn quantize97Plane(
         // HL: top-right of the current block.
         if (high_w > 0 and low_h > 0) {
             const delta = quantization.irreversibleSubbandStepsize(.hl, level);
-            quantizeSubbandRegion(src_f32, dst_i32, width, low_w, 0, high_w, low_h, delta);
+            try quantizeSubbandRegion(src_f32, dst_i32, width, low_w, 0, high_w, low_h, delta);
         }
         // LH: bottom-left of the current block.
         if (low_w > 0 and high_h > 0) {
             const delta = quantization.irreversibleSubbandStepsize(.lh, level);
-            quantizeSubbandRegion(src_f32, dst_i32, width, 0, low_h, low_w, high_h, delta);
+            try quantizeSubbandRegion(src_f32, dst_i32, width, 0, low_h, low_w, high_h, delta);
         }
         // HH: bottom-right of the current block.
         if (high_w > 0 and high_h > 0) {
             const delta = quantization.irreversibleSubbandStepsize(.hh, level);
-            quantizeSubbandRegion(src_f32, dst_i32, width, low_w, low_h, high_w, high_h, delta);
+            try quantizeSubbandRegion(src_f32, dst_i32, width, low_w, low_h, high_w, high_h, delta);
         }
 
         cur_w = low_w;
@@ -702,7 +719,7 @@ fn quantize97Plane(
         // `decomp_levels` since numres = decomp_levels + 1.
         const ll_level: u8 = decomp;
         const delta = quantization.irreversibleSubbandStepsize(.ll, ll_level);
-        quantizeSubbandRegion(src_f32, dst_i32, width, 0, 0, cur_w, cur_h, delta);
+        try quantizeSubbandRegion(src_f32, dst_i32, width, 0, 0, cur_w, cur_h, delta);
     }
 }
 
@@ -715,8 +732,8 @@ fn quantizeSubbandRegion(
     w: usize,
     h: usize,
     delta: f64,
-) void {
-    quantizeSubbandRegionScaled(src_f32, dst_i32, stride, x0, y0, w, h, delta, 1.0);
+) !void {
+    try quantizeSubbandRegionScaled(src_f32, dst_i32, stride, x0, y0, w, h, delta, 1.0);
 }
 
 /// Per-subband quantization with an explicit coefficient pre-scale. Computes
@@ -736,7 +753,7 @@ fn quantizeSubbandRegionScaled(
     h: usize,
     delta: f64,
     scale: f64,
-) void {
+) !void {
     const inv_delta: f64 = if (delta > 0.0) scale / delta else 0.0;
     var yy: usize = 0;
     while (yy < h) : (yy += 1) {
@@ -746,6 +763,8 @@ fn quantizeSubbandRegionScaled(
             const v = src_f32[row + xx];
             const av: f64 = @abs(@as(f64, v));
             const mag: f64 = @floor(av * inv_delta);
+            if (!std.math.isFinite(mag) or mag > std.math.maxInt(i32))
+                return error.InvalidTransformCoefficient;
             const q: i32 = @intFromFloat(mag);
             dst_i32[row + xx] = if (v < 0.0) -q else q;
         }
@@ -1684,6 +1703,81 @@ test "encoder rejects a singular custom MCT before building component planes" {
     };
     const pixels = [_]u8{0} ** 12;
     try std.testing.expectError(error.InvalidCustomMct, encodeU8Bytes(std.testing.allocator, &pixels, &params));
+}
+
+test "encoder rejects a finite custom MCT that can overflow centered samples" {
+    const huge = std.math.floatMax(f32);
+    const tiny = 1.0 / huge;
+    const forward = [_]f32{
+        huge, 0,    0,
+        0,    huge, 0,
+        0,    0,    huge,
+    };
+    const inverse = [_]f32{
+        tiny, 0,    0,
+        0,    tiny, 0,
+        0,    0,    tiny,
+    };
+    const offsets = [_]f32{ 0, 0, 0 };
+    const matrix = color_transform.CustomMctMatrix{
+        .num_components = 3,
+        .forward = &forward,
+        .inverse = &inverse,
+        .offsets = &offsets,
+    };
+    const params = EncodeParams{
+        .width = 2,
+        .height = 2,
+        .components = 3,
+        .wavelet_transform = 0,
+        .multiple_component_transform = true,
+        .custom_mct = matrix,
+    };
+    const pixels = [_]u8{0} ** 12;
+    try std.testing.expectError(error.InvalidCustomMct, encodeU8Bytes(std.testing.allocator, &pixels, &params));
+}
+
+test "encoder accepts a uniformly scaled well-conditioned custom MCT" {
+    const scale: f32 = 1e-7;
+    const inverse_scale: f32 = 1.0 / scale;
+    const forward = [_]f32{
+        scale, 0,     0,
+        0,     scale, 0,
+        0,     0,     scale,
+    };
+    const inverse = [_]f32{
+        inverse_scale, 0,             0,
+        0,             inverse_scale, 0,
+        0,             0,             inverse_scale,
+    };
+    const offsets = [_]f32{ 0, 0, 0 };
+    const params = EncodeParams{
+        .width = 1,
+        .height = 1,
+        .components = 3,
+        .decomposition_levels = 0,
+        .wavelet_transform = 0,
+        .multiple_component_transform = true,
+        .custom_mct = .{
+            .num_components = 3,
+            .forward = &forward,
+            .inverse = &inverse,
+            .offsets = &offsets,
+        },
+    };
+    const pixels = [_]u8{ 0, 128, 255 };
+    const encoded = try encodeU8Bytes(std.testing.allocator, &pixels, &params);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(encoded.len > 0);
+}
+
+test "irreversible quantization rejects non-representable coefficients" {
+    const source = [_]f32{std.math.floatMax(f32)};
+    var destination = [_]i32{0};
+    try std.testing.expectError(
+        error.InvalidTransformCoefficient,
+        quantizeSubbandRegion(&source, &destination, 1, 0, 0, 1, 1, 1.0),
+    );
 }
 
 test "encode 4x4 grayscale produces valid J2K starting with SOC" {

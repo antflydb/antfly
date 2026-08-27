@@ -399,27 +399,7 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
 
     const policy = policiesForState(&decode_state);
     const pixels = if (try reconstruct.StreamingPlaneAssembler.canAssemble(&decode_state)) blk: {
-        var assembler = try reconstruct.StreamingPlaneAssembler.init(allocator, &decode_state);
-        defer assembler.deinit();
-        const Visitor = struct {
-            fn visit(context: *anyopaque, codeblock_state: *const packet.Tier1CodeblockState) !void {
-                const plane_assembler: *reconstruct.StreamingPlaneAssembler = @ptrCast(@alignCast(context));
-                try plane_assembler.appendCodeblock(codeblock_state);
-            }
-        };
-        try packet.visitTier1CodeblocksForState(
-            allocator,
-            &packet_model,
-            payload_info.payload,
-            &decode_state,
-            .standard,
-            policy.refinement,
-            policy.magnitude,
-            0,
-            .standard,
-            .{ .context = &assembler, .visit = Visitor.visit },
-        );
-        const planes = try assembler.finish(0);
+        const planes = try decodeStreamingRawPlanes(allocator, &packet_model, payload_info.payload, &decode_state, policy, 0);
         defer {
             for (planes) |plane| allocator.free(plane);
             allocator.free(planes);
@@ -773,6 +753,40 @@ fn reconstructComponentPlanesU16FromPlanes(allocator: std.mem.Allocator, planes:
     return .{ .widths = dims.widths, .heights = dims.heights, .planes = planes };
 }
 
+/// Decode codeblocks directly into inverse-wavelet component planes. Each
+/// coefficient grid is released immediately after the visitor consumes it,
+/// bounding peak memory independently of the number of codeblocks.
+fn decodeStreamingRawPlanes(
+    allocator: std.mem.Allocator,
+    packet_model: *const packet.PacketModel,
+    payload: []const u8,
+    state: *const codestream.State,
+    policy: Tier1Policy,
+    discard_levels: u8,
+) ![][]i32 {
+    var assembler = try reconstruct.StreamingPlaneAssembler.init(allocator, state);
+    defer assembler.deinit();
+    const Visitor = struct {
+        fn visit(context: *anyopaque, codeblock_state: *const packet.Tier1CodeblockState) !void {
+            const plane_assembler: *reconstruct.StreamingPlaneAssembler = @ptrCast(@alignCast(context));
+            try plane_assembler.appendCodeblock(codeblock_state);
+        }
+    };
+    try packet.visitTier1CodeblocksForState(
+        allocator,
+        packet_model,
+        payload,
+        state,
+        .standard,
+        policy.refinement,
+        policy.magnitude,
+        0,
+        .standard,
+        .{ .context = &assembler, .visit = Visitor.visit },
+    );
+    return assembler.finish(discard_levels);
+}
+
 fn decodeSingleTileComponentPlanesU8(
     allocator: std.mem.Allocator,
     codestream_bytes: []const u8,
@@ -818,6 +832,27 @@ fn decodeSingleTileComponentPlanesU8AtResolution(
     defer packet_model.deinit(allocator);
 
     const policy = policiesForState(&decode_state);
+    if (try reconstruct.StreamingPlaneAssembler.canAssemble(&decode_state)) {
+        const raw_planes = try decodeStreamingRawPlanes(
+            allocator,
+            &packet_model,
+            payload_info.payload,
+            &decode_state,
+            policy,
+            discard_levels,
+        );
+        defer {
+            for (raw_planes) |plane| allocator.free(plane);
+            allocator.free(raw_planes);
+        }
+        return reconstruct.componentPlanesU8FromRawAtResolution(
+            allocator,
+            &decode_state,
+            raw_planes,
+            discard_levels,
+        );
+    }
+
     var execution = try packet.executeTier1SegmentsForState(
         allocator,
         &packet_model,
@@ -879,6 +914,27 @@ fn decodeSingleTileComponentPlanesU16AtResolution(
     defer packet_model.deinit(allocator);
 
     const policy = policiesForState(&decode_state);
+    if (try reconstruct.StreamingPlaneAssembler.canAssemble(&decode_state)) {
+        const raw_planes = try decodeStreamingRawPlanes(
+            allocator,
+            &packet_model,
+            payload_info.payload,
+            &decode_state,
+            policy,
+            discard_levels,
+        );
+        defer {
+            for (raw_planes) |plane| allocator.free(plane);
+            allocator.free(raw_planes);
+        }
+        return reconstruct.componentPlanesU16FromRawAtResolution(
+            allocator,
+            &decode_state,
+            raw_planes,
+            discard_levels,
+        );
+    }
+
     var execution = try packet.executeTier1SegmentsForState(
         allocator,
         &packet_model,
@@ -2240,6 +2296,10 @@ test "subsampled irreversible U8 clips native samples before interpolation" {
     defer allocator.free(tiled);
     try rewriteSizForSubsampling(single, 8, 8, 8, 8, 2, 2);
     try rewriteSizForSubsampling(tiled, 8, 8, 4, 4, 2, 2);
+
+    var single_state = try codestream.parseState(allocator, single);
+    defer single_state.deinit(allocator);
+    try std.testing.expect(try reconstruct.StreamingPlaneAssembler.canAssemble(&single_state));
 
     var single_u8 = try decodeU8Bytes(allocator, single);
     defer single_u8.deinit();

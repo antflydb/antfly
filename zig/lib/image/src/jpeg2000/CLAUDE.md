@@ -85,7 +85,7 @@ PCRD bisection lives in `rate_control.zig` (`optimizeTruncation`). Wired into en
 
 ## Subsampling
 
-Decoder handles `XRsiz/YRsiz != 1` for U8 and U16 via origin-aware per-component geometry (`tile.componentDimensionsAt`) and reference-grid bilinear upsampling. Reconstructed samples are clipped to their declared native precision before resampling on both output paths. Multi-tile decodes stitch component-grid samples before upsampling, preventing tile-edge clamping seams. U8 processes one compact sample plane at a time during final interleave to bound peak memory; non-8-bit streams retain native precision until after interpolation. Encoder remains 1:1 only.
+Decoder handles `XRsiz/YRsiz != 1` for U8 and U16 via origin-aware per-component geometry (`tile.componentDimensionsAt`) and reference-grid bilinear upsampling. Reconstructed samples are clipped to their declared native precision before resampling on both output paths. Streaming-compatible single-tile streams release each Tier-1 codeblock immediately after inverse-plane assembly; multi-tile decodes stitch component-grid samples before upsampling, preventing tile-edge clamping seams. U8 processes one compact sample plane at a time during final interleave to bound peak memory; non-8-bit streams retain native precision until after interpolation. Encoder remains 1:1 only.
 
 ## Current interop parity (vs OpenJPEG 2.5.4)
 

@@ -242,15 +242,6 @@ pub fn reconstructTier1ComponentPlanesU8AtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) !ComponentPlanesU8 {
-    if (state.header.components.len == 0) return error.UnsupportedPlaneCount;
-    const bits_per_component = state.header.components[0].bits_per_component;
-    const is_signed = state.header.components[0].is_signed;
-    for (state.header.components[1..]) |component| {
-        if (component.bits_per_component != bits_per_component or component.is_signed != is_signed) {
-            return error.UnsupportedPlaneCount;
-        }
-    }
-
     const coding_style = state.coding_style orelse return error.MissingCodingStyle;
     const use_irreversible = coding_style.wavelet_transform == 0;
     const use_component_wavelets = try hasMixedComponentWaveletTransforms(state);
@@ -266,6 +257,27 @@ pub fn reconstructTier1ComponentPlanesU8AtResolution(
     }
 
     if (!use_component_wavelets and !use_irreversible) applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+
+    return componentPlanesU8FromRawAtResolution(allocator, state, raw_planes, discard_levels);
+}
+
+/// Convert reconstructed, level-shifted component planes into compact native
+/// U8 samples. This is shared by retained Tier-1 execution and the bounded
+/// codeblock visitor path so clipping happens before reference-grid resampling.
+pub fn componentPlanesU8FromRawAtResolution(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: []const []const i32,
+    discard_levels: u8,
+) !ComponentPlanesU8 {
+    if (state.header.components.len == 0 or raw_planes.len != state.header.components.len)
+        return error.UnsupportedPlaneCount;
+    const bits_per_component = state.header.components[0].bits_per_component;
+    const is_signed = state.header.components[0].is_signed;
+    for (state.header.components[1..]) |component| {
+        if (component.bits_per_component != bits_per_component or component.is_signed != is_signed)
+            return error.UnsupportedPlaneCount;
+    }
 
     const widths = try allocator.alloc(usize, raw_planes.len);
     errdefer allocator.free(widths);
@@ -316,15 +328,6 @@ pub fn reconstructTier1ComponentPlanesU16AtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) !ComponentPlanesU16 {
-    if (state.header.components.len == 0) return error.UnsupportedPlaneCount;
-    const bits_per_component = state.header.components[0].bits_per_component;
-    const is_signed = state.header.components[0].is_signed;
-    for (state.header.components[1..]) |component| {
-        if (component.bits_per_component != bits_per_component or component.is_signed != is_signed) {
-            return error.UnsupportedPlaneCount;
-        }
-    }
-
     const coding_style = state.coding_style orelse return error.MissingCodingStyle;
     const use_irreversible = coding_style.wavelet_transform == 0;
     const use_component_wavelets = try hasMixedComponentWaveletTransforms(state);
@@ -340,6 +343,26 @@ pub fn reconstructTier1ComponentPlanesU16AtResolution(
     }
 
     if (!use_component_wavelets and !use_irreversible) applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+
+    return componentPlanesU16FromRawAtResolution(allocator, state, raw_planes, discard_levels);
+}
+
+/// U16 counterpart to `componentPlanesU8FromRawAtResolution`, preserving the
+/// declared 9-16 bit component precision for later resampling and color-key use.
+pub fn componentPlanesU16FromRawAtResolution(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: []const []const i32,
+    discard_levels: u8,
+) !ComponentPlanesU16 {
+    if (state.header.components.len == 0 or raw_planes.len != state.header.components.len)
+        return error.UnsupportedPlaneCount;
+    const bits_per_component = state.header.components[0].bits_per_component;
+    const is_signed = state.header.components[0].is_signed;
+    for (state.header.components[1..]) |component| {
+        if (component.bits_per_component != bits_per_component or component.is_signed != is_signed)
+            return error.UnsupportedPlaneCount;
+    }
 
     const widths = try allocator.alloc(usize, raw_planes.len);
     errdefer allocator.free(widths);
