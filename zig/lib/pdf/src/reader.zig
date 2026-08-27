@@ -23,28 +23,57 @@ const Allocator = std.mem.Allocator;
 
 const DecodedRgbaImage = struct { rgba: []u8, width: u32, height: u32 };
 
+const ImageSourceSamples = struct {
+    bytes: []const u8,
+    pixel_count: usize,
+    component_count: usize,
+    stride: usize,
+    bits_per_component: u8,
+    component_offsets: [4]u8 = .{ 0, 1, 2, 3 },
+};
+
+const MaskImageMetadata = struct {
+    width: u32,
+    height: u32,
+    interpolate: bool,
+    matte_rgb: ?[3]u8 = null,
+};
+
+const ColorKeyMask = struct {
+    component_count: usize,
+    ranges: [4][2]u16,
+};
+
+const ImageTransparencyPlan = union(enum) {
+    none,
+    color_key: ColorKeyMask,
+    explicit_mask: struct {
+        object: syntax.Object,
+        metadata: MaskImageMetadata,
+    },
+    soft_mask: struct {
+        object: syntax.Object,
+        metadata: MaskImageMetadata,
+    },
+
+    fn deinit(self: *ImageTransparencyPlan, alloc: Allocator) void {
+        switch (self.*) {
+            .explicit_mask => |*mask| mask.object.deinit(alloc),
+            .soft_mask => |*mask| mask.object.deinit(alloc),
+            .none, .color_key => {},
+        }
+        self.* = .none;
+    }
+
+    fn isColorKey(self: *const ImageTransparencyPlan) bool {
+        return self.* == .color_key;
+    }
+};
+
 const ImageDecodeContext = struct {
     const max_mask_depth: u8 = 16;
 
-    active_mask_refs: std.AutoHashMapUnmanaged(u64, void) = .empty,
-
-    fn deinit(self: *ImageDecodeContext, alloc: Allocator) void {
-        self.active_mask_refs.deinit(alloc);
-    }
-
-    fn enterMask(self: *ImageDecodeContext, alloc: Allocator, obj: *const syntax.Object, depth: u8) !?u64 {
-        if (depth >= max_mask_depth) return error.InvalidPdfImageMask;
-        if (obj.* != .obj_ref) return null;
-        const ptr = obj.obj_ref;
-        const key = (@as(u64, ptr.id) << 16) | ptr.gen;
-        const result = try self.active_mask_refs.getOrPut(alloc, key);
-        if (result.found_existing) return error.InvalidPdfImageMask;
-        return key;
-    }
-
-    fn leaveMask(self: *ImageDecodeContext, key: ?u64) void {
-        if (key) |value| std.debug.assert(self.active_mask_refs.remove(value));
-    }
+    fn deinit(_: *ImageDecodeContext, _: Allocator) void {}
 };
 
 pub const default_max_decoded_stream_bytes: usize = 64 * 1024 * 1024;
@@ -3604,6 +3633,8 @@ pub const Reader = struct {
             .max_decoded_stream_bytes = self.decode_limits.max_decoded_stream_bytes,
             .max_working_set_bytes = available_working_set,
         };
+        var transparency_plan = try self.buildImageTransparencyPlanAlloc(obj, width, height, image_mask);
+        defer transparency_plan.deinit(self.alloc);
         if (has_jbig2) {
             const packed_stride = (@as(usize, width) + 7) / 8;
             const expected_bitmap_bytes = std.math.mul(usize, packed_stride, height) catch return error.PdfDecodeWorkingSetTooLarge;
@@ -3677,18 +3708,29 @@ pub const Reader = struct {
             const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
             var resolved_color_space = try self.resolveValue(color_space_obj);
             defer resolved_color_space.deinit(self.alloc);
-            var samples_live_bytes: usize = 0;
+            var source_samples: ?[]u8 = null;
+            defer if (source_samples) |samples| self.alloc.free(samples);
+            var source_view: ?ImageSourceSamples = null;
             if (resolved_color_space.asName()) |color_space| {
                 if (!std.mem.eql(u8, color_space, "DeviceGray")) return error.UnsupportedPdfRendering;
                 // JBIG2 bitmaps use one for black, while PDF image samples use
                 // zero for black. Normalize at the codec boundary, then apply
                 // the image's Decode array normally (including for SMask).
                 try decodeJbig2DeviceGrayToRgba(rgba, width, height, decoded.pixels, obj.get("Decode"));
+                if (transparency_plan.isColorKey()) {
+                    source_samples = try unpackPackedJbig2SamplesAlloc(self.alloc, decoded.pixels, width, height);
+                    source_view = .{
+                        .bytes = source_samples.?,
+                        .pixel_count = pixel_count,
+                        .component_count = 1,
+                        .stride = 1,
+                        .bits_per_component = 1,
+                    };
+                }
             } else if (resolved_color_space == .array) {
                 try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ input_live_bytes, decoded.pixels.len, rgba_len, pixel_count });
-                const samples = try unpackPackedJbig2SamplesAlloc(self.alloc, decoded.pixels, width, height);
-                defer self.alloc.free(samples);
-                samples_live_bytes = samples.len;
+                source_samples = try unpackPackedJbig2SamplesAlloc(self.alloc, decoded.pixels, width, height);
+                const samples = source_samples.?;
                 if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
                 } else if (try self.tryDecodeCalibratedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"))) {
@@ -3698,13 +3740,24 @@ pub const Reader = struct {
                 } else {
                     try self.decodeIndexedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"));
                 }
+                if (transparency_plan.isColorKey()) {
+                    if (try self.colorSpaceInputComponentCount(&resolved_color_space) != 1) return error.UnsupportedPdfRendering;
+                    source_view = .{
+                        .bytes = samples,
+                        .pixel_count = pixel_count,
+                        .component_count = 1,
+                        .stride = 1,
+                        .bits_per_component = 1,
+                    };
+                }
             } else return error.UnsupportedPdfRendering;
+            const samples_live_bytes = if (source_samples) |samples| samples.len else 0;
             const transparency_live_bytes = try decodeWorkingSetTotal(
                 self.decode_limits.max_working_set_bytes,
                 ancestor_live_bytes,
                 &.{ input_live_bytes, decoded.pixels.len, rgba_len, samples_live_bytes },
             );
-            try self.applyImageTransparencyAlloc(rgba, width, height, obj, context, transparency_live_bytes, mask_depth);
+            try self.applyImageTransparencyPlanAlloc(rgba, width, height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth);
             return .{ .rgba = rgba, .width = width, .height = height };
         }
         if (has_ccitt) {
@@ -3745,7 +3798,13 @@ pub const Reader = struct {
                 ancestor_live_bytes,
                 &.{ raw.len, gray.len, rgba_len },
             );
-            try self.applyImageTransparencyAlloc(rgba, width, height, obj, context, transparency_live_bytes, mask_depth);
+            try self.applyImageTransparencyPlanAlloc(rgba, width, height, &transparency_plan, .{
+                .bytes = gray,
+                .pixel_count = pixel_count,
+                .component_count = 1,
+                .stride = 1,
+                .bits_per_component = 1,
+            }, context, transparency_live_bytes, mask_depth);
             return .{ .rgba = rgba, .width = width, .height = height };
         }
         if (!image_mask and has_jpx) {
@@ -3762,7 +3821,29 @@ pub const Reader = struct {
                 ancestor_live_bytes,
                 &.{ raw.len, jp2_decoded.pixels.len, rgba.len },
             );
-            try self.applyImageTransparencyAlloc(rgba, width, height, obj, context, transparency_live_bytes, mask_depth);
+            var source_view: ?ImageSourceSamples = null;
+            if (transparency_plan.isColorKey()) {
+                const header = try image_lib.jpeg2000.decodeHeaderBytes(self.alloc, raw);
+                if (header.is_signed or header.bits_per_component > 8) return error.UnsupportedPdfRendering;
+                const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
+                var color_space = try self.resolveValue(color_space_obj);
+                defer color_space.deinit(self.alloc);
+                const component_count = try self.colorSpaceInputComponentCount(&color_space);
+                var offsets: [4]u8 = .{ 0, 1, 2, 3 };
+                if (jp2_decoded.jp2_color.alphaLayout(jp2_decoded.components)) |layout| {
+                    if (component_count != 3) return error.UnsupportedPdfRendering;
+                    offsets = .{ layout.red, layout.green, layout.blue, layout.alpha };
+                } else if (component_count != jp2_decoded.components) return error.UnsupportedPdfRendering;
+                source_view = .{
+                    .bytes = jp2_decoded.pixels,
+                    .pixel_count = pixel_count,
+                    .component_count = component_count,
+                    .stride = jp2_decoded.components,
+                    .bits_per_component = header.bits_per_component,
+                    .component_offsets = offsets,
+                };
+            }
+            try self.applyImageTransparencyPlanAlloc(rgba, width, height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth);
             return .{
                 .rgba = rgba,
                 .width = jp2_decoded.width,
@@ -3789,7 +3870,28 @@ pub const Reader = struct {
                 ancestor_live_bytes,
                 &.{ encoded.len, jpeg_decoded.rgba.len },
             );
-            try self.applyImageTransparencyAlloc(jpeg_decoded.rgba, width, height, obj, context, transparency_live_bytes, mask_depth);
+            var source_view: ?ImageSourceSamples = null;
+            if (transparency_plan.isColorKey()) {
+                const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
+                var color_space = try self.resolveValue(color_space_obj);
+                defer color_space.deinit(self.alloc);
+                const name = color_space.asName() orelse return error.UnsupportedPdfRendering;
+                const component_count: usize = if (std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G"))
+                    1
+                else if (std.mem.eql(u8, name, "DeviceRGB") or std.mem.eql(u8, name, "RGB"))
+                    3
+                else
+                    return error.UnsupportedPdfRendering;
+                if (bits_i != 8) return error.UnsupportedPdfRendering;
+                source_view = .{
+                    .bytes = jpeg_decoded.rgba,
+                    .pixel_count = pixel_count,
+                    .component_count = component_count,
+                    .stride = 4,
+                    .bits_per_component = 8,
+                };
+            }
+            try self.applyImageTransparencyPlanAlloc(jpeg_decoded.rgba, width, height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth);
             return .{
                 .rgba = jpeg_decoded.rgba,
                 .width = jpeg_decoded.width,
@@ -3850,7 +3952,18 @@ pub const Reader = struct {
             ancestor_live_bytes,
             &.{ decoded.len, rgba_len, unpacked_live_bytes },
         );
-        try self.applyImageTransparencyAlloc(rgba, width, height, obj, context, transparency_live_bytes, mask_depth);
+        var source_view: ?ImageSourceSamples = null;
+        if (transparency_plan.isColorKey()) {
+            const component_count = try self.colorSpaceInputComponentCount(&resolved_color_space);
+            source_view = .{
+                .bytes = samples,
+                .pixel_count = pixel_count,
+                .component_count = component_count,
+                .stride = component_count,
+                .bits_per_component = @intCast(bits_i),
+            };
+        }
+        try self.applyImageTransparencyPlanAlloc(rgba, width, height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth);
 
         return .{ .rgba = rgba, .width = width, .height = height };
     }
@@ -3930,7 +4043,7 @@ pub const Reader = struct {
             std.mem.eql(u8, family, "Indexed") or
             std.mem.eql(u8, family, "I") or
             std.mem.eql(u8, family, "Separation")) return 1;
-        if (std.mem.eql(u8, family, "CalRGB")) return 3;
+        if (std.mem.eql(u8, family, "CalRGB") or std.mem.eql(u8, family, "Lab")) return 3;
         if (std.mem.eql(u8, family, "DeviceN")) {
             if (color_space.array.len < 2) return error.UnsupportedPdfRendering;
             var names = try self.resolveValue(&color_space.array[1]);
@@ -4338,68 +4451,194 @@ pub const Reader = struct {
         }
     }
 
-    fn applyImageTransparencyAlloc(
+    fn buildImageTransparencyPlanAlloc(
         self: *const Reader,
-        rgba: []u8,
+        obj: *const syntax.Object,
         width: u32,
         height: u32,
-        obj: *const syntax.Object,
-        context: *ImageDecodeContext,
-        parent_live_bytes: usize,
-        mask_depth: u8,
-    ) anyerror!void {
+        image_mask: bool,
+    ) anyerror!ImageTransparencyPlan {
+        if (image_mask) {
+            if (obj.get("Mask") != null or obj.get("SMask") != null) return error.InvalidPdfImageMask;
+            return .none;
+        }
+
         if (obj.get("SMask")) |smask_obj| {
-            const active_key = try context.enterMask(self.alloc, smask_obj, mask_depth);
-            defer context.leaveMask(active_key);
             var resolved = try self.resolveValue(smask_obj);
-            defer resolved.deinit(self.alloc);
-            if (resolved == .name) {
-                if (!std.mem.eql(u8, resolved.name, "None")) return error.InvalidPdfImageMask;
-            } else if (resolved == .stream) {
-                // A soft mask is part of the image's pixel definition, not
-                // optional decoration. Propagate unsupported codecs so the
-                // caller can use a capable page renderer instead of silently
-                // sending a corrupted image downstream.
-                try validateImageMaskDimensions(&resolved, width, height);
-                const smask = try self.decodeImageToRgbaGuardedAlloc(&resolved, context, parent_live_bytes, mask_depth + 1);
-                defer self.alloc.free(smask.rgba);
-                if (smask.width != width or smask.height != height) return error.InvalidPdfImageMask;
-                applySoftMaskAlpha(rgba, smask.rgba);
+            if (resolved == .name and std.mem.eql(u8, resolved.name, "None")) {
+                resolved.deinit(self.alloc);
             } else {
-                return error.InvalidPdfImageMask;
+                errdefer resolved.deinit(self.alloc);
+                if (resolved != .stream) return error.InvalidPdfImageMask;
+                const metadata = try self.validateSoftMaskMetadataAlloc(&resolved, obj, width, height);
+                return .{ .soft_mask = .{ .object = resolved, .metadata = metadata } };
             }
         }
 
         if (obj.get("Mask")) |mask_obj| {
-            const active_key = try context.enterMask(self.alloc, mask_obj, mask_depth);
-            defer context.leaveMask(active_key);
             var resolved = try self.resolveValue(mask_obj);
-            defer resolved.deinit(self.alloc);
+            errdefer resolved.deinit(self.alloc);
             if (resolved == .array) {
-                applyColorKeyMask(rgba, resolved.array);
-            } else if (resolved == .stream) {
-                try validateImageMaskDimensions(&resolved, width, height);
-                const mask = try self.decodeImageToRgbaGuardedAlloc(&resolved, context, parent_live_bytes, mask_depth + 1);
-                defer self.alloc.free(mask.rgba);
-                if (mask.width != width or mask.height != height) return error.InvalidPdfImageMask;
-                const mask_is_stencil = if (resolved.get("ImageMask")) |value| switch (value.*) {
-                    .boolean => |flag| flag,
-                    else => false,
-                } else false;
-                applyExplicitMaskAlpha(rgba, mask.rgba, mask_is_stencil);
-            } else {
-                return error.InvalidPdfImageMask;
+                const color_space_obj = obj.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
+                var color_space = try self.resolveValue(color_space_obj);
+                defer color_space.deinit(self.alloc);
+                const component_count = try self.colorSpaceInputComponentCount(&color_space);
+                const color_key = try parseColorKeyMask(resolved.array, component_count);
+                resolved.deinit(self.alloc);
+                return .{ .color_key = color_key };
             }
+            return switch (resolved) {
+                .stream => .{ .explicit_mask = .{
+                    .object = resolved,
+                    .metadata = try self.validateExplicitMaskMetadata(&resolved),
+                } },
+                else => error.InvalidPdfImageMask,
+            };
         }
+        return .none;
     }
 
-    fn validateImageMaskDimensions(mask: *const syntax.Object, expected_width: u32, expected_height: u32) !void {
-        const width_i = (mask.get("Width") orelse return error.InvalidPdfImageMask).asInteger() orelse return error.InvalidPdfImageMask;
-        const height_i = (mask.get("Height") orelse return error.InvalidPdfImageMask).asInteger() orelse return error.InvalidPdfImageMask;
-        if (width_i <= 0 or height_i <= 0) return error.InvalidPdfImageMask;
-        const width = std.math.cast(u32, width_i) orelse return error.InvalidPdfImageMask;
-        const height = std.math.cast(u32, height_i) orelse return error.InvalidPdfImageMask;
-        if (width != expected_width or height != expected_height) return error.InvalidPdfImageMask;
+    fn validateSoftMaskMetadataAlloc(
+        self: *const Reader,
+        mask: *const syntax.Object,
+        parent: *const syntax.Object,
+        parent_width: u32,
+        parent_height: u32,
+    ) anyerror!MaskImageMetadata {
+        const dimensions = try parseMaskDimensions(mask);
+        try self.preflightMaskDimensions(dimensions.width, dimensions.height);
+        const bits = (mask.get("BitsPerComponent") orelse return error.InvalidPdfImageMask).asInteger() orelse return error.InvalidPdfImageMask;
+        if (bits <= 0 or bits > 16) return error.InvalidPdfImageMask;
+        if (mask.get("ImageMask")) |value| switch (value.*) {
+            .boolean => |enabled| if (enabled) return error.InvalidPdfImageMask,
+            else => return error.InvalidPdfImageMask,
+        };
+        if (mask.get("Mask") != null or mask.get("SMask") != null) return error.InvalidPdfImageMask;
+
+        const color_space_obj = mask.get("ColorSpace") orelse return error.InvalidPdfImageMask;
+        var color_space = try self.resolveValue(color_space_obj);
+        defer color_space.deinit(self.alloc);
+        const color_space_name = color_space.asName() orelse return error.InvalidPdfImageMask;
+        if (!std.mem.eql(u8, color_space_name, "DeviceGray") and !std.mem.eql(u8, color_space_name, "G"))
+            return error.InvalidPdfImageMask;
+
+        var matte_rgb: ?[3]u8 = null;
+        if (mask.get("Matte")) |matte_obj| {
+            if (dimensions.width != parent_width or dimensions.height != parent_height) return error.InvalidPdfImageMask;
+            var matte = try self.resolveValue(matte_obj);
+            defer matte.deinit(self.alloc);
+            if (matte != .array) return error.InvalidPdfImageMask;
+            matte_rgb = try self.parentMatteRgbAlloc(parent, matte.array);
+        }
+        return .{
+            .width = dimensions.width,
+            .height = dimensions.height,
+            .interpolate = try parseMaskInterpolate(mask),
+            .matte_rgb = matte_rgb,
+        };
+    }
+
+    fn validateExplicitMaskMetadata(self: *const Reader, mask: *const syntax.Object) !MaskImageMetadata {
+        const dimensions = try parseMaskDimensions(mask);
+        try self.preflightMaskDimensions(dimensions.width, dimensions.height);
+        const image_mask = mask.get("ImageMask") orelse return error.InvalidPdfImageMask;
+        if (image_mask.* != .boolean or !image_mask.boolean) return error.InvalidPdfImageMask;
+        if (mask.get("BitsPerComponent")) |value| {
+            if ((value.asInteger() orelse return error.InvalidPdfImageMask) != 1) return error.InvalidPdfImageMask;
+        }
+        if (mask.get("ColorSpace") != null or mask.get("Mask") != null or mask.get("SMask") != null)
+            return error.InvalidPdfImageMask;
+        return .{
+            .width = dimensions.width,
+            .height = dimensions.height,
+            .interpolate = try parseMaskInterpolate(mask),
+        };
+    }
+
+    fn preflightMaskDimensions(self: *const Reader, width: u32, height: u32) !void {
+        const pixels = std.math.mul(usize, width, height) catch return error.RenderedPageTooLarge;
+        if (pixels > 100_000_000) return error.RenderedPageTooLarge;
+        const rgba_bytes = std.math.mul(usize, pixels, 4) catch return error.RenderedPageTooLarge;
+        // The parent image remains live while its mask is decoded, so a mask
+        // that consumes the entire budget can never be part of a valid tree.
+        if (rgba_bytes >= self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
+    }
+
+    fn parentMatteRgbAlloc(self: *const Reader, parent: *const syntax.Object, matte: []const syntax.Object) ![3]u8 {
+        const color_space_obj = parent.get("ColorSpace") orelse return error.UnsupportedPdfRendering;
+        var color_space = try self.resolveValue(color_space_obj);
+        defer color_space.deinit(self.alloc);
+
+        var component_count: usize = 0;
+        var kind: enum { gray, rgb } = undefined;
+        if (color_space.asName()) |name| {
+            if (std.mem.eql(u8, name, "DeviceGray") or std.mem.eql(u8, name, "G")) {
+                component_count = 1;
+                kind = .gray;
+            } else if (std.mem.eql(u8, name, "DeviceRGB") or std.mem.eql(u8, name, "RGB")) {
+                component_count = 3;
+                kind = .rgb;
+            } else return error.UnsupportedPdfRendering;
+        } else if (color_space == .array and color_space.array.len > 0) {
+            const family = color_space.array[0].asName() orelse return error.UnsupportedPdfRendering;
+            if (std.mem.eql(u8, family, "CalGray")) {
+                component_count = 1;
+                kind = .gray;
+            } else if (std.mem.eql(u8, family, "CalRGB")) {
+                component_count = 3;
+                kind = .rgb;
+            } else if (std.mem.eql(u8, family, "ICCBased")) {
+                component_count = try self.colorSpaceInputComponentCount(&color_space);
+                kind = switch (component_count) {
+                    1 => .gray,
+                    3 => .rgb,
+                    else => return error.UnsupportedPdfRendering,
+                };
+            } else return error.UnsupportedPdfRendering;
+        } else return error.UnsupportedPdfRendering;
+        if (matte.len != component_count) return error.InvalidPdfImageMask;
+
+        var components: [3]u8 = .{ 0, 0, 0 };
+        for (matte, 0..) |value, index| {
+            const component = numericObjectValue(&value) orelse return error.InvalidPdfImageMask;
+            if (!std.math.isFinite(component) or component < 0 or component > 1) return error.InvalidPdfImageMask;
+            components[index] = floatChannel(component);
+        }
+        return switch (kind) {
+            .gray => .{ components[0], components[0], components[0] },
+            .rgb => components,
+        };
+    }
+
+    fn applyImageTransparencyPlanAlloc(
+        self: *const Reader,
+        rgba: []u8,
+        width: u32,
+        height: u32,
+        plan: *const ImageTransparencyPlan,
+        source_samples: ?ImageSourceSamples,
+        context: *ImageDecodeContext,
+        parent_live_bytes: usize,
+        mask_depth: u8,
+    ) anyerror!void {
+        switch (plan.*) {
+            .none => {},
+            .color_key => |mask| try applyColorKeyMaskFromSamples(rgba, source_samples orelse return error.UnsupportedPdfRendering, mask),
+            .explicit_mask => |mask_plan| {
+                if (mask_depth >= ImageDecodeContext.max_mask_depth) return error.InvalidPdfImageMask;
+                const mask = try self.decodeImageToRgbaGuardedAlloc(&mask_plan.object, context, parent_live_bytes, mask_depth + 1);
+                defer self.alloc.free(mask.rgba);
+                if (mask.width != mask_plan.metadata.width or mask.height != mask_plan.metadata.height) return error.InvalidPdfImageMask;
+                applyResampledMaskAlpha(rgba, width, height, mask.rgba, mask.width, mask.height, 3, mask_plan.metadata.interpolate, null);
+            },
+            .soft_mask => |mask_plan| {
+                if (mask_depth >= ImageDecodeContext.max_mask_depth) return error.InvalidPdfImageMask;
+                const mask = try self.decodeImageToRgbaGuardedAlloc(&mask_plan.object, context, parent_live_bytes, mask_depth + 1);
+                defer self.alloc.free(mask.rgba);
+                if (mask.width != mask_plan.metadata.width or mask.height != mask_plan.metadata.height) return error.InvalidPdfImageMask;
+                applyResampledMaskAlpha(rgba, width, height, mask.rgba, mask.width, mask.height, 0, mask_plan.metadata.interpolate, mask_plan.metadata.matte_rgb);
+            },
+        }
     }
 
     fn findInheritedPageValue(self: *const Reader, page: *const syntax.Object, key: []const u8) !?syntax.Object {
@@ -10080,82 +10319,175 @@ fn decodeRange(decode_obj: ?*const syntax.Object, component_index: usize) ?struc
     return .{ .min = min, .max = max };
 }
 
-fn applyColorKeyMask(rgba: []u8, mask_array: []const syntax.Object) void {
-    if (mask_array.len != 2 and mask_array.len != 6) return;
+fn parseMaskDimensions(mask: *const syntax.Object) !struct { width: u32, height: u32 } {
+    const width_i = (mask.get("Width") orelse return error.InvalidPdfImageMask).asInteger() orelse return error.InvalidPdfImageMask;
+    const height_i = (mask.get("Height") orelse return error.InvalidPdfImageMask).asInteger() orelse return error.InvalidPdfImageMask;
+    if (width_i <= 0 or height_i <= 0) return error.InvalidPdfImageMask;
+    return .{
+        .width = std.math.cast(u32, width_i) orelse return error.InvalidPdfImageMask,
+        .height = std.math.cast(u32, height_i) orelse return error.InvalidPdfImageMask,
+    };
+}
 
-    const r0 = numericObjectValue(&mask_array[0]) orelse return;
-    const r1 = numericObjectValue(&mask_array[1]) orelse return;
-    const gray_only = mask_array.len == 2;
-    const g0 = if (gray_only) r0 else numericObjectValue(&mask_array[2]) orelse return;
-    const g1 = if (gray_only) r1 else numericObjectValue(&mask_array[3]) orelse return;
-    const b0 = if (gray_only) r0 else numericObjectValue(&mask_array[4]) orelse return;
-    const b1 = if (gray_only) r1 else numericObjectValue(&mask_array[5]) orelse return;
+fn parseMaskInterpolate(mask: *const syntax.Object) !bool {
+    const value = mask.get("Interpolate") orelse return false;
+    return switch (value.*) {
+        .boolean => |enabled| enabled,
+        else => error.InvalidPdfImageMask,
+    };
+}
 
-    const r0u = floatChannel(r0 / 255.0);
-    const r1u = floatChannel(r1 / 255.0);
-    const g0u = floatChannel(g0 / 255.0);
-    const g1u = floatChannel(g1 / 255.0);
-    const b0u = floatChannel(b0 / 255.0);
-    const b1u = floatChannel(b1 / 255.0);
-
-    const Vec16 = @Vector(16, u8);
-    const Vec4 = @Vector(4, u8);
-    const lanes = 16;
-    var i: usize = 0;
-    while (i + lanes <= rgba.len) : (i += lanes) {
-        const block: [16]u8 = rgba[i..][0..16].*;
-        const vec: Vec16 = @bitCast(block);
-        const rv: Vec4 = @shuffle(u8, vec, undefined, [_]i32{ 0, 4, 8, 12 });
-        const gv: Vec4 = @shuffle(u8, vec, undefined, [_]i32{ 1, 5, 9, 13 });
-        const bv: Vec4 = @shuffle(u8, vec, undefined, [_]i32{ 2, 6, 10, 14 });
-        const matches = (rv >= @as(Vec4, @splat(r0u))) &
-            (rv <= @as(Vec4, @splat(r1u))) &
-            (gv >= @as(Vec4, @splat(g0u))) &
-            (gv <= @as(Vec4, @splat(g1u))) &
-            (bv >= @as(Vec4, @splat(b0u))) &
-            (bv <= @as(Vec4, @splat(b1u)));
-        const match_arr: [4]bool = matches;
-        inline for (0..4) |lane| {
-            if (match_arr[lane]) rgba[i + lane * 4 + 3] = 0;
-        }
+fn parseColorKeyMask(mask_array: []const syntax.Object, component_count: usize) !ColorKeyMask {
+    if (component_count == 0 or component_count > 4) return error.UnsupportedPdfRendering;
+    if (mask_array.len != component_count * 2) return error.InvalidPdfImageMask;
+    var mask = ColorKeyMask{ .component_count = component_count, .ranges = undefined };
+    for (0..component_count) |component| {
+        const min_i = mask_array[component * 2].asInteger() orelse return error.InvalidPdfImageMask;
+        const max_i = mask_array[component * 2 + 1].asInteger() orelse return error.InvalidPdfImageMask;
+        if (min_i < 0 or max_i < min_i or max_i > std.math.maxInt(u16)) return error.InvalidPdfImageMask;
+        mask.ranges[component] = .{ @intCast(min_i), @intCast(max_i) };
     }
-    while (i < rgba.len) : (i += 4) {
-        const r = rgba[i + 0];
-        const g = rgba[i + 1];
-        const b = rgba[i + 2];
-        if (r >= r0u and r <= r1u and g >= g0u and g <= g1u and b >= b0u and b <= b1u) {
-            rgba[i + 3] = 0;
+    return mask;
+}
+
+fn applyColorKeyMaskFromSamples(rgba: []u8, samples: ImageSourceSamples, mask: ColorKeyMask) !void {
+    if (samples.component_count == 0 or samples.component_count > 4 or samples.stride == 0) return error.UnsupportedPdfRendering;
+    if (samples.bits_per_component == 0 or samples.bits_per_component > 8) return error.UnsupportedPdfRendering;
+    if (mask.component_count != samples.component_count) return error.UnsupportedPdfRendering;
+    const required_samples = std.math.mul(usize, samples.pixel_count, samples.stride) catch return error.UnsupportedPdfRendering;
+    const required_rgba = std.math.mul(usize, samples.pixel_count, 4) catch return error.UnsupportedPdfRendering;
+    if (samples.bytes.len < required_samples or rgba.len != required_rgba) return error.UnsupportedPdfRendering;
+
+    const max_sample: u16 = (@as(u16, 1) << @intCast(samples.bits_per_component)) - 1;
+    for (0..samples.component_count) |component| {
+        if (mask.ranges[component][1] > max_sample) return error.InvalidPdfImageMask;
+        if (samples.component_offsets[component] >= samples.stride) return error.UnsupportedPdfRendering;
+    }
+
+    for (0..samples.pixel_count) |pixel| {
+        var matches = true;
+        const base = pixel * samples.stride;
+        for (0..samples.component_count) |component| {
+            const normalized = samples.bytes[base + samples.component_offsets[component]];
+            const raw_sample: u16 = if (samples.bits_per_component == 8)
+                normalized
+            else
+                @intCast((@as(u32, normalized) * max_sample + 127) / 255);
+            if (raw_sample < mask.ranges[component][0] or raw_sample > mask.ranges[component][1]) {
+                matches = false;
+                break;
+            }
         }
+        if (matches) rgba[pixel * 4 + 3] = 0;
     }
 }
 
-fn applySoftMaskAlpha(rgba: []u8, smask_rgba: []const u8) void {
-    const Vec16 = @Vector(16, u8);
-    const Vec4 = @Vector(4, u8);
-    const lanes = 16;
-    var i: usize = 0;
-    while (i + lanes <= rgba.len and i + lanes <= smask_rgba.len) : (i += lanes) {
-        var dst_block: [16]u8 = rgba[i..][0..16].*;
-        const src_block: [16]u8 = smask_rgba[i..][0..16].*;
-        const src_vec: Vec16 = @bitCast(src_block);
-        const alpha_vec: Vec4 = @shuffle(u8, src_vec, undefined, [_]i32{ 0, 4, 8, 12 });
-        const alpha_arr: [4]u8 = @bitCast(alpha_vec);
-        inline for (0..4) |lane| {
-            dst_block[lane * 4 + 3] = alpha_arr[lane];
-        }
-        rgba[i..][0..16].* = dst_block;
+const MaskAxisSample = struct { low: usize, high: usize, fraction: u16 };
+
+const MaskAxisIterator = struct {
+    quotient: u64,
+    remainder: u64,
+    quotient_step: u64,
+    remainder_step: u64,
+    denominator: u64,
+    source_size: u32,
+    interpolate: bool,
+
+    fn init(destination_size: u32, source_size: u32, interpolate: bool) MaskAxisIterator {
+        std.debug.assert(destination_size > 0 and source_size > 0);
+        const scale: u64 = if (interpolate) 65536 else 1;
+        const denominator = @as(u64, destination_size) * 2;
+        const initial = @as(u64, source_size) * scale;
+        const step = @as(u64, source_size) * scale * 2;
+        return .{
+            .quotient = initial / denominator,
+            .remainder = initial % denominator,
+            .quotient_step = step / denominator,
+            .remainder_step = step % denominator,
+            .denominator = denominator,
+            .source_size = source_size,
+            .interpolate = interpolate,
+        };
     }
-    while (i + 3 < rgba.len and i < smask_rgba.len) : (i += 4) {
-        rgba[i + 3] = smask_rgba[i];
+
+    fn next(self: *MaskAxisIterator) MaskAxisSample {
+        const quotient = self.quotient;
+        self.quotient += self.quotient_step;
+        self.remainder += self.remainder_step;
+        if (self.remainder >= self.denominator) {
+            self.remainder -= self.denominator;
+            self.quotient += 1;
+        }
+
+        if (!self.interpolate or self.source_size <= 1) {
+            const sample: usize = @intCast(@min(quotient, @as(u64, self.source_size) - 1));
+            return .{ .low = sample, .high = sample, .fraction = 0 };
+        }
+        const signed_coordinate: i64 = @as(i64, @intCast(quotient)) - 32768;
+        const maximum = (@as(i64, self.source_size) - 1) * 65536;
+        const coordinate = std.math.clamp(signed_coordinate, 0, maximum);
+        const low: usize = @intCast(@divTrunc(coordinate, 65536));
+        return .{
+            .low = low,
+            .high = @min(low + 1, @as(usize, self.source_size) - 1),
+            .fraction = @intCast(@mod(coordinate, 65536)),
+        };
+    }
+};
+
+fn bilinearMaskValue(mask_rgba: []const u8, source_width: u32, channel: usize, xs: MaskAxisSample, ys: MaskAxisSample) u8 {
+    const v00 = mask_rgba[(ys.low * @as(usize, source_width) + xs.low) * 4 + channel];
+    const v10 = mask_rgba[(ys.low * @as(usize, source_width) + xs.high) * 4 + channel];
+    const v01 = mask_rgba[(ys.high * @as(usize, source_width) + xs.low) * 4 + channel];
+    const v11 = mask_rgba[(ys.high * @as(usize, source_width) + xs.high) * 4 + channel];
+    const inverse_x = 65536 - @as(u32, xs.fraction);
+    const inverse_y = 65536 - @as(u32, ys.fraction);
+    const top = @as(u64, v00) * inverse_x + @as(u64, v10) * xs.fraction;
+    const bottom = @as(u64, v01) * inverse_x + @as(u64, v11) * xs.fraction;
+    return @intCast((top * inverse_y + bottom * ys.fraction + (@as(u64, 1) << 31)) >> 32);
+}
+
+fn applyMatteUnblend(pixel: []u8, alpha: u8, matte: [3]u8) void {
+    if (alpha == 0) {
+        pixel[0] = 0;
+        pixel[1] = 0;
+        pixel[2] = 0;
+        return;
+    }
+    for (0..3) |component| {
+        const numerator = @as(i32, pixel[component]) * 255 - @as(i32, matte[component]) * (255 - @as(i32, alpha));
+        pixel[component] = @intCast(std.math.clamp(@divTrunc(numerator + @divTrunc(@as(i32, alpha), 2), @as(i32, alpha)), 0, 255));
     }
 }
 
-fn applyExplicitMaskAlpha(rgba: []u8, mask_rgba: []const u8, mask_is_stencil: bool) void {
-    const src_channel: usize = if (mask_is_stencil) 3 else 0;
-    const pixel_count = @min(rgba.len, mask_rgba.len) / 4;
-    for (0..pixel_count) |pixel| {
-        const offset = pixel * 4;
-        rgba[offset + 3] = mask_rgba[offset + src_channel];
+fn applyResampledMaskAlpha(
+    rgba: []u8,
+    width: u32,
+    height: u32,
+    mask_rgba: []const u8,
+    mask_width: u32,
+    mask_height: u32,
+    channel: usize,
+    interpolate: bool,
+    matte_rgb: ?[3]u8,
+) void {
+    std.debug.assert(rgba.len == @as(usize, width) * @as(usize, height) * 4);
+    std.debug.assert(mask_rgba.len == @as(usize, mask_width) * @as(usize, mask_height) * 4);
+    const x_template = MaskAxisIterator.init(width, mask_width, interpolate);
+    var y_iterator = MaskAxisIterator.init(height, mask_height, interpolate);
+    for (0..height) |y| {
+        const ys = y_iterator.next();
+        var x_iterator = x_template;
+        for (0..width) |x| {
+            const xs = x_iterator.next();
+            const alpha = if (interpolate)
+                bilinearMaskValue(mask_rgba, mask_width, channel, xs, ys)
+            else
+                mask_rgba[(ys.low * @as(usize, mask_width) + xs.low) * 4 + channel];
+            const offset = (@as(usize, y) * width + x) * 4;
+            if (matte_rgb) |matte| applyMatteUnblend(rgba[offset..][0..4], alpha, matte);
+            rgba[offset + 3] = alpha;
+        }
     }
 }
 
@@ -13667,17 +13999,15 @@ test "image decode rejects cyclic soft masks" {
     try std.testing.expectError(error.InvalidPdfImageMask, reader.decodeImageToRgbaAlloc(&image));
 }
 
-test "image decode rejects mismatched soft-mask dimensions" {
+test "image decode resamples a different-resolution soft mask" {
     const alloc = std.testing.allocator;
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
         "2 0 obj\nnull\nendobj\n",
         "3 0 obj\nnull\nendobj\n",
         "4 0 obj\nnull\nendobj\n",
-        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
-        // The malformed JBIG2 payload would produce TruncatedJbig2Stream if
-        // the decoder ran. Dimension validation must reject the mask first.
-        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode /Length 1 >>\nstream\nx\nendstream\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length 6 >>\nstream\nabcdef\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
     };
     const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
     defer alloc.free(sample);
@@ -13685,7 +14015,93 @@ test "image decode rejects mismatched soft-mask dimensions" {
     defer reader.deinit();
     var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
     defer image.deinit(alloc);
-    try std.testing.expectError(error.InvalidPdfImageMask, reader.decodeImageToRgbaAlloc(&image));
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0x80, 0x80 }, &.{ decoded.rgba[3], decoded.rgba[7] });
+}
+
+test "image soft mask overrides an explicit mask" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Mask 7 0 R /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
+        "7 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true /Width 1 /Height 1 /BitsPerComponent 1 /Length 1 >>\nstream\n\x00\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(@as(u8, 0x80), decoded.rgba[3]);
+}
+
+test "image decode resamples a different-resolution explicit mask" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask 6 0 R /Length 6 >>\nstream\nabcdef\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true /Width 1 /Height 1 /BitsPerComponent 1 /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff }, &.{ decoded.rgba[3], decoded.rgba[7] });
+}
+
+test "indexed image color key compares palette indices before conversion" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace [/Indexed /DeviceRGB 1 <FF0000FF0000>] /BitsPerComponent 8 /Mask [1 1] /Length 2 >>\nstream\n\x00\x01\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00 }, &.{ decoded.rgba[3], decoded.rgba[7] });
+}
+
+test "soft-mask Matte reverses parent sample preblending" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length 3 >>\nstream\n\x80\x00\x00\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [0 0 0] /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0x00, 0x00, 0x80 }, decoded.rgba);
 }
 
 test "image decode rejects dimensions outside the native image domain" {
@@ -13711,6 +14127,9 @@ test "image decode rejects invalid transparency mask object types" {
     const invalid_images = [_][]const u8{
         "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 42 /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
         "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask /Bogus /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+        // The malformed JBIG2 stream must not run when its color-key metadata
+        // is already invalid.
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode /Mask [0 /Bad] /Length 1 >>\nstream\nx\nendstream\nendobj\n",
     };
     for (invalid_images) |invalid_image| {
         const objects = [_][]const u8{
@@ -13728,6 +14147,58 @@ test "image decode rejects invalid transparency mask object types" {
         defer image.deinit(alloc);
         try std.testing.expectError(error.InvalidPdfImageMask, reader.decodeImageToRgbaAlloc(&image));
     }
+}
+
+test "image decode enforces soft and explicit mask dictionary contracts" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { image: []const u8, mask: []const u8 }{
+        .{
+            .image = "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+            .mask = "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+        },
+        .{
+            .image = "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask 6 0 R /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+            .mask = "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\na\nendstream\nendobj\n",
+        },
+    };
+    for (cases) |case| {
+        const objects = [_][]const u8{
+            "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+            "2 0 obj\nnull\nendobj\n",
+            "3 0 obj\nnull\nendobj\n",
+            "4 0 obj\nnull\nendobj\n",
+            case.image,
+            case.mask,
+        };
+        const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+        defer alloc.free(sample);
+        var reader = try Reader.init(alloc, sample);
+        defer reader.deinit();
+        var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+        defer image.deinit(alloc);
+        try std.testing.expectError(error.InvalidPdfImageMask, reader.decodeImageToRgbaAlloc(&image));
+    }
+}
+
+test "soft-mask Matte requires parent dimensions before codec work" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+        // The JBIG2 data is deliberately malformed: metadata validation must
+        // reject the Matte/dimension contract before entering the codec.
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Matte [0 0 0] /Filter /JBIG2Decode /Length 1 >>\nstream\nx\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    try std.testing.expectError(error.InvalidPdfImageMask, reader.decodeImageToRgbaAlloc(&image));
 }
 
 test "image decode accepts the PDF soft-mask None sentinel" {
@@ -13993,7 +14464,7 @@ test "reader applies image mask stream alpha" {
     try std.testing.expectEqual(@as(u8, 0xff), runs[0].rgba[3]);
 }
 
-test "apply soft mask alpha updates multiple pixels" {
+test "resampled soft mask alpha updates multiple pixels" {
     var rgba = [_]u8{
         10,  20,  30,  255,
         40,  50,  60,  255,
@@ -14006,11 +14477,21 @@ test "apply soft mask alpha updates multiple pixels" {
         3, 3, 3, 255,
         4, 4, 4, 255,
     };
-    applySoftMaskAlpha(&rgba, &smask);
+    applyResampledMaskAlpha(&rgba, 4, 1, &smask, 4, 1, 0, false, null);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, &.{ rgba[3], rgba[7], rgba[11], rgba[15] });
 }
 
-test "apply color key mask zeroes matching alpha across vector lane block" {
+test "interpolated soft mask uses pixel-center bilinear sampling" {
+    var rgba = [_]u8{ 0, 0, 0, 255 } ** 3;
+    const smask = [_]u8{
+        0,   0,   0,   255,
+        255, 255, 255, 255,
+    };
+    applyResampledMaskAlpha(&rgba, 3, 1, &smask, 2, 1, 0, true, null);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 128, 255 }, &.{ rgba[3], rgba[7], rgba[11] });
+}
+
+test "color key mask compares source RGB samples" {
     var rgba = [_]u8{
         255, 0,   0,   255,
         0,   255, 0,   255,
@@ -14025,14 +14506,43 @@ test "apply color key mask zeroes matching alpha across vector lane block" {
         .{ .integer = 0 },
         .{ .integer = 0 },
     };
-    applyColorKeyMask(&rgba, &mask_array);
+    try applyColorKeyMaskFromSamples(&rgba, .{
+        .bytes = &rgba,
+        .pixel_count = 4,
+        .component_count = 3,
+        .stride = 4,
+        .bits_per_component = 8,
+    }, try parseColorKeyMask(&mask_array, 3));
     try std.testing.expectEqual(@as(u8, 0), rgba[3]);
     try std.testing.expectEqual(@as(u8, 255), rgba[7]);
     try std.testing.expectEqual(@as(u8, 0), rgba[11]);
     try std.testing.expectEqual(@as(u8, 255), rgba[15]);
 }
 
-test "apply explicit mask alpha uses mask alpha or grayscale channel" {
+test "color key mask supports four-component source samples and rejects malformed ranges" {
+    var rgba = [_]u8{ 20, 30, 40, 255 };
+    const samples = [_]u8{ 1, 2, 3, 4 };
+    const cmyk_mask = [_]syntax.Object{
+        .{ .integer = 1 }, .{ .integer = 1 },
+        .{ .integer = 2 }, .{ .integer = 2 },
+        .{ .integer = 3 }, .{ .integer = 3 },
+        .{ .integer = 4 }, .{ .integer = 4 },
+    };
+    const view = ImageSourceSamples{
+        .bytes = &samples,
+        .pixel_count = 1,
+        .component_count = 4,
+        .stride = 4,
+        .bits_per_component = 8,
+    };
+    try applyColorKeyMaskFromSamples(&rgba, view, try parseColorKeyMask(&cmyk_mask, 4));
+    try std.testing.expectEqual(@as(u8, 0), rgba[3]);
+
+    const malformed = [_]syntax.Object{ .{ .integer = 1 }, .{ .boolean = true } };
+    try std.testing.expectError(error.InvalidPdfImageMask, parseColorKeyMask(&malformed, 1));
+}
+
+test "resampled explicit mask alpha uses the stencil channel" {
     const original = [_]u8{
         10,  20,  30,  255,
         40,  50,  60,  255,
@@ -14046,16 +14556,8 @@ test "apply explicit mask alpha uses mask alpha or grayscale channel" {
         44, 44, 44, 0,
     };
 
-    var grayscale_rgba = original;
-    applyExplicitMaskAlpha(&grayscale_rgba, &mask, false);
-
-    try std.testing.expectEqual(@as(u8, 11), grayscale_rgba[3]);
-    try std.testing.expectEqual(@as(u8, 22), grayscale_rgba[7]);
-    try std.testing.expectEqual(@as(u8, 33), grayscale_rgba[11]);
-    try std.testing.expectEqual(@as(u8, 44), grayscale_rgba[15]);
-
     var stencil_rgba = original;
-    applyExplicitMaskAlpha(&stencil_rgba, &mask, true);
+    applyResampledMaskAlpha(&stencil_rgba, 4, 1, &mask, 4, 1, 3, false, null);
 
     try std.testing.expectEqual(@as(u8, 255), stencil_rgba[3]);
     try std.testing.expectEqual(@as(u8, 255), stencil_rgba[7]);
