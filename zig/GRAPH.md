@@ -2,12 +2,11 @@
 
 ## Summary
 
-Graph indexes should be able to declare the enrichment inputs they need, then
-consume the resulting artifacts through Antfly's existing managed-index replay
-path.
+Graph indexes declare the enrichment inputs they need, then consume the
+resulting artifacts through Antfly's existing managed-index replay path.
 
-V1 should not introduce a separate graph recovery protocol or move graph index
-rows directly into the Raft state machine. Antfly already has the right boundary:
+V1 does not introduce a separate graph recovery protocol or move graph index
+rows directly into the Raft state machine. Antfly uses this boundary:
 
 ```text
 Rafted primary store and replay journal
@@ -53,10 +52,10 @@ edges.
 
 ## Current Antfly Shape
 
-Existing pieces to reuse:
+The implemented pieces are:
 
 - `_edges` and explicit graph writes are converted into graph edge artifact rows.
-- Graph edge artifact keys are source-owned:
+- Visible graph edge artifact keys retain the existing logical edge identity:
 
 ```text
 (doc_key, "graph", index_name, edge_type, target_doc_key)
@@ -70,16 +69,17 @@ Existing pieces to reuse:
   crash recovery.
 - Asset enrichments already support model-backed producers through
   `producer_json`.
+- Graph configs declare one `source` or up to 64 ordered `sources`, and the
+  graph materializer renders their selected artifact values into edge rows.
+- A generation-bound manifest per document, index, and artifact source retains
+  the complete desired edge keys and payloads. These manifests provide source
+  ownership without changing the public graph edge identity.
+- Reconciliation applies source order as deterministic precedence and restores
+  the next source's retained payload when a winner disappears.
 
-Missing pieces:
-
-- Graph config cannot yet declare a managed enrichment dependency.
-- Graph config cannot yet declare an artifact source such as
-  `_artifacts.relations_v1.relations[*]`.
-- There is no graph materializer that renders relation artifact items into graph
-  edge artifact rows.
-- Existing graph edge keys do not include `logical_edge_id`, so duplicate
-  relations with the same source/target/type collapse.
+The remaining identity limitation is that visible graph edge keys do not
+include `logical_edge_id`, so duplicate relations with the same
+source/target/type collapse.
 
 ## V1 Data Flow
 
@@ -519,15 +519,18 @@ Recommended phases:
 
 ## Replacement Semantics
 
-For V1, replacement should happen at the graph edge artifact layer.
+Replacement happens at the graph edge artifact layer.
 
 For each `(producer_doc_key, graph_index_name, source_artifact_name,
 config_generation)` scope:
 
-1. Read the current source artifact value.
-2. Render desired graph edge artifact rows.
-3. Find existing graph edge artifact rows owned by this graph materializer scope.
-4. Delete stale rows and upsert desired rows in the primary store.
+1. Read the current source artifact value and render its desired edge keys and
+   payloads.
+2. Persist that complete source manifest with the graph index generation.
+3. Read the manifests for the index's configured sources in array order and
+   choose the first payload for every logical edge key.
+4. Diff the selected visible set against graph edge artifact rows, deleting
+   stale rows and upserting changed winners in the primary store.
 5. Let the existing graph replay path apply changed graph edge artifact keys to
    private graph stores.
 
@@ -543,17 +546,22 @@ multigraph support is required, extend the graph edge artifact key and
 `GraphEdgeWrite`/`GraphEdgeDelete` with `edge_id` before depending on multigraph
 semantics.
 
-V1 stale cleanup can use the simple strategy because each graph index has one
-materialized source:
+Clearing every document/index edge before rewriting one source is unsafe and is
+not used. Source manifests are the ownership boundary. Because they retain
+payloads, deletion or mutation of a winning source can promote the next source
+without rereading every source artifact. Reconciliation coalesces repeated
+mutations and scans each affected state prefix once.
 
-- Store materializer-owned graph edge rows under the existing graph artifact
-  prefix and delete all rows for the document/index before writing the newly
-  rendered set.
+Manifests and graph edge payloads are generation-bound so replay from a retired
+index cannot mutate a same-name replacement. Released v0.2.0 key-only manifests
+and generation-less edge payloads are accepted as migration input and rewritten
+on the next materialization. Index retirement durably pages through both edge
+payloads and manifests before same-name recreation is admitted.
 
-If a later graph index supports multiple sources, add a small graph materializer
-state row that records the last rendered source hash and owned edge keys, then
-diff against that state. Without that state or source ownership in the graph edge
-key, clearing document/index rows would delete edges owned by another source.
+Each source manifest is bounded by entry and byte limits. Reconciliation also
+has aggregate entry and byte budgets so many overlapping sources cannot create
+unbounded work even when the visible edge count is small. Exceeding a guardrail
+records terminal repair debt instead of retrying an impossible payload forever.
 
 ## Visibility And Identity
 
@@ -651,37 +659,41 @@ Direct Raft graph state:
 
 ## Validation
 
-Open/index validation should reject:
+Open/index validation rejects:
 
-- Unknown `source.kind`.
+- Unknown graph source fields, including public `source.kind` discriminators.
 - Artifact source without `artifact`.
 - Artifact source with an unsupported `path` or `format`.
+- Empty source arrays, more than 64 sources, or duplicate artifact names.
+- Combining the single-source `source` convenience form with `sources`.
 - Graph shorthand enrichment config whose name conflicts with an incompatible
   existing enrichment.
 - Graph shorthand enrichment config that does not map cleanly to an asset
   `EnrichmentConfig`.
 - Missing enrichment for an artifact source when no shorthand config is present.
 - Deleting or changing an enrichment while graph indexes still reference it.
-- More than one materialized source in one V1 graph index.
 - Template references to undeclared `_doc.value.<field>`.
 - Non-document node modes that require hydration without an explicit external
   node policy.
 - Multigraph settings unless graph edge keys include `edge_id`.
 - Query-required global/entity/reverse projections in V1.
 
-## Implementation Plan
+## Implemented Boundaries
 
-1. Extend graph index config parsing with `source`, `artifact`, `nodes`, `edge`,
-   and `context`.
-2. Normalize existing `edge_types[].field` into `source.kind =
-   "document_field"`.
-3. Add graph managed-enrichment dependency/shorthand handling in `IndexManager`.
-4. Add graph materializer replay for changed source asset artifacts.
-5. Render selected relation items into graph edge artifact writes/deletes.
-6. Reuse existing graph replay to apply graph edge artifacts to `GraphIndex`.
-7. Add status output showing graph indexes waiting on source artifacts.
+- `source` is a single-source construction convenience; normalized responses
+  expose `sources`.
+- `sources` owns ordered artifact identity, selection path, format, mappings,
+  and context for each source.
+- `IndexManager` provisions compatible shorthand enrichments and rejects
+  missing or conflicting dependencies.
+- Managed replay materializes source manifests, reconciles precedence into edge
+  artifacts, and applies those artifacts to `GraphIndex`.
+- Per-source status reports canonical `artifact`, `path`, and `format`; catch-up
+  and repair state remain index-wide.
+- True multigraph identity, global entity routing, and required cross-shard
+  projections remain future work.
 
-## Test Plan
+## Regression Coverage
 
 Managed enrichment dependency tests:
 
@@ -692,12 +704,17 @@ Managed enrichment dependency tests:
 - Deleting a referenced enrichment is rejected.
 - Deleting the original shorthand-owning index does not delete the enrichment
   while another index references it.
-- A V1 graph index with multiple materialized sources is rejected.
+- Empty, duplicate, and oversized source sets are rejected.
+- A multi-source graph preserves declaration-order precedence.
 
 Materializer tests:
 
 - Relation artifact renders graph edge artifact rows.
 - Re-render deletes stale graph edge artifact rows.
+- Mutating or deleting a winning source restores the next source's retained
+  payload without rescanning all artifacts.
+- Overlapping source manifests respect per-source and aggregate reconciliation
+  budgets.
 - Missing source artifact leaves prior graph state unchanged unless the artifact
   was deleted.
 - Deleted source artifact clears graph edge artifact rows for that document/index.
@@ -708,6 +725,8 @@ Replay tests:
 - Graph edge artifact writes flow through existing graph replay.
 - Crash/reopen after source asset write but before graph apply catches up.
 - Crash/reopen after graph edge artifact write but before graph apply catches up.
+- Retired-generation replay cannot mutate a recreated same-name graph index.
+- Released key-only manifests migrate on the next materialization.
 - Reverse graph store rebuilds from owned outgoing rows.
 - Split/merge preserves graph edge artifact replay behavior.
 

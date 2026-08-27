@@ -124,7 +124,8 @@ type QueryRequest struct {
 	// DistanceUnder maximum distance for semantic similarity search
 	DistanceUnder *float32 `json:"distance_under,omitempty"`
 
-	// Embeddings raw embeddings to use for semantic searches (the keys are the indexes to use for the queries).
+	// Embeddings supplies dense or sparse vectors directly. Its keys select indexes
+	// when Indexes is omitted; Indexes may select or order an explicit subset.
 	// Supports both dense ([]float32 via Embedding0) and sparse ({Indices, Values} via Embedding1) embeddings.
 	Embeddings map[string]Embedding `json:"embeddings,omitempty"`
 

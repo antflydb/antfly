@@ -169,6 +169,69 @@ func TestReadSSEEventsEarlyTermination(t *testing.T) {
 	}
 }
 
+func TestQueryAcceptsExplicitEmbeddingIndexes(t *testing.T) {
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll request body: %v", err)
+			return
+		}
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"responses":[]}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	var sparse Embedding
+	if err := sparse.FromEmbedding1(oapi.Embedding1{
+		Indices: []uint32{1, 5},
+		Values:  []float32{0.5, 0.75},
+	}); err != nil {
+		t.Fatalf("FromEmbedding1: %v", err)
+	}
+
+	if _, err := client.Query(context.Background(), QueryRequest{
+		Table:      "docs",
+		Embeddings: map[string]Embedding{"sparse_idx": sparse},
+		Indexes:    []string{"sparse_idx"},
+	}); err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if !strings.Contains(gotBody, `"indexes":["sparse_idx"]`) ||
+		!strings.Contains(gotBody, `"embeddings":{"sparse_idx":{"indices":[1,5],"values":[0.5,0.75]}}`) {
+		t.Fatalf("unexpected query body: %s", gotBody)
+	}
+}
+
+func TestQueryEmbeddingValidationMatchesServerContract(t *testing.T) {
+	client, err := NewAntflyClient("http://127.0.0.1:1", nil)
+	if err != nil {
+		t.Fatalf("NewAntflyClient: %v", err)
+	}
+
+	if _, err := client.Query(context.Background(), QueryRequest{
+		Indexes: []string{"dense_idx"},
+	}); err == nil || !strings.Contains(err.Error(), "semantic_search or embeddings required") {
+		t.Fatalf("indexes-only error = %v", err)
+	}
+
+	var dense Embedding
+	if err := dense.FromEmbedding0(oapi.Embedding0{1, 0, 0}); err != nil {
+		t.Fatalf("FromEmbedding0: %v", err)
+	}
+	if _, err := client.Query(context.Background(), QueryRequest{
+		Embeddings: map[string]Embedding{"dense_idx": dense},
+		Offset:     1,
+	}); err == nil || !strings.Contains(err.Error(), "offset not available") {
+		t.Fatalf("embedding offset error = %v", err)
+	}
+}
+
 func TestCreateIndexReturnsNormalizedConfigAndUsesPathIdentity(t *testing.T) {
 	var gotPath string
 	var gotBody string

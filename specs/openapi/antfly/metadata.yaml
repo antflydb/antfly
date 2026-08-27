@@ -6984,8 +6984,12 @@ components:
           items:
             type: string
           description: |
-            List of vector index names to use for semantic search. Required when using semantic_search.
-            Multiple indexes can be specified, and their results will be merged using RRF.
+            Embedding index names selected for `semantic_search` or explicit `embeddings`.
+            Dense and sparse indexes are supported when the corresponding query representation is
+            supplied. Provisioned deployments require at least one index for `semantic_search`;
+            serverless may infer its single published dense index when this field is omitted. When
+            `embeddings` is supplied without this field, the embedding map keys select the indexes.
+            Results from multiple indexes are merged using RRF.
           example: ["title_body_nomic", "description_embedding"]
         filter_prefix:
           type: string

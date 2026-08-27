@@ -114,9 +114,12 @@ class QueryRequest:
 
             When not specified, the semantic_search string is embedded as plain text.
              Example: {{remoteMedia url=this}}.
-        indexes (list[str] | Unset): List of vector index names to use for semantic search. Required when using
-            semantic_search.
-            Multiple indexes can be specified, and their results will be merged using RRF.
+        indexes (list[str] | Unset): Embedding index names selected for `semantic_search` or explicit `embeddings`.
+            Dense and sparse indexes are supported when the corresponding query representation is
+            supplied. Provisioned deployments require at least one index for `semantic_search`;
+            serverless may infer its single published dense index when this field is omitted. When
+            `embeddings` is supplied without this field, the embedding map keys select the indexes.
+            Results from multiple indexes are merged using RRF.
              Example: ['title_body_nomic', 'description_embedding'].
         filter_prefix (str | Unset): Filter results by key prefix. Only returns documents whose keys start with this
             string.
