@@ -246,6 +246,38 @@ const LsmOwnerCloneRegistry = struct {
     ) !void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
+        const lookup_key: EntryKey = .{
+            .table_name = table_name,
+            .group_id = group_id,
+            .owner_kind = owner_kind,
+            .owner_name = owner_name,
+            .owner_overflow = owner_overflow,
+        };
+        if (self.entry_by_key.get(lookup_key)) |entry_index| {
+            const source_key: SourceKey = .{ .id = source_id, .entry_index = entry_index };
+            if (self.source_by_key.get(source_key)) |source_index| {
+                const source = &self.sources.items[source_index];
+                const collapsed_delta = stats.labels_collapsed_total -| source.observed.labels_collapsed_total;
+                accumulateObserved(&self.entries.items[entry_index].stats, source.observed, stats);
+                self.collapsed_labels +|= collapsed_delta;
+                source.observed = stats;
+                return;
+            }
+        }
+        // Never commit a permanent label entry unless its initial absolute
+        // source baseline can be retained. Otherwise source saturation could
+        // fill the entry registry with zero-valued tombstones that survive
+        // after live sources retire.
+        if (self.sources.items.len >= max_sources) {
+            self.dropped_observations +|= 1;
+            return;
+        }
+        // Reserve both source containers before publishing a new label entry.
+        // This makes admission transactional with respect to allocator failure:
+        // findOrCreateEntryLocked cannot leave an unreachable zero-stat entry
+        // if the initial source baseline cannot be stored.
+        try self.sources.ensureUnusedCapacity(self.alloc, 1);
+        try self.source_by_key.ensureUnusedCapacity(self.alloc, 1);
         const entry_index = (try self.findOrCreateEntryLocked(
             table_name,
             group_id,
@@ -254,20 +286,6 @@ const LsmOwnerCloneRegistry = struct {
             owner_overflow,
         )) orelse return;
         const source_key: SourceKey = .{ .id = source_id, .entry_index = entry_index };
-        if (self.source_by_key.get(source_key)) |source_index| {
-            const source = &self.sources.items[source_index];
-            const collapsed_delta = stats.labels_collapsed_total -| source.observed.labels_collapsed_total;
-            accumulateObserved(&self.entries.items[entry_index].stats, source.observed, stats);
-            self.collapsed_labels +|= collapsed_delta;
-            source.observed = stats;
-            return;
-        }
-        if (self.sources.items.len >= max_sources) {
-            self.dropped_observations +|= 1;
-            return;
-        }
-        try self.sources.ensureUnusedCapacity(self.alloc, 1);
-        try self.source_by_key.ensureUnusedCapacity(self.alloc, 1);
         self.sources.appendAssumeCapacity(.{
             .key = source_key,
             .observed = stats,
@@ -1631,6 +1649,43 @@ test "LSM owner registry reports capacity loss in observation units" {
 
     try std.testing.expectEqual(@as(u64, 2), registry.droppedObservationsTotal());
     try std.testing.expectEqual(@as(u64, 0), registry.collapsedLabelsTotal());
+}
+
+test "LSM owner source saturation does not consume empty label entries" {
+    var registry = LsmOwnerCloneRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    for (0..LsmOwnerCloneRegistry.max_sources) |i| {
+        try registry.observe(i + 1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+    }
+    try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
+    try registry.observe(999_999, "other", 23, .primary, "primary", false, .{ .calls = 1 });
+    try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), registry.droppedObservationsTotal());
+
+    registry.retireSource(1);
+    try registry.observe(999_999, "other", 23, .primary, "primary", false, .{ .calls = 1 });
+    try std.testing.expectEqual(@as(usize, 2), registry.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), registry.entries.items[1].stats.calls);
+}
+
+test "LSM owner source allocation failure does not publish an empty label entry" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var registry = LsmOwnerCloneRegistry.init(failing.allocator());
+    defer registry.deinit();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), registry.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.sources.items.len);
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+    try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.sources.items.len);
 }
 
 test "backend runtime API lane leases expose and release the interface" {
