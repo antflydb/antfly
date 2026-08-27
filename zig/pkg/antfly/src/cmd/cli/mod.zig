@@ -30,7 +30,7 @@ pub const auth = @import("auth.zig");
 pub const OutputFormat = enum { json, table_fmt };
 
 pub const GlobalConfig = struct {
-    url: []const u8 = "http://localhost:8080",
+    url: []const u8 = "http://127.0.0.1:8080",
     token: ?[]const u8 = null,
     output: OutputFormat = .json,
 };
@@ -93,7 +93,16 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, command, "lookup")) return "usage: antfly lookup --table <table> --key <key> [options]\n";
     if (std.mem.eql(u8, command, "insert")) return "usage: antfly insert --table <table> --key <key> --document <json> [options]\n";
     if (std.mem.eql(u8, command, "delete")) return "usage: antfly delete --table <table> --key <key> [options]\n";
-    if (std.mem.eql(u8, command, "agents")) return "usage: antfly agents <retrieval|query-builder> [options]\n";
+    if (std.mem.eql(u8, command, "agents")) return
+    \\usage: antfly agents <retrieval|query-builder> [options]
+    \\
+    \\  agents retrieval --table <table> (--semantic-search <text>|--full-text-search <query>) --generator <json> [options]
+    \\  agents retrieval options: --indexes <names> --fields <names> --limit <n> --reranker <json> --pruner <json>
+    \\                            --max-context-tokens <n> --streaming|--no-streaming
+    \\                            --classify --reasoning --generate --followup --confidence
+    \\  agents query-builder --intent <text> --generator <json> [--table <table>]
+    \\
+    ;
     if (std.mem.eql(u8, command, "backup")) return "usage: antfly backup --table <table> --location <uri> [options]\n";
     if (std.mem.eql(u8, command, "restore")) return "usage: antfly restore --location <uri> [options]\n";
     if (std.mem.eql(u8, command, "auth")) return "usage: antfly auth <me|users|permissions|roles|row-filters|subjects|api-keys> [options]\n";
@@ -131,7 +140,7 @@ test "client commands expose help without a server" {
 /// Build global CLI config from environment variables.
 ///
 /// Supported env vars:
-///   ANTFLY_URL    — server base URL (default http://localhost:8080)
+///   ANTFLY_URL    — server base URL (default http://127.0.0.1:8080)
 ///   ANTFLY_TOKEN  — bearer token for authentication
 pub fn parseGlobalFlags() GlobalConfig {
     var config = GlobalConfig{};

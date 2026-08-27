@@ -443,6 +443,7 @@ var test_before_restore_repair_step_hook: ?TestRestoreRepairStepHook = null;
 var test_before_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_after_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_before_post_create_runtime_status_publish_hook: ?TestExecutionHook = null;
+var test_before_startup_catch_up_replay_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_writer_open_persistent_descriptor_failures_remaining: std.atomic.Value(u32) = .init(0);
 
@@ -578,6 +579,12 @@ fn runTestBeforePostCreateRuntimeStatusPublishHook() void {
 fn runTestAfterStartupCatchUpReplayPassHook(db: *db_mod.DB) !void {
     if (comptime builtin.is_test) {
         if (test_after_startup_catch_up_replay_pass_hook) |hook| try hook.run(hook.ptr, db);
+    }
+}
+
+fn runTestBeforeStartupCatchUpReplayHook(db: *db_mod.DB) !void {
+    if (comptime builtin.is_test) {
+        if (test_before_startup_catch_up_replay_hook) |hook| try hook.run(hook.ptr, db);
     }
 }
 
@@ -10386,7 +10393,14 @@ pub const ProvisionedTableWriteSource = struct {
                 .all_debt,
             metadata.index_repair_options,
         ) catch |err| result_blk: {
-            if (live_broad_recovery and err == error.RestoreIndexAvailabilityIncomplete) {
+            if (live_broad_recovery and (err == error.RestoreIndexAvailabilityIncomplete or
+                err == error.ArtifactRepairRequired))
+            {
+                // Replay cannot clear debt that requires reconstructing the
+                // current index generation. Hand the same admitted quantum to
+                // the generation-repair lane before retrying broad catch-up;
+                // otherwise every pass fails on the same journal window and
+                // the repair intent can never run.
                 restore_index_prerequisite = true;
                 break :result_blk StartupCatchUpResult{
                     .had_debt = true,
@@ -24295,8 +24309,17 @@ fn catchUpManagedDb(
         var last_debt_signature = try startupReplayDebtSignature(alloc, db);
         while (pass < max_startup_catch_up_replay_passes) : (pass += 1) {
             try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .startup_catch_up, db));
+            try runTestBeforeStartupCatchUpReplayHook(db);
             db.catchUpPendingDerivedReplayWithProgress(&progress_ctx, ProgressCtx.run) catch |err| {
                 std.log.warn("managed startup catch-up replay failed table={s} err={}", .{ table_name, err });
+                if (err == error.ArtifactRepairRequired and initial_index_repair_debt) {
+                    // A durable generation intent is the only operation that
+                    // can make this replay window applicable again. Continue
+                    // into the repair lane instead of retrying the same
+                    // blocked window ahead of every rebuild quantum.
+                    if (mode == .broad_debt_only) return err;
+                    break;
+                }
                 if (err == error.WriterLocked or err == error.ReplayDocumentNotVisible) {
                     return .{
                         .had_debt = true,
@@ -24308,6 +24331,10 @@ fn catchUpManagedDb(
             };
             db.runUntilIdle() catch |err| {
                 std.log.warn("managed startup catch-up replay idle drain failed table={s} err={}", .{ table_name, err });
+                if (err == error.ArtifactRepairRequired and initial_index_repair_debt) {
+                    if (mode == .broad_debt_only) return err;
+                    break;
+                }
                 if (err == error.WriterLocked or err == error.ReplayDocumentNotVisible) {
                     return .{
                         .had_debt = true,
@@ -41981,6 +42008,120 @@ test "managed dense maintenance does not report delegated repair rediscovery as 
     try std.testing.expect(delegated.had_debt);
     try std.testing.expect(delegated.index_repair_pending);
     try std.testing.expect(!delegated.made_progress);
+}
+
+test "managed catch-up reaches durable generation repair when dense replay needs an artifact rebuild" {
+    const alloc = std.testing.allocator;
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/managed-artifact-repair-before-replay",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    // Leave a replacement replay record behind the artifact that its delete
+    // phase needs to resolve. This is the production shape that formerly made
+    // every scheduler pass fail before it could enter the already-durable
+    // generation-repair lane.
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"_embeddings\":{\"dense_idx\":[0,1]}}",
+        }},
+        .sync_level = .write,
+    });
+    var queued = try db.repairArtifactIssuesWithRequestOptions(alloc, .{
+        .target = .index,
+        .artifact_kind = .embedding,
+        .index_name = "dense_idx",
+        .limit = 1,
+        .force = true,
+    }, .{ .defer_durable_index_repair_execution = true });
+    defer queued.deinit(alloc);
+    try std.testing.expect(try db.hasPendingIndexRepairIntents(alloc));
+
+    var source = ProvisionedTableWriteSource.init(path, NoCatalog.iface());
+    defer source.deinit();
+    const ReplayFailure = struct {
+        fired: bool = false,
+
+        fn run(ptr: *anyopaque, hook_db: *db_mod.DB) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fired) return;
+            self.fired = true;
+            try hook_db.markDenseReplayArtifactRepairRequired(std.testing.allocator, "dense_idx");
+            return error.ArtifactRepairRequired;
+        }
+    };
+    var replay_failure = ReplayFailure{};
+    const previous_hook = test_before_startup_catch_up_replay_hook;
+    defer test_before_startup_catch_up_replay_hook = previous_hook;
+    test_before_startup_catch_up_replay_hook = .{
+        .ptr = &replay_failure,
+        .run = ReplayFailure.run,
+    };
+    try std.testing.expectError(error.ArtifactRepairRequired, catchUpManagedDb(
+        &source,
+        alloc,
+        7001,
+        "docs",
+        &db,
+        true,
+        .isolated,
+        .broad_debt_only,
+        .{},
+    ));
+    try std.testing.expect(replay_failure.fired);
+    test_before_startup_catch_up_replay_hook = previous_hook;
+    const result = try catchUpManagedDb(
+        &source,
+        alloc,
+        7001,
+        "docs",
+        &db,
+        true,
+        .isolated,
+        .index_repair_prerequisite,
+        .{},
+    );
+    try std.testing.expect(result.index_repair_attempted or result.terminal_degraded);
 }
 
 test "managed startup catch-up defers while shared writer cache owns the table" {

@@ -86,6 +86,7 @@ def main() -> int:
         "CreateTableWithResponse(": "Go snippets must use the high-level SDK",
         "QueryWithResponse(": "Go snippets must use the high-level SDK",
         "wiki-articles.json ": "the downloaded fixture must be identified as JSONL",
+        "--streaming=false": "the retrieval CLI uses the --no-streaming switch",
     }
     for token, message in forbidden.items():
         if token in source:
@@ -94,13 +95,16 @@ def main() -> int:
     required = (
         "export PATH=\"$HOME/.local/bin:$PATH\"",
         "wiki-articles.jsonl",
-        "2,477 of the 10,000",
+        "2,446 of the 10,000",
+        "--tasks rerank --variants f32 cross-encoder/ms-marco-MiniLM-L6-v2",
         "full_text_index_v0",
         "antfly index wait --table wikipedia",
         "--until queryable",
         "physical chunks or vector",
         "## Troubleshooting",
         "standalone inference paths",
+        "--inference-host-budget-mb 8192",
+        "--no-streaming",
     )
     for token in required:
         if token not in source:

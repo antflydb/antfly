@@ -3606,9 +3606,22 @@ fn appendSingleIndexRuntimeStatus(
     // and identity, so keep readiness aligned with the legacy terminal state
     // without allowing a retained replacement snapshot to poison its
     // successor.
+    // Coverage counters are updated incrementally as the enrichment worker
+    // advances its sequence. Until that worker catches up, the remaining
+    // source documents are represented as skipped and strict coverage can
+    // temporarily look degraded. Do not turn that transient snapshot into a
+    // terminal failure; an isolated per-index failure or a failed worker is
+    // still terminal immediately.
+    const enrichment_work_pending = if (visible_enrichment) |stats|
+        stats.enabled and !stats.worker_failed and
+            (stats.retrying or stats.applied_sequence < stats.target_sequence or
+                stats.active_embed_batch_items > 0)
+    else
+        false;
+    const coverage_degraded = (if (embeddings_view) |view| view.coverage_degraded else false) and
+        !enrichment_work_pending;
     const enrichment_degraded = index_type == .embeddings and
-        ((embeddings_materialization_current and item.enrichment_failed) or
-            (if (embeddings_view) |view| view.coverage_degraded else false));
+        ((embeddings_materialization_current and item.enrichment_failed) or coverage_degraded);
     const terminal_enrichment_failure = enrichment_degraded or
         (if (visible_enrichment) |stats| stats.worker_failed else false);
     const terminal_load_failure = load_error != null and if (@hasField(@TypeOf(item), "load_error_matches_desired_incarnation"))
@@ -5885,6 +5898,15 @@ test "single embeddings index encoder scopes isolated enrichment failure to one 
     try std.testing.expect(std.mem.indexOf(u8, healthy_encoded, "\"backfill_state\":\"failed\"") == null);
 
     indexes[0].enrichment_failed = false;
+    indexes[0].coverage_skipped_count = 1;
+    local_items[0].stats.enrichment.target_sequence = 2;
+    local_items[0].stats.enrichment.applied_sequence = 1;
+    const recovering_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
+    defer alloc.free(recovering_encoded);
+    try std.testing.expect(std.mem.indexOf(u8, recovering_encoded, "\"backfill_state\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recovering_encoded, "\"readiness\":{\"state\":\"pending\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recovering_encoded, "\"readiness\":{\"state\":\"failed\"") == null);
+
     local_items[0].stats.enrichment.worker_failed = true;
     const worker_failed_encoded = (try encodeSingleIndex(alloc, &snapshot, "docs", "visual_idx", &local_status)).?;
     defer alloc.free(worker_failed_encoded);
