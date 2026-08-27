@@ -632,6 +632,72 @@ pub const ReallocationProtocolPeer = struct {
     orchestration_url: ?[]const u8 = null,
 };
 
+/// Maps a non-leader node's Raft observation to a table-mutation route. Every
+/// blocked outcome is `error.NotLeader`: a provably pre-admission authority
+/// failure that a load-balanced public caller may safely retry elsewhere.
+fn tableMutationRouteFromObservation(
+    observation: ServiceGroupRaftObservation,
+    peers: []const ReallocationProtocolPeer,
+) !MetadataHttpService.TableMutationRoute {
+    const leader_id = observation.leader_id orelse return error.NotLeader;
+    // The caller already failed the authoritative local-leader check; a stale
+    // observation naming this node must not forward to itself.
+    if (leader_id == observation.local_node_id) return error.NotLeader;
+    const peer = findReallocationProtocolPeer(peers, leader_id) orelse {
+        std.log.warn("table mutation routing blocked: metadata leader {d} is not in the configured peer set", .{leader_id});
+        return error.NotLeader;
+    };
+    const orchestration_url = peer.orchestration_url orelse {
+        std.log.warn("table mutation routing blocked: metadata leader {d} has no orchestration URL", .{leader_id});
+        return error.NotLeader;
+    };
+    if (orchestration_url.len == 0) {
+        std.log.warn("table mutation routing blocked: metadata leader {d} has an empty orchestration URL", .{leader_id});
+        return error.NotLeader;
+    }
+    return .{ .forward = peer };
+}
+
+test "metadata.table mutation routing forwards only to a routable remote leader" {
+    const peers = [_]ReallocationProtocolPeer{
+        .{ .node_id = 2, .orchestration_url = "http://metadata-1:8080" },
+        .{ .node_id = 3, .orchestration_url = null },
+        .{ .node_id = 4, .orchestration_url = "" },
+    };
+
+    const forwarded = try tableMutationRouteFromObservation(
+        .{ .local_node_id = 1, .leader_id = 2 },
+        &peers,
+    );
+    try std.testing.expectEqual(@as(u64, 2), forwarded.forward.node_id);
+    try std.testing.expectEqualStrings("http://metadata-1:8080", forwarded.forward.orchestration_url.?);
+
+    // No known leader yet.
+    try std.testing.expectError(error.NotLeader, tableMutationRouteFromObservation(
+        .{ .local_node_id = 1, .leader_id = null },
+        &peers,
+    ));
+    // Stale observation naming the local node must not self-forward.
+    try std.testing.expectError(error.NotLeader, tableMutationRouteFromObservation(
+        .{ .local_node_id = 1, .leader_id = 1 },
+        &peers,
+    ));
+    // Leader outside the configured peer set.
+    try std.testing.expectError(error.NotLeader, tableMutationRouteFromObservation(
+        .{ .local_node_id = 1, .leader_id = 9 },
+        &peers,
+    ));
+    // Leader without a usable orchestration URL.
+    try std.testing.expectError(error.NotLeader, tableMutationRouteFromObservation(
+        .{ .local_node_id = 1, .leader_id = 3 },
+        &peers,
+    ));
+    try std.testing.expectError(error.NotLeader, tableMutationRouteFromObservation(
+        .{ .local_node_id = 1, .leader_id = 4 },
+        &peers,
+    ));
+}
+
 fn findReallocationProtocolPeer(peers: []const ReallocationProtocolPeer, node_id: u64) ?ReallocationProtocolPeer {
     for (peers) |peer| {
         if (peer.node_id == node_id) return peer;
@@ -2206,6 +2272,12 @@ pub const MetadataService = struct {
         self.lockRuntime();
         defer self.unlockRuntime();
         try self.raft.host.host.campaignGroup(self.metadata_group_id);
+    }
+
+    pub fn ensureLocalTableMutationAuthority(self: *MetadataService) !void {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) return error.NotLeader;
     }
 
     pub fn proposeTransitionCommand(self: *MetadataService, command: metadata_storage.TransitionCommand) !void {
@@ -4017,6 +4089,13 @@ pub const MetadataHttpService = struct {
         try self.raft.host.http_host.campaignGroup(self.metadata_group_id);
     }
 
+    pub fn ensureLocalTableMutationAuthority(self: *MetadataHttpService) !void {
+        switch (try self.resolveTableMutationRoute()) {
+            .local => {},
+            .forward => return error.NotLeader,
+        }
+    }
+
     pub fn proposeTransitionCommand(self: *MetadataHttpService, command: metadata_storage.TransitionCommand) !void {
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
@@ -4905,6 +4984,46 @@ pub const MetadataHttpService = struct {
             );
             return error.ReallocationProtocolUpgradeRequired;
         }
+    }
+
+    pub const TableMutationRoute = union(enum) {
+        local,
+        forward: ReallocationProtocolPeer,
+    };
+
+    /// Routes public table create/drop mutations. Only the current metadata
+    /// Raft leader may run the table workflow, so a follower must forward the
+    /// mutation to the leader's configured orchestration URL instead of
+    /// failing locally. `error.NotLeader` here is provably pre-admission: no
+    /// mutation has been sent anywhere yet.
+    pub fn resolveTableMutationRoute(self: *MetadataHttpService) !TableMutationRoute {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+            return error.NotLeader;
+        if (raft_status.soft.role == .leader and
+            raft_status.soft.leader_id != null and
+            raft_status.soft.leader_id.? == raft_status.id)
+        {
+            return .local;
+        }
+        const observation = raftObservationFromStatus(
+            raft_status,
+            self.raft.host.http_host.host.cfg.local_node_id,
+        );
+        return tableMutationRouteFromObservation(observation, self.reallocation_protocol_peers);
+    }
+
+    pub fn tableMutationForwardClient(self: *MetadataHttpService) metadata_http_client.MetadataHttpClient {
+        var client = metadata_http_client.MetadataHttpClient.init(
+            self.alloc,
+            self.raft.host.http_host.request_executor,
+        );
+        _ = client.withInternalServiceAuth(
+            self.internal_service_secret,
+            self.internal_service_issuer,
+        );
+        return client;
     }
 
     pub fn clearReallocationRequest(self: *MetadataHttpService, expected_request_id: u128) !void {

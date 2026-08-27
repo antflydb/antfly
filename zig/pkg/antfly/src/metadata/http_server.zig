@@ -42,6 +42,13 @@ const platform_time = @import("antfly_platform").time;
 const routes = @import("http_routes.zig");
 const service = @import("service.zig");
 
+const max_forwarded_table_create_body_bytes = tables_api.max_table_create_transport_bytes;
+
+fn validateForwardedCreateTableBodySize(body_len: usize) !void {
+    if (body_len > max_forwarded_table_create_body_bytes)
+        return error.CreateTableRequestTooLarge;
+}
+
 pub const MetadataHttpServerConfig = struct {
     /// Non-secret capability marker used by deployment controllers to prove
     /// that every upgraded metadata process is actually enforcing the
@@ -87,6 +94,7 @@ pub const AdminSource = struct {
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
+        preflight_table_mutation_authority: ?*const fn (ptr: *anyopaque) anyerror!void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
         restore_table: ?*const fn (
@@ -170,6 +178,11 @@ pub const AdminSource = struct {
 
     pub fn freeAdminSnapshot(self: AdminSource, snapshot: *metadata_api.AdminSnapshot) void {
         self.vtable.free_admin_snapshot(self.ptr, snapshot);
+    }
+
+    pub fn preflightTableMutationAuthority(self: AdminSource) !void {
+        const preflight = self.vtable.preflight_table_mutation_authority orelse return;
+        try preflight(self.ptr);
     }
 
     pub fn createTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
@@ -339,6 +352,7 @@ pub const AdminSource = struct {
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
+                .preflight_table_mutation_authority = metadataServicePreflightTableMutationAuthority,
                 .create_table = metadataServiceCreateTable,
                 .replace_table_definition = metadataServiceReplaceTableDefinition,
                 .restore_table = metadataServiceRestoreTable,
@@ -384,6 +398,7 @@ pub const AdminSource = struct {
                 .validate_publication = metadataHttpServiceValidatePublication,
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
+                .preflight_table_mutation_authority = metadataHttpServicePreflightTableMutationAuthority,
                 .create_table = metadataHttpServiceCreateTable,
                 .replace_table_definition = metadataHttpServiceReplaceTableDefinition,
                 .restore_table = metadataHttpServiceRestoreTable,
@@ -502,6 +517,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         const table = tables_api.deriveTableRecord(table_name, req);
@@ -536,6 +552,7 @@ pub const AdminSource = struct {
 
     fn metadataServiceDropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
@@ -843,8 +860,24 @@ pub const AdminSource = struct {
         svc.freeAdminSnapshot(snapshot);
     }
 
+    fn metadataServicePreflightTableMutationAuthority(ptr: *anyopaque) !void {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
+    }
+
+    fn metadataHttpServicePreflightTableMutationAuthority(ptr: *anyopaque) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
+    }
+
     fn metadataHttpServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
+        createTableOnLocalHttpService(svc, alloc, table_name, req) catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
+    }
+
+    fn createTableOnLocalHttpService(svc: *service.MetadataHttpService, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         const table = tables_api.deriveTableRecord(table_name, req);
@@ -882,6 +915,12 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceDropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLocalTableMutationAuthority();
+        dropTableOnLocalHttpService(svc, alloc, table_name) catch |err|
+            return metadata_authority.afterPossibleAdmission(err);
+    }
+
+    fn dropTableOnLocalHttpService(svc: *service.MetadataHttpService, alloc: std.mem.Allocator, table_name: []const u8) !void {
         var snapshot = try svc.adminSnapshot();
         defer svc.freeAdminSnapshot(&snapshot);
         const table = findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
@@ -1199,8 +1238,10 @@ pub const MetadataHttpServer = struct {
         try server.post(extension_path ++ routes.Routes.internal_extension_disable_suffix, httpx.Handler.bind(self, metadataDisableExtension));
         try server.put(extension_path ++ routes.Routes.internal_extension_config_suffix, httpx.Handler.bind(self, metadataConfigureExtension));
 
+        try server.postWithBodyLimit(routes.Routes.internal_forwarded_table_create, max_forwarded_table_create_body_bytes, httpx.Handler.bind(self, metadataCreateTableForwarded));
+        try server.post(routes.Routes.internal_forwarded_table_drop, httpx.Handler.bind(self, metadataDropTableForwarded));
         const table_path = routes.Routes.internal_tables_prefix ++ ":table_name";
-        try server.post(table_path, httpx.Handler.bind(self, metadataCreateTable));
+        try server.postWithBodyLimit(table_path, tables_api.max_table_create_body_bytes, httpx.Handler.bind(self, metadataCreateTable));
         try server.delete(table_path, httpx.Handler.bind(self, metadataDropTable));
         try server.put(table_path ++ routes.Routes.internal_table_definition_suffix, httpx.Handler.bind(self, metadataReplaceTableDefinition));
         try server.put(table_path ++ routes.Routes.internal_table_schema_suffix, httpx.Handler.bind(self, metadataUpdateTableSchema));
@@ -1455,6 +1496,15 @@ pub const MetadataHttpServer = struct {
                 http_common.metadata_mutation_not_admitted_header,
                 http_common.metadata_mutation_not_admitted_value,
             );
+        }
+        if (err == error.MetadataMutationOutcomeUnknown) {
+            // Authority moved after the mutation may have been admitted. Emit
+            // the broad retry hint without the non-admission proof so
+            // at-most-once clients converge through observation instead of a
+            // blind replay.
+            try ctx.setHeader("Retry-After", "1");
+            try ctx.setHeader(http_common.metadata_not_leader_header, http_common.metadata_not_leader_value);
+            return ctx.status(503).text("metadata authority unavailable");
         }
         return metadataReadError(ctx, err);
     }
@@ -1889,14 +1939,52 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataCreateTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        );
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
-        var request = parseCreateTableRequest(ctx.allocator, (try ctx.body()) orelse "") catch
+        return self.executeMetadataCreateTable(ctx, table_name, (try ctx.body()) orelse "");
+    }
+
+    fn metadataCreateTableForwarded(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        );
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
+        const body = (try ctx.body()) orelse "";
+        validateForwardedCreateTableBodySize(body.len) catch
+            return ctx.status(413).text("create table request too large");
+        var forwarded = std.json.parseFromSlice(
+            routes.ForwardedCreateTableMutation,
+            ctx.allocator,
+            body,
+            .{ .allocate = .alloc_always },
+        ) catch return ctx.status(400).text("invalid forwarded create table request");
+        defer forwarded.deinit();
+        tables_api.validateTableMutationName(forwarded.value.table_name) catch
+            return ctx.status(400).text("invalid table name");
+        return self.executeMetadataCreateTable(ctx, forwarded.value.table_name, forwarded.value.definition_json);
+    }
+
+    fn executeMetadataCreateTable(
+        self: *MetadataHttpServer,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+        definition_json: []const u8,
+    ) !httpx.Response {
+        tables_api.validateTableCreateBodySize(definition_json.len) catch
+            return ctx.status(413).text("create table request too large");
+        var request = parseCreateTableRequest(ctx.allocator, definition_json) catch
             return ctx.status(400).text("invalid create table request");
         defer request.deinit(ctx.allocator);
         self.tableOperations().create(ctx.allocator, requestContext(ctx), table_name, request) catch |err| switch (err) {
+            error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
-            else => return metadataReadError(ctx, err),
+            else => return metadataMutationError(ctx, err),
         };
         return ctx.status(201).text("created");
     }
@@ -1919,13 +2007,44 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataDropTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        );
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
+        return self.executeMetadataDropTable(ctx, table_name);
+    }
+
+    fn metadataDropTableForwarded(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        try ctx.setHeader(
+            routes.Routes.table_mutation_protocol_header,
+            routes.Routes.table_mutation_protocol_value,
+        );
+        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
+        var forwarded = std.json.parseFromSlice(
+            routes.ForwardedDropTableMutation,
+            ctx.allocator,
+            (try ctx.body()) orelse "",
+            .{ .allocate = .alloc_always },
+        ) catch return ctx.status(400).text("invalid forwarded drop table request");
+        defer forwarded.deinit();
+        tables_api.validateTableMutationName(forwarded.value.table_name) catch
+            return ctx.status(400).text("invalid table name");
+        return self.executeMetadataDropTable(ctx, forwarded.value.table_name);
+    }
+
+    fn executeMetadataDropTable(
+        self: *MetadataHttpServer,
+        ctx: *httpx.Context,
+        table_name: []const u8,
+    ) !httpx.Response {
         self.tableOperations().drop(ctx.allocator, requestContext(ctx), table_name) catch |err| switch (err) {
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject => return ctx.status(405).text("method not allowed"),
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
-            else => return metadataReadError(ctx, err),
+            else => return metadataMutationError(ctx, err),
         };
         return ctx.status(204).text("");
     }

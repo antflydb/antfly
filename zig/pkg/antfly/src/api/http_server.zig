@@ -1042,6 +1042,7 @@ pub const StatusSource = struct {
     }
 
     pub fn createTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
+        try tables_api.validateTableMutationName(table_name);
         const fn_ptr = self.vtable.create_table orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("create_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, req });
     }
@@ -1066,6 +1067,7 @@ pub const StatusSource = struct {
     }
 
     pub fn dropTable(self: StatusSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
+        try tables_api.validateTableMutationName(table_name);
         const fn_ptr = self.vtable.drop_table orelse return error.UnsupportedOperation;
         return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name });
     }
@@ -1348,8 +1350,122 @@ pub const StatusSource = struct {
         };
     }
 
+    /// The HTTP-backed metadata source runs behind a load-balanced public
+    /// Service, so table create/drop may arrive on a follower. Route those two
+    /// mutations to the current metadata Raft leader instead of failing
+    /// locally; every other operation keeps the generated local vtable.
+    fn makeHttpServiceVTable() VTable {
+        var vtable = makeServiceVTable(metadata_service.MetadataHttpService);
+        vtable.create_table = HttpRoutedTableMutations.createTable;
+        vtable.drop_table = HttpRoutedTableMutations.dropTable;
+        return vtable;
+    }
+
+    const HttpRoutedTableMutations = struct {
+        fn cast(ptr: *anyopaque) *metadata_service.MetadataHttpService {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void {
+            const svc = cast(ptr);
+            var prepared = try PreparedCreate.init(alloc, table_name, req);
+            defer prepared.deinit(alloc);
+            const ops: CreateOps = .{
+                .svc = svc,
+                .alloc = alloc,
+                .table_name = table_name,
+                .req = prepared.req,
+                .body = prepared.body,
+            };
+            try runRoutedTableMutation(svc, ops);
+        }
+
+        fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
+            const svc = cast(ptr);
+            const ops: DropOps = .{ .svc = svc, .alloc = alloc, .table_name = table_name };
+            try runRoutedTableMutation(svc, ops);
+        }
+
+        const PreparedCreate = struct {
+            req: tables_api.CreateTableRequest,
+            expanded_indexes_json: []u8,
+            body: []u8,
+
+            fn init(
+                alloc: std.mem.Allocator,
+                table_name: []const u8,
+                input: tables_api.CreateTableRequest,
+            ) !PreparedCreate {
+                var req = input;
+                const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(
+                    alloc,
+                    table_name,
+                    input.indexes_json orelse tables_api.default_indexes_json,
+                    tables_api.effectiveSchemaJson(input.schema_json),
+                );
+                errdefer alloc.free(expanded_indexes_json);
+                req.indexes_json = expanded_indexes_json;
+                const body = try tables_api.encodeStoredCreateTableRequestAlloc(alloc, req);
+                errdefer alloc.free(body);
+                try tables_api.validateTableCreateBodySize(body.len);
+                return .{
+                    .req = req,
+                    .expanded_indexes_json = expanded_indexes_json,
+                    .body = body,
+                };
+            }
+
+            fn deinit(self: *PreparedCreate, alloc: std.mem.Allocator) void {
+                alloc.free(self.expanded_indexes_json);
+                alloc.free(self.body);
+                self.* = undefined;
+            }
+        };
+
+        const CreateOps = struct {
+            svc: *metadata_service.MetadataHttpService,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: tables_api.CreateTableRequest,
+            body: []const u8,
+
+            fn local(self: @This()) anyerror!void {
+                createNormalizedTableOnService(self.svc, self.alloc, self.table_name, self.req) catch |err|
+                    return afterTableMutationExecutionStarted(err);
+            }
+
+            fn forward(self: @This(), peer: metadata_service.ReallocationProtocolPeer) anyerror!void {
+                // Route resolution proves this is present; fail closed to a
+                // pre-admission authority error rather than panic if a future
+                // caller constructs `.forward` without the guarantee.
+                const orchestration_url = peer.orchestration_url orelse return error.NotLeader;
+                std.log.info("forwarding table create to metadata leader table={s} leader={d}", .{ self.table_name, peer.node_id });
+                var client = self.svc.tableMutationForwardClient();
+                try client.createTableForwarded(orchestration_url, self.table_name, self.body);
+            }
+        };
+
+        const DropOps = struct {
+            svc: *metadata_service.MetadataHttpService,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+
+            fn local(self: @This()) anyerror!void {
+                dropTableOnService(self.svc, self.alloc, self.table_name) catch |err|
+                    return afterTableMutationExecutionStarted(err);
+            }
+
+            fn forward(self: @This(), peer: metadata_service.ReallocationProtocolPeer) anyerror!void {
+                const orchestration_url = peer.orchestration_url orelse return error.NotLeader;
+                std.log.info("forwarding table drop to metadata leader table={s} leader={d}", .{ self.table_name, peer.node_id });
+                var client = self.svc.tableMutationForwardClient();
+                try client.dropTableForwarded(orchestration_url, self.table_name);
+            }
+        };
+    };
+
     pub fn fromMetadataHttpService(svc: *metadata_service.MetadataHttpService) StatusSource {
-        return .{ .ptr = svc, .vtable = &comptime makeServiceVTable(metadata_service.MetadataHttpService) };
+        return .{ .ptr = svc, .vtable = &comptime makeHttpServiceVTable() };
     }
 
     pub fn fromMetadataService(svc: *metadata_service.MetadataService) StatusSource {
@@ -1360,6 +1476,14 @@ pub const StatusSource = struct {
         return fromMetadataHttpService(srv.svc);
     }
 };
+
+test "routed table mutation bounds the canonical create body before route selection" {
+    try tables_api.validateTableCreateBodySize(tables_api.max_table_create_body_bytes);
+    try std.testing.expectError(
+        error.CreateTableRequestTooLarge,
+        tables_api.validateTableCreateBodySize(tables_api.max_table_create_body_bytes + 1),
+    );
+}
 
 const RestoreMetadataSpec = struct {
     table: metadata_table_manager.TableRecord,
@@ -1401,23 +1525,186 @@ fn deriveRestoreMetadataSpec(
     };
 }
 
+const max_table_mutation_route_attempts: usize = 3;
+
+fn afterTableMutationExecutionStarted(err: anyerror) anyerror {
+    return if (metadata_authority.isRetryableError(err))
+        error.MetadataMutationOutcomeUnknown
+    else
+        err;
+}
+
+test "started table mutations preserve authority-loss ambiguity" {
+    try std.testing.expectEqual(
+        error.MetadataMutationOutcomeUnknown,
+        afterTableMutationExecutionStarted(error.NotLeader),
+    );
+    try std.testing.expectEqual(
+        error.MetadataMutationOutcomeUnknown,
+        afterTableMutationExecutionStarted(error.ReconcileLeaseNotHeld),
+    );
+    try std.testing.expectEqual(
+        error.InvalidCreateTableRequest,
+        afterTableMutationExecutionStarted(error.InvalidCreateTableRequest),
+    );
+}
+
+/// Drives one public table create/drop through the current metadata
+/// authority. `ops.local()` runs the existing local workflow when this node
+/// is the leader; `ops.forward(peer)` sends the mutation to the resolved
+/// leader otherwise. Only a typed, provably pre-admission `error.NotLeader`
+/// from the forward path triggers bounded leader rediscovery. Ambiguous
+/// transport or server failures surface unchanged and are never replayed;
+/// callers converge through an exact state probe.
+fn runRoutedTableMutation(router: anytype, ops: anytype) !void {
+    var attempts: usize = 0;
+    while (true) {
+        attempts += 1;
+        switch (try router.resolveTableMutationRoute()) {
+            .local => return try ops.local(),
+            .forward => |peer| {
+                ops.forward(peer) catch |err| switch (err) {
+                    error.NotLeader => {
+                        if (attempts >= max_table_mutation_route_attempts) return error.NotLeader;
+                        continue;
+                    },
+                    else => return err,
+                };
+                return;
+            },
+        }
+    }
+}
+
+test "routed table mutation runs locally on the metadata leader" {
+    var script = RoutedTableMutationScript{ .routes = &.{.local} };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 1), script.local_calls);
+    try std.testing.expectEqual(@as(usize, 0), script.forward_calls);
+}
+
+test "routed table mutation forwards to the resolved leader from a follower" {
+    var script = RoutedTableMutationScript{ .routes = &.{.{ .forward = .{ .node_id = 2, .orchestration_url = "http://leader" } }} };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 0), script.local_calls);
+    try std.testing.expectEqual(@as(usize, 1), script.forward_calls);
+}
+
+test "routed table mutation rediscovers the leader after a typed pre-admission rejection" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{
+            .{ .forward = .{ .node_id = 2, .orchestration_url = "http://stale-leader" } },
+            .{ .forward = .{ .node_id = 3, .orchestration_url = "http://new-leader" } },
+        },
+        .forward_errors = &.{error.NotLeader},
+    };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 2), script.forward_calls);
+    try std.testing.expectEqual(@as(usize, 2), script.route_resolutions);
+}
+
+test "routed table mutation rediscovery converges on a leader that becomes local" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{
+            .{ .forward = .{ .node_id = 2, .orchestration_url = "http://stale-leader" } },
+            .local,
+        },
+        .forward_errors = &.{error.NotLeader},
+    };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 1), script.forward_calls);
+    try std.testing.expectEqual(@as(usize, 1), script.local_calls);
+}
+
+test "routed table mutation bounds leader rediscovery" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{.{ .forward = .{ .node_id = 2, .orchestration_url = "http://flapping" } }},
+        .forward_errors = &.{ error.NotLeader, error.NotLeader, error.NotLeader, error.NotLeader },
+    };
+    try std.testing.expectError(
+        error.NotLeader,
+        runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script }),
+    );
+    try std.testing.expectEqual(@as(usize, max_table_mutation_route_attempts), script.forward_calls);
+}
+
+test "routed table mutation never replays an ambiguous forward outcome" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{.{ .forward = .{ .node_id = 2, .orchestration_url = "http://leader" } }},
+        .forward_errors = &.{error.MetadataMutationOutcomeUnknown},
+    };
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), script.forward_calls);
+}
+
+test "routed table mutation surfaces resolution failure without mutating" {
+    var script = RoutedTableMutationScript{ .routes = &.{}, .resolve_error = error.NotLeader };
+    try std.testing.expectError(
+        error.NotLeader,
+        runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), script.local_calls);
+    try std.testing.expectEqual(@as(usize, 0), script.forward_calls);
+}
+
+const RoutedTableMutationScript = struct {
+    routes: []const metadata_service.MetadataHttpService.TableMutationRoute,
+    forward_errors: []const anyerror = &.{},
+    resolve_error: ?anyerror = null,
+    route_resolutions: usize = 0,
+    local_calls: usize = 0,
+    forward_calls: usize = 0,
+
+    fn resolveTableMutationRoute(self: *@This()) !metadata_service.MetadataHttpService.TableMutationRoute {
+        if (self.resolve_error) |err| return err;
+        const index = @min(self.route_resolutions, self.routes.len - 1);
+        self.route_resolutions += 1;
+        return self.routes[index];
+    }
+
+    const Ops = struct {
+        script: *RoutedTableMutationScript,
+
+        fn local(self: @This()) anyerror!void {
+            self.script.local_calls += 1;
+        }
+
+        fn forward(self: @This(), peer: metadata_service.ReallocationProtocolPeer) anyerror!void {
+            _ = peer;
+            const index = self.script.forward_calls;
+            self.script.forward_calls += 1;
+            if (index < self.script.forward_errors.len) return self.script.forward_errors[index];
+        }
+    };
+};
+
 fn createTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
+    var normalized_req = req;
+    const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
+    const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
+    defer alloc.free(expanded_indexes_json);
+    normalized_req.indexes_json = expanded_indexes_json;
+    try createNormalizedTableOnService(svc, alloc, table_name, normalized_req);
+}
+
+fn runPostMutationRound(svc: anytype) !void {
+    try svc.runControlRoundOnly();
+}
+
+fn createNormalizedTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
-    var normalized_req = req;
-    var expanded_indexes_json: ?[]u8 = null;
-    defer if (expanded_indexes_json) |value| alloc.free(value);
-    const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-    expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
-    normalized_req.indexes_json = expanded_indexes_json;
-    const table = tables_api.deriveTableRecord(table_name, normalized_req);
+    const table = tables_api.deriveTableRecord(table_name, req);
     const ranges = try tables_api.deriveInitialRanges(alloc, table);
     defer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(ranges);
     }
     _ = try workflow.createTableWithRanges(svc, table, ranges);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn replaceTableDefinitionOnService(
@@ -1432,7 +1719,7 @@ fn replaceTableDefinitionOnService(
     if (extensionOwnsTableShape(&snapshot, replacement.name)) return error.ExtensionOwnedObject;
 
     try svc.replaceTableDefinition(expected, replacement);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -1444,7 +1731,7 @@ fn dropTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
     _ = try workflow.dropTable(svc, table.table_id);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !u32 {
@@ -1457,7 +1744,7 @@ fn updateSchemaOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []c
     defer metadata_table_manager.freeTable(alloc, updated);
     const version = try tables_api.schemaVersion(updated.schema_json);
     try svc.replaceTableDefinition(table.*, updated);
-    try svc.runRound();
+    try runPostMutationRound(svc);
     return version;
 }
 
@@ -1473,7 +1760,7 @@ fn createIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []co
     updated_record.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, expanded_index_json);
     defer alloc.free(updated_record.indexes_json);
     try svc.replaceTableDefinition(table.*, updated_record);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
@@ -1487,7 +1774,7 @@ fn dropIndexOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []cons
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.replaceTableDefinition(table.*, updated_record);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
@@ -1501,7 +1788,7 @@ fn putArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_
     defer alloc.free(updated_record.indexes_json);
     try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated_record.indexes_json);
     try svc.replaceTableDefinition(table.*, updated_record);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
@@ -1516,7 +1803,7 @@ fn deleteArtifactEnrichmentOnService(svc: anytype, alloc: std.mem.Allocator, tab
     var updated_record = table.*;
     updated_record.indexes_json = indexes_json;
     try svc.replaceTableDefinition(table.*, updated_record);
-    try svc.runRound();
+    try runPostMutationRound(svc);
 }
 
 fn persistRestoreTableIntent(
@@ -11788,7 +12075,8 @@ pub const ApiHttpServer = struct {
 
         self.source.createTable(self.alloc, table_name, request) catch |err| return switch (err) {
             error.TableAlreadyExists => try contextual_operations.textAlloc(self.alloc, 409, "table already exists"),
-            error.InvalidCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.InvalidCreateTableRequest, error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table configuration"),
+            error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
             else => return err,
         };
@@ -11844,6 +12132,7 @@ pub const ApiHttpServer = struct {
             }
         }
         self.source.dropTable(self.alloc, table_name) catch |err| return switch (err) {
+            error.InvalidTableName => try contextual_operations.textAlloc(self.alloc, 400, "invalid table name"),
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
             error.TableTransitionActive => try contextual_operations.textAlloc(self.alloc, 409, "table transition active"),
             error.ExtensionOwnedObject, error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
