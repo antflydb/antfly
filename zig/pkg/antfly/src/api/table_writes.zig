@@ -4344,8 +4344,27 @@ pub const RaftBatcher = struct {
 fn ensurePreDecisionContextActive(context: distributed_txn.PreDecisionContext) !void {
     try context.cancellation.check();
     if (context.deadline_ns) |deadline_ns| {
-        if (platform_time.monotonicNs() >= deadline_ns) return error.DeadlineExceeded;
+        // This check is deliberately adjacent to mutation admission. Keep its
+        // error distinct from generic storage and transport deadlines so only
+        // this proven pre-proposal outcome may authorize replica failover.
+        if (platform_time.monotonicNs() >= deadline_ns) return error.PreDecisionDeadlineExceeded;
     }
+}
+
+test "pre-decision context deadline has typed admission provenance" {
+    try std.testing.expectError(
+        error.PreDecisionDeadlineExceeded,
+        ensurePreDecisionContextActive(.{ .deadline_ns = 1 }),
+    );
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        ensurePreDecisionContextActive(.{
+            .deadline_ns = std.math.maxInt(u64),
+            .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled),
+        }),
+    );
 }
 
 const DocumentChildRangeDispatchContext = struct {

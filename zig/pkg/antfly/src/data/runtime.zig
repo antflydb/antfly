@@ -7124,7 +7124,7 @@ pub const DataServer = struct {
         const leader_wait_ns = preDecisionLeaderWaitNsAt(
             platform_time.monotonicNs(),
             deadline_ns,
-        ) orelse return error.DeadlineExceeded;
+        ) orelse return error.PreDecisionDeadlineExceeded;
         var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
         try self.proposeRaftBatchGroupWithLeaderWait(
             alloc,

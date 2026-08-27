@@ -5926,6 +5926,7 @@ pub fn build(b: *std.Build) void {
             "distributed txn coordinator never restarts a transaction id on topology change",
             "db transaction recovery runtime resolves table-group participants through distributed txn resolver",
             "compiled table write boundary transports cancellation and committed failure identity",
+            "pre-decision context deadline has typed admission provenance",
             "bound stable single-group transaction retry does not reapply transforms",
             "bound single-group batch reports prepared intent conflicts",
             "provisioned predicate-only batch validates matching and stale versions",

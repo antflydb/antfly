@@ -29,6 +29,7 @@ pub const Error = operation.ApiError || error{
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     GroupLeaderUnavailable,
+    PreDecisionDeadlineExceeded,
     TransactionPreDecisionOutcomeUnknown,
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
@@ -274,7 +275,7 @@ pub const Operations = struct {
     }
 
     pub fn txnBegin(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnBeginRequest) Error!void {
-        try request.ensureActive();
+        try ensurePreDecisionRequestActive(request);
         const writes = self.writes orelse return error.NotFound;
         const supports_pre_decision_context =
             writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
@@ -284,10 +285,11 @@ pub const Operations = struct {
         }) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.Timeout, error.DeadlineExceeded => {
-                if (!supports_pre_decision_context)
+            error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
+            error.PreDecisionDeadlineExceeded => {
+                if (!supports_pre_decision_context or request.deadline_ns == null)
                     return error.TransactionPreDecisionOutcomeUnknown;
-                return error.DeadlineExceeded;
+                return error.PreDecisionDeadlineExceeded;
             },
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
@@ -303,7 +305,7 @@ pub const Operations = struct {
     }
 
     pub fn txnPrepare(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnPrepareRequest) Error!void {
-        try request.ensureActive();
+        try ensurePreDecisionRequestActive(request);
         const writes = self.writes orelse return error.NotFound;
         const supports_pre_decision_context =
             writes.vtable.txn_prepare_group_local_with_pre_decision_context != null;
@@ -317,10 +319,11 @@ pub const Operations = struct {
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.Timeout, error.DeadlineExceeded => {
-                if (!supports_pre_decision_context)
+            error.Timeout, error.DeadlineExceeded => return error.TransactionPreDecisionOutcomeUnknown,
+            error.PreDecisionDeadlineExceeded => {
+                if (!supports_pre_decision_context or request.deadline_ns == null)
                     return error.TransactionPreDecisionOutcomeUnknown;
-                return error.DeadlineExceeded;
+                return error.PreDecisionDeadlineExceeded;
             },
             error.TopologyChanged => return error.TopologyChanged,
             error.VersionConflict, error.IntentConflict => return error.TransactionConflict,
@@ -793,6 +796,16 @@ pub const Operations = struct {
     }
 };
 
+fn ensurePreDecisionRequestActive(request: operation.RequestContext) Error!void {
+    request.ensureActive() catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        // This check runs before a participant callback can admit a mutation,
+        // so it is safe to give the deadline failure a stronger identity.
+        error.DeadlineExceeded => return error.PreDecisionDeadlineExceeded,
+        else => return error.Internal,
+    };
+}
+
 test "internal transaction operations preserve pre-decision leader unavailability" {
     const Source = struct {
         fn iface() table_writes.TableWriteSource {
@@ -890,6 +903,60 @@ test "internal transaction operations preserve pre-decision leader unavailabilit
         }
     };
 
+    const ContextDeadlineSource = struct {
+        failure: anyerror,
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .txn_begin_group_local_with_pre_decision_context = txnBegin,
+                    .txn_prepare_group_local_with_pre_decision_context = txnPrepare,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            return null;
+        }
+
+        fn txnBegin(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: u64,
+            _: bool,
+            _: []const []const u8,
+            _: distributed_txn.PreDecisionContext,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+
+        fn txnPrepare(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: db_mod.types.TransactionIntentRequest,
+            _: distributed_txn.PreDecisionContext,
+        ) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+    };
+
     const Validator = struct {
         fn validate(_: *anyopaque, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
     };
@@ -935,6 +1002,59 @@ test "internal transaction operations preserve pre-decision leader unavailabilit
         7,
         "docs",
         .{ .txn_id = txn_id, .req = .{} },
+    ));
+
+    var context_deadline_source = ContextDeadlineSource{ .failure = error.Timeout };
+    const context_deadline_operations = Operations{
+        .reads = null,
+        .shard_db_adapter = null,
+        .writes = context_deadline_source.iface(),
+        .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
+    };
+    const active_deadline = operation.RequestContext{ .deadline_ns = std.math.maxInt(u64) };
+    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnBegin(
+        std.testing.allocator,
+        active_deadline,
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+    context_deadline_source.failure = error.DeadlineExceeded;
+    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnPrepare(
+        std.testing.allocator,
+        active_deadline,
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .req = .{} },
+    ));
+    context_deadline_source.failure = error.PreDecisionDeadlineExceeded;
+    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, context_deadline_operations.txnBegin(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, context_deadline_operations.txnBegin(
+        std.testing.allocator,
+        active_deadline,
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, context_deadline_operations.txnPrepare(
+        std.testing.allocator,
+        active_deadline,
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .req = .{} },
+    ));
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, operations.txnBegin(
+        std.testing.allocator,
+        .{ .deadline_ns = 1 },
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
     ));
 }
 

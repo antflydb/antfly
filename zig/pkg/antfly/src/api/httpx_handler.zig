@@ -2144,6 +2144,7 @@ pub const AntflyApiHandler = struct {
             error.NotFound => textResponse(ctx, 404, "not found"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.PreDecisionDeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
             error.TransactionPreDecisionOutcomeUnknown => textResponse(ctx, 504, "transaction outcome unknown"),
             error.EnrichmentWaitCanceled,
             error.EnrichmentWaitTimeout,
@@ -2159,7 +2160,7 @@ pub const AntflyApiHandler = struct {
     fn txnErrorProvesNotProposed(err: internal_group_operations.Error, phase: InternalTxnPhase) bool {
         if (!phase.isPreDecision()) return false;
         return err == error.GroupLeaderUnavailable or
-            err == error.DeadlineExceeded or
+            err == error.PreDecisionDeadlineExceeded or
             err == error.NotFound;
     }
 
@@ -6130,8 +6131,21 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
     try std.testing.expectEqual(@as(u16, 504), ambiguous_deadline_response.status.code);
     try std.testing.expect(ambiguous_deadline_response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
 
+    var generic_deadline_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
+    defer generic_deadline_request.deinit();
+    var generic_deadline_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &generic_deadline_request);
+    defer generic_deadline_ctx.deinit();
+    var generic_deadline_response = try AntflyApiHandler.internalTxnErrorResponse(
+        &generic_deadline_ctx,
+        error.DeadlineExceeded,
+        .begin,
+    );
+    defer generic_deadline_response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), generic_deadline_response.status.code);
+    try std.testing.expect(generic_deadline_response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+
     inline for (.{
-        .{ error.DeadlineExceeded, @as(u16, 504) },
+        .{ error.PreDecisionDeadlineExceeded, @as(u16, 504) },
         .{ error.NotFound, @as(u16, 404) },
     }) |case| {
         var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");

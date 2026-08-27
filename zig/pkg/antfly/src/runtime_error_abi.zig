@@ -298,6 +298,7 @@ pub const Detail = enum(c_int) {
     enrichment_wait_timeout,
     enrichment_worker_failed,
     deadline_exceeded,
+    pre_decision_deadline_exceeded,
 };
 
 pub const Status = extern struct {
@@ -403,6 +404,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedPlatform => status(.unsupported, .unsupported_platform),
         error.Timeout => status(.timeout, .timeout),
         error.DeadlineExceeded => status(.timeout, .deadline_exceeded),
+        error.PreDecisionDeadlineExceeded => status(.timeout, .pre_decision_deadline_exceeded),
         error.ConnectionTimeout => status(.timeout, .connection_timeout),
         error.ConnectionTimedOut => status(.timeout, .connection_timed_out),
         error.Cancelled => status(.cancelled, .cancelled),
@@ -885,6 +887,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_wait_timeout => "EnrichmentWaitTimeout",
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
         .deadline_exceeded => "DeadlineExceeded",
+        .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
     };
 }
 
@@ -904,6 +907,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.EnrichmentWaitTimeout, errorFromStatus(statusFromError(error.EnrichmentWaitTimeout)));
     try std.testing.expectEqual(error.EnrichmentWorkerFailed, errorFromStatus(statusFromError(error.EnrichmentWorkerFailed)));
     try std.testing.expectEqual(error.DeadlineExceeded, errorFromStatus(statusFromError(error.DeadlineExceeded)));
+    try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));

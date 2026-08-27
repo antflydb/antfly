@@ -1119,8 +1119,8 @@ test "compiled table write boundary transports cancellation and committed failur
         },
     )) != null);
     try std.testing.expectEqual(@as(usize, 1), fake.pre_decision_calls);
-    fake.failure = error.DeadlineExceeded;
-    try std.testing.expectError(error.DeadlineExceeded, source.txnBeginGroupLocalWithPreDecisionContext(
+    fake.failure = error.PreDecisionDeadlineExceeded;
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, source.txnBeginGroupLocalWithPreDecisionContext(
         std.testing.allocator,
         7,
         "docs",

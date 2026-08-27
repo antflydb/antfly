@@ -634,11 +634,10 @@ fn isPreDecisionCandidateMiss(err: anyerror) bool {
 
 fn isLocalPreDecisionCandidateMiss(err: anyerror, supports_pre_decision_context: bool) bool {
     if (isPreDecisionCandidateMiss(err)) return true;
-    // Only the context-aware callback contract guarantees DeadlineExceeded was
-    // observed at a checked boundary before admitting the mutation. An older
-    // boundary can return the same broad error identity without that proof, so
-    // rolling-version fallback must remain fail-closed.
-    return supports_pre_decision_context and err == error.DeadlineExceeded;
+    // Only the context-aware callback contract can emit this typed proof from
+    // a checked boundary before admitting the mutation. Generic deadline and
+    // timeout errors remain ambiguous across rolling-version fallbacks.
+    return supports_pre_decision_context and err == error.PreDecisionDeadlineExceeded;
 }
 
 fn beginDefinitelyCreatedNoState(err: anyerror) bool {
@@ -1242,11 +1241,37 @@ test "hosted participant rediscovery retries only pre-decision leader unavailabi
         }
 
         fn beginWithContext(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, _: PreDecisionContext) anyerror!?void {
-            return error.DeadlineExceeded;
+            return error.PreDecisionDeadlineExceeded;
         }
 
         fn prepareWithContext(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest, _: PreDecisionContext) anyerror!?void {
-            return error.DeadlineExceeded;
+            return error.PreDecisionDeadlineExceeded;
+        }
+    };
+
+    const AmbiguousContextWrites = struct {
+        failure: anyerror,
+
+        fn source(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{
+                .batch = batch,
+                .txn_begin_group_local_with_pre_decision_context = beginWithContext,
+                .txn_prepare_group_local_with_pre_decision_context = prepareWithContext,
+            } };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
+            return null;
+        }
+
+        fn beginWithContext(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: u64, _: bool, _: []const []const u8, _: PreDecisionContext) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+
+        fn prepareWithContext(ptr: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId, _: u64, _: db_mod.types.TransactionIntentRequest, _: PreDecisionContext) anyerror!?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
         }
     };
 
@@ -1305,6 +1330,25 @@ test "hosted participant rediscovery retries only pre-decision leader unavailabi
         .req = .{ .writes = &.{.{ .key = "doc:1", .value = "{}" }} },
     });
     try std.testing.expectEqual(@as(usize, 1), local_deadline_prepare_executor.calls);
+
+    var ambiguous_context_writes = AmbiguousContextWrites{ .failure = error.DeadlineExceeded };
+    var ambiguous_context_begin_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
+    var ambiguous_context_begin_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), ambiguous_context_writes.source(), ambiguous_context_begin_executor.iface());
+    try std.testing.expectError(error.DeadlineExceeded, ambiguous_context_begin_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 0), ambiguous_context_begin_executor.calls);
+
+    ambiguous_context_writes.failure = error.Timeout;
+    var ambiguous_context_prepare_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
+    var ambiguous_context_prepare_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), ambiguous_context_writes.source(), ambiguous_context_prepare_executor.iface());
+    try std.testing.expectError(error.Timeout, ambiguous_context_prepare_worker.worker().prepareGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .req = .{ .writes = &.{.{ .key = "doc:1", .value = "{}" }} },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), ambiguous_context_prepare_executor.calls);
 
     var legacy_deadline_begin_executor = FakeExecutor{ .first_outcome = null, .first_expected_node_id = 2 };
     var legacy_deadline_begin_worker = HostedParticipantWorker.init(undefined, LocalMissRouter.iface(), LegacyDeadlineWrites.source(), legacy_deadline_begin_executor.iface());
