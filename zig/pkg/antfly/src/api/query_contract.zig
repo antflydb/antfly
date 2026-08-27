@@ -5502,7 +5502,12 @@ fn toOpenApiGraphResultWithFormat(
         return .{ .legacy_graph_query_result = response };
     }
     if (query.match_pattern != null and query.aggregates.len == 0) {
-        const rows = try toOpenApiGraphRows(alloc, graph_result, &document_lookup);
+        const rows = try toOpenApiGraphRows(
+            alloc,
+            graph_result,
+            query.return_aliases,
+            &document_lookup,
+        );
         const response = try alloc.create(indexes_openapi.GraphBindingsResult);
         errdefer alloc.destroy(response);
         response.* = .{
@@ -5611,16 +5616,41 @@ fn toOpenApiLegacyPatternMatches(
 fn toOpenApiGraphRows(
     alloc: std.mem.Allocator,
     graph_result: db_mod.types.GraphSearchResult,
+    expected_aliases: []const []const u8,
     document_lookup: *GraphDocumentLookup,
 ) ![]const indexes_openapi.GraphResultRow {
     if (graph_result.matches.len > public_limits.max_graph_result_items)
         return error.InvalidRemoteResponse;
+    if (expected_aliases.len == 0 or expected_aliases.len > graph_pattern_mod.max_pattern_steps)
+        return error.InvalidRemoteResponse;
+
+    // Build the projection set once per operation. Matching every cell against
+    // this bounded set keeps validation linear in the response size while
+    // preventing malformed workers from silently changing the row shape.
+    var expected = std.StringHashMapUnmanaged(void).empty;
+    defer expected.deinit(alloc);
+    try expected.ensureTotalCapacity(alloc, @intCast(expected_aliases.len));
+    for (expected_aliases) |alias| {
+        if (!graph_query_mod.isValidIdentifier(alias) or expected.contains(alias))
+            return error.InvalidRemoteResponse;
+        expected.putAssumeCapacity(alias, {});
+    }
+
     const out = try alloc.alloc(indexes_openapi.GraphResultRow, graph_result.matches.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*row| row.deinit(alloc);
+        alloc.free(out);
+    }
     for (graph_result.matches, 0..) |match, i| {
         var row: indexes_openapi.GraphResultRow = .{};
         errdefer row.deinit(alloc);
+        const cell_count = std.math.add(usize, match.bindings.len, match.null_aliases.len) catch
+            return error.InvalidRemoteResponse;
+        if (cell_count != expected_aliases.len) return error.InvalidRemoteResponse;
         for (match.bindings) |binding| {
-            if (binding.node.key.len == 0 or
+            if (!expected.contains(binding.alias) or row.map.contains(binding.alias) or
+                binding.node.key.len == 0 or
                 (binding.node.table != null and binding.node.table.?.len == 0))
                 return error.InvalidRemoteResponse;
             const node = indexes_openapi.GraphBindingNode{
@@ -5633,8 +5663,13 @@ fn toOpenApiGraphRows(
             };
             try row.map.put(alloc, binding.alias, node);
         }
-        for (match.null_aliases) |alias| try row.map.put(alloc, alias, null);
+        for (match.null_aliases) |alias| {
+            if (!expected.contains(alias) or row.map.contains(alias))
+                return error.InvalidRemoteResponse;
+            try row.map.put(alloc, alias, null);
+        }
         out[i] = row;
+        initialized += 1;
     }
     return out;
 }
@@ -5698,7 +5733,7 @@ test "pattern response omits paths unless requested" {
 
     var document_lookup = try GraphDocumentLookup.init(alloc, graph_result.hits, false);
     defer document_lookup.deinit(alloc);
-    const rows = try toOpenApiGraphRows(alloc, graph_result, &document_lookup);
+    const rows = try toOpenApiGraphRows(alloc, graph_result, &.{"node"}, &document_lookup);
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expect(rows[0].map.get("node") != null);
 
@@ -5710,6 +5745,67 @@ test "pattern response omits paths unless requested" {
     try std.testing.expect(node.get("depth") == null);
     try std.testing.expect(node.get("distance") == null);
     try std.testing.expect(node.get("path") == null);
+}
+
+fn expectInvalidCanonicalGraphRow(
+    alloc: std.mem.Allocator,
+    expected_aliases: []const []const u8,
+    bindings: []const db_mod.types.GraphPatternBinding,
+    null_aliases: []const []u8,
+) !void {
+    const matches = [_]db_mod.types.GraphPatternMatch{.{
+        .bindings = @constCast(bindings),
+        .path = &.{},
+        .null_aliases = @constCast(null_aliases),
+    }};
+    const graph_result = db_mod.types.GraphSearchResult{
+        .name = @constCast("pattern"),
+        .matches = @constCast(matches[0..]),
+        .hits = &.{},
+        .total_hits = 1,
+    };
+    var document_lookup = try GraphDocumentLookup.init(alloc, graph_result.hits, false);
+    defer document_lookup.deinit(alloc);
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        toOpenApiGraphRows(alloc, graph_result, expected_aliases, &document_lookup),
+    );
+}
+
+test "canonical graph binding responses require exact projected alias sets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const node = graph_query_mod.GraphResultNode{
+        .key = @constCast("doc:a"),
+        .depth = 0,
+        .distance = 0,
+    };
+
+    const missing = [_]db_mod.types.GraphPatternBinding{
+        .{ .alias = @constCast("a"), .node = node },
+    };
+    try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &missing, &.{});
+
+    const unexpected = [_]db_mod.types.GraphPatternBinding{
+        .{ .alias = @constCast("a"), .node = node },
+        .{ .alias = @constCast("c"), .node = node },
+    };
+    try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &unexpected, &.{});
+
+    const duplicate = [_]db_mod.types.GraphPatternBinding{
+        .{ .alias = @constCast("a"), .node = node },
+        .{ .alias = @constCast("a"), .node = node },
+    };
+    try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &duplicate, &.{});
+
+    const overlap = [_]db_mod.types.GraphPatternBinding{
+        .{ .alias = @constCast("a"), .node = node },
+    };
+    const null_aliases = [_][]u8{@constCast("a")};
+    try expectInvalidCanonicalGraphRow(alloc, &.{ "a", "b" }, &overlap, &null_aliases);
+
+    try expectInvalidCanonicalGraphRow(alloc, &.{"a"}, &.{}, &.{});
 }
 
 test "graph aggregate response preserves exact decimal counts" {

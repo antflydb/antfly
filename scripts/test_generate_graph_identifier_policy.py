@@ -77,6 +77,11 @@ class GraphIdentifierPolicyTest(unittest.TestCase):
             identifier_ref,
             indexes["GraphAggregatesReturn"]["properties"]["aggregates"]["x-antfly-property-name-schema"],
         )
+        self.assertEqual(1, indexes["GraphResultRow"]["minProperties"])
+        self.assertEqual(
+            identifier_ref,
+            indexes["GraphResultRow"]["x-antfly-property-name-schema"],
+        )
         self.assertEqual(
             identifier_ref,
             metadata["QueryRequest"]["properties"]["graph_queries"][

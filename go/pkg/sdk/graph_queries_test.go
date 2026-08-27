@@ -624,7 +624,7 @@ func TestCanonicalGraphResultRejectsRowsOverSchemaPropertyLimit(t *testing.T) {
 	if err := json.Unmarshal(encoded, &canonical); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DecodeGraphQueryResult(canonical); err == nil || !strings.Contains(err.Error(), "at most 64 properties") {
+	if _, err := DecodeGraphQueryResult(canonical); err == nil || !strings.Contains(err.Error(), "between 1 and 64 properties") {
 		t.Fatalf("expected row property limit error, got %v", err)
 	}
 }
@@ -645,6 +645,7 @@ func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false,"unexpected":true}}`,
 		`{"kind":"nodes","nodes":[{"key":"a","depth":0,"unexpected":true}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"bindings","rows":[{}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{"a":{}}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":false}},"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"aggregates","aggregates":{"count":{"value":"1.0","exact":true}},"stats":{"returned_items":1,"truncated":false}}`,

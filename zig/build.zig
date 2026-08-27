@@ -3869,6 +3869,7 @@ pub fn build(b: *std.Build) void {
         "graph query dependency sorting accepts path result endpoints",
         "stateful path results materialize endpoint nodes for result refs",
         "pattern response omits paths unless requested",
+        "canonical graph binding responses require exact projected alias sets",
         "graph aggregate response preserves exact decimal counts",
         "graph aggregate response fails closed on missing or inexact results",
         "graph response encoding requires exactly one result per traversal operation",

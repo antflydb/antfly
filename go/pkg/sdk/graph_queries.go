@@ -212,8 +212,8 @@ func decodeCanonicalGraphResult(
 			return nil, fmt.Errorf("antfly: bindings graph result exceeds %d rows", maxGraphHydratedBindings)
 		}
 		for rowIndex, row := range value.Rows {
-			if len(row) > maxGraphMatchNodes {
-				return nil, fmt.Errorf("antfly: bindings graph result row %d has at most %d properties", rowIndex, maxGraphMatchNodes)
+			if len(row) == 0 || len(row) > maxGraphMatchNodes {
+				return nil, fmt.Errorf("antfly: bindings graph result row %d must contain between 1 and %d properties", rowIndex, maxGraphMatchNodes)
 			}
 			for alias, binding := range row {
 				if !validGraphIdentifier(alias) {

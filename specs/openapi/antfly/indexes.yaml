@@ -3760,5 +3760,8 @@ components:
         - enum: [null]
     GraphResultRow:
       type: object
+      minProperties: 1
       maxProperties: 64
       additionalProperties: { $ref: '#/components/schemas/GraphResultBinding' }
+      x-antfly-property-name-schema:
+        $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier'
