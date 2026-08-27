@@ -620,6 +620,8 @@ pub const HttpHandler = struct {
             .cache_exact_payload_block_misses = cache_stats.exact_payload_block_misses,
             .cache_exact_payload_block_writes = cache_stats.exact_payload_block_writes,
             .cache_evictions = cache_stats.evictions,
+            .cache_bypasses = cache_stats.bypasses,
+            .cache_integrity_failures = cache_stats.integrity_failures,
             .cache_current_bytes = cache_stats.current_bytes,
             .cache_pinned_bytes = cache_stats.pinned_bytes,
             .cache_payload_bytes = cache_stats.payload_bytes,
@@ -846,6 +848,10 @@ pub const HttpHandler = struct {
 
     fn handleIngestBatch(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
+        self.catalog.ensureNamespaceWritesAllowed(namespace) catch |err| switch (err) {
+            error.ExternalTableReadOnly => return try textResponse(self.alloc, 405, "external table is read-only"),
+            else => return try textResponse(self.alloc, 500, "write admission failed"),
+        };
         var status = self.catalog.buildStatus(namespace) catch return try textResponse(self.alloc, 500, "status failed");
         defer status.deinit(self.alloc);
         if (!status.publish_admitted) {
@@ -862,6 +868,11 @@ pub const HttpHandler = struct {
 
     fn handleIngestTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
+        self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
+            error.NamespaceNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.ExternalTableReadOnly => return try textResponse(self.alloc, 405, "external table is read-only"),
+            else => return try textResponse(self.alloc, 500, "write admission failed"),
+        };
         var status = self.catalog.tableBuildStatus(table_name) catch return try textResponse(self.alloc, 500, "status failed");
         defer status.deinit(self.alloc);
         if (!status.publish_admitted) {
@@ -1146,7 +1157,6 @@ pub const HttpHandler = struct {
         var session = try self.query.openHeadSession(namespace);
         errdefer session.deinit();
         session.setCancellation(cancellation);
-        try query_mod.warmIndexedSearchPlanPath(&session, plan);
 
         var execution_stats = query_mod.QuerySearchExecutionStats{};
         const hits = try query_mod.searchIndexedPlanWithStatsAlloc(self.alloc, &session, plan, &execution_stats);
@@ -3330,7 +3340,6 @@ pub const HttpHandler = struct {
         defer if (need_docs) query_materializer.freeDocuments(self.alloc, @constCast(docs));
 
         const graph_index = query_mod.graph_reader.findGraphArtifactIndex(session, named_query.query.index_name) orelse return error.GraphSegmentNotFound;
-        try session.warmArtifact(graph_index);
         const payload = try session.fetchArtifactAlloc(graph_index);
         defer self.alloc.free(payload);
         var segment = try graph_segment_mod.decodeAlloc(self.alloc, payload);
@@ -3631,19 +3640,21 @@ pub const HttpHandler = struct {
         defer status.deinit(self.alloc);
         const neighbors = query_mod.graphNeighborsAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
+            error.GraphNeighborQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph neighbor query exceeds configured limits"),
+            error.Canceled => return error.Canceled,
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer query_mod.freeGraphNeighbors(self.alloc, neighbors);
 
         const out_neighbors = try self.alloc.alloc(query_types.GraphNeighbor, neighbors.len);
-        errdefer self.alloc.free(out_neighbors);
+        var initialized_neighbors: usize = 0;
+        errdefer {
+            for (out_neighbors[0..initialized_neighbors]) |neighbor| freeGraphNeighbor(self.alloc, neighbor);
+            self.alloc.free(out_neighbors);
+        }
         for (neighbors, 0..) |neighbor, idx| {
-            out_neighbors[idx] = .{
-                .doc_id = try self.alloc.dupe(u8, neighbor.doc_id),
-                .edge_type = try self.alloc.dupe(u8, neighbor.edge_type),
-                .weight = neighbor.weight,
-                .direction = neighbor.direction,
-            };
+            out_neighbors[idx] = try dupGraphNeighborAlloc(self.alloc, neighbor);
+            initialized_neighbors += 1;
         }
         defer freeGraphNeighbors(self.alloc, out_neighbors);
 
@@ -3750,21 +3761,21 @@ pub const HttpHandler = struct {
         defer status.deinit(self.alloc);
         const nodes = query_mod.graphTraverseAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
+            error.GraphTraversalQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph traversal query exceeds configured limits"),
+            error.Canceled => return error.Canceled,
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
         defer query_mod.freeGraphTraversalNodes(self.alloc, nodes);
 
         const out_nodes = try self.alloc.alloc(query_types.GraphTraversalNode, nodes.len);
-        errdefer self.alloc.free(out_nodes);
+        var initialized_nodes: usize = 0;
+        errdefer {
+            for (out_nodes[0..initialized_nodes]) |node| freeGraphTraversalNode(self.alloc, node);
+            self.alloc.free(out_nodes);
+        }
         for (nodes, 0..) |node, idx| {
-            out_nodes[idx] = .{
-                .doc_id = try self.alloc.dupe(u8, node.doc_id),
-                .depth = node.depth,
-                .parent_doc_id = if (node.parent_doc_id) |value| try self.alloc.dupe(u8, value) else null,
-                .via_edge_type = if (node.via_edge_type) |value| try self.alloc.dupe(u8, value) else null,
-                .path = if (node.path) |path| try dupGraphPathAlloc(self.alloc, path) else null,
-                .edge_path = if (node.edge_path) |path| try dupGraphEdgePathAlloc(self.alloc, path) else null,
-            };
+            out_nodes[idx] = try dupGraphTraversalNodeAlloc(self.alloc, node);
+            initialized_nodes += 1;
         }
         defer freeGraphTraversalNodes(self.alloc, out_nodes);
 
@@ -3813,6 +3824,8 @@ pub const HttpHandler = struct {
         defer status.deinit(self.alloc);
         const maybe_path = query_mod.graphShortestPathAlloc(self.alloc, session, req) catch |err| switch (err) {
             error.GraphSegmentNotFound => return try textResponse(self.alloc, 404, "graph segment not found"),
+            error.GraphTraversalQueryBudgetExceeded => return try textResponse(self.alloc, 422, "graph shortest-path query exceeds configured limits"),
+            error.Canceled => return error.Canceled,
             else => return try textResponse(self.alloc, 500, "query failed"),
         };
 
@@ -4168,8 +4181,6 @@ pub const HttpHandler = struct {
     }
 
     fn allocPublishedDocumentsAlloc(self: *HttpHandler, session: *query_mod.QuerySession) ![]query_materializer.Document {
-        try session.warmArtifactKind(.document_segment);
-        try session.warmArtifactKind(.mutation_segment);
         for (0..session.artifactCount()) |artifact_index| {
             const artifact_ref = session.artifactRef(artifact_index) orelse continue;
             if (artifact_ref.kind != .document_segment) continue;
@@ -4366,6 +4377,15 @@ pub const HttpHandler = struct {
         _ = alloc;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
         if (self.runtime_status.role == .query_only) return error.Unavailable;
+
+        self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
+            error.NamespaceNotFound => return error.NotFound,
+            error.ExternalTableReadOnly => return error.MethodNotAllowed,
+            else => {
+                std.log.err("serverless public table batch write admission failed table={s} err={}", .{ table_name, err });
+                return error.InternalFailure;
+            },
+        };
 
         var status = self.catalog.tableBuildStatus(table_name) catch |err| switch (err) {
             error.NamespaceNotFound => return error.NotFound,
@@ -4903,25 +4923,58 @@ fn findNamespaceQueryMetrics(
 }
 
 fn freeGraphNeighbors(alloc: Allocator, neighbors: []query_types.GraphNeighbor) void {
-    for (neighbors) |neighbor| {
-        alloc.free(neighbor.doc_id);
-        alloc.free(neighbor.edge_type);
-    }
+    for (neighbors) |neighbor| freeGraphNeighbor(alloc, neighbor);
     alloc.free(neighbors);
 }
 
+fn freeGraphNeighbor(alloc: Allocator, neighbor: query_types.GraphNeighbor) void {
+    alloc.free(neighbor.doc_id);
+    alloc.free(neighbor.edge_type);
+}
+
+fn dupGraphNeighborAlloc(alloc: Allocator, neighbor: query_mod.GraphNeighbor) !query_types.GraphNeighbor {
+    const doc_id = try alloc.dupe(u8, neighbor.doc_id);
+    errdefer alloc.free(doc_id);
+    const edge_type = try alloc.dupe(u8, neighbor.edge_type);
+    return .{
+        .doc_id = doc_id,
+        .edge_type = edge_type,
+        .weight = neighbor.weight,
+        .direction = neighbor.direction,
+    };
+}
+
 fn freeGraphTraversalNodes(alloc: Allocator, nodes: []query_types.GraphTraversalNode) void {
-    for (nodes) |node| {
-        alloc.free(node.doc_id);
-        if (node.parent_doc_id) |value| alloc.free(value);
-        if (node.via_edge_type) |value| alloc.free(value);
-        if (node.path) |path| {
-            for (path) |segment| alloc.free(segment);
-            alloc.free(path);
-        }
-        if (node.edge_path) |path| freeGraphEdgePath(alloc, path);
-    }
+    for (nodes) |node| freeGraphTraversalNode(alloc, node);
     alloc.free(nodes);
+}
+
+fn freeGraphTraversalNode(alloc: Allocator, node: query_types.GraphTraversalNode) void {
+    alloc.free(node.doc_id);
+    if (node.parent_doc_id) |value| alloc.free(value);
+    if (node.via_edge_type) |value| alloc.free(value);
+    if (node.path) |path| freeGraphPath(alloc, path);
+    if (node.edge_path) |path| freeGraphEdgePath(alloc, path);
+}
+
+fn dupGraphTraversalNodeAlloc(alloc: Allocator, node: query_mod.GraphTraversalNode) !query_types.GraphTraversalNode {
+    const doc_id = try alloc.dupe(u8, node.doc_id);
+    errdefer alloc.free(doc_id);
+    const parent_doc_id = if (node.parent_doc_id) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (parent_doc_id) |value| alloc.free(value);
+    const via_edge_type = if (node.via_edge_type) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (via_edge_type) |value| alloc.free(value);
+    const path = if (node.path) |value| try dupGraphPathAlloc(alloc, value) else null;
+    errdefer if (path) |value| freeGraphPath(alloc, value);
+    const edge_path = if (node.edge_path) |value| try dupGraphEdgePathAlloc(alloc, value) else null;
+    return .{
+        .doc_id = doc_id,
+        .depth = node.depth,
+        .parent_doc_id = parent_doc_id,
+        .via_edge_type = via_edge_type,
+        .path = path,
+        .edge_path = edge_path,
+    };
 }
 
 fn graphTotalHits(results: []const db_types.GraphSearchResult) u32 {
@@ -5025,10 +5078,15 @@ fn allocSinglePathEdgeInfo(
 ) ![]const graph_query_mod.PathEdgeInfo {
     const out = try alloc.alloc(graph_query_mod.PathEdgeInfo, 1);
     errdefer alloc.free(out);
+    const source_copy = try alloc.dupe(u8, source);
+    errdefer alloc.free(source_copy);
+    const target_copy = try alloc.dupe(u8, target);
+    errdefer alloc.free(target_copy);
+    const edge_type_copy = try alloc.dupe(u8, edge_type);
     out[0] = .{
-        .source = try alloc.dupe(u8, source),
-        .target = try alloc.dupe(u8, target),
-        .edge_type = try alloc.dupe(u8, edge_type),
+        .source = source_copy,
+        .target = target_copy,
+        .edge_type = edge_type_copy,
         .weight = weight,
     };
     return out;
@@ -5049,10 +5107,15 @@ fn allocPathEdgeInfos(
         }
     }
     for (path, 0..) |hop, idx| {
+        const source = try alloc.dupe(u8, hop.from_doc_id);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, hop.to_doc_id);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, hop.edge_type);
         out[idx] = .{
-            .source = try alloc.dupe(u8, hop.from_doc_id),
-            .target = try alloc.dupe(u8, hop.to_doc_id),
-            .edge_type = try alloc.dupe(u8, hop.edge_type),
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
             .weight = hop.weight,
         };
         initialized += 1;
@@ -5131,10 +5194,15 @@ fn toDbGraphPath(alloc: Allocator, path: query_mod.GraphShortestPath) !db_types.
 
     var total_weight: f64 = 0;
     for (path.edge_path, 0..) |hop, idx| {
+        const source = try alloc.dupe(u8, hop.from_doc_id);
+        errdefer alloc.free(source);
+        const target = try alloc.dupe(u8, hop.to_doc_id);
+        errdefer alloc.free(target);
+        const edge_type = try alloc.dupe(u8, hop.edge_type);
         edges[idx] = .{
-            .source = try alloc.dupe(u8, hop.from_doc_id),
-            .target = try alloc.dupe(u8, hop.to_doc_id),
-            .edge_type = try alloc.dupe(u8, hop.edge_type),
+            .source = source,
+            .target = target,
+            .edge_type = edge_type,
             .weight = hop.weight,
         };
         total_weight += hop.weight;
@@ -5163,7 +5231,7 @@ fn dupGraphPathAlloc(alloc: Allocator, path: [][]u8) ![][]u8 {
     return out;
 }
 
-fn freeGraphPath(alloc: Allocator, path: [][]u8) void {
+fn freeGraphPath(alloc: Allocator, path: []const []const u8) void {
     for (path) |segment| alloc.free(segment);
     alloc.free(path);
 }
@@ -5180,10 +5248,15 @@ fn dupGraphEdgePathAlloc(alloc: Allocator, path: []query_mod.GraphPathHop) ![]qu
         }
     }
     for (path, 0..) |hop, idx| {
+        const from_doc_id = try alloc.dupe(u8, hop.from_doc_id);
+        errdefer alloc.free(from_doc_id);
+        const to_doc_id = try alloc.dupe(u8, hop.to_doc_id);
+        errdefer alloc.free(to_doc_id);
+        const edge_type = try alloc.dupe(u8, hop.edge_type);
         out[idx] = .{
-            .from_doc_id = try alloc.dupe(u8, hop.from_doc_id),
-            .to_doc_id = try alloc.dupe(u8, hop.to_doc_id),
-            .edge_type = try alloc.dupe(u8, hop.edge_type),
+            .from_doc_id = from_doc_id,
+            .to_doc_id = to_doc_id,
+            .edge_type = edge_type,
             .weight = hop.weight,
             .direction = hop.direction,
         };
@@ -5552,6 +5625,10 @@ fn parseEnsureTableRequest(alloc: Allocator, body: []const u8) !api_types.Ensure
 }
 
 const ServerlessIndexStatus = struct {
+    readiness_ready: bool,
+    readiness_incarnation: ?u64,
+    readiness_target_revision: u64,
+    readiness_published_revision: ?u64,
     rebuilding: bool,
     backfill_active: bool,
     doc_count: u64,
@@ -5640,7 +5717,28 @@ fn appendServerlessIndexStatusJson(
     out: *std.ArrayListUnmanaged(u8),
     status: ServerlessIndexStatus,
 ) !void {
-    try out.appendSlice(alloc, "{\"rebuilding\":");
+    try out.appendSlice(alloc, "{\"readiness\":{\"state\":");
+    try out.appendSlice(alloc, if (status.readiness_ready) "\"ready\"" else "\"pending\"");
+    try out.appendSlice(alloc, ",\"queryable\":");
+    try out.appendSlice(alloc, if (status.readiness_ready) "true" else "false");
+    try out.appendSlice(alloc, ",\"complete\":");
+    try out.appendSlice(alloc, if (status.readiness_ready) "true" else "false");
+    if (status.readiness_incarnation) |incarnation| {
+        try out.print(alloc, ",\"incarnation\":\"g-{x:0>16}\"", .{incarnation});
+    }
+    try out.print(alloc, ",\"target_revision\":{}", .{status.readiness_target_revision});
+    if (status.readiness_published_revision) |published_revision| {
+        try out.print(alloc, ",\"published_revision\":{}", .{published_revision});
+    }
+    try out.appendSlice(alloc, ",\"pending_reasons\":");
+    if (status.readiness_ready) {
+        try out.appendSlice(alloc, "[]}");
+    } else if (status.materialization_blocked) {
+        try out.appendSlice(alloc, "[\"materialization\",\"publication\"]}");
+    } else {
+        try out.appendSlice(alloc, "[\"publication\"]}");
+    }
+    try out.appendSlice(alloc, ",\"rebuilding\":");
     try out.appendSlice(alloc, if (status.rebuilding) "true" else "false");
     try out.appendSlice(alloc, ",\"backfill_active\":");
     try out.appendSlice(alloc, if (status.backfill_active) "true" else "false");
@@ -5786,6 +5884,8 @@ fn serverlessIndexStatus(
     const head_sparse_action = findNamedArtifactPublicationAction(status.head_sparse_index_actions, index_name);
     const graph_action = findNamedArtifactPublicationAction(status.graph_index_actions, index_name);
     const head_graph_action = findNamedArtifactPublicationAction(status.head_graph_index_actions, index_name);
+    const config_action = findIndexConfigPublicationStatus(status.index_config_actions, index_name);
+    const config_published = if (config_action) |action| action.action == .reuse else false;
     const built = if (std.mem.eql(u8, kind, "full_text")) blk: {
         if (full_text_action) |action| {
             break :blk action.action == .reuse;
@@ -5812,7 +5912,7 @@ fn serverlessIndexStatus(
         }
         break :blk status.head_version != 0;
     } else if (std.mem.eql(u8, kind, "algebraic")) blk: {
-        break :blk status.head_version != 0;
+        break :blk config_published;
     } else return error.InvalidTableIndexMetadata;
 
     const doc_count: u64 = if (built)
@@ -5841,7 +5941,12 @@ fn serverlessIndexStatus(
         break :blk null;
     } else null;
     const is_vector_driver = std.mem.eql(u8, kind, "embeddings") and !try isSparseEmbeddingsIndex(config) and status.vector_compaction_driver_index_name != null and std.mem.eql(u8, status.vector_compaction_driver_index_name.?, index_name);
+    const readiness_ready = config_published and built and materialization_blocker == null;
     return .{
+        .readiness_ready = readiness_ready,
+        .readiness_incarnation = if (config_action) |action| action.incarnation else null,
+        .readiness_target_revision = if (readiness_ready) status.head_version else status.next_version,
+        .readiness_published_revision = if (config_published and status.head_version != 0) status.head_version else null,
         .rebuilding = !built and has_documents,
         .backfill_active = !built and has_documents,
         .doc_count = doc_count,
@@ -5863,6 +5968,8 @@ fn serverlessIndexStatus(
                 null;
         } else if (std.mem.eql(u8, kind, "graph"))
             if (graph_action) |action| action.action else null
+        else if (std.mem.eql(u8, kind, "algebraic"))
+            if (config_action) |action| action.action else null
         else
             null,
         .head_publication_action = if (std.mem.eql(u8, kind, "full_text"))
@@ -5929,6 +6036,68 @@ fn findNamedArtifactPublicationAction(
         if (std.mem.eql(u8, entry.name, index_name)) return entry;
     }
     return null;
+}
+
+fn findIndexConfigPublicationStatus(
+    actions: []const catalog_types.IndexConfigPublicationStatus,
+    index_name: []const u8,
+) ?catalog_types.IndexConfigPublicationStatus {
+    var low: usize = 0;
+    var high = actions.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const order = std.mem.order(u8, actions[mid].name, index_name);
+        switch (order) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return actions[mid],
+        }
+    }
+    return null;
+}
+
+test "serverless readiness serializes durable incarnation as an opaque token" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendServerlessIndexStatusJson(alloc, &encoded, .{
+        .readiness_ready = true,
+        .readiness_incarnation = 42,
+        .readiness_target_revision = 7,
+        .readiness_published_revision = 7,
+        .rebuilding = false,
+        .backfill_active = false,
+        .doc_count = 0,
+        .total_indexed = 0,
+    });
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true,\"pending_reasons\":[]}}",
+        encoded.items,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"incarnation\":\"g-000000000000002a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "_coverage_incarnation") == null);
+}
+
+test "serverless pending readiness is explicitly non-queryable and incomplete" {
+    const alloc = std.testing.allocator;
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    try appendServerlessIndexStatusJson(alloc, &encoded, .{
+        .readiness_ready = false,
+        .readiness_incarnation = null,
+        .readiness_target_revision = 7,
+        .readiness_published_revision = null,
+        .rebuilding = true,
+        .backfill_active = true,
+        .doc_count = 0,
+        .total_indexed = 0,
+    });
+    try ant_json.testing.expectSubsetJsonText(
+        alloc,
+        "{\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"publication\"]}}",
+        encoded.items,
+    );
 }
 
 fn validateServerlessIndexCatalog(alloc: Allocator, indexes_json: []const u8) !void {
@@ -6422,6 +6591,13 @@ fn testJoinProfileFieldValue(response: anytype, field: []const u8) ?std.json.Val
 
 const ServerlessIndexStatusTestResponse = struct {
     const Status = struct {
+        readiness: ?struct {
+            state: []const u8,
+            incarnation: ?[]const u8 = null,
+            target_revision: ?u64 = null,
+            published_revision: ?u64 = null,
+            pending_reasons: []const []const u8,
+        } = null,
         rebuilding: ?bool = null,
         backfill_active: ?bool = null,
         doc_count: ?u64 = null,
@@ -8036,7 +8212,7 @@ test "http handler index status exposes lexical sparse blocker for sparse index"
     try std.testing.expectEqualStrings("lexical_sparse", parsed_sparse_index.value.status.materialization_blocker.?);
 }
 
-test "http handler index status exposes graph publication actions" {
+test "serverless http handler index status exposes graph publication actions" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -8122,6 +8298,13 @@ test "http handler index status exposes graph publication actions" {
     var parsed_planned = try parseServerlessIndexStatusTestResponse(alloc, planned.body, "graph_idx");
     defer parsed_planned.deinit();
     try std.testing.expectEqualStrings("rebuild", parsed_planned.value.status.planned_publication_action.?);
+    try std.testing.expectEqualStrings("pending", parsed_planned.value.status.readiness.?.state);
+    try std.testing.expect(parsed_planned.value.status.readiness.?.pending_reasons.len > 0);
+    // Graph indexes do not yet persist a private incarnation. Omitting the
+    // optional token is safer than deriving one from redacted response JSON.
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed_planned.value.status.readiness.?.incarnation);
+    try std.testing.expectEqual(@as(?u64, 2), parsed_planned.value.status.readiness.?.target_revision);
+    try std.testing.expectEqual(@as(?u64, null), parsed_planned.value.status.readiness.?.published_revision);
 
     var rebuild = try catalog.buildTable("docs");
     defer rebuild.deinit(alloc);
@@ -8136,6 +8319,13 @@ test "http handler index status exposes graph publication actions" {
     var parsed_head = try parseServerlessIndexStatusTestResponse(alloc, head.body, "graph_idx");
     defer parsed_head.deinit();
     try std.testing.expectEqualStrings("rebuild", parsed_head.value.status.head_publication_action.?);
+    try std.testing.expectEqualStrings("ready", parsed_head.value.status.readiness.?.state);
+    try std.testing.expectEqual(@as(usize, 0), parsed_head.value.status.readiness.?.pending_reasons.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed_head.value.status.readiness.?.incarnation);
+    try std.testing.expectEqual(
+        parsed_head.value.status.readiness.?.target_revision,
+        parsed_head.value.status.readiness.?.published_revision,
+    );
 }
 
 test "http handler index status predicts graph reuse and rebuild before publish" {
@@ -8243,7 +8433,7 @@ test "http handler index status predicts graph reuse and rebuild before publish"
     try std.testing.expectEqualStrings("rebuild", parsed_graph_rebuild.value.status.planned_publication_action.?);
 }
 
-test "http handler create index expands schema-derived algebraic config" {
+test "serverless http handler create index expands schema-derived algebraic config" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -8303,6 +8493,16 @@ test "http handler create index expands schema-derived algebraic config" {
         "{\"full_text_index_v0\":{\"type\":\"full_text\"}}",
     ));
 
+    const initial_docs = [_]api_types.DocumentMutation{
+        .{ .kind = .upsert, .doc_id = "order-1", .body = "{\"customer\":\"acme\",\"amount\":42,\"created_at\":\"2026-01-01T00:00:00Z\"}" },
+    };
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 150, .mutations = &initial_docs });
+    defer ingest.deinit(alloc);
+
+    var initial_build = try catalog.buildTable("docs");
+    defer initial_build.deinit(alloc);
+    try std.testing.expect(initial_build.published);
+
     var create = try handler.handle(.{
         .method = .post,
         .path = "/tables/docs/indexes/sales_rollup",
@@ -8331,7 +8531,32 @@ test "http handler create index expands schema-derived algebraic config" {
     defer detail.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), detail.status);
     try std.testing.expect(std.mem.indexOf(u8, detail.body, "\"derive_from_schema\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, detail.body, "\"group_fields\"") != null);
+    var parsed_detail = try parseServerlessIndexStatusTestResponse(alloc, detail.body, "sales_rollup");
+    defer parsed_detail.deinit();
+    try std.testing.expectEqualStrings("rebuild", parsed_detail.value.status.planned_publication_action.?);
+    try std.testing.expectEqualStrings("pending", parsed_detail.value.status.readiness.?.state);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed_detail.value.status.readiness.?.incarnation);
+    try std.testing.expectEqual(@as(?u64, 2), parsed_detail.value.status.readiness.?.target_revision);
+    try std.testing.expectEqual(@as(?u64, null), parsed_detail.value.status.readiness.?.published_revision);
+
+    var algebraic_build = try catalog.buildTable("docs");
+    defer algebraic_build.deinit(alloc);
+    try std.testing.expect(algebraic_build.published);
+
+    var published_detail = try handler.handle(.{
+        .method = .get,
+        .path = "/tables/docs/indexes/sales_rollup",
+    });
+    defer published_detail.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), published_detail.status);
+    var parsed_published = try parseServerlessIndexStatusTestResponse(alloc, published_detail.body, "sales_rollup");
+    defer parsed_published.deinit();
+    try std.testing.expectEqualStrings("ready", parsed_published.value.status.readiness.?.state);
+    try std.testing.expectEqual(@as(?[]const u8, null), parsed_published.value.status.readiness.?.incarnation);
+    try std.testing.expectEqual(
+        parsed_published.value.status.readiness.?.target_revision,
+        parsed_published.value.status.readiness.?.published_revision,
+    );
 }
 
 test "serverless create index normalization resolves and persists one probed embedding dimension" {
@@ -8399,7 +8624,7 @@ test "serverless create index normalization resolves and persists one probed emb
     defer alloc.free(response);
     try ant_json.testing.expectEqualJsonText(
         alloc,
-        "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
+        "{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"publication_policy\":\"progressive\",\"field\":\"body\",\"embedder\":{\"provider\":\"antfly\",\"model\":\"antflydb/clipclap\"},\"dimension\":3}",
         response,
     );
 }
@@ -9624,6 +9849,15 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqualStrings("doc-c", parsed_neighbors.value.neighbors[1].doc_id);
     try std.testing.expectEqualStrings("related", parsed_neighbors.value.neighbors[1].edge_type);
 
+    var oversized_neighbors = try handler.handle(.{
+        .method = .post,
+        .path = "/internal/v1/namespaces/docs/query/graph/neighbors",
+        .body = "{\"doc_id\":\"doc-a\",\"direction\":\"out\",\"limit\":100001}",
+    });
+    defer oversized_neighbors.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), oversized_neighbors.status);
+    try std.testing.expectEqualStrings("graph neighbor query exceeds configured limits", oversized_neighbors.body);
+
     var version_neighbors = try handler.handle(.{
         .method = .post,
         .path = "/internal/v1/namespaces/docs/query/versions/1/graph/neighbors",
@@ -9672,6 +9906,15 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqualStrings("doc-c", parsed_traverse.value.nodes[2].path.?[2]);
     try std.testing.expect(parsed_traverse.value.nodes[2].edge_path != null);
 
+    var oversized_traverse = try handler.handle(.{
+        .method = .post,
+        .path = "/internal/v1/namespaces/docs/query/graph/traverse",
+        .body = "{\"start_doc_id\":\"doc-a\",\"direction\":\"out\",\"max_depth\":65,\"limit\":10}",
+    });
+    defer oversized_traverse.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), oversized_traverse.status);
+    try std.testing.expectEqualStrings("graph traversal query exceeds configured limits", oversized_traverse.body);
+
     var table_traverse = try handler.handle(.{
         .method = .post,
         .path = "/tables/docs/query/graph/traverse",
@@ -9716,6 +9959,15 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqualStrings("doc-b", parsed_shortest.value.edge_path.?[0].to_doc_id);
     try std.testing.expectEqualStrings("doc-c", parsed_shortest.value.edge_path.?[1].to_doc_id);
     try std.testing.expectEqualStrings("cites", parsed_shortest.value.edge_path.?[0].edge_type);
+
+    var oversized_shortest = try handler.handle(.{
+        .method = .post,
+        .path = "/internal/v1/namespaces/docs/query/graph/shortest-path",
+        .body = "{\"start_doc_id\":\"doc-a\",\"end_doc_id\":\"doc-c\",\"direction\":\"out\",\"max_depth\":65}",
+    });
+    defer oversized_shortest.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), oversized_shortest.status);
+    try std.testing.expectEqualStrings("graph shortest-path query exceeds configured limits", oversized_shortest.body);
 
     var table_shortest = try handler.handle(.{
         .method = .post,
@@ -10022,6 +10274,34 @@ test "serverless public graph query rejects exact sort controls" {
         "{\"graph_searches\":{\"related\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc:1\"]}}},\"search_after\":[\"2026-01-01T00:00:00Z\",\"doc:1\"]}",
         .none,
     ));
+}
+
+test "serverless graph HTTP result copies are allocation-failure safe" {
+    const alloc = std.testing.allocator;
+    var node_path = [_][]u8{ @constCast("doc-a"), @constCast("doc-b") };
+    var edge_path = [_]query_mod.GraphPathHop{.{
+        .from_doc_id = @constCast("doc-a"),
+        .to_doc_id = @constCast("doc-b"),
+        .edge_type = @constCast("cites"),
+        .weight = 1.0,
+        .direction = .out,
+    }};
+    const node = query_mod.GraphTraversalNode{
+        .doc_id = @constCast("doc-b"),
+        .depth = 1,
+        .parent_doc_id = @constCast("doc-a"),
+        .via_edge_type = @constCast("cites"),
+        .path = &node_path,
+        .edge_path = &edge_path,
+    };
+
+    const AllocationRunner = struct {
+        fn run(a: Allocator, source: query_mod.GraphTraversalNode) !void {
+            const copy = try dupGraphTraversalNodeAlloc(a, source);
+            defer freeGraphTraversalNode(a, copy);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{node});
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);

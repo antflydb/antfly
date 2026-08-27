@@ -162,7 +162,7 @@ pub const CredentialCache = struct {
         self.mutex.unlock(io);
         defer self.finishCall(io);
         while (true) {
-            const now = currentUnixSeconds();
+            const now = try currentUnixSeconds();
             self.mutex.lockUncancelable(io);
             if (self.closing) {
                 self.mutex.unlock(io);
@@ -194,12 +194,16 @@ pub const CredentialCache = struct {
             self.mutex.unlock(io);
 
             var fresh = resolveCredentialsUncached(alloc, http, region, source) catch |err| {
+                const fallback_now = currentUnixSeconds() catch |clock_err| {
+                    self.finishFailedRefresh(io);
+                    return clock_err;
+                };
                 self.mutex.lockUncancelable(io);
                 self.refreshing = false;
                 const closing = self.closing;
                 const fallback = if (!closing and self.cached != null) blk: {
                     const snapshot = self.cached.?;
-                    if (snapshot.source_key != source_key or !snapshot.credentials.isUnexpired(currentUnixSeconds())) break :blk null;
+                    if (snapshot.source_key != source_key or !snapshot.credentials.isUnexpired(fallback_now)) break :blk null;
                     snapshot.retain();
                     break :blk snapshot;
                 } else null;
@@ -282,9 +286,61 @@ fn credentialSourceKey(region: []const u8, source: CredentialSource) u64 {
     return hash.final();
 }
 
+pub const RequestFormat = enum {
+    auto,
+    titan_text,
+    titan_multimodal,
+    cohere_v3,
+    cohere_v4,
+};
+
+pub fn parseRequestFormat(value: []const u8) !RequestFormat {
+    if (value.len == 0) return .auto;
+    return std.meta.stringToEnum(RequestFormat, value) orelse error.InvalidBedrockRequestFormat;
+}
+
+/// Resolve the provider-specific JSON contract independently from the Bedrock
+/// invocation target. Application profiles and provisioned/custom model ARNs
+/// can have opaque names, so callers must configure those explicitly.
+pub fn resolveRequestFormat(model: []const u8, configured: RequestFormat) !RequestFormat {
+    if (configured != .auto) return configured;
+
+    var identifier = std.mem.trim(u8, model, " \t\r\n");
+    if (identifier.len == 0) return error.BedrockRequestFormatRequired;
+    // These resources intentionally decouple the invocation target name from
+    // the underlying foundation model. Guessing from an operator-chosen name
+    // can silently send a valid payload for the wrong provider contract.
+    for ([_][]const u8{
+        ":application-inference-profile/",
+        ":provisioned-model/",
+        ":custom-model/",
+        ":custom-model-deployment/",
+        ":imported-model/",
+    }) |opaque_resource| {
+        if (std.mem.indexOf(u8, identifier, opaque_resource) != null)
+            return error.BedrockRequestFormatRequired;
+    }
+    if (std.mem.lastIndexOfScalar(u8, identifier, '/')) |separator| {
+        identifier = identifier[separator + 1 ..];
+    }
+    for ([_][]const u8{ "global.", "us.", "eu.", "apac." }) |prefix| {
+        if (std.mem.startsWith(u8, identifier, prefix)) {
+            identifier = identifier[prefix.len..];
+            break;
+        }
+    }
+
+    if (std.mem.startsWith(u8, identifier, "amazon.titan-embed-image")) return .titan_multimodal;
+    if (std.mem.startsWith(u8, identifier, "amazon.titan-embed-text")) return .titan_text;
+    if (std.mem.startsWith(u8, identifier, "cohere.embed-v4")) return .cohere_v4;
+    if (std.mem.startsWith(u8, identifier, "cohere.embed-")) return .cohere_v3;
+    return error.BedrockRequestFormatRequired;
+}
+
 pub const Options = struct {
     region: []const u8,
     endpoint: []const u8,
+    request_format: RequestFormat = .auto,
     input_type: []const u8 = "",
     truncate: []const u8 = "",
     dimension: u32 = 0,
@@ -316,8 +372,9 @@ pub const Provider = struct {
     }
 
     pub fn embedText(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) !inference.EmbedResult {
-        if (std.mem.startsWith(u8, model, "cohere.embed-")) {
-            return try self.embedCohereText(alloc, model, texts);
+        const request_format = try resolveRequestFormat(model, self.options.request_format);
+        if (request_format == .cohere_v3 or request_format == .cohere_v4) {
+            return try self.embedCohereText(alloc, model, texts, request_format);
         }
 
         const vectors = try alloc.alloc([]const f32, texts.len);
@@ -331,9 +388,7 @@ pub const Provider = struct {
             defer arena_state.deinit();
             const arena = arena_state.allocator();
 
-            var body = std.json.ObjectMap.empty;
-            try body.put(arena, "inputText", .{ .string = text });
-            if (self.options.dimension > 0) try body.put(arena, "dimensions", .{ .integer = self.options.dimension });
+            const body = try textEmbeddingBody(arena, request_format, text, self.options.dimension);
             var result = try self.invokeEmbeddingsValue(alloc, model, .{ .object = body });
             defer result.deinit();
             if (result.vectors.len == 0) return error.EmptyEmbeddingResponse;
@@ -344,13 +399,14 @@ pub const Provider = struct {
     }
 
     pub fn embedParts(self: *Provider, alloc: std.mem.Allocator, model: []const u8, parts: []const template_mod.ContentPart) !inference.EmbedResult {
-        if (std.mem.startsWith(u8, model, "amazon.titan-embed-image")) {
+        const request_format = try resolveRequestFormat(model, self.options.request_format);
+        if (request_format == .titan_multimodal) {
             var arena_state = std.heap.ArenaAllocator.init(alloc);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
             return try self.invokeEmbeddingsValue(alloc, model, .{ .object = try titanMultimodalBody(arena, parts, self.options.dimension) });
         }
-        if (isCohereV4(model)) {
+        if (request_format == .cohere_v4) {
             var arena_state = std.heap.ArenaAllocator.init(alloc);
             defer arena_state.deinit();
             const arena = arena_state.allocator();
@@ -398,9 +454,9 @@ pub const Provider = struct {
         return try parseEmbeddingResponse(alloc, response_body);
     }
 
-    fn embedCohereText(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) !inference.EmbedResult {
+    fn embedCohereText(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, request_format: RequestFormat) !inference.EmbedResult {
         if (texts.len <= cohere_max_batch_size) {
-            return try self.embedCohereTextBatch(alloc, model, texts);
+            return try self.embedCohereTextBatch(alloc, model, texts, request_format);
         }
 
         var out = std.ArrayListUnmanaged([]const f32).empty;
@@ -412,7 +468,7 @@ pub const Provider = struct {
         var offset: usize = 0;
         while (offset < texts.len) {
             const end = @min(texts.len, offset + cohere_max_batch_size);
-            var result = try self.embedCohereTextBatch(alloc, model, texts[offset..end]);
+            var result = try self.embedCohereTextBatch(alloc, model, texts[offset..end], request_format);
             {
                 errdefer result.deinit();
                 try out.ensureUnusedCapacity(alloc, result.vectors.len);
@@ -427,7 +483,7 @@ pub const Provider = struct {
         return .{ .vectors = vectors, .dimension = dimension, .allocator = alloc };
     }
 
-    fn embedCohereTextBatch(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8) !inference.EmbedResult {
+    fn embedCohereTextBatch(self: *Provider, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, request_format: RequestFormat) !inference.EmbedResult {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -439,7 +495,7 @@ pub const Provider = struct {
         try body.put(arena, "texts", .{ .array = values });
         try body.put(arena, "input_type", .{ .string = if (self.options.input_type.len > 0) self.options.input_type else "search_document" });
         if (self.options.truncate.len > 0) try body.put(arena, "truncate", .{ .string = self.options.truncate });
-        if (self.options.dimension > 0 and isCohereV4(model)) try body.put(arena, "output_dimension", .{ .integer = self.options.dimension });
+        if (self.options.dimension > 0 and request_format == .cohere_v4) try body.put(arena, "output_dimension", .{ .integer = self.options.dimension });
         return try self.invokeEmbeddingsValue(alloc, model, .{ .object = body });
     }
 };
@@ -470,12 +526,12 @@ pub fn listFoundationModelsBodyAlloc(alloc: std.mem.Allocator, http: *httpx.Clie
     return try alloc.dupe(u8, body);
 }
 
-fn isCohereV4(model: []const u8) bool {
-    return std.mem.startsWith(u8, model, "cohere.embed-v4");
-}
-
 pub fn maxBatchSize(model: []const u8) usize {
     return requestShape(model).text_inputs_per_request;
+}
+
+pub fn maxBatchSizeForFormat(request_format: RequestFormat) usize {
+    return requestShapeForFormat(request_format).text_inputs_per_request;
 }
 
 pub const RequestShape = struct {
@@ -484,7 +540,12 @@ pub const RequestShape = struct {
 };
 
 pub fn requestShape(model: []const u8) RequestShape {
-    if (std.mem.startsWith(u8, model, "cohere.embed-")) {
+    const request_format = resolveRequestFormat(model, .auto) catch return requestShapeForFormat(.titan_text);
+    return requestShapeForFormat(request_format);
+}
+
+pub fn requestShapeForFormat(request_format: RequestFormat) RequestShape {
+    if (request_format == .cohere_v3 or request_format == .cohere_v4) {
         return .{
             .text_inputs_per_request = cohere_max_batch_size,
             .multimodal_inputs_per_request = cohere_max_batch_size,
@@ -541,6 +602,18 @@ fn titanMultimodalBody(alloc: std.mem.Allocator, parts: []const template_mod.Con
         try cfg.put(alloc, "outputEmbeddingLength", .{ .integer = dimension });
         try body.put(alloc, "embeddingConfig", .{ .object = cfg });
     }
+    return body;
+}
+
+fn textEmbeddingBody(alloc: std.mem.Allocator, request_format: RequestFormat, text: []const u8, dimension: u32) !std.json.ObjectMap {
+    if (request_format == .titan_multimodal) {
+        return try titanMultimodalBody(alloc, &.{.{ .text = text }}, dimension);
+    }
+
+    var body = std.json.ObjectMap.empty;
+    errdefer body.deinit(alloc);
+    try body.put(alloc, "inputText", .{ .string = text });
+    if (dimension > 0) try body.put(alloc, "dimensions", .{ .integer = dimension });
     return body;
 }
 
@@ -1033,7 +1106,7 @@ fn signHeadersAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []cons
 }
 
 fn signRequestHeadersAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []const u8, method: []const u8, host: []const u8, path: []const u8, body: []const u8) ![]HeaderPair {
-    const timestamp = currentUnixSeconds();
+    const timestamp = try currentUnixSeconds();
     const amz_date = try formatAmzDateAlloc(alloc, timestamp);
     errdefer alloc.free(amz_date);
     const scope_date = try formatScopeDateAlloc(alloc, timestamp);
@@ -1058,7 +1131,9 @@ fn signRequestHeadersAlloc(alloc: std.mem.Allocator, creds: Credentials, region:
 fn authorizationValueAlloc(alloc: std.mem.Allocator, creds: Credentials, region: []const u8, method: []const u8, path: []const u8, headers: []const HeaderPair, payload_hash: []const u8, amz_date: []const u8, scope_date: []const u8) ![]u8 {
     var canonical_headers = try canonicalHeadersAlloc(alloc, headers);
     defer canonical_headers.deinit(alloc);
-    const canonical_request = try std.fmt.allocPrint(alloc, "{s}\n{s}\n\n{s}\n{s}\n{s}", .{ method, path, canonical_headers.header_block, canonical_headers.signed_headers, payload_hash });
+    const canonical_path = try canonicalUriPathAlloc(alloc, path);
+    defer alloc.free(canonical_path);
+    const canonical_request = try std.fmt.allocPrint(alloc, "{s}\n{s}\n\n{s}\n{s}\n{s}", .{ method, canonical_path, canonical_headers.header_block, canonical_headers.signed_headers, payload_hash });
     defer alloc.free(canonical_request);
     const canonical_hash = try sha256HexAlloc(alloc, canonical_request);
     defer alloc.free(canonical_hash);
@@ -1071,6 +1146,10 @@ fn authorizationValueAlloc(alloc: std.mem.Allocator, creds: Credentials, region:
     const signature = try hmacSha256HexAlloc(alloc, key, string_to_sign);
     defer alloc.free(signature);
     return try std.fmt.allocPrint(alloc, "AWS4-HMAC-SHA256 Credential={s}/{s}, SignedHeaders={s}, Signature={s}", .{ creds.access_key_id, scope, canonical_headers.signed_headers, signature });
+}
+
+fn canonicalUriPathAlloc(alloc: std.mem.Allocator, encoded_path: []const u8) ![]u8 {
+    return try percentEncodePathSegmentAlloc(alloc, encoded_path);
 }
 
 const CanonicalHeaders = struct {
@@ -1119,12 +1198,43 @@ fn endpointBaseAlloc(alloc: std.mem.Allocator, endpoint: []const u8) ![]u8 {
     return try alloc.dupe(u8, endpoint[0..end]);
 }
 
-fn currentUnixSeconds() u64 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn currentUnixSeconds() !u64 {
+    return unixSecondsFromTimestamp(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .real));
+}
+
+fn unixSecondsFromTimestamp(timestamp: std.Io.Timestamp) !u64 {
+    const nanoseconds = timestamp.toNanoseconds();
+    if (nanoseconds < 0) return error.InvalidSystemTime;
+    return @intCast(@divTrunc(nanoseconds, std.time.ns_per_s));
+}
+
+pub fn testBedrockSigningClockUsesUnixWallTime() !void {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
-    const now = std.Io.Timestamp.now(io_impl.io(), .awake);
-    const ns: u64 = @intCast(now.toNanoseconds());
-    return ns / std.time.ns_per_s;
+    const before = try unixSecondsFromTimestamp(std.Io.Timestamp.now(io_impl.io(), .real));
+    const actual = try currentUnixSeconds();
+    const after = try unixSecondsFromTimestamp(std.Io.Timestamp.now(io_impl.io(), .real));
+
+    try std.testing.expect(actual >= before);
+    try std.testing.expect(actual <= after);
+}
+
+pub fn testBedrockSigningDatesUseCalendarMonthNumbers() !void {
+    const amz_date = try formatAmzDateAlloc(std.testing.allocator, 0);
+    defer std.testing.allocator.free(amz_date);
+    const scope_date = try formatScopeDateAlloc(std.testing.allocator, 0);
+    defer std.testing.allocator.free(scope_date);
+
+    try std.testing.expectEqualStrings("19700101T000000Z", amz_date);
+    try std.testing.expectEqualStrings("19700101", scope_date);
+}
+
+test "bedrock signing clock uses Unix wall time" {
+    try testBedrockSigningClockUsesUnixWallTime();
+}
+
+test "bedrock signing dates use calendar month numbers" {
+    try testBedrockSigningDatesUseCalendarMonthNumbers();
 }
 
 fn formatAmzDateAlloc(alloc: std.mem.Allocator, unix_seconds: u64) ![]u8 {
@@ -1134,7 +1244,7 @@ fn formatAmzDateAlloc(alloc: std.mem.Allocator, unix_seconds: u64) ![]u8 {
     const day_seconds = epoch_seconds.getDaySeconds();
     return try std.fmt.allocPrint(alloc, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
         year_day.year,
-        @intFromEnum(month_day.month) + 1,
+        @intFromEnum(month_day.month),
         month_day.day_index + 1,
         day_seconds.getHoursIntoDay(),
         day_seconds.getMinutesIntoHour(),
@@ -1146,7 +1256,7 @@ fn formatScopeDateAlloc(alloc: std.mem.Allocator, unix_seconds: u64) ![]u8 {
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = unix_seconds };
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
-    return try std.fmt.allocPrint(alloc, "{d:0>4}{d:0>2}{d:0>2}", .{ year_day.year, @intFromEnum(month_day.month) + 1, month_day.day_index + 1 });
+    return try std.fmt.allocPrint(alloc, "{d:0>4}{d:0>2}{d:0>2}", .{ year_day.year, @intFromEnum(month_day.month), month_day.day_index + 1 });
 }
 
 fn signingKeyAlloc(alloc: std.mem.Allocator, secret: []const u8, scope_date: []const u8, region: []const u8) ![]u8 {
@@ -1221,6 +1331,16 @@ pub fn testTitanMultimodalBodyOmitsEmptyInputText() !void {
     try std.testing.expect(body.get("inputText") == null);
     try std.testing.expect(body.get("inputImage") != null);
     try std.testing.expect(body.get("embeddingConfig") != null);
+}
+
+pub fn testTitanMultimodalTextBodyUsesEmbeddingConfig() !void {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const body = try textEmbeddingBody(arena_state.allocator(), .titan_multimodal, "text only", 1024);
+    try std.testing.expectEqualStrings("text only", body.get("inputText").?.string);
+    try std.testing.expect(body.get("dimensions") == null);
+    try std.testing.expectEqual(@as(i64, 1024), body.get("embeddingConfig").?.object.get("outputEmbeddingLength").?.integer);
 }
 
 pub fn testTitanMultimodalBodyCombinesTextAndRejectsMultipleImages() !void {
@@ -1350,6 +1470,33 @@ pub fn testRequestShapeBatchesByProviderRequest() !void {
     try std.testing.expectEqual(@as(usize, cohere_max_batch_size), maxBatchSize("cohere.embed-english-v3"));
     try std.testing.expectEqual(@as(usize, single_input_batch_size), maxBatchSize("amazon.titan-embed-text-v2:0"));
     try std.testing.expectEqual(@as(usize, single_input_batch_size), maxBatchSize("amazon.titan-embed-image-v1"));
+    try std.testing.expectEqual(@as(usize, cohere_max_batch_size), maxBatchSize("us.cohere.embed-v4:0"));
+}
+
+pub fn testBedrockRequestFormatResolution() !void {
+    try std.testing.expectEqual(RequestFormat.titan_text, try resolveRequestFormat("amazon.titan-embed-text-v2:0", .auto));
+    try std.testing.expectEqual(RequestFormat.titan_multimodal, try resolveRequestFormat("us.amazon.titan-embed-image-v1:0", .auto));
+    try std.testing.expectEqual(RequestFormat.cohere_v4, try resolveRequestFormat(
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.cohere.embed-v4:0",
+        .auto,
+    ));
+    try std.testing.expectEqual(RequestFormat.titan_text, try resolveRequestFormat(
+        "arn:aws:bedrock:us-east-1::foundation-model/amazon.titan-embed-text-v2:0",
+        .auto,
+    ));
+    try std.testing.expectEqual(RequestFormat.titan_multimodal, try resolveRequestFormat(
+        "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings",
+        .titan_multimodal,
+    ));
+    try std.testing.expectError(
+        error.BedrockRequestFormatRequired,
+        resolveRequestFormat("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings", .auto),
+    );
+    try std.testing.expectError(
+        error.BedrockRequestFormatRequired,
+        resolveRequestFormat("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/us.amazon.titan-embed-image-v1:0", .auto),
+    );
+    try std.testing.expectError(error.InvalidBedrockRequestFormat, parseRequestFormat("future_format"));
 }
 
 pub fn testBedrockInvokePathEscapesModelId() !void {
@@ -1361,6 +1508,15 @@ pub fn testBedrockInvokePathEscapesModelId() !void {
     const arn = try bedrockInvokePathAlloc(alloc, "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.amazon.titan-embed-text-v2:0");
     defer alloc.free(arn);
     try std.testing.expectEqualStrings("/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Ainference-profile%2Fus.amazon.titan-embed-text-v2%3A0/invoke", arn);
+}
+
+pub fn testBedrockCanonicalUriDoubleEncodesEscapedModelId() !void {
+    const alloc = std.testing.allocator;
+    const path = try bedrockInvokePathAlloc(alloc, "amazon.titan-embed-text-v2:0");
+    defer alloc.free(path);
+    const canonical_path = try canonicalUriPathAlloc(alloc, path);
+    defer alloc.free(canonical_path);
+    try std.testing.expectEqualStrings("/model/amazon.titan-embed-text-v2%253A0/invoke", canonical_path);
 }
 
 pub fn testBedrockSignerUsesBedrockServiceScope() !void {
@@ -1495,6 +1651,10 @@ test "request shape batches by provider request" {
 
 test "bedrock invoke path escapes model id" {
     try testBedrockInvokePathEscapesModelId();
+}
+
+test "bedrock canonical uri double encodes escaped model id" {
+    try testBedrockCanonicalUriDoubleEncodesEscapedModelId();
 }
 
 test "bedrock signer uses bedrock service scope" {

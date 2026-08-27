@@ -80,6 +80,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
     configureBackendPreference(&session_manager, opts.backend);
+    try validateSmokeBackendPolicy(&session_manager, opts.backend);
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
@@ -294,6 +295,29 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     print("finish_reason={s} tokens={d}\n", .{ result.finish_reason, result.tokens_used });
     print("{s}\n", .{result.text});
+}
+
+fn validateSmokeBackendPolicy(
+    session_manager: *const backends.SessionManager,
+    choice: BackendChoice,
+) !void {
+    try native_backend_choice.validateRequiredCompiledBackend(
+        session_manager,
+        native_backend_choice.compiledPartitionBackend(choice),
+    );
+}
+
+test "smoke rejects a compiled backend outside the required policy" {
+    var session_manager = backends.SessionManager.init(std.testing.allocator);
+    session_manager.required_backend = .native;
+    session_manager.required_backend_invalid = false;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        validateSmokeBackendPolicy(&session_manager, .onnx),
+    );
+
+    session_manager.required_backend = null;
+    try validateSmokeBackendPolicy(&session_manager, .onnx);
 }
 
 fn parseArgs(args: []const []const u8) !Options {
@@ -815,7 +839,7 @@ fn printGgufSummary(
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference smoke <model-dir> <prompt> [--backend auto|onnx|native|metal|xla] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--prefill-chunk-size N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--draft-model path] [--inspect-only] [--no-chat-template]
+        \\usage: antfly inference smoke <model-dir> <prompt> [--backend auto|onnx|native|metal|cuda|xla] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--prefill-chunk-size N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--draft-model path] [--inspect-only] [--no-chat-template]
         \\  Loads a native GGUF/SafeTensors model, prints GGUF tensor coverage, and runs one native generation pass.
         \\  With --draft-model, prints Gemma4 MTP target/assistant compatibility metadata.
         \\

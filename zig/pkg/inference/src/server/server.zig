@@ -27,6 +27,7 @@ const readers_api = @import("antfly_readers");
 const transcribing_api = @import("antfly_transcribing");
 const extracting_api = @import("antfly_extracting");
 const scraping = @import("antfly_scraping");
+const ant_json = @import("antfly-json");
 const jsonschema = @import("antfly_jsonschema");
 const lib_chunker = @import("inference_chunker");
 const hf_tokenizer_mod = @import("inference_hf_tokenizer");
@@ -103,6 +104,42 @@ fn generationPipelineSession(pipeline: anytype) ?backends_mod.Session {
     };
     if (comptime @hasField(Pipeline, "session")) return pipeline.session;
     return null;
+}
+
+fn generationPipelineUsesReasoningChannels(pipeline: anytype) bool {
+    const Pipeline = switch (@typeInfo(@TypeOf(pipeline))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(pipeline),
+    };
+    if (comptime @hasField(Pipeline, "gpt_config")) {
+        return requiresNativeChannelProjection(pipeline.gpt_config);
+    }
+    return false;
+}
+
+fn shouldDeferStreamContentForReasoning(
+    pipeline: anytype,
+    config: generation.GenerationConfig,
+) bool {
+    return generationPipelineUsesReasoningChannels(pipeline) and
+        config.enable_thinking != false and
+        // Grammar-constrained Gemma4 generation rewrites the prompt to open
+        // the public final channel directly, so no private reasoning can
+        // precede its incrementally streamed content.
+        config.grammar == null;
+}
+
+test "channel streaming defers content only when reasoning can precede it" {
+    const Probe = struct { gpt_config: gpt_model_mod.Config };
+    const pipeline = Probe{ .gpt_config = .{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+    } };
+    try std.testing.expect(shouldDeferStreamContentForReasoning(&pipeline, .{}));
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&pipeline, .{ .enable_thinking = false }));
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&pipeline, .{ .grammar = "json" }));
+    const ordinary = Probe{ .gpt_config = .{ .family = .llama } };
+    try std.testing.expect(!shouldDeferStreamContentForReasoning(&ordinary, .{}));
 }
 
 fn serverA4bTelemetryEnabled() bool {
@@ -1116,11 +1153,13 @@ pub const WarmModel = struct {
     memory_budget_mb: ?u32 = null,
 
     pub fn a4bRequest(self: WarmModel) ?ops.A4bInferenceRequest {
-        if (self.residency_mode == null and self.memory_budget_mb == null) return null;
-        return .{
-            .residency_mode = self.residency_mode orelse .auto,
-            .memory_budget_mb = self.memory_budget_mb orelse 0,
-        };
+        const residency_mode = self.residency_mode orelse .auto;
+        const memory_budget_mb = self.memory_budget_mb orelse 0;
+        // The documented wire defaults are policy-neutral. Treating explicit
+        // `auto`/`0` as an A4B request makes an otherwise ordinary generator
+        // fail geometry qualification merely because defaults were serialized.
+        if (residency_mode == .auto and memory_budget_mb == 0) return null;
+        return .{ .residency_mode = residency_mode, .memory_budget_mb = memory_budget_mb };
     }
 };
 
@@ -1134,6 +1173,11 @@ fn validatedWarmModelA4bRequest(model: WarmModel) !?ops.A4bInferenceRequest {
 }
 
 test "warm model A4B controls are GPU generator only" {
+    try std.testing.expect((WarmModel{
+        .name = "ordinary-generator",
+        .residency_mode = .auto,
+        .memory_budget_mb = 0,
+    }).a4bRequest() == null);
     const request = (try validatedWarmModelA4bRequest(.{
         .name = "gemma4-a4b",
         .backend = .metal,
@@ -2940,6 +2984,35 @@ fn classifyExtractionResolutionFailure(err: anyerror) ExtractionResolutionFailur
     };
 }
 
+fn compatibilityBackendsForSessionManager(
+    session_manager: *const backends_mod.SessionManager,
+    required_scratch: *[1]backends_mod.BackendType,
+) ![]const backends_mod.BackendType {
+    return session_manager.requiredBackendCandidates(
+        session_manager.preferred_backends,
+        required_scratch,
+    );
+}
+
+test "compatibility backend candidates honor required policy" {
+    var session_manager = backends_mod.SessionManager.init(std.testing.allocator);
+    session_manager.preferred_backends = &.{ .native, .cuda };
+    session_manager.required_backend = .cuda;
+    session_manager.required_backend_invalid = false;
+    var required_scratch: [1]backends_mod.BackendType = undefined;
+    try std.testing.expectEqualSlices(
+        backends_mod.BackendType,
+        &.{.cuda},
+        try compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+
+    session_manager.required_backend = .pjrt;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        compatibilityBackendsForSessionManager(&session_manager, &required_scratch),
+    );
+}
+
 pub const Node = struct {
     config: NodeConfig,
     allocator: std.mem.Allocator,
@@ -3057,6 +3130,7 @@ pub const Node = struct {
         try config.kernel_jit.validate();
         try config.prompt_cache.validate();
         var session_manager = backends_mod.SessionManager.init(allocator);
+        try session_manager.validateRequiredBackendPolicy();
         session_manager.kernel_jit = config.kernel_jit;
         try graph_mod.kernel_jit.validateMetalProfileBackend(
             backends_mod.BackendType.metal.available(),
@@ -3216,6 +3290,11 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model_path: []const u8,
     ) !CompatibilitySummary {
+        var required_backend_scratch: [1]backends_mod.BackendType = undefined;
+        const compatibility_backends = try compatibilityBackendsForSessionManager(
+            &self.session_manager,
+            &required_backend_scratch,
+        );
         var io_impl: ?std.Io.Threaded = null;
         defer if (io_impl) |*threaded| threaded.deinit();
         const io = self.session_manager.io orelse blk: {
@@ -3274,7 +3353,7 @@ pub const Node = struct {
                 allocator,
                 model_path,
                 &man,
-                self.session_manager.preferred_backends,
+                compatibility_backends,
             );
 
             var verification_manifest = try manifest_mod.loadListingFromDir(
@@ -4633,24 +4712,60 @@ pub const Node = struct {
         self.metrics.incRequest(if (admission_owner == .direct) "extract.local" else "extract");
         defer self.metrics.decActive();
 
-        const media_shape = try directExtractionMediaShape(allocator, request.inputs);
-        const media_admission = requestMediaAdmission(self, media_shape);
-        try self.growAdmissionUnits(reserved_units, media_admission.units);
-        reserved_units = media_admission.units;
-
         var schema_parsed = try std.json.parseFromSlice(extraction_api.ExtractionSchema, allocator, request.schema_json, .{
             .allocate = .alloc_always,
             .ignore_unknown_fields = true,
         });
         defer schema_parsed.deinit();
+        const operation = try canonicalExtractionOperation(schema_parsed.value);
+
+        if (operation != .structures) {
+            // Entity, relation, and classification models are text-only. Parse
+            // them with a no-I/O path so a request that will be rejected cannot
+            // trigger remote media fetches or decoding work first.
+            var typed_options = try std.json.parseFromSlice(extraction_api.ExtractionOptions, allocator, if (request.options_json.len > 0) request.options_json else "{}", .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            });
+            defer typed_options.deinit();
+            var parsed_inputs = try parseDirectTextExtractionInputs(allocator, request.inputs);
+            defer parsed_inputs.deinit();
+            const json = switch (operation) {
+                .entities_relations => try self.extractEntitiesAndRelationsDirectJsonAlloc(
+                    allocator,
+                    model_name,
+                    schema_parsed.value,
+                    typed_options.value,
+                    request.inputs,
+                    parsed_inputs.texts.items,
+                ),
+                .classifications => try self.extractClassificationsDirectJsonAlloc(
+                    allocator,
+                    model_name,
+                    schema_parsed.value,
+                    typed_options.value,
+                    request.inputs,
+                    parsed_inputs.texts.items,
+                ),
+                .structures => unreachable,
+            };
+            return .{ .allocator = allocator, .json = json };
+        }
+
         const schemas = try parseCanonicalStructureSchemas(allocator, schema_parsed.value);
         defer {
             for (schemas) |*schema| schema.deinit(allocator);
             allocator.free(schemas);
         }
 
+        // This parser bounds max_tokens before resolver or media work begins.
         var options = try parseExtractionOptionsJson(allocator, request.options_json);
         defer options.deinit();
+        const media_shape = try directExtractionMediaShape(allocator, request.inputs);
+        if (media_shape.image_count > max_read_batch_images) return error.ReadBatchTooLarge;
+        const media_admission = requestMediaAdmission(self, media_shape);
+        try self.growAdmissionUnits(reserved_units, media_admission.units);
+        reserved_units = media_admission.units;
         const config = extraction_mod.ExtractionConfig{
             .threshold = options.threshold orelse 0.3,
             .flat_ner = options.flat_ner orelse true,
@@ -4675,6 +4790,7 @@ pub const Node = struct {
         var extractor = try extractors_mod.resolve(extractor_ctx, model_name, media_shape.image_count > 0);
         defer extractor.deinit(allocator);
 
+        // Fetch and decode request media only after resolver preflight succeeds.
         var parsed_inputs = try parseDirectExtractionInputs(
             self,
             allocator,
@@ -4684,12 +4800,8 @@ pub const Node = struct {
             media_admission.byte_cap,
         );
         defer parsed_inputs.deinit();
-
         try validateExtractionInputKinds(parsed_inputs.texts.items.len, parsed_inputs.images.items.len);
         if (parsed_inputs.images.items.len > max_read_batch_images) return error.ReadBatchTooLarge;
-        if (parsed_inputs.max_tokens) |max_tokens| {
-            if (max_tokens == 0 or max_tokens > max_read_tokens) return error.InvalidMaxTokens;
-        }
         if (parsed_inputs.images.items.len > 0) {
             var decoded_budget = ReadDecodedImageBudget.init(media_admission, effectiveRequestContentSecurity(self).max_image_dimension);
             for (parsed_inputs.images.items) |image_bytes| try decoded_budget.addImage(image_bytes);
@@ -4717,6 +4829,205 @@ pub const Node = struct {
             .allocator = allocator,
             .json = try extractionResponseJsonAlloc(allocator, model_name, request.inputs, results),
         };
+    }
+
+    fn extractEntitiesAndRelationsDirectJsonAlloc(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        schema: extraction_api.ExtractionSchema,
+        options: extraction_api.ExtractionOptions,
+        inputs: []const extracting_api.Input,
+        texts: []const []const u8,
+    ) ![]u8 {
+        if (schema.entities) |labels| {
+            for (labels) |label| if (!isCanonicalLabelSegment(label)) return error.InvalidEntitySchema;
+        }
+        const relation_schemas = schema.relations orelse &.{};
+        const relation_labels = try canonicalRelationLabels(allocator, relation_schemas);
+        defer freeStringSlice(allocator, relation_labels);
+        const want_relations = relation_labels.len > 0;
+        const input_ids = try allocator.alloc(?[]const u8, inputs.len);
+        defer allocator.free(input_ids);
+        for (inputs, 0..) |input, index| input_ids[index] = input.id;
+        const request = EntityExtractionRequest{
+            .model = model_name,
+            .labels = schema.entities,
+            .relation_labels = if (want_relations) relation_labels else null,
+            .resolver = options.resolver,
+            .threshold = options.threshold,
+            .flat_ner = options.flat_ner,
+            .include_confidence = options.include_confidence orelse false,
+            .include_spans = options.include_spans orelse false,
+            .input_ids = input_ids,
+        };
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveRequestModelPath(allocator, io_impl.io(), model_name, "extractors");
+        defer allocator.free(model_path);
+        if (rebel_mod.isRebelModel(allocator, model_path)) {
+            try rebel_mod.validateSchemaSupport(request.labels, request.relation_labels);
+            var failure_stage: RebelExtractionFailureStage = .model_layout;
+            return self.extractRebelJsonAlloc(
+                allocator,
+                model_path,
+                request,
+                texts,
+                want_relations,
+                &failure_stage,
+            );
+        }
+
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
+        try validateTextEntityExtractionManifest(&model.manifest);
+
+        if (model.isGlinerModel()) {
+            var pipeline = model.glinerPipeline(allocator);
+            pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
+            pipeline.config.flat_ner = options.flat_ner orelse pipeline.config.flat_ner;
+            const labels: ?[]const []const u8 = if (schema.entities) |values|
+                if (values.len > 0) values else null
+            else
+                null;
+
+            if (want_relations) {
+                if (!model.supportsRelationExtraction() or !pipeline.supportsRelationExtraction())
+                    return error.UnsupportedRelationExtraction;
+                const relation_entity_labels = try relationEntityLabelsAlloc(
+                    allocator,
+                    labels,
+                    pipeline.config.default_labels,
+                    relation_labels,
+                );
+                defer if (relation_entity_labels) |values| allocator.free(values);
+                const extracted = try pipeline.extractRelationsBatch(texts, relation_entity_labels, relation_labels);
+                defer {
+                    freeBorrowedLabelEntityBatches(allocator, extracted.entities);
+                    for (extracted.relations) |relations| {
+                        for (relations) |*relation| relation.deinit(allocator);
+                        allocator.free(relations);
+                    }
+                    allocator.free(extracted.relations);
+                }
+                if (options.resolver) |resolver_cfg| {
+                    var resolved = try resolveExtractedOutput(allocator, extracted.entities, extracted.relations, resolver_cfg);
+                    defer resolved.deinit(allocator);
+                    return try entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
+                }
+                return try entityExtractionResponseJsonAlloc(allocator, request, extracted.entities, extracted.relations, texts);
+            }
+
+            const all_entities = try pipeline.recognizeBatch(texts, labels);
+            defer freeBorrowedLabelEntityBatches(allocator, all_entities);
+            const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), texts, all_entities);
+            defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
+            const entities_for_response = cleaned_entities orelse all_entities;
+            if (options.resolver) |resolver_cfg| {
+                var resolved = try resolveExtractedOutput(allocator, entities_for_response, null, resolver_cfg);
+                defer resolved.deinit(allocator);
+                return try entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
+            }
+            return try entityExtractionResponseJsonAlloc(allocator, request, entities_for_response, null, texts);
+        }
+
+        if (want_relations) return error.UnsupportedRelationExtraction;
+        var pipeline = model.nerPipeline(allocator);
+        pipeline.config.threshold = options.threshold orelse pipeline.config.threshold;
+        const all_entities = try pipeline.recognizeBatch(texts);
+        defer freeBorrowedLabelEntityBatches(allocator, all_entities);
+        const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, try model.getCleanupHead(), texts, all_entities);
+        defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
+        const entities_for_response = cleaned_entities orelse all_entities;
+        if (options.resolver) |resolver_cfg| {
+            var resolved = try resolveExtractedOutput(allocator, entities_for_response, null, resolver_cfg);
+            defer resolved.deinit(allocator);
+            return try entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
+        }
+        return try entityExtractionResponseJsonAlloc(allocator, request, entities_for_response, null, texts);
+    }
+
+    fn extractClassificationsDirectJsonAlloc(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        schema: extraction_api.ExtractionSchema,
+        options: extraction_api.ExtractionOptions,
+        inputs: []const extracting_api.Input,
+        texts: []const []const u8,
+    ) ![]u8 {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveClassificationRequestModelPath(allocator, io_impl.io(), model_name);
+        defer allocator.free(model_path);
+        var model_handle = try self.model_manager.acquireFromDir(model_path);
+        defer model_handle.release();
+        const model = model_handle.get();
+        if (!model.supportsClassification()) return error.UnsupportedClassificationExtraction;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const lists = try alloc.alloc(std.ArrayListUnmanaged(extraction_api.ExtractionClassification), texts.len);
+        for (lists) |*list| list.* = .empty;
+        var prompt_tokens: usize = 0;
+        for (schema.classifications orelse &.{}) |classification_schema| {
+            if (classification_schema.name.len == 0 or classification_schema.labels.len == 0)
+                return error.InvalidClassificationSchema;
+            if (classification_schema.top_k) |top_k| if (top_k < 1) return error.InvalidTopK;
+
+            if (model.isGlinerModel()) {
+                var pipeline = model.glinerPipeline(allocator);
+                const multi_label = classification_schema.multi_label orelse false;
+                const results = try pipeline.classifyBatch(texts, classification_schema.labels, .{
+                    .threshold = options.threshold orelse 0.0,
+                    .multi_label = multi_label,
+                    .top_k = if (multi_label) 0 else @intCast(classification_schema.top_k orelse 1),
+                });
+                defer freeClassificationBatch(allocator, results);
+                try appendExtractionClassificationBatch(alloc, lists, classification_schema, options, results);
+                const schema_prompt_tokens = try std.math.add(
+                    usize,
+                    estimateTextsTokens(texts),
+                    estimateTextsTokens(classification_schema.labels),
+                );
+                prompt_tokens = try std.math.add(usize, prompt_tokens, schema_prompt_tokens);
+                continue;
+            }
+
+            if (!manifestSupportsZeroShotClassification(&model.manifest))
+                return error.UnsupportedClassificationExtraction;
+            var pipeline = model.classificationPipeline(allocator, .{
+                .max_length = model.manifest.max_position_embeddings,
+                .hypothesis_template = classification_schema.hypothesis_template orelse "This example is {}.",
+                .multi_label = classification_schema.multi_label orelse false,
+                .entailment_index = nliEntailmentIndex(model.manifest.id2label),
+            });
+            var schema_prompt_tokens: usize = 0;
+            const results = try pipeline.classifyBatchWithPromptTokens(texts, classification_schema.labels, &schema_prompt_tokens);
+            defer freeClassificationBatch(allocator, results);
+            try appendExtractionClassificationBatch(alloc, lists, classification_schema, options, results);
+            prompt_tokens = try std.math.add(usize, prompt_tokens, schema_prompt_tokens);
+        }
+
+        const data = try alloc.alloc(extraction_api.ExtractionObject, texts.len);
+        for (data, 0..) |*item, index| item.* = .{
+            .id = if (index < inputs.len) inputs[index].id else null,
+            .classifications = lists[index].items,
+        };
+        var usage: std.json.ObjectMap = .empty;
+        try usage.ensureTotalCapacity(alloc, 3);
+        usage.putAssumeCapacity("prompt_tokens", .{ .integer = @intCast(prompt_tokens) });
+        usage.putAssumeCapacity("completion_tokens", .{ .integer = 0 });
+        usage.putAssumeCapacity("total_tokens", .{ .integer = @intCast(prompt_tokens) });
+        return try std.json.Stringify.valueAlloc(allocator, extraction_api.ExtractionResponse{
+            .object = "extraction",
+            .model = model_name,
+            .data = data,
+            .usage = .{ .object = usage },
+        }, .{});
     }
 
     /// Returns a newly allocated canonical path. The caller must free it with
@@ -4750,6 +5061,7 @@ pub const Node = struct {
             .missing => ctx.status(404).json(.{
                 .@"error" = "MODEL_NOT_FOUND",
                 .message = "model not found",
+                .hint = "Run `antfly inference list`; pull the requested model or restart with --models-dir <path>",
             }),
             .internal => ctx.status(500).json(.{
                 .@"error" = "MODEL_RESOLUTION_FAILED",
@@ -6139,7 +6451,10 @@ pub const Node = struct {
             self.config.allow_unknown_models,
         )) |response|
             return response;
-        const allow_onnx = effective_draft_model_name == null and
+        const required_policy_allows_onnx = self.session_manager.allowsDirectBackend(.onnx) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        const allow_onnx = required_policy_allows_onnx and
+            effective_draft_model_name == null and
             !backend_selection.graph_mode_requested and
             (body.backend == null or backend_selection.native_choice == .onnx);
 
@@ -6477,6 +6792,10 @@ pub const Node = struct {
             .metal
         else
             backend_selection.compiled_partition_backend;
+        native_backend_choice.validateRequiredCompiledBackend(
+            &self.session_manager,
+            effective_compiled_partition_backend,
+        ) catch |err| return modelLoadFailureResponse(ctx, err);
         const effective_compiled_attachment_target: graph_mod.compiled_backend.AttachmentTarget = if (auto_metal_whole_model)
             .whole_model
         else
@@ -8746,6 +9065,7 @@ pub const Node = struct {
             allocator: std.mem.Allocator,
             parser: ?*tool_parser_mod.Parser,
             request_context: *const httpx.Context,
+            defer_content: bool,
             errored: bool = false,
 
             fn shouldContinue(raw_ctx: *anyopaque) bool {
@@ -8755,6 +9075,11 @@ pub const Node = struct {
 
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
+                // Reasoning is projected only once generation completes. For
+                // channel-aware thinking requests, retain protocol order by
+                // emitting the buffered reasoning before the completed public
+                // content below.
+                if (stream.defer_content) return true;
                 if (stream.parser) |parser| {
                     const update = parser.feed(token_text) catch {
                         stream.errored = true;
@@ -8799,6 +9124,7 @@ pub const Node = struct {
             .allocator = ctx.allocator,
             .parser = tool_parser,
             .request_context = ctx,
+            .defer_content = shouldDeferStreamContentForReasoning(pipeline, config),
         };
 
         if (comptime @hasField(@TypeOf(pipeline.*), "continue_ctx") and
@@ -8876,33 +9202,51 @@ pub const Node = struct {
         );
         recordSpeculationOutcome(&self.metrics, speculative);
 
-        if (result.reasoning_text) |reasoning| {
-            if (reasoning.len > 0) emitReasoningDelta(
-                &writer,
+        if (stream_ctx.defer_content) {
+            writeStreamCompletion(
                 ctx.allocator,
+                &writer,
                 stream_id,
                 stream_created,
                 model_name,
-                reasoning,
+                result.text,
+                result.reasoning_text,
+                result.finish_reason,
+                tool_parser,
+                speculative,
             ) catch |err| {
                 writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
-        }
-
-        if (tool_parser != null) {
-            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
-                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
-                writer.close() catch {};
-                return ctx.response.build();
-            };
         } else {
-            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
-                writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
-                writer.close() catch {};
-                return ctx.response.build();
-            };
+            if (result.reasoning_text) |reasoning| {
+                if (reasoning.len > 0) emitReasoningDelta(
+                    &writer,
+                    ctx.allocator,
+                    stream_id,
+                    stream_created,
+                    model_name,
+                    reasoning,
+                ) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            }
+            if (tool_parser != null) {
+                flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            } else {
+                emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
+                    writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
+                    writer.close() catch {};
+                    return ctx.response.build();
+                };
+            }
         }
 
         emitTerminalUsageOrDone(
@@ -9212,6 +9556,8 @@ pub const Node = struct {
         defer ctx.allocator.free(model_path);
 
         if (rebel_mod.isRebelModel(ctx.allocator, model_path)) {
+            rebel_mod.validateSchemaSupport(body.labels, body.relation_labels) catch |err|
+                return rebelSchemaFailureResponse(ctx, err);
             return self.extractRebel(ctx, model_path, body, texts, want_relations);
         }
 
@@ -9219,6 +9565,16 @@ pub const Node = struct {
             return modelLoadFailureResponse(ctx, err);
         defer model_handle.release();
         const model = model_handle.get();
+        validateTextEntityExtractionManifest(&model.manifest) catch |err| switch (err) {
+            error.InvalidModelForExtraction => return ctx.status(400).json(.{
+                .@"error" = "INVALID_MODEL",
+                .message = "model does not support entity extraction",
+            }),
+            error.UnsupportedInput => return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = "model does not support text extraction",
+            }),
+        };
 
         // Use GLiNER pipeline for GLiNER models, standard NER for BIO models
         if (model.isGlinerModel()) {
@@ -9233,13 +9589,7 @@ pub const Node = struct {
         pipeline.config.threshold = body.threshold orelse pipeline.config.threshold;
         const all_entities = pipeline.recognizeBatch(texts) catch |err|
             return inferenceFailureResponse(ctx, err);
-        defer {
-            for (all_entities) |entities| {
-                for (entities) |e| ctx.allocator.free(e.text);
-                ctx.allocator.free(entities);
-            }
-            ctx.allocator.free(all_entities);
-        }
+        defer freeBorrowedLabelEntityBatches(ctx.allocator, all_entities);
 
         const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(), texts, all_entities);
         defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
@@ -9262,109 +9612,143 @@ pub const Node = struct {
         texts: []const []const u8,
         want_relations: bool,
     ) !httpx.Response {
+        var failure_stage: RebelExtractionFailureStage = .model_layout;
+        const json = self.extractRebelJsonAlloc(
+            ctx.allocator,
+            model_path,
+            body,
+            texts,
+            want_relations,
+            &failure_stage,
+        ) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return switch (failure_stage) {
+                .model_layout => ctx.status(400).json(.{
+                    .@"error" = "INVALID_MODEL",
+                    .message = "model is not a supported encoder-decoder recognizer",
+                }),
+                .tokenizer => ctx.status(500).json(.{
+                    .@"error" = "TOKENIZER_LOAD_FAILED",
+                    .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err),
+                }),
+                .model_load => modelLoadFailureResponse(ctx, err),
+                .inference => inferenceFailureResponse(ctx, err),
+                .response => switch (err) {
+                    error.InvalidExtractionResponse => ctx.status(500).json(.{
+                        .@"error" = "INVALID_EXTRACTION_RESULT",
+                        .message = "model returned an invalid entity or relation response",
+                    }),
+                    else => return err,
+                },
+            };
+        };
+        defer ctx.allocator.free(json);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(json);
+        return ctx.response.build();
+    }
+
+    const RebelExtractionFailureStage = enum {
+        model_layout,
+        tokenizer,
+        model_load,
+        inference,
+        response,
+    };
+
+    fn extractRebelJsonAlloc(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        request: EntityExtractionRequest,
+        texts: []const []const u8,
+        want_relations: bool,
+        failure_stage: *RebelExtractionFailureStage,
+    ) ![]u8 {
         const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
-        const hf_tokenizer = @import("inference_hf_tokenizer");
 
-        const paths = enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, model_path) catch
-            return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model is not a supported encoder-decoder recognizer" });
-        defer ctx.allocator.free(paths.encoder);
-        defer ctx.allocator.free(paths.decoder);
+        failure_stage.* = .model_layout;
+        const paths = try enc_dec_mod.findEncoderDecoderPaths(allocator, model_path);
+        defer allocator.free(paths.encoder);
+        defer allocator.free(paths.decoder);
 
-        const tok_path = std.fmt.allocPrint(ctx.allocator, "{s}/tokenizer.json", .{model_path}) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer ctx.allocator.free(tok_path);
+        failure_stage.* = .tokenizer;
+        const tokenizer_path = try std.fmt.allocPrint(allocator, "{s}/tokenizer.json", .{model_path});
+        defer allocator.free(tokenizer_path);
+        const tokenizer_bytes = try c_file.readFile(allocator, tokenizer_path);
+        defer allocator.free(tokenizer_bytes);
+        var tokenizer = try hf_tokenizer_mod.HfTokenizer.loadFromBytes(allocator, tokenizer_bytes);
+        defer tokenizer.deinitSelf();
 
-        const tok_bytes = c_file.readFile(ctx.allocator, tok_path) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer ctx.allocator.free(tok_bytes);
+        failure_stage.* = .model_load;
+        var config = try rebel_mod.loadConfig(allocator, model_path);
+        var config_owned = true;
+        errdefer if (config_owned) config.deinit();
+        const decoder_config = enc_dec_mod.loadDecoderConfig(allocator, model_path) catch enc_dec_mod.DecoderConfig{};
+        if (decoder_config.max_length > 0) config.max_length = decoder_config.max_length;
 
-        var hf_tok = hf_tokenizer.HfTokenizer.loadFromBytes(ctx.allocator, tok_bytes) catch |err|
-            return ctx.status(500).json(.{ .@"error" = "TOKENIZER_LOAD_FAILED", .message = internalErrorMessage("TOKENIZER_LOAD_FAILED", err) });
-        defer hf_tok.deinitSelf();
-
-        var config = rebel_mod.loadConfig(ctx.allocator, model_path) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-
-        const dec_config = enc_dec_mod.loadDecoderConfig(ctx.allocator, model_path) catch enc_dec_mod.DecoderConfig{};
-        if (dec_config.max_length > 0) config.max_length = dec_config.max_length;
-
-        var component_loader = self.model_manager.componentLoaderForPaths(
+        var component_loader = try self.model_manager.componentLoaderForPaths(
             model_path,
             self.session_manager.preferred_backends,
             &.{ paths.encoder, paths.decoder },
-        ) catch |err| return modelLoadFailureResponse(ctx, err);
-        var encoder_managed = component_loader.load(paths.encoder) catch |err|
-            return modelLoadFailureResponse(ctx, err);
+        );
+        var encoder_managed = try component_loader.load(paths.encoder);
         defer encoder_managed.deinit();
-        var strict_loader = component_loader.restrictToBackend(encoder_managed.session.backend()) catch |err|
-            return modelLoadFailureResponse(ctx, err);
-        var decoder_managed = strict_loader.load(paths.decoder) catch |err|
-            return modelLoadFailureResponse(ctx, err);
+        var strict_loader = try component_loader.restrictToBackend(encoder_managed.session.backend());
+        var decoder_managed = try strict_loader.load(paths.decoder);
         defer decoder_managed.deinit();
         const encoder_session = encoder_managed.disownSession();
         const decoder_session = decoder_managed.disownSession();
 
         var pipeline = rebel_mod.RebelPipeline{
-            .allocator = ctx.allocator,
+            .allocator = allocator,
             .enc_dec = .{
-                .allocator = ctx.allocator,
+                .allocator = allocator,
                 .encoder = encoder_session,
                 .decoder = decoder_session,
-                .config = dec_config,
+                .config = decoder_config,
             },
-            .tokenizer = hf_tok.tokenizer(),
+            .tokenizer = tokenizer.tokenizer(),
             .config = config,
         };
+        config_owned = false;
         defer pipeline.deinit();
 
+        failure_stage.* = .inference;
         if (want_relations) {
-            const relation_labels = body.relation_labels.?;
-            const extracted = pipeline.extractRelationsBatch(texts, body.labels, relation_labels) catch |err|
-                return inferenceFailureResponse(ctx, err);
+            const relation_labels = request.relation_labels orelse return error.InvalidRelationSchema;
+            const extracted = try pipeline.extractRelationsBatch(texts, request.labels, relation_labels);
             defer {
-                for (extracted.entities) |entities| {
-                    for (entities) |entity| ctx.allocator.free(entity.text);
-                    ctx.allocator.free(entities);
-                }
-                ctx.allocator.free(extracted.entities);
-
+                rebel_mod.deinitEntityBatches(allocator, extracted.entities);
                 for (extracted.relations) |relations| {
-                    for (relations) |*relation| relation.deinit(ctx.allocator);
-                    ctx.allocator.free(relations);
+                    for (relations) |*relation| relation.deinit(allocator);
+                    allocator.free(relations);
                 }
-                ctx.allocator.free(extracted.relations);
+                allocator.free(extracted.relations);
             }
 
-            if (body.resolver) |resolver_cfg| {
-                var resolved = try resolveExtractedOutput(ctx.allocator, extracted.entities, extracted.relations, resolver_cfg);
-                defer resolved.deinit(ctx.allocator);
-                return self.buildEntityExtractionResponse(ctx, body, resolved.entities, resolved.relations, texts);
+            failure_stage.* = .response;
+            if (request.resolver) |resolver_config| {
+                var resolved = try resolveExtractedOutput(allocator, extracted.entities, extracted.relations, resolver_config);
+                defer resolved.deinit(allocator);
+                return entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
             }
-
-            return self.buildEntityExtractionResponse(ctx, body, extracted.entities, extracted.relations, texts);
+            return entityExtractionResponseJsonAlloc(allocator, request, extracted.entities, extracted.relations, texts);
         }
 
-        const all_entities = pipeline.recognizeBatch(texts) catch |err|
-            return inferenceFailureResponse(ctx, err);
-        defer {
-            for (all_entities) |entities| {
-                for (entities) |entity| ctx.allocator.free(entity.text);
-                ctx.allocator.free(entities);
-            }
-            ctx.allocator.free(all_entities);
-        }
-
-        const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, null, texts, all_entities);
-        defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
+        const all_entities = try pipeline.recognizeBatch(texts);
+        defer rebel_mod.deinitEntityBatches(allocator, all_entities);
+        failure_stage.* = .response;
+        const cleaned_entities = try applyLearnedCleanupIfPresent(allocator, null, texts, all_entities);
+        defer if (cleaned_entities) |entities| freeEntityBatches(allocator, entities);
         const entities_for_response = cleaned_entities orelse all_entities;
 
-        if (body.resolver) |resolver_cfg| {
-            var resolved = try resolveExtractedOutput(ctx.allocator, entities_for_response, null, resolver_cfg);
-            defer resolved.deinit(ctx.allocator);
-            return self.buildEntityExtractionResponse(ctx, body, resolved.entities, resolved.relations, texts);
+        if (request.resolver) |resolver_config| {
+            var resolved = try resolveExtractedOutput(allocator, entities_for_response, null, resolver_config);
+            defer resolved.deinit(allocator);
+            return entityExtractionResponseJsonAlloc(allocator, request, resolved.entities, resolved.relations, texts);
         }
-
-        return self.buildEntityExtractionResponse(ctx, body, entities_for_response, null, texts);
+        return entityExtractionResponseJsonAlloc(allocator, request, entities_for_response, null, texts);
     }
 
     fn extractGliner(
@@ -9393,14 +9777,17 @@ pub const Node = struct {
             }
 
             const relation_labels = body.relation_labels.?;
-            const extracted = pipeline.extractRelationsBatch(texts, labels, relation_labels) catch |err|
+            const relation_entity_labels = try relationEntityLabelsAlloc(
+                ctx.allocator,
+                labels,
+                pipeline.config.default_labels,
+                relation_labels,
+            );
+            defer if (relation_entity_labels) |values| ctx.allocator.free(values);
+            const extracted = pipeline.extractRelationsBatch(texts, relation_entity_labels, relation_labels) catch |err|
                 return inferenceFailureResponse(ctx, err);
             defer {
-                for (extracted.entities) |entities| {
-                    for (entities) |e| ctx.allocator.free(e.text);
-                    ctx.allocator.free(entities);
-                }
-                ctx.allocator.free(extracted.entities);
+                freeBorrowedLabelEntityBatches(ctx.allocator, extracted.entities);
 
                 for (extracted.relations) |relations| {
                     for (relations) |*relation| relation.deinit(ctx.allocator);
@@ -9420,13 +9807,7 @@ pub const Node = struct {
 
         const all_entities = pipeline.recognizeBatch(texts, labels) catch |err|
             return inferenceFailureResponse(ctx, err);
-        defer {
-            for (all_entities) |entities| {
-                for (entities) |e| ctx.allocator.free(e.text);
-                ctx.allocator.free(entities);
-            }
-            ctx.allocator.free(all_entities);
-        }
+        defer freeBorrowedLabelEntityBatches(ctx.allocator, all_entities);
 
         const cleaned_entities = try applyLearnedCleanupIfPresent(ctx.allocator, try model.getCleanupHead(), texts, all_entities);
         defer if (cleaned_entities) |entities| freeEntityBatches(ctx.allocator, entities);
@@ -9449,62 +9830,23 @@ pub const Node = struct {
         all_relations: ?[]const []const gliner_mod.Relation,
         input_texts: []const []const u8,
     ) !httpx.Response {
-        if (all_entities.len != input_texts.len or (all_relations != null and all_relations.?.len != input_texts.len)) {
-            return ctx.status(500).json(.{
+        const json = entityExtractionResponseJsonAlloc(
+            ctx.allocator,
+            request,
+            all_entities,
+            all_relations,
+            input_texts,
+        ) catch |err| switch (err) {
+            error.InvalidExtractionResponse => return ctx.status(500).json(.{
                 .@"error" = "INVALID_EXTRACTION_RESULT",
-                .message = "model returned a different number of result batches than inputs",
-            });
-        }
-        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-
-        const data = try alloc.alloc(extraction_api.ExtractionObject, all_entities.len);
-        for (all_entities, 0..) |entities, ti| {
-            const entity_objects = try alloc.alloc(extraction_api.ExtractionEntity, entities.len);
-            for (entities, 0..) |e, ei| entity_objects[ei] = toExtractionApiEntity(e, request);
-
-            const relations_inner: ?[]const extraction_api.ExtractionRelation = if (all_relations) |rels_by_text| blk: {
-                const relations = if (ti < rels_by_text.len) rels_by_text[ti] else &.{};
-                const relation_objects = try alloc.alloc(extraction_api.ExtractionRelation, relations.len);
-                for (relations, 0..) |r, ri| {
-                    const source_index = findEntityIndex(entities, r.head) orelse return ctx.status(500).json(.{
-                        .@"error" = "INVALID_EXTRACTION_RESULT",
-                        .message = "relation source is missing from extracted entities",
-                    });
-                    const target_index = findEntityIndex(entities, r.tail) orelse return ctx.status(500).json(.{
-                        .@"error" = "INVALID_EXTRACTION_RESULT",
-                        .message = "relation target is missing from extracted entities",
-                    });
-                    relation_objects[ri] = .{
-                        .type = r.label,
-                        .source = .{ .entity_index = @intCast(source_index) },
-                        .target = .{ .entity_index = @intCast(target_index) },
-                        .score = if (request.include_confidence) r.score else null,
-                    };
-                }
-                break :blk relation_objects;
-            } else null;
-
-            data[ti] = .{
-                .id = if (ti < request.input_ids.len) request.input_ids[ti] else null,
-                .entities = entity_objects,
-                .relations = relations_inner,
-            };
-        }
-
-        const prompt_tokens = estimateTextsTokens(input_texts);
-        var usage: std.json.ObjectMap = .empty;
-        try usage.ensureTotalCapacity(alloc, 3);
-        usage.putAssumeCapacity("prompt_tokens", .{ .integer = @intCast(prompt_tokens) });
-        usage.putAssumeCapacity("completion_tokens", .{ .integer = 0 });
-        usage.putAssumeCapacity("total_tokens", .{ .integer = @intCast(prompt_tokens) });
-        return ctx.json(extraction_api.ExtractionResponse{
-            .object = "extraction",
-            .data = data,
-            .model = request.model,
-            .usage = .{ .object = usage },
-        });
+                .message = "model returned an invalid entity or relation response",
+            }),
+            else => return err,
+        };
+        defer ctx.allocator.free(json);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(json);
+        return ctx.response.build();
     }
 
     fn toExtractionApiEntity(entity: @import("../pipelines/ner.zig").Entity, request: EntityExtractionRequest) extraction_api.ExtractionEntity {
@@ -10347,24 +10689,18 @@ pub const Node = struct {
         if (body.inputs.len == 0) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "inputs are required" });
         }
-        const has_entities = if (body.schema.entities) |entities| entities.len > 0 else false;
         const has_relations = if (body.schema.relations) |relations| relations.len > 0 else false;
-        const has_classifications = if (body.schema.classifications) |classifications| classifications.len > 0 else false;
-        const has_structures = if (body.schema.structures) |structures| structures.map.count() > 0 else false;
-        const operation_count: usize = @intFromBool(has_entities or has_relations) + @intFromBool(has_classifications) + @intFromBool(has_structures);
-        if (operation_count == 0) {
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "schema must request at least one extraction operation" });
-        }
-        if (operation_count > 1) {
-            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "mixed extraction operations are not supported by this model runtime" });
-        }
+        const operation = canonicalExtractionOperation(body.schema) catch |err| switch (err) {
+            error.MissingExtractionOperation => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "schema must request at least one extraction operation" }),
+            error.MixedExtractionOperations => return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "mixed extraction operations are not supported by this model runtime" }),
+        };
         if (body.schema.entities) |labels| {
             for (labels) |label| if (!isCanonicalLabelSegment(label)) {
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "entity labels must be non-empty and cannot contain '::'" });
             };
         }
 
-        if (has_structures) {
+        if (operation == .structures) {
             const inputs = try canonicalExtractingInputs(ctx.allocator, body.inputs);
             defer freeCanonicalExtractingInputs(ctx.allocator, inputs);
             const schema_json = try std.json.Stringify.valueAlloc(ctx.allocator, body.schema, .{});
@@ -10385,14 +10721,14 @@ pub const Node = struct {
             return ctx.response.build();
         }
 
-        if (has_classifications) {
-            var classification_inputs = parseCanonicalTextInputs(self, ctx.allocator, body.inputs) catch
+        if (operation == .classifications) {
+            var classification_inputs = parseCanonicalTextInputs(ctx.allocator, body.inputs) catch
                 return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "classification extraction requires text inputs" });
             defer classification_inputs.deinit();
             return self.extractClassifications(ctx, body, classification_inputs.texts.items);
         }
 
-        var direct_inputs = parseCanonicalTextInputs(self, ctx.allocator, body.inputs) catch
+        var direct_inputs = parseCanonicalTextInputs(ctx.allocator, body.inputs) catch
             return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "entity and relation extraction requires text inputs" });
         defer direct_inputs.deinit();
         if (try self.acquireSlot(ctx)) |resp| return resp;
@@ -11132,7 +11468,11 @@ pub const Node = struct {
 
     fn readyzHandler(self: *Node, ctx: *httpx.Context) anyerror!httpx.Response {
         const snapshot = self.readiness_inventory.load();
-        const is_ready = snapshot.initialized and snapshot.counts.total() > 0;
+        const required_backend_ready = blk: {
+            self.session_manager.validateRequiredBackendPolicy() catch break :blk false;
+            break :blk true;
+        };
+        const is_ready = required_backend_ready and snapshot.initialized and snapshot.counts.total() > 0;
         const status_text = if (is_ready) "ready" else "not_ready";
         const status_code: u16 = if (is_ready) 200 else 503;
         return ctx.status(status_code).json(.{
@@ -11186,6 +11526,93 @@ fn appendExtractionClassificationBatch(
             appended += 1;
         }
     }
+}
+
+const CanonicalExtractionOperation = enum {
+    entities_relations,
+    classifications,
+    structures,
+};
+
+fn canonicalExtractionOperation(schema: extraction_api.ExtractionSchema) !CanonicalExtractionOperation {
+    const has_entities = if (schema.entities) |entities| entities.len > 0 else false;
+    const has_relations = if (schema.relations) |relations| relations.len > 0 else false;
+    const has_classifications = if (schema.classifications) |classifications| classifications.len > 0 else false;
+    const has_structures = if (schema.structures) |structures| structures.map.count() > 0 else false;
+    const operation_count: usize = @as(usize, @intFromBool(has_entities or has_relations)) +
+        @as(usize, @intFromBool(has_classifications)) + @as(usize, @intFromBool(has_structures));
+    if (operation_count == 0) return error.MissingExtractionOperation;
+    if (operation_count > 1) return error.MixedExtractionOperations;
+    if (has_classifications) return .classifications;
+    if (has_structures) return .structures;
+    return .entities_relations;
+}
+
+/// Entity extraction has two supported loaded-model layouts: GLiNER models
+/// with an extraction-capable head and standard BIO token recognizers. Reject
+/// other model families before constructing a pipeline or running inference.
+fn validateTextEntityExtractionManifest(manifest: *const manifest_mod.ModelManifest) !void {
+    if (manifest.model_type != .recognizer) return error.InvalidModelForExtraction;
+    if (!model_caps.modelAcceptsInput(manifest, "text")) return error.UnsupportedInput;
+    if (manifest.gliner_model_type.len > 0 and !model_caps.modelSupportsCapability(
+        @tagName(manifest.model_type),
+        manifest.gliner_model_type,
+        manifest.capabilities,
+        "extraction",
+    )) return error.InvalidModelForExtraction;
+}
+
+fn entityExtractionResponseJsonAlloc(
+    allocator: std.mem.Allocator,
+    request: Node.EntityExtractionRequest,
+    all_entities: []const []const @import("../pipelines/ner.zig").Entity,
+    all_relations: ?[]const []const gliner_mod.Relation,
+    input_texts: []const []const u8,
+) ![]u8 {
+    if (all_entities.len != input_texts.len or (all_relations != null and all_relations.?.len != input_texts.len))
+        return error.InvalidExtractionResponse;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const data = try alloc.alloc(extraction_api.ExtractionObject, all_entities.len);
+    for (all_entities, 0..) |entities, text_index| {
+        const entity_objects = try alloc.alloc(extraction_api.ExtractionEntity, entities.len);
+        for (entities, 0..) |entity, entity_index|
+            entity_objects[entity_index] = Node.toExtractionApiEntity(entity, request);
+
+        const relation_objects: ?[]const extraction_api.ExtractionRelation = if (all_relations) |relations_by_text| blk: {
+            const relations = relations_by_text[text_index];
+            const objects = try alloc.alloc(extraction_api.ExtractionRelation, relations.len);
+            for (relations, 0..) |relation, relation_index| {
+                const source_index = Node.findEntityIndex(entities, relation.head) orelse return error.InvalidExtractionResponse;
+                const target_index = Node.findEntityIndex(entities, relation.tail) orelse return error.InvalidExtractionResponse;
+                objects[relation_index] = .{
+                    .type = relation.label,
+                    .source = .{ .entity_index = @intCast(source_index) },
+                    .target = .{ .entity_index = @intCast(target_index) },
+                    .score = if (request.include_confidence) relation.score else null,
+                };
+            }
+            break :blk objects;
+        } else null;
+        data[text_index] = .{
+            .id = if (text_index < request.input_ids.len) request.input_ids[text_index] else null,
+            .entities = entity_objects,
+            .relations = relation_objects,
+        };
+    }
+    const prompt_tokens = estimateTextsTokens(input_texts);
+    var usage: std.json.ObjectMap = .empty;
+    try usage.ensureTotalCapacity(alloc, 3);
+    usage.putAssumeCapacity("prompt_tokens", .{ .integer = @intCast(prompt_tokens) });
+    usage.putAssumeCapacity("completion_tokens", .{ .integer = 0 });
+    usage.putAssumeCapacity("total_tokens", .{ .integer = @intCast(prompt_tokens) });
+    return try std.json.Stringify.valueAlloc(allocator, extraction_api.ExtractionResponse{
+        .object = "extraction",
+        .data = data,
+        .model = request.model,
+        .usage = .{ .object = usage },
+    }, .{});
 }
 
 fn predictorTaskFromTabular(task: @import("ml_tabular").ir.TaskType) api.PredictorTask {
@@ -11494,18 +11921,10 @@ fn freeCanonicalExtractingInputs(allocator: std.mem.Allocator, inputs: []extract
     allocator.free(inputs);
 }
 
-fn parseCanonicalTextInputs(
-    node: *Node,
-    allocator: std.mem.Allocator,
-    inputs: []const extraction_api.ExtractionInput,
-) !DirectExtractionInputs {
+fn parseCanonicalTextInputs(allocator: std.mem.Allocator, inputs: []const extraction_api.ExtractionInput) !DirectExtractionInputs {
     const direct = try canonicalExtractingInputs(allocator, inputs);
     defer freeCanonicalExtractingInputs(allocator, direct);
-    const media_admission = requestMediaAdmission(node, .{});
-    var parsed = try parseDirectExtractionInputs(node, allocator, direct, null, null, media_admission.byte_cap);
-    errdefer parsed.deinit();
-    if (parsed.images.items.len > 0 or parsed.texts.items.len != inputs.len) return error.UnsupportedInput;
-    return parsed;
+    return parseDirectTextExtractionInputs(allocator, direct);
 }
 
 fn canonicalInputIds(allocator: std.mem.Allocator, inputs: []const extraction_api.ExtractionInput) ![]?[]const u8 {
@@ -11541,6 +11960,52 @@ fn canonicalRelationLabels(
     return labels;
 }
 
+/// Build the entity-label vocabulary needed by GLiNER relation extraction.
+/// Explicit entity labels remain authoritative; otherwise model defaults are
+/// retained. Canonical relation endpoint constraints are always added so a
+/// legal relations-only schema does not depend on those endpoints happening
+/// to exist in a model's default vocabulary.
+fn relationEntityLabelsAlloc(
+    allocator: std.mem.Allocator,
+    requested: ?[]const []const u8,
+    defaults: []const []const u8,
+    canonical_relation_labels: []const []const u8,
+) !?[]const []const u8 {
+    var labels = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer labels.deinit(allocator);
+
+    const seed = if (requested) |values|
+        if (values.len > 0) values else defaults
+    else
+        defaults;
+    for (seed) |label| try appendUniqueLabel(allocator, &labels, label);
+
+    for (canonical_relation_labels) |label| {
+        const first_separator = std.mem.indexOf(u8, label, "::") orelse continue;
+        try appendUniqueLabel(allocator, &labels, label[0..first_separator]);
+        const remainder = label[first_separator + 2 ..];
+        const second_separator = std.mem.indexOf(u8, remainder, "::") orelse continue;
+        try appendUniqueLabel(allocator, &labels, remainder[second_separator + 2 ..]);
+    }
+
+    if (labels.items.len == 0) {
+        labels.deinit(allocator);
+        return null;
+    }
+    return try labels.toOwnedSlice(allocator);
+}
+
+fn appendUniqueLabel(
+    allocator: std.mem.Allocator,
+    labels: *std.ArrayListUnmanaged([]const u8),
+    candidate: []const u8,
+) !void {
+    for (labels.items) |label| {
+        if (std.ascii.eqlIgnoreCase(label, candidate)) return;
+    }
+    try labels.append(allocator, candidate);
+}
+
 fn isCanonicalLabelSegment(value: []const u8) bool {
     return value.len > 0 and std.mem.indexOf(u8, value, "::") == null;
 }
@@ -11559,18 +12024,91 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
             "inference_admission",
         ),
         error.InvalidExtractionConfig,
+        error.InvalidClassificationSchema,
+        error.InvalidEntitySchema,
+        error.InvalidModelForExtraction,
+        error.InvalidRelationSchema,
         error.InvalidStructureField,
+        error.InvalidTopK,
+        error.MissingExtractionOperation,
         error.MissingStructureFields,
         error.MissingStructureSchema,
+        error.MixedExtractionOperations,
+        error.UnsupportedClassificationExtraction,
         error.UnsupportedInput,
+        error.UnsupportedRelationExtraction,
         error.InvalidMaxTokens,
         => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+        error.UnsupportedRebelEntityLabels,
+        error.UnsupportedRebelRelationEndpoints,
+        => rebelSchemaFailureResponse(ctx, err),
         error.ReadBatchTooLarge,
         error.StreamTooLong,
         => ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = @errorName(err) }),
         error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "model not found" }),
         else => inferenceFailureResponse(ctx, err),
     };
+}
+
+fn rebelSchemaFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    return switch (err) {
+        error.UnsupportedRebelEntityLabels => ctx.status(400).json(.{
+            .@"error" = "INVALID_REQUEST",
+            .message = "REBEL supports only the generic entity label 'ENTITY'; use an entity-typing extractor for typed entity schemas",
+        }),
+        error.UnsupportedRebelRelationEndpoints => ctx.status(400).json(.{
+            .@"error" = "INVALID_REQUEST",
+            .message = "REBEL supports relation-type filters, but source and target constraints must use the generic 'ENTITY' label",
+        }),
+        else => return err,
+    };
+}
+
+fn parseDirectTextExtractionInputs(
+    allocator: std.mem.Allocator,
+    inputs: []const extracting_api.Input,
+) !DirectExtractionInputs {
+    var out = DirectExtractionInputs{ .allocator = allocator };
+    errdefer out.deinit();
+    for (inputs) |input| try appendDirectTextExtractionContent(allocator, &out, input.content_json);
+    if (out.texts.items.len != inputs.len or out.texts.items.len == 0) return error.UnsupportedInput;
+    return out;
+}
+
+fn appendDirectTextExtractionContent(
+    allocator: std.mem.Allocator,
+    out: *DirectExtractionInputs,
+    content_json: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content_json, .{});
+    defer parsed.deinit();
+
+    const text = switch (parsed.value) {
+        .string => |value| try allocator.dupe(u8, value),
+        .array => |parts| blk: {
+            var text_buf = std.ArrayListUnmanaged(u8).empty;
+            defer text_buf.deinit(allocator);
+            var saw_text = false;
+            for (parts.items) |part| {
+                if (part != .object) continue;
+                const type_value = part.object.get("type") orelse continue;
+                if (type_value != .string) continue;
+                if (std.mem.eql(u8, type_value.string, "image_url") or
+                    std.mem.eql(u8, type_value.string, "media")) return error.UnsupportedInput;
+                if (!std.mem.eql(u8, type_value.string, "text")) continue;
+                const text_value = part.object.get("text") orelse continue;
+                if (text_value != .string) continue;
+                if (saw_text) try text_buf.append(allocator, '\n');
+                try text_buf.appendSlice(allocator, text_value.string);
+                saw_text = true;
+            }
+            if (!saw_text) return error.UnsupportedInput;
+            break :blk try allocator.dupe(u8, text_buf.items);
+        },
+        else => try std.json.Stringify.valueAlloc(allocator, parsed.value, .{}),
+    };
+    errdefer allocator.free(text);
+    try out.texts.append(allocator, text);
 }
 
 fn parseDirectExtractionInputs(
@@ -11789,7 +12327,7 @@ fn resolveExtractedOutput(
     const entity_batches = try allocator.alloc([]@import("../pipelines/ner.zig").Entity, input_count);
     var initialized_entity_batches: usize = 0;
     errdefer {
-        freeEntityBatches(allocator, entity_batches[0..initialized_entity_batches]);
+        freeOwnedEntityBatchContents(allocator, entity_batches[0..initialized_entity_batches]);
         allocator.free(entity_batches);
     }
 
@@ -11806,7 +12344,12 @@ fn resolveExtractedOutput(
 
         for (kg.entities) |entity| {
             if (!resolvedHasTextIndex(entity.text_indices, text_index)) continue;
-            try resolved_for_text.append(allocator, try cloneResolvedEntity(allocator, entity, text_index));
+            const cloned = try cloneResolvedEntity(allocator, entity, text_index);
+            errdefer {
+                allocator.free(cloned.text);
+                allocator.free(cloned.label);
+            }
+            try resolved_for_text.append(allocator, cloned);
         }
 
         entity_batches[text_index] = try resolved_for_text.toOwnedSlice(allocator);
@@ -11837,7 +12380,13 @@ fn resolveExtractedOutput(
 
             for (kg.relations) |relation| {
                 if (!resolvedHasTextIndex(relation.text_indices, text_index)) continue;
-                try resolved_for_text.append(allocator, try cloneResolvedRelation(allocator, kg.entities, relation, text_index));
+                var cloned = try cloneResolvedRelation(allocator, kg.entities, relation, text_index);
+                errdefer {
+                    allocator.free(cloned.head.label);
+                    allocator.free(cloned.tail.label);
+                    cloned.deinit(allocator);
+                }
+                try resolved_for_text.append(allocator, cloned);
             }
 
             batches[text_index] = try resolved_for_text.toOwnedSlice(allocator);
@@ -11971,7 +12520,7 @@ fn applyLearnedCleanupIfPresent(
     const out = try allocator.alloc([]@import("../pipelines/ner.zig").Entity, texts.len);
     var built: usize = 0;
     errdefer {
-        freeEntityBatches(allocator, out[0..built]);
+        freeOwnedEntityBatchContents(allocator, out[0..built]);
         allocator.free(out);
     }
 
@@ -12000,28 +12549,72 @@ fn applyLearnedCleanupIfPresent(
         });
         defer cleaned.deinit(allocator);
 
-        out[idx] = try allocator.alloc(@import("../pipelines/ner.zig").Entity, cleaned.resolved_entities.len);
-        for (cleaned.resolved_entities, 0..) |resolved_entity, entity_idx| {
-            out[idx][entity_idx] = .{
-                .text = try allocator.dupe(u8, resolved_entity.text),
-                .label = try allocator.dupe(u8, resolved_entity.label),
-                .start = resolved_entity.start,
-                .end = resolved_entity.end,
-                .score = resolved_entity.detect_score * resolved_entity.validity_score,
-            };
-        }
+        out[idx] = try cloneCleanedEntityBatch(allocator, cleaned.resolved_entities);
         built += 1;
     }
 
     return out;
 }
 
-fn freeEntityBatches(allocator: std.mem.Allocator, all_entities: []const []@import("../pipelines/ner.zig").Entity) void {
+fn cloneCleanedEntityBatch(
+    allocator: std.mem.Allocator,
+    resolved_entities: []const cleanup_pipeline_mod.ResolvedEntity,
+) ![]@import("../pipelines/ner.zig").Entity {
+    const out = try allocator.alloc(@import("../pipelines/ner.zig").Entity, resolved_entities.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |entity| {
+            allocator.free(entity.text);
+            allocator.free(entity.label);
+        }
+        allocator.free(out);
+    }
+
+    for (resolved_entities, 0..) |resolved_entity, idx| {
+        const text = try allocator.dupe(u8, resolved_entity.text);
+        errdefer allocator.free(text);
+        const label = try allocator.dupe(u8, resolved_entity.label);
+        errdefer allocator.free(label);
+        out[idx] = .{
+            .text = text,
+            .label = label,
+            .start = resolved_entity.start,
+            .end = resolved_entity.end,
+            .score = resolved_entity.detect_score * resolved_entity.validity_score,
+        };
+        built += 1;
+    }
+
+    return out;
+}
+
+fn freeOwnedEntityBatchContents(
+    allocator: std.mem.Allocator,
+    all_entities: []const []@import("../pipelines/ner.zig").Entity,
+) void {
     for (all_entities) |entities| {
         for (entities) |entity| {
             allocator.free(entity.text);
             allocator.free(entity.label);
         }
+        allocator.free(entities);
+    }
+}
+
+fn freeEntityBatches(allocator: std.mem.Allocator, all_entities: []const []@import("../pipelines/ner.zig").Entity) void {
+    freeOwnedEntityBatchContents(allocator, all_entities);
+    allocator.free(all_entities);
+}
+
+/// Release raw NER/GLiNER results. Their span text and batch containers are
+/// owned by the caller, while labels borrow model configuration or request
+/// schema storage and must remain untouched.
+fn freeBorrowedLabelEntityBatches(
+    allocator: std.mem.Allocator,
+    all_entities: []const []@import("../pipelines/ner.zig").Entity,
+) void {
+    for (all_entities) |entities| {
+        for (entities) |entity| allocator.free(entity.text);
         allocator.free(entities);
     }
     allocator.free(all_entities);
@@ -14484,6 +15077,568 @@ test "canonical relation schemas preserve endpoint label constraints" {
     );
 }
 
+test "relation entity labels merge defaults and canonical endpoint constraints" {
+    const defaults = [_][]const u8{ "person", "organization", "location" };
+    const canonical_relations = [_][]const u8{
+        "employee::works_at::company",
+        "company::located_in::location",
+        "knows",
+    };
+
+    const inferred = (try relationEntityLabelsAlloc(
+        std.testing.allocator,
+        null,
+        &defaults,
+        &canonical_relations,
+    )).?;
+    defer std.testing.allocator.free(inferred);
+    const expected_inferred = [_][]const u8{ "person", "organization", "location", "employee", "company" };
+    try std.testing.expectEqual(expected_inferred.len, inferred.len);
+    for (&expected_inferred, inferred) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+
+    const requested = [_][]const u8{"employee"};
+    const constrained = (try relationEntityLabelsAlloc(
+        std.testing.allocator,
+        &requested,
+        &defaults,
+        &canonical_relations,
+    )).?;
+    defer std.testing.allocator.free(constrained);
+    const expected_constrained = [_][]const u8{ "employee", "company", "location" };
+    try std.testing.expectEqual(expected_constrained.len, constrained.len);
+    for (&expected_constrained, constrained) |expected, actual|
+        try std.testing.expectEqualStrings(expected, actual);
+
+    try std.testing.expect((try relationEntityLabelsAlloc(
+        std.testing.allocator,
+        null,
+        &.{},
+        &.{"knows"},
+    )) == null);
+}
+
+test "canonical extraction operation routes every documented schema family" {
+    const cases = [_]struct { json: []const u8, expected: CanonicalExtractionOperation }{
+        .{ .json = "{\"entities\":[\"person\"]}", .expected = .entities_relations },
+        .{ .json = "{\"relations\":[{\"type\":\"works_for\"}]}", .expected = .entities_relations },
+        .{ .json = "{\"entities\":[\"person\"],\"relations\":[{\"type\":\"works_for\"}]}", .expected = .entities_relations },
+        .{ .json = "{\"classifications\":[{\"name\":\"sentiment\",\"labels\":[\"positive\",\"negative\"]}]}", .expected = .classifications },
+        .{ .json = "{\"structures\":{\"person\":{\"fields\":{\"name\":\"string\"}}}}", .expected = .structures },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(extraction_api.ExtractionSchema, std.testing.allocator, case.json, .{
+            .allocate = .alloc_always,
+        });
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expected, try canonicalExtractionOperation(parsed.value));
+    }
+}
+
+test "entity extraction model preflight rejects incompatible families and modalities" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .model_type = .recognizer,
+    };
+    try validateTextEntityExtractionManifest(&manifest);
+
+    manifest.model_type = .classifier;
+    try std.testing.expectError(
+        error.InvalidModelForExtraction,
+        validateTextEntityExtractionManifest(&manifest),
+    );
+
+    var image_inputs = [_][]const u8{"image"};
+    manifest.model_type = .recognizer;
+    manifest.inputs = &image_inputs;
+    try std.testing.expectError(
+        error.UnsupportedInput,
+        validateTextEntityExtractionManifest(&manifest),
+    );
+
+    manifest.inputs = &.{};
+    manifest.gliner_model_type = "uniencoder";
+    try std.testing.expectError(
+        error.InvalidModelForExtraction,
+        validateTextEntityExtractionManifest(&manifest),
+    );
+
+    var extraction_capabilities = [_][]const u8{"extraction"};
+    manifest.capabilities = &extraction_capabilities;
+    try validateTextEntityExtractionManifest(&manifest);
+}
+
+test "canonical extraction operation repeatedly rejects empty and mixed schemas without leaking" {
+    var empty = try std.json.parseFromSlice(extraction_api.ExtractionSchema, std.testing.allocator, "{}", .{
+        .allocate = .alloc_always,
+    });
+    defer empty.deinit();
+    const mixed_json = "{\"entities\":[\"person\"],\"structures\":{\"person\":{\"fields\":{\"name\":\"string\"}}}}";
+    var mixed = try std.json.parseFromSlice(
+        extraction_api.ExtractionSchema,
+        std.testing.allocator,
+        mixed_json,
+        .{ .allocate = .alloc_always },
+    );
+    defer mixed.deinit();
+    for (0..64) |_| {
+        try std.testing.expectError(error.MissingExtractionOperation, canonicalExtractionOperation(empty.value));
+        try std.testing.expectError(error.MixedExtractionOperations, canonicalExtractionOperation(mixed.value));
+    }
+
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    const inputs = [_]extracting_api.Input{.{ .content_json = "\"Grace Hopper built compilers.\"" }};
+    for (0..64) |_| {
+        try std.testing.expectError(error.MissingExtractionOperation, node.extractDirect(
+            std.testing.allocator,
+            "antflydb/gliner2-base-v1",
+            .{ .inputs = &inputs, .schema_json = "{}" },
+        ));
+        try std.testing.expectError(error.MixedExtractionOperations, node.extractDirect(
+            std.testing.allocator,
+            "antflydb/gliner2-base-v1",
+            .{ .inputs = &inputs, .schema_json = mixed_json },
+        ));
+    }
+}
+
+test "text extraction rejects media before fetch or model resolution" {
+    var node = try Node.init(std.testing.allocator, .{
+        .models_dir = "missing-model-root",
+        .max_concurrent_requests = 1,
+    });
+    defer node.deinit();
+    const inputs = [_]extracting_api.Input{.{
+        .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]
+        ,
+    }};
+
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(error.UnsupportedInput, node.extractDirect(
+        std.testing.allocator,
+        "antflydb/gliner2-base-v1",
+        .{ .inputs = &inputs, .schema_json = "{\"entities\":[\"person\"]}" },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    var canonical_input = try std.json.parseFromSlice(extraction_api.ExtractionInput, std.testing.allocator,
+        \\{"content":[{"type":"image_url","image_url":{"url":"https://example.com/image.png"}}]}
+    , .{ .allocate = .alloc_always });
+    defer canonical_input.deinit();
+    const canonical_inputs = [_]extraction_api.ExtractionInput{canonical_input.value};
+    try std.testing.expectError(
+        error.UnsupportedInput,
+        parseCanonicalTextInputs(std.testing.allocator, &canonical_inputs),
+    );
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_resolution_attempts);
+}
+
+test "text extraction preserves multipart text as one input" {
+    const inputs = [_]extracting_api.Input{.{
+        .content_json =
+        \\[{"type":"text","text":"Grace Hopper"},{"type":"text","text":"built compilers."}]
+        ,
+    }};
+    var parsed = try parseDirectTextExtractionInputs(std.testing.allocator, &inputs);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.texts.items.len);
+    try std.testing.expectEqualStrings("Grace Hopper\nbuilt compilers.", parsed.texts.items[0]);
+}
+
+test "structured extraction validates generation options before resolver and media work" {
+    var node = try Node.init(std.testing.allocator, .{
+        .models_dir = "missing-model-root",
+        .max_concurrent_requests = 1,
+    });
+    defer node.deinit();
+    // Three images require two admission units. With a one-unit node this
+    // proves invalid options win over capacity checks, not merely over fetch.
+    const inputs = [_]extracting_api.Input{
+        .{ .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/one.png"}}]
+        },
+        .{ .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/two.png"}}]
+        },
+        .{ .content_json =
+        \\[{"type":"image_url","image_url":{"url":"https://example.com/three.png"}}]
+        },
+    };
+
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(error.InvalidMaxTokens, node.extractDirect(
+        std.testing.allocator,
+        "missing/structured-extractor",
+        .{
+            .inputs = &inputs,
+            .schema_json =
+            \\{"structures":{"person":{"fields":{"name":"string"}}}}
+            ,
+            .options_json = "{\"max_tokens\":0}",
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    try std.testing.expectError(error.MissingStructureFields, node.extractDirect(
+        std.testing.allocator,
+        "missing/structured-extractor",
+        .{
+            .inputs = &inputs,
+            .schema_json =
+            \\{"structures":{"person":{"fields":{}}}}
+            ,
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.media_fetch_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+}
+
+test "valid direct entity failures release admission and partial model state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/owner/broken-gliner");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/broken-gliner/config.json",
+        .data = "{\"model_type\":\"gliner2\"}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/broken-gliner/gliner_config.json",
+        .data = "{\"model_type\":\"gliner2\",\"default_labels\":[\"person\"]}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{
+        .models_dir = models_root,
+        .max_concurrent_requests = 1,
+        .allow_unknown_models = true,
+    });
+    defer node.deinit();
+    const inputs = [_]extracting_api.Input{.{ .content_json = "\"Grace Hopper built compilers.\"" }};
+
+    resetRequestWorkTestCounters();
+    for (0..64) |_| {
+        var response = node.extractDirect(
+            allocator,
+            "owner/broken-gliner",
+            .{ .inputs = &inputs, .schema_json = "{\"entities\":[\"person\"]}" },
+        ) catch |err| {
+            try std.testing.expect(err != error.MissingExtractionOperation);
+            try std.testing.expect(err != error.MixedExtractionOperations);
+            try std.testing.expect(err != error.UnsupportedInput);
+            try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+            try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+            continue;
+        };
+        defer response.deinit();
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, 64), request_work_test_counters.model_resolution_attempts);
+}
+
+test "direct entity extraction response populates requested canonical fields" {
+    const ner = @import("../pipelines/ner.zig");
+    const entities = [_]ner.Entity{.{
+        .text = "Grace Hopper",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.889,
+    }};
+    const batches = [_][]const ner.Entity{&entities};
+    const input_ids = [_]?[]const u8{"doc-1"};
+    const request = Node.EntityExtractionRequest{
+        .model = "antflydb/gliner2-base-v1",
+        .include_confidence = true,
+        .include_spans = true,
+        .input_ids = &input_ids,
+    };
+    for (0..64) |_| {
+        const json = try entityExtractionResponseJsonAlloc(
+            std.testing.allocator,
+            request,
+            &batches,
+            null,
+            &.{"Grace Hopper built compilers."},
+        );
+        defer std.testing.allocator.free(json);
+        try ant_json.testing.expectSubsetJsonText(std.testing.allocator,
+            \\{
+            \\  "object": "extraction",
+            \\  "model": "antflydb/gliner2-base-v1",
+            \\  "data": [{
+            \\    "id": "doc-1",
+            \\    "entities": [{
+            \\      "text": "Grace Hopper",
+            \\      "label": "person",
+            \\      "start": 0,
+            \\      "end": 12,
+            \\      "score": 0.8889999985694885
+            \\    }]
+            \\  }]
+            \\}
+        , json);
+    }
+}
+
+test "raw entity cleanup preserves borrowed labels" {
+    const allocator = std.testing.allocator;
+    const ner = @import("../pipelines/ner.zig");
+    const borrowed_label = "person";
+    const batches = try allocator.alloc([]ner.Entity, 1);
+    batches[0] = try allocator.alloc(ner.Entity, 1);
+    batches[0][0] = .{
+        .text = try allocator.dupe(u8, "Grace Hopper"),
+        .label = borrowed_label,
+        .start = 0,
+        .end = 12,
+        .score = 0.889,
+    };
+
+    freeBorrowedLabelEntityBatches(allocator, batches);
+    try std.testing.expectEqualStrings("person", borrowed_label);
+}
+
+test "resolved extraction releases partial entity batches on every allocation failure" {
+    const ner = @import("../pipelines/ner.zig");
+    const first_entities = [_]ner.Entity{ .{
+        .text = "Grace Hopper",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.95,
+    }, .{
+        .text = "COBOL",
+        .label = "technology",
+        .start = 13,
+        .end = 18,
+        .score = 0.91,
+    } };
+    const second_entities = [_]ner.Entity{ .{
+        .text = "Ada Lovelace",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.94,
+    }, .{
+        .text = "Analytical Engine",
+        .label = "technology",
+        .start = 13,
+        .end = 30,
+        .score = 0.90,
+    } };
+    const batches = [_][]const ner.Entity{ &first_entities, &second_entities };
+    const relations = [_][]const gliner_mod.Relation{
+        &.{.{
+            .head = first_entities[0],
+            .tail = first_entities[1],
+            .label = "created",
+            .score = 0.89,
+        }},
+        &.{.{
+            .head = second_entities[0],
+            .tail = second_entities[1],
+            .label = "described",
+            .score = 0.88,
+        }},
+    };
+
+    const Runner = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            source: []const []const ner.Entity,
+            source_relations: []const []const gliner_mod.Relation,
+        ) !void {
+            var resolved = try resolveExtractedOutput(allocator, source, source_relations, .{});
+            defer resolved.deinit(allocator);
+            try std.testing.expectEqual(@as(usize, 2), resolved.entities.len);
+            try std.testing.expectEqual(@as(usize, 2), resolved.relations.?.len);
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &batches, &relations) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
+}
+
+test "learned entity cleanup releases partial batches on every allocation failure" {
+    const ner = @import("../pipelines/ner.zig");
+    var head = try cleanup_model_mod.CleanupHead.init(std.testing.allocator, 32, 4, 8);
+    defer head.deinit();
+
+    const texts = [_][]const u8{
+        "Grace Hopper built compilers.",
+        "COBOL influenced business computing.",
+    };
+    const first_entities = [_]ner.Entity{.{
+        .text = "Grace Hopper",
+        .label = "person",
+        .start = 0,
+        .end = 12,
+        .score = 0.95,
+    }};
+    const second_entities = [_]ner.Entity{.{
+        .text = "COBOL",
+        .label = "technology",
+        .start = 0,
+        .end = 5,
+        .score = 0.91,
+    }};
+    const batches = [_][]const ner.Entity{ &first_entities, &second_entities };
+
+    const Runner = struct {
+        fn run(
+            allocator: std.mem.Allocator,
+            cleanup_head: *const cleanup_model_mod.CleanupHead,
+            source_texts: []const []const u8,
+            source_entities: []const []const ner.Entity,
+        ) !void {
+            const cleaned = (try applyLearnedCleanupIfPresent(
+                allocator,
+                cleanup_head,
+                source_texts,
+                source_entities,
+            )).?;
+            defer freeEntityBatches(allocator, cleaned);
+            try std.testing.expectEqual(source_texts.len, cleaned.len);
+        }
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+            .resize_fail_index = 0,
+        });
+        Runner.run(failing.allocator(), &head, &texts, &batches) catch |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+                continue;
+            },
+            else => return err,
+        };
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        break;
+    }
+}
+
+test "REBEL rejects unsupported typed schemas before model loading" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models/owner/rebel");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/rebel/config.json",
+        .data = "{}",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "models/owner/rebel/rebel_config.json",
+        .data = "{}",
+    });
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+
+    var node = try Node.init(allocator, .{
+        .models_dir = models_root,
+        .allow_unknown_models = true,
+    });
+    defer node.deinit();
+    const input_ids = [_]?[]const u8{null};
+    const texts = [_][]const u8{"Grace Hopper served in the Navy."};
+    const direct_inputs = [_]extracting_api.Input{.{ .content_json = "\"Grace Hopper served in the Navy.\"" }};
+
+    resetRequestWorkTestCounters();
+    try std.testing.expectError(
+        error.UnsupportedRebelEntityLabels,
+        node.extractDirect(allocator, "owner/rebel", .{
+            .inputs = &direct_inputs,
+            .schema_json = "{\"entities\":[\"person\"]}",
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+    try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightRequests());
+
+    const cases = [_]struct {
+        labels: ?[]const []const u8,
+        relation_labels: ?[]const []const u8,
+        want_relations: bool,
+        expected_message: []const u8,
+    }{
+        .{
+            .labels = &.{"person"},
+            .relation_labels = null,
+            .want_relations = false,
+            .expected_message = "REBEL supports only the generic entity label 'ENTITY'",
+        },
+        .{
+            .labels = null,
+            .relation_labels = &.{"person::served in::organization"},
+            .want_relations = true,
+            .expected_message = "source and target constraints must use the generic 'ENTITY' label",
+        },
+    };
+
+    for (cases) |case| {
+        resetRequestWorkTestCounters();
+        var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.extractEntitiesAndRelations(
+            &ctx,
+            .{
+                .model = "owner/rebel",
+                .labels = case.labels,
+                .relation_labels = case.relation_labels,
+                .input_ids = &input_ids,
+            },
+            &texts,
+            case.want_relations,
+        );
+        defer response.deinit();
+
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        try ant_json.testing.expectSubsetJsonText(
+            allocator,
+            "{\"error\":\"INVALID_REQUEST\"}",
+            response.body.?,
+        );
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, case.expected_message) != null);
+        try std.testing.expectEqual(@as(usize, 1), request_work_test_counters.model_resolution_attempts);
+        try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
+    }
+}
+
 test "canonical structure schemas preserve field types and choices" {
     var parsed = try std.json.parseFromSlice(
         extraction_api.ExtractionSchema,
@@ -14633,6 +15788,19 @@ test "readyz serves only the published inventory snapshot" {
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"ready\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"generators\":2") != null);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"embedders\":1") != null);
+    }
+
+    node.session_manager.required_backend_invalid = true;
+    {
+        var request = try httpx.Request.init(allocator, .GET, "/readyz");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+
+        var response = try node.readyzHandler(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"status\":\"not_ready\"") != null);
     }
 }
 

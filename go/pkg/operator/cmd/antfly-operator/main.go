@@ -55,6 +55,7 @@ func main() {
 	var skipCRDInstall bool
 	var enableInferenceControllers bool
 	var inferenceAntflyImage string
+	var clusterDomain string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
@@ -66,14 +67,21 @@ func main() {
 		"Enable InferencePool and InferenceProxy controllers and AntflyCluster.spec.inference management. CRD installation remains unconditional unless --skip-crd-install is set.")
 	flag.StringVar(&inferenceAntflyImage, "inference-antfly-image", defaultInferenceImage,
 		"Default Zig Antfly image for InferencePool pods. The image must provide the /antfly inference runtime contract.")
+	flag.StringVar(&clusterDomain, "cluster-domain", controllers.DefaultClusterDomain,
+		"Kubernetes DNS cluster domain used for internal Service and StatefulSet pod addresses.")
 	opts := zap.Options{
 		Development: false,
 		TimeEncoder: zapcore.RFC3339TimeEncoder,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
-
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	clusterDomain, err := controllers.NormalizeClusterDomain(clusterDomain)
+	if err != nil {
+		setupLog.Error(err, "invalid operator configuration", "option", "cluster-domain")
+		os.Exit(2)
+	}
 
 	mgrOpts := ctrl.Options{
 		Scheme:                 scheme,
@@ -106,6 +114,7 @@ func main() {
 	setupLog.Info("operator configuration",
 		"enableInferenceControllers", enableInferenceControllers,
 		"inferenceAntflyImage", inferenceAntflyImage,
+		"clusterDomain", clusterDomain,
 		"skipCRDInstall", skipCRDInstall,
 		"webhooksEnabled", webhooksEnabled(),
 	)
@@ -122,24 +131,27 @@ func main() {
 		Recorder:              mgr.GetEventRecorder("antfly-operator"),
 		ManageInferencePools:  enableInferenceControllers,
 		DefaultInferenceImage: inferenceAntflyImage,
+		ClusterDomain:         clusterDomain,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AntflyCluster")
 		os.Exit(1)
 	}
 
 	if err = (&controllers.AntflyBackupReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("antfly-backup"),
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Recorder:      mgr.GetEventRecorder("antfly-backup"),
+		ClusterDomain: clusterDomain,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AntflyBackup")
 		os.Exit(1)
 	}
 
 	if err = (&controllers.AntflyRestoreReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("antfly-restore"),
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Recorder:      mgr.GetEventRecorder("antfly-restore"),
+		ClusterDomain: clusterDomain,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AntflyRestore")
 		os.Exit(1)

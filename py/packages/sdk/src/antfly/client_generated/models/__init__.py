@@ -62,6 +62,7 @@ from .batch_request_inserts_additional_property import BatchRequestInsertsAdditi
 from .batch_response import BatchResponse
 from .batch_response_status import BatchResponseStatus
 from .bedrock_embedder_config import BedrockEmbedderConfig
+from .bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
 from .bedrock_generator_config import BedrockGeneratorConfig
 from .bool_field_query import BoolFieldQuery
 from .boolean_query import BooleanQuery
@@ -375,11 +376,15 @@ from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
+from .index_publication_policy import IndexPublicationPolicy
+from .index_readiness_state import IndexReadinessState
+from .index_readiness_status import IndexReadinessStatus
 from .index_repair_status import IndexRepairStatus
 from .index_repair_status_state import IndexRepairStatusState
 from .index_status import IndexStatus
 from .index_status_shard_status import IndexStatusShardStatus
 from .index_type import IndexType
+from .inference_a4b_residency_mode import InferenceA4BResidencyMode
 from .inference_admission_config import InferenceAdmissionConfig
 from .inference_audio_chunk_config import InferenceAudioChunkConfig
 from .inference_backend_runtimes import InferenceBackendRuntimes
@@ -657,6 +662,8 @@ from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
 from .query_temporarily_unavailable_error_code import QueryTemporarilyUnavailableErrorCode
+from .reauthorize_table_destinations_response_200 import ReauthorizeTableDestinationsResponse200
+from .reauthorize_table_destinations_response_200_status import ReauthorizeTableDestinationsResponse200Status
 from .regexp_query import RegexpQuery
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -889,6 +896,7 @@ __all__ = (
     "BatchResponse",
     "BatchResponseStatus",
     "BedrockEmbedderConfig",
+    "BedrockEmbedderConfigRequestFormat",
     "BedrockGeneratorConfig",
     "BooleanQuery",
     "BoolFieldQuery",
@@ -1200,11 +1208,15 @@ __all__ = (
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexExecutionConfig",
+    "IndexPublicationPolicy",
+    "IndexReadinessState",
+    "IndexReadinessStatus",
     "IndexRepairStatus",
     "IndexRepairStatusState",
     "IndexStatus",
     "IndexStatusShardStatus",
     "IndexType",
+    "InferenceA4BResidencyMode",
     "InferenceAdmissionConfig",
     "InferenceAudioChunkConfig",
     "InferenceBackendRuntimes",
@@ -1478,6 +1490,8 @@ __all__ = (
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",
     "QueryTemporarilyUnavailableErrorCode",
+    "ReauthorizeTableDestinationsResponse200",
+    "ReauthorizeTableDestinationsResponse200Status",
     "RegexpQuery",
     "RepairIssueListRequest",
     "RepairRunRequest",

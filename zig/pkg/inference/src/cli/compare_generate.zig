@@ -420,6 +420,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const opts = try parseArgs(args);
 
     var session_manager = backends.SessionManager.init(allocator);
+    try session_manager.validateRequiredBackendPolicy();
     configureBackendPreference(&session_manager, opts.backend);
 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
@@ -467,6 +468,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         } else if (!c_file.fileExistsInDir(allocator, opts.reference_model_dir, "genai_config.json") and
             onnx_decoder_only_vlm.isSupportedModelDir(allocator, opts.reference_model_dir))
         {
+            try validateDirectOnnxPolicy(&session_manager);
             const stage_override = platform.env.getenv("TERMITE_COMPARE_NATIVE_VISION_STAGE");
             if (opts.image_features_only and stage_override != null) {
                 const native_image_features = try collectNativeVisionStageFeatures(
@@ -713,6 +715,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     } else if (!c_file.fileExistsInDir(allocator, opts.reference_model_dir, "genai_config.json") and
         onnx_decoder_only_vlm.isSupportedModelDir(allocator, opts.reference_model_dir))
     {
+        try validateDirectOnnxPolicy(&session_manager);
         var onnx_pipeline = try onnx_decoder_only_vlm.Pipeline.load(allocator, opts.reference_model_dir);
         defer onnx_pipeline.deinit();
         const onnx_prompt = try alignOnnxPromptForCompare(
@@ -743,6 +746,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return;
     } else if (try ortgenai.prepareGenerativeModelPackage(allocator, opts.reference_model_dir)) |onnx_model_dir| {
         defer allocator.free(onnx_model_dir);
+        try validateDirectOnnxPolicy(&session_manager);
         const onnx_prompt = try allocator.dupe(u8, native.prompt);
         defer allocator.free(onnx_prompt);
         print("native_prompt == onnx_prompt: {}\n", .{true});
@@ -3754,6 +3758,43 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
         .cuda => &.{ .cuda, .native },
         .metal => &.{ .metal, .onnx, .native },
     };
+}
+
+fn validateDirectOnnxPolicy(session_manager: *const backends.SessionManager) !void {
+    try session_manager.validateRequiredBackendPolicy();
+    if (!try session_manager.allowsDirectBackend(.onnx))
+        return error.RequiredBackendUnavailable;
+}
+
+test "compare direct ONNX routes honor the required backend" {
+    var session_manager = backends.SessionManager.init(std.testing.allocator);
+    session_manager.required_backend_invalid = false;
+
+    session_manager.required_backend = null;
+    try validateDirectOnnxPolicy(&session_manager);
+
+    session_manager.required_backend = .cuda;
+    try std.testing.expectError(
+        error.RequiredBackendUnavailable,
+        validateDirectOnnxPolicy(&session_manager),
+    );
+
+    session_manager.required_backend = .onnx;
+    if (build_options.enable_onnx) {
+        try validateDirectOnnxPolicy(&session_manager);
+    } else {
+        try std.testing.expectError(
+            error.RequiredBackendUnavailable,
+            validateDirectOnnxPolicy(&session_manager),
+        );
+    }
+
+    session_manager.required_backend = null;
+    session_manager.required_backend_invalid = true;
+    try std.testing.expectError(
+        error.InvalidRequiredBackend,
+        validateDirectOnnxPolicy(&session_manager),
+    );
 }
 
 fn printUsage() void {

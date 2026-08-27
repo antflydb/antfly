@@ -11,8 +11,10 @@ dependencies = [
 
 [tool.pytest.ini_options]
 testpaths = ["."]
-addopts = "-v --durations=50 --durations-min=1.0"
+addopts = "-v --durations=50 --durations-min=1.0 --dist=loadgroup"
 markers = [
+    "e2e_isolation(policy, group=None): declares test- or module-level scheduling isolation",
+    "e2e_resource(name, lifetime=None, identity=None): declares a capacity-constrained resource such as antfly_process",
     "reuse_antfly_process: share one local Antfly process within this test module and clean tables after each test",
     "fresh_antfly_process: override module-level process reuse for tests that exercise process or storage lifecycle",
     "objectstore_integration: requires real S3 or GCS objectstore credentials and buckets",
@@ -21,4 +23,5 @@ markers = [
     "real_model: requires local or downloadable model weights",
     "postgres_integration: requires a local PostgreSQL instance",
     "slow: marks tests that are too long-running for required E2E base CI",
+    "scale: marks corpus-scale correctness gates run by dedicated scale CI",
 ]

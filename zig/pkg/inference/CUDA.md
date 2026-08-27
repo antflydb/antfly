@@ -431,7 +431,7 @@ zig/pkg/inference/scripts/regen-cuda-artifacts.sh --check --all
 
 zig/pkg/inference/zig-out/bin/antfly-inference cuda-info --smoke
 
-zig/pkg/inference/scripts/validate_cuda_turboquant_gemma4.sh --quick
+zig/pkg/inference/scripts/gemma4/validate_cuda_turboquant_gemma4.sh --quick
 
 zig/pkg/inference/zig-out/bin/antfly-inference generate \
   /path/to/gemma4-12b-target \
@@ -799,7 +799,7 @@ contract and promotion gate.
 Run the hardware gate with:
 
 ```sh
-python3 scripts/benchmark_gemma4_cuda_batching.py
+python3 scripts/gemma4/benchmark_gemma4_cuda_batching.py
 ```
 
 The gate records response fingerprints, latency and aggregate throughput by

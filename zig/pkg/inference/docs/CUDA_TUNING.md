@@ -1,7 +1,7 @@
 # CUDA Tuning Profile
 
 Gemma 4 QAT CUDA measurements must use the shared profile in
-`scripts/gemma4_qat_cuda_tuning.sh`. The CLI benchmark and server wrapper both
+`scripts/gemma4/gemma4_qat_cuda_tuning.sh`. The CLI benchmark and server wrapper both
 source it so production route settings stay aligned.
 
 ## Production Defaults
@@ -28,7 +28,7 @@ The tuned profile currently uses these conservative defaults:
 Run the tuned server with:
 
 ```sh
-zig/pkg/inference/scripts/with_gemma4_qat_cuda_tuning.sh \
+zig/pkg/inference/scripts/gemma4/with_gemma4_qat_cuda_tuning.sh \
   zig/pkg/inference/zig-out/bin/antfly-inference run \
   --host 127.0.0.1 --port 8080 --models-dir .models --config server.json
 ```
@@ -41,7 +41,7 @@ and output tokens, rounded up to a KV page:
 
 ```sh
 ANTFLY_CAPTURE_FORCE_KV_CAPACITY=1056 \
-  zig/pkg/inference/scripts/with_gemma4_qat_cuda_tuning.sh \
+  zig/pkg/inference/scripts/gemma4/with_gemma4_qat_cuda_tuning.sh \
   zig/pkg/inference/zig-out/bin/antfly-inference run \
   --host 127.0.0.1 --port 8080 --models-dir .models --config server.json
 ```
@@ -121,7 +121,7 @@ Set both server controls explicitly when running the batching profile:
 ```sh
 ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING=0 \
 ANTFLY_SERVER_DECODE_GRAPH_REPLAY=off \
-  zig/pkg/inference/scripts/with_gemma4_qat_cuda_tuning.sh \
+  zig/pkg/inference/scripts/gemma4/with_gemma4_qat_cuda_tuning.sh \
   zig/pkg/inference/zig-out/bin/antfly-inference run \
   --host 127.0.0.1 --port 8080 --models-dir .models --config server.json
 ```
@@ -133,7 +133,7 @@ the model-wide lock for graph, speculative/MTP, and multimodal requests.
 `generation_batching.mode: auto` also remains serialized until the batching
 promotion gate passes; use `mode: on` only for an explicit row-2 run.
 
-`scripts/benchmark_gemma4_cuda_batching.py` uses distinguishable equal-length
+`scripts/gemma4/benchmark_gemma4_cuda_batching.py` uses distinguishable equal-length
 prompts, alternating row order, and a staggered mixed-length/page-growth probe.
 Scheduled and release CI enforce that correctness corpus with a `0.40` C2
 regression floor. Manual promotion runs retain the `1.5x` throughput threshold.
@@ -316,7 +316,7 @@ with the model-neutral candidate validator:
 
 ```sh
 cd zig/pkg/inference
-python3 scripts/validate_gemma4_cuda_candidate.py \
+python3 scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --kernel-id cuda.attention.gqa.decode.score_prework \
   --cache-dtype polar4 \
   --prompt Ants \
@@ -417,7 +417,7 @@ cannot exercise this Q6_K route. Use a GGUF whose output tensor is Q6_K, then
 validate exact tokens, replay, and route telemetry before comparing throughput:
 
 ```sh
-zig/pkg/inference/scripts/validate_gemma4_cuda_candidate.py \
+zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --candidate q6-k-q8-1-lm-head-argmax \
   --model .models/google/gemma-4-12B-it-q4_k/gemma-4-12B-it-Q4_K_M.gguf \
   --config-label l4-sm89-q6-lm-head \
@@ -468,7 +468,7 @@ REQUIRE_GENERATED_ATTENTION=0 REQUIRE_LM_HEAD_ARGMAX=1 \
 REQUIRE_GENERATED_E2B_FFN=0 \
 MIN_LLAMA_THROUGHPUT_RATIO=0 MIN_COMPARABLE_THROUGHPUT_RATIO=0 \
 MIN_ANTFLY_TOK_S=0 MAX_ANTFLY_TOK_S_CV=0.02 \
-  zig/pkg/inference/scripts/gemma4_qat_llamacpp_pair_benchmark.sh
+  zig/pkg/inference/scripts/gemma4/gemma4_qat_llamacpp_pair_benchmark.sh
 ```
 
 Warmups and measured pairs use balanced AB/BA order: odd pairs run Antfly then
@@ -486,7 +486,7 @@ Collect the current production matrix without asserting future throughput
 targets:
 
 ```sh
-zig/pkg/inference/scripts/benchmark_gemma4_cuda_matrix.py \
+zig/pkg/inference/scripts/gemma4/benchmark_gemma4_cuda_matrix.py \
   --lengths 64 128 256 512 --target-length 256 \
   --min-antfly-tok-s 0 --min-comparable-ratio 0 --max-cv 1 \
   --no-require-generated-attention --collect-only
@@ -499,7 +499,7 @@ attention is not required because the production profile keeps it off.
 The following are aspirational gates, not current achieved values:
 
 ```sh
-zig/pkg/inference/scripts/benchmark_gemma4_cuda_matrix.py \
+zig/pkg/inference/scripts/gemma4/benchmark_gemma4_cuda_matrix.py \
   --lengths 64 128 256 512 --target-length 256 \
   --min-antfly-tok-s 120 --min-comparable-ratio 0.95 --max-cv 0.02 \
   --no-require-generated-attention
@@ -624,10 +624,10 @@ Screen the score-prework route on the same versioned 8,251-byte rendered prompt,
 program:
 
 ```sh
-zig/pkg/inference/scripts/validate_gemma4_cuda_candidate.py \
+zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --kernel-id cuda.attention.gqa.decode.score_prework \
   --qualification-profile screening \
-  --prompt-fixture zig/pkg/inference/scripts/fixtures/gemma4_long_context_v1.json \
+  --prompt-fixture zig/pkg/inference/scripts/gemma4/fixtures/gemma4_long_context_v1.json \
   --lengths 300 --prefill-chunk-size 512 \
   --cache-dtype f16 --capture-kv-capacity 2432 \
   --config-label l4-sm89-long-context-f16-decode-score-prework-screening \
@@ -653,10 +653,10 @@ Screen either tiled F16 GQA prefill candidate on the fixed realistic prompt by
 selecting its catalog ID:
 
 ```sh
-zig/pkg/inference/scripts/validate_gemma4_cuda_candidate.py \
+zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --kernel-id cuda.attention.gqa.prefill.tiled_f16_exact \
   --qualification-profile prefill-screening \
-  --prompt-fixture zig/pkg/inference/scripts/fixtures/gemma4_long_context_v1.json \
+  --prompt-fixture zig/pkg/inference/scripts/gemma4/fixtures/gemma4_long_context_v1.json \
   --lengths 300 --prefill-chunk-size 512 \
   --cache-dtype f16 --capture-kv-capacity 2432 \
   --config-label l4-sm89-long-context-f16-prefill-tiled-exact-screening \
@@ -678,7 +678,7 @@ the E4B frozen-baseline regression lane, or the 12B control lane.
 Run the repeated LM-head regression gate with:
 
 ```sh
-zig/pkg/inference/scripts/validate_gemma4_cuda_candidate.py \
+zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --candidate q4-0-q8-1-lm-head-argmax \
   --lengths 64 128 256 512 --repeats 5 \
   --min-candidate-ratio 1.01 --max-cv 0.02 \
@@ -706,7 +706,7 @@ so launch savings do not translate directly. These kernels remain dev-only.
 Require repeated full-model evidence before changing the profile default:
 
 ```sh
-zig/pkg/inference/scripts/validate_gemma4_cuda_candidate.py \
+zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --candidate q4-0-q8-1-e2b-ffn \
   --lengths 64 128 256 512 --repeats 5 \
   --min-candidate-ratio 1.00 --max-cv 0.02 \
@@ -730,7 +730,7 @@ candidate, and the validator locks the coupled and exact-F32 routes off in both
 arms:
 
 ```sh
-zig/pkg/inference/scripts/validate_gemma4_cuda_candidate.py \
+zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --candidate q4-0-q8-1-e2b-ffn-pair-only \
   --lengths 64 128 256 512 --repeats 5 \
   --min-candidate-ratio 1.00 --max-cv 0.02 \
@@ -758,7 +758,7 @@ separate `ANTFLY_INFERENCE_CUDA_GENERATED_Q4_0_E2B_FFN_EXACT` direct gate;
 cataloging the artifacts does not enable that route.
 
 ```sh
-zig/pkg/inference/scripts/validate_gemma4_cuda_candidate.py \
+zig/pkg/inference/scripts/gemma4/validate_gemma4_cuda_candidate.py \
   --candidate q4-0-e2b-ffn-exact \
   --lengths 64 256 --repeats 3 --capture-kv-capacity 2048 \
   --min-candidate-ratio 1.00 --max-cv 0.02 \
@@ -860,7 +860,7 @@ or llama.cpp-superiority claim. Strict CUDA MTP certification is follow-up work.
 For an equivalent local evidence run after a ReleaseFast CUDA build:
 
 ```sh
-python3 zig/pkg/inference/scripts/gemma4_cuda_l4_release_gate.py \
+python3 zig/pkg/inference/scripts/gemma4/gemma4_cuda_l4_release_gate.py \
   --binary zig/pkg/inference/zig-out/bin/antfly-inference \
   --llama-cpp-bin /path/to/llama-completion \
   --e2b-model /path/to/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
@@ -1012,7 +1012,7 @@ Run the E2B QAT Q4_0 headline gate with a SHA-pinned GGUF and a pinned
 `llama-server` build:
 
 ```sh
-python3 zig/pkg/inference/scripts/benchmark_gemma4_long_e2e_server.py \
+python3 zig/pkg/inference/scripts/gemma4/benchmark_gemma4_long_e2e_server.py \
   --profile headline \
   --backend cuda \
   --model /models/gemma-4-E2B-it-qat-Q4_0/gemma-4-E2B-it-qat-Q4_0.gguf \
@@ -1077,14 +1077,14 @@ E4B and F32 lanes compare current Antfly medians with a frozen evidence bundle:
 
 ```sh
 # Record the frozen E4B F16 baseline before a runtime change.
-python3 zig/pkg/inference/scripts/benchmark_gemma4_long_e2e_server.py \
+python3 zig/pkg/inference/scripts/gemma4/benchmark_gemma4_long_e2e_server.py \
   --profile e4b-regression --collect-only \
   --model /models/gemma-4-E4B-it-qat-Q4_0/gemma-4-E4B-it-qat-Q4_0.gguf \
   --models-dir /models \
   --output-dir /evidence/e4b-f16-frozen
 
 # Gate the candidate (3% maximum Antfly latency regression).
-python3 zig/pkg/inference/scripts/benchmark_gemma4_long_e2e_server.py \
+python3 zig/pkg/inference/scripts/gemma4/benchmark_gemma4_long_e2e_server.py \
   --profile e4b-regression \
   --model /models/gemma-4-E4B-it-qat-Q4_0/gemma-4-E4B-it-qat-Q4_0.gguf \
   --models-dir /models \
@@ -1095,7 +1095,7 @@ python3 zig/pkg/inference/scripts/benchmark_gemma4_long_e2e_server.py \
   --output-dir /tmp/e4b-f16-candidate
 
 # F32 control (5% maximum Antfly latency regression).
-python3 zig/pkg/inference/scripts/benchmark_gemma4_long_e2e_server.py \
+python3 zig/pkg/inference/scripts/gemma4/benchmark_gemma4_long_e2e_server.py \
   --profile f32-control \
   --model /models/gemma-4-E4B-it-qat-Q4_0/gemma-4-E4B-it-qat-Q4_0.gguf \
   --models-dir /models \
@@ -1167,7 +1167,7 @@ or E4B regression evidence implicitly.
 Measure warmed HTTP server throughput and repeatability with:
 
 ```sh
-zig/pkg/inference/scripts/benchmark_gemma4_cuda_server.py \
+zig/pkg/inference/scripts/gemma4/benchmark_gemma4_cuda_server.py \
   --tokens 256 --warmups 1 --repeats 5
 ```
 
@@ -1175,7 +1175,7 @@ Continuous batching remains off. Before enabling it, run the row-2 manual
 promotion gate for dense and compressed KV storage:
 
 ```sh
-zig/pkg/inference/scripts/benchmark_gemma4_cuda_batching.py \
+zig/pkg/inference/scripts/gemma4/benchmark_gemma4_cuda_batching.py \
   --tokens 256 --cache-dtypes f32 polar4 \
   --concurrency 1 2 4 --min-c2-speedup 1.5
 ```

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -57,6 +58,8 @@ import requests
 from helpers import create_index_payload, start_http_server
 from port_reservations import LoopbackPortReservations, find_free_port
 
+pytest_plugins = ("e2e_scheduler",)
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ANTFLY_BIN = REPO_ROOT / "zig-out" / "bin" / "antfly"
 E2E_BACKUP_CONNECTION = "e2e-backups"
@@ -70,6 +73,43 @@ CLIPCLAP_GGUF_FILES = (
     "termite_variants.json",
 )
 ALLOW_REAL_MODEL_DOWNLOAD_ENV = "ANTFLY_E2E_ALLOW_REAL_MODEL_DOWNLOAD"
+
+# Distributed binaries fail fast without an isolated internal RPC identity.
+# Every subprocess launched by this pytest tree inherits this test-only key;
+# production deployments must provision their own random credential as
+# documented in docs/secrets.md.
+os.environ.setdefault(
+    "ANTFLY_INTERNAL_SERVICE_SECRET",
+    "antfly-e2e-dedicated-internal-service-secret-v1",
+)
+os.environ.setdefault("ANTFLY_INTERNAL_SERVICE_ISSUER", "antfly-e2e")
+
+
+def internal_service_headers() -> dict[str, str]:
+    now = int(time.time())
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {
+        "iss": os.environ["ANTFLY_INTERNAL_SERVICE_ISSUER"],
+        "sub": "antfly-e2e-client",
+        "aud": "antfly-internal-v1",
+        "principal_kind": "service",
+        "admin": True,
+        "iat": now,
+        "exp": now + 60,
+    }
+
+    def encode(value: dict[str, object]) -> str:
+        raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    signing_input = f"{encode(header)}.{encode(payload)}"
+    signature = hmac.new(
+        os.environ["ANTFLY_INTERNAL_SERVICE_SECRET"].encode(),
+        signing_input.encode(),
+        hashlib.sha256,
+    ).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+    return {"X-Antfly-Trusted-Principal": f"{signing_input}.{encoded_signature}"}
 
 
 def resolve_binary_path(binary: str) -> str:
@@ -2143,6 +2183,14 @@ def slow_openai_embedder():
 
 
 @pytest.fixture(scope="function")
+def progressive_openai_embedder():
+    """Keep initial backfill observable without making the E2E minutes long."""
+    server = OpenAiEmbeddingServer(response_delay_s=0.05)
+    yield server.url
+    server.stop()
+
+
+@pytest.fixture(scope="function")
 def rate_limited_openai_embedder():
     server = RateLimitedOpenAiEmbeddingServer()
     yield server
@@ -2391,6 +2439,7 @@ def stateful_api(request: pytest.FixtureRequest):
                     self._check(
                         self.s.post(
                             internal_url,
+                            headers=internal_service_headers(),
                             json={
                                 "doc_key": doc_key,
                                 "index_name": index_name,

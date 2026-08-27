@@ -97,6 +97,7 @@ const active_index_root_pointer_file = ".antfly-active-index-root";
 const active_index_root_pointer_magic = "antfly-active-index-root-v1\n";
 const exact_dense_cancellation_stride: usize = 64;
 const exact_dense_metadata_batch_size: usize = 1024;
+const exact_dense_score_batch_size: usize = 1024;
 
 fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null or b == null) return a == null and b == null;
@@ -251,6 +252,47 @@ pub const ManagedIndexRef = struct {
     estimated_dense_vector_bytes: u64 = 0,
 };
 
+pub const LsmOwnerStats = struct {
+    kind: types.IndexKind,
+    name: []u8,
+    maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+    /// Distinguishes the bounded synthetic aggregate from a user index that
+    /// happens to have the same display name.
+    owner_overflow: bool = false,
+    retired_labels_collapsed_total: u64 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+fn accumulateCloneMaintenance(
+    dst: *lsm_backend_mod.Backend.MaintenanceStats,
+    src: lsm_backend_mod.Backend.MaintenanceStats,
+) void {
+    dst.mutable_snapshot_clone_calls +|= src.mutable_snapshot_clone_calls;
+    dst.mutable_snapshot_clone_bytes_total +|= src.mutable_snapshot_clone_bytes_total;
+    dst.mutable_snapshot_clone_peak_bytes = @max(dst.mutable_snapshot_clone_peak_bytes, src.mutable_snapshot_clone_peak_bytes);
+    for (&dst.mutable_snapshot_clone_by_reason, src.mutable_snapshot_clone_by_reason) |*dst_reason, src_reason| {
+        dst_reason.calls +|= src_reason.calls;
+        dst_reason.bytes_total +|= src_reason.bytes_total;
+        dst_reason.peak_bytes = @max(dst_reason.peak_bytes, src_reason.peak_bytes);
+    }
+    dst.bulk_ingest_current_scan_clone_peak_active_bytes = @max(
+        dst.bulk_ingest_current_scan_clone_peak_active_bytes,
+        src.bulk_ingest_current_scan_clone_peak_active_bytes,
+    );
+}
+
+fn cloneMaintenanceOnly(
+    src: lsm_backend_mod.Backend.MaintenanceStats,
+) lsm_backend_mod.Backend.MaintenanceStats {
+    var result = lsm_backend_mod.Backend.MaintenanceStats{};
+    accumulateCloneMaintenance(&result, src);
+    return result;
+}
+
 pub const IndexBatchOptions = struct {
     compact_text: bool = true,
     compact_text_segment_threshold: ?usize = null,
@@ -365,7 +407,13 @@ const PhaseTrackingAllocator = struct {
 const TextMergeBudgetAllocator = struct {
     backing: Allocator,
     reservation: ?resource_manager_mod.Reservation,
+    /// All bytes competing inside the reservation, including persistent
+    /// publication work temporarily charged through `chargeExternal`.
     live_bytes: std.atomic.Value(usize) = .init(0),
+    /// Task-owned allocations only. Keep this separate from `live_bytes` so
+    /// operational peak telemetry is not inflated by estimated external work.
+    task_live_bytes: std.atomic.Value(usize) = .init(0),
+    peak_task_live_bytes: std.atomic.Value(usize) = .init(0),
     budget_denied: std.atomic.Value(bool) = .init(false),
 
     fn init(backing: Allocator, reservation: ?resource_manager_mod.Reservation) TextMergeBudgetAllocator {
@@ -376,6 +424,8 @@ const TextMergeBudgetAllocator = struct {
     }
 
     fn deinit(self: *TextMergeBudgetAllocator) void {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        std.debug.assert(self.task_live_bytes.load(.acquire) == 0);
         if (self.reservation) |*reservation| reservation.release();
         self.* = undefined;
     }
@@ -396,6 +446,20 @@ const TextMergeBudgetAllocator = struct {
         return self.budget_denied.load(.acquire);
     }
 
+    /// Task-owned and externally charged bytes live inside the admitted merge
+    /// reservation. This is the enforcement ledger, not task telemetry.
+    fn liveBytes(self: *const TextMergeBudgetAllocator) usize {
+        return self.live_bytes.load(.acquire);
+    }
+
+    fn taskLiveBytes(self: *const TextMergeBudgetAllocator) usize {
+        return self.task_live_bytes.load(.acquire);
+    }
+
+    fn peakTaskLiveBytes(self: *const TextMergeBudgetAllocator) usize {
+        return self.peak_task_live_bytes.load(.acquire);
+    }
+
     /// Account allocations which must be owned by the persistent index's
     /// allocator (and therefore cannot safely retain this task-local allocator
     /// after publication). The charge remains live across the external work so
@@ -407,12 +471,15 @@ const TextMergeBudgetAllocator = struct {
     }
 
     fn releaseExternal(self: *TextMergeBudgetAllocator, bytes: usize) void {
-        self.releaseBytes(bytes);
+        self.releaseReservedBytes(bytes);
     }
 
     fn reserveGrowth(self: *TextMergeBudgetAllocator, bytes: usize) bool {
-        if (bytes == 0 or self.reservation == null) return true;
-        const limit = std.math.cast(usize, self.reservation.?.bytes) orelse std.math.maxInt(usize);
+        if (bytes == 0) return true;
+        const limit = if (self.reservation) |reservation|
+            std.math.cast(usize, reservation.bytes) orelse std.math.maxInt(usize)
+        else
+            std.math.maxInt(usize);
         var live = self.live_bytes.load(.acquire);
         while (true) {
             if (bytes > limit -| live) {
@@ -423,49 +490,73 @@ const TextMergeBudgetAllocator = struct {
         }
     }
 
-    fn releaseBytes(self: *TextMergeBudgetAllocator, bytes: usize) void {
-        if (bytes == 0 or self.reservation == null) return;
+    fn releaseReservedBytes(self: *TextMergeBudgetAllocator, bytes: usize) void {
+        if (bytes == 0) return;
         const previous = self.live_bytes.fetchSub(bytes, .acq_rel);
         std.debug.assert(previous >= bytes);
     }
 
+    fn noteTaskGrowth(self: *TextMergeBudgetAllocator, bytes: usize) void {
+        if (bytes == 0) return;
+        const previous = self.task_live_bytes.fetchAdd(bytes, .acq_rel);
+        const current = previous + bytes;
+        var peak = self.peak_task_live_bytes.load(.acquire);
+        while (current > peak) {
+            peak = self.peak_task_live_bytes.cmpxchgWeak(peak, current, .acq_rel, .acquire) orelse return;
+        }
+    }
+
+    fn reserveTaskGrowth(self: *TextMergeBudgetAllocator, bytes: usize) bool {
+        if (!self.reserveGrowth(bytes)) return false;
+        self.noteTaskGrowth(bytes);
+        return true;
+    }
+
+    fn releaseTaskBytes(self: *TextMergeBudgetAllocator, bytes: usize) void {
+        if (bytes == 0) return;
+        const previous = self.task_live_bytes.fetchSub(bytes, .acq_rel);
+        std.debug.assert(previous >= bytes);
+        self.releaseReservedBytes(bytes);
+    }
+
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
-        if (!self.reserveGrowth(len)) return null;
-        return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
-            self.releaseBytes(len);
+        if (!self.reserveTaskGrowth(len)) return null;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+            self.releaseTaskBytes(len);
             return null;
         };
+        return ptr;
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) return false;
+        if (growth > 0 and !self.reserveTaskGrowth(growth)) return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) {
-            if (growth > 0) self.releaseBytes(growth);
+            if (growth > 0) self.releaseTaskBytes(growth);
             return false;
         }
-        if (new_len < memory.len) self.releaseBytes(memory.len - new_len);
+        if (new_len < memory.len) self.releaseTaskBytes(memory.len - new_len);
         return true;
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) return null;
+        if (growth > 0 and !self.reserveTaskGrowth(growth)) return null;
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
-            if (growth > 0) self.releaseBytes(growth);
+            if (growth > 0) self.releaseTaskBytes(growth);
             return null;
         };
-        if (new_len < memory.len) self.releaseBytes(memory.len - new_len);
+        if (new_len < memory.len) self.releaseTaskBytes(memory.len - new_len);
         return ptr;
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
         self.backing.rawFree(memory, alignment, ret_addr);
-        self.releaseBytes(memory.len);
+        self.releaseTaskBytes(memory.len);
     }
 };
 
@@ -496,6 +587,33 @@ test "text merge bounded task allocator enforces live reservation" {
     alloc.free(second);
     try std.testing.expectEqual(@as(usize, 40), stats.current_bytes);
     try std.testing.expectEqual(@as(usize, 64), stats.peak_bytes);
+}
+
+test "text merge task allocator tracks live and external bytes without reservation" {
+    var budget = TextMergeBudgetAllocator.init(std.testing.allocator, null);
+    defer budget.deinit();
+    const alloc = budget.allocator();
+
+    const task_bytes = try alloc.alloc(u8, 128);
+    defer alloc.free(task_bytes);
+    try std.testing.expectEqual(@as(usize, 128), budget.liveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.peakTaskLiveBytes());
+
+    const external_charge = try budget.chargeExternal(64);
+    try std.testing.expectEqual(@as(usize, 192), budget.liveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.peakTaskLiveBytes());
+
+    budget.releaseExternal(external_charge);
+    try std.testing.expectEqual(@as(usize, 128), budget.liveBytes());
+
+    const transient = try alloc.alloc(u8, 256);
+    try std.testing.expectEqual(@as(usize, 384), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 384), budget.peakTaskLiveBytes());
+    alloc.free(transient);
+    try std.testing.expectEqual(@as(usize, 128), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 384), budget.peakTaskLiveBytes());
 }
 
 pub const TextMemoryAttributionStats = struct {
@@ -1098,6 +1216,8 @@ const SplitSide = enum {
 };
 
 pub const IndexManager = struct {
+    const max_retired_lsm_owner_stats: usize = 1024;
+    const retired_lsm_owner_overflow_name = "__retired_owner_overflow__";
     alloc: Allocator,
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
@@ -1122,6 +1242,7 @@ pub const IndexManager = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     bind_cache_resource_manager: bool,
+    retained_vector_cache_enabled: ?bool,
     // Background lane used by algebraic indexes to run HLL cardinality
     // maintenance off the foreground write path. Attached after construction
     // via attachHllMaintenance(); when null, maintenance runs inline.
@@ -1146,6 +1267,9 @@ pub const IndexManager = struct {
     text_indexes: std.ArrayListUnmanaged(TextIndex),
     text_merge_scheduler: TextMergeScheduler,
     dense_indexes: std.ArrayListUnmanaged(DenseIndex),
+    retired_lsm_owner_stats: std.ArrayListUnmanaged(LsmOwnerStats) = .empty,
+    retired_lsm_owner_overflow_stats: [2]lsm_backend_mod.Backend.MaintenanceStats = .{ .{}, .{} },
+    retired_lsm_owner_labels_collapsed: [2]u64 = .{ 0, 0 },
     sparse_indexes: std.ArrayListUnmanaged(SparseIndex),
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
@@ -1494,18 +1618,17 @@ pub const IndexManager = struct {
         prepared_owner: ?*persistent_mod.PersistentIndex = null,
         output_ordinals: []OrdinalSlot = &.{},
         output_ids: []IdSlot = &.{},
-        /// Stable allocator behind the build-scoped tracking wrapper. Result
-        /// storage must be released before the owning merge task is destroyed.
+        publication_lookup_built: bool = false,
+        /// Stable task allocator. Result storage must be released before the
+        /// owning merge task is destroyed.
         owned_alloc: ?Allocator = null,
         elapsed_ns: u64 = 0,
-        /// Peak bytes allocated through the merge task allocator. File-backed
-        /// and heap-backed builders both run through this allocator.
+        /// Exact high-water mark of task-owned bytes from task creation through
+        /// publication. Persistent publication charges are excluded.
         peak_task_alloc_bytes: u64 = 0,
 
-        // Lookup storage is allocated through the task's tracking wrapper.
-        // That wrapper delegates raw allocations unchanged to the backing
-        // allocator, so detached result ownership is released through `alloc`
-        // in deinit after the stack-scoped tracker has recorded its peak.
+        // Lookup storage uses the stable task allocator because it survives
+        // the off-lock preparation phase until atomic publication.
         fn buildPublicationLookup(self: *TextMergeResult, alloc: Allocator) !void {
             const output_count = if (self.prepared_segments.len > 0) self.prepared_segments.len else self.segments.len;
             var ordinal_count: usize = 0;
@@ -1559,6 +1682,7 @@ pub const IndexManager = struct {
             }
             self.output_ordinals = ordinals;
             self.output_ids = ids;
+            self.publication_lookup_built = true;
         }
 
         fn outputForOrdinal(self: *const TextMergeResult, identity: u32) ?OutputLocation {
@@ -1709,6 +1833,8 @@ pub const IndexManager = struct {
         vector_cache: std.AutoHashMapUnmanaged(u64, []f32) = .empty,
         raw_cache_hits: u64 = 0,
         raw_cache_misses: u64 = 0,
+        raw_batch_reads: u64 = 0,
+        raw_scalar_reads: u64 = 0,
         raw_cache_key_bytes: u64 = 0,
         raw_read_value_bytes: u64 = 0,
         vector_cache_hits: u64 = 0,
@@ -1719,6 +1845,8 @@ pub const IndexManager = struct {
         recycle_raw_reads: bool = true,
         cache_raw_values: bool = true,
         cache_vectors: bool = true,
+        block_cache_admission: backend_types.Namespace.BlockCacheAdmission = .retain,
+        decoded_residency_lease: ?hbc_mod.DecodedVectorResidencyLease = null,
 
         const DefaultRawReadLimitBytes: u64 = 32 * 1024 * 1024;
         const MaxRawReadLimitBytes: u64 = 64 * 1024 * 1024;
@@ -1748,7 +1876,33 @@ pub const IndexManager = struct {
             while (vector_it.next()) |entry| self.context.manager.alloc.free(entry.value_ptr.*);
             self.vector_cache.deinit(self.context.manager.alloc);
             if (self.read_txn) |*txn| txn.abort();
+            if (self.decoded_residency_lease) |*lease| lease.deinit();
             self.* = undefined;
+        }
+
+        fn cacheDecodedVector(self: *@This(), index: *hbc_mod.HBCIndex, vector_id: u64, vector: []const f32) void {
+            const lease = if (self.decoded_residency_lease) |*value| value else return;
+            _ = index.cacheVectorForResidencyLease(lease, vector_id, vector) catch {};
+        }
+
+        fn ensureDecodedResidencyCapacity(self: *@This(), vector_count: usize, dims: usize) void {
+            const lease = if (self.decoded_residency_lease) |*value| value else return;
+            const required_bytes = @as(u64, @intCast(vector_count)) *| hbc_mod.estimateDecodedVectorResidencyBytes(dims);
+            if (lease.ensureCapacity(required_bytes)) return;
+            // Capacity is precharged before the read. A saturated replacement
+            // window, pinned cache entries, or degraded/stale payload can make
+            // the next complete batch ineligible. Switch while no returned
+            // transaction views are live, so the remainder of the request is
+            // coherently LSM-owned and cannot overcommit the cache envelope.
+            self.useLsmResidency();
+        }
+
+        fn useLsmResidency(self: *@This()) void {
+            if (self.decoded_residency_lease) |*lease| lease.deinit();
+            self.decoded_residency_lease = null;
+            if (self.block_cache_admission == .retain) return;
+            self.recycleRawReadState();
+            self.block_cache_admission = .retain;
         }
 
         fn rawReadLimitBytes(self: *const @This()) u64 {
@@ -1793,18 +1947,25 @@ pub const IndexManager = struct {
         fn getTxn(self: *@This(), store: *docstore_mod.DocStore) !*docstore_mod.DocStore.Txn {
             if (self.read_txn == null) {
                 self.read_txn = switch (self.read_txn_kind) {
-                    .probe => try store.beginProbeTxn(),
-                    .snapshot => try store.beginReadTxn(),
+                    .probe => try store.beginProbeTxnWithBlockCacheAdmission(self.block_cache_admission),
+                    .snapshot => try store.beginReadTxnWithBlockCacheAdmission(self.block_cache_admission),
                 };
             }
             return &self.read_txn.?;
         }
 
-        fn noteRawValueLoaded(self: *@This(), value: []const u8) void {
-            if (self.txn_override == null) {
-                self.raw_read_value_bytes +|= @intCast(value.len);
-                self.observeWorkingBytes();
+        fn noteRawValuesLoaded(self: *@This(), values: []const ?[]const u8) void {
+            if (self.txn_override != null) return;
+            var bytes: u64 = 0;
+            for (values) |maybe_value| {
+                const value = maybe_value orelse continue;
+                bytes +|= @intCast(value.len);
             }
+            self.raw_read_value_bytes +|= bytes;
+            // A getMany is one bounded working set. Account its retained
+            // transaction pages once, rather than performing an atomic
+            // ResourceManager update for every returned vector.
+            self.observeWorkingBytes();
         }
 
         fn maybeCacheRawValue(self: *@This(), key: []const u8, value: []const u8) !void {
@@ -1828,11 +1989,12 @@ pub const IndexManager = struct {
                 }
             }
             self.raw_cache_misses += 1;
+            self.raw_scalar_reads += 1;
             const value = if (self.txn_override) |txn|
                 try txn.get(key)
             else
                 try (try self.getTxn(store)).get(key);
-            self.noteRawValueLoaded(value);
+            self.noteRawValuesLoaded(&.{@as(?[]const u8, value)});
             try self.maybeCacheRawValue(key, value);
             return value;
         }
@@ -1864,6 +2026,7 @@ pub const IndexManager = struct {
                 miss_count += 1;
             }
             if (miss_count == 0) return;
+            self.raw_batch_reads += 1;
 
             const miss_values = try self.context.manager.alloc.alloc(?[]const u8, miss_count);
             defer self.context.manager.alloc.free(miss_values);
@@ -1904,11 +2067,11 @@ pub const IndexManager = struct {
                     );
                 }
             }
+            self.noteRawValuesLoaded(miss_values[0..miss_count]);
             for (miss_values[0..miss_count], 0..) |maybe_value, i| {
                 const out_index = miss_indexes[i];
                 values[out_index] = maybe_value;
                 const value = maybe_value orelse continue;
-                self.noteRawValueLoaded(value);
                 try self.maybeCacheRawValue(miss_keys[i], value);
             }
         }
@@ -2149,6 +2312,7 @@ pub const IndexManager = struct {
             .resource_manager = resource_manager,
             .owned_resource_manager = owned_resource_manager,
             .bind_cache_resource_manager = bind_cache_resource_manager,
+            .retained_vector_cache_enabled = opts.retained_vector_cache_enabled,
             .primary_store = null,
             .applied_sequence_checkpoint_path = null,
             .load_parallelism = null,
@@ -2331,6 +2495,60 @@ pub const IndexManager = struct {
         self.deinitTextIndexEntry(entry, false);
     }
 
+    fn archiveLsmOwnerStats(
+        self: *IndexManager,
+        kind: types.IndexKind,
+        name: []const u8,
+        maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+    ) void {
+        if (maintenance.mutable_snapshot_clone_calls == 0 and
+            maintenance.mutable_snapshot_clone_bytes_total == 0 and
+            maintenance.mutable_snapshot_clone_peak_bytes == 0 and
+            maintenance.bulk_ingest_current_scan_clone_peak_active_bytes == 0) return;
+        for (self.retired_lsm_owner_stats.items) |*retired| {
+            if (retired.kind != kind or !std.mem.eql(u8, retired.name, name)) continue;
+            accumulateCloneMaintenance(&retired.maintenance, maintenance);
+            return;
+        }
+        if (self.retired_lsm_owner_stats.items.len >= max_retired_lsm_owner_stats) {
+            const overflow_index: usize = switch (kind) {
+                .full_text => 0,
+                .dense_vector => 1,
+                else => unreachable,
+            };
+            accumulateCloneMaintenance(&self.retired_lsm_owner_overflow_stats[overflow_index], maintenance);
+            self.retired_lsm_owner_labels_collapsed[overflow_index] +|= 1;
+            return;
+        }
+        const owned_name = self.alloc.dupe(u8, name) catch |err| {
+            std.log.warn("failed to retain retired LSM owner name owner={s} err={s}", .{ name, @errorName(err) });
+            return;
+        };
+        self.retired_lsm_owner_stats.append(self.alloc, .{
+            .kind = kind,
+            .name = owned_name,
+            .maintenance = cloneMaintenanceOnly(maintenance),
+        }) catch |err| {
+            self.alloc.free(owned_name);
+            std.log.warn("failed to retain retired LSM owner metrics owner={s} err={s}", .{ name, @errorName(err) });
+        };
+    }
+
+    fn archiveTextIndexOwner(self: *IndexManager, entry: *TextIndex) void {
+        const stats = entry.persistent.snapshotLsmMaintenanceStats() orelse return;
+        self.archiveLsmOwnerStats(.full_text, entry.config.name, stats);
+    }
+
+    fn archiveDenseIndexOwner(self: *IndexManager, entry: *DenseIndex) void {
+        const stats = entry.index.snapshotLsmMaintenanceStats() orelse return;
+        self.archiveLsmOwnerStats(.dense_vector, entry.config.name, stats);
+    }
+
+    fn retireTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
+        self.archiveTextIndexOwner(entry);
+        self.freeTextIndexEntry(entry);
+    }
+
     fn abandonTextIndexEntryAfterCrash(self: *IndexManager, entry: *TextIndex) void {
         self.deinitTextIndexEntry(entry, true);
     }
@@ -2446,6 +2664,11 @@ pub const IndexManager = struct {
         self.deinitDenseIndexEntry(entry, false);
     }
 
+    fn retireDenseIndexEntry(self: *IndexManager, entry: *DenseIndex) void {
+        self.archiveDenseIndexOwner(entry);
+        self.freeDenseIndexEntry(entry);
+    }
+
     fn abandonDenseIndexEntryAfterCrash(self: *IndexManager, entry: *DenseIndex) void {
         self.deinitDenseIndexEntry(entry, true);
     }
@@ -2464,6 +2687,12 @@ pub const IndexManager = struct {
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
         if (entry.embedding_name) |embedding_name| self.alloc.free(embedding_name);
         entry.config.deinit(self.alloc);
+    }
+
+    fn retainedVectorCacheEnabled(self: *const IndexManager) bool {
+        if (self.retained_vector_cache_enabled) |enabled| return enabled;
+        const manager = self.resource_manager orelse return false;
+        return manager.hbcCachePolicy().target_bytes > 0;
     }
 
     fn reopenDenseIndexStorage(self: *IndexManager, entry: *DenseIndex, path: []const u8) !void {
@@ -2508,6 +2737,8 @@ pub const IndexManager = struct {
         });
         errdefer index.close();
 
+        index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
+        index.setIo(self.io);
         if (self.hbc_cache) |cache| index.attachSharedCache(cache);
         if (self.resource_manager) |manager| {
             index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
@@ -2746,6 +2977,8 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |*entry| {
             if (abandon_after_crash) self.abandonDenseIndexEntryAfterCrash(entry) else self.freeDenseIndexEntry(entry);
         }
+        for (self.retired_lsm_owner_stats.items) |*entry| entry.deinit(self.alloc);
+        self.retired_lsm_owner_stats.deinit(self.alloc);
         for (self.sparse_indexes.items) |*entry| {
             if (abandon_after_crash) self.abandonSparseIndexEntryAfterCrash(entry) else self.freeSparseIndexEntry(entry);
         }
@@ -3447,6 +3680,101 @@ pub const IndexManager = struct {
         return stats;
     }
 
+    pub fn snapshotLsmOwnerStatsAlloc(self: *const IndexManager, alloc: Allocator) ![]LsmOwnerStats {
+        var owners = std.ArrayListUnmanaged(LsmOwnerStats).empty;
+        errdefer {
+            for (owners.items) |*owner| owner.deinit(alloc);
+            owners.deinit(alloc);
+        }
+        for (self.retired_lsm_owner_stats.items) |retired| {
+            try owners.append(alloc, .{
+                .kind = retired.kind,
+                .name = try alloc.dupe(u8, retired.name),
+                .maintenance = retired.maintenance,
+            });
+        }
+        const overflow_kinds = [_]types.IndexKind{ .full_text, .dense_vector };
+        for (overflow_kinds, 0..) |kind, i| {
+            if (self.retired_lsm_owner_labels_collapsed[i] == 0) continue;
+            try owners.append(alloc, .{
+                .kind = kind,
+                .name = try alloc.dupe(u8, retired_lsm_owner_overflow_name),
+                .maintenance = self.retired_lsm_owner_overflow_stats[i],
+                .owner_overflow = true,
+                .retired_labels_collapsed_total = self.retired_lsm_owner_labels_collapsed[i],
+            });
+        }
+        for (self.text_indexes.items) |*entry| {
+            const stats = entry.persistent.snapshotLsmMaintenanceStats() orelse continue;
+            for (owners.items) |*owner| {
+                if (owner.owner_overflow or owner.kind != .full_text or !std.mem.eql(u8, owner.name, entry.config.name)) continue;
+                accumulateCloneMaintenance(&owner.maintenance, stats);
+                break;
+            } else {
+                try owners.ensureUnusedCapacity(alloc, 1);
+                const name = try alloc.dupe(u8, entry.config.name);
+                owners.appendAssumeCapacity(.{
+                    .kind = .full_text,
+                    .name = name,
+                    .maintenance = stats,
+                });
+            }
+        }
+        for (self.dense_indexes.items) |*entry| {
+            const stats = entry.index.snapshotLsmMaintenanceStats() orelse continue;
+            for (owners.items) |*owner| {
+                if (owner.owner_overflow or owner.kind != .dense_vector or !std.mem.eql(u8, owner.name, entry.config.name)) continue;
+                accumulateCloneMaintenance(&owner.maintenance, stats);
+                break;
+            } else {
+                try owners.ensureUnusedCapacity(alloc, 1);
+                const name = try alloc.dupe(u8, entry.config.name);
+                owners.appendAssumeCapacity(.{
+                    .kind = .dense_vector,
+                    .name = name,
+                    .maintenance = stats,
+                });
+            }
+        }
+        return try owners.toOwnedSlice(alloc);
+    }
+
+    /// Preserve clone attribution from a short-lived shadow manager before it
+    /// is torn down. Snapshot first and then lock the destination so repair
+    /// cleanup never holds two catalog locks at once.
+    pub fn transferLsmOwnerCloneStatsTo(self: *IndexManager, destination: *IndexManager) !void {
+        if (self == destination) return;
+        const owners = owners_blk: {
+            self.catalog_mutex.lockShared();
+            defer self.catalog_mutex.unlockShared();
+            break :owners_blk try self.snapshotLsmOwnerStatsAlloc(self.alloc);
+        };
+        defer {
+            for (owners) |*owner| owner.deinit(self.alloc);
+            self.alloc.free(owners);
+        }
+
+        destination.catalog_mutex.lockExclusive();
+        defer destination.catalog_mutex.unlockExclusive();
+        for (owners) |owner| {
+            if (owner.owner_overflow) {
+                const overflow_index: usize = switch (owner.kind) {
+                    .full_text => 0,
+                    .dense_vector => 1,
+                    else => unreachable,
+                };
+                accumulateCloneMaintenance(
+                    &destination.retired_lsm_owner_overflow_stats[overflow_index],
+                    owner.maintenance,
+                );
+                destination.retired_lsm_owner_labels_collapsed[overflow_index] +|=
+                    owner.retired_labels_collapsed_total;
+                continue;
+            }
+            destination.archiveLsmOwnerStats(owner.kind, owner.name, owner.maintenance);
+        }
+    }
+
     pub fn snapshotLsmWriteStats(self: *const IndexManager) lsm_backend_mod.Backend.WriteStats {
         var stats = lsm_backend_mod.Backend.WriteStats{};
         for (self.text_indexes.items) |*entry| {
@@ -3675,8 +4003,12 @@ pub const IndexManager = struct {
         var lsm_recovery_peak: u64 = 0;
         var derived_backlog_used: u64 = 0;
         var derived_backlog_peak: u64 = 0;
+        var cache_reclaim_requests: u64 = 0;
+        var cache_reclaimed_bytes: u64 = 0;
         if (self.resource_manager) |manager| {
             const resource_stats = manager.snapshot();
+            cache_reclaim_requests = resource_stats.reclaim_requests;
+            cache_reclaimed_bytes = resource_stats.reclaimed_bytes;
             const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
             const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
             const ft_residency = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)];
@@ -3778,7 +4110,7 @@ pub const IndexManager = struct {
             },
         );
         std.log.info(
-            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} full_text_residency_used_bytes={d} full_text_residency_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} derived_backlog_used_bytes={d} derived_backlog_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_disk_bytes={d} lsm_wal_retention_peak_disk_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} rss_after_lsm_resource_gap_bytes={d} footprint_after_lsm_resource_gap_bytes={d}",
+            "antfly_bench_memory_resources label={s} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} full_text_residency_used_bytes={d} full_text_residency_peak_bytes={d} text_merge_used_bytes={d} text_merge_peak_bytes={d} derived_backlog_used_bytes={d} derived_backlog_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_disk_bytes={d} lsm_wal_retention_peak_disk_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} cache_reclaim_requests={d} cache_reclaimed_bytes={d} rss_after_lsm_resource_gap_bytes={d} footprint_after_lsm_resource_gap_bytes={d}",
             .{
                 label,
                 ft_pending_used,
@@ -3807,12 +4139,14 @@ pub const IndexManager = struct {
                 lsm_recovery_peak,
                 lsm_resource_used,
                 lsm_resource_peak,
+                cache_reclaim_requests,
+                cache_reclaimed_bytes,
                 rss_after_lsm_resource_gap,
                 footprint_after_lsm_resource_gap,
             },
         );
         std.log.info(
-            "antfly_bench_memory_lsm_tables label={s} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_physical_block_bytes={d}",
+            "antfly_bench_memory_lsm_tables label={s} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_transient_serves={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_physical_block_bytes={d}",
             .{
                 label,
                 lsm_stats.mutable_bytes,
@@ -3821,6 +4155,11 @@ pub const IndexManager = struct {
                 lsm_stats.total_run_bytes,
                 lsm_stats.total_runs,
                 lsm_cache_stats.entry_count,
+                lsm_cache_stats.run_state.transient_serves +|
+                    lsm_cache_stats.run_table_raw.transient_serves +|
+                    lsm_cache_stats.run_table_index.transient_serves +|
+                    lsm_cache_stats.run_table_block.transient_serves +|
+                    lsm_cache_stats.run_table_physical_block.transient_serves,
                 lsm_cache_stats.run_state.used_bytes,
                 lsm_cache_stats.run_table_raw.used_bytes,
                 lsm_cache_stats.run_table_index.used_bytes,
@@ -4349,6 +4688,7 @@ pub const IndexManager = struct {
 
     pub fn setIo(self: *IndexManager, io: ?std.Io) void {
         self.io = io;
+        for (self.dense_indexes.items) |*entry| entry.index.setIo(io);
     }
 
     pub fn checkpointIo(self: *const IndexManager) std.Io {
@@ -5295,7 +5635,7 @@ pub const IndexManager = struct {
                 );
                 self.text_merge_scheduler.removeIndex(self.alloc, name);
                 entry.detachAllMergeDeletionStates();
-                self.freeTextIndexEntry(entry);
+                self.retireTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
@@ -5329,7 +5669,7 @@ pub const IndexManager = struct {
                 defer artifact_cleanup.deinit();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
                 try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
-                self.freeDenseIndexEntry(entry);
+                self.retireDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
@@ -5469,6 +5809,11 @@ pub const IndexManager = struct {
     }
 
     pub fn destroyDetachedReplacementIndex(self: *IndexManager, entry: *DetachedIndex) void {
+        switch (entry.*) {
+            .full_text => |*index| self.archiveTextIndexOwner(index),
+            .dense_vector => |*index| self.archiveDenseIndexOwner(index),
+            else => {},
+        }
         entry.deinit(self);
     }
 
@@ -7654,11 +7999,14 @@ pub const IndexManager = struct {
         }
 
         if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
+            const decoded_residency_lease = entry.index.acquireDecodedVectorResidencyForSearch(req);
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
+                .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
+                .decoded_residency_lease = decoded_residency_lease,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
@@ -7679,11 +8027,14 @@ pub const IndexManager = struct {
         }
 
         if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
+            const decoded_residency_lease = entry.index.acquireDecodedVectorResidencyForSearch(req);
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
+                .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
+                .decoded_residency_lease = decoded_residency_lease,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
@@ -7705,19 +8056,64 @@ pub const IndexManager = struct {
         }
 
         if (active_dense_vector_load_session == null and self.primary_store != null and entry.vector_loader_context != null) {
+            const decoded_residency_lease = entry.index.acquireDecodedVectorResidency(req.filter_ids.len);
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
                 .working_slice = .dense_search_working_set,
                 .recycle_raw_reads = false,
                 .cache_raw_values = false,
+                .cache_vectors = false,
+                .block_cache_admission = if (decoded_residency_lease != null) .transient else .retain,
+                .decoded_residency_lease = decoded_residency_lease,
             };
             active_dense_vector_load_session = &vector_load_session.?;
         }
 
+        // Admit the candidate-normalization and per-candidate metadata arrays
+        // before any of them allocate. The include length is a conservative
+        // upper bound after sort/unique/subtraction; charging the exclusion
+        // copy unconditionally preserves fail-closed accounting without first
+        // scanning a large request merely to discover whether it is sorted.
+        const requested_candidates: u64 = @intCast(req.filter_ids.len);
+        const fixed_candidate_bytes = requested_candidates *|
+            (@as(u64, @sizeOf(u64)) + @sizeOf(?[]const u8) + @sizeOf(?[]u8));
+        const exclusion_bytes = @as(u64, @intCast(req.exclude_ids.len)) *| @sizeOf(u64);
+        const result_capacity_bytes = @as(u64, @intCast(req.k)) *| 64;
+        const vector_scratch_bytes = @as(u64, entry.dims) *| @sizeOf(f32);
+        const preflight_workspace_bytes = fixed_candidate_bytes +| exclusion_bytes +|
+            result_capacity_bytes +| vector_scratch_bytes +| 4096;
+        var workspace_accounted: u64 = 0;
+        if (!self.tryObserveDenseWorkingBytes(
+            .dense_search_working_set,
+            &workspace_accounted,
+            preflight_workspace_bytes,
+        )) return error.ResourceBudgetExceeded;
+        defer self.observeDenseWorkingBytes(.dense_search_working_set, &workspace_accounted, 0);
+
+        const prepare_start_ns = platform_time.monotonicNs();
         var candidates = try dense_exact.CandidateDifference.init(self.alloc, req.filter_ids, req.exclude_ids);
         defer candidates.deinit();
         const unique_candidate_ids = candidates.values;
+        var exact_profile: dense_exact.SearchOutcome.Profile = .{
+            .candidate_count = @intCast(unique_candidate_ids.len),
+            .workspace_bytes = preflight_workspace_bytes,
+            .candidate_prepare_ns = platform_time.monotonicNs() - prepare_start_ns,
+        };
         try checkDenseSearchCancelled(req);
+
+        // Exact scoring is single-pass. Retaining every decoded vector in a
+        // request-local cache doubles residency without creating a reuse
+        // opportunity, so force it off even when a caller supplied a session.
+        const exact_load_session = blk: {
+            const session = active_dense_vector_load_session orelse break :blk null;
+            if (entry.vector_loader_context == null or session.context != entry.vector_loader_context.?) break :blk null;
+            break :blk session;
+        };
+        const previous_cache_vectors = if (exact_load_session) |session| session.cache_vectors else false;
+        if (exact_load_session) |session| session.cache_vectors = false;
+        defer {
+            if (exact_load_session) |session| session.cache_vectors = previous_cache_vectors;
+        }
 
         var results = try hbc_mod.SearchResults.initCapacity(
             self.alloc,
@@ -7737,6 +8133,7 @@ pub const IndexManager = struct {
         const candidate_metadata = try self.alloc.alloc(?[]const u8, unique_candidate_ids.len);
         defer self.alloc.free(candidate_metadata);
         @memset(candidate_metadata, null);
+        const metadata_lookup_start_ns = platform_time.monotonicNs();
         var metadata_start: usize = 0;
         while (metadata_start < unique_candidate_ids.len) {
             try checkDenseSearchCancelled(req);
@@ -7744,13 +8141,14 @@ pub const IndexManager = struct {
                 metadata_start + exact_dense_metadata_batch_size,
                 unique_candidate_ids.len,
             );
-            try entry.index.getMetadataManySortedInTxn(
+            try entry.index.getMetadataManySortedInTxnUncached(
                 &txn,
                 unique_candidate_ids[metadata_start..metadata_end],
                 candidate_metadata[metadata_start..metadata_end],
             );
             metadata_start = metadata_end;
         }
+        exact_profile.metadata_lookup_ns = platform_time.monotonicNs() - metadata_lookup_start_ns;
         try checkDenseSearchCancelled(req);
 
         const fallback_doc_keys = try self.alloc.alloc(?[]u8, unique_candidate_ids.len);
@@ -7802,62 +8200,173 @@ pub const IndexManager = struct {
             }
         }
 
-        var vector_cursor = entry.index.openNamespacedCursor(self.alloc, &txn, .vecs) catch |err| switch (err) {
-            error.Unsupported => null,
-            else => return err,
-        };
-        defer if (vector_cursor) |*cursor| cursor.close();
-
         const query_measure = vector_mod.norm(req.query);
-        const vector_scratch = try self.alloc.alloc(f32, entry.dims);
-        defer self.alloc.free(vector_scratch);
         var vectors_scored: u64 = 0;
-        for (unique_candidate_ids, candidate_metadata, fallback_doc_keys, 0..) |vector_id, maybe_metadata, fallback_doc_key, i| {
-            if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
-            const doc_key = maybe_metadata orelse fallback_doc_key;
-            if (req.filter_prefix.len > 0) {
-                const resolved_doc_key = doc_key orelse continue;
-                if (!std.mem.startsWith(u8, resolved_doc_key, req.filter_prefix)) continue;
+        const vectors_stored_externally = entry.vector_loader_context != null and
+            self.primary_store != null and
+            entry.index.hasExternalVectorLoader();
+        if (vectors_stored_externally) {
+            // Production indexes intentionally keep full vectors outside HBC.
+            // Do not issue the guaranteed `.vecs` miss: compact eligible IDs
+            // into bounded sorted batches and read their artifacts together.
+            const batch_capacity = @min(exact_dense_score_batch_size, unique_candidate_ids.len);
+            const artifact_name = entry.embedding_name orelse entry.config.name;
+            var max_batch_key_bytes: u64 = 0;
+            var key_scan_start: usize = 0;
+            while (key_scan_start < unique_candidate_ids.len) {
+                const key_scan_end = @min(key_scan_start + exact_dense_score_batch_size, unique_candidate_ids.len);
+                var batch_key_bytes: u64 = 0;
+                for (candidate_metadata[key_scan_start..key_scan_end], fallback_doc_keys[key_scan_start..key_scan_end]) |maybe_metadata, fallback_doc_key| {
+                    const doc_key = maybe_metadata orelse fallback_doc_key orelse continue;
+                    if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
+                    // Internal tuple encoding can escape every byte. Include
+                    // fixed namespace/components plus arena alignment slack.
+                    batch_key_bytes +|= @as(u64, @intCast(doc_key.len)) *| 2 +| @as(u64, @intCast(artifact_name.len)) +| 64;
+                    // A direct-field index created by backfill may predate
+                    // materialized vector artifacts. Its compatibility path
+                    // retains the artifact key and the primary-document key
+                    // in the same per-batch arena before scoring.
+                    if (!entry.external and entry.embedding_name == null) {
+                        batch_key_bytes +|= @as(u64, @intCast(doc_key.len)) *| 2 +| 32;
+                    }
+                }
+                max_batch_key_bytes = @max(max_batch_key_bytes, batch_key_bytes);
+                key_scan_start = key_scan_end;
             }
-            const vector = (if (vector_cursor) |*cursor|
-                entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
-            else
-                entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
-                error.NotFound => blk: {
-                    const loader_ctx = entry.vector_loader_context orelse continue;
-                    const resolved_doc_key = doc_key orelse continue;
-                    break :blk try loadDenseVectorForHbcIntoScratch(loader_ctx, vector_id, resolved_doc_key, vector_scratch);
-                },
+            const per_candidate_workspace = @sizeOf(u64) + @sizeOf(?[]const u8) + @sizeOf(f32) +
+                @sizeOf([]const u8) + @sizeOf(?[]const u8) + @sizeOf(DenseArtifactReadKey) +
+                @sizeOf([]const u8) + @sizeOf(usize) + @sizeOf(?[]const u8);
+            const batch_workspace_bytes = @as(u64, @intCast(batch_capacity)) *| per_candidate_workspace +|
+                @as(u64, entry.dims) *| @sizeOf(f32) +| max_batch_key_bytes +| 4096;
+            const total_workspace_bytes = preflight_workspace_bytes +| batch_workspace_bytes;
+            exact_profile.workspace_bytes = total_workspace_bytes;
+            if (!self.tryObserveDenseWorkingBytes(.dense_search_working_set, &workspace_accounted, total_workspace_bytes)) {
+                return error.ResourceBudgetExceeded;
+            }
+
+            const batch_ids = try self.alloc.alloc(u64, batch_capacity);
+            defer self.alloc.free(batch_ids);
+            const batch_metadata = try self.alloc.alloc(?[]const u8, batch_capacity);
+            defer self.alloc.free(batch_metadata);
+            const batch_distances = try self.alloc.alloc(f32, batch_capacity);
+            defer self.alloc.free(batch_distances);
+            const artifact_keys = try self.alloc.alloc([]const u8, batch_capacity);
+            defer self.alloc.free(artifact_keys);
+            const raw_values = try self.alloc.alloc(?[]const u8, batch_capacity);
+            defer self.alloc.free(raw_values);
+            const vector_scratch = try self.alloc.alloc(f32, entry.dims);
+            defer self.alloc.free(vector_scratch);
+
+            var hbc_profile: hbc_mod.SearchProfile = .{};
+            var candidate_start: usize = 0;
+            while (candidate_start < unique_candidate_ids.len) {
+                try checkDenseSearchCancelled(req);
+                const candidate_end = @min(candidate_start + exact_dense_score_batch_size, unique_candidate_ids.len);
+                var batch_len: usize = 0;
+                for (unique_candidate_ids[candidate_start..candidate_end], candidate_metadata[candidate_start..candidate_end], fallback_doc_keys[candidate_start..candidate_end]) |vector_id, maybe_metadata, fallback_doc_key| {
+                    const doc_key = maybe_metadata orelse fallback_doc_key orelse continue;
+                    if (req.filter_prefix.len > 0 and !std.mem.startsWith(u8, doc_key, req.filter_prefix)) continue;
+                    batch_ids[batch_len] = vector_id;
+                    batch_metadata[batch_len] = doc_key;
+                    batch_distances[batch_len] = std.math.inf(f32);
+                    batch_len += 1;
+                }
+                if (batch_len > 0) {
+                    exact_profile.batch_count += 1;
+                    exact_profile.max_batch_size = @max(exact_profile.max_batch_size, batch_len);
+                    try scoreDenseVectorsForHbcBatch(
+                        entry.vector_loader_context.?,
+                        batch_ids[0..batch_len],
+                        batch_metadata[0..batch_len],
+                        req.query,
+                        query_measure,
+                        entry.metric,
+                        batch_distances[0..batch_len],
+                        vector_scratch,
+                        entry.dims,
+                        .{ .artifact_keys = artifact_keys, .raw_values = raw_values },
+                        &hbc_profile,
+                    );
+                    for (batch_ids[0..batch_len], batch_metadata[0..batch_len], batch_distances[0..batch_len]) |vector_id, maybe_doc_key, distance| {
+                        if (!std.math.isFinite(distance)) {
+                            exact_profile.missing_vectors += 1;
+                            continue;
+                        }
+                        vectors_scored += 1;
+                        if (req.distance_over) |threshold| if (distance <= threshold) continue;
+                        if (req.distance_under) |threshold| if (distance >= threshold) continue;
+                        const owned_metadata = if (maybe_doc_key) |doc_key| try self.alloc.dupe(u8, doc_key) else null;
+                        results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
+                    }
+                }
+                candidate_start = candidate_end;
+            }
+            exact_profile.artifact_key_ns = hbc_profile.rerank_artifact_key_ns;
+            exact_profile.artifact_read_ns = hbc_profile.rerank_artifact_read_ns;
+            exact_profile.artifact_decode_ns = hbc_profile.rerank_artifact_decode_ns;
+            exact_profile.distance_ns = hbc_profile.rerank_artifact_distance_ns;
+            exact_profile.lsm_cache_hits = hbc_profile.rerank_lsm_cache_hits;
+            exact_profile.lsm_cache_misses = hbc_profile.rerank_lsm_cache_misses;
+            exact_profile.artifact_cache_hits = hbc_profile.rerank_artifact_cache_hits;
+            exact_profile.artifact_vectors_loaded = hbc_profile.rerank_artifact_vectors_loaded;
+        } else {
+            var vector_cursor = entry.index.openNamespacedCursor(self.alloc, &txn, .vecs) catch |err| switch (err) {
+                error.Unsupported => null,
                 else => return err,
             };
-            if (vector.len != req.query.len) return error.DimensionMismatch;
-
-            vectors_scored += 1;
-            const distance = vector_mod.distanceToQuery(req.query, query_measure, vector, entry.metric);
-            if (!std.math.isFinite(distance)) continue;
-            if (req.distance_over) |threshold| {
-                if (distance <= threshold) continue;
+            defer if (vector_cursor) |*cursor| cursor.close();
+            const vector_scratch = try self.alloc.alloc(f32, entry.dims);
+            defer self.alloc.free(vector_scratch);
+            for (unique_candidate_ids, candidate_metadata, fallback_doc_keys, 0..) |vector_id, maybe_metadata, fallback_doc_key, i| {
+                if (i % exact_dense_cancellation_stride == 0) try checkDenseSearchCancelled(req);
+                const doc_key = maybe_metadata orelse fallback_doc_key;
+                if (req.filter_prefix.len > 0) {
+                    const resolved_doc_key = doc_key orelse continue;
+                    if (!std.mem.startsWith(u8, resolved_doc_key, req.filter_prefix)) continue;
+                }
+                const distance_start_ns = platform_time.monotonicNs();
+                const vector = (if (vector_cursor) |*cursor|
+                    entry.index.getVectorViewOrScratchWithCursor(cursor, vector_id, vector_scratch)
+                else
+                    entry.index.getVectorViewOrScratch(&txn, vector_id, vector_scratch)) catch |err| switch (err) {
+                    error.NotFound => {
+                        exact_profile.missing_vectors += 1;
+                        continue;
+                    },
+                    else => return err,
+                };
+                if (vector.len != req.query.len) return error.DimensionMismatch;
+                vectors_scored += 1;
+                const distance = vector_mod.distanceToQuery(req.query, query_measure, vector, entry.metric);
+                exact_profile.distance_ns += platform_time.monotonicNs() - distance_start_ns;
+                if (!std.math.isFinite(distance)) continue;
+                if (req.distance_over) |threshold| if (distance <= threshold) continue;
+                if (req.distance_under) |threshold| if (distance >= threshold) continue;
+                const owned_metadata = if (doc_key) |resolved_doc_key| try self.alloc.dupe(u8, resolved_doc_key) else null;
+                results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
             }
-            if (req.distance_under) |threshold| {
-                if (distance >= threshold) continue;
-            }
-            const owned_metadata = if (doc_key) |resolved_doc_key|
-                try self.alloc.dupe(u8, resolved_doc_key)
-            else
-                null;
-            results.addResultWithOwnedMetadata(vector_id, distance, 0, owned_metadata);
+        }
+        if (exact_load_session) |session| {
+            exact_profile.request_vector_cache_entries = session.vector_cache.count();
+            exact_profile.raw_batch_reads = session.raw_batch_reads;
+            exact_profile.raw_scalar_reads = session.raw_scalar_reads;
         }
         results.sort();
         if (getenv("ANTFLY_BENCH_QUERY_PROFILE") != null) {
-            std.log.info("antfly_bench_dense_exact_filter index={s} candidates={d} hits={d}", .{
+            std.log.info("antfly_bench_dense_exact_filter index={s} candidates={d} hits={d} batches={d} batch_reads={d} scalar_reads={d} missing={d}", .{
                 entry.config.name,
                 unique_candidate_ids.len,
                 results.getHits().len,
+                exact_profile.batch_count,
+                exact_profile.raw_batch_reads,
+                exact_profile.raw_scalar_reads,
+                exact_profile.missing_vectors,
             });
         }
         return .{
             .results = results,
             .vectors_scored = vectors_scored,
+            .profile = exact_profile,
         };
     }
 
@@ -8805,7 +9314,17 @@ pub const IndexManager = struct {
                 else => return err,
             };
             defer result.deinit(self.alloc);
-            _ = try self.finishTextMergeTask(&task, &result);
+            while (true) {
+                _ = self.finishTextMergeTask(&task, &result) catch |err| {
+                    if (err != error.TextMergePublicationLookupRequired) return err;
+                    // This synchronous scheduler does not acquire the runtime's
+                    // database-wide apply lock. Prepare outside IndexManager's
+                    // short per-index publication critical section and retry.
+                    try prepareTextMergeTaskPublicationLookup(&task, &result);
+                    continue;
+                };
+                break;
+            }
             completed += 1;
         }
         return completed;
@@ -10594,6 +11113,8 @@ pub const IndexManager = struct {
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                 });
+                index.setIo(self.io);
+                index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
                 if (self.hbc_cache) |cache| index.attachSharedCache(cache);
                 if (self.resource_manager) |manager| {
                     index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
@@ -11345,11 +11866,9 @@ pub const IndexManager = struct {
         const started_ns = platform_time.monotonicNs();
         defer task.discardSourceCleanPages();
         logTextMergeTaskMemory("before", task, 0);
-        var alloc_stats = PhaseAllocStats{};
-        var tracking = PhaseTrackingAllocator.init(task.mergeAllocator(), &alloc_stats);
-        const task_alloc = tracking.allocator();
+        const task_alloc = task.mergeAllocator();
         const deleted_docs = task_alloc.alloc(?roaring.RoaringBitmap, task.source.len) catch |err| {
-            if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+            if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
         defer task_alloc.free(deleted_docs);
@@ -11372,23 +11891,19 @@ pub const IndexManager = struct {
                 .prepared_owner = task.persistent,
                 .owned_alloc = task.mergeAllocator(),
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
             };
             errdefer result.deinit(alloc);
-            result.buildPublicationLookup(task_alloc) catch |err| {
-                if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-                return err;
-            };
-            result.peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes);
             return result;
         } else |err| switch (err) {
             error.EmptySegment => return .{
                 .segments = &.{},
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
             },
             error.Unsupported => {},
             else => {
-                if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+                if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
                 if (builtin.os.tag != .freestanding) {
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
                 }
@@ -11396,14 +11911,14 @@ pub const IndexManager = struct {
             },
         }
 
-        const merged = merger_mod.mergeSegmentsBounded(tracking.allocator(), task.snapshot, task.merge_indices, .{
+        const merged = merger_mod.mergeSegmentsBounded(task_alloc, task.snapshot, task.merge_indices, .{
             .target_segment_bytes = @intCast(activeTextMergePolicy().max_segment_size),
             .deleted_docs = deleted_docs,
         }) catch |err| {
-            if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+            if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
             if (err == error.EmptySegment) return .{
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
             };
             if (builtin.os.tag != .freestanding) {
                 std.log.err("scheduled text merge failed index={s}: {s}", .{ task.index_name, @errorName(err) });
@@ -11417,15 +11932,25 @@ pub const IndexManager = struct {
             .segments = merged,
             .owned_alloc = task.mergeAllocator(),
             .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-            .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+            .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
         };
         errdefer result.deinit(alloc);
-        result.buildPublicationLookup(task_alloc) catch |err| {
-            if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        };
-        result.peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes);
         return result;
+    }
+
+    /// Build the document-identity lookup required to reconcile deletions
+    /// which commit after the merge snapshot. The runtime calls this only
+    /// after publication reports that a lookup is necessary, and crucially
+    /// does so without holding the database-wide apply lock.
+    pub fn prepareTextMergeTaskPublicationLookup(task: *const TextMergeTask, result: *TextMergeResult) !void {
+        if (result.publication_lookup_built) return;
+        result.buildPublicationLookup(task.mergeAllocator()) catch |err| {
+            return task.deletion_state.allocationError(err);
+        };
+        result.peak_task_alloc_bytes = @max(
+            result.peak_task_alloc_bytes,
+            @as(u64, @intCast(task.deletion_state.budget.peakTaskLiveBytes())),
+        );
     }
 
     fn logTextMergeTaskMemory(label: []const u8, task: *const TextMergeTask, output_bytes: u64) void {
@@ -11450,7 +11975,8 @@ pub const IndexManager = struct {
     }
 
     pub fn finishTextMergeTask(self: *IndexManager, task: *const TextMergeTask, result: *TextMergeResult) !bool {
-        defer self.completeTextMergeTaskTracking(task);
+        var retire_task = true;
+        defer if (retire_task) self.completeTextMergeTaskTracking(task);
 
         const entry = self.textIndexEntry(task.index_name) orelse return false;
         if (!self.text_merge_scheduler.taskInFlight(task.index_name, task.source, task.deletion_state)) {
@@ -11481,6 +12007,19 @@ pub const IndexManager = struct {
         }
         var merge_delta_locked = true;
         defer if (merge_delta_locked) entry.merge_delta_mutex.unlock();
+        var has_deletion_deltas = false;
+        for (task.deletion_state.deltas) |delta| {
+            if (delta.count == 0) continue;
+            has_deletion_deltas = true;
+            break;
+        }
+        if (has_deletion_deltas and !result.publication_lookup_built) {
+            // Do not scan the entire merge output while the caller holds the
+            // database-wide apply lock. Preserve task registration so the
+            // runtime can prepare the lookup off-lock and retry publication.
+            retire_task = false;
+            return error.TextMergePublicationLookupRequired;
+        }
         const publication_external_bytes = estimateTextMergePublicationExternalBytes(entry, task, result) catch |err| {
             return task.deletion_state.allocationError(err);
         };
@@ -11751,9 +12290,9 @@ pub const IndexManager = struct {
             // oversized exception would account the estimate without actually
             // bounding the live working set.
             .strict => try manager.reserve(.text_merge_buffers, reservation_bytes),
-            // Scheduled tasks execute through PhaseTrackingAllocator. Permit
-            // one task up to 2x the normal hard limit: ResourceManager keeps it
-            // exclusive and the task allocator enforces the same live cap.
+            // Permit one scheduled task up to 2x the normal hard limit:
+            // ResourceManager keeps it exclusive and the task's shared budget
+            // allocator enforces the same live cap through publication.
             .bounded_task => try manager.reserveBoundedOversizedSingle(.text_merge_buffers, reservation_bytes, 2),
         };
     }
@@ -11901,15 +12440,15 @@ pub const IndexManager = struct {
         const layout = seg.layoutStats(false);
 
         // Merge working memory is driven by doc renumbering, the largest term
-        // accumulator, compact dictionary/value builders, and the publication
-        // identity table. File-backed output streams separately; heap-backed
-        // output adds its serialized source-sized envelope at the caller.
-        // Keep generous capacity/headroom factors here and enforce the
-        // reservation with the bounded task allocator.
-        // Include the fixed-capacity publication identity table. Ordinal-backed
-        // documents use 32 bytes at the table's <= 50% load factor; retain more
-        // headroom for the less common string-identity fallback.
-        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 224 else 160;
+        // accumulator, and compact dictionary/value builders. File-backed
+        // output streams separately; heap-backed output adds its serialized
+        // source-sized envelope at the caller. The publication identity table
+        // is no longer part of the normal reservation: append-only publication
+        // does not build it, while a rare concurrent-delete publication may
+        // fail its lazy allocation and safely retry the merge. Charging that
+        // O(live documents) table here recreated a hard admission ceiling even
+        // after its eager allocation was removed from execution.
+        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 128 else 64;
         var bytes = try std.math.mul(u64, seg.reader.doc_count, per_doc_bytes);
         bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_term_dict_bytes, 3));
         bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_bloom_bytes, 3));
@@ -11939,7 +12478,7 @@ pub const IndexManager = struct {
     fn textMergePublicationDeletes(
         entry: *TextIndex,
         task: *const TextMergeTask,
-        result: *const TextMergeResult,
+        result: *TextMergeResult,
         deletion_deltas: []const TextMergeDeletionDelta,
     ) !TextMergePublicationDeletes {
         if (deletion_deltas.len != task.source.len) return error.InvalidDeletionSnapshot;
@@ -11952,6 +12491,15 @@ pub const IndexManager = struct {
                 if (maybe_deleted.*) |*deleted| deleted.deinit();
             }
             publication_alloc.free(output_deleted);
+        }
+
+        // Publication requested the O(live documents) lookup only when a
+        // delete raced the unlocked build, and the runtime prepared it without
+        // holding the database-wide apply lock.
+        for (deletion_deltas) |delta| {
+            if (delta.count == 0) continue;
+            std.debug.assert(result.publication_lookup_built);
+            break;
         }
 
         const snap = entry.persistent.acquireSnapshot();
@@ -11985,6 +12533,14 @@ pub const IndexManager = struct {
                 try output_deleted[output_idx].?.add(output.doc);
             }
         }
+
+        // The shared allocator high-water mark includes task creation, merge
+        // build, the off-lock lookup, and publication bitmaps while excluding
+        // persistent publication charges by construction.
+        result.peak_task_alloc_bytes = @max(
+            result.peak_task_alloc_bytes,
+            @as(u64, @intCast(task.deletion_state.budget.peakTaskLiveBytes())),
+        );
 
         return .{
             .source_current = true,
@@ -12069,7 +12625,7 @@ pub const IndexManager = struct {
     fn removeInMemory(self: *IndexManager, name: []const u8) void {
         for (self.text_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
-                self.freeTextIndexEntry(entry);
+                self.retireTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
                 self.dropIndexLoadStateNoLock(name);
                 return;
@@ -12077,7 +12633,7 @@ pub const IndexManager = struct {
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
-                self.freeDenseIndexEntry(entry);
+                self.retireDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
                 self.dropIndexLoadStateNoLock(name);
                 return;
@@ -13316,7 +13872,7 @@ pub const IndexManager = struct {
                 const lsm_resource_used = lsm_cache.used_bytes +| lsm_compaction.used_bytes +| lsm_table_builder.used_bytes +| lsm_state.used_bytes +| lsm_wal_write.used_bytes +| lsm_recovery.used_bytes;
                 const lsm_resource_peak = lsm_cache.peak_bytes +| lsm_compaction.peak_bytes +| lsm_table_builder.peak_bytes +| lsm_state.peak_bytes +| lsm_wal_write.peak_bytes +| lsm_recovery.peak_bytes;
                 std.log.info(
-                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} derived_backlog_used_bytes={d} derived_backlog_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_disk_bytes={d} lsm_wal_retention_peak_disk_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d}",
+                    "antfly_bench_text_resources index={s} source_docs={d} projection_docs={d} segments={d} full_text_pending_used_bytes={d} full_text_pending_peak_bytes={d} full_text_build_used_bytes={d} full_text_build_peak_bytes={d} derived_backlog_used_bytes={d} derived_backlog_peak_bytes={d} lsm_cache_used_bytes={d} lsm_cache_peak_bytes={d} lsm_compaction_used_bytes={d} lsm_compaction_peak_bytes={d} lsm_table_builder_used_bytes={d} lsm_table_builder_peak_bytes={d} lsm_state_used_bytes={d} lsm_state_peak_bytes={d} lsm_wal_write_used_bytes={d} lsm_wal_write_peak_bytes={d} lsm_wal_retention_disk_bytes={d} lsm_wal_retention_peak_disk_bytes={d} lsm_recovery_used_bytes={d} lsm_recovery_peak_bytes={d} lsm_resource_used_bytes={d} lsm_resource_peak_bytes={d} cache_reclaim_requests={d} cache_reclaimed_bytes={d}",
                     .{
                         entry.config.name,
                         source_docs.len,
@@ -13344,10 +13900,12 @@ pub const IndexManager = struct {
                         lsm_recovery.peak_bytes,
                         lsm_resource_used,
                         lsm_resource_peak,
+                        resource_stats.reclaim_requests,
+                        resource_stats.reclaimed_bytes,
                     },
                 );
                 std.log.info(
-                    "antfly_bench_text_lsm_tables index={s} source_docs={d} projection_docs={d} segments={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_block_inserts={d} lsm_cache_block_evictions={d} lsm_cache_physical_block_bytes={d} lsm_cache_physical_block_inserts={d} lsm_cache_physical_block_evictions={d}",
+                    "antfly_bench_text_lsm_tables index={s} source_docs={d} projection_docs={d} segments={d} lsm_mutable_bytes={d} lsm_immutable_bytes={d} lsm_immutable_memtables={d} lsm_total_run_bytes={d} lsm_total_runs={d} lsm_cache_entries={d} lsm_cache_transient_serves={d} lsm_cache_state_bytes={d} lsm_cache_raw_table_bytes={d} lsm_cache_table_index_bytes={d} lsm_cache_block_bytes={d} lsm_cache_block_inserts={d} lsm_cache_block_evictions={d} lsm_cache_physical_block_bytes={d} lsm_cache_physical_block_inserts={d} lsm_cache_physical_block_evictions={d}",
                     .{
                         entry.config.name,
                         source_docs.len,
@@ -13359,6 +13917,11 @@ pub const IndexManager = struct {
                         lsm_stats.total_run_bytes,
                         lsm_stats.total_runs,
                         lsm_cache_stats.entry_count,
+                        lsm_cache_stats.run_state.transient_serves +|
+                            lsm_cache_stats.run_table_raw.transient_serves +|
+                            lsm_cache_stats.run_table_index.transient_serves +|
+                            lsm_cache_stats.run_table_block.transient_serves +|
+                            lsm_cache_stats.run_table_physical_block.transient_serves,
                         lsm_cache_stats.run_state.used_bytes,
                         lsm_cache_stats.run_table_raw.used_bytes,
                         lsm_cache_stats.run_table_index.used_bytes,
@@ -15541,6 +16104,7 @@ pub const IndexManager = struct {
         };
         if (load_session) |session| {
             if (session.getVector(vector_id)) |cached| return try alloc.dupe(f32, cached);
+            session.ensureDecodedResidencyCapacity(1, entry.dims);
         }
 
         const vector = blk: {
@@ -15562,7 +16126,10 @@ pub const IndexManager = struct {
                 try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
         };
         errdefer alloc.free(vector);
-        if (load_session) |session| try session.cacheVector(vector_id, vector);
+        if (load_session) |session| {
+            try session.cacheVector(vector_id, vector);
+            session.cacheDecodedVector(&entry.index, vector_id, vector);
+        }
         return vector;
     }
 
@@ -15578,16 +16145,23 @@ pub const IndexManager = struct {
         };
         if (load_session) |session| {
             if (session.getVector(vector_id)) |cached| return cached;
+            session.ensureDecodedResidencyCapacity(1, entry.dims);
         }
 
         if (entry.embedding_name) |embedding_name| {
             const vector = try manager.loadDenseVectorArtifactForHbcIntoScratch(store, metadata, embedding_name, load_session, scratch);
-            if (load_session) |session| try session.cacheVector(vector_id, vector);
+            if (load_session) |session| {
+                try session.cacheVector(vector_id, vector);
+                session.cacheDecodedVector(&entry.index, vector_id, vector);
+            }
             return vector;
         }
         if (entry.external) {
             const vector = try manager.loadDenseVectorArtifactForHbcIntoScratch(store, metadata, entry.config.name, load_session, scratch);
-            if (load_session) |session| try session.cacheVector(vector_id, vector);
+            if (load_session) |session| {
+                try session.cacheVector(vector_id, vector);
+                session.cacheDecodedVector(&entry.index, vector_id, vector);
+            }
             return vector;
         }
 
@@ -15677,6 +16251,7 @@ pub const IndexManager = struct {
         const raw_values = try manager.alloc.alloc(?[]const u8, key_count);
         defer manager.alloc.free(raw_values);
         if (load_session) |session| {
+            session.ensureDecodedResidencyCapacity(key_count, dims);
             try session.getManySorted(store, artifact_keys, raw_values);
         } else {
             var runtime_store = try initRuntimeStore(manager.alloc, store);
@@ -15709,7 +16284,10 @@ pub const IndexManager = struct {
             };
             if (vector.len != dims) return error.InvalidVectorDimensions;
             vector_views[slot] = vector;
-            if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
+            if (load_session) |session| {
+                try session.cacheVector(vector_ids[slot], vector);
+                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector);
+            }
         }
     }
 
@@ -15787,6 +16365,7 @@ pub const IndexManager = struct {
         const raw_values = try manager.alloc.alloc(?[]const u8, key_count);
         defer manager.alloc.free(raw_values);
         if (load_session) |session| {
+            session.ensureDecodedResidencyCapacity(key_count, dims);
             try session.getManySorted(store, artifact_keys, raw_values);
         } else {
             var runtime_store = try initRuntimeStore(manager.alloc, store);
@@ -15825,7 +16404,10 @@ pub const IndexManager = struct {
             const matrix_end = std.math.add(usize, matrix_start, dims) catch return error.BufferTooSmall;
             if (matrix_end > matrix.len) return error.BufferTooSmall;
             _ = transform(index, vector, matrix[matrix_start..matrix_end]);
-            if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
+            if (load_session) |session| {
+                try session.cacheVector(vector_ids[slot], vector);
+                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector);
+            }
         }
     }
 
@@ -15852,10 +16434,9 @@ pub const IndexManager = struct {
         if (scratch.artifact_keys.len < vector_ids.len) return error.InvalidArgument;
         if (scratch.raw_values.len < vector_ids.len) return error.InvalidArgument;
 
-        const artifact_name = entry.embedding_name orelse blk: {
-            if (!entry.external) return error.Unsupported;
-            break :blk entry.config.name;
-        };
+        // Dense apply always publishes the authoritative vector artifact under
+        // the configured embedding name, or the index name for direct fields.
+        const artifact_name = entry.embedding_name orelse entry.config.name;
         const load_session = blk: {
             const session = active_dense_vector_load_session orelse break :blk null;
             if (session.context != loader) break :blk null;
@@ -15876,6 +16457,7 @@ pub const IndexManager = struct {
                     distances[i] = exactStoredVectorDistance(query, query_measure, cached, metric);
                     if (profile) |p| {
                         const elapsed = platform_time.monotonicNs() - distance_start;
+                        p.rerank_artifact_cache_hits += 1;
                         p.rerank_artifact_distance_ns += elapsed;
                         p.rerank_distance_ns += elapsed;
                     }
@@ -15888,6 +16470,10 @@ pub const IndexManager = struct {
                 const cached = handle.view();
                 if (cached.len != dims) return error.InvalidVectorDimensions;
                 const distance_start = platform_time.monotonicNs();
+                if (profile) |p| {
+                    p.vector_cache_hits += 1;
+                    p.rerank_artifact_cache_hits += 1;
+                }
                 distances[i] = exactStoredVectorDistance(query, query_measure, cached, metric);
                 if (profile) |p| {
                     const elapsed = platform_time.monotonicNs() - distance_start;
@@ -15896,15 +16482,17 @@ pub const IndexManager = struct {
                 }
                 continue;
             }
+            if (profile) |p| p.vector_cache_misses += 1;
             const doc_key = maybe_doc_key orelse continue;
-            const artifact_key = if (internal_keys.isInternalUserKey(doc_key))
+            const storage_key = if (internal_keys.isInternalUserKey(doc_key))
                 try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
             else
                 try internal_keys.embeddingArtifactKeyForDocumentAlloc(key_alloc, doc_key, artifact_name);
-            artifact_reads[key_count] = .{ .key = artifact_key, .position = i };
+            artifact_reads[key_count] = .{ .key = storage_key, .position = i };
             key_count += 1;
         }
         if (key_count == 0) return;
+        if (profile) |p| p.rerank_artifact_vectors_loaded +|= @intCast(key_count);
         std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], {}, DenseArtifactReadKey.lessThan);
         if (profile) |p| p.rerank_artifact_key_ns += platform_time.monotonicNs() - key_start;
 
@@ -15915,6 +16503,7 @@ pub const IndexManager = struct {
         const cache_before = if (manager.lsm_cache) |cache| cache.snapshotStats() else null;
         const read_start = platform_time.monotonicNs();
         if (load_session) |session| {
+            session.ensureDecodedResidencyCapacity(key_count, dims);
             try session.getManySorted(store, artifact_keys, raw_values);
         } else {
             var runtime_store = try initRuntimeStore(manager.alloc, store);
@@ -15945,16 +16534,16 @@ pub const IndexManager = struct {
                 };
                 const vector_scratch = batch_scratch[0..dims];
                 const decode_start = platform_time.monotonicNs();
-                const vector = enrichment_artifact_codec.decodeDenseEmbeddingViewOrInto(raw, vector_scratch) catch |err| {
-                    if (isRecoverableEmbeddingArtifactError(err)) {
-                        distances[slot] = std.math.inf(f32);
-                        continue;
-                    }
-                    return err;
+                const vector = (try decodeExactStoredVectorInto(raw, vector_scratch)) orelse {
+                    distances[slot] = std.math.inf(f32);
+                    continue;
                 };
                 if (profile) |p| p.rerank_artifact_decode_ns += platform_time.monotonicNs() - decode_start;
                 if (vector.len != dims) return error.InvalidVectorDimensions;
-                _ = entry.index.cacheVector(vector_ids[slot], vector) catch {};
+                if (load_session) |session|
+                    session.cacheDecodedVector(&entry.index, vector_ids[slot], vector)
+                else
+                    _ = entry.index.cacheVector(vector_ids[slot], vector) catch {};
                 const distance_start = platform_time.monotonicNs();
                 distances[slot] = exactStoredVectorDistance(query, query_measure, vector, metric);
                 if (profile) |p| {
@@ -15962,6 +16551,26 @@ pub const IndexManager = struct {
                     p.rerank_artifact_distance_ns += elapsed;
                     p.rerank_distance_ns += elapsed;
                 }
+            }
+            if (!entry.external and entry.embedding_name == null) {
+                try scoreDirectDenseDocumentFallbackBatch(
+                    manager,
+                    store,
+                    entry,
+                    null,
+                    vector_ids,
+                    metadata,
+                    query,
+                    query_measure,
+                    metric,
+                    distances,
+                    batch_scratch,
+                    dims,
+                    artifact_reads,
+                    key_alloc,
+                    scratch,
+                    profile,
+                );
             }
             return;
         }
@@ -15983,22 +16592,29 @@ pub const IndexManager = struct {
         for (raw_values, 0..) |maybe_raw, key_index| {
             const slot = artifact_reads[key_index].position;
             const raw = maybe_raw orelse {
+                if (getenv("ANTFLY_DEBUG_DENSE_VECTOR_LOAD_SESSION") != null) {
+                    std.log.debug("dense exact batch miss index={s} metadata={any} storage_key={any}", .{
+                        entry.config.name,
+                        metadata[slot],
+                        artifact_reads[key_index].key,
+                    });
+                }
                 distances[slot] = std.math.inf(f32);
                 continue;
             };
             const vector_scratch = batch_scratch[0..dims];
             const decode_start = platform_time.monotonicNs();
-            const vector = enrichment_artifact_codec.decodeDenseEmbeddingViewOrInto(raw, vector_scratch) catch |err| {
-                if (isRecoverableEmbeddingArtifactError(err)) {
-                    distances[slot] = std.math.inf(f32);
-                    continue;
-                }
-                return err;
+            const vector = (try decodeExactStoredVectorInto(raw, vector_scratch)) orelse {
+                distances[slot] = std.math.inf(f32);
+                continue;
             };
             if (profile) |p| p.rerank_artifact_decode_ns += platform_time.monotonicNs() - decode_start;
             if (vector.len != dims) return error.InvalidVectorDimensions;
             if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
-            _ = entry.index.cacheVector(vector_ids[slot], vector) catch {};
+            if (load_session) |session|
+                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector)
+            else
+                _ = entry.index.cacheVector(vector_ids[slot], vector) catch {};
             const distance_start = platform_time.monotonicNs();
             distances[slot] = exactStoredVectorDistance(query, query_measure, vector, metric);
             if (profile) |p| {
@@ -16007,6 +16623,122 @@ pub const IndexManager = struct {
                 p.rerank_distance_ns += elapsed;
             }
         }
+        if (!entry.external and entry.embedding_name == null) {
+            try scoreDirectDenseDocumentFallbackBatch(
+                manager,
+                store,
+                entry,
+                load_session,
+                vector_ids,
+                metadata,
+                query,
+                query_measure,
+                metric,
+                distances,
+                batch_scratch,
+                dims,
+                artifact_reads,
+                key_alloc,
+                scratch,
+                profile,
+            );
+        }
+    }
+
+    fn scoreDirectDenseDocumentFallbackBatch(
+        manager: *IndexManager,
+        store: *docstore_mod.DocStore,
+        entry: *DenseIndex,
+        load_session: ?*DenseVectorLoadSession,
+        vector_ids: []const u64,
+        metadata: []const ?[]const u8,
+        query: []const f32,
+        query_measure: f32,
+        metric: vector_mod.DistanceMetric,
+        distances: []f32,
+        batch_scratch: []f32,
+        dims: usize,
+        reads: []DenseArtifactReadKey,
+        key_alloc: Allocator,
+        scratch: hbc_mod.HBCIndex.ExternalVectorBatchDistanceScratch,
+        profile: ?*hbc_mod.SearchProfile,
+    ) !void {
+        var read_count: usize = 0;
+        for (metadata, distances, 0..) |maybe_doc_key, distance, slot| {
+            if (std.math.isFinite(distance)) continue;
+            const doc_key = maybe_doc_key orelse continue;
+            reads[read_count] = .{
+                .key = try internal_keys.documentKeyAlloc(key_alloc, doc_key),
+                .position = slot,
+            };
+            read_count += 1;
+        }
+        if (read_count == 0) return;
+        std.mem.sort(DenseArtifactReadKey, reads[0..read_count], {}, DenseArtifactReadKey.lessThan);
+        const keys = scratch.artifact_keys[0..read_count];
+        for (reads[0..read_count], 0..) |read, i| keys[i] = read.key;
+        const values = scratch.raw_values[0..read_count];
+
+        const cache_before = if (manager.lsm_cache) |cache| cache.snapshotStats() else null;
+        const read_start = platform_time.monotonicNs();
+        if (load_session) |session| {
+            // Primary-document fallback is not replaceable by decoded-vector
+            // residency, so retain its blocks and keep one reusable owner.
+            session.useLsmResidency();
+            try session.getManySorted(store, keys, values);
+        } else {
+            var runtime_store = try initRuntimeStore(manager.alloc, store);
+            defer runtime_store.deinit();
+            var txn = try runtime_store.store.beginRead();
+            defer txn.abort();
+            try txn.getManySorted(keys, values);
+        }
+        if (profile) |p| {
+            p.rerank_artifact_read_ns += platform_time.monotonicNs() - read_start;
+            if (manager.lsm_cache) |cache| {
+                if (cache_before) |before| {
+                    const after = cache.snapshotStats();
+                    const before_hits = before.run_table_index.hits + before.run_table_block.hits + before.run_table_physical_block.hits;
+                    const after_hits = after.run_table_index.hits + after.run_table_block.hits + after.run_table_physical_block.hits;
+                    const before_misses = before.run_table_index.misses + before.run_table_block.misses + before.run_table_physical_block.misses;
+                    const after_misses = after.run_table_index.misses + after.run_table_block.misses + after.run_table_physical_block.misses;
+                    p.rerank_lsm_cache_hits += after_hits -| before_hits;
+                    p.rerank_lsm_cache_misses += after_misses -| before_misses;
+                }
+            }
+        }
+
+        for (values, 0..) |maybe_raw, read_index| {
+            const slot = reads[read_index].position;
+            const raw = maybe_raw orelse continue;
+            const vector_scratch = batch_scratch[0..dims];
+            const decode_start = platform_time.monotonicNs();
+            const vector = mapper.extractDenseVectorFieldInto(manager.alloc, raw, entry.field_name, entry.dims, vector_scratch) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => continue,
+            } orelse continue;
+            if (profile) |p| p.rerank_artifact_decode_ns += platform_time.monotonicNs() - decode_start;
+            if (vector.len != dims) continue;
+            if (load_session) |session| try session.cacheVector(vector_ids[slot], vector);
+            if (load_session) |session|
+                session.cacheDecodedVector(&entry.index, vector_ids[slot], vector)
+            else
+                _ = entry.index.cacheVector(vector_ids[slot], vector) catch {};
+            const distance_start = platform_time.monotonicNs();
+            distances[slot] = exactStoredVectorDistance(query, query_measure, vector, metric);
+            if (profile) |p| {
+                const elapsed = platform_time.monotonicNs() - distance_start;
+                p.rerank_artifact_distance_ns += elapsed;
+                p.rerank_distance_ns += elapsed;
+            }
+        }
+    }
+
+    fn decodeExactStoredVectorInto(raw: []const u8, scratch: []f32) !?[]const f32 {
+        return enrichment_artifact_codec.decodeDenseEmbeddingViewOrInto(raw, scratch) catch |err| {
+            if (isRecoverableEmbeddingArtifactError(err)) return null;
+            return err;
+        };
     }
 
     fn exactStoredVectorDistance(
@@ -16064,7 +16796,10 @@ pub const IndexManager = struct {
         alloc: Allocator,
     ) ![]const u8 {
         _ = self;
-        if (load_session) |session| return try session.get(store, doc_store_key);
+        if (load_session) |session| {
+            session.useLsmResidency();
+            return try session.get(store, doc_store_key);
+        }
         return try store.get(alloc, doc_store_key);
     }
 
@@ -23777,6 +24512,125 @@ test "dense vector load session caches decoded vectors and tracks bytes" {
     try std.testing.expectEqual(@as(u64, 0), session.vector_cache_misses);
 }
 
+test "dense vector load session switches to retained LSM ownership before reservation overrun" {
+    const alloc = std.testing.allocator;
+    const dims: usize = 4;
+    const vector_bytes = hbc_mod.estimateDecodedVectorResidencyBytes(dims);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = vector_bytes,
+        .hard_limit_bytes = vector_bytes,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(alloc);
+    var hbc_cache = hbc_mod.Cache.init(alloc);
+    defer hbc_cache.deinit();
+    hbc_cache.attachResourceManager(&resource_manager);
+
+    var manager = try IndexManager.initWithOptions(alloc, ".", .{
+        .resource_manager = &resource_manager,
+        .hbc_cache = &hbc_cache,
+    });
+    defer manager.deinit();
+    const context = try alloc.create(IndexManager.DenseVectorLoadContext);
+    defer context.deinit(alloc);
+    context.* = .{
+        .manager = &manager,
+        .index_name = try alloc.dupe(u8, "dv_v1"),
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/residency-fallback", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var index = try hbc_mod.HBCIndex.open(alloc, path_z, .{ .dims = dims, .max_cached_vectors = 8 });
+    defer index.close();
+    index.attachResourceManager(&resource_manager);
+    index.attachSharedCache(&hbc_cache);
+    const lease = index.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+
+    var session: IndexManager.DenseVectorLoadSession = .{
+        .context = context,
+        .block_cache_admission = .transient,
+        .decoded_residency_lease = lease,
+    };
+    defer session.deinit();
+    session.ensureDecodedResidencyCapacity(2, dims);
+    try std.testing.expect(session.decoded_residency_lease == null);
+    try std.testing.expectEqual(backend_types.Namespace.BlockCacheAdmission.retain, session.block_cache_admission);
+}
+
+test "production external vector session evolves a saturated decoded resident set" {
+    const alloc = std.testing.allocator;
+    const dims: usize = 2;
+    const vector_bytes = hbc_mod.estimateDecodedVectorResidencyBytes(dims);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+        .soft_limit_bytes = vector_bytes * 2,
+        .hard_limit_bytes = vector_bytes * 2,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer resource_manager.deinit(alloc);
+    var hbc_cache = hbc_mod.Cache.init(alloc);
+    defer hbc_cache.deinit();
+    hbc_cache.attachResourceManager(&resource_manager);
+
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "external-vector-saturated-residency");
+    defer cleanupIndexManagerDir(path);
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.initWithOptions(alloc, std.mem.span(path), .{
+        .resource_manager = &resource_manager,
+        .hbc_cache = &hbc_cache,
+    });
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    manager.primary_store = &store;
+
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+    const entry = manager.denseIndex("semantic_idx") orelse return error.IndexNotFound;
+    const context = entry.vector_loader_context orelse return error.TestUnexpectedResult;
+
+    _ = try entry.index.cacheVector(1, &[_]f32{ 1, 0 });
+    _ = try entry.index.cacheVector(2, &[_]f32{ 0, 1 });
+    try std.testing.expectEqual(vector_bytes * 2, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+
+    const doc_key = "doc:replacement";
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, "semantic_idx");
+    defer alloc.free(artifact_key);
+    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 0.5, 0.5 });
+    defer alloc.free(payload);
+    try store.put(artifact_key, payload);
+
+    const lease = entry.index.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
+    var session: IndexManager.DenseVectorLoadSession = .{
+        .context = context,
+        .cache_vectors = false,
+        .block_cache_admission = .transient,
+        .decoded_residency_lease = lease,
+    };
+    defer session.deinit();
+    const previous_session = IndexManager.active_dense_vector_load_session;
+    defer IndexManager.active_dense_vector_load_session = previous_session;
+    IndexManager.active_dense_vector_load_session = &session;
+
+    var scratch: [dims]f32 = undefined;
+    const loaded = try IndexManager.loadDenseVectorForHbcIntoScratch(context, 3, doc_key, &scratch);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 0.5, 0.5 }, loaded);
+    var retained = entry.index.borrowCachedVector(3) orelse return error.TestUnexpectedResult;
+    retained.deinit();
+    try std.testing.expect(session.decoded_residency_lease != null);
+    try std.testing.expectEqual(backend_types.Namespace.BlockCacheAdmission.transient, session.block_cache_admission);
+    try std.testing.expectEqual(vector_bytes * 2, resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes);
+}
+
 test "dense vector load session is bounded by the shared apply working-set budget" {
     const alloc = std.testing.allocator;
 
@@ -24801,7 +25655,9 @@ test "dense index manager accepts external embedding indexes without enrichments
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
 
-    var manager = try IndexManager.init(alloc, path);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .retained_vector_cache_enabled = false,
+    });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });
 
@@ -24835,6 +25691,336 @@ test "dense index manager accepts external embedding indexes without enrichments
 
     const entry = manager.denseIndex("semantic_idx") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, 1), entry.index.stats().active_count);
+    try std.testing.expect(entry.index.acquireDecodedVectorResidency(1) == null);
+    try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
+}
+
+test "production external scorers use bounded cache-first artifact batches" {
+    const alloc = std.testing.allocator;
+    const dims: usize = 3;
+    const external_rerank_batch_size: usize = 128;
+    const candidate_count = exact_dense_score_batch_size + 17;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{});
+    defer resource_manager.deinit(alloc);
+    var hbc_cache = hbc_mod.Cache.init(alloc);
+    defer hbc_cache.deinit();
+    hbc_cache.attachResourceManager(&resource_manager);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .resource_manager = &resource_manager,
+        .hbc_cache = &hbc_cache,
+    });
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"embedding_name\":\"semantic_idx\",\"external\":true}",
+    }});
+
+    const writes = try alloc.alloc(mapper.DenseEmbeddingWrite, candidate_count);
+    defer alloc.free(writes);
+    const doc_keys = try alloc.alloc([]u8, candidate_count);
+    defer {
+        for (doc_keys) |doc_key| alloc.free(doc_key);
+        alloc.free(doc_keys);
+    }
+    const vectors = try alloc.alloc(f32, candidate_count * dims);
+    defer alloc.free(vectors);
+    const candidate_ids = try alloc.alloc(u64, candidate_count);
+    defer alloc.free(candidate_ids);
+    const candidate_id_order = try alloc.alloc(usize, candidate_count);
+    defer alloc.free(candidate_id_order);
+    for (writes, 0..) |*write, i| {
+        doc_keys[i] = try std.fmt.allocPrint(alloc, "doc:{d:0>6}", .{i});
+        const vector = vectors[i * dims ..][0..dims];
+        write.* = .{
+            .index_name = @constCast("semantic_idx"),
+            .doc_key = doc_keys[i],
+            .vector = vector,
+            .artifact_key = null,
+        };
+        candidate_ids[i] = deterministicDenseVectorId(doc_keys[i]);
+        candidate_id_order[i] = i;
+    }
+    std.mem.sort(usize, candidate_id_order, candidate_ids, struct {
+        fn lessThan(ids: []const u64, lhs: usize, rhs: usize) bool {
+            return ids[lhs] < ids[rhs];
+        }
+    }.lessThan);
+    // External batches are sorted by vector id for storage locality. Make the
+    // first complete batch a compact ordered range followed by a continuous
+    // tail. Queries from opposite ends then deterministically cover both
+    // halves of the stop invariant: a safe positive stop and a required
+    // continuation, without relying on hash ordering accidentally correlating
+    // with distance.
+    for (candidate_id_order, 0..) |candidate_idx, rank| {
+        const vector = vectors[candidate_idx * dims ..][0..dims];
+        const base: f32 = @floatFromInt(rank + if (rank < external_rerank_batch_size) @as(usize, 0) else 128);
+        vector[0] = base;
+        vector[1] = @floatFromInt(rank % 17);
+        vector[2] = @floatFromInt(rank % 31);
+    }
+    const far_query_idx = candidate_id_order[candidate_count - 1];
+    const missing_candidate_idx = candidate_id_order[external_rerank_batch_size];
+    try manager.applyDenseEmbeddingWritesByNameWithOptions(&store, "semantic_idx", writes, .{ .mode = .bulk_ingest });
+
+    const entry = manager.denseIndex("semantic_idx") orelse return error.IndexNotFound;
+    try std.testing.expectEqual(hbc_mod.HBCConfig.RerankPolicy.boundary, entry.index.config.rerank_policy);
+    var residency_probe = entry.index.acquireDecodedVectorResidency(candidate_count) orelse return error.ResidencyProbeUnavailable;
+    residency_probe.deinit();
+    try std.testing.expectEqual(@as(u64, candidate_count), entry.index.stats().active_count);
+    try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
+    var metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
+
+    // Exercise the production HBC -> IndexManager -> DocStore external-vector
+    // wiring with one governed decoded hit and one true artifact miss. The
+    // adapter must compact the miss set before both metadata and artifact I/O.
+    _ = try entry.index.cacheVector(candidate_ids[0], vectors[0..dims]);
+    {
+        var hbc_txn = try entry.index.beginReadTxn();
+        defer hbc_txn.abort();
+        const ranked = [_]hbc_mod.ApproxSearchResult{
+            .{ .vector_id = candidate_ids[0], .distance = 0.1 },
+            .{ .vector_id = candidate_ids[1], .distance = 0.2 },
+        };
+        var rerank_distances: [2]f32 = undefined;
+        var rerank_vector_ids: [2]u64 = undefined;
+        var rerank_metadata: [2]?[]const u8 = undefined;
+        var rerank_lookups: [2]hbc_mod.FixedKeyLookup = undefined;
+        var rerank_key_views: [2][]const u8 = undefined;
+        var rerank_values: [2]?[]const u8 = undefined;
+        var rerank_scratch: [dims]f32 = undefined;
+        var rerank_miss_distances: [2]f32 = undefined;
+        var rerank_profile: hbc_mod.SearchProfile = .{};
+        try std.testing.expect(try entry.index.scoreExternalRerankVectorsSortedWithScratch(
+            &hbc_txn,
+            &ranked,
+            &.{ 0, 1 },
+            vectors[0..dims],
+            0,
+            &rerank_distances,
+            &rerank_vector_ids,
+            &rerank_metadata,
+            &rerank_lookups,
+            &rerank_key_views,
+            &rerank_values,
+            &rerank_scratch,
+            &rerank_miss_distances,
+            &rerank_profile,
+        ));
+        try std.testing.expectEqual(@as(f32, 0), rerank_distances[0]);
+        try std.testing.expect(std.math.isFinite(rerank_distances[1]));
+        try std.testing.expectEqual(@as(u64, 1), rerank_profile.rerank_artifact_cache_hits);
+        try std.testing.expectEqual(@as(u64, 1), rerank_profile.rerank_metadata_vectors_loaded);
+        try std.testing.expectEqual(@as(u64, 1), rerank_profile.rerank_artifact_vectors_loaded);
+    }
+    try std.testing.expectEqual(metadata_insertions_before + 1, entry.index.hbcCacheStats().metadata.insertions);
+    metadata_insertions_before = entry.index.hbcCacheStats().metadata.insertions;
+
+    // Missing/corrupt external artifacts are candidate-local failures. They
+    // must not fail the whole request (the old scalar fallback did).
+    const missing_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_keys[missing_candidate_idx], "semantic_idx");
+    defer alloc.free(missing_artifact_key);
+    try store.delete(missing_artifact_key);
+
+    const VectorNamespaceProbeCounter = struct {
+        count: usize = 0,
+
+        fn onLoad(ctx_ptr: ?*anyopaque, _: *hbc_mod.HBCIndex, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr.?));
+            self.count += 1;
+        }
+    };
+    var vector_namespace_probes = VectorNamespaceProbeCounter{};
+    hbc_mod.setTestGetVectorViewOrScratchHook(&vector_namespace_probes, VectorNamespaceProbeCounter.onLoad);
+    defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
+
+    var outcome = try manager.exactScoreDenseEntryWithRequest(entry, .{
+        .query = vectors[far_query_idx * dims ..][0..dims],
+        .k = 10,
+        .filter_ids = candidate_ids,
+    });
+    defer outcome.results.deinit();
+
+    try std.testing.expectEqual(@as(u64, candidate_count - 1), outcome.vectors_scored);
+    try std.testing.expectEqual(@as(u64, candidate_count), outcome.profile.candidate_count);
+    try std.testing.expectEqual(@as(u64, 2), outcome.profile.batch_count);
+    try std.testing.expectEqual(@as(u64, exact_dense_score_batch_size), outcome.profile.max_batch_size);
+    try std.testing.expectEqual(@as(u64, 2), outcome.profile.raw_batch_reads);
+    try std.testing.expectEqual(@as(u64, 0), outcome.profile.raw_scalar_reads);
+    try std.testing.expectEqual(@as(u64, 0), outcome.profile.request_vector_cache_entries);
+    try std.testing.expectEqual(@as(usize, 0), vector_namespace_probes.count);
+    try std.testing.expect(entry.index.hbcCacheStats().vector.used_bytes > 0);
+    try std.testing.expectEqual(metadata_insertions_before, entry.index.hbcCacheStats().metadata.insertions);
+    try std.testing.expectEqual(@as(u64, 1), outcome.profile.missing_vectors);
+    try std.testing.expect(outcome.profile.workspace_bytes > 0);
+    try std.testing.expect(outcome.profile.artifact_read_ns > 0);
+    try std.testing.expectEqual(@as(usize, 10), outcome.results.getHits().len);
+    try std.testing.expectEqual(candidate_ids[far_query_idx], outcome.results.getHits()[0].vector_id);
+
+    // Drive the complete production HBC search path with the default boundary
+    // policy. An ambiguous distance threshold selects the full >128 candidate
+    // set, after which exact sorted batches evaluate the stop proof. This
+    // fixture keeps the second batch's lower bounds overlapping the retained
+    // frontier, so skipping it would be a recall bug.
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+    const no_stop_query = [_]f32{ 20_000, 0, 0 };
+    var boundary_probe = try entry.index.searchProfiledRequest(.{
+        .query = &no_stop_query,
+        .k = 128,
+        .search_width = @intCast(candidate_count),
+        .load_metadata = false,
+        .filter_ids = candidate_ids,
+    });
+    defer boundary_probe.results.deinit();
+    try std.testing.expect(boundary_probe.profile.approx_top_count > 0);
+    const approximate_top = boundary_probe.profile.approx_top[0];
+    try std.testing.expect(approximate_top.error_bound > 0);
+    // Equality with the approximate lower bound is ambiguous, while a query
+    // outside the indexed corpus keeps every true top-k distance eligible.
+    const ambiguous_distance_over = approximate_top.lower_bound;
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+
+    var full_profiled = try entry.index.searchProfiledRequest(.{
+        .query = &no_stop_query,
+        .k = 128,
+        .search_width = @intCast(candidate_count),
+        // Equality with the retained approximate lower bound is ambiguous under
+        // the default boundary policy and therefore selects the complete
+        // candidate shell before progressive exact batches evaluate the stop.
+        .distance_over = ambiguous_distance_over,
+        .load_metadata = false,
+        .filter_ids = candidate_ids,
+    });
+    defer full_profiled.results.deinit();
+    try std.testing.expect(full_profiled.profile.approx_candidate_count > 128);
+    try std.testing.expect(full_profiled.profile.rerank_candidate_count > 128);
+    try std.testing.expect(full_profiled.profile.full_rerank_due_to_threshold);
+    try std.testing.expect(full_profiled.profile.ambiguous_distance_over_hits > 0);
+    try std.testing.expect(full_profiled.profile.rerank_batches > 0);
+    try std.testing.expectEqual(@as(u64, 128), full_profiled.profile.rerank_max_batch_size);
+    try std.testing.expect(full_profiled.profile.rerank_artifact_vectors_loaded > 0);
+    try std.testing.expectEqual(
+        full_profiled.profile.rerank_artifact_vectors_loaded,
+        full_profiled.profile.rerank_metadata_vectors_loaded,
+    );
+    try std.testing.expectEqual(@as(u64, 0), full_profiled.profile.rerank_candidates_skipped_by_bound);
+    try std.testing.expectEqual(
+        std.math.divCeil(u64, full_profiled.profile.rerank_candidate_count, 128) catch unreachable,
+        full_profiled.profile.rerank_batches,
+    );
+
+    const ExpectedHit = struct {
+        vector_id: u64,
+        distance: f32,
+
+        fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+            if (lhs.distance != rhs.distance) return lhs.distance < rhs.distance;
+            return lhs.vector_id < rhs.vector_id;
+        }
+    };
+    // Size for the complete shell so correctness of this oracle never depends
+    // on how many candidates the calibrated threshold admits.
+    const expected_storage = try alloc.alloc(ExpectedHit, candidate_count);
+    defer alloc.free(expected_storage);
+    var expected_count: usize = 0;
+    for (candidate_ids, 0..) |vector_id, i| {
+        if (i == missing_candidate_idx) continue; // Candidate-local artifact deleted above.
+        const distance = vector_mod.distance(&no_stop_query, vectors[i * dims ..][0..dims], .l2_squared);
+        if (distance <= ambiguous_distance_over) continue; // distance_over is strict.
+        expected_storage[expected_count] = .{ .vector_id = vector_id, .distance = distance };
+        expected_count += 1;
+    }
+    std.mem.sort(ExpectedHit, expected_storage[0..expected_count], {}, ExpectedHit.lessThan);
+    const hits = full_profiled.results.getHits();
+    try std.testing.expectEqual(@as(usize, 128), hits.len);
+    for (hits, expected_storage[0..hits.len], 0..) |hit, expected, rank| {
+        if (expected.vector_id != hit.vector_id) std.debug.print(
+            "external boundary no-stop mismatch rank={d} expected_id={d} actual_id={d}\n",
+            .{ rank, expected.vector_id, hit.vector_id },
+        );
+        try std.testing.expectEqual(expected.vector_id, hit.vector_id);
+        try std.testing.expectApproxEqRel(expected.distance, hit.distance, 0.000001);
+    }
+
+    // A separated vector-id-ordered shell must exercise the positive half of
+    // the production stop proof: after one bounded external batch establishes
+    // 128 exact upper bounds, candidates whose approximate lower bounds are
+    // strictly worse can be skipped. Keep the
+    // threshold ambiguity so this still enters through the default boundary
+    // policy rather than forcing rerank_policy=always.
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+    const early_stop_query = [_]f32{ -10_000, 0, 0 };
+    var early_stop_probe = try entry.index.searchProfiledRequest(.{
+        .query = &early_stop_query,
+        .k = 128,
+        .search_width = @intCast(candidate_count),
+        .load_metadata = false,
+        .filter_ids = candidate_ids,
+    });
+    defer early_stop_probe.results.deinit();
+    try std.testing.expect(early_stop_probe.profile.approx_top_count > 0);
+    const early_stop_top = early_stop_probe.profile.approx_top[0];
+    try std.testing.expect(early_stop_top.error_bound > 0);
+    const early_stop_distance_over = early_stop_top.lower_bound;
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+
+    var early_stopped = try entry.index.searchProfiledRequest(.{
+        .query = &early_stop_query,
+        .k = 128,
+        .search_width = @intCast(candidate_count),
+        .distance_over = early_stop_distance_over,
+        .load_metadata = false,
+        .filter_ids = candidate_ids,
+    });
+    defer early_stopped.results.deinit();
+    try std.testing.expect(early_stopped.profile.approx_candidate_count > 128);
+    try std.testing.expect(early_stopped.profile.rerank_candidate_count > 128);
+    try std.testing.expect(early_stopped.profile.full_rerank_due_to_threshold);
+    try std.testing.expect(early_stopped.profile.ambiguous_distance_over_hits > 0);
+    try std.testing.expect(early_stopped.profile.rerank_candidates_skipped_by_bound > 0);
+    try std.testing.expect(early_stopped.profile.rerank_batches > 0);
+    try std.testing.expect(early_stopped.profile.rerank_batches <
+        std.math.divCeil(u64, early_stopped.profile.rerank_candidate_count, 128) catch unreachable);
+    try std.testing.expectEqual(@as(u64, 128), early_stopped.profile.rerank_max_batch_size);
+    try std.testing.expectEqual(
+        early_stopped.profile.rerank_artifact_vectors_loaded,
+        early_stopped.profile.rerank_metadata_vectors_loaded,
+    );
+
+    expected_count = 0;
+    for (candidate_ids, 0..) |vector_id, i| {
+        if (i == missing_candidate_idx) continue;
+        const distance = vector_mod.distance(&early_stop_query, vectors[i * dims ..][0..dims], .l2_squared);
+        if (distance <= early_stop_distance_over) continue;
+        expected_storage[expected_count] = .{ .vector_id = vector_id, .distance = distance };
+        expected_count += 1;
+    }
+    std.mem.sort(ExpectedHit, expected_storage[0..expected_count], {}, ExpectedHit.lessThan);
+    const early_hits = early_stopped.results.getHits();
+    try std.testing.expectEqual(@as(usize, 128), early_hits.len);
+    for (early_hits, expected_storage[0..early_hits.len], 0..) |hit, expected, rank| {
+        if (expected.vector_id != hit.vector_id) std.debug.print(
+            "external boundary early-stop mismatch rank={d} expected_id={d} actual_id={d}\n",
+            .{ rank, expected.vector_id, hit.vector_id },
+        );
+        try std.testing.expectEqual(expected.vector_id, hit.vector_id);
+        try std.testing.expectApproxEqRel(expected.distance, hit.distance, 0.000001);
+    }
 }
 
 test "external dense embedding writes persist deterministic vector mappings" {
@@ -25545,6 +26731,21 @@ test "text merge task carries concurrent deletes into publication" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_limit_bytes = 64 * 1024 * 1024,
+        .hard_limit_bytes = 64 * 1024 * 1024,
+    };
+    var policies = resource_manager_mod.Options.defaultPolicies();
+    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_action = .report,
+        .hard_action = .report,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .budgets = budgets,
+        .policies = policies,
+    });
+
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     const path_z = try alloc.dupeZ(u8, path);
@@ -25553,7 +26754,9 @@ test "text merge task carries concurrent deletes into publication" {
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
 
-    var manager = try IndexManager.init(alloc, path);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .resource_manager = &resource_manager,
+    });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });
 
@@ -25631,6 +26834,8 @@ test "text merge task carries concurrent deletes into publication" {
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
     var merged_docs: u32 = 0;
     for (result.prepared_segments) |*prepared| {
         var reader = try segment_mod.SegmentReader.init(alloc, prepared.data.bytes());
@@ -25646,8 +26851,33 @@ test "text merge task carries concurrent deletes into publication" {
     // the later tombstone into the replacement rather than reject the useful
     // merge and retry forever under sustained mutation.
     try std.testing.expectEqual(frozen_live_docs, merged_docs);
+    // Keep a known task-local allocation live across publication. The peak
+    // must include this existing working set plus the lazy identity lookup,
+    // rather than treating build and publication as disjoint phases.
+    const build_peak = result.peak_task_alloc_bytes;
+    const telemetry_probe_len = std.math.cast(usize, build_peak +| 4096) orelse
+        return error.TestUnexpectedResult;
+    const telemetry_probe = try task.mergeAllocator().alloc(u8, telemetry_probe_len);
+    defer task.mergeAllocator().free(telemetry_probe);
+    const publication_task_live_bytes = task.deletion_state.budget.liveBytes();
+    try std.testing.expect(publication_task_live_bytes > build_peak);
+    // Publication must never perform the document-sized scan while its caller
+    // holds the database apply lock. It preserves the in-flight task and asks
+    // the runtime to prepare the lookup off-lock instead.
+    try std.testing.expectError(
+        error.TextMergePublicationLookupRequired,
+        manager.finishTextMergeTask(&task, &result),
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
+    try std.testing.expectEqual(@as(u64, 1), manager.textMergeStats().in_flight_merges);
+
+    try IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result);
+    try std.testing.expect(result.publication_lookup_built);
     const applied = try manager.finishTextMergeTask(&task, &result);
     try std.testing.expect(applied);
+    try std.testing.expect(result.output_ordinals.len + result.output_ids.len > 0);
+    try std.testing.expect(result.peak_task_alloc_bytes >= publication_task_live_bytes);
     const merge_stats = manager.textMergeStats();
     try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_merges);
     try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_segments);
@@ -26122,8 +27352,13 @@ test "text merge task records input and output bytes" {
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
+    // Append-only merges do not pay for a document-sized publication lookup.
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
     const expected_output = IndexManager.textMergeResultOutputStats(&result);
     try std.testing.expect(try manager.finishTextMergeTask(&task, &result));
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
 
     const stats = manager.textMergeStats();
     try std.testing.expectEqual(@as(u64, 1), stats.completed_merges);
@@ -26866,6 +28101,134 @@ test "dense hbc batch options store vectors when no external loader can serve sk
     try std.testing.expect(!opts.defer_leaf_splits_to_bulk_finish);
     try std.testing.expectEqual(@as(usize, 0), opts.bulk_rebuild_leaf_min_members);
     try std.testing.expect(!opts.skip_vector_store);
+}
+
+test "retired LSM owner clone counters survive index generations" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "retired-lsm-owner-clones");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+
+    var first = lsm_backend_mod.Backend.MaintenanceStats{
+        .mutable_snapshot_clone_calls = 2,
+        .mutable_snapshot_clone_bytes_total = 4096,
+        .mutable_snapshot_clone_peak_bytes = 3072,
+        .bulk_ingest_current_scan_clone_peak_active_bytes = 2048,
+    };
+    first.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bulk_current_scan)] = .{
+        .calls = 2,
+        .bytes_total = 4096,
+        .peak_bytes = 3072,
+    };
+    manager.archiveLsmOwnerStats(.dense_vector, "embedding", first);
+    manager.archiveLsmOwnerStats(.dense_vector, "embedding", .{
+        .mutable_snapshot_clone_calls = 1,
+        .mutable_snapshot_clone_bytes_total = 512,
+        .mutable_snapshot_clone_peak_bytes = 512,
+        .bulk_ingest_current_scan_clone_peak_active_bytes = 256,
+    });
+
+    const owners = try manager.snapshotLsmOwnerStatsAlloc(alloc);
+    defer {
+        for (owners) |*owner| owner.deinit(alloc);
+        alloc.free(owners);
+    }
+    try std.testing.expectEqual(@as(usize, 1), owners.len);
+    try std.testing.expectEqual(types.IndexKind.dense_vector, owners[0].kind);
+    try std.testing.expectEqualStrings("embedding", owners[0].name);
+    try std.testing.expectEqual(@as(u64, 3), owners[0].maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 4608), owners[0].maintenance.mutable_snapshot_clone_bytes_total);
+    try std.testing.expectEqual(@as(u64, 3072), owners[0].maintenance.mutable_snapshot_clone_peak_bytes);
+    try std.testing.expectEqual(
+        @as(u64, 2048),
+        owners[0].maintenance.bulk_ingest_current_scan_clone_peak_active_bytes,
+    );
+}
+
+test "retired LSM owner clone attribution is bounded with loss-accounted overflow" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "bounded-retired-lsm-owner-clones");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+
+    // A user owner may legally have the synthetic aggregate's display name;
+    // identity must remain distinct even after the bounded tier fills.
+    manager.archiveLsmOwnerStats(.dense_vector, IndexManager.retired_lsm_owner_overflow_name, .{
+        .mutable_snapshot_clone_calls = 1,
+        .mutable_snapshot_clone_bytes_total = 64,
+        .mutable_snapshot_clone_peak_bytes = 64,
+    });
+    var name_buf: [64]u8 = undefined;
+    for (0..IndexManager.max_retired_lsm_owner_stats - 1) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "retired-{d}", .{i});
+        manager.archiveLsmOwnerStats(.dense_vector, name, .{
+            .mutable_snapshot_clone_calls = 1,
+            .mutable_snapshot_clone_bytes_total = 128,
+            .mutable_snapshot_clone_peak_bytes = 128,
+        });
+    }
+    for (0..2) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "collapsed-{d}", .{i});
+        manager.archiveLsmOwnerStats(.dense_vector, name, .{
+            .mutable_snapshot_clone_calls = 1,
+            .mutable_snapshot_clone_bytes_total = 128,
+            .mutable_snapshot_clone_peak_bytes = 128,
+        });
+    }
+
+    const owners = try manager.snapshotLsmOwnerStatsAlloc(alloc);
+    defer {
+        for (owners) |*owner| owner.deinit(alloc);
+        alloc.free(owners);
+    }
+    try std.testing.expectEqual(IndexManager.max_retired_lsm_owner_stats + 1, owners.len);
+    const overflow = for (owners) |owner| {
+        if (owner.owner_overflow) break owner;
+    } else return error.TestExpectedEqual;
+    const concrete = for (owners) |owner| {
+        if (!owner.owner_overflow and std.mem.eql(u8, owner.name, IndexManager.retired_lsm_owner_overflow_name)) break owner;
+    } else return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), concrete.maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 2), overflow.retired_labels_collapsed_total);
+    try std.testing.expectEqual(@as(u64, 2), overflow.maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 256), overflow.maintenance.mutable_snapshot_clone_bytes_total);
+}
+
+test "shadow manager transfers clone attribution before teardown" {
+    const alloc = std.testing.allocator;
+    var source_path_buf: [256]u8 = undefined;
+    var destination_path_buf: [256]u8 = undefined;
+    const source_path = indexManagerTmpPathWithSuffix(&source_path_buf, "shadow-clone-source");
+    const destination_path = indexManagerTmpPathWithSuffix(&destination_path_buf, "shadow-clone-destination");
+    defer cleanupIndexManagerDir(source_path);
+    defer cleanupIndexManagerDir(destination_path);
+
+    var source = try IndexManager.init(alloc, std.mem.span(source_path));
+    defer source.deinit();
+    var destination = try IndexManager.init(alloc, std.mem.span(destination_path));
+    defer destination.deinit();
+    source.archiveLsmOwnerStats(.dense_vector, "embedding", .{
+        .mutable_snapshot_clone_calls = 3,
+        .mutable_snapshot_clone_bytes_total = 1536,
+        .mutable_snapshot_clone_peak_bytes = 1024,
+    });
+
+    try source.transferLsmOwnerCloneStatsTo(&destination);
+    const owners = try destination.snapshotLsmOwnerStatsAlloc(alloc);
+    defer {
+        for (owners) |*owner| owner.deinit(alloc);
+        alloc.free(owners);
+    }
+    try std.testing.expectEqual(@as(usize, 1), owners.len);
+    try std.testing.expectEqualStrings("embedding", owners[0].name);
+    try std.testing.expectEqual(@as(u64, 3), owners[0].maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 1536), owners[0].maintenance.mutable_snapshot_clone_bytes_total);
 }
 
 test "dense replay keep mask keeps only the last write per doc and index" {

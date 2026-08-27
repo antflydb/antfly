@@ -202,6 +202,8 @@ jobs:
           if git diff --quiet "$base" "${{ github.sha }}" -- \
             scripts/install.sh \
             scripts/test_install_download_markers.sh \
+            scripts/test_quickstart_docs.py \
+            docs/guides/quickstart.mdx \
             .github/workflows/cli-publish.yml \
             .github/workflows/zig-tests.yml
           then
@@ -224,6 +226,7 @@ jobs:
       - name: Test release download markers
         run: |
           scripts/test_install_download_markers.sh
+          scripts/test_quickstart_docs.py
           sh -n scripts/install.sh
           bash -n scripts/test_install_download_markers.sh
 
@@ -377,21 +380,21 @@ jobs:
         working-directory: zig/pkg/inference
         run: |
           python3 -m unittest \
-            scripts.test_benchmark_gemma4_long_e2e_server \
-            scripts.test_benchmark_gemma4_cuda_batching \
-            scripts.test_benchmark_gemma4_cuda_matrix \
-            scripts.test_benchmark_metal_gemma4_ab \
-            scripts.test_benchmark_metal_gemma4_long_output \
+            scripts.gemma4.test_benchmark_gemma4_long_e2e_server \
+            scripts.gemma4.test_benchmark_gemma4_cuda_batching \
+            scripts.gemma4.test_benchmark_gemma4_cuda_matrix \
+            scripts.gemma4.test_benchmark_metal_gemma4_ab \
+            scripts.gemma4.test_benchmark_metal_gemma4_long_output \
             scripts.test_content_security_contract \
-            scripts.test_gemma4_cuda_l4_release_gate \
-            scripts.test_gemma4_cuda_production_gate \
-            scripts.test_gemma4_qat_cuda_tuning \
-            scripts.test_gemma4_qat_llamacpp_pair_benchmark \
+            scripts.gemma4.test_gemma4_cuda_l4_release_gate \
+            scripts.gemma4.test_gemma4_cuda_production_gate \
+            scripts.gemma4.test_gemma4_qat_cuda_tuning \
+            scripts.gemma4.test_gemma4_qat_llamacpp_pair_benchmark \
             scripts.test_paired_benchmark \
             scripts.test_regen_cuda_artifacts \
             scripts.test_summarize_cuda_flash_prefill_v2 \
-            scripts.test_validate_gemma4_cuda_candidate \
-            scripts.test_validate_gemma4_cuda_quality_candidate
+            scripts.gemma4.test_validate_gemma4_cuda_candidate \
+            scripts.gemma4.test_validate_gemma4_cuda_quality_candidate
 
       - name: Test reproducible release archive packaging
         run: python3 scripts/packaging/test_reproducible_tar.py
@@ -925,9 +928,10 @@ jobs:
       - name: Upload E2E executable
         uses: actions/upload-artifact@v6
         with:
-          name: antfly-e2e-base-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base.tar.gz
           compression-level: 0
+          overwrite: true
           retention-days: 1
 
   e2e-base-tests:
@@ -949,6 +953,7 @@ jobs:
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
+      ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
       ANTFLY_CI_TRACE: "1"
     steps:
       - uses: actions/checkout@v6
@@ -970,7 +975,7 @@ jobs:
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
-          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME"
+          mkdir -p "$local_cache" "$global_cache" "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
           ln -s "/mnt/cache/antfly/zig/home-cache-${{ matrix.suite }}" ~/.cache
@@ -989,7 +994,7 @@ jobs:
       - name: Download E2E executable
         uses: actions/download-artifact@v6
         with:
-          name: antfly-e2e-base-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-base-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-base
 
       - name: Install E2E executable
@@ -1089,9 +1094,10 @@ jobs:
       - name: Upload E2E executable
         uses: actions/upload-artifact@v6
         with:
-          name: antfly-e2e-full-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full.tar.gz
           compression-level: 0
+          overwrite: true
           retention-days: 1
 
   e2e-full-tests:
@@ -1113,6 +1119,7 @@ jobs:
     env:
       UV_CACHE_DIR: /mnt/cache/antfly/zig/uv
       HF_HOME: /mnt/cache/antfly/zig/hf
+      ANTFLY_E2E_DURATION_FILE: /mnt/cache/antfly/zig/e2e-durations/antfly-v1.json
     steps:
       - uses: actions/checkout@v6
         with:
@@ -1123,7 +1130,7 @@ jobs:
 
       - name: Prepare ARC test cache dirs
         run: |
-          mkdir -p "$UV_CACHE_DIR" "$HF_HOME"
+          mkdir -p "$UV_CACHE_DIR" "$HF_HOME" "$(dirname "$ANTFLY_E2E_DURATION_FILE")"
           mkdir -p "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" "/mnt/cache/antfly/zig/home-antfly-full-${{ matrix.suite }}"
           rm -rf ~/.cache ~/.antfly
           ln -s "/mnt/cache/antfly/zig/home-cache-full-${{ matrix.suite }}" ~/.cache
@@ -1152,7 +1159,7 @@ jobs:
       - name: Download E2E executable
         uses: actions/download-artifact@v6
         with:
-          name: antfly-e2e-full-${{ github.run_id }}-${{ github.run_attempt }}
+          name: antfly-e2e-full-${{ github.run_id }}
           path: ${{ runner.temp }}/antfly-e2e-full
 
       - name: Install E2E executable

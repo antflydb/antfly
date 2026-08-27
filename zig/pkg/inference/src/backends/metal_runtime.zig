@@ -36,6 +36,7 @@ const turboquant = @import("../runtime/kv/turboquant.zig");
 const io_compat = @import("../io/compat.zig");
 const kernel_jit_profile_output = @import("../kernel_jit_profile_output.zig");
 const workload_profile_policy = @import("../workload_profile_policy.zig");
+const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 
 // Qualification evidence is valid only for the exact generated candidate,
 // handwritten baseline, and backend-specific qualification implementation.
@@ -1098,22 +1099,14 @@ fn getenvFlagEnabled(comptime name: [*:0]const u8) bool {
 }
 
 fn a4bHighMemoryFastPathEnabled() bool {
-    const S = struct {
-        var cached: ?bool = null;
-    };
-    if (S.cached) |cached| return cached;
-    const enabled = getenvBool("TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH") and
-        !getenvBool("TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH");
-    S.cached = enabled;
-    return enabled;
+    return a4b_feature_flags.highMemoryFastPathEnabled();
 }
 
 fn a4bHighMemoryFeatureEnabled(
     comptime enable_name: [*:0]const u8,
     comptime disable_name: [*:0]const u8,
 ) bool {
-    return (a4bHighMemoryFastPathEnabled() or getenvFlagEnabled(enable_name)) and
-        !getenvFlagEnabled(disable_name);
+    return a4b_feature_flags.highMemoryFeatureEnabled(enable_name, disable_name);
 }
 
 fn q4_0LinearRmsAddF16ProjectEnabled() bool {
@@ -10796,6 +10789,7 @@ test "Metal native provider initializes fresh encoder workloads with encoder reg
 }
 
 test "Metal workload profile lifecycle is bounded and fail closed" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
     const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
     defer termite_metal_decode_runtime_destroy(runtime);
@@ -11542,12 +11536,24 @@ pub const MetalJitQualificationRequest = struct {
     generated: *const RawMetalGeneratedPipeline,
 };
 
+fn unavailableMetalJitQualification(
+    context: ?*anyopaque,
+    request: MetalJitQualificationRequest,
+) anyerror!MetalJitQualificationMeasurements {
+    _ = context;
+    _ = request;
+    return error.MetalJitUnavailable;
+}
+
 pub const MetalJitQualificationHarness = struct {
     context: ?*anyopaque = null,
     qualify_fn: *const fn (
         context: ?*anyopaque,
         request: MetalJitQualificationRequest,
-    ) anyerror!MetalJitQualificationMeasurements = liveMetalJitQualification,
+    ) anyerror!MetalJitQualificationMeasurements = if (build_options.enable_metal)
+        liveMetalJitQualification
+    else
+        unavailableMetalJitQualification,
 
     pub fn qualify(
         self: MetalJitQualificationHarness,
@@ -13307,6 +13313,10 @@ fn activateMetalQualifiedProfileKernel(
     {
         return error.StaleQualifiedKernelSchedule;
     }
+    // Keep the pure profile and schedule validation above available to
+    // non-Metal builds without retaining any Metal C ABI references in their
+    // test artifacts.
+    if (comptime !build_options.enable_metal) return error.MetalJitUnavailable;
     const emitted = try quant_kernel_compiler.emitMetalScheduleCandidateSource(
         context.allocator,
         artifact,
@@ -13551,6 +13561,10 @@ fn metalJitQualificationWork(job: *MetalJitQualificationJob) anyerror!void {
 }
 
 fn metalJitActivateQualifiedJob(job: *MetalJitQualificationJob) !void {
+    if (comptime !build_options.enable_metal) {
+        job.outcome = .rejected;
+        return error.MetalJitUnavailable;
+    }
     job.outcome = .qualified;
     if (!job.mode.activates()) return;
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;

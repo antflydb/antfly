@@ -1395,9 +1395,11 @@ def test_restore_missing_backup_returns_bad_request(backup_api):
                 "connection": BACKUP_CONNECTION,
             },
         )
-        table_job = _wait_for_terminal_restore_job(backup_api, table_restore)
-        assert table_job["phase"] == "failed"
-        assert table_job["error"] == "TableAlreadyExists"
+        # Table restore must inspect the manifest before it can authorize every
+        # stored destination. A missing manifest is therefore rejected at
+        # admission and never consumes a durable job slot.
+        assert table_restore.status_code == 400
+        assert table_restore.json() == {"error": "invalid backup manifest"}
 
         cluster_restore = backup_api._request(
             "POST",

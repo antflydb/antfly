@@ -40,6 +40,7 @@ const kernel_jit = @import("../graph/kernel_jit.zig");
 const graph_quant_matmul = @import("../graph/quant_matmul.zig");
 const quant_codec = @import("../gguf/quant_codec.zig");
 const linalg = @import("inference_linalg");
+const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 
 const WeightStore = gpu_hosted_store_mod.WeightStore;
 const NativeWeightStore = native_compute_mod.WeightStore;
@@ -356,16 +357,14 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
 }
 
 fn a4bHighMemoryFastPathEnabled() bool {
-    return getenvBool("TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH") and
-        !getenvBool("TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH");
+    return a4b_feature_flags.highMemoryFastPathEnabled();
 }
 
 fn a4bHighMemoryFeatureEnabled(
     comptime enable_name: [*:0]const u8,
     comptime disable_name: [*:0]const u8,
 ) bool {
-    return (a4bHighMemoryFastPathEnabled() or getenvBool(enable_name)) and
-        !getenvBool(disable_name);
+    return a4b_feature_flags.highMemoryFeatureEnabled(enable_name, disable_name);
 }
 
 fn a4bExplicitCandidateEnabled(
@@ -34081,6 +34080,7 @@ test "metal_compute: primitive tanh saturates large finite inputs" {
 
 test "metal_compute: qualified A4B slot layout is bounded and page aligned" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
+
     var request: ops.RunMoeBlockRequest = undefined;
     request.hidden_size = 2816;
     request.inter_size = 704;
@@ -34165,6 +34165,7 @@ test "metal_compute: mapped A4B gate up fusion requires one packed descriptor" {
 
 test "metal_compute: packed Q4 slot copier honors expert and fused projection offsets" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
     const in_dim: usize = 32;
     const out_dim: usize = 32;

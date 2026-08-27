@@ -418,6 +418,7 @@ fn runBench(alloc: std.mem.Allocator, cfg: Config, dataset: []const f32, queries
         var warm = try idx.searchProfiledRequest(.{
             .query = queries[i * cfg.dims ..][0..cfg.dims],
             .k = cfg.k,
+            .search_effort = cfg.search_effort,
             .search_width = resolved_search_width,
             .epsilon = resolved_epsilon,
             .load_metadata = false,
@@ -431,6 +432,7 @@ fn runBench(alloc: std.mem.Allocator, cfg: Config, dataset: []const f32, queries
             var profiled = try idx.searchProfiledRequest(.{
                 .query = query,
                 .k = cfg.k,
+                .search_effort = cfg.search_effort,
                 .search_width = resolved_search_width,
                 .epsilon = resolved_epsilon,
                 .load_metadata = false,

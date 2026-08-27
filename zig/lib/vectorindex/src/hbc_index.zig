@@ -148,21 +148,21 @@ fn childType(comptime T: type) type {
     };
 }
 
-fn CachedNodeReadHandle(comptime T: type) type {
+pub fn CachedNodeReadHandle(comptime T: type) type {
     const Index = childType(T);
     const Borrowed = if (comptime @hasDecl(Index, "BorrowedNode")) Index.BorrowedNode else void;
     return union(enum) {
         borrowed: Borrowed,
         owned: types.Node,
 
-        fn ptr(self: *const @This()) *const types.Node {
+        pub fn ptr(self: *const @This()) *const types.Node {
             return switch (self.*) {
                 .borrowed => |*lease| if (Borrowed == void) unreachable else lease.ptr(),
                 .owned => |*node| node,
             };
         }
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             switch (self.*) {
                 .borrowed => |*lease| {
                     if (Borrowed != void) lease.deinit();
@@ -174,21 +174,21 @@ fn CachedNodeReadHandle(comptime T: type) type {
     };
 }
 
-fn CachedQuantizedReadHandle(comptime T: type) type {
+pub fn CachedQuantizedReadHandle(comptime T: type) type {
     const Index = childType(T);
     const Borrowed = if (comptime @hasDecl(Index, "BorrowedQuantized")) Index.BorrowedQuantized else void;
     return union(enum) {
         borrowed: Borrowed,
         owned: hbc_runtime.QuantizedSet,
 
-        fn ptr(self: *const @This()) *const hbc_runtime.QuantizedSet {
+        pub fn ptr(self: *const @This()) *const hbc_runtime.QuantizedSet {
             return switch (self.*) {
                 .borrowed => |*lease| if (Borrowed == void) unreachable else lease.ptr(),
                 .owned => |*qs| qs,
             };
         }
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             switch (self.*) {
                 .borrowed => |*lease| {
                     if (Borrowed != void) lease.deinit();
@@ -273,13 +273,64 @@ fn loadSearchNodeFromStorage(self: anytype, txn: anytype, node_id: u64) !types.N
     return try self.loadNodeFromStorage(txn, node_id);
 }
 
-fn cacheSearchNode(self: anytype, node: *const types.Node) !void {
+const SearchCacheFill = struct {
+    guarded: bool,
+    epoch: ?u64,
+};
+
+fn searchCacheFillForTxn(self: anytype, txn: anytype) SearchCacheFill {
     const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "beginSearchCacheFill")) {
+        const Txn = comptime childType(@TypeOf(txn));
+        if (comptime @hasField(Txn, "cache_fill_epoch")) {
+            return .{ .guarded = true, .epoch = txn.cache_fill_epoch };
+        }
+        // A miss-time epoch is insufficient: the transaction may already be
+        // an old MVCC snapshot after a writer completed. Fail closed unless the
+        // adapter bound the epoch to transaction creation.
+        return .{ .guarded = true, .epoch = null };
+    }
+    return .{ .guarded = false, .epoch = null };
+}
+
+fn cacheSearchNodeAfterLoad(self: anytype, node: *const types.Node, fill: SearchCacheFill) !void {
+    const Index = comptime childType(@TypeOf(self));
+    if (fill.guarded) {
+        const epoch = fill.epoch orelse return;
+        if (comptime @hasDecl(Index, "cacheSearchNodeIfFillCurrent")) {
+            try self.cacheSearchNodeIfFillCurrent(node, epoch);
+        }
+        return;
+    }
     if (comptime @hasDecl(Index, "cacheSearchNode")) {
         try self.cacheSearchNode(node);
     } else {
         try self.cacheNode(node);
     }
+}
+
+fn cacheQuantizedAfterLoad(self: anytype, node_id: u64, qs: *const hbc_runtime.QuantizedSet, fill: SearchCacheFill) !void {
+    const Index = comptime childType(@TypeOf(self));
+    if (fill.guarded) {
+        const epoch = fill.epoch orelse return;
+        if (comptime @hasDecl(Index, "cacheQuantizedIfFillCurrent")) {
+            try self.cacheQuantizedIfFillCurrent(node_id, qs, epoch);
+        }
+        return;
+    }
+    try self.cacheQuantized(node_id, qs);
+}
+
+fn cacheMetadataAfterLoad(self: anytype, vector_id: u64, metadata: []const u8, fill: SearchCacheFill) ![]const u8 {
+    const Index = comptime childType(@TypeOf(self));
+    if (fill.guarded) {
+        const epoch = fill.epoch orelse return metadata;
+        if (comptime @hasDecl(Index, "cacheMetadataIfFillCurrent")) {
+            return try self.cacheMetadataIfFillCurrent(vector_id, metadata, epoch);
+        }
+        return metadata;
+    }
+    return try self.cacheMetadata(vector_id, metadata);
 }
 
 fn borrowCachedVectorHandle(self: anytype, vector_id: u64) ?CachedVectorReadHandle(@TypeOf(self)) {
@@ -288,6 +339,46 @@ fn borrowCachedVectorHandle(self: anytype, vector_id: u64) ?CachedVectorReadHand
         if (self.borrowCachedVector(vector_id)) |borrowed| return .{ .borrowed = borrowed };
     }
     return null;
+}
+
+const VectorCacheFill = struct {
+    guarded: bool,
+    epoch: ?u64,
+};
+
+fn beginVectorCacheFillIfSupported(self: anytype, vector_id: u64) VectorCacheFill {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "beginVectorCacheFill")) {
+        return .{ .guarded = true, .epoch = self.beginVectorCacheFill(vector_id) };
+    }
+    return .{ .guarded = false, .epoch = null };
+}
+
+fn cacheVectorAfterLoad(self: anytype, vector_id: u64, vector: []const f32, fill: VectorCacheFill) ![]const f32 {
+    const Index = comptime childType(@TypeOf(self));
+    if (fill.guarded) {
+        const epoch = fill.epoch orelse return vector;
+        if (comptime @hasDecl(Index, "cacheVectorIfFillCurrent")) {
+            return try self.cacheVectorIfFillCurrent(vector_id, vector, epoch);
+        }
+        return vector;
+    }
+    return try self.cacheVector(vector_id, vector);
+}
+
+fn abortVectorCacheMutationsIfSupported(self: anytype) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "abortVectorCacheMutations")) self.abortVectorCacheMutations();
+}
+
+fn seedRetainedVectorsAfterCommit(self: anytype, items: []const hbc_runtime.BatchInsertItem, options: anytype) void {
+    const Options = @TypeOf(options);
+    if (comptime !@hasField(Options, "skip_vector_store")) return;
+    if (!options.skip_vector_store) return;
+    // Skip-store embeddings are authoritative in the caller's LSM. Cache
+    // them only after the index transaction publishes, never from its
+    // uncommitted mutation window.
+    for (items) |item| _ = self.cacheVector(item.vector_id, item.vector) catch {};
 }
 
 fn shouldSeedRetainedVectorCacheOnSkipStore(self: anytype) bool {
@@ -312,7 +403,7 @@ fn borrowCachedMetadataHandle(self: anytype, vector_id: u64) ?CachedMetadataRead
     return null;
 }
 
-fn loadNodeReadHandleProfiled(
+pub fn loadNodeReadHandleProfiled(
     self: anytype,
     txn: anytype,
     node_id: u64,
@@ -320,32 +411,59 @@ fn loadNodeReadHandleProfiled(
     now_fn: fn () u64,
     elapsed_fn: fn (u64) u64,
 ) !CachedNodeReadHandle(@TypeOf(self)) {
+    return loadNodeReadHandleProfiledWithCachePolicy(self, txn, node_id, profile, true, now_fn, elapsed_fn);
+}
+
+fn loadNodeReadHandleProfiledWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    profile: *search_types.SearchProfile,
+    comptime use_cache: bool,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+) !CachedNodeReadHandle(@TypeOf(self)) {
     const lookup_start = now_fn();
-    if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| {
-        profile.node_cache_lookup_ns += elapsed_fn(lookup_start);
-        return cached;
+    if (use_cache) {
+        if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| {
+            profile.node_cache_lookup_ns += elapsed_fn(lookup_start);
+            return cached;
+        }
     }
     profile.node_cache_lookup_ns += elapsed_fn(lookup_start);
 
     const start = now_fn();
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     var loaded = try loadSearchNodeFromStorage(self, txn, node_id);
     errdefer loaded.deinit(self.alloc);
-    try self.cacheSearchNode(&loaded);
+    if (use_cache) try cacheSearchNodeAfterLoad(self, &loaded, fill);
     profile.node_cache_miss_ns += elapsed_fn(start);
     profile.node_cache_misses += 1;
     return .{ .owned = loaded };
 }
 
-fn loadNodeReadHandle(
+pub fn loadNodeReadHandle(
     self: anytype,
     txn: anytype,
     node_id: u64,
 ) !CachedNodeReadHandle(@TypeOf(self)) {
-    if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| return cached;
+    return loadNodeReadHandleWithCachePolicy(self, txn, node_id, true);
+}
 
+fn loadNodeReadHandleWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    comptime use_cache: bool,
+) !CachedNodeReadHandle(@TypeOf(self)) {
+    if (use_cache) {
+        if (try borrowSearchCachedNodeHandle(self, node_id)) |cached| return cached;
+    }
+
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     var loaded = try loadSearchNodeFromStorage(self, txn, node_id);
     errdefer loaded.deinit(self.alloc);
-    try self.cacheSearchNode(&loaded);
+    if (use_cache) try cacheSearchNodeAfterLoad(self, &loaded, fill);
     return .{ .owned = loaded };
 }
 
@@ -366,7 +484,7 @@ fn loadMutationNodeReadHandle(
     return .{ .owned = loaded };
 }
 
-fn loadQuantizedReadHandleProfiled(
+pub fn loadQuantizedReadHandleProfiled(
     self: anytype,
     txn: anytype,
     node_id: u64,
@@ -377,9 +495,35 @@ fn loadQuantizedReadHandleProfiled(
     elapsed_fn: fn (u64) u64,
     is_not_found: fn (anyerror) bool,
 ) !?CachedQuantizedReadHandle(@TypeOf(self)) {
+    return loadQuantizedReadHandleProfiledWithCachePolicy(
+        self,
+        txn,
+        node_id,
+        is_root,
+        expected_count,
+        profile,
+        true,
+        now_fn,
+        elapsed_fn,
+        is_not_found,
+    );
+}
+
+fn loadQuantizedReadHandleProfiledWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    is_root: bool,
+    expected_count: usize,
+    profile: *search_types.SearchProfile,
+    comptime use_cache: bool,
+    now_fn: fn () u64,
+    elapsed_fn: fn (u64) u64,
+    is_not_found: fn (anyerror) bool,
+) !?CachedQuantizedReadHandle(@TypeOf(self)) {
     const Index = comptime childType(@TypeOf(self));
     const lookup_start = now_fn();
-    if (comptime @hasDecl(Index, "borrowCachedQuantized")) {
+    if (use_cache and comptime @hasDecl(Index, "borrowCachedQuantized")) {
         if (self.borrowCachedQuantized(node_id)) |borrowed| {
             profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
             var handle = borrowed;
@@ -396,30 +540,34 @@ fn loadQuantizedReadHandleProfiled(
             return .{ .borrowed = borrowed };
         }
         profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
-    } else if (try self.getCachedQuantizedClone(node_id)) |cached| {
-        profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
-        validateQuantizedSet(self, &cached, expected_count) catch |err| switch (err) {
-            error.Corrupted => self.invalidateQuantizedCache(node_id),
-        };
-        if (try self.getCachedQuantizedClone(node_id)) |valid| return .{ .owned = valid };
     } else {
+        if (use_cache) {
+            if (try self.getCachedQuantizedClone(node_id)) |cached| {
+                profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
+                validateQuantizedSet(self, &cached, expected_count) catch |err| switch (err) {
+                    error.Corrupted => self.invalidateQuantizedCache(node_id),
+                };
+                if (try self.getCachedQuantizedClone(node_id)) |valid| return .{ .owned = valid };
+            }
+        }
         profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
     }
 
     const start = now_fn();
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
         if (is_not_found(err) or err == error.Corrupted) return null;
         return err;
     };
     profile.quantized_cache_miss_ns += elapsed_fn(start);
     profile.quantized_cache_misses += 1;
-    if (self.cache_enabled) {
-        self.cacheQuantized(node_id, &decoded) catch {};
+    if (use_cache and self.cache_enabled) {
+        cacheQuantizedAfterLoad(self, node_id, &decoded, fill) catch {};
     }
     return .{ .owned = decoded };
 }
 
-fn loadQuantizedReadHandle(
+pub fn loadQuantizedReadHandle(
     self: anytype,
     txn: anytype,
     node_id: u64,
@@ -450,14 +598,45 @@ fn loadQuantizedReadHandle(
         if (try self.getCachedQuantizedClone(node_id)) |valid| return .{ .owned = valid };
     }
 
+    const fill = searchCacheFillForTxn(self, txn);
     const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
         if (is_not_found(err) or err == error.Corrupted) return null;
         return err;
     };
     if (self.cache_enabled) {
-        self.cacheQuantized(node_id, &decoded) catch {};
+        cacheQuantizedAfterLoad(self, node_id, &decoded, fill) catch {};
     }
     return .{ .owned = decoded };
+}
+
+/// Return an independently owned quantized value for mutation paths. Cached
+/// entries are immutable while published: writers clone, modify, persist, and
+/// replace them instead of retaining a lease and racing readers in place.
+fn loadQuantizedOwned(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    is_root: bool,
+    expected_count: usize,
+    is_not_found: fn (anyerror) bool,
+) !?hbc_runtime.QuantizedSet {
+    if (try self.getCachedQuantizedClone(node_id)) |cached_value| {
+        var cached = cached_value;
+        validateQuantizedSet(self, &cached, expected_count) catch {
+            cached.deinit(self.alloc);
+            self.invalidateQuantizedCache(node_id);
+            return loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
+                if (is_not_found(err) or err == error.Corrupted) return null;
+                return err;
+            };
+        };
+        return cached;
+    }
+
+    return loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
+        if (is_not_found(err) or err == error.Corrupted) return null;
+        return err;
+    };
 }
 
 fn recordDeferredQuantizedNode(self: anytype, node_id: u64) !void {
@@ -671,14 +850,13 @@ pub fn updateParent(self: anytype, txn: anytype, node_id: u64, new_parent: u64, 
     }
     var key_buf: [12]u8 = undefined;
     const packed_data = try self.getNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node_id, .packed_node));
-    const packed_value = try self.alloc.dupe(u8, packed_data);
+    const decoded = try hbc.decodePackedNodeValue(packed_data);
+    const packed_value = try self.alloc.alloc(u8, hbc.packedNodeValueSize(decoded.centroid_bytes.len, decoded.ids_bytes.len));
     defer self.alloc.free(packed_value);
-    var decoded = try hbc.decodePackedNodeValue(packed_value);
     var header = decoded.header;
     const old_parent = header.parent;
     header.parent = new_parent;
-    decoded.header = header;
-    _ = try hbc.encodePackedNodeValue(packed_value, decoded.header, decoded.centroid_bytes, decoded.ids_bytes);
+    _ = try hbc.encodePackedNodeValue(packed_value, header, decoded.covering_radius, decoded.centroid_bytes, decoded.ids_bytes);
     try self.putNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node_id, .packed_node), packed_value);
     self.invalidateNodeCache(node_id);
     if (self.config.use_quantization and (old_parent == 0) != (new_parent == 0)) {
@@ -719,10 +897,17 @@ pub fn getVectorInto(self: anytype, txn: anytype, vector_id: u64, scratch: []f32
         @memcpy(scratch[0..cached.len], cached);
         return scratch[0..cached.len];
     }
+    const fill = beginVectorCacheFillIfSupported(self, vector_id);
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, vector_id));
     const view = try vectorViewFromRaw(data, scratch);
-    return try self.cacheVector(vector_id, view);
+    return try cacheVectorAfterLoad(self, vector_id, view, fill);
+}
+
+pub fn getVectorIntoUncached(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
+    var key_buf: [10]u8 = undefined;
+    const data = try self.getNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, vector_id));
+    return try vectorViewFromRaw(data, scratch);
 }
 
 pub fn getVectorViewOrScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
@@ -738,12 +923,13 @@ pub fn getVectorViewOrScratchWithCursor(self: anytype, cursor: anytype, vector_i
         @memcpy(scratch[0..cached.len], cached);
         return scratch[0..cached.len];
     }
+    const fill = beginVectorCacheFillIfSupported(self, vector_id);
     var key_buf: [10]u8 = undefined;
     const key = hbc.encodeVecKey(&key_buf, vector_id);
     const entry = (try cursor.seekAtOrAfter(key)) orelse return error.NotFound;
     if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
     const view = try vectorViewFromRaw(entry.value, scratch);
-    return try self.cacheVector(vector_id, view);
+    return try cacheVectorAfterLoad(self, vector_id, view, fill);
 }
 
 pub fn getVectorScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []f32) ![]const f32 {
@@ -755,10 +941,11 @@ pub fn getVectorScratch(self: anytype, txn: anytype, vector_id: u64, scratch: []
         @memcpy(scratch[0..cached.len], cached);
         return scratch[0..cached.len];
     }
+    const fill = beginVectorCacheFillIfSupported(self, vector_id);
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, vector_id));
     const view = try vectorViewFromRaw(data, scratch);
-    return try self.cacheVector(vector_id, view);
+    return try cacheVectorAfterLoad(self, vector_id, view, fill);
 }
 
 pub fn vectorViewFromRaw(data: []const u8, scratch: []f32) ![]const f32 {
@@ -781,13 +968,34 @@ pub fn getVecLeaf(self: anytype, txn: anytype, vector_id: u64) !u64 {
 }
 
 pub fn loadMetadataRaw(self: anytype, txn: anytype, vector_id: u64, is_not_found: fn (anyerror) bool) !?[]const u8 {
-    if (self.getCachedMetadata(vector_id)) |cached| return cached;
+    return loadMetadataRawWithCachePolicy(self, txn, vector_id, true, is_not_found);
+}
+
+pub fn loadMetadataRawUncached(self: anytype, txn: anytype, vector_id: u64, is_not_found: fn (anyerror) bool) !?[]const u8 {
+    return loadMetadataRawWithCachePolicy(self, txn, vector_id, false, is_not_found);
+}
+
+fn loadMetadataRawWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    vector_id: u64,
+    comptime use_cache: bool,
+    is_not_found: fn (anyerror) bool,
+) !?[]const u8 {
+    const Index = comptime childType(@TypeOf(self));
+    // Retained-cache implementations cannot return a raw cached slice: a
+    // concurrent reclaimer may evict it immediately after the lookup lock is
+    // released. Scalar callers receive the transaction-owned storage view.
+    if (use_cache and comptime !@hasDecl(Index, "borrowCachedMetadata")) {
+        if (self.getCachedMetadata(vector_id)) |cached| return cached;
+    }
     var key_buf: [10]u8 = undefined;
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     const data = self.getNamespaced(txn, .vecs, hbc.encodeVecMetaKey(&key_buf, vector_id)) catch |err| {
         if (is_not_found(err)) return null;
         return err;
     };
-    return try self.cacheMetadata(vector_id, data);
+    return if (use_cache) try cacheMetadataAfterLoad(self, vector_id, data, fill) else data;
 }
 
 pub fn putMetadata(self: anytype, txn: anytype, vector_id: u64, metadata: []const u8) !void {
@@ -838,7 +1046,7 @@ fn savePackedNodeValue(self: anytype, txn: anytype, node: *const types.Node) !vo
     const packed_len = hbc.packedNodeValueSize(centroid_bytes.len, ids_bytes.len);
     const packed_value = try self.alloc.alloc(u8, packed_len);
     defer self.alloc.free(packed_value);
-    const encoded = try hbc.encodePackedNodeValue(packed_value, header, centroid_bytes, ids_bytes);
+    const encoded = try hbc.encodePackedNodeValue(packed_value, header, node.covering_radius, centroid_bytes, ids_bytes);
     var key_buf: [12]u8 = undefined;
     try self.putNamespaced(txn, .nodes, hbc.encodeNodeKey(&key_buf, node.id, .packed_node), encoded);
 }
@@ -938,7 +1146,7 @@ fn refreshQuantizedWithKnownVectors(
 fn saveLeafNodeBodyWithKnownVectors(
     self: anytype,
     txn: anytype,
-    node: *const types.Node,
+    node: *types.Node,
     vectors: []const f32,
     now_fn: fn () i128,
     elapsed_fn: fn (i128) u64,
@@ -951,6 +1159,10 @@ fn saveLeafNodeBodyWithKnownVectors(
         self.write_profile.save_node_calls += 1;
     }
 
+    node.covering_radius = if (self.config.metric == .l2_squared)
+        l2CoveringRadiusForMatrix(node.centroid, vectors, node.members.len)
+    else
+        std.math.nan(f32);
     try savePackedNodeValue(self, txn, node);
     try refreshQuantizedWithKnownVectors(self, txn, node, vectors, nowNsU64Fixed, elapsedSinceU64Fixed);
     clearDeferredQuantizedNode(self, node.id);
@@ -960,7 +1172,7 @@ fn saveLeafNodeBodyWithKnownVectors(
 fn saveLeafNodeWithKnownVectors(
     self: anytype,
     txn: anytype,
-    node: *const types.Node,
+    node: *types.Node,
     vectors: []const f32,
     now_fn: fn () i128,
     elapsed_fn: fn (i128) u64,
@@ -1186,13 +1398,13 @@ pub fn updateQuantizedWithAddedVector(
     if (node.members.len == 0) return false;
 
     const previous_count = node.members.len - 1;
-    _ = self.getQuantized(txn, node.id, usesNonQuantizedPayload(node), previous_count) catch |err| switch (err) {
+    var cached = (loadQuantizedOwned(self, txn, node.id, usesNonQuantizedPayload(node), previous_count, isNotFoundGeneric) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return false,
-    };
-    const cached = self.getCachedQuantizedPtr(node.id) orelse return false;
+    }) orelse return false;
+    defer cached.deinit(self.alloc);
 
-    switch (cached.*) {
+    switch (cached) {
         .nonquant => |*set| {
             const old_len = set.vectors.data.len;
             set.vectors.dims = @intCast(self.config.dims);
@@ -1212,7 +1424,8 @@ pub fn updateQuantizedWithAddedVector(
     self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
 
     const store_start = now_fn();
-    try self.putQuantizedCached(txn, node.id, cached);
+    try self.putQuantizedCached(txn, node.id, &cached);
+    try self.cacheQuantized(node.id, &cached);
     self.write_profile.quantized_store_ns += elapsed_fn(store_start);
     self.write_profile.refresh_quantized_ns += elapsed_fn(compute_start);
     return true;
@@ -1243,14 +1456,14 @@ fn primeDeferredLeafNonQuantCacheWithAddedVector(
                 .data = try self.alloc.dupe(f32, transformed_vector),
             },
         } };
-        _ = try self.cacheQuantizedOwned(node.id, fresh);
+        try self.cacheQuantizedOwned(node.id, fresh);
         self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
         return true;
     }
 
-    _ = try self.getQuantized(txn, node.id, true, previous_count);
-    const cached = self.getCachedQuantizedPtr(node.id) orelse return false;
-    switch (cached.*) {
+    var cached = (try loadQuantizedOwned(self, txn, node.id, true, previous_count, isNotFoundGeneric)) orelse return false;
+    defer cached.deinit(self.alloc);
+    switch (cached) {
         .nonquant => |*set| {
             const old_len = set.vectors.data.len;
             set.vectors.dims = @intCast(self.config.dims);
@@ -1262,6 +1475,7 @@ fn primeDeferredLeafNonQuantCacheWithAddedVector(
                 @memcpy(set.vectors.data[old_len..][0..transformed_vector.len], transformed_vector);
             }
             noteMutatedCachedQuantized(self, node.id);
+            try self.cacheQuantized(node.id, &cached);
             self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
             return true;
         },
@@ -1286,13 +1500,13 @@ pub fn updateQuantizedWithAddedVectors(
     if (added_count == 0) return true;
 
     const previous_count = node.members.len - added_count;
-    _ = self.getQuantized(txn, node.id, usesNonQuantizedPayload(node), previous_count) catch |err| switch (err) {
+    var cached = (loadQuantizedOwned(self, txn, node.id, usesNonQuantizedPayload(node), previous_count, isNotFoundGeneric) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return false,
-    };
-    const cached = self.getCachedQuantizedPtr(node.id) orelse return false;
+    }) orelse return false;
+    defer cached.deinit(self.alloc);
 
-    switch (cached.*) {
+    switch (cached) {
         .nonquant => |*set| {
             const old_len = set.vectors.data.len;
             set.vectors.dims = @intCast(self.config.dims);
@@ -1312,7 +1526,8 @@ pub fn updateQuantizedWithAddedVectors(
     self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
 
     const store_start = now_fn();
-    try self.putQuantizedCached(txn, node.id, cached);
+    try self.putQuantizedCached(txn, node.id, &cached);
+    try self.cacheQuantized(node.id, &cached);
     self.write_profile.quantized_store_ns += elapsed_fn(store_start);
     self.write_profile.refresh_quantized_ns += elapsed_fn(compute_start);
     return true;
@@ -1345,14 +1560,14 @@ fn primeDeferredLeafNonQuantCacheWithAddedVectors(
                 .data = try self.alloc.dupe(f32, transformed_vectors),
             },
         } };
-        _ = try self.cacheQuantizedOwned(node.id, fresh);
+        try self.cacheQuantizedOwned(node.id, fresh);
         self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
         return true;
     }
 
-    _ = try self.getQuantized(txn, node.id, true, previous_count);
-    const cached = self.getCachedQuantizedPtr(node.id) orelse return false;
-    switch (cached.*) {
+    var cached = (try loadQuantizedOwned(self, txn, node.id, true, previous_count, isNotFoundGeneric)) orelse return false;
+    defer cached.deinit(self.alloc);
+    switch (cached) {
         .nonquant => |*set| {
             const old_len = set.vectors.data.len;
             set.vectors.dims = @intCast(self.config.dims);
@@ -1364,6 +1579,7 @@ fn primeDeferredLeafNonQuantCacheWithAddedVectors(
                 @memcpy(set.vectors.data[old_len..][0..transformed_vectors.len], transformed_vectors);
             }
             noteMutatedCachedQuantized(self, node.id);
+            try self.cacheQuantized(node.id, &cached);
             self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
             return true;
         },
@@ -1505,6 +1721,24 @@ fn includeSplitRangeBounds(
 test "internal node split range loads child ranges in one sorted batch" {
     const TestIndex = struct {
         alloc: Allocator,
+
+        fn getCachedMetadata(_: @This(), _: u64) ?[]const u8 {
+            return null;
+        }
+
+        fn cacheMetadata(_: @This(), _: u64, metadata: []const u8) ![]const u8 {
+            return metadata;
+        }
+
+        fn getCachedNodeClone(_: @This(), _: u64) !?types.Node {
+            return null;
+        }
+
+        fn loadNodeFromStorage(_: @This(), _: anytype, _: u64) !types.Node {
+            return error.UnexpectedNodeLoad;
+        }
+
+        fn cacheNode(_: @This(), _: *const types.Node) !void {}
     };
     const TestTxn = struct {
         first: []const u8,
@@ -1563,6 +1797,16 @@ test "leaf node split range loads member metadata in one sorted batch" {
         fn cacheMetadata(_: @This(), _: u64, metadata: []const u8) ![]const u8 {
             return metadata;
         }
+
+        fn getCachedNodeClone(_: @This(), _: u64) !?types.Node {
+            return null;
+        }
+
+        fn loadNodeFromStorage(_: @This(), _: anytype, _: u64) !types.Node {
+            return error.UnexpectedNodeLoad;
+        }
+
+        fn cacheNode(_: @This(), _: *const types.Node) !void {}
     };
     const TestTxn = struct {
         calls: usize = 0,
@@ -1654,6 +1898,32 @@ pub fn getMetadataManySortedInTxn(self: anytype, txn: anytype, vector_ids: []con
     try getMetadataManySortedInTxnWithScratch(self, txn, vector_ids, out_metadata, lookups, key_views, values);
 }
 
+/// Return transaction-owned metadata views without consulting or populating
+/// the retained metadata cache. Single-pass callers such as exact scoring keep
+/// the transaction alive for the complete scan and would otherwise pay a
+/// clone/lock/eviction cycle for entries they never reuse.
+pub fn getMetadataManySortedInTxnUncached(self: anytype, txn: anytype, vector_ids: []const u64, out_metadata: []?[]const u8) !void {
+    const lookups = try self.alloc.alloc(FixedKeyLookup, vector_ids.len);
+    defer self.alloc.free(lookups);
+    const key_views = try self.alloc.alloc([]const u8, vector_ids.len);
+    defer self.alloc.free(key_views);
+    const values = try self.alloc.alloc(?[]const u8, vector_ids.len);
+    defer self.alloc.free(values);
+    try getMetadataManySortedInTxnWithScratchProfiled(
+        self,
+        txn,
+        vector_ids,
+        out_metadata,
+        lookups,
+        key_views,
+        values,
+        false,
+        null,
+        null,
+        null,
+    );
+}
+
 pub fn getMetadataManySortedInTxnWithScratch(
     self: anytype,
     txn: anytype,
@@ -1663,6 +1933,58 @@ pub fn getMetadataManySortedInTxnWithScratch(
     key_views_storage: [][]const u8,
     values_storage: []?[]const u8,
 ) !void {
+    return try getMetadataManySortedInTxnWithScratchProfiled(
+        self,
+        txn,
+        vector_ids,
+        out_metadata,
+        lookup_storage,
+        key_views_storage,
+        values_storage,
+        true,
+        null,
+        null,
+        null,
+    );
+}
+
+pub fn getMetadataManySortedInTxnWithScratchUncached(
+    self: anytype,
+    txn: anytype,
+    vector_ids: []const u64,
+    out_metadata: []?[]const u8,
+    lookup_storage: []FixedKeyLookup,
+    key_views_storage: [][]const u8,
+    values_storage: []?[]const u8,
+) !void {
+    return try getMetadataManySortedInTxnWithScratchProfiled(
+        self,
+        txn,
+        vector_ids,
+        out_metadata,
+        lookup_storage,
+        key_views_storage,
+        values_storage,
+        false,
+        null,
+        null,
+        null,
+    );
+}
+
+fn getMetadataManySortedInTxnWithScratchProfiled(
+    self: anytype,
+    txn: anytype,
+    vector_ids: []const u64,
+    out_metadata: []?[]const u8,
+    lookup_storage: []FixedKeyLookup,
+    key_views_storage: [][]const u8,
+    values_storage: []?[]const u8,
+    comptime use_cache: bool,
+    profile: ?*search_types.SearchProfile,
+    now_fn_u64: ?*const fn () u64,
+    elapsed_fn_u64: ?*const fn (u64) u64,
+) !void {
     if (vector_ids.len != out_metadata.len) return error.InvalidArgument;
     if (lookup_storage.len < vector_ids.len) return error.InvalidArgument;
     if (key_views_storage.len < vector_ids.len) return error.InvalidArgument;
@@ -1671,11 +1993,20 @@ pub fn getMetadataManySortedInTxnWithScratch(
     if (vector_ids.len == 0) return;
 
     var lookup_count: usize = 0;
+    const Index = comptime childType(@TypeOf(self));
     for (vector_ids, 0..) |vector_id, index| {
-        if (self.getCachedMetadata(vector_id)) |cached| {
-            out_metadata[index] = cached;
-            continue;
+        // See loadMetadataRaw: this API returns views that remain live after
+        // the function returns, so retained-cache adapters must use the
+        // transaction-owned ordered read. Result population uses borrowed
+        // handles where the lifetime is naturally bounded.
+        if (use_cache and comptime !@hasDecl(Index, "borrowCachedMetadata")) {
+            if (self.getCachedMetadata(vector_id)) |cached| {
+                if (profile) |p| p.metadata_cache_hits += 1;
+                out_metadata[index] = cached;
+                continue;
+            }
         }
+        if (profile) |p| p.metadata_cache_misses += 1;
         var key: [10]u8 = undefined;
         _ = hbc.encodeVecMetaKey(&key, vector_id);
         lookup_storage[lookup_count] = .{
@@ -1694,6 +2025,8 @@ pub fn getMetadataManySortedInTxnWithScratch(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
+    const miss_start = if (now_fn_u64) |now| now() else 0;
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
         try txn.getManySorted(.vecs, key_views, values);
     } else {
@@ -1704,9 +2037,13 @@ pub fn getMetadataManySortedInTxnWithScratch(
             };
         }
     }
+    if (profile) |p| p.metadata_cache_miss_ns += elapsed_fn_u64.?(miss_start);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
-        out_metadata[lookups[i].item_index] = try self.cacheMetadata(lookups[i].vector_id, value);
+        out_metadata[lookups[i].item_index] = if (use_cache)
+            try cacheMetadataAfterLoad(self, lookups[i].vector_id, value, fill)
+        else
+            value;
     }
 }
 
@@ -1820,14 +2157,134 @@ pub fn searchProfiledRequest(
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !search_types.ProfiledSearchResults {
+    if (!search_types.requiresExhaustiveCoverage(req)) {
+        return try searchProfiledRequestAttempt(self, req, null, false, null, now_fn_u64, elapsed_fn_u64);
+    }
+
+    const Index = comptime childType(@TypeOf(self));
+    var pessimistic = false;
+    while (true) {
+        const capture_durable_snapshot = pessimistic and comptime @hasDecl(Index, "beginCompleteSnapshotRead");
+        if (capture_durable_snapshot) {
+            // The durable attempt captures both the publication metadata and
+            // its MVCC transaction under the reader fence. It therefore has
+            // no pre-fence token to invalidate and must terminate rather than
+            // joining an unbounded retry loop behind queued publishers.
+            notifyBeforeDurableSnapshotCaptureForTestIfSupported(self);
+            var durable_generation: ?u64 = null;
+            return searchProfiledRequestAttempt(
+                self,
+                req,
+                null,
+                true,
+                &durable_generation,
+                now_fn_u64,
+                elapsed_fn_u64,
+            ) catch |err| {
+                if (err == error.IncompletePublishedSnapshot) {
+                    if (durable_generation) |generation| {
+                        noteIncompletePublishedSnapshotIfSupported(self, generation);
+                    }
+                }
+                return err;
+            };
+        }
+        const token = CompleteSnapshotAttempt{
+            .snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation),
+            .mutation_epoch = publishedMutationEpoch(self),
+        };
+
+        const profiled = searchProfiledRequestAttempt(
+            self,
+            req,
+            token.snapshot,
+            false,
+            null,
+            now_fn_u64,
+            elapsed_fn_u64,
+        ) catch |err| {
+            const attempt_current = completeSnapshotAttemptStillCurrent(self, token);
+            if (err == error.StalePublishedSnapshot or
+                (err == error.IncompletePublishedSnapshot and
+                    !attempt_current))
+            {
+                // The attempt overlapped a publisher. Retry under a short
+                // reader fence to capture a durable MVCC transaction.
+                // Traversal then runs cache-free after releasing the fence, so
+                // writers are not serialized behind the O(N) exhaustive pass.
+                pessimistic = true;
+                continue;
+            }
+            if (err == error.IncompletePublishedSnapshot) {
+                noteIncompletePublishedSnapshotIfSupported(self, token.snapshot.publish_generation);
+            }
+            return err;
+        };
+
+        if (completeSnapshotAttemptStillCurrent(self, token)) return profiled;
+
+        var stale = profiled;
+        stale.results.deinit();
+        pessimistic = true;
+    }
+}
+
+const CompleteSnapshotAttempt = struct {
+    snapshot: SearchPublishedSnapshot,
+    mutation_epoch: u64,
+};
+
+fn publishedMutationEpoch(self: anytype) u64 {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "publishedMutationEpoch")) return self.publishedMutationEpoch();
+    return 0;
+}
+
+fn completeSnapshotAttemptStillCurrent(self: anytype, attempt: CompleteSnapshotAttempt) bool {
+    return publishedSnapshotStillCurrent(self, attempt.snapshot) and
+        publishedMutationEpoch(self) == attempt.mutation_epoch and
+        (attempt.mutation_epoch & 1) == 0;
+}
+
+fn searchProfiledRequestAttempt(
+    self: anytype,
+    req: search_types.SearchRequest,
+    expected_snapshot: ?SearchPublishedSnapshot,
+    comptime capture_durable_snapshot: bool,
+    captured_generation_out: ?*?u64,
+    now_fn_u64: fn () u64,
+    elapsed_fn_u64: fn (u64) u64,
+) anyerror!search_types.ProfiledSearchResults {
     var profile = search_types.SearchProfile{};
+    const Index = comptime childType(@TypeOf(self));
+    defer if (!capture_durable_snapshot and comptime @hasDecl(Index, "observeSearchCacheBenefit")) {
+        self.observeSearchCacheBenefit(&profile);
+    };
     const total_start = now_fn_u64();
     try search_types.checkCancelled(req);
-    hbc_runtime.beginSearchEpoch(self);
-    defer hbc_runtime.endSearchEpoch(self);
-    const Index = comptime childType(@TypeOf(self));
-    if (comptime @hasDecl(Index, "publishedActiveCount")) {
-        if (self.publishedActiveCount() == 0) {
+    const coverage_policy = search_types.coveragePolicy(req);
+    const exhaustive_coverage = coverage_policy == .complete_snapshot;
+    var snapshot_fence_held = false;
+    if (capture_durable_snapshot and comptime @hasDecl(Index, "beginCompleteSnapshotRead")) {
+        try self.beginCompleteSnapshotRead(req.cancellation);
+        snapshot_fence_held = true;
+    }
+    errdefer if (snapshot_fence_held) self.endCompleteSnapshotRead();
+
+    var published_snapshot = if (capture_durable_snapshot)
+        try loadStableSearchPublishedSnapshot(self, req.cancellation)
+    else
+        expected_snapshot orelse try loadStableSearchPublishedSnapshot(self, req.cancellation);
+    if (captured_generation_out) |out| out.* = published_snapshot.publish_generation;
+    if (published_snapshot.active_count == 0) {
+        if (snapshot_fence_held) {
+            self.endCompleteSnapshotRead();
+            snapshot_fence_held = false;
+            const empty = search_results.SearchResults.init(self.alloc, req.k);
+            profile.total_ns = elapsed_fn_u64(total_start);
+            return .{ .results = empty, .profile = profile };
+        }
+        if (!exhaustive_coverage or publishedSnapshotStillCurrent(self, published_snapshot)) {
             const empty = search_results.SearchResults.init(self.alloc, req.k);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{
@@ -1835,13 +2292,69 @@ pub fn searchProfiledRequest(
                 .profile = profile,
             };
         }
+        published_snapshot = try loadStableSearchPublishedSnapshot(self, req.cancellation);
     }
+    var coverage_tracker = CompleteCoverageTracker.init(
+        .{ .enabled = false, .held = false },
+        published_snapshot.active_count,
+    );
+    defer if (coverage_tracker.claim_held) {
+        // A normal early exit without a completed validation is retryable.
+        finishCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, false);
+    };
+    errdefer |failure| if (coverage_tracker.claim_held) {
+        failCompleteCoverageValidationIfSupported(self, published_snapshot.publish_generation, failure);
+        coverage_tracker.claim_held = false;
+    };
+    if (!capture_durable_snapshot) {
+        coverage_tracker = CompleteCoverageTracker.init(
+            try beginCompleteCoverageValidationIfSupported(
+                self,
+                exhaustive_coverage,
+                published_snapshot.publish_generation,
+                req.cancellation,
+            ),
+            published_snapshot.active_count,
+        );
+    }
+    // A waiter may have spent time behind the generation validator. Do not
+    // retain an MVCC snapshot or request workspace while waiting, and honor a
+    // disconnect before acquiring either resource.
+    try search_types.checkCancelled(req);
     const setup_start = total_start;
     const txn_start = now_fn_u64();
-    var txn = try self.beginRuntimeSearchTxn();
-    profile.runtime_txn_ns += elapsed_fn_u64(txn_start);
+    var txn = if (comptime @hasDecl(Index, "beginRuntimeSearchTxnForCoverage"))
+        try self.beginRuntimeSearchTxnForCoverage(exhaustive_coverage)
+    else
+        try self.beginRuntimeSearchTxn();
     defer txn.abort();
-    if (comptime @hasDecl(Index, "pinUpperTreeCache")) {
+    if (!capture_durable_snapshot and exhaustive_coverage and !publishedSnapshotStillCurrent(self, published_snapshot)) {
+        return error.StalePublishedSnapshot;
+    }
+    if (snapshot_fence_held) {
+        self.endCompleteSnapshotRead();
+        snapshot_fence_held = false;
+    }
+    if (exhaustive_coverage) notifyCompleteSnapshotCapturedForTestIfSupported(self);
+    if (capture_durable_snapshot) {
+        // Validation can wait on another query's generation flight. Hold the
+        // captured MVCC transaction, but never the publication fence, while
+        // waiting so publishers remain independent of the O(N) traversal.
+        coverage_tracker = CompleteCoverageTracker.init(
+            try beginCompleteCoverageValidationIfSupported(
+                self,
+                exhaustive_coverage,
+                published_snapshot.publish_generation,
+                req.cancellation,
+            ),
+            published_snapshot.active_count,
+        );
+    }
+    hbc_runtime.beginSearchEpoch(self);
+    defer hbc_runtime.endSearchEpoch(self);
+    const use_search_cache = !capture_durable_snapshot;
+    profile.runtime_txn_ns += elapsed_fn_u64(txn_start);
+    if (use_search_cache and comptime @hasDecl(Index, "pinUpperTreeCache")) {
         try self.pinUpperTreeCache(&txn);
     }
     var filter_state = try search_types.RequestFilterState.init(self.alloc, req);
@@ -1849,13 +2362,14 @@ pub fn searchProfiledRequest(
     const scratch_start = now_fn_u64();
     var scratch_handle = try self.acquireSearchScratch();
     profile.scratch_acquire_ns += elapsed_fn_u64(scratch_start);
+    const scratch = &scratch_handle.scratch;
     defer {
+        if (exhaustive_coverage) scratch.clearExhaustiveWorkspace(self.alloc);
         if (comptime @hasDecl(Index, "refreshSearchScratchAccounting")) {
             self.refreshSearchScratchAccounting(&scratch_handle);
         }
         self.releaseSearchScratch(&scratch_handle);
     }
-    const scratch = &scratch_handle.scratch;
     const transformed_query = self.transformVector(req.query, scratch.transformed_query);
     const transformed_query_measure: f32 = switch (self.config.metric) {
         .l2_squared => vec.dot(req.query, req.query),
@@ -1873,7 +2387,29 @@ pub fn searchProfiledRequest(
     const should_rerank = self.config.use_quantization and self.config.rerank_policy != .never;
     const candidate_limit: usize = if (should_rerank) req.k * rerank_factor else req.k;
     const candidate_capacity: usize = search_mod.candidateCapacity(search_width, self.metadata.branching_factor);
-    const root_node_id = searchRootNode(self);
+    const root_node_id = published_snapshot.root_node;
+
+    const previous_accounted_bytes = scratch_handle.accounted_bytes;
+    if (exhaustive_coverage) {
+        if (comptime @hasDecl(Index, "reserveSearchScratchBytes")) {
+            const assignment_capacity = if (coverage_tracker.enabled)
+                CompleteCoverageTracker.assignment_batch_size
+            else
+                0;
+            const target_bytes = try scratch.projectedBytesForExhaustiveCoverage(
+                published_snapshot.node_count,
+                assignment_capacity,
+            );
+            try self.reserveSearchScratchBytes(&scratch_handle, target_bytes);
+        }
+    }
+    errdefer if (exhaustive_coverage) {
+        if (comptime @hasDecl(Index, "rollbackSearchScratchBytes")) {
+            self.rollbackSearchScratchBytes(&scratch_handle, previous_accounted_bytes);
+        }
+    };
+    try coverage_tracker.prepare(self, scratch);
+    if (exhaustive_coverage) try scratch.resetCoverageVisited(self.alloc, published_snapshot.node_count);
 
     var candidates = std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan).initContext({});
     defer candidates.deinit(self.alloc);
@@ -1888,50 +2424,107 @@ pub fn searchProfiledRequest(
             self.config.flat_centroid_probe_count
         else
             @as(usize, @intCast(search_width));
-        const probe_limit = @max(configured_probe_count, @as(usize, 1));
-        var probes = try self.alloc.alloc(spfresh_index.FlatCentroidProbe, probe_limit);
-        defer self.alloc.free(probes);
-
-        const probe_count = try spfresh_index.selectFlatRabitqPostings(
+        const requested_probe_limit = @max(configured_probe_count, @as(usize, 1));
+        // The flat directory is compact (one id/radius plus a quantized
+        // centroid per posting). Keep the full ordered frontier so selective
+        // filters can advance without rebuilding it and stopping can be based
+        // on a real lower bound instead of the old fixed probe cutoff.
+        const probes = try spfresh_index.selectFlatRabitqPostingsAlloc(
             self,
             &txn,
             transformed_query,
-            probe_limit,
-            probes,
-            scratch,
+            &scratch_handle,
             &profile,
+            coverage_policy,
+            if (exhaustive_coverage) .{
+                .root_node = published_snapshot.root_node,
+                .node_count = published_snapshot.node_count,
+                .publish_generation = published_snapshot.publish_generation,
+            } else null,
+            req.cancellation,
             now_fn_u64,
             elapsed_fn_u64,
         );
+        const probe_count = probes.len;
+        const initial_probe_limit = if (exhaustive_coverage)
+            probe_count
+        else
+            @min(requested_probe_limit, probe_count);
 
         var flat_leaves_scored: usize = 0;
+        var previous_wave_end: usize = 0;
+        var next_wave_end: usize = @min(initial_probe_limit, probe_count);
+        profile.traversal_initial_wave_leaves = @intCast(@min(next_wave_end, std.math.maxInt(u32)));
         for (probes[0..probe_count], 0..) |probe, i| {
+            if (i == next_wave_end and next_wave_end < probe_count) {
+                profile.traversal_waves += 1;
+                profile.traversal_max_wave_leaves = @max(
+                    profile.traversal_max_wave_leaves,
+                    @as(u64, @intCast(next_wave_end - previous_wave_end)),
+                );
+                // Covering-radius bounds remain shadow telemetry until their
+                // end-to-end certification includes payload freshness and
+                // quantized candidate retention. Preserve the ANN budget as a
+                // floor, then expand only when filters or sparse postings have
+                // not filled the requested rerank pool.
+                if (!exhaustive_coverage and approx_results.items.items.len >= candidate_limit) {
+                    profile.traversal_frontier_remaining = @intCast(probe_count - i);
+                    break;
+                }
+
+                const explored = @max(flat_leaves_scored, 1);
+                const eligible = @max(profile.traversal_eligible_vectors, 1);
+                const still_needed = @max(candidate_limit -| approx_results.items.items.len, 1);
+                const projected_more = std.math.divCeil(
+                    usize,
+                    still_needed *| explored,
+                    @as(usize, @intCast(eligible)),
+                ) catch probe_count;
+                const current_wave = @max(next_wave_end - previous_wave_end, 1);
+                const next_size = @max(current_wave, @min(projected_more, current_wave *| 2));
+                previous_wave_end = next_wave_end;
+                next_wave_end = @min(probe_count, next_wave_end +| next_size);
+            }
             if (i % 64 == 0) try search_types.checkCancelled(req);
             profile.nodes_visited += 1;
-            var leaf_handle = loadNodeReadHandleProfiled(self, &txn, probe.posting_id, &profile, now_fn_u64, elapsed_fn_u64) catch continue;
+            var leaf_handle = loadNodeReadHandleProfiledWithCachePolicy(self, &txn, probe.posting_id, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| {
+                try handleTraversalNodeLoadError(err, coverage_policy);
+                continue;
+            };
             var leaf_handle_active = true;
             defer if (leaf_handle_active) leaf_handle.deinit(self.alloc);
             const leaf = leaf_handle.ptr();
             if (!leaf.is_leaf) {
                 leaf_handle.deinit(self.alloc);
                 leaf_handle_active = false;
+                if (exhaustive_coverage) return error.IncompletePublishedSnapshot;
                 continue;
             }
             const leaf_posting = try posting.PostingStore.view(leaf);
             const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
+            try coverage_tracker.observe(self, &txn, scratch, leaf_posting.id, member_ids);
             const leaf_id = leaf_posting.id;
             const leaf_uses_nonquantized_payload = leaf_posting.usesNonQuantizedPayload();
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
             leaf_handle.deinit(self.alloc);
             leaf_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
             profile.leaves_explored += 1;
             flat_leaves_scored += 1;
         }
 
+        if (flat_leaves_scored > previous_wave_end) {
+            profile.traversal_waves += 1;
+            profile.traversal_max_wave_leaves = @max(
+                profile.traversal_max_wave_leaves,
+                @as(u64, @intCast(flat_leaves_scored - previous_wave_end)),
+            );
+        }
+
         if (flat_leaves_scored > 0) {
+            try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
             if (should_rerank) {
-                const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+                const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
                 profile.total_ns = elapsed_fn_u64(total_start);
                 return .{ .results = reranked, .profile = profile };
@@ -1940,15 +2533,16 @@ pub fn searchProfiledRequest(
             var results = try approx_results.toFinalResults();
             approx_results.deinit();
             results.sort();
-            if (req.load_metadata) try populateMetadata(self, &txn, &results);
+            if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{ .results = results, .profile = profile };
         }
     }
 
     const root_start = now_fn_u64();
-    var root_handle = loadNodeReadHandleProfiled(self, &txn, root_node_id, &profile, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
+    var root_handle = loadNodeReadHandleProfiledWithCachePolicy(self, &txn, root_node_id, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
         error.NotFound => {
+            if (exhaustive_coverage) return error.IncompletePublishedSnapshot;
             approx_results.deinit();
             const empty = search_results.SearchResults.init(self.alloc, req.k);
             profile.total_ns = elapsed_fn_u64(total_start);
@@ -1957,24 +2551,29 @@ pub fn searchProfiledRequest(
                 .profile = profile,
             };
         },
-        else => return err,
+        else => |unhandled| return @as(anyerror!search_types.ProfiledSearchResults, unhandled),
     };
     var root_handle_active = true;
     defer if (root_handle_active) root_handle.deinit(self.alloc);
     profile.root_load_ns += elapsed_fn_u64(root_start);
+    if (exhaustive_coverage and !scratch.markCoverageNodeVisited(root_node_id, published_snapshot.node_count)) {
+        return error.IncompletePublishedSnapshot;
+    }
 
     {
         const root = root_handle.ptr();
         if (root.is_leaf) {
             const root_posting = try posting.PostingStore.view(root);
             const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, root_posting);
+            try coverage_tracker.observe(self, &txn, scratch, root_posting.id, member_ids);
             const leaf_id = root_posting.id;
             const leaf_uses_nonquantized_payload = root_posting.usesNonQuantizedPayload();
             const leaf_has_fresh_stored_payload = root_posting.hasFreshStoredPayload();
             root_handle.deinit(self.alloc);
             root_handle_active = false;
-            @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
+            @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
                 error.NotFound => {
+                    if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                     approx_results.deinit();
                     const empty = search_results.SearchResults.init(self.alloc, req.k);
                     profile.total_ns = elapsed_fn_u64(total_start);
@@ -1983,10 +2582,11 @@ pub fn searchProfiledRequest(
                         .profile = profile,
                     };
                 },
-                else => return err,
+                else => |unhandled| return @as(anyerror!search_types.ProfiledSearchResults, unhandled),
             };
+            try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
             if (should_rerank) {
-                const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+                const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
                 approx_results.deinit();
                 profile.total_ns = elapsed_fn_u64(total_start);
                 return .{ .results = reranked, .profile = profile };
@@ -1994,7 +2594,7 @@ pub fn searchProfiledRequest(
             var results = try approx_results.toFinalResults();
             approx_results.deinit();
             results.sort();
-            if (req.load_metadata) try populateMetadata(self, &txn, &results);
+            if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
             profile.total_ns = elapsed_fn_u64(total_start);
             return .{ .results = results, .profile = profile };
         }
@@ -2006,21 +2606,74 @@ pub fn searchProfiledRequest(
         const root_uses_nonquantized_payload = usesNonQuantizedPayload(root);
         root_handle.deinit(self.alloc);
         root_handle_active = false;
-        try addChildCandidatesFromIds(self, &txn, root_id, root_uses_nonquantized_payload, root_child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+        try addChildCandidatesFromIds(self, &txn, root_id, root_uses_nonquantized_payload, root_child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, coverage_policy, use_search_cache, now_fn_u64, elapsed_fn_u64);
     }
 
     var beam_state = search_mod.BeamSearchState{};
+    const initial_wave_leaves: u32 = @min(search_width, @max(@as(u32, 4), @min(@as(u32, @intCast(req.k)), @as(u32, 16))));
+    var previous_wave_leaf: u32 = 0;
+    var next_wave_leaf: u32 = initial_wave_leaves;
+    profile.traversal_initial_wave_leaves = initial_wave_leaves;
     while (true) {
         try search_types.checkCancelled(req);
-        const candidate = candidates.pop() orelse break;
-        if (search_mod.shouldStopBeamSearch(&beam_state, search_width)) break;
+        // Best-effort search avoids the exhaustive visited bitmap on its hot
+        // path, but still needs a corruption ceiling: a valid strict tree can
+        // never pop more nodes than the published node high-water mark.
+        if (!exhaustive_coverage and profile.nodes_visited >= published_snapshot.node_count) break;
+        if (!exhaustive_coverage and beam_state.leaves_explored >= next_wave_leaf) {
+            profile.traversal_waves += 1;
+            profile.traversal_max_wave_leaves = @max(profile.traversal_max_wave_leaves, next_wave_leaf - previous_wave_leaf);
+            if (next_wave_leaf < search_width) {
+                const explored = @max(beam_state.leaves_explored, 1);
+                const eligible = @max(profile.traversal_eligible_vectors, 1);
+                const still_needed = @max(candidate_limit -| approx_results.items.items.len, 1);
+                const projected_more_u64 = std.math.divCeil(
+                    u64,
+                    @as(u64, @intCast(still_needed)) *| explored,
+                    eligible,
+                ) catch @as(u64, search_width);
+                const current_wave = @max(next_wave_leaf - previous_wave_leaf, 1);
+                const projected_more: u32 = @intCast(@min(projected_more_u64, std.math.maxInt(u32)));
+                const next_size = @max(current_wave, @min(projected_more, current_wave *| 2));
+                previous_wave_leaf = next_wave_leaf;
+                next_wave_leaf = @min(search_width, next_wave_leaf +| next_size);
+            }
+        }
+        var candidate = candidates.pop() orelse break;
+        if (!exhaustive_coverage and search_mod.shouldStopBeamSearch(&beam_state, search_width)) break;
+        if (exhaustive_coverage and !scratch.markCoverageNodeVisited(candidate.id, published_snapshot.node_count)) {
+            return error.IncompletePublishedSnapshot;
+        }
         profile.nodes_visited += 1;
 
-        var node_handle = loadNodeReadHandleProfiled(self, &txn, candidate.id, &profile, now_fn_u64, elapsed_fn_u64) catch continue;
+        var node_handle = loadNodeReadHandleProfiledWithCachePolicy(self, &txn, candidate.id, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| {
+            try handleTraversalNodeLoadError(err, coverage_policy);
+            continue;
+        };
         var node_handle_active = true;
         defer if (node_handle_active) node_handle.deinit(self.alloc);
         const node = node_handle.ptr();
-        const allow_dynamic_pruning = self.config.metric != .inner_product;
+        if (!candidate.bound_resolved) {
+            profile.traversal_bound_resolutions += 1;
+            // Mutable ancestors are intentionally not used as proof objects:
+            // foreground appends update a posting without rewriting its whole
+            // ancestor chain. Resolve/expand those internal nodes first, then
+            // order the resulting leaf frontier by durable posting radii.
+            if (node.is_leaf and self.config.metric == .l2_squared) {
+                if (l2SubtreeLowerBound(candidate, node.covering_radius)) |lower_bound| {
+                    candidate.lower_bound = lower_bound;
+                    candidate.bound_resolved = true;
+                    candidate.is_leaf = node.is_leaf;
+                } else {
+                    profile.traversal_bound_fallbacks += 1;
+                    candidate.bound_resolved = true;
+                }
+            } else {
+                profile.traversal_bound_fallbacks += 1;
+                candidate.bound_resolved = true;
+            }
+        }
+        const allow_dynamic_pruning = !exhaustive_coverage and self.config.metric != .inner_product;
         if (allow_dynamic_pruning and !node.is_leaf and search_mod.shouldBreakOnInternalCandidate(candidate, &approx_results)) {
             node_handle.deinit(self.alloc);
             node_handle_active = false;
@@ -2040,12 +2693,13 @@ pub fn searchProfiledRequest(
             }
             const leaf_posting = try posting.PostingStore.view(node);
             const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
+            try coverage_tracker.observe(self, &txn, scratch, leaf_posting.id, member_ids);
             const leaf_id = leaf_posting.id;
             const leaf_uses_nonquantized_payload = leaf_posting.usesNonQuantizedPayload();
             const leaf_has_fresh_stored_payload = leaf_posting.hasFreshStoredPayload();
             node_handle.deinit(self.alloc);
             node_handle_active = false;
-            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+            try @This().scoreLeafMemberIds(self, &txn, leaf_id, leaf_uses_nonquantized_payload, leaf_has_fresh_stored_payload, member_ids, transformed_query, transformed_query_measure, req.query, exact_query_measure, req, &filter_state, &approx_results, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
             search_mod.noteLeafExplored(&beam_state);
             profile.leaves_explored += 1;
         } else {
@@ -2056,12 +2710,14 @@ pub fn searchProfiledRequest(
             const node_uses_nonquantized_payload = usesNonQuantizedPayload(node);
             node_handle.deinit(self.alloc);
             node_handle_active = false;
-            try addChildCandidatesFromIds(self, &txn, node_id, node_uses_nonquantized_payload, child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+            try addChildCandidatesFromIds(self, &txn, node_id, node_uses_nonquantized_payload, child_ids, transformed_query, transformed_query_measure, &candidates, scratch, &profile, coverage_policy, use_search_cache, now_fn_u64, elapsed_fn_u64);
         }
     }
 
+    try validateCompleteCoverage(self, &txn, scratch, &coverage_tracker, published_snapshot.publish_generation);
+
     if (should_rerank) {
-        const reranked = try rerankResults(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, now_fn_u64, elapsed_fn_u64);
+        const reranked = try rerankResultsWithCachePolicy(self, &txn, &approx_results, req.query, exact_query_measure, req, &filter_state, scratch, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64);
         approx_results.deinit();
         profile.total_ns = elapsed_fn_u64(total_start);
         return .{ .results = reranked, .profile = profile };
@@ -2070,25 +2726,31 @@ pub fn searchProfiledRequest(
     var results = try approx_results.toFinalResults();
     approx_results.deinit();
     results.sort();
-    if (req.load_metadata) try populateMetadata(self, &txn, &results);
+    if (req.load_metadata) try populateMetadataWithCachePolicy(self, &txn, &results, use_search_cache);
     profile.total_ns = elapsed_fn_u64(total_start);
     return .{ .results = results, .profile = profile };
 }
 
-fn publishSearchStateIfSupported(self: anytype) void {
+fn publishSearchStateIfSupported(self: anytype) !void {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "shouldPublishSearchStateAfterWrite")) {
         if (!self.shouldPublishSearchStateAfterWrite()) return;
     }
-    if (comptime @hasDecl(Index, "refreshPublishedSearchState")) {
+    if (comptime @hasDecl(Index, "refreshPublishedSearchStateIo")) {
+        try self.refreshPublishedSearchStateIo();
+    } else if (comptime @hasDecl(Index, "refreshPublishedSearchState")) {
         self.refreshPublishedSearchState();
     }
 }
 
-fn beginPublishSearchStateIfSupported(self: anytype) bool {
+fn beginPublishSearchStateIfSupported(self: anytype) !bool {
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "shouldPublishSearchStateAfterWrite")) {
         if (!self.shouldPublishSearchStateAfterWrite()) return false;
+    }
+    if (comptime @hasDecl(Index, "beginPublishedSearchStateRefreshIo")) {
+        try self.beginPublishedSearchStateRefreshIo();
+        return true;
     }
     if (comptime @hasDecl(Index, "beginPublishedSearchStateRefresh")) {
         self.beginPublishedSearchStateRefresh();
@@ -2097,14 +2759,22 @@ fn beginPublishSearchStateIfSupported(self: anytype) bool {
     return false;
 }
 
-fn finishPublishSearchStateIfSupported(self: anytype, publishing: bool) void {
+fn finishPublishSearchStateIfSupported(self: anytype, publishing: bool) !void {
     if (!publishing) {
-        publishSearchStateIfSupported(self);
+        try publishSearchStateIfSupported(self);
         return;
     }
     const Index = comptime childType(@TypeOf(self));
     if (comptime @hasDecl(Index, "finishPublishedSearchStateRefresh")) {
         self.finishPublishedSearchStateRefresh();
+    }
+}
+
+fn markPublishSearchStateCommittingIfSupported(self: anytype, publishing: bool) !void {
+    if (!publishing) return;
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "markPublishedSearchStateCommitting")) {
+        try self.markPublishedSearchStateCommitting();
     }
 }
 
@@ -2114,6 +2784,247 @@ fn abortPublishSearchStateIfSupported(self: anytype, publishing: bool) void {
     if (comptime @hasDecl(Index, "abortPublishedSearchStateRefresh")) {
         self.abortPublishedSearchStateRefresh();
     }
+}
+
+const SearchPublishedSnapshot = struct {
+    root_node: u64,
+    active_count: u64,
+    node_count: u64,
+    publish_generation: u64,
+};
+
+fn waitForStableSearchPublicationIfSupported(
+    self: anytype,
+    generation: u64,
+    cancellation: ?search_types.CancellationToken,
+) !void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "waitForPublishedSearchState")) {
+        return try self.waitForPublishedSearchState(generation, cancellation);
+    }
+    if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+    if (builtin.os.tag == .freestanding) {
+        std.atomic.spinLoopHint();
+    } else {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn loadStableSearchPublishedSnapshot(
+    self: anytype,
+    cancellation: ?search_types.CancellationToken,
+) !SearchPublishedSnapshot {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime !@hasDecl(Index, "publishedGeneration")) {
+        return .{
+            .root_node = searchRootNode(self),
+            .active_count = self.metadata.active_count,
+            .node_count = self.metadata.node_count,
+            .publish_generation = 0,
+        };
+    }
+
+    while (true) {
+        const generation = self.publishedGeneration();
+        if ((generation & 1) != 0) {
+            try waitForStableSearchPublicationIfSupported(self, generation, cancellation);
+            continue;
+        }
+        const snapshot: SearchPublishedSnapshot = .{
+            .root_node = self.publishedRootNode(),
+            .active_count = self.publishedActiveCount(),
+            .node_count = self.publishedNodeCount(),
+            .publish_generation = generation,
+        };
+        const generation_after = self.publishedGeneration();
+        if (generation == generation_after and (generation_after & 1) == 0) return snapshot;
+        try waitForStableSearchPublicationIfSupported(self, generation_after, cancellation);
+    }
+}
+
+fn publishedSnapshotStillCurrent(self: anytype, snapshot: SearchPublishedSnapshot) bool {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime !@hasDecl(Index, "publishedGeneration")) return true;
+    return self.publishedGeneration() == snapshot.publish_generation;
+}
+
+fn notifyCompleteSnapshotCapturedForTestIfSupported(self: anytype) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "notifyCompleteSnapshotCapturedForTest")) {
+        self.notifyCompleteSnapshotCapturedForTest();
+    }
+}
+
+fn notifyBeforeDurableSnapshotCaptureForTestIfSupported(self: anytype) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "notifyBeforeDurableSnapshotCaptureForTest")) {
+        self.notifyBeforeDurableSnapshotCaptureForTest();
+    }
+}
+
+fn noteIncompletePublishedSnapshotIfSupported(self: anytype, generation: u64) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "noteIncompletePublishedSnapshotForGeneration")) {
+        self.noteIncompletePublishedSnapshotForGeneration(generation);
+    } else if (comptime @hasDecl(Index, "noteIncompletePublishedSnapshot")) {
+        self.noteIncompletePublishedSnapshot();
+    }
+}
+
+const CompleteCoverageValidationClaim = struct {
+    enabled: bool,
+    held: bool,
+};
+
+fn beginCompleteCoverageValidationIfSupported(
+    self: anytype,
+    exhaustive: bool,
+    generation: u64,
+    cancellation: ?search_types.CancellationToken,
+) !CompleteCoverageValidationClaim {
+    if (!exhaustive) return .{ .enabled = false, .held = false };
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "beginCompleteCoverageValidation")) {
+        const claimed = try self.beginCompleteCoverageValidation(generation, cancellation);
+        return .{ .enabled = claimed, .held = claimed };
+    }
+    if (comptime @hasDecl(Index, "completeCoverageAlreadyValidated")) {
+        return .{
+            .enabled = !self.completeCoverageAlreadyValidated(generation),
+            .held = false,
+        };
+    }
+    return .{ .enabled = true, .held = false };
+}
+
+fn finishCompleteCoverageValidationIfSupported(self: anytype, generation: u64, validated: bool) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "finishCompleteCoverageValidation")) {
+        self.finishCompleteCoverageValidation(generation, validated);
+    } else if (validated and comptime @hasDecl(Index, "noteCompleteCoverageValidated")) {
+        self.noteCompleteCoverageValidated(generation);
+    }
+}
+
+fn failCompleteCoverageValidationIfSupported(self: anytype, generation: u64, err: anyerror) void {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "failCompleteCoverageValidation")) {
+        self.failCompleteCoverageValidation(generation, err);
+    } else if (comptime @hasDecl(Index, "finishCompleteCoverageValidation")) {
+        // Legacy adapters cannot preserve a terminal failure for waiters, but
+        // must still release the elected producer claim.
+        self.finishCompleteCoverageValidation(generation, false);
+    }
+}
+
+const CompleteCoverageTracker = struct {
+    const assignment_batch_size: usize = 8_192;
+
+    enabled: bool,
+    claim_held: bool,
+    expected_count: u64,
+    observed_count: u64 = 0,
+    assignment_count: usize = 0,
+
+    fn init(claim: CompleteCoverageValidationClaim, expected_count: u64) CompleteCoverageTracker {
+        return .{
+            .enabled = claim.enabled,
+            .claim_held = claim.held,
+            .expected_count = expected_count,
+        };
+    }
+
+    fn prepare(self: *CompleteCoverageTracker, index: anytype, scratch: anytype) !void {
+        if (!self.enabled) return;
+        try scratch.ensureCoverageMemberCapacity(index.alloc, assignment_batch_size);
+        try scratch.ensureLookupCapacity(index.alloc, assignment_batch_size);
+    }
+
+    fn observe(
+        self: *CompleteCoverageTracker,
+        index: anytype,
+        txn: anytype,
+        scratch: anytype,
+        leaf_id: u64,
+        member_ids: []const u64,
+    ) !void {
+        if (!self.enabled) return;
+        self.observed_count = std.math.add(u64, self.observed_count, @intCast(member_ids.len)) catch
+            return error.IncompletePublishedSnapshot;
+        if (self.observed_count > self.expected_count) return error.IncompletePublishedSnapshot;
+        if (member_ids.len == 0) return;
+
+        // Detect same-posting duplicates exactly without coupling the global
+        // validation batch size to a leaf's fanout.
+        try scratch.ensureVectorIdCapacity(index.alloc, member_ids.len);
+        const sorted_ids = scratch.vector_ids[0..member_ids.len];
+        @memcpy(sorted_ids, member_ids);
+        std.mem.sort(u64, sorted_ids, {}, std.sort.asc(u64));
+        for (sorted_ids[1..], sorted_ids[0 .. sorted_ids.len - 1]) |current, previous| {
+            if (current == previous) return error.IncompletePublishedSnapshot;
+        }
+
+        for (member_ids) |member_id| {
+            if (self.assignment_count == assignment_batch_size) {
+                try self.flushAssignments(txn, scratch);
+            }
+            scratch.coverage_members[self.assignment_count] = .{
+                .vector_id = member_id,
+                .leaf_id = leaf_id,
+            };
+            self.assignment_count += 1;
+        }
+    }
+
+    fn flushAssignments(self: *CompleteCoverageTracker, txn: anytype, scratch: anytype) !void {
+        if (self.assignment_count == 0) return;
+        const assignments = scratch.coverage_members[0..self.assignment_count];
+        std.mem.sort(search_runtime.CoverageMember, assignments, {}, struct {
+            fn lessThan(_: void, lhs: search_runtime.CoverageMember, rhs: search_runtime.CoverageMember) bool {
+                return lhs.vector_id < rhs.vector_id;
+            }
+        }.lessThan);
+        for (assignments[1..], assignments[0 .. assignments.len - 1]) |current, previous| {
+            if (current.vector_id == previous.vector_id) return error.IncompletePublishedSnapshot;
+        }
+
+        const lookups = scratch.lookups[0..assignments.len];
+        const key_views = scratch.key_views[0..assignments.len];
+        const values = scratch.values[0..assignments.len];
+        for (assignments, 0..) |assignment, i| {
+            lookups[i].vector_id = assignment.vector_id;
+            _ = hbc.encodeVecLeafKey(&lookups[i].key, assignment.vector_id);
+            key_views[i] = lookups[i].key[0..];
+        }
+        try txn.getManySorted(.vecs, key_views, values);
+        for (assignments, values) |assignment, maybe_value| {
+            const value = maybe_value orelse return error.IncompletePublishedSnapshot;
+            if (value.len < @sizeOf(u64) or std.mem.readInt(u64, value[0..8], .little) != assignment.leaf_id) {
+                return error.IncompletePublishedSnapshot;
+            }
+        }
+        self.assignment_count = 0;
+    }
+
+    fn validate(self: *CompleteCoverageTracker, txn: anytype, scratch: anytype) !void {
+        if (!self.enabled) return;
+        if (self.observed_count != self.expected_count) return error.IncompletePublishedSnapshot;
+        return self.flushAssignments(txn, scratch);
+    }
+};
+
+fn validateCompleteCoverage(
+    self: anytype,
+    txn: anytype,
+    scratch: anytype,
+    tracker: *CompleteCoverageTracker,
+    generation: u64,
+) !void {
+    try tracker.validate(txn, scratch);
+    if (!tracker.enabled) return;
+    finishCompleteCoverageValidationIfSupported(self, generation, true);
+    tracker.claim_held = false;
+    tracker.enabled = false;
 }
 
 fn searchRootNode(self: anytype) u64 {
@@ -2139,7 +3050,7 @@ pub fn addChildCandidates(
     try scratch.ensureMemberIdCapacity(self.alloc, node.children.len);
     const child_ids = scratch.member_ids[0..node.children.len];
     @memcpy(child_ids, node.children);
-    return try addChildCandidatesFromIds(self, txn, node.id, usesNonQuantizedPayload(node), child_ids, query, query_measure, candidates, scratch, profile, now_fn_u64, elapsed_fn_u64);
+    return try addChildCandidatesFromIds(self, txn, node.id, usesNonQuantizedPayload(node), child_ids, query, query_measure, candidates, scratch, profile, .best_effort, true, now_fn_u64, elapsed_fn_u64);
 }
 
 fn addChildCandidatesFromIds(
@@ -2153,6 +3064,8 @@ fn addChildCandidatesFromIds(
     candidates: *std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan),
     scratch: anytype,
     profile: *search_types.SearchProfile,
+    coverage_policy: search_types.CoveragePolicy,
+    comptime use_search_cache: bool,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
@@ -2160,7 +3073,7 @@ fn addChildCandidatesFromIds(
     defer profile.child_expand_ns += elapsed_fn_u64(start);
     const child_count = child_ids.len;
     if (self.config.use_quantization) {
-        if (try loadQuantizedReadHandleProfiled(self, txn, node_id, uses_nonquantized_payload, child_count, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
+        if (try loadQuantizedReadHandleProfiledWithCachePolicy(self, txn, node_id, uses_nonquantized_payload, child_count, profile, use_search_cache, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
             defer {
                 var handle = quantized_handle;
                 handle.deinit(self.alloc);
@@ -2175,27 +3088,37 @@ fn addChildCandidatesFromIds(
             try self.estimateQuantizedDistances(quantized, query, query_measure, distances, error_bounds, &scratch.estimate);
             for (child_ids, 0..) |child_id, i| {
                 _ = error_bounds[i];
-                try candidates.push(self.alloc, .{ .id = child_id, .distance = distances[i], .error_bound = 0 });
+                try candidates.push(self.alloc, .{
+                    .id = child_id,
+                    .distance = distances[i],
+                    .error_bound = error_bounds[i],
+                    .bound_resolved = false,
+                });
             }
             return;
         }
     }
 
     for (child_ids) |child_id| {
-        if (try borrowCachedNodeHandle(self, child_id)) |cached_handle| {
-            defer {
-                var handle = cached_handle;
-                handle.deinit(self.alloc);
+        if (use_search_cache) {
+            if (try borrowSearchCachedNodeHandle(self, child_id)) |cached_handle| {
+                defer {
+                    var handle = cached_handle;
+                    handle.deinit(self.alloc);
+                }
+                const dist = vec.distanceToQuery(query, query_measure, cached_handle.ptr().centroid, self.config.metric);
+                try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0, .bound_resolved = false });
+                continue;
             }
-            const dist = vec.distanceToQuery(query, query_measure, cached_handle.ptr().centroid, self.config.metric);
-            try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0 });
-            continue;
         }
 
-        var child_handle = loadNodeReadHandle(self, txn, child_id) catch continue;
+        var child_handle = loadNodeReadHandleWithCachePolicy(self, txn, child_id, use_search_cache) catch |err| {
+            try handleTraversalNodeLoadError(err, coverage_policy);
+            continue;
+        };
         defer child_handle.deinit(self.alloc);
         const dist = vec.distanceToQuery(query, query_measure, child_handle.ptr().centroid, self.config.metric);
-        try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0 });
+        try candidates.push(self.alloc, .{ .id = child_id, .distance = dist, .error_bound = 0, .bound_resolved = false });
     }
 }
 
@@ -2217,7 +3140,7 @@ pub fn scoreLeafMembers(
 ) !void {
     const leaf_posting = try posting.PostingStore.view(leaf);
     const member_ids = try posting.PostingStore.copyMemberIds(self.alloc, scratch, leaf_posting);
-    return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, now_fn_u64, elapsed_fn_u64);
+    return try @This().scoreLeafMemberIds(self, txn, leaf_posting.id, leaf_posting.usesNonQuantizedPayload(), leaf_posting.hasFreshStoredPayload(), member_ids, approx_query, approx_query_measure, exact_query, exact_query_measure, req, filter_state, results, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
 }
 
 fn scoreLeafMemberIds(
@@ -2236,15 +3159,79 @@ fn scoreLeafMemberIds(
     results: *search_results.ApproxSearchResults,
     scratch: anytype,
     profile: *search_types.SearchProfile,
+    comptime use_search_cache: bool,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
     const start = now_fn_u64();
     defer profile.leaf_score_ns += elapsed_fn_u64(start);
-    const has_extra_filters = search_runtime.requestHasExtraFilters(req, filter_state);
+    const coverage_policy = search_types.coveragePolicy(req);
     try scratch.ensureVectorFetchCapacity(self.alloc, member_ids.len);
+
+    // Resolve selective ID and metadata-prefix predicates once per leaf. The
+    // sorted metadata batch reuses LSM blocks and replaces the former scalar
+    // point lookup (plus cache lock) for every quantized candidate.
+    const filters_active = !filter_state.isTrivial() or req.filter_prefix.len > 0;
+    var filtered_count: usize = 0;
+    for (member_ids, 0..) |member_id, original_index| {
+        if (filters_active) profile.filter_candidates += 1;
+        if (filter_state.rejects(member_id)) {
+            profile.filter_rejected += 1;
+            continue;
+        }
+        scratch.member_ids[filtered_count] = member_id;
+        scratch.positions[filtered_count] = original_index;
+        filtered_count += 1;
+    }
+    if (req.filter_prefix.len > 0 and filtered_count > 0) {
+        const filter_start = now_fn_u64();
+        profile.filter_metadata_batches += 1;
+        const candidates = scratch.member_ids[0..filtered_count];
+        try getMetadataManySortedInTxnWithScratchProfiled(
+            self,
+            txn,
+            candidates,
+            scratch.metadata[0..filtered_count],
+            scratch.lookups[0..filtered_count],
+            scratch.key_views[0..filtered_count],
+            scratch.values[0..filtered_count],
+            use_search_cache,
+            profile,
+            now_fn_u64,
+            elapsed_fn_u64,
+        );
+        profile.filter_metadata_batch_ns += elapsed_fn_u64(filter_start);
+        var prefix_count: usize = 0;
+        for (candidates, scratch.metadata[0..filtered_count], scratch.positions[0..filtered_count]) |member_id, maybe_metadata, original_index| {
+            const metadata = maybe_metadata orelse {
+                // Metadata is optional. Absence is a valid non-match for a
+                // prefix predicate, not evidence that vector coverage is
+                // incomplete.
+                profile.filter_rejected += 1;
+                continue;
+            };
+            if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) {
+                profile.filter_rejected += 1;
+                continue;
+            }
+            scratch.member_ids[prefix_count] = member_id;
+            scratch.positions[prefix_count] = original_index;
+            prefix_count += 1;
+        }
+        filtered_count = prefix_count;
+    }
+    if (filtered_count == 0) return;
+    profile.traversal_eligible_vectors += @intCast(filtered_count);
+    const scoring_member_ids = scratch.member_ids[0..filtered_count];
+    const original_positions = scratch.positions[0..filtered_count];
+    const has_extra_filters = req.distance_over != null or req.distance_under != null;
+    var scoring_req = req;
+    scoring_req.filter_prefix = "";
+    scoring_req.filter_ids = &.{};
+    scoring_req.exclude_ids = &.{};
+    const empty_filter_state = search_types.RequestFilterState{};
     if (self.config.use_quantization and leaf_has_fresh_stored_payload) {
-        if (try loadQuantizedReadHandleProfiled(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
+        if (try loadQuantizedReadHandleProfiledWithCachePolicy(self, txn, leaf_id, leaf_uses_nonquantized_payload, member_ids.len, profile, use_search_cache, now_fn_u64, elapsed_fn_u64, isNotFoundGeneric)) |quantized_handle| {
             defer {
                 var handle = quantized_handle;
                 handle.deinit(self.alloc);
@@ -2256,14 +3243,14 @@ fn scoreLeafMemberIds(
             const error_bounds = scratch.error_bounds[0..count];
             try self.estimateQuantizedDistances(quantized, approx_query, approx_query_measure, distances, error_bounds, &scratch.estimate);
             if (!has_extra_filters) {
-                for (member_ids, 0..) |member_id, i| {
+                for (scoring_member_ids, original_positions) |member_id, i| {
                     if (i % 256 == 0) try search_types.checkCancelled(req);
                     results.addApproxResult(member_id, distances[i], error_bounds[i]);
                 }
             } else {
-                for (member_ids, 0..) |member_id, i| {
+                for (scoring_member_ids, original_positions) |member_id, i| {
                     if (i % 256 == 0) try search_types.checkCancelled(req);
-                    if (!try memberMatchesRequest(self, txn, member_id, distances[i], error_bounds[i], req, filter_state, true)) continue;
+                    if (!try memberMatchesRequestWithCachePolicy(self, txn, member_id, distances[i], error_bounds[i], scoring_req, &empty_filter_state, true, use_search_cache)) continue;
                     results.addApproxResult(member_id, distances[i], error_bounds[i]);
                 }
             }
@@ -2280,21 +3267,25 @@ fn scoreLeafMemberIds(
         }
     }
 
-    const fetch_member_ids = scratch.member_ids[0..member_ids.len];
+    const fetch_member_ids = scratch.vector_ids[0..scoring_member_ids.len];
     var fetch_count: usize = 0;
-    for (member_ids, 0..) |member_id, i| {
+    for (scoring_member_ids, 0..) |member_id, i| {
         if (i % 256 == 0) try search_types.checkCancelled(req);
-        if (borrowCachedVectorHandle(self, member_id)) |cached_handle| {
-            var handle = cached_handle;
-            defer handle.deinit();
-            const dist = vec.distanceToQuery(exact_query, exact_query_measure, handle.view(), self.config.metric);
-            if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, req, filter_state, false)) {
+        if (use_search_cache) {
+            if (borrowCachedVectorHandle(self, member_id)) |cached_handle| {
+                profile.vector_cache_hits += 1;
+                var handle = cached_handle;
+                defer handle.deinit();
+                const dist = vec.distanceToQuery(exact_query, exact_query_measure, handle.view(), self.config.metric);
+                if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false, use_search_cache)) {
+                    continue;
+                }
+                results.addResult(member_id, dist, 0);
+                profile.exact_vectors_scored += 1;
                 continue;
             }
-            results.addResult(member_id, dist, 0);
-            profile.exact_vectors_scored += 1;
-            continue;
         }
+        if (!indexHasExternalVectorLoader(self)) profile.vector_cache_misses += 1;
         fetch_member_ids[fetch_count] = member_id;
         fetch_count += 1;
     }
@@ -2305,25 +3296,42 @@ fn scoreLeafMemberIds(
     var external_scored = false;
     const Index = comptime childType(@TypeOf(self));
     if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalVectorsSortedWithScratch")) {
-        external_scored = try self.scoreExternalVectorsSortedWithScratch(
-            txn,
-            fetch_member_ids[0..fetch_count],
-            exact_query,
-            exact_query_measure,
-            exact_distances,
-            scratch.metadata,
-            scratch.lookups,
-            scratch.key_views,
-            scratch.values,
-            scratch.vector_batch,
-        );
+        external_scored = if (!use_search_cache and comptime @hasDecl(Index, "scoreExternalVectorsSortedWithScratchUncached"))
+            try self.scoreExternalVectorsSortedWithScratchUncached(
+                txn,
+                fetch_member_ids[0..fetch_count],
+                exact_query,
+                exact_query_measure,
+                exact_distances,
+                scratch.metadata,
+                scratch.lookups,
+                scratch.key_views,
+                scratch.values,
+                scratch.vector_batch,
+            )
+        else
+            try self.scoreExternalVectorsSortedWithScratch(
+                txn,
+                fetch_member_ids[0..fetch_count],
+                exact_query,
+                exact_query_measure,
+                exact_distances,
+                scratch.metadata,
+                scratch.lookups,
+                scratch.key_views,
+                scratch.values,
+                scratch.vector_batch,
+            );
     }
 
     if (external_scored) {
         for (fetch_member_ids[0..fetch_count], 0..) |member_id, i| {
             const dist = exact_distances[i];
-            if (!std.math.isFinite(dist)) continue;
-            if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, req, filter_state, false)) {
+            if (!std.math.isFinite(dist)) {
+                if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
+                continue;
+            }
+            if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false, use_search_cache)) {
                 continue;
             }
             results.addResult(member_id, dist, 0);
@@ -2333,7 +3341,7 @@ fn scoreLeafMemberIds(
     }
 
     const vector_views = scratch.vector_views[0..fetch_count];
-    try loadVectorIdsSortedWithScratch(
+    try loadVectorIdsSortedWithScratchWithCachePolicy(
         self,
         txn,
         fetch_member_ids[0..fetch_count],
@@ -2343,6 +3351,7 @@ fn scoreLeafMemberIds(
         scratch.values,
         scratch.vector,
         scratch.vector_batch,
+        use_search_cache,
     );
     const scored_positions = scratch.positions[0..fetch_count];
     var scored_count: usize = 0;
@@ -2351,6 +3360,9 @@ fn scoreLeafMemberIds(
         vector_views[scored_count] = member_vec;
         scored_positions[scored_count] = i;
         scored_count += 1;
+    }
+    if (coverage_policy == .complete_snapshot and scored_count != fetch_count) {
+        return error.IncompletePublishedSnapshot;
     }
     if (scored_count == 0) return;
     try search_types.checkCancelled(req);
@@ -2367,7 +3379,7 @@ fn scoreLeafMemberIds(
         if (dist_index % 256 == 0) try search_types.checkCancelled(req);
         const member_id = fetch_member_ids[member_index];
         const dist = exact_distances[dist_index];
-        if (has_extra_filters and !try memberMatchesRequest(self, txn, member_id, dist, 0, req, filter_state, false)) {
+        if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, member_id, dist, 0, scoring_req, &empty_filter_state, false, use_search_cache)) {
             continue;
         }
         results.addResult(member_id, dist, 0);
@@ -2388,8 +3400,26 @@ pub fn rerankResults(
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !search_results.SearchResults {
+    return rerankResultsWithCachePolicy(self, txn, approx_results, query, query_measure, req, filter_state, scratch, profile, true, now_fn_u64, elapsed_fn_u64);
+}
+
+fn rerankResultsWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    approx_results: *search_results.ApproxSearchResults,
+    query: []const f32,
+    query_measure: f32,
+    req: search_types.SearchRequest,
+    filter_state: *const search_types.RequestFilterState,
+    scratch: anytype,
+    profile: *search_types.SearchProfile,
+    comptime use_search_cache: bool,
+    now_fn_u64: fn () u64,
+    elapsed_fn_u64: fn (u64) u64,
+) !search_results.SearchResults {
     const start = now_fn_u64();
     defer profile.rerank_ns += elapsed_fn_u64(start);
+    const coverage_policy = search_types.coveragePolicy(req);
     const ranked_items = approx_results.items.items;
     const has_extra_filters = search_runtime.requestHasExtraFilters(req, filter_state);
     try scratch.ensureRerankCapacity(self.alloc, ranked_items.len);
@@ -2434,25 +3464,93 @@ pub fn rerankResults(
         var external_scored = false;
         const Index = comptime childType(@TypeOf(self));
         if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalRerankVectorsSortedWithScratch")) {
-            const score_start = now_fn_u64();
-            external_scored = try self.scoreExternalRerankVectorsSortedWithScratch(
-                txn,
-                ranked_items,
-                rerank_positions,
-                query,
-                query_measure,
-                exact_distances,
-                scratch.vector_ids,
-                scratch.metadata,
-                scratch.lookups,
-                scratch.key_views,
-                scratch.values,
-                scratch.vector_batch,
-                profile,
-            );
-            const score_elapsed = elapsed_fn_u64(score_start);
-            profile.rerank_prefetch_ns += score_elapsed;
-            profile.rerank_vector_load_ns += score_elapsed;
+            const max_external_rerank_batch: usize = 128;
+            var offset: usize = 0;
+            while (offset < rerank_positions.len) {
+                const batch_end = @min(offset + max_external_rerank_batch, rerank_positions.len);
+                const batch_positions = rerank_positions[offset..batch_end];
+                const batch_distances = exact_distances[0..batch_positions.len];
+                const score_start = now_fn_u64();
+                const handled = if (!use_search_cache and comptime @hasDecl(Index, "scoreExternalRerankVectorsSortedWithScratchUncached"))
+                    try self.scoreExternalRerankVectorsSortedWithScratchUncached(
+                        txn,
+                        ranked_items,
+                        batch_positions,
+                        query,
+                        query_measure,
+                        batch_distances,
+                        scratch.vector_ids,
+                        scratch.metadata,
+                        scratch.lookups,
+                        scratch.key_views,
+                        scratch.values,
+                        scratch.vector_batch,
+                        scratch.error_bounds,
+                        profile,
+                    )
+                else
+                    try self.scoreExternalRerankVectorsSortedWithScratch(
+                        txn,
+                        ranked_items,
+                        batch_positions,
+                        query,
+                        query_measure,
+                        batch_distances,
+                        scratch.vector_ids,
+                        scratch.metadata,
+                        scratch.lookups,
+                        scratch.key_views,
+                        scratch.values,
+                        scratch.vector_batch,
+                        scratch.error_bounds,
+                        profile,
+                    );
+                const score_elapsed = elapsed_fn_u64(score_start);
+                profile.rerank_prefetch_ns += score_elapsed;
+                profile.rerank_vector_load_ns += score_elapsed;
+                if (!handled) {
+                    if (offset != 0) return error.ExternalRerankCapabilityChanged;
+                    break;
+                }
+                external_scored = true;
+                profile.rerank_batches += 1;
+                profile.rerank_max_batch_size = @max(profile.rerank_max_batch_size, batch_positions.len);
+
+                const apply_start = now_fn_u64();
+                for (batch_positions, 0..) |index, slot| {
+                    if (slot % 64 == 0) try search_types.checkCancelled(req);
+                    const item = &ranked_items[index];
+                    const dist = batch_distances[slot];
+                    rerank_selection.flags[index] = false;
+                    if (!std.math.isFinite(dist)) {
+                        if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
+                        item.distance = std.math.inf(f32);
+                        item.error_bound = 0;
+                        continue;
+                    }
+                    if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, item.vector_id, dist, 0, req, filter_state, false, use_search_cache)) {
+                        item.distance = std.math.inf(f32);
+                        item.error_bound = 0;
+                        continue;
+                    }
+                    item.distance = dist;
+                    item.error_bound = 0;
+                    profile.exact_vectors_scored += 1;
+                    profile.reranked_vectors += 1;
+                }
+                profile.rerank_apply_ns += elapsed_fn_u64(apply_start);
+                offset = batch_end;
+
+                if (offset < rerank_positions.len and remainingRerankCandidatesCannotEnter(
+                    ranked_items,
+                    rerank_selection.flags,
+                    rerank_selection.top_k_count,
+                    scratch.distances,
+                )) {
+                    profile.rerank_candidates_skipped_by_bound += rerank_positions.len - offset;
+                    break;
+                }
+            }
         }
 
         if (!external_scored) {
@@ -2469,6 +3567,7 @@ pub fn rerankResults(
                 scratch.values,
                 scratch.vector,
                 scratch.vector_batch,
+                use_search_cache,
             );
             const preload_elapsed = elapsed_fn_u64(preload_start);
             profile.rerank_prefetch_ns += preload_elapsed;
@@ -2479,6 +3578,7 @@ pub fn rerankResults(
                 const item = &ranked_items[index];
                 const member_vec = vector_views[slot];
                 if (member_vec.len == 0) {
+                    if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
                     item.distance = std.math.inf(f32);
                     item.error_bound = 0;
                     continue;
@@ -2493,33 +3593,34 @@ pub fn rerankResults(
             profile.rerank_distance_ns += elapsed_fn_u64(dist_start);
         }
 
-        const apply_start = now_fn_u64();
-        var exact_idx: usize = 0;
-        for (rerank_positions, 0..) |index, slot| {
-            if (slot % 256 == 0) try search_types.checkCancelled(req);
-            const item = &ranked_items[index];
-            if (!std.math.isFinite(item.distance)) continue;
-            const dist = if (external_scored) exact_distances[slot] else blk: {
-                const value = exact_distances[exact_idx];
+        if (!external_scored) {
+            profile.rerank_batches += 1;
+            profile.rerank_max_batch_size = @max(profile.rerank_max_batch_size, rerank_positions.len);
+            const apply_start = now_fn_u64();
+            var exact_idx: usize = 0;
+            for (rerank_positions, 0..) |index, slot| {
+                if (slot % 256 == 0) try search_types.checkCancelled(req);
+                const item = &ranked_items[index];
+                if (!std.math.isFinite(item.distance)) continue;
+                const dist = exact_distances[exact_idx];
                 exact_idx += 1;
-                break :blk value;
-            };
-            if (!std.math.isFinite(dist)) {
-                item.distance = std.math.inf(f32);
+                if (!std.math.isFinite(dist)) {
+                    item.distance = std.math.inf(f32);
+                    item.error_bound = 0;
+                    continue;
+                }
+                if (has_extra_filters and !try memberMatchesRequestWithCachePolicy(self, txn, item.vector_id, dist, 0, req, filter_state, false, use_search_cache)) {
+                    item.distance = std.math.inf(f32);
+                    item.error_bound = 0;
+                    continue;
+                }
+                item.distance = dist;
                 item.error_bound = 0;
-                continue;
+                profile.exact_vectors_scored += 1;
+                profile.reranked_vectors += 1;
             }
-            if (has_extra_filters and !try memberMatchesRequest(self, txn, item.vector_id, dist, 0, req, filter_state, false)) {
-                item.distance = std.math.inf(f32);
-                item.error_bound = 0;
-                continue;
-            }
-            item.distance = dist;
-            item.error_bound = 0;
-            profile.exact_vectors_scored += 1;
-            profile.reranked_vectors += 1;
+            profile.rerank_apply_ns += elapsed_fn_u64(apply_start);
         }
-        profile.rerank_apply_ns += elapsed_fn_u64(apply_start);
 
         const resort_start = now_fn_u64();
         search_mod.sortApproxResultsByDistance(ranked_items);
@@ -2532,7 +3633,7 @@ pub fn rerankResults(
 
     if (req.load_metadata) {
         const metadata_start = now_fn_u64();
-        try populateMetadataWithScratch(self, txn, &exact_results, scratch);
+        try populateMetadataWithScratch(self, txn, &exact_results, scratch, use_search_cache);
         profile.rerank_metadata_ns += elapsed_fn_u64(metadata_start);
     }
     return exact_results;
@@ -2728,6 +3829,55 @@ fn countSelectedRerankCandidates(flags: []const bool) usize {
     return count;
 }
 
+/// Returns true only when `top_k` already-scored/permanently-retained
+/// candidates have upper bounds strictly below every still-selected
+/// candidate's lower bound. This lets external reranking stop between sorted
+/// artifact batches without weakening membership recall.
+fn remainingRerankCandidatesCannotEnter(
+    ranked_items: []const search_results.ApproxSearchResult,
+    pending_flags: []const bool,
+    top_k: usize,
+    upper_storage: []f32,
+) bool {
+    if (top_k == 0 or upper_storage.len < ranked_items.len) return false;
+    var retained_count: usize = 0;
+    var pending_lower = std.math.inf(f32);
+    for (ranked_items, pending_flags) |item, pending| {
+        if (pending) {
+            pending_lower = @min(pending_lower, item.distance - item.error_bound);
+            continue;
+        }
+        const upper = item.distance + item.error_bound;
+        if (!std.math.isFinite(upper)) continue;
+        upper_storage[retained_count] = upper;
+        retained_count += 1;
+    }
+    if (retained_count < top_k or !std.math.isFinite(pending_lower)) return false;
+    std.mem.sort(f32, upper_storage[0..retained_count], {}, struct {
+        fn lessThan(_: void, lhs: f32, rhs: f32) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+    return upper_storage[top_k - 1] < pending_lower;
+}
+
+test "progressive rerank stops only beyond retained kth upper bound" {
+    const items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 1.0, .error_bound = 0 },
+        .{ .vector_id = 2, .distance = 2.0, .error_bound = 0.1 },
+        .{ .vector_id = 3, .distance = 4.0, .error_bound = 0.2 },
+        .{ .vector_id = 4, .distance = 6.0, .error_bound = 0.5 },
+    };
+    var storage: [items.len]f32 = undefined;
+    try std.testing.expect(remainingRerankCandidatesCannotEnter(&items, &.{ false, false, true, true }, 2, &storage));
+    try std.testing.expect(!remainingRerankCandidatesCannotEnter(&items, &.{ false, true, true, true }, 2, &storage));
+
+    var overlapping = items;
+    overlapping[2].distance = 2.0;
+    overlapping[2].error_bound = 0.5;
+    try std.testing.expect(!remainingRerankCandidatesCannotEnter(&overlapping, &.{ false, false, true, true }, 2, &storage));
+}
+
 fn selectedRerankCandidatePositions(
     alloc: std.mem.Allocator,
     ranked_items: []const search_results.ApproxSearchResult,
@@ -2778,7 +3928,7 @@ fn loadRerankVectorsSorted(
     defer self.alloc.free(vector_ids);
     const batch_scratch = try self.alloc.alloc(f32, scratch.len * rerank_positions.len);
     defer self.alloc.free(batch_scratch);
-    try loadRerankVectorsSortedWithScratch(self, txn, ranked_items, rerank_positions, vector_views, vector_ids, lookups, key_views, values, scratch, batch_scratch);
+    try loadRerankVectorsSortedWithScratch(self, txn, ranked_items, rerank_positions, vector_views, vector_ids, lookups, key_views, values, scratch, batch_scratch, true);
 }
 
 fn loadRerankVectorsSortedWithScratch(
@@ -2793,11 +3943,12 @@ fn loadRerankVectorsSortedWithScratch(
     values_storage: []?[]const u8,
     scratch: []f32,
     batch_scratch: []f32,
+    comptime use_cache: bool,
 ) !void {
     if (vector_id_storage.len < rerank_positions.len) return error.InvalidArgument;
     const vector_ids = vector_id_storage[0..rerank_positions.len];
     for (rerank_positions, 0..) |index, slot| vector_ids[slot] = ranked_items[index].vector_id;
-    try loadVectorIdsSortedWithScratch(self, txn, vector_ids, vector_views, lookup_storage, key_views_storage, values_storage, scratch, batch_scratch);
+    try loadVectorIdsSortedWithScratchWithCachePolicy(self, txn, vector_ids, vector_views, lookup_storage, key_views_storage, values_storage, scratch, batch_scratch, use_cache);
 }
 
 fn loadVectorIdsSortedWithScratch(
@@ -2811,6 +3962,32 @@ fn loadVectorIdsSortedWithScratch(
     scratch: []f32,
     batch_scratch: []f32,
 ) !void {
+    return loadVectorIdsSortedWithScratchWithCachePolicy(
+        self,
+        txn,
+        vector_ids,
+        vector_views,
+        lookup_storage,
+        key_views_storage,
+        values_storage,
+        scratch,
+        batch_scratch,
+        true,
+    );
+}
+
+fn loadVectorIdsSortedWithScratchWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    vector_ids: []const u64,
+    vector_views: [][]const f32,
+    lookup_storage: []FixedKeyLookup,
+    key_views_storage: [][]const u8,
+    values_storage: []?[]const u8,
+    scratch: []f32,
+    batch_scratch: []f32,
+    comptime use_cache: bool,
+) !void {
     const Index = comptime childType(@TypeOf(self));
     std.debug.assert(vector_views.len >= vector_ids.len);
     std.debug.assert(lookup_storage.len >= vector_ids.len);
@@ -2819,22 +3996,38 @@ fn loadVectorIdsSortedWithScratch(
     for (vector_views[0..vector_ids.len]) |*view| view.* = &.{};
     if (indexHasExternalVectorLoader(self)) {
         if (comptime @hasDecl(Index, "getExternalVectorViewsSortedWithScratch")) {
-            if (try self.getExternalVectorViewsSortedWithScratch(
-                txn,
-                vector_ids,
-                vector_views,
-                lookup_storage,
-                key_views_storage,
-                values_storage,
-                scratch,
-                batch_scratch,
-            )) return;
+            const loaded = if (!use_cache and comptime @hasDecl(Index, "getExternalVectorViewsSortedWithScratchUncached"))
+                try self.getExternalVectorViewsSortedWithScratchUncached(
+                    txn,
+                    vector_ids,
+                    vector_views,
+                    lookup_storage,
+                    key_views_storage,
+                    values_storage,
+                    scratch,
+                    batch_scratch,
+                )
+            else
+                try self.getExternalVectorViewsSortedWithScratch(
+                    txn,
+                    vector_ids,
+                    vector_views,
+                    lookup_storage,
+                    key_views_storage,
+                    values_storage,
+                    scratch,
+                    batch_scratch,
+                );
+            if (loaded) return;
         }
         const dims = scratch.len;
         std.debug.assert(batch_scratch.len >= dims * vector_ids.len);
         for (vector_ids, 0..) |vector_id, slot| {
             const slot_scratch = batch_scratch[slot * dims ..][0..dims];
-            vector_views[slot] = self.getVectorInto(txn, vector_id, slot_scratch) catch &.{};
+            vector_views[slot] = if (!use_cache and comptime @hasDecl(Index, "getVectorIntoUncached"))
+                self.getVectorIntoUncached(txn, vector_id, slot_scratch) catch &.{}
+            else
+                self.getVectorInto(txn, vector_id, slot_scratch) catch &.{};
         }
         return;
     }
@@ -2844,25 +4037,30 @@ fn loadVectorIdsSortedWithScratch(
         std.debug.assert(batch_scratch.len >= dims * vector_ids.len);
         for (vector_ids, 0..) |vector_id, slot| {
             const slot_scratch = batch_scratch[slot * dims ..][0..dims];
-            vector_views[slot] = self.getVectorInto(txn, vector_id, slot_scratch) catch &.{};
+            vector_views[slot] = if (!use_cache and comptime @hasDecl(Index, "getVectorIntoUncached"))
+                self.getVectorIntoUncached(txn, vector_id, slot_scratch) catch &.{}
+            else
+                self.getVectorInto(txn, vector_id, slot_scratch) catch &.{};
         }
         return;
     }
 
     var lookup_count: usize = 0;
     for (vector_ids, 0..) |vector_id, slot| {
-        if (borrowCachedVectorHandle(self, vector_id)) |cached_handle| {
-            var handle = cached_handle;
-            defer handle.deinit();
-            const cached = handle.view();
-            const slot_scratch = batch_scratch[slot * scratch.len ..][0..scratch.len];
-            if (cached.len > slot_scratch.len) return error.BufferTooSmall;
-            @memcpy(slot_scratch[0..cached.len], cached);
-            if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
-                self.notifyVectorViewLoadForTest(vector_id);
+        if (use_cache) {
+            if (borrowCachedVectorHandle(self, vector_id)) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                const cached = handle.view();
+                const slot_scratch = batch_scratch[slot * scratch.len ..][0..scratch.len];
+                if (cached.len > slot_scratch.len) return error.BufferTooSmall;
+                @memcpy(slot_scratch[0..cached.len], cached);
+                if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
+                    self.notifyVectorViewLoadForTest(vector_id);
+                }
+                vector_views[slot] = slot_scratch[0..cached.len];
+                continue;
             }
-            vector_views[slot] = slot_scratch[0..cached.len];
-            continue;
         }
         var key: [10]u8 = undefined;
         _ = hbc.encodeVecKey(&key, vector_id);
@@ -2870,6 +4068,7 @@ fn loadVectorIdsSortedWithScratch(
             .item_index = slot,
             .vector_id = vector_id,
             .key = key,
+            .vector_cache_fill_epoch = if (use_cache) beginVectorCacheFillIfSupported(self, vector_id).epoch else 0,
         };
         lookup_count += 1;
     }
@@ -2881,28 +4080,74 @@ fn loadVectorIdsSortedWithScratch(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
-    try txn.getManySorted(.vecs, key_views, values);
+    const vector_namespace = if (comptime @hasDecl(Index, "vectorArtifactReadNamespace"))
+        self.vectorArtifactReadNamespace()
+    else
+        .vecs;
+    try txn.getManySorted(vector_namespace, key_views, values);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
-        if (borrowCachedVectorHandle(self, lookups[i].vector_id)) |cached_handle| {
-            var handle = cached_handle;
-            defer handle.deinit();
-            const cached = handle.view();
-            const slot_scratch = batch_scratch[lookups[i].item_index * scratch.len ..][0..scratch.len];
-            if (cached.len > slot_scratch.len) return error.BufferTooSmall;
-            @memcpy(slot_scratch[0..cached.len], cached);
-            if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
-                self.notifyVectorViewLoadForTest(lookups[i].vector_id);
+        if (use_cache) {
+            if (borrowCachedVectorHandle(self, lookups[i].vector_id)) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                const cached = handle.view();
+                const slot_scratch = batch_scratch[lookups[i].item_index * scratch.len ..][0..scratch.len];
+                if (cached.len > slot_scratch.len) return error.BufferTooSmall;
+                @memcpy(slot_scratch[0..cached.len], cached);
+                if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
+                    self.notifyVectorViewLoadForTest(lookups[i].vector_id);
+                }
+                vector_views[lookups[i].item_index] = slot_scratch[0..cached.len];
+                continue;
             }
-            vector_views[lookups[i].item_index] = slot_scratch[0..cached.len];
-            continue;
         }
-        const view = try vectorViewFromRaw(value, scratch);
+        // Cache admission is an optimization, not an ownership contract.
+        // Decode into this result's stable batch slot so a rejected cache
+        // fill cannot leave every returned view aliasing the shared scalar
+        // scratch buffer (and therefore the final vector decoded).
+        const slot_scratch = batch_scratch[lookups[i].item_index * scratch.len ..][0..scratch.len];
+        const view = try vectorViewFromRaw(value, slot_scratch);
         if (builtin.is_test and comptime @hasDecl(Index, "notifyVectorViewLoadForTest")) {
             self.notifyVectorViewLoadForTest(lookups[i].vector_id);
         }
-        vector_views[lookups[i].item_index] = try self.cacheVector(lookups[i].vector_id, view);
+        if (use_cache) {
+            const guarded = comptime @hasDecl(Index, "beginVectorCacheFill");
+            vector_views[lookups[i].item_index] = try cacheVectorAfterLoad(self, lookups[i].vector_id, view, .{
+                .guarded = guarded,
+                .epoch = lookups[i].vector_cache_fill_epoch,
+            });
+        } else {
+            vector_views[lookups[i].item_index] = view;
+        }
     }
+}
+
+/// Narrow test seam for the cache-admission ownership regression. Keeping the
+/// generic loader private in production avoids widening the vector-index API.
+pub fn loadVectorIdsSortedWithScratchForTest(
+    self: anytype,
+    txn: anytype,
+    vector_ids: []const u64,
+    vector_views: [][]const f32,
+    lookup_storage: []search_runtime.RerankLookup,
+    key_views_storage: [][]const u8,
+    values_storage: []?[]const u8,
+    scratch: []f32,
+    batch_scratch: []f32,
+) !void {
+    if (!builtin.is_test) @compileError("test-only vector batch loader seam");
+    return try loadVectorIdsSortedWithScratch(
+        self,
+        txn,
+        vector_ids,
+        vector_views,
+        lookup_storage,
+        key_views_storage,
+        values_storage,
+        scratch,
+        batch_scratch,
+    );
 }
 
 fn loadTransformedVectorIdsIntoMatrix(
@@ -3510,6 +4755,16 @@ test "kmeans bulk builder packs bounded leaves" {
         fn putNodeSplitRange(_: *@This(), _: anytype, _: u64, _: anytype) !void {}
 
         fn updateParent(_: *@This(), _: anytype, _: u64, _: u64) !void {}
+
+        fn getCachedNodeClone(_: *@This(), _: u64) !?types.Node {
+            return null;
+        }
+
+        fn loadNodeFromStorage(_: *@This(), _: anytype, _: u64) !types.Node {
+            return error.UnexpectedNodeLoad;
+        }
+
+        fn cacheNode(_: *@This(), _: *const types.Node) !void {}
     };
 
     const raw = [_]f32{
@@ -3538,6 +4793,7 @@ test "kmeans bulk builder packs bounded leaves" {
             .dims = 2,
             .leaf_size = 2,
             .branching_factor = 2,
+            .metric = .cosine,
             .kmeans_max_iter = 4,
             .kmeans_update_strategy = .segmented,
             .use_quantization = false,
@@ -3556,35 +4812,39 @@ test "kmeans bulk builder packs bounded leaves" {
 }
 
 pub fn populateMetadata(self: anytype, txn: anytype, results: *search_results.SearchResults) !void {
+    return populateMetadataWithCachePolicy(self, txn, results, true);
+}
+
+fn populateMetadataWithCachePolicy(self: anytype, txn: anytype, results: *search_results.SearchResults, comptime use_cache: bool) !void {
     try self.bindTxnLike(txn);
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
-        try populateMetadataBatched(self, txn, results);
+        try populateMetadataBatched(self, txn, results, use_cache);
         return;
     }
     for (results.items.items) |*item| {
         if (item.metadata != null) continue;
-        const data = (try loadMetadataRaw(self, txn, item.vector_id, isNotFoundGeneric)) orelse continue;
+        const data = (try loadMetadataRawWithCachePolicy(self, txn, item.vector_id, use_cache, isNotFoundGeneric)) orelse continue;
         item.metadata = try self.alloc.dupe(u8, data);
     }
 }
 
-fn populateMetadataWithScratch(self: anytype, txn: anytype, results: *search_results.SearchResults, scratch: anytype) !void {
+fn populateMetadataWithScratch(self: anytype, txn: anytype, results: *search_results.SearchResults, scratch: anytype, comptime use_cache: bool) !void {
     try self.bindTxnLike(txn);
     if (comptime txnSupportsGetManySorted(@TypeOf(txn))) {
-        try populateMetadataBatchedWithScratch(self, txn, results, scratch.lookups, scratch.key_views, scratch.values);
+        try populateMetadataBatchedWithScratch(self, txn, results, scratch.lookups, scratch.key_views, scratch.values, use_cache);
         return;
     }
-    try populateMetadata(self, txn, results);
+    try populateMetadataWithCachePolicy(self, txn, results, use_cache);
 }
 
-fn populateMetadataBatched(self: anytype, txn: anytype, results: *search_results.SearchResults) !void {
+fn populateMetadataBatched(self: anytype, txn: anytype, results: *search_results.SearchResults, comptime use_cache: bool) !void {
     const lookups = try self.alloc.alloc(FixedKeyLookup, results.items.items.len);
     defer self.alloc.free(lookups);
     const key_views = try self.alloc.alloc([]const u8, results.items.items.len);
     defer self.alloc.free(key_views);
     const values = try self.alloc.alloc(?[]const u8, results.items.items.len);
     defer self.alloc.free(values);
-    try populateMetadataBatchedWithScratch(self, txn, results, lookups, key_views, values);
+    try populateMetadataBatchedWithScratch(self, txn, results, lookups, key_views, values, use_cache);
 }
 
 fn populateMetadataBatchedWithScratch(
@@ -3594,19 +4854,25 @@ fn populateMetadataBatchedWithScratch(
     lookup_storage: []FixedKeyLookup,
     key_views_storage: [][]const u8,
     values_storage: []?[]const u8,
+    comptime use_cache: bool,
 ) !void {
     var lookup_count: usize = 0;
     for (results.items.items, 0..) |item, index| {
         if (item.metadata != null) continue;
-        if (borrowCachedMetadataHandle(self, item.vector_id)) |cached_handle| {
-            var handle = cached_handle;
-            defer handle.deinit();
-            results.items.items[index].metadata = try self.alloc.dupe(u8, handle.view());
-            continue;
+        if (use_cache) {
+            if (borrowCachedMetadataHandle(self, item.vector_id)) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                results.items.items[index].metadata = try self.alloc.dupe(u8, handle.view());
+                continue;
+            }
         }
-        if (self.getCachedMetadata(item.vector_id)) |cached| {
-            results.items.items[index].metadata = try self.alloc.dupe(u8, cached);
-            continue;
+        const Index = comptime childType(@TypeOf(self));
+        if (use_cache and comptime !@hasDecl(Index, "borrowCachedMetadata")) {
+            if (self.getCachedMetadata(item.vector_id)) |cached| {
+                results.items.items[index].metadata = try self.alloc.dupe(u8, cached);
+                continue;
+            }
         }
         var key: [10]u8 = undefined;
         _ = hbc.encodeVecMetaKey(&key, item.vector_id);
@@ -3625,10 +4891,11 @@ fn populateMetadataBatchedWithScratch(
     std.mem.sort(FixedKeyLookup, lookups, {}, lessFixedKeyLookup);
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
+    const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
     try txn.getManySorted(.vecs, key_views, values);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
-        _ = try self.cacheMetadata(lookups[i].vector_id, value);
+        if (use_cache) _ = try cacheMetadataAfterLoad(self, lookups[i].vector_id, value, fill);
         results.items.items[lookups[i].item_index].metadata = try self.alloc.dupe(u8, value);
     }
 }
@@ -3643,6 +4910,20 @@ pub fn memberMatchesRequest(
     filter_state: *const search_types.RequestFilterState,
     approximate: bool,
 ) !bool {
+    return memberMatchesRequestWithCachePolicy(self, txn, vector_id, distance, error_bound, req, filter_state, approximate, true);
+}
+
+fn memberMatchesRequestWithCachePolicy(
+    self: anytype,
+    txn: anytype,
+    vector_id: u64,
+    distance: f32,
+    error_bound: f32,
+    req: search_types.SearchRequest,
+    filter_state: *const search_types.RequestFilterState,
+    approximate: bool,
+    comptime use_cache: bool,
+) !bool {
     try self.bindTxnLike(txn);
     if (filter_state.rejects(vector_id)) return false;
     if (req.distance_over) |threshold| {
@@ -3656,13 +4937,15 @@ pub fn memberMatchesRequest(
         } else if (distance >= threshold) return false;
     }
     if (req.filter_prefix.len > 0) {
-        if (borrowCachedMetadataHandle(self, vector_id)) |cached_handle| {
-            var handle = cached_handle;
-            defer handle.deinit();
-            if (!std.mem.startsWith(u8, handle.view(), req.filter_prefix)) return false;
-            return true;
+        if (use_cache) {
+            if (borrowCachedMetadataHandle(self, vector_id)) |cached_handle| {
+                var handle = cached_handle;
+                defer handle.deinit();
+                if (!std.mem.startsWith(u8, handle.view(), req.filter_prefix)) return false;
+                return true;
+            }
         }
-        const metadata = (try loadMetadataRaw(self, txn, vector_id, isNotFoundGeneric)) orelse return false;
+        const metadata = (try loadMetadataRawWithCachePolicy(self, txn, vector_id, use_cache, isNotFoundGeneric)) orelse return false;
         if (!std.mem.startsWith(u8, metadata, req.filter_prefix)) return false;
     }
     return true;
@@ -3677,6 +4960,99 @@ fn normalizeCentroidForMetric(self: anytype, centroid: []f32) void {
     if (self.config.metric == .cosine and centroid.len > 0) {
         _ = vec.normalize(centroid);
     }
+}
+
+fn l2CoveringRadiusForMatrix(centroid: []const f32, vectors: []const f32, count: usize) f32 {
+    if (count == 0) return 0;
+    if (centroid.len == 0 or vectors.len < count * centroid.len) return std.math.nan(f32);
+    var max_squared: f32 = 0;
+    for (0..count) |row| {
+        const candidate = vectors[row * centroid.len ..][0..centroid.len];
+        var squared: f32 = 0;
+        for (centroid, candidate) |center, value| {
+            const delta = value - center;
+            squared += delta * delta;
+        }
+        max_squared = @max(max_squared, squared);
+    }
+    return @sqrt(max_squared);
+}
+
+fn expandL2RadiusAfterAppend(node: *types.Node, appended: []const f32) void {
+    if (node.members.len <= 1) {
+        node.covering_radius = 0;
+        return;
+    }
+    if (!std.math.isFinite(node.covering_radius) or node.covering_radius < 0 or appended.len != node.centroid.len) {
+        node.covering_radius = std.math.nan(f32);
+        return;
+    }
+    const old_count: f32 = @floatFromInt(node.members.len - 1);
+    var shift_squared: f32 = 0;
+    var appended_squared: f32 = 0;
+    for (node.centroid, appended) |new_center, value| {
+        const appended_delta = value - new_center;
+        appended_squared += appended_delta * appended_delta;
+        const shift = appended_delta / old_count;
+        shift_squared += shift * shift;
+    }
+    node.covering_radius = @max(node.covering_radius + @sqrt(shift_squared), @sqrt(appended_squared));
+}
+
+fn expandL2RadiusAfterBatchAppend(node: *types.Node, appended: []const f32, added_count: usize) void {
+    if (added_count == 0) return;
+    if (node.members.len == added_count) {
+        node.covering_radius = l2CoveringRadiusForMatrix(node.centroid, appended, added_count);
+        return;
+    }
+    if (!std.math.isFinite(node.covering_radius) or node.covering_radius < 0 or appended.len < added_count * node.centroid.len) {
+        node.covering_radius = std.math.nan(f32);
+        return;
+    }
+    const old_count = node.members.len - added_count;
+    const old_count_f: f32 = @floatFromInt(old_count);
+    const total_count_f: f32 = @floatFromInt(node.members.len);
+    var shift_squared: f32 = 0;
+    for (node.centroid, 0..) |new_center, dim| {
+        var appended_sum: f32 = 0;
+        for (0..added_count) |row| appended_sum += appended[row * node.centroid.len + dim];
+        const old_center = (new_center * total_count_f - appended_sum) / old_count_f;
+        const shift = old_center - new_center;
+        shift_squared += shift * shift;
+    }
+    var radius = node.covering_radius + @sqrt(shift_squared);
+    for (0..added_count) |row| {
+        const candidate = appended[row * node.centroid.len ..][0..node.centroid.len];
+        var squared: f32 = 0;
+        for (node.centroid, candidate) |center, value| {
+            const delta = value - center;
+            squared += delta * delta;
+        }
+        radius = @max(radius, @sqrt(squared));
+    }
+    node.covering_radius = radius;
+}
+
+fn l2SubtreeLowerBound(candidate: types.PriorityItem, covering_radius: f32) ?f32 {
+    if (!std.math.isFinite(covering_radius) or covering_radius < 0) return null;
+    const centroid_squared_lower = @max(@as(f32, 0), candidate.distance - candidate.error_bound);
+    if (!std.math.isFinite(centroid_squared_lower)) return null;
+    const vector_distance_lower = @max(@as(f32, 0), @sqrt(centroid_squared_lower) - covering_radius);
+    return vector_distance_lower * vector_distance_lower;
+}
+
+fn computeInternalCoveringRadius(self: anytype, txn: anytype, node: *const types.Node) !f32 {
+    if (self.config.metric != .l2_squared) return std.math.nan(f32);
+    if (node.children.len == 0) return 0;
+    var radius: f32 = 0;
+    for (node.children) |child_id| {
+        var child = try loadNode(self, txn, child_id);
+        defer child.deinit(self.alloc);
+        if (!std.math.isFinite(child.covering_radius) or child.covering_radius < 0) return std.math.nan(f32);
+        const center_squared = vec.distanceToQuery(node.centroid, vec.dot(node.centroid, node.centroid), child.centroid, .l2_squared);
+        radius = @max(radius, @sqrt(@max(center_squared, 0)) + child.covering_radius);
+    }
+    return radius;
 }
 
 pub fn recomputeLeafCentroid(self: anytype, txn: anytype, leaf: *types.Node) !void {
@@ -3694,6 +5070,10 @@ fn applyLeafCentroidDelta(self: anytype, leaf: *types.Node, delta: []const f32) 
     const n: f32 = @floatFromInt(leaf.members.len);
     for (leaf.centroid, 0..) |*c, i| c.* += delta[i] / n;
     normalizeCentroidForMetric(self, leaf.centroid);
+    // An in-place replacement removes one old point and adds another. The
+    // centroid delta alone cannot tighten the old sphere safely without both
+    // endpoints, so maintenance recomputes it and search uses width meanwhile.
+    leaf.covering_radius = std.math.nan(f32);
     posting.PostingStore.noteCentroidRefreshed(leaf);
 }
 
@@ -3740,6 +5120,7 @@ pub fn recomputeInternalCentroid(self: anytype, txn: anytype, node: *types.Node)
     }
     vec.scale(1.0 / @as(f32, @floatFromInt(node.children.len)), node.centroid);
     normalizeCentroidForMetric(self, node.centroid);
+    node.covering_radius = try computeInternalCoveringRadius(self, txn, node);
 }
 
 fn updateInternalCentroidForLeafSplit(
@@ -3802,26 +5183,34 @@ pub fn collapseSingleChildParents(self: anytype, txn: anytype, start_node_id: u6
 }
 
 pub fn delete(self: anytype, vector_id: u64) !void {
+    const publishing = try beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
     try deleteTxn(self, &txn, vector_id);
     try runAutoPostingMaintenanceTxn(self, &txn);
     try self.flushMetadata(&txn);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
-    publishSearchStateIfSupported(self);
+    try finishPublishSearchStateIfSupported(self, publishing);
 }
 
 pub fn batchDelete(self: anytype, vector_ids: []const u64) !void {
     if (vector_ids.len == 0) return;
     if (vector_ids.len == 1) return delete(self, vector_ids[0]);
 
+    const publishing = try beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     var batch = try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
     try batchDeleteTxn(self, &batch, vector_ids);
     try runAutoPostingMaintenanceTxn(self, &batch);
     try self.flushMetadata(&batch);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
-    publishSearchStateIfSupported(self);
+    try finishPublishSearchStateIfSupported(self, publishing);
 }
 
 const PreparedBatchDelete = struct {
@@ -4217,12 +5606,16 @@ pub fn repairTreeLinks(self: anytype, txn: anytype, max_nodes: usize) !TreeLinkR
 /// metadata (the sweep can change root/node bookkeeping via collapse), and
 /// republishes search state — mirroring delete()/batchDelete().
 pub fn repairLinks(self: anytype, max_nodes: usize) !TreeLinkRepairReport {
+    const publishing = try beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
     const report = try repairTreeLinks(self, &txn, max_nodes);
     try self.flushMetadata(&txn);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
-    publishSearchStateIfSupported(self);
+    try finishPublishSearchStateIfSupported(self, publishing);
     return report;
 }
 
@@ -4276,6 +5669,7 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
     try leaf.ensureUnbacked(self.alloc);
 
     try posting.PostingStore.removeMember(self.alloc, &leaf, vector_id);
+    leaf.covering_radius = if (leaf.members.len == 0) 0 else std.math.nan(f32);
 
     if (leaf.members.len > 0 and shouldDeferPostingCentroidRefresh(self, &leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
@@ -4283,6 +5677,7 @@ pub fn deleteTxn(self: anytype, txn: anytype, vector_id: u64) !void {
         try posting.PostingStore.recomputeCentroid(self, txn, &leaf);
     } else {
         @memset(leaf.centroid, 0);
+        leaf.covering_radius = 0;
     }
 
     if (leaf.members.len == 0 and leaf.parent != 0) {
@@ -4457,8 +5852,11 @@ pub fn insertWithMetadata(
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !void {
+    const publishing = try beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     var txn = try self.beginRuntimeWriteTxn();
     errdefer txn.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
     const transformed_vector = try self.alloc.alloc(f32, self.config.dims);
     defer self.alloc.free(transformed_vector);
     try insertWithMetadataTxn(self, &txn, vector_id, vector_data, metadata_value, transformed_vector, now_fn_u64, elapsed_fn_u64);
@@ -4467,9 +5865,10 @@ pub fn insertWithMetadata(
     try self.flushMetadata(&txn);
     self.write_profile.insert_flush_metadata_ns += elapsed_fn_u64(flush_start);
     const commit_start = now_fn_u64();
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try txn.commit();
     self.write_profile.insert_commit_ns += elapsed_fn_u64(commit_start);
-    publishSearchStateIfSupported(self);
+    try finishPublishSearchStateIfSupported(self, publishing);
 }
 
 pub fn insertWithMetadataTxn(
@@ -4598,6 +5997,11 @@ pub fn insertWithMetadataTxnOptions(
     };
 
     const store_start = now_fn_u64();
+    // The embedding may be authoritative in an external LSM rather than this
+    // index's vector namespace. Invalidate unconditionally so a retained
+    // derivative from an earlier generation cannot survive an update merely
+    // because cache seeding is bypassed for this write.
+    self.invalidateVectorCache(vector_id);
     if (!skip_vector_store) {
         try putVector(self, txn, vector_id, vector_data);
     } else if (shouldSeedRetainedVectorCacheOnSkipStore(self)) {
@@ -4627,6 +6031,11 @@ pub fn insertWithMetadataTxnOptions(
         }
         normalizeCentroidForMetric(self, leaf.centroid);
         posting.PostingStore.noteCentroidRefreshed(&leaf);
+    }
+    if (self.config.metric == .l2_squared) {
+        expandL2RadiusAfterAppend(&leaf, effective_transformed);
+    } else {
+        leaf.covering_radius = std.math.nan(f32);
     }
     const leaf_overflows = leaf.members.len > self.config.leaf_size;
     const defer_leaf_split = shouldDeferOversizedLeafSplit(self, &leaf, batch_insert_options);
@@ -4890,11 +6299,15 @@ pub fn removeFromLeaf(self: anytype, txn: anytype, leaf_id: u64, vector_id: u64)
             try sibling.ensureUnbacked(self.alloc);
             const merged_len = sibling.members.len + leaf.members.len;
             var merged = try self.alloc.alloc(u64, merged_len);
-            errdefer self.alloc.free(merged);
+            var merged_owned = true;
+            errdefer if (merged_owned) self.alloc.free(merged);
             @memcpy(merged[0..sibling.members.len], sibling.members);
             @memcpy(merged[sibling.members.len..], leaf.members);
             self.alloc.free(sibling.members);
             sibling.members = merged;
+            // sibling's deferred destructor owns the replacement after the
+            // transfer, including every subsequent error path.
+            merged_owned = false;
             try posting.PostingStore.recomputeCentroid(self, txn, &sibling);
             try self.saveNodeWithOptionsMode(txn, &sibling, .{}, false);
             for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
@@ -4996,6 +6409,8 @@ pub fn splitInternalWithOptions(
 
     for (n1.children) |child_id| try updateParent(self, txn, child_id, n1_id, nowNsU64Fixed, elapsedSinceU64Fixed);
     for (n2.children) |child_id| try updateParent(self, txn, child_id, n2_id, nowNsU64Fixed, elapsedSinceU64Fixed);
+    n1.covering_radius = try computeInternalCoveringRadius(self, txn, &n1);
+    n2.covering_radius = try computeInternalCoveringRadius(self, txn, &n2);
 
     if (node.parent == 0) {
         const new_root_id = self.nextNodeId();
@@ -5026,6 +6441,7 @@ pub fn splitInternalWithOptions(
             .members = &.{},
         };
         defer new_root.deinit(self.alloc);
+        new_root.covering_radius = try computeInternalCoveringRadius(self, txn, &new_root);
         try saveNodeWithOptions(self, txn, &new_root, options, now_fn, elapsed_fn);
         self.metadata.root_node = new_root_id;
     } else {
@@ -5223,9 +6639,17 @@ pub fn splitLeafWithOptions(
     defer self.alloc.free(vec_data);
     const vector_load_start = now_fn();
     var used_cached_nonquant = false;
-    _ = self.getQuantized(txn, leaf.id, usesNonQuantizedPayload(leaf), count) catch null;
-    if (self.getCachedQuantizedPtr(leaf.id)) |cached| {
-        switch (cached.*) {
+    var quantized_handle = try loadQuantizedReadHandle(
+        self,
+        txn,
+        leaf.id,
+        usesNonQuantizedPayload(leaf),
+        count,
+        isNotFoundGeneric,
+    );
+    defer if (quantized_handle) |*handle| handle.deinit(self.alloc);
+    if (quantized_handle) |*handle| {
+        switch (handle.ptr().*) {
             .nonquant => |*set| {
                 if (set.vectors.dims == dims and set.vectors.count == count and set.vectors.data.len >= count * dims) {
                     @memcpy(vec_data, set.vectors.data[0 .. count * dims]);
@@ -5309,9 +6733,13 @@ pub fn splitLeafWithOptions(
     defer if (left_vectors.len > 0) self.alloc.free(left_vectors);
     var right_vectors: []f32 = &.{};
     defer if (right_vectors.len > 0) self.alloc.free(right_vectors);
-    if (publish_known_quantized_now) {
+    if (publish_known_quantized_now or self.config.metric == .l2_squared) {
         left_vectors = try copyNodeMemberVectorsFromSource(self, &left_node, leaf.members, vec_data);
         right_vectors = try copyNodeMemberVectorsFromSource(self, &right_node, leaf.members, vec_data);
+    }
+    if (self.config.metric == .l2_squared) {
+        left_node.covering_radius = l2CoveringRadiusForMatrix(left_node.centroid, left_vectors, left_node.members.len);
+        right_node.covering_radius = l2CoveringRadiusForMatrix(right_node.centroid, right_vectors, right_node.members.len);
     }
 
     if (splitting_root) {
@@ -5350,6 +6778,7 @@ pub fn splitLeafWithOptions(
             .members = &.{},
         };
         defer new_root.deinit(self.alloc);
+        new_root.covering_radius = try computeInternalCoveringRadius(self, txn, &new_root);
         try saveNodeWithOptions(self, txn, &new_root, options, now_fn, elapsed_fn);
         self.metadata.root_node = new_root_id;
 
@@ -5428,9 +6857,17 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
 
     const vector_load_start = now_fn();
     var used_cached_nonquant = false;
-    _ = self.getQuantized(txn, leaf.id, usesNonQuantizedPayload(leaf), leaf.members.len) catch null;
-    if (self.getCachedQuantizedPtr(leaf.id)) |cached| {
-        switch (cached.*) {
+    var quantized_handle = try loadQuantizedReadHandle(
+        self,
+        txn,
+        leaf.id,
+        usesNonQuantizedPayload(leaf),
+        leaf.members.len,
+        isNotFoundGeneric,
+    );
+    defer if (quantized_handle) |*handle| handle.deinit(self.alloc);
+    if (quantized_handle) |*handle| {
+        switch (handle.ptr().*) {
             .nonquant => |*set| {
                 if (set.vectors.dims == dims and set.vectors.count == leaf.members.len and set.vectors.data.len >= leaf.members.len * dims) {
                     @memcpy(dense_vectors, set.vectors.data[0 .. leaf.members.len * dims]);
@@ -5546,6 +6983,10 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
                 .members = members,
             };
             defer node.deinit(self.alloc);
+            node.covering_radius = if (self.config.metric == .l2_squared)
+                l2CoveringRadiusForMatrix(node.centroid, group_vectors, node.members.len)
+            else
+                std.math.nan(f32);
             if (publish_known_quantized_now) {
                 try saveLeafNodeWithKnownVectors(self, txn, &node, group_vectors, now_fn, elapsed_fn);
             } else {
@@ -5578,6 +7019,7 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
             .members = &.{},
         };
         defer root.deinit(self.alloc);
+        root.covering_radius = try computeInternalCoveringRadius(self, txn, &root);
         try saveNodeWithOptions(self, txn, &root, options, now_fn, elapsed_fn);
         self.metadata.root_node = new_root_id;
     } else {
@@ -5645,29 +7087,34 @@ pub fn batchApplyOptions(
         if (deletes.len == 1) return self.delete(deletes[0]);
 
         const Index = comptime childType(@TypeOf(self));
+        const publishing = try beginPublishSearchStateIfSupported(self);
+        errdefer abortPublishSearchStateIfSupported(self, publishing);
         var batch = if (options.bulk_ingest and comptime @hasDecl(Index, "beginRuntimeBatchTxnOptions"))
             try self.beginRuntimeBatchTxnOptions(options)
         else
             try self.beginRuntimeBatchTxn();
         errdefer batch.abort();
+        errdefer abortVectorCacheMutationsIfSupported(self);
         try batchDeleteTxn(self, &batch, deletes);
         try finalizeWriteTxnOptions(self, &batch, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
-        const publishing = beginPublishSearchStateIfSupported(self);
-        errdefer abortPublishSearchStateIfSupported(self, publishing);
+        try markPublishSearchStateCommittingIfSupported(self, publishing);
         try batch.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
-        finishPublishSearchStateIfSupported(self, publishing);
+        try finishPublishSearchStateIfSupported(self, publishing);
         return;
     }
     if (deletes.len == 0) return batchInsertWithMetadataOptions(self, writes, options, now_fn, elapsed_fn);
 
     const Index = comptime childType(@TypeOf(self));
+    const publishing = try beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     var batch = if (options.bulk_ingest and comptime @hasDecl(Index, "beginRuntimeBatchTxnOptions"))
         try self.beginRuntimeBatchTxnOptions(options)
     else
         try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
 
     try batchDeleteTxn(self, &batch, deletes);
 
@@ -5684,11 +7131,11 @@ pub fn batchApplyOptions(
     if (!grouped) try batchInsertWithMetadataTxnOptions(self, &batch, writes, insert_options);
     try finalizeWriteTxnOptions(self, &batch, insert_options, now_fn, elapsed_fn);
     const commit_start = now_fn();
-    const publishing = beginPublishSearchStateIfSupported(self);
-    errdefer abortPublishSearchStateIfSupported(self, publishing);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
-    finishPublishSearchStateIfSupported(self, publishing);
+    try finishPublishSearchStateIfSupported(self, publishing);
+    seedRetainedVectorsAfterCommit(self, writes, insert_options);
 }
 
 pub fn batchInsertWithMetadataOptions(
@@ -5702,11 +7149,14 @@ pub fn batchInsertWithMetadataOptions(
 
     if (items.len > 1) {
         const Index = comptime childType(@TypeOf(self));
+        const publishing = try beginPublishSearchStateIfSupported(self);
+        errdefer abortPublishSearchStateIfSupported(self, publishing);
         var batch = if (options.bulk_ingest and comptime @hasDecl(Index, "beginRuntimeBatchTxnOptions"))
             try self.beginRuntimeBatchTxnOptions(options)
         else
             try self.beginRuntimeBatchTxn();
         errdefer batch.abort();
+        errdefer abortVectorCacheMutationsIfSupported(self);
         const grouped = if (options.coalesce_leaf_writes)
             try batchInsertAssumeAbsentGroupedTxnOptions(self, &batch, items, options, now_fn, elapsed_fn)
         else
@@ -5714,22 +7164,25 @@ pub fn batchInsertWithMetadataOptions(
         if (!grouped) try batchInsertWithMetadataTxnOptions(self, &batch, items, options);
         try finalizeWriteTxnOptions(self, &batch, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
-        const publishing = beginPublishSearchStateIfSupported(self);
-        errdefer abortPublishSearchStateIfSupported(self, publishing);
+        try markPublishSearchStateCommittingIfSupported(self, publishing);
         try batch.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
-        finishPublishSearchStateIfSupported(self, publishing);
+        try finishPublishSearchStateIfSupported(self, publishing);
+        seedRetainedVectorsAfterCommit(self, items, options);
     } else {
+        const publishing = try beginPublishSearchStateIfSupported(self);
+        errdefer abortPublishSearchStateIfSupported(self, publishing);
         var txn = try self.beginRuntimeWriteTxn();
         errdefer txn.abort();
+        errdefer abortVectorCacheMutationsIfSupported(self);
         try batchInsertWithMetadataTxnOptions(self, &txn, items, options);
         try finalizeWriteTxnOptions(self, &txn, options, now_fn, elapsed_fn);
         const commit_start = now_fn();
-        const publishing = beginPublishSearchStateIfSupported(self);
-        errdefer abortPublishSearchStateIfSupported(self, publishing);
+        try markPublishSearchStateCommittingIfSupported(self, publishing);
         try txn.commit();
         self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
-        finishPublishSearchStateIfSupported(self, publishing);
+        try finishPublishSearchStateIfSupported(self, publishing);
+        seedRetainedVectorsAfterCommit(self, items, options);
     }
 }
 
@@ -5909,7 +7362,9 @@ fn routeBatchNodeToLeaves(
     profile: *BatchRouteProfile,
 ) !void {
     if (current_item_indexes.len == 0) return;
-    const node = try self.getNodePtr(txn, node_id);
+    var node_handle = try loadMutationNodeReadHandle(self, txn, node_id);
+    defer node_handle.deinit(self.alloc);
+    const node = node_handle.ptr();
     if (node.is_leaf or node.children.len == 0) {
         for (current_item_indexes) |item_index| {
             prepared[prepared_count.*] = .{ .item_index = item_index, .leaf_id = node_id };
@@ -6110,6 +7565,9 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
 
     const store_start = now_fn();
     for (sorted_item_indexes) |item_idx| {
+        self.invalidateVectorCache(items[item_idx].vector_id);
+    }
+    for (sorted_item_indexes) |item_idx| {
         const item = items[item_idx];
         if (item.metadata.len == 0) continue;
         var key_buf: [10]u8 = undefined;
@@ -6120,7 +7578,6 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
             const item = items[item_idx];
             var key_buf: [10]u8 = undefined;
             try self.appendNamespaced(txn, .vecs, hbc.encodeVecKey(&key_buf, item.vector_id), std.mem.sliceAsBytes(item.vector));
-            self.invalidateVectorCache(item.vector_id);
         }
     } else if (shouldSeedRetainedVectorCacheOnSkipStore(self)) {
         for (sorted_item_indexes) |item_idx| {
@@ -6246,6 +7703,11 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
             for (leaf.centroid, 0..) |*c, dim| c.* = (c.* * old_f + centroid_sum[dim]) / new_f;
             normalizeCentroidForMetric(self, leaf.centroid);
             posting.PostingStore.noteCentroidRefreshed(&leaf);
+        }
+        if (self.config.metric == .l2_squared) {
+            expandL2RadiusAfterBatchAppend(&leaf, added_vectors, group_len);
+        } else {
+            leaf.covering_radius = std.math.nan(f32);
         }
 
         const leaf_overflows = leaf.members.len > self.config.leaf_size;
@@ -6418,16 +7880,19 @@ pub fn bulkBuildWithMetadataOptions(
 ) !void {
     if (items.len == 0) return;
 
+    const publishing = try beginPublishSearchStateIfSupported(self);
+    errdefer abortPublishSearchStateIfSupported(self, publishing);
     var batch = try self.beginRuntimeBatchTxn();
     errdefer batch.abort();
+    errdefer abortVectorCacheMutationsIfSupported(self);
     try bulkBuildWithMetadataTxnOptions(self, &batch, items, options, now_fn, elapsed_fn);
     try finalizeWriteTxnOptions(self, &batch, .{}, now_fn, elapsed_fn);
     const commit_start = now_fn();
-    const publishing = beginPublishSearchStateIfSupported(self);
-    errdefer abortPublishSearchStateIfSupported(self, publishing);
+    try markPublishSearchStateCommittingIfSupported(self, publishing);
     try batch.commit();
     self.write_profile.insert_commit_ns += elapsed_fn(commit_start);
-    finishPublishSearchStateIfSupported(self, publishing);
+    try finishPublishSearchStateIfSupported(self, publishing);
+    seedRetainedVectorsAfterCommit(self, items, options);
 }
 
 pub fn bulkBuildWithMetadataTxn(self: anytype, txn: anytype, items: []const hbc_runtime.BatchInsertItem) !void {
@@ -6460,6 +7925,9 @@ pub fn bulkBuildPreparedInputsTxnOptions(
     }.lessThan);
 
     const store_start = now_fn();
+    for (sorted_indexes) |input_idx| {
+        self.invalidateVectorCache(inputs[input_idx].vector_id);
+    }
     for (sorted_indexes) |input_idx| {
         const input = inputs[input_idx];
         if (input.metadata.len > 0) {
@@ -6674,6 +8142,7 @@ pub fn buildBulkHilbertSeeded(
                 .children = child_ids,
                 .members = &.{},
             };
+            node.covering_radius = try computeInternalCoveringRadius(self, txn, &node);
             try self.saveNodeBody(txn, &node);
             try self.putNodeSplitRange(txn, node_id, if (merged_range) |*owned| owned else null);
             self.alloc.free(child_ids);
@@ -6936,19 +8405,8 @@ pub fn loadQuantized(self: anytype, txn: anytype, node_id: u64, is_root: bool, e
     return decoded;
 }
 
-pub fn getQuantized(self: anytype, txn: anytype, node_id: u64, is_root: bool, expected_count: usize, is_not_found: fn (anyerror) bool) !?*const hbc_runtime.QuantizedSet {
-    if (self.getCachedQuantizedPtr(node_id)) |cached| {
-        validateQuantizedSet(self, cached, expected_count) catch |err| switch (err) {
-            error.Corrupted => self.invalidateQuantizedCache(node_id),
-        };
-        if (self.getCachedQuantizedPtr(node_id)) |valid| return valid;
-    }
-
-    const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
-        if (is_not_found(err) or err == error.Corrupted) return null;
-        return err;
-    };
-    return try self.cacheQuantizedOwned(node_id, decoded);
+pub fn getQuantized(self: anytype, txn: anytype, node_id: u64, is_root: bool, expected_count: usize, is_not_found: fn (anyerror) bool) !?CachedQuantizedReadHandle(@TypeOf(self)) {
+    return try loadQuantizedReadHandle(self, txn, node_id, is_root, expected_count, is_not_found);
 }
 
 pub fn getQuantizedProfiled(
@@ -6961,23 +8419,8 @@ pub fn getQuantizedProfiled(
     is_not_found: fn (anyerror) bool,
     now_fn: fn () u64,
     elapsed_fn: fn (u64) u64,
-) !?*const hbc_runtime.QuantizedSet {
-    if (self.getCachedQuantizedPtr(node_id)) |cached| {
-        validateQuantizedSet(self, cached, expected_count) catch |err| switch (err) {
-            error.Corrupted => self.invalidateQuantizedCache(node_id),
-        };
-        if (self.getCachedQuantizedPtr(node_id)) |valid| return valid;
-    }
-
-    const start = now_fn();
-    const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
-        if (is_not_found(err) or err == error.Corrupted) return null;
-        return err;
-    };
-    const cached = try self.cacheQuantizedOwned(node_id, decoded);
-    profile.quantized_cache_miss_ns += elapsed_fn(start);
-    profile.quantized_cache_misses += 1;
-    return cached;
+) !?CachedQuantizedReadHandle(@TypeOf(self)) {
+    return try loadQuantizedReadHandleProfiled(self, txn, node_id, is_root, expected_count, profile, now_fn, elapsed_fn, is_not_found);
 }
 
 fn loadQuantizedProfiledOwned(
@@ -6991,11 +8434,22 @@ fn loadQuantizedProfiledOwned(
     elapsed_fn: fn (u64) u64,
     is_not_found: fn (anyerror) bool,
 ) !?hbc_runtime.QuantizedSet {
-    if (try self.getCachedQuantizedClone(node_id)) |cached| {
-        validateQuantizedSet(self, &cached, expected_count) catch |err| switch (err) {
-            error.Corrupted => self.invalidateQuantizedCache(node_id),
+    if (try self.getCachedQuantizedClone(node_id)) |cached_value| {
+        var cached = cached_value;
+        validateQuantizedSet(self, &cached, expected_count) catch {
+            cached.deinit(self.alloc);
+            self.invalidateQuantizedCache(node_id);
+            const start = now_fn();
+            const decoded = loadQuantized(self, txn, node_id, is_root, expected_count, is_not_found) catch |err| {
+                if (is_not_found(err) or err == error.Corrupted) return null;
+                return err;
+            };
+            profile.quantized_cache_miss_ns += elapsed_fn(start);
+            profile.quantized_cache_misses += 1;
+            if (self.cache_enabled) self.cacheQuantized(node_id, &decoded) catch {};
+            return decoded;
         };
-        if (try self.getCachedQuantizedClone(node_id)) |valid| return valid;
+        return cached;
     }
 
     const start = now_fn();
@@ -7094,8 +8548,10 @@ pub fn refreshQuantizedWithOptions(
         return;
     }
 
-    if (self.getCachedQuantizedPtr(node.id)) |cached| {
-        switch (cached.*) {
+    if (try self.getCachedQuantizedClone(node.id)) |cached_value| {
+        var cached = cached_value;
+        defer cached.deinit(self.alloc);
+        switch (cached) {
             .nonquant => |*set| {
                 if (!usesNonQuantizedPayload(node)) {
                     const compute_start = now_fn();
@@ -7115,9 +8571,10 @@ pub fn refreshQuantizedWithOptions(
                     set.vectors.data = try self.alloc.realloc(set.vectors.data, count * dims);
                 }
                 @memcpy(set.vectors.data, vectors);
-                noteMutatedCachedQuantized(self, node.id);
                 const store_start = now_fn();
-                try putQuantizedCached(self, txn, node.id, cached, now_fn, elapsed_fn);
+                try putQuantizedCached(self, txn, node.id, &cached, now_fn, elapsed_fn);
+                try self.cacheQuantized(node.id, &cached);
+                noteMutatedCachedQuantized(self, node.id);
                 self.write_profile.quantized_store_ns += elapsed_fn(store_start);
                 return;
             },
@@ -7141,9 +8598,10 @@ pub fn refreshQuantizedWithOptions(
                 const compute_start = now_fn();
                 try self.quantizer.quantizeInto(set, node.centroid, vectors, count);
                 self.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
-                noteMutatedCachedQuantized(self, node.id);
                 const store_start = now_fn();
-                try putQuantizedCached(self, txn, node.id, cached, now_fn, elapsed_fn);
+                try putQuantizedCached(self, txn, node.id, &cached, now_fn, elapsed_fn);
+                try self.cacheQuantized(node.id, &cached);
+                noteMutatedCachedQuantized(self, node.id);
                 self.write_profile.quantized_store_ns += elapsed_fn(store_start);
                 return;
             },
@@ -7315,6 +8773,7 @@ fn storeVectorAndMetadataWithOptions(
     metadata_value: []const u8,
     skip_vector_store: bool,
 ) !void {
+    self.invalidateVectorCache(vector_id);
     if (!skip_vector_store) {
         try putVector(self, txn, vector_id, vector_data);
     } else if (shouldSeedRetainedVectorCacheOnSkipStore(self)) {
@@ -7400,6 +8859,7 @@ fn buildBulkSubtreeRecursive(
         .children = child_ids,
         .members = &.{},
     };
+    node.covering_radius = try computeInternalCoveringRadius(self, txn, &node);
     try self.saveNodeBody(txn, &node);
     self.alloc.free(child_ids);
 
@@ -7541,6 +9001,7 @@ fn buildBulkParentLevels(
                 .children = child_ids,
                 .members = &.{},
             };
+            node.covering_radius = try computeInternalCoveringRadius(self, txn, &node);
             try self.saveNodeBody(txn, &node);
             try self.putNodeSplitRange(txn, node_id, if (merged_range) |*owned| owned else null);
             self.alloc.free(child_ids);
@@ -7763,6 +9224,7 @@ fn buildBulkParentFromNodeIndexes(
         .children = child_ids,
         .members = &.{},
     };
+    node.covering_radius = try computeInternalCoveringRadius(self, txn, &node);
     try self.saveNodeBody(txn, &node);
     try self.putNodeSplitRange(txn, node_id, if (merged_range) |*owned| owned else null);
     self.alloc.free(child_ids);
@@ -7814,6 +9276,14 @@ fn buildBulkLeaf(
         .children = &.{},
         .members = members,
     };
+    if (self.config.metric == .l2_squared) {
+        const radius_matrix = try self.alloc.alloc(f32, inputs.len * self.config.dims);
+        defer self.alloc.free(radius_matrix);
+        for (inputs, 0..) |input, row| {
+            @memcpy(radius_matrix[row * self.config.dims ..][0..self.config.dims], input.transformed);
+        }
+        node.covering_radius = l2CoveringRadiusForMatrix(node.centroid, radius_matrix, inputs.len);
+    }
     try self.saveNodeBody(txn, &node);
     try self.putNodeSplitRange(txn, node_id, &range);
     self.alloc.free(members);
@@ -8335,6 +9805,15 @@ fn deferQuantizedRebuild(options: anytype) bool {
 
 fn isNotFoundGeneric(err: anyerror) bool {
     return err == error.NotFound;
+}
+
+/// Approximate searches tolerate stale topology references so repair can run
+/// without turning a partially useful index into an outage. Full-effort
+/// searches promise coverage of the published snapshot, so the same missing
+/// node must be surfaced instead of silently weakening that contract.
+fn handleTraversalNodeLoadError(err: anyerror, coverage_policy: search_types.CoveragePolicy) !void {
+    if (!isNotFoundGeneric(err)) return err;
+    if (coverage_policy == .complete_snapshot) return error.IncompletePublishedSnapshot;
 }
 
 fn nowNsI128Fixed() i128 {

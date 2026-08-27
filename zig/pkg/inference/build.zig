@@ -772,7 +772,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_frame_script_self_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--self-test",
     });
     const metal_gemma4_prefill_frame_script_self_test_step = b.step(
@@ -800,7 +800,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_bench_script_self_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/bench_metal_gemma4_e2b.sh",
+        "scripts/gemma4/bench_metal_gemma4_e2b.sh",
         "--self-test",
     });
     const metal_gemma4_bench_script_self_test_step = b.step(
@@ -814,7 +814,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_frame_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--antfly-bin",
     });
     metal_gemma4_prefill_frame_test.addFileArg(exe.getEmittedBin());
@@ -826,7 +826,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_frame_generated_q8_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--antfly-bin",
     });
     metal_gemma4_prefill_frame_generated_q8_test.addFileArg(exe.getEmittedBin());
@@ -841,7 +841,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_frame_e4b_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--antfly-bin",
     });
     metal_gemma4_prefill_frame_e4b_test.addFileArg(exe.getEmittedBin());
@@ -856,7 +856,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_frame_e4b_generated_q8_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--e4b-smoke",
         "--generated-q8-smoke",
         "--antfly-bin",
@@ -875,7 +875,7 @@ pub fn build(b: *std.Build) void {
         "ANTFLY_INFERENCE_GEMMA4_EXPECTED_GENERATED_TOP_FAMILY=q4_0",
         "ANTFLY_INFERENCE_GEMMA4_MIN_GENERATED_TOP_COUNT=1",
         "bash",
-        "scripts/test_metal_gemma4_prefill_frame.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_frame.sh",
         "--e4b-smoke",
         "--generated-q8-smoke",
         "--antfly-bin",
@@ -905,7 +905,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_prefill_block_parity_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_prefill_block_parity.sh",
+        "scripts/gemma4/test_metal_gemma4_prefill_block_parity.sh",
     });
     metal_gemma4_prefill_block_parity_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_prefill_block_parity_test_step = b.step(
@@ -916,7 +916,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_mtp_long_context_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_mtp_long_context.sh",
+        "scripts/gemma4/test_metal_gemma4_mtp_long_context.sh",
     });
     metal_gemma4_mtp_long_context_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_mtp_long_context_test_step = b.step(
@@ -930,7 +930,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_long_output_benchmark_contract_test = b.addSystemCommand(&.{
         "python3",
-        "scripts/test_benchmark_metal_gemma4_long_output.py",
+        "scripts/gemma4/test_benchmark_metal_gemma4_long_output.py",
     });
     const metal_gemma4_long_output_benchmark_contract_test_step = b.step(
         "test-metal-gemma4-long-output-benchmark",
@@ -940,7 +940,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_ab_benchmark_contract_test = b.addSystemCommand(&.{
         "python3",
-        "scripts/test_benchmark_metal_gemma4_ab.py",
+        "scripts/gemma4/test_benchmark_metal_gemma4_ab.py",
     });
     const metal_gemma4_ab_benchmark_contract_test_step = b.step(
         "test-metal-gemma4-ab-benchmark",
@@ -957,7 +957,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_tool_calling_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_tool_calling.sh",
+        "scripts/gemma4/test_metal_gemma4_tool_calling.sh",
     });
     metal_gemma4_tool_calling_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_tool_calling_test_step = b.step(
@@ -968,7 +968,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_cli_tool_calling_test = b.addSystemCommand(&.{
         "bash",
-        "scripts/test_metal_gemma4_cli_tool_calling.sh",
+        "scripts/gemma4/test_metal_gemma4_cli_tool_calling.sh",
     });
     metal_gemma4_cli_tool_calling_test.step.dependOn(b.getInstallStep());
     const metal_gemma4_cli_tool_calling_test_step = b.step(
@@ -979,7 +979,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_e2b_bench = b.addSystemCommand(&.{
         "bash",
-        "scripts/bench_metal_gemma4_e2b.sh",
+        "scripts/gemma4/bench_metal_gemma4_e2b.sh",
     });
     metal_gemma4_e2b_bench.step.dependOn(b.getInstallStep());
     const metal_gemma4_e2b_bench_step = b.step(
@@ -990,7 +990,7 @@ pub fn build(b: *std.Build) void {
 
     const metal_gemma4_e4b_bench = b.addSystemCommand(&.{
         "bash",
-        "scripts/bench_metal_gemma4_e4b.sh",
+        "scripts/gemma4/bench_metal_gemma4_e4b.sh",
     });
     metal_gemma4_e4b_bench.step.dependOn(b.getInstallStep());
     const metal_gemma4_e4b_bench_step = b.step(
@@ -1496,6 +1496,7 @@ pub fn build(b: *std.Build) void {
         .test_runner = runtime_filter_test_runner,
     });
     tests.root_module.addImport("build_options", build_options_mod);
+    tests.root_module.addImport("antfly-json", runtime_graph.json_mod);
     tests.root_module.addImport("httpx", httpx_mod);
     tests.root_module.addImport("inference_api", inference_api_mod);
     tests.root_module.addImport("antfly_generating_openapi", generating_openapi_mod);

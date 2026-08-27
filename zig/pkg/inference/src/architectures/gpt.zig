@@ -28,6 +28,7 @@ const std = @import("std");
 const is_freestanding = @import("builtin").os.tag == .freestanding;
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 const ops = @import("../ops/ops.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
 const CT = ops.CT;
@@ -2754,6 +2755,22 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     }
     defer if (owns_a4b_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
 
+    // A long-lived Metal frame may recycle a released buffer immediately for
+    // a later encoded layer even though an earlier command still reads it.
+    // Keep prior hidden tensors owned until frame completion; this retains the
+    // no-blit cross-layer path without allowing same-frame storage reuse.
+    var deferred_a4b_hidden_frees = std.ArrayListUnmanaged(CT).empty;
+    defer {
+        for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
+        deferred_a4b_hidden_frees.deinit(allocator);
+    }
+    if (owns_a4b_forward_frame) {
+        try deferred_a4b_hidden_frees.ensureTotalCapacity(
+            allocator,
+            config.num_hidden_layers * 2 + 2,
+        );
+    }
+
     var a4b_moe_checkpoint_started = false;
     var a4b_replay_checkpoint: ?CT = null;
     defer if (a4b_replay_checkpoint) |checkpoint| cb.free(checkpoint);
@@ -2834,13 +2851,23 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             hidden = carrier.active();
             owns_hidden = false;
         } else {
-            if (new_hidden != hidden) cb.free(hidden);
+            if (new_hidden != hidden) {
+                if (owns_a4b_forward_frame)
+                    deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
+                else
+                    cb.free(hidden);
+            }
             hidden = new_hidden;
             owns_hidden = true;
         }
         if (cb.kind() == .metal and forceLayerCloneDebug()) {
             const cloned_hidden = try cloneTensorMaterialized(cb, allocator, hidden);
-            if (owns_hidden) cb.free(hidden);
+            if (owns_hidden) {
+                if (owns_a4b_forward_frame)
+                    deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
+                else
+                    cb.free(hidden);
+            }
             hidden = cloned_hidden;
             owns_hidden = true;
         }
@@ -2898,7 +2925,10 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
         reserved_hidden = null;
         owns_hidden = true;
     } else if (final_hidden != hidden) {
-        cb.free(hidden);
+        if (owns_a4b_forward_frame)
+            deferred_a4b_hidden_frees.appendAssumeCapacity(hidden)
+        else
+            cb.free(hidden);
     }
     hidden = final_hidden;
     if (!is_freestanding and prefillTraceEnabled() and decode_context != null and decode_context.?.attention_mode == .paged_prefill) {
@@ -2914,6 +2944,8 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     if (owns_a4b_forward_frame) {
         try cb.decoderRuntimeSubmitAndWaitFrame();
         owns_a4b_forward_frame = false;
+        for (deferred_a4b_hidden_frees.items) |tensor| cb.free(tensor);
+        deferred_a4b_hidden_frees.clearRetainingCapacity();
         const replay_required = if (a4b_moe_checkpoint_started)
             try cb.decoderRuntimeFinishMoeCheckpoint()
         else
@@ -2926,6 +2958,12 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             owns_hidden = false;
             try cb.decoderRuntimeSetMoeReplayMode(true);
             defer cb.decoderRuntimeSetMoeReplayMode(false) catch {};
+            // Replay uses the identical decode context and token position.
+            // Metal paged-KV writes are positional overwrites, and their
+            // SlotBinding commit accepts equal token/position watermarks; no
+            // host sequence/page counters are advanced by this recursive
+            // forward. Keep that invariant explicit because replay correctness
+            // depends on it.
             return forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
                 cb,
                 allocator,
@@ -6465,16 +6503,14 @@ fn getenvBool(comptime name: [*:0]const u8) bool {
 }
 
 fn a4bHighMemoryFastPathEnabled() bool {
-    return getenvBool("TERMITE_METAL_ENABLE_A4B_HIGH_MEMORY_FAST_PATH") and
-        !getenvBool("TERMITE_METAL_DISABLE_A4B_HIGH_MEMORY_FAST_PATH");
+    return a4b_feature_flags.highMemoryFastPathEnabled();
 }
 
 fn a4bHighMemoryFeatureEnabled(
     comptime enable_name: [*:0]const u8,
     comptime disable_name: [*:0]const u8,
 ) bool {
-    return (a4bHighMemoryFastPathEnabled() or getenvBool(enable_name)) and
-        !getenvBool(disable_name);
+    return a4b_feature_flags.highMemoryFeatureEnabled(enable_name, disable_name);
 }
 
 fn a4bParallelFfnFusionEnabled(

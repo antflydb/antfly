@@ -376,8 +376,26 @@ pub fn BoundStore(comptime BackendType: type) type {
             return try LocalReadTxn.open(self.backend, self.namespace);
         }
 
+        pub fn beginReadWithBlockCacheAdmission(
+            self: *@This(),
+            admission: backend_types.Namespace.BlockCacheAdmission,
+        ) !LocalReadTxn {
+            var namespace = self.namespace;
+            namespace.block_cache_admission = admission;
+            return try LocalReadTxn.open(self.backend, namespace);
+        }
+
         pub fn beginProbe(self: *@This()) !LocalProbeTxn {
             return try LocalProbeTxn.open(self.backend, self.namespace);
+        }
+
+        pub fn beginProbeWithBlockCacheAdmission(
+            self: *@This(),
+            admission: backend_types.Namespace.BlockCacheAdmission,
+        ) !LocalProbeTxn {
+            var namespace = self.namespace;
+            namespace.block_cache_admission = admission;
+            return try LocalProbeTxn.open(self.backend, namespace);
         }
 
         pub fn beginCurrentScan(self: *@This()) !LocalCurrentScanTxn {
@@ -392,7 +410,14 @@ pub fn BoundStore(comptime BackendType: type) type {
             ctx: *anyopaque,
             callback: backend_erased.Store.ReplayCallback,
         ) !backend_types.ReplayLaneIterationStats {
-            var scan = try LocalCurrentScanTxn.open(self.backend, self.namespace);
+            // Replay is a sequential, one-shot scan. It must neither retain
+            // the scanned data blocks in the shared cache nor clone an entire
+            // bulk-ingest mutable generation merely to establish visibility.
+            // A replay boundary freezes the current generation instead; the
+            // upstream replay window owns the byte/dimension bound.
+            var namespace = self.namespace;
+            namespace.block_cache_admission = .transient;
+            var scan = try LocalCurrentScanTxn.openReplay(self.backend, namespace);
             defer scan.abort();
 
             var cursor = try scan.openCursor();
@@ -1521,7 +1546,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             self.clearSourceBlock(source_index);
             self.backend.recordCursorBlockLoad();
             const bytes = if (self.backend.options.cache != null) blk: {
-                var handle = try loadRunTableBlockHandle(self.backend, run, index, window);
+                var handle = try loadRunTableBlockHandle(self.backend, run, index, window, self.namespace.retainDataBlocks());
                 errdefer handle.release();
                 const block = handle.runTableBlock();
                 self.source_blocks[source_index] = .{ .cached = handle };
@@ -1561,7 +1586,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             if (self.source_block_indices[source_index]) |loaded_index| {
                 if (loaded_index == next_window.relative_offset) return;
             }
-            var handle = try loadRunTableBlockHandle(self.backend, run, index, next_window);
+            var handle = try loadRunTableBlockHandle(self.backend, run, index, next_window, self.namespace.retainDataBlocks());
             defer handle.release();
             recordCursorBlockReadahead(self.backend);
         }
@@ -3136,7 +3161,17 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
         l0_groups: []RunGroup = &.{},
         levels: []RunLevel = &.{},
 
+        const Purpose = enum { general, replay };
+
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
+            return try openWithPurpose(backend, namespace, .general);
+        }
+
+        pub fn openReplay(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
+            return try openWithPurpose(backend, namespace, .replay);
+        }
+
+        fn openWithPurpose(backend: *BackendType, namespace: backend_types.Namespace, purpose: Purpose) !@This() {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
@@ -3151,7 +3186,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             var mutable_snapshot: MutableSnapshot = .none;
             var mutable_snapshot_is_bulk_current_scan_clone = false;
             var bulk_current_scan_clone_denied = false;
-            if (@hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) {
+            if (purpose == .general and @hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) {
                 if (try backend.cloneCurrentScanMutableStateForBulkIngest()) |snapshot| {
                     const owned = try backend.allocator.create(State);
                     errdefer backend.allocator.destroy(owned);
@@ -3161,6 +3196,8 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 } else if (@hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
                     bulk_current_scan_clone_denied = true;
                 }
+            } else if (purpose == .replay and @hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
+                bulk_current_scan_clone_denied = true;
             }
             errdefer {
                 if (mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
@@ -4577,6 +4614,7 @@ const AsyncPointBlockRead = struct {
     compression: lsm_table_file.BlockCompression,
     checksum: u32,
     status: Status,
+    retain_block: bool = true,
     physical_handle: ?cache_mod.Handle = null,
     future: ?storage_io.RangeReadFuture = null,
 
@@ -4684,6 +4722,7 @@ fn prepareAsyncPointBlockRead(
         .compression = window.compression,
         .checksum = window.checksum,
         .status = .future,
+        .retain_block = namespace.retainDataBlocks(),
         .future = future,
     };
 }
@@ -4705,7 +4744,10 @@ fn payloadForAsyncPointRead(
     backend.recordPointRunAsyncWait(elapsed_ns);
     backend.recordTableBlockLoad(bytes.len, elapsed_ns);
     try lsm_table_file.validateBlockPayload(bytes, read.checksum);
-    read.physical_handle = try cache.putRunTablePhysicalBlock(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes);
+    read.physical_handle = if (read.retain_block)
+        try cache.putRunTablePhysicalBlock(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes)
+    else
+        try cache.putTransientRunTablePhysicalBlock(read.path, read.run_id, read.generation, read.absolute_offset, read.physical_len, bytes);
     return read.physical_handle.?.runTablePhysicalBlock();
 }
 
@@ -5211,6 +5253,7 @@ fn loadRunTableBlockHandle(
     run: *Run,
     index: *const lsm_table_file.TableIndex,
     window: lsm_table_file.EntryDataWindow,
+    retain_block: bool,
 ) !cache_mod.Handle {
     const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
     return try loadRunTableBlockHandleAtOffset(
@@ -5221,6 +5264,7 @@ fn loadRunTableBlockHandle(
         window.compression,
         window.len,
         window.checksum,
+        retain_block,
     );
 }
 
@@ -5232,6 +5276,7 @@ fn loadRunTableBlockHandleAtOffset(
     compression: lsm_table_file.BlockCompression,
     logical_len: u32,
     checksum: u32,
+    retain_block: bool,
 ) !cache_mod.Handle {
     const cache = backend.options.cache orelse return error.RunStateUnavailable;
     const path = run.path orelse return error.RunStateUnavailable;
@@ -5258,7 +5303,10 @@ fn loadRunTableBlockHandleAtOffset(
             logical_len,
             checksum,
         );
-        return try cache.putRunTableBlock(path, run.id, generation, absolute_offset, physical_len, block);
+        return if (retain_block)
+            try cache.putRunTableBlock(path, run.id, generation, absolute_offset, physical_len, block)
+        else
+            try cache.putTransientRunTableBlock(path, run.id, generation, absolute_offset, physical_len, block);
     }
 }
 
@@ -5268,6 +5316,7 @@ fn loadRunTablePhysicalBlockHandleAtOffset(
     absolute_offset: u64,
     physical_len: u32,
     checksum: u32,
+    retain_block: bool,
 ) !cache_mod.Handle {
     const cache = backend.options.cache orelse return error.RunStateUnavailable;
     const path = run.path orelse return error.RunStateUnavailable;
@@ -5286,7 +5335,10 @@ fn loadRunTablePhysicalBlockHandleAtOffset(
         backend.recordSharedBlockCacheMiss();
         const block = try loadRunTableBlockWithStats(backend, cache.valueAllocator(), path, absolute_offset, physical_len);
         try lsm_table_file.validateBlockPayload(block, checksum);
-        return try cache.putRunTablePhysicalBlock(path, run.id, generation, absolute_offset, physical_len, block);
+        return if (retain_block)
+            try cache.putRunTablePhysicalBlock(path, run.id, generation, absolute_offset, physical_len, block)
+        else
+            try cache.putTransientRunTablePhysicalBlock(path, run.id, generation, absolute_offset, physical_len, block);
     }
 }
 
@@ -5313,6 +5365,7 @@ fn findExactEntryInCachedCompressedPrefixBlock(
         absolute_offset,
         window.physicalLen(),
         window.checksum,
+        namespace.retainDataBlocks(),
     );
     defer handle.release();
     const positioned = try lsm_table_file.findExactEntryInCompressedBlockPayloadAlloc(
@@ -5357,7 +5410,7 @@ fn findExactEntryInCachedBlocks(
         };
     }
     const window = index.blockWindow(block_index);
-    var handle = try loadRunTableBlockHandle(backend, run, index, window);
+    var handle = try loadRunTableBlockHandle(backend, run, index, window, namespace.retainDataBlocks());
     errdefer handle.release();
     const positioned = try lsm_table_file.findExactEntryInBlock(
         index,
@@ -5380,11 +5433,12 @@ fn loadBatchBlock(
     state: *RunBatchIndexState,
     held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
     block_index: usize,
+    retain_block: bool,
 ) ![]const u8 {
     if (state.block_index == null or state.block_index.? != block_index) {
         try state.transferBlock(backend.allocator, held_blocks);
         const window = index.blockWindow(block_index);
-        state.block_handle = try loadRunTableBlockHandle(backend, run, index, window);
+        state.block_handle = try loadRunTableBlockHandle(backend, run, index, window, retain_block);
         state.block_index = block_index;
         state.block_has_values = false;
     }
@@ -5417,7 +5471,7 @@ fn findExactEntryInBatchBlocks(
     // iteration advances to another block.
     _ = held_values;
     _ = value_allocator;
-    const block_bytes = try loadBatchBlock(backend, run, index, state, held_blocks, block_index);
+    const block_bytes = try loadBatchBlock(backend, run, index, state, held_blocks, block_index, namespace.retainDataBlocks());
     const positioned = try lsm_table_file.findExactEntryInBlock(
         index,
         block_bytes,
@@ -5590,6 +5644,7 @@ fn loadOwnedBlockForWindowAlloc(
             window.compression,
             window.len,
             window.checksum,
+            true,
         );
         defer block_handle.release();
         return try allocator.dupe(u8, block_handle.runTableBlock());
@@ -5652,6 +5707,7 @@ fn loadOwnedBlockForWindowAllocMaybeLocked(
             window.compression,
             window.len,
             window.checksum,
+            true,
         );
         defer block_handle.release();
         return try allocator.dupe(u8, block_handle.runTableBlock());

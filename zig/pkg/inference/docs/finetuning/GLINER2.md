@@ -235,7 +235,7 @@ gliner2-adapter-dataset`, `finetune adapter materialize gliner2`, and
 The frozen oracle is fastino-ai/GLiNER2 commit
 `8f3fc399bcc5a00749a62a1565e5c6529f04b574`, running on Python 3.12 with
 Unicode 15.0 and the exact package versions in
-`scripts/requirements-gliner2-oracle.txt`. Tooling verifies dependency
+`scripts/gliner2/requirements-gliner2-oracle.txt`. Tooling verifies dependency
 versions, checkout commit and cleanliness, and the imported module path in
 every trainer/evaluator report. Model fingerprints cover the ordered required
 inventory and the present/absent state of optional `spm.model`.
@@ -245,7 +245,7 @@ Create the default oracle environment from the checked-in lock surface:
 ```sh
 python3.12 -m venv /private/tmp/gliner2-parity-venv
 /private/tmp/gliner2-parity-venv/bin/pip install \
-  -r scripts/requirements-gliner2-oracle.txt
+  -r scripts/gliner2/requirements-gliner2-oracle.txt
 ```
 
 The Fastino checkout is supplied separately with `--upstream-source`; release
@@ -285,7 +285,7 @@ boundary, not silent score drift.
 Generate a convergence summary from five paired runs:
 
 ```sh
-python3.12 scripts/summarize_gliner2_convergence.py \
+python3.12 scripts/gliner2/summarize_gliner2_convergence.py \
   --input /runs/gliner2/convergence-study.json \
   --output /runs/gliner2/convergence-summary.json \
   --upstream-source /src/GLiNER2 \
@@ -306,11 +306,11 @@ and all nine `--heldout-min` values. Produce one source-bound lane on each
 required GPU, then aggregate the reports:
 
 ```sh
-python3.12 scripts/qualify_gliner2_cuda_hardware.py \
+python3.12 scripts/gliner2/qualify_gliner2_cuda_hardware.py \
   --output /runs/gliner2/cuda-lane.json
 
 # After collecting reports from A100 (SM80), L4 (SM89), and H100 (SM90):
-python3.12 scripts/summarize_gliner2_cuda_hardware.py \
+python3.12 scripts/gliner2/summarize_gliner2_cuda_hardware.py \
   --report /runs/gliner2/cuda-sm80.json \
   --report /runs/gliner2/cuda-sm89.json \
   --report /runs/gliner2/cuda-sm90.json \
@@ -324,7 +324,7 @@ failed sanitizers, non-FP32 evidence, and reports whose source fingerprint no
 longer matches the checkout.
 
 ```sh
-scripts/run_gliner2_lora_production_readiness.sh \
+scripts/gliner2/run_gliner2_lora_production_readiness.sh \
   --zig-backend cuda --zig-cuda-artifacts fatbin \
   --model-dir /models/gliner2 \
   --release-adapter-dir /runs/gliner2/adapter \
@@ -366,7 +366,7 @@ For an apples-to-apples CUDA comparison, the harness synchronizes both CUDA
 runtimes around measured steps and records the PyTorch GPU name:
 
 ```sh
-python3.12 scripts/compare_gliner2_lora_python_zig.py \
+python3.12 scripts/gliner2/compare_gliner2_lora_python_zig.py \
   --model-dir /models/gliner2 \
   --python-model /models/gliner2 \
   --train-data /data/train.jsonl \

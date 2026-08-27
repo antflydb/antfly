@@ -23,11 +23,13 @@ class InferenceGenerateDelta:
     Attributes:
         role (InferenceRole | Unset): Role of the message sender in a generation/chat conversation
         content (None | str | Unset): Token content delta
+        reasoning_content (None | str | Unset): Reasoning content delta, separate from public content
         tool_calls (list[InferenceToolCallDelta] | Unset): Tool call deltas for streaming tool calls
     """
 
     role: InferenceRole | Unset = UNSET
     content: None | str | Unset = UNSET
+    reasoning_content: None | str | Unset = UNSET
     tool_calls: list[InferenceToolCallDelta] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -41,6 +43,12 @@ class InferenceGenerateDelta:
             content = UNSET
         else:
             content = self.content
+
+        reasoning_content: None | str | Unset
+        if isinstance(self.reasoning_content, Unset):
+            reasoning_content = UNSET
+        else:
+            reasoning_content = self.reasoning_content
 
         tool_calls: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.tool_calls, Unset):
@@ -56,6 +64,8 @@ class InferenceGenerateDelta:
             field_dict["role"] = role
         if content is not UNSET:
             field_dict["content"] = content
+        if reasoning_content is not UNSET:
+            field_dict["reasoning_content"] = reasoning_content
         if tool_calls is not UNSET:
             field_dict["tool_calls"] = tool_calls
 
@@ -82,6 +92,15 @@ class InferenceGenerateDelta:
 
         content = _parse_content(d.pop("content", UNSET))
 
+        def _parse_reasoning_content(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        reasoning_content = _parse_reasoning_content(d.pop("reasoning_content", UNSET))
+
         _tool_calls = d.pop("tool_calls", UNSET)
         tool_calls: list[InferenceToolCallDelta] | Unset = UNSET
         if _tool_calls is not UNSET:
@@ -94,6 +113,7 @@ class InferenceGenerateDelta:
         inference_generate_delta = cls(
             role=role,
             content=content,
+            reasoning_content=reasoning_content,
             tool_calls=tool_calls,
         )
 

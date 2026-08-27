@@ -255,6 +255,7 @@ pub const PostingStore = struct {
         if (!node.is_leaf) return error.ExpectedLeaf;
         if (node.members.len == 0) {
             @memset(node.centroid, 0);
+            node.covering_radius = 0;
             noteCentroidRefreshed(node);
             return;
         }
@@ -281,10 +282,12 @@ pub const PostingStore = struct {
             .pointer => |ptr| ptr.child,
             else => @TypeOf(index),
         };
+        var loaded_vectors: ?[]f32 = null;
+        defer if (loaded_vectors) |vectors| index.alloc.free(vectors);
         if (comptime @hasDecl(Index, "loadPostingVectorsTransformed")) {
             const matrix_len = try std.math.mul(usize, node.members.len, index.config.dims);
             const vectors = try index.alloc.alloc(f32, matrix_len);
-            defer index.alloc.free(vectors);
+            loaded_vectors = vectors;
             try index.loadPostingVectorsTransformed(txn, node.members, vectors);
             for (0..node.members.len) |i| {
                 vec.add(node.centroid, vectors[i * index.config.dims ..][0..index.config.dims]);
@@ -303,6 +306,36 @@ pub const PostingStore = struct {
         }
         vec.scale(1.0 / @as(f32, @floatFromInt(node.members.len)), node.centroid);
         normalizeCentroidForMetric(index, node.centroid);
+        if (index.config.metric == .l2_squared) {
+            var radius_only_vectors: ?[]f32 = null;
+            defer if (radius_only_vectors) |vectors| index.alloc.free(vectors);
+            if (loaded_vectors == null) {
+                const matrix_len = try std.math.mul(usize, node.members.len, index.config.dims);
+                radius_only_vectors = try index.alloc.alloc(f32, matrix_len);
+            }
+            const vectors = loaded_vectors orelse radius_only_vectors.?;
+            if (comptime !@hasDecl(Index, "loadPostingVectorsTransformed")) {
+                const raw_scratch = try index.alloc.alloc(f32, index.config.dims);
+                defer index.alloc.free(raw_scratch);
+                for (node.members, 0..) |member_id, row| {
+                    const raw = try index.getVectorScratch(txn, member_id, raw_scratch);
+                    _ = index.transformVector(raw, vectors[row * index.config.dims ..][0..index.config.dims]);
+                }
+            }
+            var max_squared: f32 = 0;
+            for (0..node.members.len) |row| {
+                const candidate = vectors[row * index.config.dims ..][0..index.config.dims];
+                var squared: f32 = 0;
+                for (node.centroid, candidate) |center, value| {
+                    const delta = value - center;
+                    squared += delta * delta;
+                }
+                max_squared = @max(max_squared, squared);
+            }
+            node.covering_radius = @sqrt(max_squared);
+        } else {
+            node.covering_radius = std.math.nan(f32);
+        }
         noteCentroidRefreshed(node);
     }
 
@@ -351,8 +384,10 @@ pub const PostingStore = struct {
         const dims: usize = @intCast(index.metadata.dims);
         if (vectors.len < count * dims) return error.BufferTooSmall;
 
-        if (index.getCachedQuantizedPtr(posting.id)) |cached| {
-            switch (cached.*) {
+        if (try index.getCachedQuantizedClone(posting.id)) |cached_value| {
+            var cached = cached_value;
+            defer cached.deinit(index.alloc);
+            switch (cached) {
                 .nonquant => |*set| {
                     if (!posting.usesNonQuantizedPayload()) {
                         const compute_start = now_fn();
@@ -372,9 +407,10 @@ pub const PostingStore = struct {
                         set.vectors.data = try index.alloc.realloc(set.vectors.data, count * dims);
                     }
                     @memcpy(set.vectors.data, vectors[0 .. count * dims]);
-                    noteMutatedCachedQuantized(index, posting.id);
                     const store_start = now_fn();
-                    try index.putQuantizedCached(txn, posting.id, cached);
+                    try index.putQuantizedCached(txn, posting.id, &cached);
+                    try index.cacheQuantized(posting.id, &cached);
+                    noteMutatedCachedQuantized(index, posting.id);
                     index.write_profile.quantized_store_ns += elapsed_fn(store_start);
                     return;
                 },
@@ -398,9 +434,10 @@ pub const PostingStore = struct {
                     const compute_start = now_fn();
                     try index.quantizer.quantizeInto(set, posting.centroid, vectors, count);
                     index.write_profile.quantized_compute_ns += elapsed_fn(compute_start);
-                    noteMutatedCachedQuantized(index, posting.id);
                     const store_start = now_fn();
-                    try index.putQuantizedCached(txn, posting.id, cached);
+                    try index.putQuantizedCached(txn, posting.id, &cached);
+                    try index.cacheQuantized(posting.id, &cached);
+                    noteMutatedCachedQuantized(index, posting.id);
                     index.write_profile.quantized_store_ns += elapsed_fn(store_start);
                     return;
                 },

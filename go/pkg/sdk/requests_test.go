@@ -2,9 +2,8 @@ package sdk
 
 import (
 	"bytes"
+	"encoding/json"
 	"testing"
-
-	"github.com/antflydb/antfly/go/pkg/libaf/json"
 )
 
 func TestQueryRequestMarshalOmitsZeroJoin(t *testing.T) {
