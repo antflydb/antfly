@@ -67,6 +67,14 @@ const JpxAlphaMode = enum {
     premultiplied,
 };
 
+/// Native codecs do not all expose 1-bit samples in PDF sample polarity.
+/// Keep that distinction at the codec boundary instead of baking it into the
+/// PDF stencil semantics shared by ordinary and explicit image masks.
+const PackedStencilSampleConvention = enum {
+    pdf_sample,
+    jbig2_black_is_one,
+};
+
 const ColorKeyMask = struct {
     component_count: usize,
     ranges: [4][2]u16,
@@ -3785,7 +3793,7 @@ pub const Reader = struct {
             const rgba = try self.alloc.alloc(u8, rgba_len);
             errdefer self.alloc.free(rgba);
             if (image_mask) {
-                try decodeImageMaskToRgba(rgba, width, height, decoded.pixels, obj.get("Decode"));
+                try decodeImageMaskToRgba(rgba, width, height, decoded.pixels, obj.get("Decode"), .jbig2_black_is_one);
                 return .{ .rgba = rgba, .width = width, .height = height };
             }
 
@@ -3941,6 +3949,12 @@ pub const Reader = struct {
             }
             try transparency_plan.validateColorKeyBits(header.bits_per_component);
             const indexed_color_space = try self.imageUsesIndexedColorSpace(obj);
+            // Associated alpha is a linear transform over color components.
+            // Applying it to a discrete palette index selects a different,
+            // unrelated entry. Reject this combination before the full decode;
+            // straight embedded alpha remains well-defined and supported.
+            if (indexed_color_space and jpx_alpha_mode == .premultiplied)
+                return error.UnsupportedPdfRendering;
             if ((header.bits_per_component > 8 and transparency_plan.needsNativeSamples()) or
                 (header.bits_per_component != 8 and indexed_color_space))
             {
@@ -4126,7 +4140,7 @@ pub const Reader = struct {
         const rgba = try self.alloc.alloc(u8, rgba_len);
         errdefer self.alloc.free(rgba);
         if (image_mask) {
-            try decodeImageMaskToRgba(rgba, width, height, decoded, obj.get("Decode"));
+            try decodeImageMaskToRgba(rgba, width, height, decoded, obj.get("Decode"), .pdf_sample);
             return .{ .rgba = rgba, .width = width, .height = height };
         }
 
@@ -4774,10 +4788,11 @@ pub const Reader = struct {
         height: u32,
         decoded: []const u8,
         decode_obj: ?*const syntax.Object,
+        sample_convention: PackedStencilSampleConvention,
     ) !void {
         const row_bytes = @divFloor(@as(usize, width) + 7, 8);
         if (decoded.len < row_bytes * @as(usize, height)) return error.UnsupportedPdfRendering;
-        const decode_zero_is_paint = parseMaskDecodeInvert(decode_obj);
+        const decode_reversed = parseMaskDecodeReversed(decode_obj);
 
         var y: usize = 0;
         while (y < height) : (y += 1) {
@@ -4785,8 +4800,15 @@ pub const Reader = struct {
             while (x < width) : (x += 1) {
                 const byte = decoded[y * row_bytes + x / 8];
                 const bit_index: u3 = @intCast(7 - @as(u3, @intCast(x % 8)));
-                const bit = (byte >> bit_index) & 1;
-                const paint = if (decode_zero_is_paint) bit == 0 else bit == 1;
+                const codec_bit = (byte >> bit_index) & 1;
+                const pdf_sample = switch (sample_convention) {
+                    .pdf_sample => codec_bit,
+                    // The native JBIG2 decoder deliberately returns a display
+                    // bitmap where one is black. PDF's default DeviceGray
+                    // sample polarity represents that same black sample as zero.
+                    .jbig2_black_is_one => codec_bit ^ 1,
+                };
+                const paint = if (decode_reversed) pdf_sample == 1 else pdf_sample == 0;
                 const dst = (y * @as(usize, width) + x) * 4;
                 rgba[dst + 0] = 0;
                 rgba[dst + 1] = 0;
@@ -5933,10 +5955,10 @@ fn decodeGrayMaskToRgba(
     gray: []const u8,
     decode_obj: ?*const syntax.Object,
 ) !void {
-    const decode_zero_is_paint = parseMaskDecodeInvert(decode_obj);
+    const decode_reversed = parseMaskDecodeReversed(decode_obj);
     if (rgba.len != gray.len * 4) return error.UnsupportedPdfRendering;
     for (gray, 0..) |sample, i| {
-        const paint = if (decode_zero_is_paint) sample < 128 else sample >= 128;
+        const paint = if (decode_reversed) sample >= 128 else sample < 128;
         const dst = i * 4;
         rgba[dst + 0] = 0;
         rgba[dst + 1] = 0;
@@ -10728,7 +10750,7 @@ fn applyIndexedDecode(value: u8, decode_obj: ?*const syntax.Object, palette_entr
     return @intFromFloat(@round(mapped));
 }
 
-fn parseMaskDecodeInvert(decode_obj: ?*const syntax.Object) bool {
+fn parseMaskDecodeReversed(decode_obj: ?*const syntax.Object) bool {
     const range = decodeRange(decode_obj, 0) orelse return false;
     return range.min > range.max;
 }
@@ -14167,9 +14189,58 @@ test "reader decodes JPX stencil masks and applies Decode" {
     const decoded = try reader.decodeImageToRgbaAlloc(&image);
     defer alloc.free(decoded.rgba);
     try std.testing.expectEqualSlices(u8, &.{
-        0, 0, 0, 255,
         0, 0, 0, 0,
+        0, 0, 0, 255,
     }, decoded.rgba);
+}
+
+test "reader rejects associated JPX alpha for Indexed color before full decode" {
+    const alloc = std.testing.allocator;
+    const pixels = [_]u8{ 1, 128 };
+    const codestream_params = image_lib.jpeg2000.EncodeParams{
+        .width = 1,
+        .height = 1,
+        .components = 2,
+        .decomposition_levels = 0,
+        .wavelet_transform = 1,
+        .multiple_component_transform = false,
+        .format = .j2k,
+    };
+    const codestream = try image_lib.jpeg2000.encodeU8Bytes(alloc, &pixels, &codestream_params);
+    defer alloc.free(codestream);
+    const channel_definitions = [_]image_lib.jpeg2000.box.ChannelDefinition{
+        .{ .channel = 0, .kind = .color, .association = 1 },
+        .{ .channel = 1, .kind = .premultiplied_opacity, .association = 0 },
+    };
+    const container_params = .{
+        .width = @as(u32, 1),
+        .height = @as(u32, 1),
+        .components = @as(u8, 2),
+        .bits_per_component = @as(u8, 8),
+        .extras = image_lib.jpeg2000.box.Jp2WriteExtras{ .cdef = &channel_definitions },
+    };
+    const jp2_bytes = try image_lib.jpeg2000.box.writeJp2(alloc, codestream, &container_params);
+    defer alloc.free(jp2_bytes);
+
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace [/Indexed /DeviceRGB 1 <000000FF0000>] /BitsPerComponent 8 /SMaskInData 2 /Filter /JPXDecode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+            .{ jp2_bytes.len, jp2_bytes },
+        ),
+    };
+    defer alloc.free(objects[4]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedPdfRendering, reader.decodeImageToRgbaAlloc(&image));
 }
 
 test "reader applies a source-domain color key to high-bit JPX without a PDF ColorSpace" {
@@ -14651,7 +14722,8 @@ test "reader applies Decode array to grayscale image xobject" {
 
 test "reader decodes 1-bit image mask xobject" {
     const alloc = std.testing.allocator;
-    const image_data = &.{0b10000000};
+    // PDF's default stencil Decode [0 1] paints zero samples.
+    const image_data = &.{0b00000000};
     const content = "q\n1 0 0 1 20 30 cm\n/Im1 Do\nQ\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
@@ -14888,7 +14960,7 @@ test "image decode resamples a different-resolution explicit mask" {
         "3 0 obj\nnull\nendobj\n",
         "4 0 obj\nnull\nendobj\n",
         "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask 6 0 R /Length 6 >>\nstream\nabcdef\nendstream\nendobj\n",
-        "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true /Width 1 /Height 1 /BitsPerComponent 1 /Length 1 >>\nstream\n\x80\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true /Width 1 /Height 1 /BitsPerComponent 1 /Length 1 >>\nstream\n\x00\nendstream\nendobj\n",
     };
     const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
     defer alloc.free(sample);
@@ -15310,7 +15382,7 @@ test "reader applies color key mask array" {
 test "reader applies image mask stream alpha" {
     const alloc = std.testing.allocator;
     const image_data = &.{ 255, 0, 0 };
-    const mask_data = &.{0b10000000};
+    const mask_data = &.{0b00000000};
     const content = "q\n1 0 0 1 20 30 cm\n/Im1 Do\nQ\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
@@ -15518,6 +15590,31 @@ test "mask decode context rejects an active reference immediately" {
     const first = try context.enterMask(alloc, 0x0005_0000, 0);
     defer context.leaveMask(first);
     try std.testing.expectError(error.InvalidPdfImageMask, context.enterMask(alloc, 0x0005_0000, 1));
+}
+
+test "image masks honor PDF Decode polarity across native sample conventions" {
+    const alloc = std.testing.allocator;
+    var scanner = syntax.Scanner.init(alloc, "[1 0]");
+    defer scanner.deinit();
+    var reversed_decode = try scanner.readObject();
+    defer reversed_decode.deinit(alloc);
+
+    var packed_rgba: [8]u8 = undefined;
+    try Reader.decodeImageMaskToRgba(&packed_rgba, 2, 1, &.{0b01000000}, null, .pdf_sample);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0 }, &.{ packed_rgba[3], packed_rgba[7] });
+    try Reader.decodeImageMaskToRgba(&packed_rgba, 2, 1, &.{0b01000000}, &reversed_decode, .pdf_sample);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255 }, &.{ packed_rgba[3], packed_rgba[7] });
+
+    // The native JBIG2 decoder returns one for black, so its codec bitmap
+    // normalizes to the same PDF samples before Decode is applied.
+    try Reader.decodeImageMaskToRgba(&packed_rgba, 2, 1, &.{0b10000000}, null, .jbig2_black_is_one);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0 }, &.{ packed_rgba[3], packed_rgba[7] });
+
+    var gray_rgba: [8]u8 = undefined;
+    try decodeGrayMaskToRgba(&gray_rgba, &.{ 0, 255 }, null);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 0 }, &.{ gray_rgba[3], gray_rgba[7] });
+    try decodeGrayMaskToRgba(&gray_rgba, &.{ 0, 255 }, &reversed_decode);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255 }, &.{ gray_rgba[3], gray_rgba[7] });
 }
 
 test "resampled explicit mask alpha uses the stencil channel" {
