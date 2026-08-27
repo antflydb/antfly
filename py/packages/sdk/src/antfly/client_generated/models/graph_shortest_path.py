@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.edge_direction import EdgeDirection
 from ..models.path_weight_mode import PathWeightMode
 from ..types import UNSET, Unset
 
@@ -32,11 +33,15 @@ T = TypeVar("T", bound="GraphShortestPath")
 
 @_attrs_define
 class GraphShortestPath:
-    """Find the best outgoing path from `from` to `to`.
+    """Find the best path from `from` to `to` in the requested stored-edge direction.
 
     Attributes:
         from_ (GraphPathEndpoint):
         to (GraphPathEndpoint):
+        direction (EdgeDirection | Unset): Direction of edges to query:
+            - out: Outgoing edges from the node
+            - in: Incoming edges to the node
+            - both: Both outgoing and incoming edges
         edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
         max_depth (int | Unset):  Default: 10.
         min_weight (float | Unset):
@@ -62,6 +67,7 @@ class GraphShortestPath:
 
     from_: GraphPathEndpoint
     to: GraphPathEndpoint
+    direction: EdgeDirection | Unset = UNSET
     edge_types: list[str] | Unset = UNSET
     max_depth: int | Unset = 10
     min_weight: float | Unset = UNSET
@@ -107,6 +113,10 @@ class GraphShortestPath:
         from_ = self.from_.to_dict()
 
         to = self.to.to_dict()
+
+        direction: str | Unset = UNSET
+        if not isinstance(self.direction, Unset):
+            direction = self.direction.value
 
         edge_types: list[str] | Unset = UNSET
         if not isinstance(self.edge_types, Unset):
@@ -170,6 +180,8 @@ class GraphShortestPath:
                 "to": to,
             }
         )
+        if direction is not UNSET:
+            field_dict["direction"] = direction
         if edge_types is not UNSET:
             field_dict["edge_types"] = edge_types
         if max_depth is not UNSET:
@@ -212,6 +224,13 @@ class GraphShortestPath:
         from_ = GraphPathEndpoint.from_dict(d.pop("from"))
 
         to = GraphPathEndpoint.from_dict(d.pop("to"))
+
+        _direction = d.pop("direction", UNSET)
+        direction: EdgeDirection | Unset
+        if isinstance(_direction, Unset):
+            direction = UNSET
+        else:
+            direction = EdgeDirection(_direction)
 
         edge_types = cast(list[str], d.pop("edge_types", UNSET))
 
@@ -377,6 +396,7 @@ class GraphShortestPath:
         graph_shortest_path = cls(
             from_=from_,
             to=to,
+            direction=direction,
             edge_types=edge_types,
             max_depth=max_depth,
             min_weight=min_weight,

@@ -41,6 +41,7 @@ const (
 	maxGraphEdgeTypeBytes       = 64 * 1024
 	maxGraphHydratedBindings    = 10_000
 	maxNamedGraphQueries        = 64
+	maxGraphMatchQueries        = 8
 	defaultGraphBindingsLimit   = 100
 	maxAntflyUnixSeconds        = int64(18_446_744_073)
 	maxAntflyUnixNanoseconds    = 709_551_615
@@ -50,25 +51,41 @@ func validateNamedGraphQueries(queries map[string]GraphQuery) error {
 	if len(queries) > maxNamedGraphQueries {
 		return fmt.Errorf("antfly: graph_queries accepts at most %d named operations", maxNamedGraphQueries)
 	}
+	matchQueries := 0
 	for name, query := range queries {
 		if !validGraphQueryName(name) {
 			return invalidGraphIdentifier("graph_queries key")
 		}
-		if err := validateGraphQuery(query); err != nil {
+		isMatch, err := validateGraphQueryWithKind(query)
+		if err != nil {
 			return fmt.Errorf("antfly: graph_queries[%q]: %w", name, err)
+		}
+		if isMatch {
+			matchQueries++
+			if matchQueries > maxGraphMatchQueries {
+				return fmt.Errorf("antfly: graph_queries accepts at most %d match operations", maxGraphMatchQueries)
+			}
 		}
 	}
 	return nil
 }
 
 func validateGraphQuery(query GraphQuery) error {
+	_, err := validateGraphQueryWithKind(query)
+	return err
+}
+
+// validateGraphQueryWithKind validates a query and reports whether it is a
+// MATCH without encoding the generated union a second time. Request-level
+// admission uses that bit to enforce the independent complete-anchor scan cap.
+func validateGraphQueryWithKind(query GraphQuery) (bool, error) {
 	encoded, err := json.Marshal(query)
 	if err != nil {
-		return fmt.Errorf("invalid graph query: %w", err)
+		return false, fmt.Errorf("invalid graph query: %w", err)
 	}
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(encoded, &members); err != nil {
-		return fmt.Errorf("invalid graph query: %w", err)
+		return false, fmt.Errorf("invalid graph query: %w", err)
 	}
 	match, hasMatch := members["match"]
 	traverse, hasTraverse := members["traverse"]
@@ -81,48 +98,48 @@ func validateGraphQuery(query GraphQuery) error {
 		}
 	}
 	if variants != 1 {
-		return fmt.Errorf("graph query must contain exactly one of match, traverse, shortest_path, or k_shortest_paths")
+		return false, fmt.Errorf("graph query must contain exactly one of match, traverse, shortest_path, or k_shortest_paths")
 	}
 	switch {
 	case hasMatch:
 		if isNullGraphJSON(match) {
-			return fmt.Errorf("graph query match must not be null")
+			return false, fmt.Errorf("graph query match must not be null")
 		}
 		var value GraphMatchQuery
 		if err := query.DecodeStrictInto(&value); err != nil {
-			return fmt.Errorf("antfly: invalid graph match query: %w", err)
+			return false, fmt.Errorf("antfly: invalid graph match query: %w", err)
 		}
-		return validateGraphMatchQuery(value)
+		return true, validateGraphMatchQuery(value)
 	case hasTraverse:
 		if isNullGraphJSON(traverse) {
-			return fmt.Errorf("graph query traverse must not be null")
+			return false, fmt.Errorf("graph query traverse must not be null")
 		}
 		var value GraphTraverseQuery
 		if err := query.DecodeStrictInto(&value); err != nil {
-			return fmt.Errorf("antfly: invalid graph traverse query: %w", err)
+			return false, fmt.Errorf("antfly: invalid graph traverse query: %w", err)
 		}
-		return validateGraphTraverseQuery(value)
+		return false, validateGraphTraverseQuery(value)
 	case hasShortestPath:
 		if isNullGraphJSON(shortestPath) {
-			return fmt.Errorf("graph query shortest_path must not be null")
+			return false, fmt.Errorf("graph query shortest_path must not be null")
 		}
 		var value GraphShortestPathQuery
 		if err := query.DecodeStrictInto(&value); err != nil {
-			return fmt.Errorf("antfly: invalid graph shortest-path query: %w", err)
+			return false, fmt.Errorf("antfly: invalid graph shortest-path query: %w", err)
 		}
-		return validateGraphPathQuery(value.Index, value.ShortestPath.From, value.ShortestPath.To, value.ShortestPath.Filter, value.ShortestPath.EdgeTypes, value.ShortestPath.MaxDepth, value.ShortestPath.MinWeight, value.ShortestPath.MaxWeight, value.ShortestPath.IncludeDocuments, value.ShortestPath.Fields)
+		return false, validateGraphPathQuery(value.Index, value.ShortestPath.From, value.ShortestPath.To, value.ShortestPath.Direction, value.ShortestPath.Filter, value.ShortestPath.EdgeTypes, value.ShortestPath.MaxDepth, value.ShortestPath.MinWeight, value.ShortestPath.MaxWeight, value.ShortestPath.IncludeDocuments, value.ShortestPath.Fields)
 	default:
 		if isNullGraphJSON(kShortestPaths) {
-			return fmt.Errorf("graph query k_shortest_paths must not be null")
+			return false, fmt.Errorf("graph query k_shortest_paths must not be null")
 		}
 		var value GraphKShortestPathsQuery
 		if err := query.DecodeStrictInto(&value); err != nil {
-			return fmt.Errorf("antfly: invalid graph k-shortest-paths query: %w", err)
+			return false, fmt.Errorf("antfly: invalid graph k-shortest-paths query: %w", err)
 		}
 		if value.KShortestPaths.K < 1 || value.KShortestPaths.K > 100 {
-			return fmt.Errorf("graph k must be between 1 and 100")
+			return false, fmt.Errorf("graph k must be between 1 and 100")
 		}
-		return validateGraphPathQuery(value.Index, value.KShortestPaths.From, value.KShortestPaths.To, value.KShortestPaths.Filter, value.KShortestPaths.EdgeTypes, value.KShortestPaths.MaxDepth, value.KShortestPaths.MinWeight, value.KShortestPaths.MaxWeight, value.KShortestPaths.IncludeDocuments, value.KShortestPaths.Fields)
+		return false, validateGraphPathQuery(value.Index, value.KShortestPaths.From, value.KShortestPaths.To, value.KShortestPaths.Direction, value.KShortestPaths.Filter, value.KShortestPaths.EdgeTypes, value.KShortestPaths.MaxDepth, value.KShortestPaths.MinWeight, value.KShortestPaths.MaxWeight, value.KShortestPaths.IncludeDocuments, value.KShortestPaths.Fields)
 	}
 }
 
@@ -1186,7 +1203,7 @@ func NewGraphTraverseQuery(query GraphTraverseQuery) (GraphQuery, error) {
 
 // NewGraphShortestPathQuery wraps a shortest-path query in the canonical GraphQuery union.
 func NewGraphShortestPathQuery(query GraphShortestPathQuery) (GraphQuery, error) {
-	if err := validateGraphPathQuery(query.Index, query.ShortestPath.From, query.ShortestPath.To, query.ShortestPath.Filter, query.ShortestPath.EdgeTypes, query.ShortestPath.MaxDepth, query.ShortestPath.MinWeight, query.ShortestPath.MaxWeight, query.ShortestPath.IncludeDocuments, query.ShortestPath.Fields); err != nil {
+	if err := validateGraphPathQuery(query.Index, query.ShortestPath.From, query.ShortestPath.To, query.ShortestPath.Direction, query.ShortestPath.Filter, query.ShortestPath.EdgeTypes, query.ShortestPath.MaxDepth, query.ShortestPath.MinWeight, query.ShortestPath.MaxWeight, query.ShortestPath.IncludeDocuments, query.ShortestPath.Fields); err != nil {
 		return GraphQuery{}, err
 	}
 	var result GraphQuery
@@ -1199,7 +1216,7 @@ func NewGraphKShortestPathsQuery(query GraphKShortestPathsQuery) (GraphQuery, er
 	if query.KShortestPaths.K < 1 || query.KShortestPaths.K > 100 {
 		return GraphQuery{}, fmt.Errorf("antfly: graph k must be between 1 and 100")
 	}
-	if err := validateGraphPathQuery(query.Index, query.KShortestPaths.From, query.KShortestPaths.To, query.KShortestPaths.Filter, query.KShortestPaths.EdgeTypes, query.KShortestPaths.MaxDepth, query.KShortestPaths.MinWeight, query.KShortestPaths.MaxWeight, query.KShortestPaths.IncludeDocuments, query.KShortestPaths.Fields); err != nil {
+	if err := validateGraphPathQuery(query.Index, query.KShortestPaths.From, query.KShortestPaths.To, query.KShortestPaths.Direction, query.KShortestPaths.Filter, query.KShortestPaths.EdgeTypes, query.KShortestPaths.MaxDepth, query.KShortestPaths.MinWeight, query.KShortestPaths.MaxWeight, query.KShortestPaths.IncludeDocuments, query.KShortestPaths.Fields); err != nil {
 		return GraphQuery{}, err
 	}
 	var result GraphQuery
@@ -1873,6 +1890,9 @@ func validateGraphTraverseQuery(query GraphTraverseQuery) error {
 	if err := validateGraphSelector(query.Traverse.Start); err != nil {
 		return err
 	}
+	if err := validateGraphDirection(query.Traverse.Direction); err != nil {
+		return err
+	}
 	filterVisited := 0
 	if err := validateGraphDocumentFilter(query.Traverse.Filter, 0, &filterVisited); err != nil {
 		return fmt.Errorf("antfly: graph traversal filter: %w", err)
@@ -1900,12 +1920,15 @@ func validateGraphTraverseQuery(query GraphTraverseQuery) error {
 	return nil
 }
 
-func validateGraphPathQuery(index string, from, to GraphPathEndpoint, filter GraphDocumentFilter, edgeTypes []string, maxDepth int, minWeight, maxWeight *float64, includeDocuments bool, fields []string) error {
+func validateGraphPathQuery(index string, from, to GraphPathEndpoint, direction EdgeDirection, filter GraphDocumentFilter, edgeTypes []string, maxDepth int, minWeight, maxWeight *float64, includeDocuments bool, fields []string) error {
 	if strings.TrimSpace(index) == "" {
 		return fmt.Errorf("antfly: graph index must not be empty")
 	}
 	if from.Key == "" || to.Key == "" {
 		return fmt.Errorf("antfly: graph path endpoints must not be empty")
+	}
+	if err := validateGraphDirection(direction); err != nil {
+		return err
 	}
 	filterVisited := 0
 	if err := validateGraphDocumentFilter(filter, 0, &filterVisited); err != nil {
@@ -1927,6 +1950,13 @@ func validateGraphPathQuery(index string, from, to GraphPathEndpoint, filter Gra
 		if err := validateNonEmptyUnique("graph field", fields); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateGraphDirection(direction EdgeDirection) error {
+	if direction != "" && direction != EdgeDirectionOut && direction != EdgeDirectionIn && direction != EdgeDirectionBoth {
+		return fmt.Errorf("antfly: graph direction must be out, in, or both")
 	}
 	return nil
 }

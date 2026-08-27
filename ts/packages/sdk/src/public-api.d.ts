@@ -12181,9 +12181,11 @@ export interface components {
         };
         /** @description Select graph nodes using exactly one explicit, exact selector form. */
         GraphNodeSelector: components["schemas"]["GraphKeyNodeSelector"] | components["schemas"]["GraphIdentityNodeSelector"] | components["schemas"]["GraphResultRefNodeSelector"];
-        /** @description Outgoing breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Model an undirected relationship by indexing an outgoing edge in each direction. */
+        /** @description Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge. */
         GraphTraversal: {
             start: components["schemas"]["GraphNodeSelector"];
+            /** @description Stored-edge direction relative to each expanded node; defaults to `out`. */
+            direction?: components["schemas"]["EdgeDirection"];
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: components["schemas"]["GraphEdgeType"][];
             /**
@@ -12221,10 +12223,12 @@ export interface components {
          * @enum {string}
          */
         PathWeightMode: "min_hops" | "min_weight" | "max_weight";
-        /** @description Find the best outgoing path from `from` to `to`. */
+        /** @description Find the best path from `from` to `to` in the requested stored-edge direction. */
         GraphShortestPath: {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
+            /** @description Stored-edge direction relative to each expanded path node; defaults to `out`. */
+            direction?: components["schemas"]["EdgeDirection"];
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: components["schemas"]["GraphEdgeType"][];
             /** @default 10 */
@@ -12248,10 +12252,12 @@ export interface components {
             index: string;
             shortest_path: components["schemas"]["GraphShortestPath"];
         };
-        /** @description Find up to `k` outgoing loopless paths from `from` to `to`. */
+        /** @description Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. */
         GraphKShortestPaths: {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
+            /** @description Stored-edge direction relative to each expanded path node; defaults to `out`. */
+            direction?: components["schemas"]["EdgeDirection"];
             k: number;
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: components["schemas"]["GraphEdgeType"][];

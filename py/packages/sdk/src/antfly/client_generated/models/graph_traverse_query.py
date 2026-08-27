@@ -17,8 +17,9 @@ class GraphTraverseQuery:
     """
     Attributes:
         index (str):
-        traverse (GraphTraversal): Outgoing breadth-first traversal with request-wide deduplication by exact table-
-            qualified node identity. Model an undirected relationship by indexing an outgoing edge in each direction.
+        traverse (GraphTraversal): Breadth-first traversal with request-wide deduplication by exact table-qualified node
+            identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a
+            reciprocal edge.
     """
 
     index: str

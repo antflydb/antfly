@@ -39,6 +39,34 @@ func TestQueryRequestMarshalEnforcesCanonicalGraphOperationLimit(t *testing.T) {
 	}
 }
 
+func TestQueryRequestMarshalEnforcesMatchOperationLimit(t *testing.T) {
+	graphReturn, err := NewGraphBindingsReturn([]string{"node"}, GraphBindingsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	matchQuery, err := NewGraphMatchQuery(GraphMatchQuery{
+		Index: "graph_idx",
+		Match: GraphMatch{
+			Anchor: "node",
+			Nodes:  map[string]GraphMatchNode{"node": {}},
+			Edges:  []GraphMatchEdge{},
+		},
+		Return: graphReturn,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queries := make(map[string]GraphQuery, maxGraphMatchQueries+1)
+	for i := 0; i <= maxGraphMatchQueries; i++ {
+		queries[fmt.Sprintf("match_%d", i)] = matchQuery
+	}
+	if _, err := json.Marshal(QueryRequest{GraphQueries: queries}); err == nil {
+		t.Fatal("expected too many canonical match operations to fail")
+	} else if !bytes.Contains([]byte(err.Error()), []byte("at most 8 match operations")) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestQueryRequestMarshalRejectsMixedGraphContracts(t *testing.T) {
 	_, err := json.Marshal(QueryRequest{
 		GraphQueries:  map[string]GraphQuery{},

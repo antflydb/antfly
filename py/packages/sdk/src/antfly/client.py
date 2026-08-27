@@ -53,6 +53,7 @@ MAX_GENERATION_SSE_EVENT_BYTES = 16 << 20
 MAX_GENERATION_SSE_LINE_BYTES = 16 << 20
 MAX_GRAPH_EDGE_TYPES = 64
 MAX_GRAPH_EDGE_TYPE_UTF8_BYTES = 64 << 10
+MAX_GRAPH_MATCH_QUERIES = 8
 
 CreateIndexRequest: TypeAlias = (
     CreateFullTextIndexRequest | CreateEmbeddingsIndexRequest | CreateGraphIndexRequest | CreateAlgebraicIndexRequest
@@ -105,11 +106,16 @@ def _validate_graph_edges(edges: object, path: str) -> None:
         edge_path = f"{path}[{index}]"
         _require_graph_identifier(edge.get("from"), f"{edge_path}.from")
         _require_graph_identifier(edge.get("to"), f"{edge_path}.to")
-        if "direction" in edge:
-            direction = edge["direction"]
-            if not isinstance(direction, str) or direction not in {"out", "in", "both"}:
-                raise AntflyException(f"{edge_path}.direction must be out, in, or both")
+        _validate_graph_direction(edge, edge_path)
         _require_graph_edge_types(edge.get("types"), f"{edge_path}.types")
+
+
+def _validate_graph_direction(value: Mapping[str, Any], path: str) -> None:
+    if "direction" not in value:
+        return
+    direction = value["direction"]
+    if not isinstance(direction, str) or direction not in {"out", "in", "both"}:
+        raise AntflyException(f"{path}.direction must be out, in, or both")
 
 
 def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, path: str) -> None:
@@ -186,6 +192,7 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
         raise AntflyException("graph_queries accepts at most 64 named operations")
 
     encoded: dict[str, Any] = {}
+    match_queries = 0
     typed_queries = (GraphMatchQuery, GraphTraverseQuery, GraphShortestPathQuery, GraphKShortestPathsQuery)
     for name, query in operations.items():
         _require_graph_identifier(name, "graph_queries key")
@@ -197,9 +204,13 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
             raise AntflyException(f"graph query {name!r} must be a generated graph query model or mapping")
         match = encoded_query.get("match")
         if isinstance(match, Mapping):
+            match_queries += 1
+            if match_queries > MAX_GRAPH_MATCH_QUERIES:
+                raise AntflyException(f"graph_queries accepts at most {MAX_GRAPH_MATCH_QUERIES} match operations")
             _validate_graph_match_identifiers(match, encoded_query.get("return"), f"graph_queries[{name!r}]")
         traverse = encoded_query.get("traverse")
         if isinstance(traverse, Mapping):
+            _validate_graph_direction(traverse, f"graph_queries[{name!r}].traverse")
             _require_graph_edge_types(traverse.get("edge_types"), f"graph_queries[{name!r}].traverse.edge_types")
             start = traverse.get("start")
             if isinstance(start, Mapping) and "result_ref" in start:
@@ -220,6 +231,7 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
         for operation in ("shortest_path", "k_shortest_paths"):
             path_query = encoded_query.get(operation)
             if isinstance(path_query, Mapping):
+                _validate_graph_direction(path_query, f"graph_queries[{name!r}].{operation}")
                 _require_graph_edge_types(
                     path_query.get("edge_types"),
                     f"graph_queries[{name!r}].{operation}.edge_types",

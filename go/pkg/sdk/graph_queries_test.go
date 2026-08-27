@@ -103,9 +103,10 @@ func TestGraphSelectorAndProjectionConstructors(t *testing.T) {
 	query, err := NewGraphTraverseQuery(GraphTraverseQuery{
 		Index: "graph_idx",
 		Traverse: GraphTraversal{
-			Start:  start,
-			Limit:  25,
-			Filter: filter,
+			Start:     start,
+			Direction: EdgeDirectionBoth,
+			Limit:     25,
+			Filter:    filter,
 		},
 	})
 	if err != nil {
@@ -120,6 +121,9 @@ func TestGraphSelectorAndProjectionConstructors(t *testing.T) {
 		t.Fatal(err)
 	}
 	traverse := selectorJSON["traverse"].(map[string]any)
+	if traverse["direction"] != "both" {
+		t.Fatalf("direction = %#v", traverse["direction"])
+	}
 	startJSON := traverse["start"].(map[string]any)
 	if keys, ok := startJSON["keys"].([]any); !ok || len(keys) != 2 {
 		t.Fatalf("start = %#v", startJSON)
@@ -834,6 +838,46 @@ func TestGraphMatchEdgeValidationMatchesServerDefaultsAndBudgets(t *testing.T) {
 	}
 	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Types: []string{strings.Repeat("文", maxGraphEdgeTypeBytes/3+1)}}); err == nil {
 		t.Fatal("expected encoded graph edge type byte limit to fail")
+	}
+}
+
+func TestGraphTraversalAndPathDirectionValidation(t *testing.T) {
+	start, err := NewGraphKeySelector("doc:a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGraphTraverseQuery(GraphTraverseQuery{
+		Index:    "graph_idx",
+		Traverse: GraphTraversal{Start: start, Direction: EdgeDirectionIn},
+	}); err != nil {
+		t.Fatalf("incoming traversal failed validation: %v", err)
+	}
+	if err := validateGraphTraverseQuery(GraphTraverseQuery{
+		Index:    "graph_idx",
+		Traverse: GraphTraversal{Start: start, Direction: EdgeDirection("sideways")},
+	}); err == nil {
+		t.Fatal("expected invalid traversal direction to fail")
+	}
+	if _, err := NewGraphShortestPathQuery(GraphShortestPathQuery{
+		Index: "graph_idx",
+		ShortestPath: GraphShortestPath{
+			From:      GraphPathEndpoint{Key: "doc:a"},
+			To:        GraphPathEndpoint{Key: "doc:b"},
+			Direction: EdgeDirectionBoth,
+		},
+	}); err != nil {
+		t.Fatalf("undirected shortest path failed validation: %v", err)
+	}
+	if _, err := NewGraphKShortestPathsQuery(GraphKShortestPathsQuery{
+		Index: "graph_idx",
+		KShortestPaths: GraphKShortestPaths{
+			From:      GraphPathEndpoint{Key: "doc:a"},
+			To:        GraphPathEndpoint{Key: "doc:b"},
+			K:         2,
+			Direction: EdgeDirection("sideways"),
+		},
+	}); err == nil {
+		t.Fatal("expected invalid k-shortest-path direction to fail")
 	}
 }
 

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.edge_direction import EdgeDirection
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -33,12 +34,16 @@ T = TypeVar("T", bound="GraphTraversal")
 
 @_attrs_define
 class GraphTraversal:
-    """Outgoing breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Model an
-    undirected relationship by indexing an outgoing edge in each direction.
+    """Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults
+    to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge.
 
         Attributes:
             start (GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector): Select graph nodes using
                 exactly one explicit, exact selector form.
+            direction (EdgeDirection | Unset): Direction of edges to query:
+                - out: Outgoing edges from the node
+                - in: Incoming edges to the node
+                - both: Both outgoing and incoming edges
             edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
             max_depth (int | Unset): Maximum traversal depth. Defaults to one hop to keep fan-out explicit. Default: 1.
             min_weight (float | Unset):
@@ -60,6 +65,7 @@ class GraphTraversal:
     """
 
     start: GraphIdentityNodeSelector | GraphKeyNodeSelector | GraphResultRefNodeSelector
+    direction: EdgeDirection | Unset = UNSET
     edge_types: list[str] | Unset = UNSET
     max_depth: int | Unset = 1
     min_weight: float | Unset = UNSET
@@ -112,6 +118,10 @@ class GraphTraversal:
             start = self.start.to_dict()
         else:
             start = self.start.to_dict()
+
+        direction: str | Unset = UNSET
+        if not isinstance(self.direction, Unset):
+            direction = self.direction.value
 
         edge_types: list[str] | Unset = UNSET
         if not isinstance(self.edge_types, Unset):
@@ -174,6 +184,8 @@ class GraphTraversal:
                 "start": start,
             }
         )
+        if direction is not UNSET:
+            field_dict["direction"] = direction
         if edge_types is not UNSET:
             field_dict["edge_types"] = edge_types
         if max_depth is not UNSET:
@@ -242,6 +254,13 @@ class GraphTraversal:
             return componentsschemas_graph_node_selector_type_2
 
         start = _parse_start(d.pop("start"))
+
+        _direction = d.pop("direction", UNSET)
+        direction: EdgeDirection | Unset
+        if isinstance(_direction, Unset):
+            direction = UNSET
+        else:
+            direction = EdgeDirection(_direction)
 
         edge_types = cast(list[str], d.pop("edge_types", UNSET))
 
@@ -403,6 +422,7 @@ class GraphTraversal:
 
         graph_traversal = cls(
             start=start,
+            direction=direction,
             edge_types=edge_types,
             max_depth=max_depth,
             min_weight=min_weight,

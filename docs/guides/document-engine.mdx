@@ -184,6 +184,13 @@ one of `traverse`, `match`, `shortest_path`, or `k_shortest_paths`. A traversal
 defaults to one hop, and stored documents are returned only when the operation
 enables `include_documents`.
 
+Traversal, MATCH edges, shortest paths, and K-shortest paths all use the same
+stored-edge `direction`: `out` by default, `in` for reverse expansion, and
+`both` for undirected expansion. Store one physical relationship and select
+`both` when its query semantics are undirected; storing a reciprocal edge
+creates a second physical relationship and can therefore create a second
+binding or path.
+
 Use `$query_results` to seed a graph operation from the final ranked result page,
 regardless of whether retrieval was lexical, vector, or fused:
 
@@ -363,10 +370,10 @@ Fixed single-hop relationships preserve physical self-loops, so distinct aliases
 may bind the same node unless `where.not_equal` excludes that binding. Variable-
 length relationships remain node-simple except for explicit repeated-alias cycle
 closure.
-Edge direction is relative to `from` and defaults to `out`. Use `direction: "in"`
-to traverse a stored relationship in reverse, or `direction: "both"` to treat one
-stored relationship as undirected. A physical self-loop still contributes only
-one relationship binding under `both`.
+MATCH edge direction is relative to `from` and defaults to `out`. Use
+`direction: "in"` to traverse a stored relationship in reverse, or
+`direction: "both"` to treat one stored relationship as undirected. A physical
+self-loop still contributes only one relationship binding under `both`.
 Top-level full-text, semantic, and filter clauses shape the retrieval result only;
 they do not implicitly narrow `MATCH`. Put source constraints on the node named by
 `match.anchor`. Row-level authorization still applies to every anchor and reached

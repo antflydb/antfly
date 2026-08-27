@@ -130,6 +130,44 @@ describe("graph identifier policy", () => {
     ).toThrow("direction must be out, in, or both");
   });
 
+  it.each([
+    "traverse",
+    "shortest_path",
+    "k_shortest_paths",
+  ] as const)("validates %s direction", (operation) => {
+    const body =
+      operation === "traverse"
+        ? { start: { keys: ["doc:a"] }, direction: "both" }
+        : {
+            from: { key: "doc:a" },
+            to: { key: "doc:b" },
+            ...(operation === "k_shortest_paths" ? { k: 2 } : {}),
+            direction: "both",
+          };
+    expect(() =>
+      validateGraphQueryIdentifiers({ walk: { index: "graph_idx", [operation]: body } })
+    ).not.toThrow();
+    expect(() =>
+      validateGraphQueryIdentifiers({
+        walk: { index: "graph_idx", [operation]: { ...body, direction: "sideways" } },
+      })
+    ).toThrow("direction must be out, in, or both");
+  });
+
+  it("rejects more than eight match operations before transport", () => {
+    const graphQueries = Object.fromEntries(
+      Array.from({ length: 9 }, (_, index) => [
+        `match_${index}`,
+        {
+          index: "graph_idx",
+          match: { anchor: "node", nodes: { node: {} }, edges: [] },
+          return: { bindings: ["node"] },
+        },
+      ])
+    );
+    expect(() => validateGraphQueryIdentifiers(graphQueries)).toThrow("at most 8 match operations");
+  });
+
   it.each([false, true])("rejects distinct presence on count(*) (%s)", (distinct) => {
     expect(() =>
       validateGraphQueryIdentifiers({

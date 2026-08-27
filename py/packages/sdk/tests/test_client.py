@@ -611,6 +611,45 @@ class TestAntflyClient:
         with pytest.raises(AntflyException, match=r"not_exists\.edges\[0\]\.direction must be out, in, or both"):
             client.query(table="docs", graph_queries={"people": anti_join_query})
 
+    @pytest.mark.parametrize("operation", ["traverse", "shortest_path", "k_shortest_paths"])
+    def test_query_validates_graph_operation_direction(self, operation: str) -> None:
+        if operation == "traverse":
+            body: dict[str, object] = {"start": {"keys": ["doc:a"]}, "direction": "both"}
+        else:
+            body = {
+                "from": {"key": "doc:a"},
+                "to": {"key": "doc:b"},
+                "direction": "both",
+            }
+            if operation == "k_shortest_paths":
+                body["k"] = 2
+
+        with patch("antfly.client.Client") as mock_client_class:
+            mock_httpx = MagicMock()
+            configure_response(mock_httpx, 200, {"responses": []})
+            mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+            client = AntflyClient(base_url="http://localhost:8080")
+            client.query(table="docs", graph_queries={"walk": {"index": "graph_idx", operation: body}})
+            mock_httpx.stream.assert_called_once()
+
+        body["direction"] = "sideways"
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(AntflyException, match="direction must be out, in, or both"):
+            client.query(table="docs", graph_queries={"walk": {"index": "graph_idx", operation: body}})
+
+    def test_query_rejects_more_than_eight_match_operations(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        graph_queries = {
+            f"match_{index}": {
+                "index": "graph_idx",
+                "match": {"anchor": "node", "nodes": {"node": {}}, "edges": []},
+                "return": {"bindings": ["node"]},
+            }
+            for index in range(9)
+        }
+        with pytest.raises(AntflyException, match="at most 8 match operations"):
+            client.query(table="docs", graph_queries=graph_queries)
+
     @pytest.mark.parametrize(
         ("start", "error"),
         [

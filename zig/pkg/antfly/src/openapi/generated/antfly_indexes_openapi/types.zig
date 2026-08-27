@@ -1891,10 +1891,12 @@ pub const GraphIndexStats = struct {
     algebraic_graph: ?std.json.Value = null,
 };
 
-/// Find up to `k` outgoing loopless paths from `from` to `to`.
+/// Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction.
 pub const GraphKShortestPaths = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
+    /// Stored-edge direction relative to each expanded path node; defaults to `out`.
+    direction: ?EdgeDirection = null,
     k: i64,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const GraphEdgeType = null,
@@ -2611,10 +2613,12 @@ pub const GraphRowCountTarget = enum {
     }
 };
 
-/// Find the best outgoing path from `from` to `to`.
+/// Find the best path from `from` to `to` in the requested stored-edge direction.
 pub const GraphShortestPath = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
+    /// Stored-edge direction relative to each expanded path node; defaults to `out`.
+    direction: ?EdgeDirection = null,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const GraphEdgeType = null,
     max_depth: ?i64 = null,
@@ -2637,9 +2641,11 @@ pub const GraphShortestPathQuery = struct {
 /// A literal numeric value or a Handlebars template evaluated for each materialized graph item.
 pub const GraphTemplateValue = std.json.Value;
 
-/// Outgoing breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Model an undirected relationship by indexing an outgoing edge in each direction.
+/// Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge.
 pub const GraphTraversal = struct {
     start: GraphNodeSelector,
+    /// Stored-edge direction relative to each expanded node; defaults to `out`.
+    direction: ?EdgeDirection = null,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const GraphEdgeType = null,
     /// Maximum traversal depth. Defaults to one hop to keep fan-out explicit.

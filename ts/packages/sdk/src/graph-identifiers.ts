@@ -14,6 +14,7 @@ const MAX_ANTFLY_UNIX_NS = (1n << 64n) - 1n;
 const NS_PER_SECOND = 1_000_000_000n;
 const MAX_GRAPH_EDGE_TYPES = 64;
 const MAX_GRAPH_EDGE_TYPE_UTF8_BYTES = 64 * 1024;
+const MAX_GRAPH_MATCH_QUERIES = 8;
 
 function object(value: unknown): JSONObject | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -303,16 +304,15 @@ function validateEdges(value: unknown, path: string): void {
     if (!edge) return;
     requireIdentifier(edge.from, `${path}[${index}].from`);
     requireIdentifier(edge.to, `${path}[${index}].to`);
-    if (
-      edge.direction !== undefined &&
-      edge.direction !== "out" &&
-      edge.direction !== "in" &&
-      edge.direction !== "both"
-    ) {
-      throw new TypeError(`${path}[${index}].direction must be out, in, or both`);
-    }
+    validateDirection(edge.direction, `${path}[${index}].direction`);
     validateEdgeTypes(edge.types, `${path}[${index}].types`);
   });
+}
+
+function validateDirection(value: unknown, path: string): void {
+  if (value !== undefined && value !== "out" && value !== "in" && value !== "both") {
+    throw new TypeError(`${path} must be out, in, or both`);
+  }
 }
 
 function validateWhere(root: unknown, path: string): void {
@@ -418,6 +418,7 @@ export function countGraphAlias(alias: string, distinct = false): GraphCountAggr
 
 function validateTraverse(query: JSONObject, path: string): void {
   const traverse = object(query.traverse);
+  validateDirection(traverse?.direction, `${path}.traverse.direction`);
   validateEdgeTypes(traverse?.edge_types, `${path}.traverse.edge_types`);
   const start = object(traverse?.start);
   if (!start || !("result_ref" in start)) return;
@@ -446,6 +447,7 @@ function validateTraverse(query: JSONObject, path: string): void {
 function validatePathEdgeTypes(query: JSONObject, path: string): void {
   for (const operation of ["shortest_path", "k_shortest_paths"] as const) {
     const body = object(query[operation]);
+    validateDirection(body?.direction, `${path}.${operation}.direction`);
     validateEdgeTypes(body?.edge_types, `${path}.${operation}.edge_types`);
   }
 }
@@ -458,11 +460,20 @@ export function validateGraphQueryIdentifiers(graphQueries: unknown): void {
   if (entries.length > 64) {
     throw new TypeError("graph_queries accepts at most 64 named operations");
   }
+  let matchQueries = 0;
   for (const [name, candidate] of entries) {
     requireIdentifier(name, "graph_queries key");
     const query = object(candidate);
     if (query) {
       const path = `graph_queries[${JSON.stringify(name)}]`;
+      if (query.match !== undefined && query.match !== null) {
+        matchQueries += 1;
+        if (matchQueries > MAX_GRAPH_MATCH_QUERIES) {
+          throw new TypeError(
+            `graph_queries accepts at most ${MAX_GRAPH_MATCH_QUERIES} match operations`
+          );
+        }
+      }
       validateMatch(query, path);
       validateTraverse(query, path);
       validatePathEdgeTypes(query, path);

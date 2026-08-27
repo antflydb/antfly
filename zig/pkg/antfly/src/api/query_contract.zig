@@ -9812,7 +9812,7 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
         .start_nodes = start,
         .params = .{
             .edge_types = edge_types,
-            .direction = .out,
+            .direction = parseGraphDirection(traversal.direction),
             .max_depth = try parseGraphBoundedU32(traversal.max_depth, 1, 1, 64),
             .max_results = try parseGraphBoundedU32(traversal.limit, 100, 1, 10_000),
             .min_weight = traversal.min_weight,
@@ -9861,7 +9861,7 @@ fn parseGraphPathQuery(
         .k = k,
         .params = .{
             .edge_types = edge_types,
-            .direction = .out,
+            .direction = parseGraphDirection(path.direction),
             .max_depth = try parseGraphBoundedU32(path.max_depth, 10, 1, 64),
             .min_weight = path.min_weight,
             .max_weight = path.max_weight,
@@ -15043,6 +15043,7 @@ test "api query contract owns the admitted graph wire for exact proxying" {
         \\      "index": "graph_idx",
         \\      "traverse": {
         \\        "start": {"keys":["doc:a"]},
+        \\        "direction": "both",
         \\        "filter": {"term":"active","path":"/status"}
         \\      }
         \\    }
@@ -15054,12 +15055,13 @@ test "api query contract owns the admitted graph wire for exact proxying" {
     defer owned.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
+    try std.testing.expectEqual(graph_mod.EdgeDirection.both, owned.req.graph_queries[0].query.params.direction);
     var wire = try ant_json.parseFromSlice(std.json.Value, alloc, owned.req.graph_queries_proxy_json, .{});
     defer wire.deinit();
     const graph_queries = wire.value.object.get("graph_queries") orelse return error.TestUnexpectedResult;
     const walk = graph_queries.object.get("walk") orelse return error.TestUnexpectedResult;
     const traverse = walk.object.get("traverse") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(traverse.object.get("direction") == null);
+    try std.testing.expectEqualStrings("both", traverse.object.get("direction").?.string);
     const filter = traverse.object.get("filter") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("active", filter.object.get("term").?.string);
 }
@@ -15086,9 +15088,7 @@ test "api query contract preserves opaque legacy graph operation names" {
 
 test "canonical graph contract rejects modes without exact public execution" {
     const cases = [_][]const u8{
-        "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"direction\":\"in\"}}}}",
         "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"deduplicate_nodes\":false}}}}",
-        "{\"graph_queries\":{\"path\":{\"index\":\"g\",\"shortest_path\":{\"from\":{\"key\":\"a\"},\"to\":{\"key\":\"b\"},\"direction\":\"both\"}}}}",
         "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.\"}}}}}",
         "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.bad\u{200b}name\"}}}}}",
         "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"result_ref\":\"$graph_results.*\"}}}}}",
@@ -15099,6 +15099,31 @@ test "canonical graph contract rejects modes without exact public execution" {
             error.InvalidQueryRequest,
             parsePublicQueryRequest(std.testing.allocator, null, "docs", body),
         );
+    }
+}
+
+test "canonical graph traversal and paths preserve requested direction" {
+    const cases = [_]struct {
+        body: []const u8,
+        expected: graph_mod.EdgeDirection,
+    }{
+        .{
+            .body = "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"direction\":\"in\"}}}}",
+            .expected = .in,
+        },
+        .{
+            .body = "{\"graph_queries\":{\"path\":{\"index\":\"g\",\"shortest_path\":{\"from\":{\"key\":\"a\"},\"to\":{\"key\":\"b\"},\"direction\":\"both\"}}}}",
+            .expected = .both,
+        },
+        .{
+            .body = "{\"graph_queries\":{\"paths\":{\"index\":\"g\",\"k_shortest_paths\":{\"from\":{\"key\":\"a\"},\"to\":{\"key\":\"b\"},\"k\":2,\"direction\":\"in\"}}}}",
+            .expected = .in,
+        },
+    };
+    for (cases) |case| {
+        var owned = try parsePublicQueryRequest(std.testing.allocator, null, "docs", case.body);
+        defer owned.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.expected, owned.req.graph_queries[0].query.params.direction);
     }
 }
 

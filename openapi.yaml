@@ -23341,11 +23341,15 @@ components:
       additionalProperties: false
       required:
         - start
-      description: Outgoing breadth-first traversal with request-wide deduplication by exact table-qualified
-        node identity. Model an undirected relationship by indexing an outgoing edge in each direction.
+      description: Breadth-first traversal with request-wide deduplication by exact table-qualified node
+        identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without
+        storing a reciprocal edge.
       properties:
         start:
           $ref: '#/components/schemas/GraphNodeSelector'
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+          description: Stored-edge direction relative to each expanded node; defaults to `out`.
         edge_types:
           type: array
           maxItems: 64
@@ -23421,12 +23425,15 @@ components:
       required:
         - from
         - to
-      description: Find the best outgoing path from `from` to `to`.
+      description: Find the best path from `from` to `to` in the requested stored-edge direction.
       properties:
         from:
           $ref: '#/components/schemas/GraphPathEndpoint'
         to:
           $ref: '#/components/schemas/GraphPathEndpoint'
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+          description: Stored-edge direction relative to each expanded path node; defaults to `out`.
         edge_types:
           type: array
           maxItems: 64
@@ -23481,12 +23488,15 @@ components:
         - from
         - to
         - k
-      description: Find up to `k` outgoing loopless paths from `from` to `to`.
+      description: Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction.
       properties:
         from:
           $ref: '#/components/schemas/GraphPathEndpoint'
         to:
           $ref: '#/components/schemas/GraphPathEndpoint'
+        direction:
+          $ref: '#/components/schemas/EdgeDirection'
+          description: Stored-edge direction relative to each expanded path node; defaults to `out`.
         k:
           type: integer
           minimum: 1
