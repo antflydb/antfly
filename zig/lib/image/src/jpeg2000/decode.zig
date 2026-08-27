@@ -344,6 +344,32 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
         };
     }
 
+    // JPEG 2000 reconstruction clips component samples to their declared
+    // precision before presentation-grid resampling. Use the compact native
+    // component APIs for subsampled single-tile streams so U8 and U16, and
+    // single- and multi-tile decode, all perform those operations in the same
+    // order. Keep the optimized raw-plane path below for the common 1:1 case.
+    if (hasSubsampledComponents(&state)) {
+        const pixels = if (state.header.components[0].bits_per_component == 8) blk: {
+            var component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, &state, 0);
+            defer component_planes.deinit(allocator);
+            break :blk try reconstruct.interleaveComponentSamplesU8(allocator, &component_planes, &state);
+        } else blk: {
+            var component_planes = try decodeSingleTileComponentPlanesU16AtResolution(allocator, codestream_bytes, &state, 0);
+            defer component_planes.deinit(allocator);
+            break :blk try reconstruct.interleaveNativeComponentSamplesU8(allocator, &component_planes, &state);
+        };
+        return .{
+            .allocator = allocator,
+            .width = state.header.width,
+            .height = state.header.height,
+            .components = @intCast(state.header.components.len),
+            .backend = .pure_zig,
+            .pixels = pixels,
+            .jp2_color = jp2_color,
+        };
+    }
+
     const packed_headers = try collectPackedPacketHeaders(allocator, &state, 1, null);
     defer freePackedPacketHeaders(allocator, packed_headers);
 
@@ -687,6 +713,21 @@ fn ceilDivUsize(value: usize, denom: usize) usize {
     return if (value == 0) 0 else (value + denom - 1) / denom;
 }
 
+fn hasSubsampledComponents(state: *const codestream.State) bool {
+    for (state.header.components) |component| {
+        const dims = tile.componentDimensionsAt(
+            state.header.x_offset,
+            state.header.y_offset,
+            state.header.width,
+            state.header.height,
+            component.xrsiz,
+            component.yrsiz,
+        );
+        if (dims.width != state.header.width or dims.height != state.header.height) return true;
+    }
+    return false;
+}
+
 fn usizeDimensionsToU32(allocator: std.mem.Allocator, dims: []const usize) ![]u32 {
     const out = try allocator.alloc(u32, dims.len);
     errdefer allocator.free(out);
@@ -939,6 +980,9 @@ fn decodeMultiTileComponentPlanesU8(
             .component_quantization_styles = state.component_quantization_styles,
             .poc_entries = if (packed_headers != null) &.{} else tile_poc.entries,
             .rgn_entries = state.rgn_entries,
+            .mct_segments = state.mct_segments,
+            .mcc_collections = state.mcc_collections,
+            .mco = state.mco,
             .comments = state.comments,
             .tile_parts = &.{},
             .has_start_of_data = true,
@@ -1074,6 +1118,9 @@ fn decodeMultiTileComponentPlanesU16(
             .component_quantization_styles = state.component_quantization_styles,
             .poc_entries = if (packed_headers != null) &.{} else tile_poc.entries,
             .rgn_entries = state.rgn_entries,
+            .mct_segments = state.mct_segments,
+            .mcc_collections = state.mcc_collections,
+            .mco = state.mco,
             .comments = state.comments,
             .tile_parts = &.{},
             .has_start_of_data = true,
@@ -2158,6 +2205,56 @@ test "decodeU8 and decodeU16 upsample stitched component planes without tile sea
     defer single_12_u16.deinit();
     for (single_12_u8.pixels, single_12_u16.pixels) |sample_u8, sample_u16| {
         try std.testing.expectEqual(@as(u8, @intCast(sample_u16 >> 4)), sample_u8);
+    }
+}
+
+test "subsampled irreversible U8 clips native samples before interpolation" {
+    const allocator = std.testing.allocator;
+    const pixels = [_]u8{
+        0,   255, 0,   255,
+        255, 0,   255, 0,
+        0,   255, 0,   255,
+        255, 0,   255, 0,
+    };
+    const single_params = encode.EncodeParams{
+        .width = 4,
+        .height = 4,
+        .components = 1,
+        .bits_per_component = 8,
+        .decomposition_levels = 1,
+        .wavelet_transform = 0,
+        .multiple_component_transform = false,
+        .format = .j2k,
+    };
+    var tiled_params = single_params;
+    tiled_params.tile_width = 2;
+    tiled_params.tile_height = 2;
+
+    const single_const = try encode.encodeU8Bytes(allocator, &pixels, &single_params);
+    defer allocator.free(single_const);
+    const tiled_const = try encode.encodeU8Bytes(allocator, &pixels, &tiled_params);
+    defer allocator.free(tiled_const);
+    const single = try allocator.dupe(u8, single_const);
+    defer allocator.free(single);
+    const tiled = try allocator.dupe(u8, tiled_const);
+    defer allocator.free(tiled);
+    try rewriteSizForSubsampling(single, 8, 8, 8, 8, 2, 2);
+    try rewriteSizForSubsampling(tiled, 8, 8, 4, 4, 2, 2);
+
+    var single_u8 = try decodeU8Bytes(allocator, single);
+    defer single_u8.deinit();
+    var single_u16 = try decodeU16Bytes(allocator, single);
+    defer single_u16.deinit();
+    for (single_u8.pixels, single_u16.pixels) |sample_u8, sample_u16| {
+        try std.testing.expectEqual(@as(u16, sample_u8), sample_u16);
+    }
+
+    var tiled_u8 = try decodeU8Bytes(allocator, tiled);
+    defer tiled_u8.deinit();
+    var tiled_u16 = try decodeU16Bytes(allocator, tiled);
+    defer tiled_u16.deinit();
+    for (tiled_u8.pixels, tiled_u16.pixels) |sample_u8, sample_u16| {
+        try std.testing.expectEqual(@as(u16, sample_u8), sample_u16);
     }
 }
 

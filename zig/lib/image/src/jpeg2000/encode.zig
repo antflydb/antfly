@@ -184,6 +184,7 @@ pub fn encodeU8Bytes(
     params: *const EncodeParams,
 ) ![]u8 {
     const w: usize, const h: usize, const num_components: usize, const tile_width: usize, const tile_height: usize = try validateEncodeParams(params, pixels.len);
+    try validateCustomMctInvertible(allocator, params);
 
     const planes = try buildUnsignedPlanesU8(allocator, pixels, w, h, num_components);
     defer freePlanes(allocator, planes);
@@ -198,6 +199,7 @@ pub fn encodeU16Bytes(
 ) ![]u8 {
     const w: usize, const h: usize, const num_components: usize, const tile_width: usize, const tile_height: usize = try validateEncodeParams(params, pixels.len);
     if (params.bits_per_component == 0 or params.bits_per_component > 16) return error.UnsupportedSamplePrecision;
+    try validateCustomMctInvertible(allocator, params);
 
     const planes = try buildUnsignedPlanesU16(allocator, pixels, w, h, num_components, params.bits_per_component);
     defer freePlanes(allocator, planes);
@@ -262,6 +264,15 @@ fn validateEncodeParams(params: *const EncodeParams, pixel_len: usize) !struct {
     const tile_height: usize = if (params.tile_height == 0) h else params.tile_height;
     if (tile_width == 0 or tile_height == 0) return error.InvalidTileSize;
     return .{ w, h, num_components, tile_width, tile_height };
+}
+
+fn validateCustomMctInvertible(allocator: std.mem.Allocator, params: *const EncodeParams) !void {
+    const matrix = params.custom_mct orelse return;
+    const inverse = color_transform.invertMctMatrixGaussJordan(matrix.forward, matrix.num_components, allocator) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidCustomMct,
+    };
+    allocator.free(inverse);
 }
 
 fn buildUnsignedPlanesU8(
@@ -1651,6 +1662,28 @@ test "validateEncodeParams rejects custom MCT offsets that cannot be serialized"
         .custom_mct = matrix,
     };
     try std.testing.expectError(error.UnsupportedCustomMctOffsets, validateEncodeParams(&params, 12));
+}
+
+test "encoder rejects a singular custom MCT before building component planes" {
+    const singular = [_]f32{0} ** 9;
+    const identity = [_]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    const offsets = [_]f32{ 0, 0, 0 };
+    const matrix = color_transform.CustomMctMatrix{
+        .num_components = 3,
+        .forward = &singular,
+        .inverse = &identity,
+        .offsets = &offsets,
+    };
+    const params = EncodeParams{
+        .width = 2,
+        .height = 2,
+        .components = 3,
+        .wavelet_transform = 0,
+        .multiple_component_transform = true,
+        .custom_mct = matrix,
+    };
+    const pixels = [_]u8{0} ** 12;
+    try std.testing.expectError(error.InvalidCustomMct, encodeU8Bytes(std.testing.allocator, &pixels, &params));
 }
 
 test "encode 4x4 grayscale produces valid J2K starting with SOC" {
@@ -3216,18 +3249,18 @@ test "custom MCT encode+decode round-trip via marker chain" {
         }
     }
 
-    // Built-in ICT matrix (ISO 15444-1 Annex G-1). Using ICT itself as the
-    // custom matrix verifies that the decoder reads markers → builds matrix
-    // → applies inverse, independent of the built-in ICT fallback.
+    // Identity is deliberately different from built-in ICT: if a per-tile
+    // decode state drops the custom marker chain and falls back to ICT, the
+    // resulting RGB pixels are visibly wrong and fail the PSNR assertion.
     const forward = [_]f32{
-        0.299,     0.587,     0.114,
-        -0.168736, -0.331264, 0.5,
-        0.5,       -0.418688, -0.081312,
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
     };
     const inverse = [_]f32{
-        1.0, 0.0,       1.402,
-        1.0, -0.344136, -0.714136,
-        1.0, 1.772,     0.0,
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
     };
     const offsets = [_]f32{ 0.0, 0.0, 0.0 };
     const matrix = color_transform.CustomMctMatrix{
@@ -3251,20 +3284,36 @@ test "custom MCT encode+decode round-trip via marker chain" {
 
     const bytes = try encodeU8Bytes(allocator, &pixels, &params);
     defer allocator.free(bytes);
+    var tiled_params = params;
+    tiled_params.tile_width = 4;
+    tiled_params.tile_height = 4;
+    const tiled_bytes = try encodeU8Bytes(allocator, &pixels, &tiled_params);
+    defer allocator.free(tiled_bytes);
 
     var decoded = try decode.decodeU8Bytes(allocator, bytes);
     defer decoded.deinit();
+    var tiled_decoded = try decode.decodeU8Bytes(allocator, tiled_bytes);
+    defer tiled_decoded.deinit();
+    var tiled_decoded_u16 = try decode.decodeU16Bytes(allocator, tiled_bytes);
+    defer tiled_decoded_u16.deinit();
     try std.testing.expectEqual(@as(u32, 8), decoded.width);
     try std.testing.expectEqual(@as(u32, 8), decoded.height);
     try std.testing.expectEqual(@as(u8, 3), decoded.components);
 
     var sse: f64 = 0.0;
+    var tiled_sse: f64 = 0.0;
     var i: usize = 0;
     while (i < pixels.len) : (i += 1) {
         const d: f64 = @as(f64, @floatFromInt(pixels[i])) - @as(f64, @floatFromInt(decoded.pixels[i]));
         sse += d * d;
+        const tiled_d: f64 = @as(f64, @floatFromInt(pixels[i])) - @as(f64, @floatFromInt(tiled_decoded.pixels[i]));
+        tiled_sse += tiled_d * tiled_d;
+        try std.testing.expectEqual(@as(u16, tiled_decoded.pixels[i]), tiled_decoded_u16.pixels[i]);
     }
     const mse = sse / @as(f64, @floatFromInt(pixels.len));
+    const tiled_mse = tiled_sse / @as(f64, @floatFromInt(pixels.len));
     const psnr_db: f64 = if (mse <= 0.0) 100.0 else 10.0 * std.math.log10(255.0 * 255.0 / mse);
+    const tiled_psnr_db: f64 = if (tiled_mse <= 0.0) 100.0 else 10.0 * std.math.log10(255.0 * 255.0 / tiled_mse);
     try std.testing.expect(psnr_db > 40.0);
+    try std.testing.expect(tiled_psnr_db > 40.0);
 }
