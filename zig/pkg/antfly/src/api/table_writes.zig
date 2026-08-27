@@ -11594,12 +11594,17 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         if (self.backend_runtime) |runtime| {
-            const cumulative = try runtime.snapshotRetiredLsmOwnerCloneStatsAlloc(alloc);
+            var cumulative = try runtime.snapshotRetiredLsmOwnerCloneStatsAlloc(alloc);
+            // The processed prefix owns no labels: matching entries are freed
+            // immediately, while new entries transfer both strings into
+            // result. On error, only the untouched suffix still needs deinit.
+            var cumulative_processed: usize = 0;
             defer {
-                for (cumulative) |*owner| owner.deinit(alloc);
+                for (cumulative[cumulative_processed..]) |*owner| owner.deinit(alloc);
                 alloc.free(cumulative);
             }
-            for (cumulative) |owner| {
+            while (cumulative_processed < cumulative.len) : (cumulative_processed += 1) {
+                const owner = &cumulative[cumulative_processed];
                 const maintenance = archivedLsmOwnerMaintenance(owner.stats);
                 const key = lsmOwnerMetricKey(
                     owner.table_name,
@@ -11611,17 +11616,15 @@ pub const ProvisionedTableWriteSource = struct {
                 if (result_index.get(key)) |existing_index| {
                     const existing = &result.items[existing_index];
                     accumulateLsmOwnerCloneMaintenance(&existing.maintenance, maintenance);
+                    owner.deinit(alloc);
                 } else {
                     try result.ensureUnusedCapacity(alloc, 1);
                     try result_index.ensureUnusedCapacity(alloc, 1);
-                    const table_name = try alloc.dupe(u8, owner.table_name);
-                    errdefer alloc.free(table_name);
-                    const owner_name = try alloc.dupe(u8, owner.owner_name);
                     result.appendAssumeCapacity(.{
-                        .table_name = table_name,
+                        .table_name = owner.table_name,
                         .group_id = owner.group_id,
                         .owner_kind = owner.owner_kind,
-                        .owner_name = owner_name,
+                        .owner_name = owner.owner_name,
                         .owner_overflow = owner.owner_overflow,
                         .maintenance = maintenance,
                     });
@@ -17221,6 +17224,20 @@ test "provisioned owner clone snapshot preserves retired runtime counters" {
         @as(u64, 2),
         owners[0].maintenance.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bulk_current_scan)].calls,
     );
+
+    const AllocationRunner = struct {
+        fn run(test_alloc: std.mem.Allocator, write_source: *ProvisionedTableWriteSource) !void {
+            const snapshot = try write_source.lsmOwnerStatsBestEffortAlloc(test_alloc);
+            defer {
+                for (snapshot) |*owner| owner.deinit(test_alloc);
+                test_alloc.free(snapshot);
+            }
+            try std.testing.expectEqual(@as(usize, 1), snapshot.len);
+            try std.testing.expectEqualStrings("docs", snapshot[0].table_name);
+            try std.testing.expectEqualStrings("embedding", snapshot[0].owner_name);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{&source});
 }
 
 fn enforceHAWriteGateOptional(gate: ?db_mod.HAWriteGate) !void {

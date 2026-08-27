@@ -140,6 +140,8 @@ const LsmOwnerCloneRegistry = struct {
     const Source = struct {
         key: SourceKey,
         observed: LsmOwnerCloneStats,
+        previous_for_id: ?usize = null,
+        next_for_id: ?usize = null,
     };
 
     alloc: Allocator,
@@ -148,6 +150,7 @@ const LsmOwnerCloneRegistry = struct {
     entry_by_key: EntryMap = .empty,
     sources: std.ArrayListUnmanaged(Source) = .empty,
     source_by_key: std.AutoHashMapUnmanaged(SourceKey, usize) = .empty,
+    source_head_by_id: std.AutoHashMapUnmanaged(usize, usize) = .empty,
     dropped_observations: u64 = 0,
     collapsed_labels: u64 = 0,
 
@@ -161,6 +164,7 @@ const LsmOwnerCloneRegistry = struct {
         self.entry_by_key.deinit(self.alloc);
         self.sources.deinit(self.alloc);
         self.source_by_key.deinit(self.alloc);
+        self.source_head_by_id.deinit(self.alloc);
         self.* = undefined;
     }
 
@@ -263,6 +267,12 @@ const LsmOwnerCloneRegistry = struct {
                 source.observed = stats;
                 return;
             }
+        } else if (self.entries.items.len >= max_entries) {
+            // Reject a new label before reserving source storage. At the label
+            // ceiling this observation is intentionally dropped, so allocator
+            // pressure must not turn a healthy /metrics response into OOM.
+            self.dropped_observations +|= 1;
+            return;
         }
         // Never commit a permanent label entry unless its initial absolute
         // source baseline can be retained. Otherwise source saturation could
@@ -278,6 +288,8 @@ const LsmOwnerCloneRegistry = struct {
         // if the initial source baseline cannot be stored.
         try self.sources.ensureUnusedCapacity(self.alloc, 1);
         try self.source_by_key.ensureUnusedCapacity(self.alloc, 1);
+        const previous_head = self.source_head_by_id.get(source_id);
+        if (previous_head == null) try self.source_head_by_id.ensureUnusedCapacity(self.alloc, 1);
         const entry_index = (try self.findOrCreateEntryLocked(
             table_name,
             group_id,
@@ -289,25 +301,60 @@ const LsmOwnerCloneRegistry = struct {
         self.sources.appendAssumeCapacity(.{
             .key = source_key,
             .observed = stats,
+            .next_for_id = previous_head,
         });
-        self.source_by_key.putAssumeCapacity(source_key, self.sources.items.len - 1);
+        const source_index = self.sources.items.len - 1;
+        self.source_by_key.putAssumeCapacity(source_key, source_index);
+        if (previous_head) |head_index| {
+            self.sources.items[head_index].previous_for_id = source_index;
+            self.source_head_by_id.getPtr(source_id).?.* = source_index;
+        } else {
+            self.source_head_by_id.putAssumeCapacity(source_id, source_index);
+        }
         self.entries.items[entry_index].stats.accumulate(stats);
         self.collapsed_labels +|= stats.labels_collapsed_total;
+    }
+
+    fn removeSourceAtLocked(self: *LsmOwnerCloneRegistry, source_index: usize) void {
+        const removed = self.sources.items[source_index];
+        _ = self.source_by_key.remove(removed.key);
+
+        if (removed.previous_for_id) |previous_index| {
+            self.sources.items[previous_index].next_for_id = removed.next_for_id;
+        } else if (removed.next_for_id) |next_index| {
+            self.source_head_by_id.getPtr(removed.key.id).?.* = next_index;
+        } else {
+            _ = self.source_head_by_id.remove(removed.key.id);
+        }
+        if (removed.next_for_id) |next_index| {
+            self.sources.items[next_index].previous_for_id = removed.previous_for_id;
+        }
+
+        const last_index = self.sources.items.len - 1;
+        if (source_index == last_index) {
+            _ = self.sources.pop();
+            return;
+        }
+
+        const moved = self.sources.items[last_index];
+        self.sources.items[source_index] = moved;
+        _ = self.sources.pop();
+        self.source_by_key.getPtr(moved.key).?.* = source_index;
+        if (moved.previous_for_id) |previous_index| {
+            self.sources.items[previous_index].next_for_id = source_index;
+        } else {
+            self.source_head_by_id.getPtr(moved.key.id).?.* = source_index;
+        }
+        if (moved.next_for_id) |next_index| {
+            self.sources.items[next_index].previous_for_id = source_index;
+        }
     }
 
     fn retireSource(self: *LsmOwnerCloneRegistry, source_id: usize) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        var i: usize = self.sources.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.sources.items[i].key.id != source_id) continue;
-            const removed_key = self.sources.items[i].key;
-            _ = self.source_by_key.remove(removed_key);
-            _ = self.sources.swapRemove(i);
-            if (i < self.sources.items.len) {
-                self.source_by_key.getPtr(self.sources.items[i].key).?.* = i;
-            }
+        while (self.source_head_by_id.get(source_id)) |source_index| {
+            self.removeSourceAtLocked(source_index);
         }
     }
 
@@ -334,28 +381,52 @@ const LsmOwnerCloneRegistry = struct {
     }
 
     fn snapshotAlloc(self: *LsmOwnerCloneRegistry, alloc: Allocator) ![]LsmOwnerCloneMetricSnapshot {
+        // Registry labels are immutable and entries are never removed. Capture
+        // their stable slices and counter values under the mutex, then perform
+        // every allocator call after releasing it so scraping cannot stall DB
+        // retirement or another observation on allocator latency.
         lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        const result = try alloc.alloc(LsmOwnerCloneMetricSnapshot, self.entries.items.len);
+        var entry_count = self.entries.items.len;
+        self.mutex.unlock();
+        var result = try alloc.alloc(LsmOwnerCloneMetricSnapshot, entry_count);
+        while (true) {
+            lockAtomic(&self.mutex);
+            if (self.entries.items.len != result.len) {
+                entry_count = self.entries.items.len;
+                self.mutex.unlock();
+                alloc.free(result);
+                result = try alloc.alloc(LsmOwnerCloneMetricSnapshot, entry_count);
+                continue;
+            }
+            for (self.entries.items, result) |entry, *snapshot| {
+                snapshot.* = .{
+                    // Temporarily borrowed. The loop below replaces both
+                    // slices with owned copies before returning.
+                    .table_name = entry.table_name,
+                    .group_id = entry.group_id,
+                    .owner_kind = entry.owner_kind,
+                    .owner_name = entry.owner_name,
+                    .owner_overflow = entry.owner_overflow,
+                    .stats = entry.stats,
+                };
+            }
+            self.mutex.unlock();
+            break;
+        }
+
         var initialized: usize = 0;
         errdefer {
             for (result[0..initialized]) |*entry| entry.deinit(alloc);
             alloc.free(result);
         }
-        for (self.entries.items, result) |entry, *snapshot| {
-            const table_name = try alloc.dupe(u8, entry.table_name);
-            const owner_name = alloc.dupe(u8, entry.owner_name) catch |err| {
+        for (result) |*snapshot| {
+            const table_name = try alloc.dupe(u8, snapshot.table_name);
+            const owner_name = alloc.dupe(u8, snapshot.owner_name) catch |err| {
                 alloc.free(table_name);
                 return err;
             };
-            snapshot.* = .{
-                .table_name = table_name,
-                .group_id = entry.group_id,
-                .owner_kind = entry.owner_kind,
-                .owner_name = owner_name,
-                .owner_overflow = entry.owner_overflow,
-                .stats = entry.stats,
-            };
+            snapshot.table_name = table_name;
+            snapshot.owner_name = owner_name;
             initialized += 1;
         }
         return result;
@@ -1651,6 +1722,30 @@ test "LSM owner registry reports capacity loss in observation units" {
     try std.testing.expectEqual(@as(u64, 0), registry.collapsedLabelsTotal());
 }
 
+test "LSM owner entry saturation rejects before reserving source storage" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var registry = LsmOwnerCloneRegistry.init(failing.allocator());
+    defer registry.deinit();
+
+    for (0..LsmOwnerCloneRegistry.max_entries) |i| {
+        try registry.observe(i + 1, "docs", @intCast(i), .primary, "primary", false, .{ .calls = 1 });
+    }
+    // Fill the source list to its current allocation boundary so the old
+    // reserve-before-label-cap ordering would necessarily allocate.
+    var source_id = LsmOwnerCloneRegistry.max_entries + 1;
+    while (registry.sources.items.len < registry.sources.capacity) : (source_id += 1) {
+        try registry.observe(source_id, "docs", 0, .primary, "primary", false, .{ .calls = 1 });
+    }
+    try std.testing.expect(registry.sources.items.len < LsmOwnerCloneRegistry.max_sources);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const dropped_before = registry.droppedObservationsTotal();
+    try registry.observe(999_999, "other", 99_999, .primary, "primary", false, .{ .calls = 1 });
+    try std.testing.expectEqual(dropped_before + 1, registry.droppedObservationsTotal());
+    try std.testing.expectEqual(LsmOwnerCloneRegistry.max_entries, registry.entries.items.len);
+}
+
 test "LSM owner source saturation does not consume empty label entries" {
     var registry = LsmOwnerCloneRegistry.init(std.testing.allocator);
     defer registry.deinit();
@@ -1686,6 +1781,96 @@ test "LSM owner source allocation failure does not publish an empty label entry"
     try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
     try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), registry.sources.items.len);
+}
+
+test "LSM owner source admission is transactional across every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var registry = LsmOwnerCloneRegistry.init(alloc);
+            defer registry.deinit();
+            try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+            try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 1), registry.sources.items.len);
+            try std.testing.expectEqual(@as(usize, 1), registry.source_head_by_id.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "LSM owner indexed retirement repairs interleaved swap removals" {
+    const expectIndexIntegrity = struct {
+        fn run(source: *LsmOwnerCloneRegistry) !void {
+            for (source.sources.items, 0..) |item, index| {
+                try std.testing.expectEqual(index, source.source_by_key.get(item.key).?);
+                if (item.previous_for_id) |previous_index| {
+                    try std.testing.expectEqual(index, source.sources.items[previous_index].next_for_id.?);
+                } else {
+                    try std.testing.expectEqual(index, source.source_head_by_id.get(item.key.id).?);
+                }
+                if (item.next_for_id) |next_index| {
+                    try std.testing.expectEqual(index, source.sources.items[next_index].previous_for_id.?);
+                }
+            }
+        }
+    }.run;
+
+    var registry = LsmOwnerCloneRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+    try registry.observe(2, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 2 });
+    try registry.observe(1, "docs", 17, .primary, "primary", false, .{ .calls = 3 });
+    try registry.observe(3, "docs", 17, .full_text, "body", false, .{ .calls = 4 });
+
+    registry.retireSource(1);
+    try std.testing.expectEqual(@as(usize, 2), registry.sources.items.len);
+    try std.testing.expect(registry.source_head_by_id.get(1) == null);
+    try std.testing.expect(registry.source_head_by_id.get(2) != null);
+    try std.testing.expect(registry.source_head_by_id.get(3) != null);
+    try expectIndexIntegrity(&registry);
+
+    // Both surviving exact-key indexes must still target the entries moved by
+    // swap removal, and a replacement source must join a new per-ID chain.
+    try registry.observe(2, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 5 });
+    try registry.observe(3, "docs", 17, .full_text, "body", false, .{ .calls = 6 });
+    try registry.observe(4, "docs", 17, .primary, "primary", false, .{ .calls = 7 });
+    try expectIndexIntegrity(&registry);
+
+    const snapshot = try registry.snapshotAlloc(std.testing.allocator);
+    defer {
+        for (snapshot) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(snapshot);
+    }
+    var dense_calls: ?u64 = null;
+    var primary_calls: ?u64 = null;
+    var full_text_calls: ?u64 = null;
+    for (snapshot) |entry| switch (entry.owner_kind) {
+        .dense_vector => dense_calls = entry.stats.calls,
+        .primary => primary_calls = entry.stats.calls,
+        .full_text => full_text_calls = entry.stats.calls,
+    };
+    try std.testing.expectEqual(@as(?u64, 6), dense_calls);
+    try std.testing.expectEqual(@as(?u64, 10), primary_calls);
+    try std.testing.expectEqual(@as(?u64, 6), full_text_calls);
+}
+
+test "LSM owner snapshot is allocation-failure safe after capture" {
+    var registry = LsmOwnerCloneRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+    try registry.observe(1, "docs", 17, .primary, "primary", false, .{ .calls = 2 });
+
+    const Runner = struct {
+        fn run(alloc: Allocator, source: *LsmOwnerCloneRegistry) !void {
+            const snapshot = try source.snapshotAlloc(alloc);
+            defer {
+                for (snapshot) |*entry| entry.deinit(alloc);
+                alloc.free(snapshot);
+            }
+            try std.testing.expectEqual(@as(usize, 2), snapshot.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{&registry});
 }
 
 test "backend runtime API lane leases expose and release the interface" {
