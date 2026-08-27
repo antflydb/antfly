@@ -202,6 +202,11 @@ pub const StdHttpExecutor = struct {
             .PUT => .PUT,
             .DELETE => .DELETE,
         };
+        // The resolved client owns URI parsing, connection establishment,
+        // transmission, and response receipt behind one opaque call. Local
+        // header construction above can still prove `not_sent`; once this
+        // boundary is crossed, any error must conservatively assume delivery.
+        if (req.delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
         var response = try self.resolved_client.request(method, req.uri, .{
             .headers = header_pairs,
             .body = if (req.body.len == 0) null else req.body,
@@ -626,6 +631,69 @@ test "std http executor forwards only end-to-end request headers" {
     }
     try std.testing.expect(shouldForwardRequestHeader(&headers, headers[6].name));
     try std.testing.expect(shouldForwardRequestHeader(&headers, headers[7].name));
+}
+
+test "resolved std http executor preserves delivery provenance across opaque exchange" {
+    const App = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn executor(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            const content_type = try alloc.dupe(u8, "application/json");
+            errdefer alloc.free(content_type);
+            return .{
+                .status = 200,
+                .content_type = content_type,
+                .body = try alloc.dupe(u8, "{}"),
+            };
+        }
+    };
+
+    var app = App{};
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, app.executor());
+    defer listener.deinit();
+    try listener.start();
+    const uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(uri);
+
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{
+        .resolve_before_connect = true,
+    });
+    defer executor.deinit();
+
+    // Header-pair construction is caller-local and can prove that no request
+    // reached the server.
+    var setup_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var setup_delivery: common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.OutOfMemory, executor.executor().execute(setup_failing.allocator(), .{
+        .method = .POST,
+        .uri = uri,
+        .content_type = "application/json",
+        .body = "{}",
+        .delivery_tracker = &setup_delivery,
+    }));
+    try std.testing.expectEqual(common.RequestDeliveryTracker.State.not_sent, setup_delivery.load());
+    try std.testing.expectEqual(@as(usize, 0), app.calls.load(.acquire));
+
+    // The second caller allocation copies the response content type. Failing
+    // it proves that the opaque exchange completed before response ownership
+    // could be transferred, so replay must remain forbidden.
+    var response_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var response_delivery: common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.OutOfMemory, executor.executor().execute(response_failing.allocator(), .{
+        .method = .POST,
+        .uri = uri,
+        .content_type = "application/json",
+        .body = "{}",
+        .delivery_tracker = &response_delivery,
+    }));
+    try std.testing.expectEqual(common.RequestDeliveryTracker.State.may_have_been_sent, response_delivery.load());
+    try std.testing.expectEqual(@as(usize, 1), app.calls.load(.acquire));
 }
 
 test "std http executor retires pooled connection before configured cap" {
