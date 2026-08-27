@@ -1937,6 +1937,8 @@ pub const ApiHttpServer = struct {
     restore_retry_wakeup_in_flight: std.atomic.Value(bool) = .init(false),
     restore_retry_wakeup_generation: std.atomic.Value(u64) = .init(0),
     restore_retry_wakeup_event: std.Io.Event = .unset,
+    restore_backoff_waiters: [max_concurrent_restore_jobs]?*std.Io.Event =
+        .{null} ** max_concurrent_restore_jobs,
     restore_jobs_resumed: std.atomic.Value(bool) = .init(false),
     restore_jobs_closing: std.atomic.Value(bool) = .init(false),
     restore_leadership_term: std.atomic.Value(u64) = .init(0),
@@ -2416,6 +2418,7 @@ pub const ApiHttpServer = struct {
     pub fn deinit(self: *ApiHttpServer) void {
         self.restore_jobs_closing.store(true, .release);
         self.signalRestoreRetryWakeup();
+        self.signalRestoreBackoffWaiters();
         self.backup_maintenance_closing.store(true, .release);
         self.index_installation_closing.store(true, .release);
         if (self.cfg.backend_runtime) |runtime| {
@@ -2485,6 +2488,13 @@ pub const ApiHttpServer = struct {
     fn prepareRestoreLeadershipLocked(self: *ApiHttpServer, runtime: *db_mod.background_runtime.BackendRuntime, leadership_term: u64) !void {
         self.restore_leadership_term.store(0, .release);
         const previous_owner_id = self.restore_job_owner_id.swap(0, .acq_rel);
+        // Wake both classes of sleepers after publishing the ownership change.
+        // The earlier admission-pause signal keeps dispatch responsive; this
+        // second signal closes the race where a worker starts another wait just
+        // before the swap. Post-wakeup checks can now retire immediately, so
+        // closeOwner never inherits a multi-second retry deadline.
+        self.signalRestoreRetryWakeup();
+        self.signalRestoreBackoffWaiters();
         if (previous_owner_id != 0) runtime.durable_jobs.closeOwner(previous_owner_id);
         platform_sync.lockYielding(&self.restore_schedule_mutex);
         self.scheduled_restore_jobs.clearRetainingCapacity();
@@ -13224,6 +13234,71 @@ pub const ApiHttpServer = struct {
         if (self.sharedApiIo()) |io| self.restore_retry_wakeup_event.set(io);
     }
 
+    fn signalRestoreBackoffWaiters(self: *ApiHttpServer) void {
+        const io = self.sharedApiIo() orelse return;
+        platform_sync.lockYielding(&self.restore_schedule_mutex);
+        defer self.restore_schedule_mutex.unlock();
+        for (self.restore_backoff_waiters) |waiter| {
+            if (waiter) |event| event.set(io);
+        }
+    }
+
+    /// Register-before-check closes the owner-change wakeup race without a
+    /// polling loop. The fixed slots are bounded by restore admission, require
+    /// no outage-path allocation, and allow one broadcast to release every old
+    /// owner before `closeOwner` drains it.
+    fn waitForRestoreBackoff(
+        self: *ApiHttpServer,
+        event: *std.Io.Event,
+        owner_id: u64,
+        delay_ms: u64,
+    ) bool {
+        const io = self.sharedApiIo() orelse {
+            // Freestanding/manual runtimes do not expose shared I/O. Keep this
+            // compatibility path tightly bounded so ownership drain latency is
+            // never coupled to the five-second production backoff.
+            sleepNs(@min(delay_ms, restore_jobs.restore_retry_min_ms) * @as(u64, std.time.ns_per_ms));
+            return !self.restore_jobs_closing.load(.acquire) and
+                self.restore_job_owner_id.load(.acquire) == owner_id;
+        };
+        event.reset();
+
+        platform_sync.lockYielding(&self.restore_schedule_mutex);
+        if (self.restore_jobs_closing.load(.acquire) or
+            self.restore_job_owner_id.load(.acquire) != owner_id)
+        {
+            self.restore_schedule_mutex.unlock();
+            return false;
+        }
+        var registered_slot: ?usize = null;
+        for (&self.restore_backoff_waiters, 0..) |*slot, index| {
+            if (slot.* != null) continue;
+            slot.* = event;
+            registered_slot = index;
+            break;
+        }
+        self.restore_schedule_mutex.unlock();
+
+        const slot_index = registered_slot orelse {
+            // Admission guarantees at most one waiter per scheduled restore.
+            // Preserve correctness if that invariant is violated without
+            // spinning or extending leadership drain by the full backoff.
+            io.sleep(std.Io.Duration.fromMilliseconds(@intCast(@min(delay_ms, restore_jobs.restore_retry_min_ms))), .awake) catch return false;
+            return !self.restore_jobs_closing.load(.acquire) and
+                self.restore_job_owner_id.load(.acquire) == owner_id;
+        };
+        defer {
+            platform_sync.lockYielding(&self.restore_schedule_mutex);
+            std.debug.assert(self.restore_backoff_waiters[slot_index] == event);
+            self.restore_backoff_waiters[slot_index] = null;
+            self.restore_schedule_mutex.unlock();
+        }
+
+        _ = waitForRestoreBackoffEvent(io, event, delay_ms) catch return false;
+        return !self.restore_jobs_closing.load(.acquire) and
+            self.restore_job_owner_id.load(.acquire) == owner_id;
+    }
+
     fn unmarkScheduledRestoreJob(self: *ApiHttpServer, job_id: u64) void {
         platform_sync.lockYielding(&self.restore_schedule_mutex);
         _ = self.scheduled_restore_jobs.remove(job_id);
@@ -13235,13 +13310,19 @@ pub const ApiHttpServer = struct {
             try self.restore_job_store.requeuePending(job_id);
             return;
         }
-        const running_encoded = (try self.restore_job_store.begin(self.alloc, job_id)) orelse return;
-        defer self.alloc.free(running_encoded);
-        var parsed = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, running_encoded, .{ .ignore_unknown_fields = true });
+        const begin = (try self.restore_job_store.beginAttempt(
+            self.alloc,
+            job_id,
+            attempt_id_out,
+        )) orelse return;
+        defer self.alloc.free(begin.encoded);
+        if (begin.attempt_id == 0) return;
+        std.debug.assert(attempt_id_out.* == begin.attempt_id);
+        var parsed = try std.json.parseFromSlice(restore_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const state = parsed.value;
-        if (state.phase != .running) return;
-        attempt_id_out.* = state.attempt_id;
+        if (state.phase != .running or state.attempt_id != begin.attempt_id)
+            return error.CorruptRestoreJobStore;
         var location = backups_api.openBackupLocationWithOptions(self.alloc, state.location, .{
             .secret_store = self.cfg.secret_store,
             .node_config = self.cfg.node_config,
@@ -13249,6 +13330,7 @@ pub const ApiHttpServer = struct {
             .required_capability = "restore.read",
             .io = self.sharedApiIo(),
         }) catch |err| {
+            if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
             self.alloc.free(failed);
             return;
@@ -13262,7 +13344,7 @@ pub const ApiHttpServer = struct {
                 if (!restore_jobs.containsTableIndex(state.published_table_ranges orelse &.{}, 0)) {
                     if (!restore_jobs.tableAttempted(state, 0)) {
                         self.checkpointRestoreTableStarted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                            if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                            if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                             self.alloc.free(failed);
                             return;
@@ -13290,7 +13372,7 @@ pub const ApiHttpServer = struct {
                         error.RestoreDurabilityConfirmed => restored_via_metadata = false,
                         error.RestoreDurabilityPending => {
                             self.checkpointRestoreTableDurabilityPending(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |checkpoint_err| {
-                                if (checkpoint_err == error.RestoreJobFenced or metadata_authority.isRetryableError(checkpoint_err)) return error.RestoreJobFenced;
+                                if (restoreJobErrorIsFenced(checkpoint_err)) return error.RestoreJobFenced;
                                 const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(checkpoint_err));
                                 self.alloc.free(failed);
                                 return;
@@ -13302,13 +13384,14 @@ pub const ApiHttpServer = struct {
                             return;
                         },
                         else => {
+                            if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                             self.alloc.free(failed);
                             return;
                         },
                     };
                     self.checkpointRestoreTablePublished(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                        if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                        if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
@@ -13329,14 +13412,14 @@ pub const ApiHttpServer = struct {
                 }
                 if (restored_via_metadata and !self.cfg.deployment_mode.isStandalone()) {
                     self.waitForDistributedRestoreCompletion(table_name, state.location, state.backup_id, state.backup_id, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }) catch |err| {
-                        if (metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                        if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                         const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                         self.alloc.free(failed);
                         return;
                     };
                 }
                 self.checkpointRestoreTableCompleted(.{ .job_id = state.job_id, .attempt_id = state.attempt_id }, 0) catch |err| {
-                    if (err == error.RestoreJobFenced or metadata_authority.isRetryableError(err)) return error.RestoreJobFenced;
+                    if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
                     const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                     self.alloc.free(failed);
                     return;
@@ -13367,7 +13450,7 @@ pub const ApiHttpServer = struct {
                     try self.ensureRestoreRetryWakeup();
                     return;
                 }
-                if (err == error.NotLeader or err == error.RestoreJobFenced) {
+                if (restoreJobErrorIsFenced(err)) {
                     return error.RestoreJobFenced;
                 }
                 const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
@@ -13645,6 +13728,27 @@ fn waitForRestoreRetryDeadline(
     return false;
 }
 
+fn waitForRestoreBackoffEvent(
+    io: std.Io,
+    event: *std.Io.Event,
+    delay_ms: u64,
+) error{Canceled}!bool {
+    const bounded_delay_ms: i64 = @intCast(@min(
+        delay_ms,
+        @as(u64, @intCast(std.math.maxInt(i64))),
+    ));
+    event.waitTimeout(io, .{
+        .duration = .{
+            .raw = std.Io.Duration.fromMilliseconds(bounded_delay_ms),
+            .clock = .awake,
+        },
+    }) catch |err| switch (err) {
+        error.Timeout => return true,
+        error.Canceled => return error.Canceled,
+    };
+    return false;
+}
+
 test "restore retry deadline wakeup is interruptible without polling" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
@@ -13674,11 +13778,28 @@ test "restore retry deadline wakeup is interruptible without polling" {
     ));
 }
 
+test "restore ownership backoff is interruptible without polling" {
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var event: std.Io.Event = .unset;
+    const Wake = struct {
+        fn run(wake_io: std.Io, wake_event: *std.Io.Event) void {
+            wake_io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+            wake_event.set(wake_io);
+        }
+    };
+    var wake = try io.concurrent(Wake.run, .{ io, &event });
+    defer _ = wake.await(io);
+    try std.testing.expect(!try waitForRestoreBackoffEvent(io, &event, 60 * 1000));
+}
+
 const RestoreJobWork = struct {
     server: *ApiHttpServer,
     job_id: u64,
     owner_id: u64,
     attempt_id: u64 = 0,
+    retry_wakeup: std.Io.Event = .unset,
 
     fn run(ptr: *anyopaque) !void {
         const self: *RestoreJobWork = @ptrCast(@alignCast(ptr));
@@ -13698,9 +13819,11 @@ const RestoreJobWork = struct {
     }
 
     fn requeueExactAttempt(self: *RestoreJobWork, cause: anyerror) void {
-        var retry_delay_ms: u64 = 100;
-        while (!self.server.restore_jobs_closing.load(.acquire)) {
-            const requeued = self.server.restore_job_store.requeueRunningAttempt(
+        var retry_delay_ms = restore_jobs.restore_retry_min_ms;
+        while (!self.server.restore_jobs_closing.load(.acquire) and
+            self.server.restore_job_owner_id.load(.acquire) == self.owner_id)
+        {
+            const requeued = self.server.restore_job_store.recoverDispatchedAttempt(
                 self.server.alloc,
                 self.job_id,
                 self.attempt_id,
@@ -13716,8 +13839,12 @@ const RestoreJobWork = struct {
                     self.attempt_id,
                     @errorName(err),
                 });
-                sleepNs(retry_delay_ms * std.time.ns_per_ms);
-                retry_delay_ms = @min(retry_delay_ms * 2, 5_000);
+                if (!self.server.waitForRestoreBackoff(
+                    &self.retry_wakeup,
+                    self.owner_id,
+                    retry_delay_ms,
+                )) return;
+                retry_delay_ms = @min(retry_delay_ms * 2, restore_jobs.restore_retry_max_ms);
                 continue;
             };
             _ = requeued;
