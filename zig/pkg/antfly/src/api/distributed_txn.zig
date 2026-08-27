@@ -21,6 +21,7 @@ const http_common = @import("../raft/transport/http_common.zig");
 const raft_host = @import("../raft/host.zig");
 const http_client_mod = @import("http_client.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
+const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const table_catalog = @import("table_catalog.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
@@ -183,7 +184,15 @@ pub const RecoveryResolver = struct {
 
 pub const HostedParticipantWorker = struct {
     const default_pre_decision_timeout_ms: u32 = 20_000;
-    const default_pre_decision_attempt_timeout_ms: u32 = 5_000;
+    /// The data-Raft write path may spend its complete bounded window finding
+    /// a leader before it can return the authenticated `not-proposed` proof.
+    /// Keep the outer HTTP deadline strictly later so request admission,
+    /// response serialization, and transport cannot erase that proof at the
+    /// exact timeout boundary and turn a safe replica retry into an ambiguous
+    /// post-send failure.
+    const pre_decision_response_reserve_ms: u32 = 1_000;
+    const default_pre_decision_attempt_timeout_ms: u32 =
+        internal_batch_forwarding.max_remaining_ms + pre_decision_response_reserve_ms;
 
     catalog: table_catalog.CatalogSource,
     router: table_router.HostedGroupRouter,
@@ -727,6 +736,18 @@ test "distributed txn classifies local and transported visibility outcomes ident
     try std.testing.expect(!isPostCommitVisibilityError(error.GroupLeaderUnavailable));
     try std.testing.expect(isTerminalVisibilityRepair(error.EnrichmentWorkerFailed));
     try std.testing.expect(!isTerminalVisibilityRepair(error.CommitVisibilityNotSatisfied));
+}
+
+test "hosted participant attempt deadline preserves the server outcome window" {
+    try std.testing.expect(
+        HostedParticipantWorker.default_pre_decision_attempt_timeout_ms >
+            internal_batch_forwarding.max_remaining_ms,
+    );
+    try std.testing.expectEqual(
+        HostedParticipantWorker.pre_decision_response_reserve_ms,
+        HostedParticipantWorker.default_pre_decision_attempt_timeout_ms -
+            internal_batch_forwarding.max_remaining_ms,
+    );
 }
 
 test "hosted participant rediscovery retries only pre-decision leader unavailability" {
