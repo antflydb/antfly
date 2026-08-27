@@ -11411,6 +11411,11 @@ pub const DB = struct {
         if (try self.indexRepairIdForIndex(alloc, index_name)) |repair_id| {
             var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
             defer entry.deinit(alloc);
+            // Replaying the same unavailable artifact must not revoke the
+            // serviceability proof that created this shadow-repair intent.
+            // Only an unrelated pre-existing intent is promoted to the
+            // conservative blocking classification below.
+            if (entry.intent.trigger == .replay_artifact_unavailable) return;
             // A resumable shadow already owns recovery. Do not replace its
             // phase or candidate merely because the stale active generation
             // still cannot consume replay.
@@ -70671,6 +70676,67 @@ test "db replay blocks and preserves corrupt dense embedding artifacts" {
     try std.testing.expectEqual(@as(usize, 1), issues_after_repair.len);
     try std.testing.expectEqual(@as(u64, 1), issues_after_repair[0].attempts);
     try std.testing.expectEqualStrings("embedding_enrichment_unavailable", issues_after_repair[0].last_error);
+}
+
+test "db repeated replay preserves nonblocking dense artifact repair intent" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
+
+        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try db.core.store.put(artifact_key, "bad-artifact");
+        _ = try appendDerivedBatchRecord(&db, .{
+            .dense_embeddings = &.{.{
+                .index_name = "dv_v1",
+                .doc_key = "doc:a",
+                .artifact_key = artifact_key,
+                .vector = &[_]f32{ 1, 0 },
+            }},
+        });
+    }
+
+    for (0..2) |_| {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reopened.close();
+
+        const repair_id = (try reopened.indexRepairIdForIndex(alloc, "dv_v1")) orelse
+            return error.TestUnexpectedResult;
+        var replay_repair = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+        defer replay_repair.deinit(alloc);
+        try std.testing.expectEqual(
+            index_repair_state.Trigger.replay_artifact_unavailable,
+            replay_repair.intent.trigger,
+        );
+        try std.testing.expect(!reopened.core.index_manager.repairUnavailable("dv_v1"));
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "dv_v1",
+            .dense = .{ .vector = &[_]f32{ 1, 0 }, .k = 1 },
+            .limit = 1,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+    }
 }
 
 test "db replay records wrong-dimension dense embedding artifact as repair debt" {

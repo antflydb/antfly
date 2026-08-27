@@ -6800,6 +6800,7 @@ pub fn build(b: *std.Build) void {
             "db replay skips a missing dense artifact after its source document was deleted",
             "db replay blocks dense embedding writes when artifact payload is missing",
             "db replay blocks and preserves corrupt dense embedding artifacts",
+            "db repeated replay preserves nonblocking dense artifact repair intent",
             "db dense artifact surplus uses quarantined generation replacement",
             "db dense artifact planner does not let stale status override authoritative counter",
             "db dense artifact counter bootstrap combines snapshot with concurrent write delta",
