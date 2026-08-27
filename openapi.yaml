@@ -3851,6 +3851,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/IndexMutationServiceUnavailable'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -4198,7 +4200,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/IndexMutationServiceUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5385,7 +5387,7 @@ paths:
         '429':
           $ref: '#/components/responses/StorageResourceExhausted'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/IndexMutationServiceUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -7939,6 +7941,27 @@ components:
           type: boolean
           enum:
             - false
+    IndexMutationServiceUnavailableError:
+      type: object
+      additionalProperties: false
+      description: A retryable index mutation failure, including a distributed artifact-source protocol
+        fence or a temporarily unavailable model probe.
+      required:
+        - error
+        - message
+        - retryable
+      properties:
+        error:
+          type: string
+          enum:
+            - index_capability_upgrade_pending
+            - index_probe_unavailable
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - true
     MetadataCapabilityUnavailableError:
       type: object
       additionalProperties: false
@@ -8480,13 +8503,24 @@ components:
       additionalProperties: false
       required:
         - artifact_sources
+        - artifact_sources_state
       description: Deployment-level index capabilities clients can inspect before submitting index mutations.
       properties:
         artifact_sources:
           type: boolean
-          description: Whether full-text, embedding, and graph indexes may consume generated artifact
-            streams through either single-source or multi-source request forms. False for serverless deployments
-            and during distributed rolling upgrades until every live data store reports protocol support.
+          description: Whether full-text, embedding, and graph indexes may currently consume generated
+            artifact streams through either single-source or multi-source request forms. Equivalent to
+            artifact_sources_state=available.
+        artifact_sources_state:
+          $ref: '#/components/schemas/ArtifactSourcesCapabilityState'
+    ArtifactSourcesCapabilityState:
+      type: string
+      enum:
+        - available
+        - upgrade_pending
+        - unsupported
+      description: Whether artifact-backed index mutations are accepted now, temporarily fenced during
+        a distributed rolling upgrade, or permanently unsupported by this deployment.
     ClusterStatus:
       type: object
       required:
@@ -19554,6 +19588,30 @@ components:
         - ready
         - failed
       description: Authoritative query-readiness and completeness state for the desired index incarnation.
+    IndexReadinessReason:
+      type: string
+      enum:
+        - load_failure
+        - enrichment_failure
+        - runtime_unavailable
+        - shard_observation_incomplete
+        - incarnation_pending
+        - source_publication
+        - repair
+        - backfill
+        - coverage
+        - replay
+        - publication
+      description: Stable machine-readable reason why an index is pending, partial, or failed.
+    IndexSourceReadinessReason:
+      type: string
+      enum:
+        - index_failed
+        - runtime_unavailable
+        - shard_observation_incomplete
+        - source_observation_incomplete
+        - publication
+      description: Stable machine-readable reason why an artifact source is pending or failed.
     IndexSourceReadinessStatus:
       type: object
       additionalProperties: false
@@ -19574,13 +19632,13 @@ components:
             - failed
         complete:
           type: boolean
-          description: Whether this source is published through its captured target revision on every
-            expected shard.
+          description: Whether this source is fully observed and published on every expected shard.
         pending_reasons:
           type: array
           items:
-            type: string
-          description: Stable, machine-readable blockers for this source. Empty when state is ready.
+            $ref: '#/components/schemas/IndexSourceReadinessReason'
+          description: Stable, machine-readable blockers or failure reasons for this source. Empty when
+            state is ready.
     IndexReadinessStatus:
       type: object
       additionalProperties: false
@@ -19606,13 +19664,12 @@ components:
         pending_reasons:
           type: array
           items:
-            type: string
-          description: Stable, machine-readable blockers. Empty when state is ready.
+            $ref: '#/components/schemas/IndexReadinessReason'
+          description: Stable, machine-readable blockers or failure reasons. Empty when state is ready.
         sources:
           type: array
           description: Operational readiness for each configured artifact stream. Present only for artifact-backed
-            indexes, in configuration order. These are captured and published watermarks, not a restatement
-            of index configuration.
+            indexes, in configuration order.
           items:
             $ref: '#/components/schemas/IndexSourceReadinessStatus'
     IndexRepairStatus:
@@ -26322,6 +26379,20 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    IndexMutationServiceUnavailable:
+      description: Index validation is temporarily unavailable or a distributed rolling upgrade has not
+        yet converged.
+      headers:
+        Retry-After:
+          required: false
+          description: Minimum number of seconds clients should wait when the failure is retryable.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/IndexMutationServiceUnavailableError'
     BackupMetadataUnavailable:
       description: Backup could not establish the required metadata authority before starting side effects.
       headers:

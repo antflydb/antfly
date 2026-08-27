@@ -185,6 +185,8 @@ pub const TableApi = struct {
         RestoreDurabilityConfirmed,
         BackupIntegrityFailure,
         RestoreDestinationReauthorizationRequired,
+        UnsupportedArtifactIndexSources,
+        ArtifactIndexSourcesTemporarilyUnavailable,
         InvalidBackupRequest,
         InternalFailure,
     };
@@ -1256,6 +1258,17 @@ pub fn handleTableRestore(
             .status = 409,
             .body = try alloc.dupe(u8, "restore was queued before destination authorization was recorded; resubmit it to reauthorize CDC and graph destinations"),
         },
+        error.UnsupportedArtifactIndexSources => return .{
+            .status = 400,
+            .body = try alloc.dupe(u8, "{\"error\":\"unsupported_index_capability\",\"message\":\"artifact-backed index sources are not supported by this deployment\",\"retryable\":false}"),
+            .json = true,
+        },
+        error.ArtifactIndexSourcesTemporarilyUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"error\":\"index_capability_upgrade_pending\",\"message\":\"artifact-backed index sources are temporarily unavailable until every live table-serving store supports them\",\"retryable\":true}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.InvalidBackupRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
@@ -1351,8 +1364,18 @@ pub fn handleTableCreateIndex(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "{\"error\":\"method_not_allowed\",\"message\":\"method not allowed\",\"retryable\":false}"), .json = true },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"invalid_index_request\",\"message\":\"unsupported index configuration\",\"retryable\":false}"), .json = true },
         error.UnsupportedArtifactIndexSources => return .{ .status = 400, .body = try alloc.dupe(u8, "{\"error\":\"unsupported_index_capability\",\"message\":\"artifact-backed index sources are not supported by this deployment\",\"retryable\":false}"), .json = true },
-        error.ArtifactIndexSourcesTemporarilyUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "{\"error\":\"index_capability_upgrade_pending\",\"message\":\"artifact-backed index sources are temporarily unavailable until every live data store supports them\",\"retryable\":true}"), .json = true },
-        error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"index validation probe unavailable\",\"retryable\":true}"), .json = true },
+        error.ArtifactIndexSourcesTemporarilyUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"error\":\"index_capability_upgrade_pending\",\"message\":\"artifact-backed index sources are temporarily unavailable until every live table-serving store supports them\",\"retryable\":true}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
+        error.ProbeUnavailable => return .{
+            .status = 503,
+            .body = try alloc.dupe(u8, "{\"error\":\"index_probe_unavailable\",\"message\":\"index validation probe unavailable\",\"retryable\":true}"),
+            .json = true,
+            .retry_after_seconds = 1,
+        },
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"model_not_found\",\"message\":\"model not found\",\"retryable\":false}"), .json = true },
         error.Backpressured => return .{
             .status = 429,

@@ -7,6 +7,7 @@ import httpx
 from ... import errors
 from ...client import AuthenticatedClient, Client
 from ...models.error import Error
+from ...models.index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
 from ...models.restore_job import RestoreJob
 from ...models.restore_request import RestoreRequest
 from ...types import UNSET, Response, Unset
@@ -37,7 +38,9 @@ def _get_kwargs(
     return _kwargs
 
 
-def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Error | RestoreJob | None:
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Error | IndexMutationServiceUnavailableError | RestoreJob | None:
     if response.status_code == 202:
         response_202 = RestoreJob.from_dict(response.json())
 
@@ -64,7 +67,7 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return response_500
 
     if response.status_code == 503:
-        response_503 = Error.from_dict(response.json())
+        response_503 = IndexMutationServiceUnavailableError.from_dict(response.json())
 
         return response_503
 
@@ -74,7 +77,9 @@ def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Res
         return None
 
 
-def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Error | RestoreJob]:
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Error | IndexMutationServiceUnavailableError | RestoreJob]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -89,7 +94,7 @@ def sync_detailed(
     client: AuthenticatedClient,
     body: RestoreRequest,
     idempotency_key: str | Unset = UNSET,
-) -> Response[Error | RestoreJob]:
+) -> Response[Error | IndexMutationServiceUnavailableError | RestoreJob]:
     """Restore a table from backup
 
     Args:
@@ -102,7 +107,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | RestoreJob]
+        Response[Error | IndexMutationServiceUnavailableError | RestoreJob]
     """
 
     kwargs = _get_kwargs(
@@ -124,7 +129,7 @@ def sync(
     client: AuthenticatedClient,
     body: RestoreRequest,
     idempotency_key: str | Unset = UNSET,
-) -> Error | RestoreJob | None:
+) -> Error | IndexMutationServiceUnavailableError | RestoreJob | None:
     """Restore a table from backup
 
     Args:
@@ -137,7 +142,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | RestoreJob
+        Error | IndexMutationServiceUnavailableError | RestoreJob
     """
 
     return sync_detailed(
@@ -154,7 +159,7 @@ async def asyncio_detailed(
     client: AuthenticatedClient,
     body: RestoreRequest,
     idempotency_key: str | Unset = UNSET,
-) -> Response[Error | RestoreJob]:
+) -> Response[Error | IndexMutationServiceUnavailableError | RestoreJob]:
     """Restore a table from backup
 
     Args:
@@ -167,7 +172,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | RestoreJob]
+        Response[Error | IndexMutationServiceUnavailableError | RestoreJob]
     """
 
     kwargs = _get_kwargs(
@@ -187,7 +192,7 @@ async def asyncio(
     client: AuthenticatedClient,
     body: RestoreRequest,
     idempotency_key: str | Unset = UNSET,
-) -> Error | RestoreJob | None:
+) -> Error | IndexMutationServiceUnavailableError | RestoreJob | None:
     """Restore a table from backup
 
     Args:
@@ -200,7 +205,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | RestoreJob
+        Error | IndexMutationServiceUnavailableError | RestoreJob
     """
 
     return (

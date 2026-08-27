@@ -556,6 +556,35 @@ pub const ArtifactRepairReason = enum {
     }
 };
 
+/// Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
+pub const ArtifactSourcesCapabilityState = enum {
+    available,
+    upgrade_pending,
+    unsupported,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .available => "available",
+            .upgrade_pending => "upgrade_pending",
+            .unsupported => "unsupported",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "available", .available },
+            .{ "upgrade_pending", .upgrade_pending },
+            .{ "unsupported", .unsupported },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const AuthSubject = struct {
     /// Casbin subject name.
     subject: []const u8,
@@ -1694,10 +1723,18 @@ pub const IncompleteDetails = struct {
     reason: []const u8,
 };
 
+/// A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
+pub const IndexMutationServiceUnavailableError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 /// Deployment-level index capabilities clients can inspect before submitting index mutations.
 pub const IndexRuntimeCapabilities = struct {
-    /// Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments and during distributed rolling upgrades until every live data store reports protocol support.
+    /// Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available.
     artifact_sources: bool,
+    artifact_sources_state: ArtifactSourcesCapabilityState,
 };
 
 pub const IndexStatus = struct {

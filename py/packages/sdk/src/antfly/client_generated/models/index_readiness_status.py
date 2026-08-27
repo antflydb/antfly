@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.index_readiness_reason import IndexReadinessReason
 from ..models.index_readiness_state import IndexReadinessState
 from ..types import UNSET, Unset
 
@@ -24,18 +25,18 @@ class IndexReadinessStatus:
         queryable (bool): Whether the published generation can safely answer queries.
         complete (bool): Whether the desired incarnation has complete coverage and publication according to its
             configured policies.
-        pending_reasons (list[str]): Stable, machine-readable blockers. Empty when state is ready.
+        pending_reasons (list[IndexReadinessReason]): Stable, machine-readable blockers or failure reasons. Empty when
+            state is ready.
         incarnation (str | Unset): Opaque identity for the desired index incarnation. Clients may compare it for
             equality but must not interpret its contents.
         sources (list[IndexSourceReadinessStatus] | Unset): Operational readiness for each configured artifact stream.
-            Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks,
-            not a restatement of index configuration.
+            Present only for artifact-backed indexes, in configuration order.
     """
 
     state: IndexReadinessState
     queryable: bool
     complete: bool
-    pending_reasons: list[str]
+    pending_reasons: list[IndexReadinessReason]
     incarnation: str | Unset = UNSET
     sources: list[IndexSourceReadinessStatus] | Unset = UNSET
 
@@ -46,7 +47,10 @@ class IndexReadinessStatus:
 
         complete = self.complete
 
-        pending_reasons = self.pending_reasons
+        pending_reasons = []
+        for pending_reasons_item_data in self.pending_reasons:
+            pending_reasons_item = pending_reasons_item_data.value
+            pending_reasons.append(pending_reasons_item)
 
         incarnation = self.incarnation
 
@@ -85,7 +89,12 @@ class IndexReadinessStatus:
 
         complete = d.pop("complete")
 
-        pending_reasons = cast(list[str], d.pop("pending_reasons"))
+        pending_reasons = []
+        _pending_reasons = d.pop("pending_reasons")
+        for pending_reasons_item_data in _pending_reasons:
+            pending_reasons_item = IndexReadinessReason(pending_reasons_item_data)
+
+            pending_reasons.append(pending_reasons_item)
 
         incarnation = d.pop("incarnation", UNSET)
 

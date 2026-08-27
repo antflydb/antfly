@@ -47,7 +47,10 @@ function generatedSortProfileDeclaration(): string {
 describe("Antfly Query Type Integration", () => {
   describe("cluster status capabilities", () => {
     it("exports the typed artifact-source capability contract", () => {
-      const capabilities: IndexRuntimeCapabilities = { artifact_sources: true };
+      const capabilities: IndexRuntimeCapabilities = {
+        artifact_sources: true,
+        artifact_sources_state: "available",
+      };
       const status: ClusterStatus = {
         health: "healthy",
         deployment_mode: "standalone",
@@ -61,6 +64,7 @@ describe("Antfly Query Type Integration", () => {
       };
 
       expect(status.index_capabilities?.artifact_sources).toBe(true);
+      expect(status.index_capabilities?.artifact_sources_state).toBe("available");
       expect(created.embedding_name).toBe("document_dense_v1");
     });
   });

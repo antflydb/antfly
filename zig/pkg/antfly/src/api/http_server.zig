@@ -2276,9 +2276,9 @@ pub const ApiHttpServer = struct {
     fn artifactSourcesSupportedByStores(stores: []const metadata_table_manager.StoreRecord) bool {
         var saw_live_data_store = false;
         for (stores) |store| {
-            if (!store.live or !std.mem.eql(u8, store.role, "data")) continue;
+            if (!store.live or !metadata_table_manager.storeServesTableData(store.role)) continue;
             saw_live_data_store = true;
-            if (!metadata_table_manager.artifactSourcesProtocolValid(
+            if (!metadata_table_manager.artifactSourcesProtocolSupported(
                 store.reporter_incarnation,
                 store.artifact_sources_protocol_version,
             )) return false;
@@ -2290,15 +2290,47 @@ pub const ApiHttpServer = struct {
         return artifactSourcesSupportedByStores(snapshot.stores);
     }
 
-    fn artifactSourcesSupported(
+    fn artifactSourcesCapabilityState(
         self: *const ApiHttpServer,
         snapshot: ?*const metadata_api.AdminSnapshot,
-    ) bool {
+    ) cluster.ArtifactSourcesCapabilityState {
         return switch (self.cfg.deployment_mode) {
-            .serverless => false,
-            .distributed => if (snapshot) |value| artifactSourcesSupportedBySnapshot(value) else false,
-            else => true,
+            .serverless => .unsupported,
+            .distributed => if (snapshot) |value|
+                if (artifactSourcesSupportedBySnapshot(value)) .available else .upgrade_pending
+            else
+                .upgrade_pending,
+            else => .available,
         };
+    }
+
+    const ArtifactSourcesAdmissionError = error{
+        UnsupportedArtifactIndexSources,
+        ArtifactIndexSourcesTemporarilyUnavailable,
+        Canceled,
+        DeadlineExceeded,
+    };
+
+    /// Enforce the deployment-wide artifact-source protocol fence before any
+    /// catalog mutation can publish a definition that older stores cannot run.
+    fn admitArtifactSources(
+        self: *ApiHttpServer,
+        request: api_operation.RequestContext,
+        uses_artifact_sources: bool,
+    ) ArtifactSourcesAdmissionError!void {
+        if (!uses_artifact_sources) return;
+        if (self.cfg.deployment_mode == .serverless)
+            return error.UnsupportedArtifactIndexSources;
+        if (self.cfg.deployment_mode != .distributed) return;
+
+        var snapshot = self.source.linearizableSnapshot(request) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.DeadlineExceeded => return error.DeadlineExceeded,
+            else => return error.ArtifactIndexSourcesTemporarilyUnavailable,
+        } orelse return error.ArtifactIndexSourcesTemporarilyUnavailable;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        if (!artifactSourcesSupportedBySnapshot(&snapshot))
+            return error.ArtifactIndexSourcesTemporarilyUnavailable;
     }
 
     fn loadClusterStatusWithSnapshot(
@@ -2311,7 +2343,8 @@ pub const ApiHttpServer = struct {
         errdefer status.deinit(alloc);
         status.auth_enabled = self.cfg.auth_enabled;
         status.deployment_mode = self.cfg.deployment_mode;
-        status.index_capabilities.artifact_sources = self.artifactSourcesSupported(snapshot);
+        status.index_capabilities.artifact_sources_state = self.artifactSourcesCapabilityState(snapshot);
+        status.index_capabilities.artifact_sources = status.index_capabilities.artifact_sources_state == .available;
         status.storage = self.currentStorageRuntimeStatus();
         if (self.cfg.secret_store) |secret_store| {
             _ = secret_store.refreshIfChanged() catch |err| {
@@ -9704,6 +9737,16 @@ pub const ApiHttpServer = struct {
                 if (backups_api.isArtifactIntegrityError(err)) return error.BackupIntegrityFailure;
                 return error.InvalidBackupRequest;
             };
+            const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
+                self.alloc,
+                manifest.indexes_json,
+            ) catch return error.InvalidBackupRequest;
+            self.admitArtifactSources(request, uses_artifact_sources) catch |err| return switch (err) {
+                error.UnsupportedArtifactIndexSources => error.UnsupportedArtifactIndexSources,
+                error.ArtifactIndexSourcesTemporarilyUnavailable => error.ArtifactIndexSourcesTemporarilyUnavailable,
+                error.Canceled => error.Canceled,
+                error.DeadlineExceeded => error.DeadlineExceeded,
+            };
             self.admitExternalRestoreArtifactIntegrity(
                 self.sharedApiIo() orelse return error.InternalFailure,
                 location,
@@ -10292,23 +10335,7 @@ pub const ApiHttpServer = struct {
 
         const uses_artifact_sources = indexes_api.indexConfigUsesArtifactSources(alloc, normalized_index_json) catch
             return error.InvalidIndexRequest;
-        if (uses_artifact_sources) {
-            if (self.cfg.deployment_mode == .serverless) return error.UnsupportedArtifactIndexSources;
-            if (self.cfg.deployment_mode == .distributed) {
-                var capability_snapshot = self.source.linearizableSnapshot(request) catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    error.DeadlineExceeded => return error.DeadlineExceeded,
-                    else => return error.ArtifactIndexSourcesTemporarilyUnavailable,
-                };
-                if (capability_snapshot) |*snapshot| {
-                    defer self.source.freeAdminSnapshot(snapshot);
-                    if (!self.artifactSourcesSupported(snapshot))
-                        return error.ArtifactIndexSourcesTemporarilyUnavailable;
-                } else {
-                    return error.ArtifactIndexSourcesTemporarilyUnavailable;
-                }
-            }
-        }
+        try self.admitArtifactSources(request, uses_artifact_sources);
 
         const destination_principal = if (request.destination_authorization_principal.len > 0)
             request.destination_authorization_principal
@@ -11378,6 +11405,16 @@ pub const ApiHttpServer = struct {
                     statuses[i].@"error" = "table backup manifest does not match table";
                     continue;
                 }
+                const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
+                    op_alloc,
+                    table_manifest.indexes_json,
+                ) catch return error.InvalidRequest;
+                self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
+                    error.UnsupportedArtifactIndexSources => error.UnsupportedArtifactIndexSources,
+                    error.ArtifactIndexSourcesTemporarilyUnavailable => error.ArtifactIndexSourcesTemporarilyUnavailable,
+                    error.Canceled => error.Cancelled,
+                    error.DeadlineExceeded => error.ArtifactIndexSourcesTemporarilyUnavailable,
+                };
                 self.admitExternalRestoreArtifactIntegrity(
                     restore_io,
                     location,
@@ -11525,6 +11562,16 @@ pub const ApiHttpServer = struct {
                 artifact_backup_id,
             ) catch return error.InvalidRequest;
             defer authorized_manifest.deinit(op_alloc);
+            const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
+                op_alloc,
+                authorized_manifest.indexes_json,
+            ) catch return error.InvalidRequest;
+            self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
+                error.UnsupportedArtifactIndexSources => error.UnsupportedArtifactIndexSources,
+                error.ArtifactIndexSourcesTemporarilyUnavailable => error.ArtifactIndexSourcesTemporarilyUnavailable,
+                error.Canceled => error.Cancelled,
+                error.DeadlineExceeded => error.ArtifactIndexSourcesTemporarilyUnavailable,
+            };
             const destination_authorization_fingerprint = stored_destination_authorization.destinationConfigFingerprintAlloc(
                 op_alloc,
                 authorized_manifest.replication_sources_json,
@@ -11871,7 +11918,7 @@ pub const ApiHttpServer = struct {
             },
         ) catch |err| return switch (err) {
             error.ModelNotFound => try contextualJsonErrorResponse(self.alloc, 404, "model not found"),
-            error.EmbeddingProbeUnavailable => try contextual_operations.textAlloc(self.alloc, 503, "table index validation probe unavailable"),
+            error.EmbeddingProbeUnavailable => try contextualIndexProbeUnavailableResponse(self.alloc),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
         };
@@ -11879,6 +11926,16 @@ pub const ApiHttpServer = struct {
         request.indexes_json = normalized_indexes_json;
         tables_api.validatePublicAlgebraicIndexesJson(self.alloc, request.indexes_json orelse tables_api.default_indexes_json) catch
             return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
+
+        const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
+            self.alloc,
+            request.indexes_json orelse tables_api.default_indexes_json,
+        ) catch return try contextual_operations.textAlloc(self.alloc, 400, "unsupported table index configuration");
+        self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
+            error.UnsupportedArtifactIndexSources => try contextualUnsupportedArtifactSourcesResponse(self.alloc),
+            error.ArtifactIndexSourcesTemporarilyUnavailable => try contextualArtifactSourcesUpgradePendingResponse(self.alloc),
+            error.Canceled, error.DeadlineExceeded => return err,
+        };
 
         const destinations_allowed = (replicationDestinationsAllowedForIdentity(
             self.alloc,
@@ -13061,6 +13118,15 @@ pub const ApiHttpServer = struct {
             parsed.value.backup_id,
         ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup manifest");
         defer manifest.deinit(self.alloc);
+        const uses_artifact_sources = indexes_api.indexesConfigUsesArtifactSources(
+            self.alloc,
+            manifest.indexes_json,
+        ) catch return try contextualJsonErrorResponse(self.alloc, 400, "invalid backup manifest");
+        self.admitArtifactSources(.{}, uses_artifact_sources) catch |err| return switch (err) {
+            error.UnsupportedArtifactIndexSources => try contextualUnsupportedArtifactSourcesResponse(self.alloc),
+            error.ArtifactIndexSourcesTemporarilyUnavailable => try contextualArtifactSourcesUpgradePendingResponse(self.alloc),
+            error.Canceled, error.DeadlineExceeded => return err,
+        };
         const destinations_allowed = (replicationDestinationsAllowedForIdentity(
             self.alloc,
             authenticated_identity,
@@ -14059,6 +14125,7 @@ const RestoreJobWork = struct {
 fn restoreJobErrorIsFenced(err: anyerror) bool {
     return err == error.RestoreJobFenced or
         err == error.RestoreJobPersistenceUnavailable or
+        err == error.ArtifactIndexSourcesTemporarilyUnavailable or
         metadata_authority.isRetryableError(err);
 }
 
@@ -14070,6 +14137,7 @@ test "restore job ownership failures remain retryable" {
     try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobFenced));
     try std.testing.expect(restoreJobErrorIsFenced(error.RestoreJobPersistenceUnavailable));
     try std.testing.expect(restoreJobErrorIsFenced(error.NotLeader));
+    try std.testing.expect(restoreJobErrorIsFenced(error.ArtifactIndexSourcesTemporarilyUnavailable));
     try std.testing.expect(!restoreJobErrorIsFenced(error.InvalidArguments));
     try std.testing.expect(restoreJobFailureRequiresRecovery(false, error.OutOfMemory));
     try std.testing.expect(!restoreJobFailureRequiresRecovery(true, error.OutOfMemory));
@@ -15130,6 +15198,42 @@ fn contextualJsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: [
     return try contextualJsonResponse(alloc, status, .{ .@"error" = message });
 }
 
+fn contextualUnsupportedArtifactSourcesResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    return try contextualJsonResponse(alloc, 400, .{
+        .@"error" = "unsupported_index_capability",
+        .message = "artifact-backed index sources are not supported by this deployment",
+        .retryable = false,
+    });
+}
+
+fn contextualArtifactSourcesUpgradePendingResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonResponse(alloc, 503, .{
+        .@"error" = "index_capability_upgrade_pending",
+        .message = "artifact-backed index sources are temporarily unavailable until every live table-serving store supports them",
+        .retryable = true,
+    });
+    errdefer response.deinit(alloc);
+    var retry_after = try ownedContextualHeader(alloc, "Retry-After", "1");
+    errdefer retry_after.deinit(alloc);
+    response.headers = try alloc.alloc(contextual_operations.Header, 1);
+    response.headers[0] = retry_after;
+    return response;
+}
+
+fn contextualIndexProbeUnavailableResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonResponse(alloc, 503, .{
+        .@"error" = "index_probe_unavailable",
+        .message = "index validation probe unavailable",
+        .retryable = true,
+    });
+    errdefer response.deinit(alloc);
+    var retry_after = try ownedContextualHeader(alloc, "Retry-After", "1");
+    errdefer retry_after.deinit(alloc);
+    response.headers = try alloc.alloc(contextual_operations.Header, 1);
+    response.headers[0] = retry_after;
+    return response;
+}
+
 fn contextualPublicFilterQueryErrorResponseForBody(
     alloc: std.mem.Allocator,
     body: []const u8,
@@ -15271,6 +15375,11 @@ test "artifact source capability waits for every live data store reporter" {
 
     stores[1].artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version;
     try std.testing.expect(ApiHttpServer.artifactSourcesSupportedByStores(&stores));
+
+    stores[1].role = "hot";
+    try std.testing.expect(ApiHttpServer.artifactSourcesSupportedByStores(&stores));
+    stores[1].artifact_sources_protocol_version = 0;
+    try std.testing.expect(!ApiHttpServer.artifactSourcesSupportedByStores(&stores));
 
     stores[1].live = false;
     stores[0].artifact_sources_protocol_version = 0;

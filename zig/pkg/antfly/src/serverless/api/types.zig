@@ -482,6 +482,13 @@ pub const RuntimeDeploymentMode = enum {
 
 pub const IndexRuntimeCapabilities = struct {
     artifact_sources: bool = false,
+    artifact_sources_state: ArtifactSourcesCapabilityState = .unsupported,
+};
+
+pub const ArtifactSourcesCapabilityState = enum {
+    available,
+    upgrade_pending,
+    unsupported,
 };
 
 pub const HealthResult = struct {
@@ -722,6 +729,7 @@ test "runtime status defaults maintenance features to enabled" {
     try std.testing.expectEqual(RuntimeHealth.healthy, status.health);
     try std.testing.expectEqual(RuntimeDeploymentMode.serverless, status.deployment_mode);
     try std.testing.expect(!status.index_capabilities.artifact_sources);
+    try std.testing.expectEqual(ArtifactSourcesCapabilityState.unsupported, status.index_capabilities.artifact_sources_state);
 }
 
 test "metrics result deinit handles namespace array" {

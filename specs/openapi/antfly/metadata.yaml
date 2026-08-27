@@ -1494,6 +1494,20 @@ components:
         retryable:
           type: boolean
           enum: [false]
+    IndexMutationServiceUnavailableError:
+      type: object
+      additionalProperties: false
+      description: A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
+      required: [error, message, retryable]
+      properties:
+        error:
+          type: string
+          enum: [index_capability_upgrade_pending, index_probe_unavailable]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum: [true]
     MetadataCapabilityUnavailableError:
       type: object
       additionalProperties: false
@@ -1897,12 +1911,18 @@ components:
     IndexRuntimeCapabilities:
       type: object
       additionalProperties: false
-      required: [artifact_sources]
+      required: [artifact_sources, artifact_sources_state]
       description: Deployment-level index capabilities clients can inspect before submitting index mutations.
       properties:
         artifact_sources:
           type: boolean
-          description: Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments and during distributed rolling upgrades until every live data store reports protocol support.
+          description: Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available.
+        artifact_sources_state:
+          $ref: "#/components/schemas/ArtifactSourcesCapabilityState"
+    ArtifactSourcesCapabilityState:
+      type: string
+      enum: [available, upgrade_pending, unsupported]
+      description: Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
     ClusterStatus:
       type: object
       required:
@@ -8737,6 +8757,19 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    IndexMutationServiceUnavailable:
+      description: Index validation is temporarily unavailable or a distributed rolling upgrade has not yet converged.
+      headers:
+        Retry-After:
+          required: false
+          description: Minimum number of seconds clients should wait when the failure is retryable.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/IndexMutationServiceUnavailableError"
     BackupMetadataUnavailable:
       description: Backup could not establish the required metadata authority before starting side effects.
       headers:
@@ -10235,6 +10268,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
     delete:
       summary: Drop a table
       tags:
@@ -10532,7 +10567,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/destination-authorization:
@@ -11549,7 +11584,7 @@ paths:
         "429":
           $ref: "#/components/responses/StorageResourceExhausted"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/IndexMutationServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
     delete:

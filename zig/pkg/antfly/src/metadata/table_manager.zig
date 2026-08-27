@@ -674,6 +674,32 @@ pub fn artifactSourcesProtocolValid(reporter_incarnation: u64, protocol_version:
         (protocol_version == 0 or reporter_incarnation != 0);
 }
 
+/// Capability admission is intentionally stricter than wire validation.
+/// Version zero is a valid rolling-upgrade record, but it is never proof that
+/// the store can materialize the generalized artifact-source index contract.
+pub fn artifactSourcesProtocolSupported(reporter_incarnation: u64, protocol_version: u16) bool {
+    return reporter_incarnation != 0 and
+        protocol_version >= artifact_sources_protocol_version and
+        artifactSourcesProtocolValid(reporter_incarnation, protocol_version);
+}
+
+/// Store roles are placement classes, not process kinds. Data runtimes may use
+/// custom roles such as `hot` or `cold`; only the metadata-only role is known
+/// not to host table shards.
+pub fn storeServesTableData(role: []const u8) bool {
+    return !std.mem.eql(u8, role, "metadata");
+}
+
+test "artifact source protocol support fails closed and includes custom placement roles" {
+    try std.testing.expect(!artifactSourcesProtocolSupported(0, artifact_sources_protocol_version));
+    try std.testing.expect(!artifactSourcesProtocolSupported(7, 0));
+    try std.testing.expect(artifactSourcesProtocolSupported(7, artifact_sources_protocol_version));
+    try std.testing.expect(storeServesTableData("data"));
+    try std.testing.expect(storeServesTableData("hot"));
+    try std.testing.expect(storeServesTableData("cold"));
+    try std.testing.expect(!storeServesTableData("metadata"));
+}
+
 pub const RuntimeEnrichmentStatusReport = struct {
     enabled: bool = false,
     lease_owned: bool = true,

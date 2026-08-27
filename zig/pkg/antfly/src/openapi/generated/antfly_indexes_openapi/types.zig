@@ -1793,6 +1793,59 @@ pub const IndexPublicationPolicy = enum {
     }
 };
 
+/// Stable machine-readable reason why an index is pending, partial, or failed.
+pub const IndexReadinessReason = enum {
+    load_failure,
+    enrichment_failure,
+    runtime_unavailable,
+    shard_observation_incomplete,
+    incarnation_pending,
+    source_publication,
+    repair,
+    backfill,
+    coverage,
+    replay,
+    publication,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .load_failure => "load_failure",
+            .enrichment_failure => "enrichment_failure",
+            .runtime_unavailable => "runtime_unavailable",
+            .shard_observation_incomplete => "shard_observation_incomplete",
+            .incarnation_pending => "incarnation_pending",
+            .source_publication => "source_publication",
+            .repair => "repair",
+            .backfill => "backfill",
+            .coverage => "coverage",
+            .replay => "replay",
+            .publication => "publication",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "load_failure", .load_failure },
+            .{ "enrichment_failure", .enrichment_failure },
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "shard_observation_incomplete", .shard_observation_incomplete },
+            .{ "incarnation_pending", .incarnation_pending },
+            .{ "source_publication", .source_publication },
+            .{ "repair", .repair },
+            .{ "backfill", .backfill },
+            .{ "coverage", .coverage },
+            .{ "replay", .replay },
+            .{ "publication", .publication },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Authoritative query-readiness and completeness state for the desired index incarnation.
 pub const IndexReadinessState = enum {
     pending,
@@ -1833,9 +1886,9 @@ pub const IndexReadinessStatus = struct {
     complete: bool,
     /// Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
-    /// Stable, machine-readable blockers. Empty when state is ready.
-    pending_reasons: []const []const u8,
-    /// Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks, not a restatement of index configuration.
+    /// Stable, machine-readable blockers or failure reasons. Empty when state is ready.
+    pending_reasons: []const IndexReadinessReason,
+    /// Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order.
     sources: ?[]const IndexSourceReadinessStatus = null,
 };
 
@@ -1847,14 +1900,49 @@ pub const IndexRepairStatus = struct {
     action_required: bool,
 };
 
+/// Stable machine-readable reason why an artifact source is pending or failed.
+pub const IndexSourceReadinessReason = enum {
+    index_failed,
+    runtime_unavailable,
+    shard_observation_incomplete,
+    source_observation_incomplete,
+    publication,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .index_failed => "index_failed",
+            .runtime_unavailable => "runtime_unavailable",
+            .shard_observation_incomplete => "shard_observation_incomplete",
+            .source_observation_incomplete => "source_observation_incomplete",
+            .publication => "publication",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "index_failed", .index_failed },
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "shard_observation_incomplete", .shard_observation_incomplete },
+            .{ "source_observation_incomplete", .source_observation_incomplete },
+            .{ "publication", .publication },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const IndexSourceReadinessStatus = struct {
     /// Configured artifact stream identity.
     artifact: []const u8,
     state: []const u8,
-    /// Whether this source is published through its captured target revision on every expected shard.
+    /// Whether this source is fully observed and published on every expected shard.
     complete: bool,
-    /// Stable, machine-readable blockers for this source. Empty when state is ready.
-    pending_reasons: []const []const u8,
+    /// Stable, machine-readable blockers or failure reasons for this source. Empty when state is ready.
+    pending_reasons: []const IndexSourceReadinessReason,
 };
 
 /// Statistics for an index

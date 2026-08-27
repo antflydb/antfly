@@ -67,6 +67,13 @@ pub const ClusterTopology = struct {
 
 pub const IndexRuntimeCapabilities = struct {
     artifact_sources: bool = true,
+    artifact_sources_state: ArtifactSourcesCapabilityState = .available,
+};
+
+pub const ArtifactSourcesCapabilityState = enum {
+    available,
+    upgrade_pending,
+    unsupported,
 };
 
 pub const SecretStoreStatus = struct {
@@ -618,16 +625,18 @@ test "cluster topology preserves deployment index capabilities" {
     var status = ClusterStatus{
         .health = .healthy,
         .deployment_mode = .serverless,
-        .index_capabilities = .{ .artifact_sources = false },
+        .index_capabilities = .{ .artifact_sources = false, .artifact_sources_state = .unsupported },
     };
     defer status.deinit(alloc);
     var topology = try topologyFromStatus(alloc, status);
     defer topology.deinit(alloc);
 
     try std.testing.expect(!topology.index_capabilities.artifact_sources);
+    try std.testing.expectEqual(ArtifactSourcesCapabilityState.unsupported, topology.index_capabilities.artifact_sources_state);
     const encoded = try std.json.Stringify.valueAlloc(alloc, topology, .{});
     defer alloc.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"index_capabilities\":{\"artifact_sources\":false}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"artifact_sources\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"artifact_sources_state\":\"unsupported\"") != null);
 }
 
 test "secret store status preserves unsupported source generation capability" {

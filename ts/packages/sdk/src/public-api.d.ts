@@ -2712,6 +2712,14 @@ export interface components {
             /** @enum {boolean} */
             retryable: false;
         };
+        /** @description A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe. */
+        IndexMutationServiceUnavailableError: {
+            /** @enum {string} */
+            error: "index_capability_upgrade_pending" | "index_probe_unavailable";
+            message: string;
+            /** @enum {boolean} */
+            retryable: true;
+        };
         /** @description The metadata service does not yet provide the consistency capability required by backup. */
         MetadataCapabilityUnavailableError: {
             /**
@@ -3037,9 +3045,15 @@ export interface components {
         ClusterHealth: "unknown" | "healthy" | "unhealthy" | "degraded" | "error";
         /** @description Deployment-level index capabilities clients can inspect before submitting index mutations. */
         IndexRuntimeCapabilities: {
-            /** @description Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments and during distributed rolling upgrades until every live data store reports protocol support. */
+            /** @description Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available. */
             artifact_sources: boolean;
+            artifact_sources_state: components["schemas"]["ArtifactSourcesCapabilityState"];
         };
+        /**
+         * @description Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
+         * @enum {string}
+         */
+        ArtifactSourcesCapabilityState: "available" | "upgrade_pending" | "unsupported";
         ClusterStatus: {
             health: components["schemas"]["ClusterHealth"];
             /** @description Optional message providing details about the health status */
@@ -10042,15 +10056,25 @@ export interface components {
          * @enum {string}
          */
         IndexReadinessState: "pending" | "queryable_partial" | "ready" | "failed";
+        /**
+         * @description Stable machine-readable reason why an index is pending, partial, or failed.
+         * @enum {string}
+         */
+        IndexReadinessReason: "load_failure" | "enrichment_failure" | "runtime_unavailable" | "shard_observation_incomplete" | "incarnation_pending" | "source_publication" | "repair" | "backfill" | "coverage" | "replay" | "publication";
+        /**
+         * @description Stable machine-readable reason why an artifact source is pending or failed.
+         * @enum {string}
+         */
+        IndexSourceReadinessReason: "index_failed" | "runtime_unavailable" | "shard_observation_incomplete" | "source_observation_incomplete" | "publication";
         IndexSourceReadinessStatus: {
             /** @description Configured artifact stream identity. */
             artifact: string;
             /** @enum {string} */
             state: "pending" | "ready" | "failed";
-            /** @description Whether this source is published through its captured target revision on every expected shard. */
+            /** @description Whether this source is fully observed and published on every expected shard. */
             complete: boolean;
-            /** @description Stable, machine-readable blockers for this source. Empty when state is ready. */
-            pending_reasons: string[];
+            /** @description Stable, machine-readable blockers or failure reasons for this source. Empty when state is ready. */
+            pending_reasons: components["schemas"]["IndexSourceReadinessReason"][];
         };
         IndexReadinessStatus: {
             state: components["schemas"]["IndexReadinessState"];
@@ -10060,9 +10084,9 @@ export interface components {
             complete: boolean;
             /** @description Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents. */
             incarnation?: string;
-            /** @description Stable, machine-readable blockers. Empty when state is ready. */
-            pending_reasons: string[];
-            /** @description Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks, not a restatement of index configuration. */
+            /** @description Stable, machine-readable blockers or failure reasons. Empty when state is ready. */
+            pending_reasons: components["schemas"]["IndexReadinessReason"][];
+            /** @description Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. */
             sources?: components["schemas"]["IndexSourceReadinessStatus"][];
         };
         /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
@@ -14139,6 +14163,17 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Index validation is temporarily unavailable or a distributed rolling upgrade has not yet converged. */
+        IndexMutationServiceUnavailable: {
+            headers: {
+                /** @description Minimum number of seconds clients should wait when the failure is retryable. */
+                "Retry-After"?: number;
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["IndexMutationServiceUnavailableError"];
+            };
+        };
         /** @description Backup could not establish the required metadata authority before starting side effects. */
         BackupMetadataUnavailable: {
             headers: {
@@ -15502,6 +15537,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     dropTable: {
@@ -15735,7 +15771,7 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
-            503: components["responses"]["ServiceUnavailable"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     reauthorizeTableDestinations: {
@@ -16572,7 +16608,7 @@ export interface operations {
             };
             429: components["responses"]["StorageResourceExhausted"];
             500: components["responses"]["InternalServerError"];
-            503: components["responses"]["ServiceUnavailable"];
+            503: components["responses"]["IndexMutationServiceUnavailable"];
         };
     };
     dropIndex: {

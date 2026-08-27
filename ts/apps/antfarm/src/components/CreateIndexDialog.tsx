@@ -55,9 +55,12 @@ interface CreateIndexDialogProps {
   schema: TableSchema | null;
   /** Undefined while capability discovery is loading or unavailable. */
   artifactSourcesSupported?: boolean;
+  artifactSourcesState?: ArtifactSourcesCapabilityState;
   artifactSourcesCapabilityError?: boolean;
   onRetryArtifactSourcesCapability?: () => void;
 }
+
+export type ArtifactSourcesCapabilityState = "available" | "upgrade_pending" | "unsupported";
 
 export function getSchemaFieldNames(schema: TableSchema | null): string[] {
   if (!schema?.document_schemas || typeof schema.document_schemas !== "object") {
@@ -997,6 +1000,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
   onIndexCreated,
   schema,
   artifactSourcesSupported,
+  artifactSourcesState,
   artifactSourcesCapabilityError = false,
   onRetryArtifactSourcesCapability,
 }) => {
@@ -1012,6 +1016,18 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
   const [jsonSource, setJsonSource] = useState("");
   const [jsonFormBaseline, setJsonFormBaseline] = useState("");
   const [jsonValidationError, setJsonValidationError] = useState<string | null>(null);
+  const artifactSourcesPermanentlyUnsupported =
+    artifactSourcesState === "unsupported" ||
+    (artifactSourcesState === undefined && artifactSourcesSupported === false);
+  const artifactSourcesAvailableInEditor =
+    artifactSourcesState === "available" ||
+    artifactSourcesState === "upgrade_pending" ||
+    (artifactSourcesState === undefined && artifactSourcesSupported === true);
+  const artifactSourcesEditorCapability = artifactSourcesPermanentlyUnsupported
+    ? false
+    : artifactSourcesAvailableInEditor
+      ? true
+      : undefined;
   const form = useForm<IndexFormData>({
     resolver: zodResolver(indexFormSchema),
     defaultValues: {
@@ -1024,7 +1040,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
       fullTextSourceType: "field",
       fullTextField: "",
       fullTextArtifacts: [{ artifact: "", field: "" }],
-      graphSourceType: artifactSourcesSupported ? "artifacts" : "document_fields",
+      graphSourceType: artifactSourcesAvailableInEditor ? "artifacts" : "document_fields",
       graphEdgeTypes: [
         {
           name: "",
@@ -1165,7 +1181,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
       let indexConfig: IndexConfig;
       if (viewMode === "json") {
         indexConfig = parseAdvancedIndexConfig(jsonSource);
-        if (artifactSourcesSupported === false && usesArtifactBackedIndexSource(indexConfig)) {
+        if (artifactSourcesPermanentlyUnsupported && usesArtifactBackedIndexSource(indexConfig)) {
           throw new Error("Artifact-backed index sources are unavailable on this deployment.");
         }
       } else if (data.indexType === "full_text") {
@@ -1261,6 +1277,14 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
                 embedder: embedderConfig,
                 chunker: data.chunker || undefined,
               } as IndexConfig);
+      }
+      if (
+        artifactSourcesState === "upgrade_pending" &&
+        usesArtifactBackedIndexSource(indexConfig)
+      ) {
+        throw new Error(
+          "Artifact-backed index sources are temporarily unavailable while the rolling upgrade completes. Retry shortly."
+        );
       }
       const { indexName, request } = createIndexArguments(indexConfig);
       await client.indexes.create(tableName, indexName, request);
@@ -1360,6 +1384,15 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
           </Alert>
         )}
 
+        {artifactSourcesState === "upgrade_pending" && (
+          <Alert>
+            <AlertDescription>
+              Artifact-backed index drafts remain editable, but creation is temporarily paused
+              until every table-serving store completes the rolling upgrade.
+            </AlertDescription>
+          </Alert>
+        )}
+
         <Form
           form={form}
           onSubmit={
@@ -1380,7 +1413,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
           ) : (
             <IndexKindForm
               schemaFields={schemaFields}
-              artifactSourcesSupported={artifactSourcesSupported}
+              artifactSourcesSupported={artifactSourcesEditorCapability}
             />
           )}
           <FormActions>

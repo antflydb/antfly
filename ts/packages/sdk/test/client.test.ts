@@ -120,7 +120,7 @@ describe("AntflyClient", () => {
       const status: ClusterStatus = {
         health: "healthy",
         deployment_mode: "standalone",
-        index_capabilities: { artifact_sources: true },
+        index_capabilities: { artifact_sources: true, artifact_sources_state: "available" },
       };
       mockGet.mockResolvedValueOnce({ data: status, error: undefined });
 

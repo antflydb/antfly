@@ -68,7 +68,9 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import type { TableSchema } from "../api";
 import AggregationResults from "../components/AggregationResults";
 import AIQueryAssistant from "../components/AIQueryAssistant";
-import CreateIndexDialog from "../components/CreateIndexDialog";
+import CreateIndexDialog, {
+  type ArtifactSourcesCapabilityState,
+} from "../components/CreateIndexDialog";
 import DocumentBuilder from "../components/DocumentBuilder";
 import { GraphIndexExplorer } from "../components/GraphIndexExplorer";
 import BulkInsert from "../components/Insert";
@@ -270,6 +272,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [artifactSourcesSupported, setArtifactSourcesSupported] = useState<boolean | undefined>(
     undefined
   );
+  const [artifactSourcesState, setArtifactSourcesState] =
+    useState<ArtifactSourcesCapabilityState>();
   const [artifactSourcesCapabilityError, setArtifactSourcesCapabilityError] = useState(false);
   const [openDropDialog, setOpenDropDialog] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState<IndexStatus | null>(null);
@@ -285,12 +289,18 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const refreshArtifactSourcesCapability = useCallback(() => {
     const requestSequence = ++artifactSourcesCapabilityRequestSequence.current;
     setArtifactSourcesSupported(undefined);
+    setArtifactSourcesState(undefined);
     setArtifactSourcesCapabilityError(false);
     void client
       .getStatus()
       .then((status) => {
         if (requestSequence === artifactSourcesCapabilityRequestSequence.current) {
-          setArtifactSourcesSupported(status.index_capabilities?.artifact_sources === true);
+          const capabilities = status.index_capabilities;
+          const supported = capabilities?.artifact_sources === true;
+          setArtifactSourcesSupported(supported);
+          setArtifactSourcesState(
+            capabilities?.artifact_sources_state ?? (supported ? "available" : "unsupported")
+          );
           setArtifactSourcesCapabilityError(false);
         }
       })
@@ -1625,6 +1635,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         onIndexCreated={handleIndexCreated}
         schema={tableSchema}
         artifactSourcesSupported={artifactSourcesSupported}
+        artifactSourcesState={artifactSourcesState}
         artifactSourcesCapabilityError={artifactSourcesCapabilityError}
         onRetryArtifactSourcesCapability={refreshArtifactSourcesCapability}
       />

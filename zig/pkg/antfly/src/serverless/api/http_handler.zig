@@ -8692,7 +8692,8 @@ test "serverless http handler create index expands schema-derived algebraic conf
     defer parsed_detail.deinit();
     try std.testing.expectEqualStrings("rebuild", parsed_detail.value.status.planned_publication_action.?);
     try std.testing.expectEqualStrings("pending", parsed_detail.value.status.readiness.?.state);
-    try std.testing.expectEqual(@as(?[]const u8, null), parsed_detail.value.status.readiness.?.incarnation);
+    const planned_incarnation = parsed_detail.value.status.readiness.?.incarnation.?;
+    try std.testing.expect(std.mem.startsWith(u8, planned_incarnation, "g-"));
     try std.testing.expectEqual(@as(?u64, 2), parsed_detail.value.status.readiness.?.target_revision);
     try std.testing.expectEqual(@as(?u64, null), parsed_detail.value.status.readiness.?.published_revision);
 
@@ -8709,7 +8710,7 @@ test "serverless http handler create index expands schema-derived algebraic conf
     var parsed_published = try parseServerlessIndexStatusTestResponse(alloc, published_detail.body, "sales_rollup");
     defer parsed_published.deinit();
     try std.testing.expectEqualStrings("ready", parsed_published.value.status.readiness.?.state);
-    try std.testing.expectEqual(@as(?[]const u8, null), parsed_published.value.status.readiness.?.incarnation);
+    try std.testing.expectEqualStrings(planned_incarnation, parsed_published.value.status.readiness.?.incarnation.?);
     try std.testing.expectEqual(
         parsed_published.value.status.readiness.?.target_revision,
         parsed_published.value.status.readiness.?.published_revision,

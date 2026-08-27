@@ -1133,8 +1133,12 @@ fn configuredArtifactSourceNames(config: std.json.Value, index_type: ApiIndexTyp
 pub fn indexConfigUsesArtifactSources(alloc: std.mem.Allocator, config_json: []const u8) !bool {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, config_json, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidCreateIndexRequest;
-    const object = parsed.value.object;
+    return indexConfigValueUsesArtifactSources(parsed.value);
+}
+
+fn indexConfigValueUsesArtifactSources(value: std.json.Value) !bool {
+    if (value != .object) return error.InvalidCreateIndexRequest;
+    const object = value.object;
     const type_value = object.get("type") orelse return error.InvalidCreateIndexRequest;
     if (type_value != .string) return error.InvalidCreateIndexRequest;
 
@@ -1142,6 +1146,19 @@ pub fn indexConfigUsesArtifactSources(alloc: std.mem.Allocator, config_json: []c
     if (std.mem.eql(u8, type_value.string, "full_text")) return object.get("artifact_name") != null;
     if (std.mem.eql(u8, type_value.string, "embeddings")) return object.get("embedding_name") != null;
     if (std.mem.eql(u8, type_value.string, "graph")) return object.get("source") != null;
+    return false;
+}
+
+/// Detects artifact consumers in a normalized create-table index map so every
+/// catalog mutation path can share the same rolling-upgrade admission rule.
+pub fn indexesConfigUsesArtifactSources(alloc: std.mem.Allocator, indexes_json: []const u8) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCreateTableRequest;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (try indexConfigValueUsesArtifactSources(entry.value_ptr.*)) return true;
+    }
     return false;
 }
 
@@ -1154,6 +1171,14 @@ test "artifact source admission recognizes canonical and v0.2 request forms" {
     try std.testing.expect(!try indexConfigUsesArtifactSources(alloc, "{\"type\":\"full_text\",\"field\":\"body\"}"));
     try std.testing.expect(!try indexConfigUsesArtifactSources(alloc, "{\"type\":\"embeddings\",\"field\":\"body\"}"));
     try std.testing.expect(!try indexConfigUsesArtifactSources(alloc, "{\"type\":\"graph\",\"edge_types\":[]}"));
+    try std.testing.expect(try indexesConfigUsesArtifactSources(
+        alloc,
+        "{\"default\":{\"type\":\"full_text\"},\"vectors\":{\"type\":\"embeddings\",\"sources\":[{\"artifact\":\"chunk_vectors\"}]}}",
+    ));
+    try std.testing.expect(!try indexesConfigUsesArtifactSources(
+        alloc,
+        "{\"default\":{\"type\":\"full_text\"},\"vectors\":{\"type\":\"embeddings\",\"field\":\"body\"}}",
+    ));
 }
 
 fn appendIndexConfig(
@@ -4433,6 +4458,8 @@ fn appendIndexReadinessStatus(
             try appendJsonString(reason_alloc, reason_out, reason);
         }
     }.run;
+    if (terminal_load_failure) try appendReason(alloc, out, "load_failure", &emitted);
+    if (terminal_enrichment_failure) try appendReason(alloc, out, "enrichment_failure", &emitted);
     if (!observation_fresh) try appendReason(alloc, out, "runtime_unavailable", &emitted);
     if (!topology_complete) try appendReason(alloc, out, "shard_observation_incomplete", &emitted);
     if (!incarnation_current) try appendReason(alloc, out, "incarnation_pending", &emitted);

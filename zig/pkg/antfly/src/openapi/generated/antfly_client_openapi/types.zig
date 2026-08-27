@@ -800,6 +800,35 @@ pub const ArtifactRepairReason = enum {
     }
 };
 
+/// Whether artifact-backed index mutations are accepted now, temporarily fenced during a distributed rolling upgrade, or permanently unsupported by this deployment.
+pub const ArtifactSourcesCapabilityState = enum {
+    available,
+    upgrade_pending,
+    unsupported,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .available => "available",
+            .upgrade_pending => "upgrade_pending",
+            .unsupported => "unsupported",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "available", .available },
+            .{ "upgrade_pending", .upgrade_pending },
+            .{ "unsupported", .unsupported },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Options specific to audio chunking.
 pub const AudioChunkOptions = struct {
     /// Window duration in milliseconds for fixed-window audio chunking (default: 30000).
@@ -5011,6 +5040,13 @@ pub const IndexExecutionConfig = struct {
     embedding: ?ExecutionPolicy = null,
 };
 
+/// A retryable index mutation failure, including a distributed artifact-source protocol fence or a temporarily unavailable model probe.
+pub const IndexMutationServiceUnavailableError = struct {
+    @"error": []const u8,
+    message: []const u8,
+    retryable: bool,
+};
+
 /// Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
 pub const IndexPublicationPolicy = enum {
     progressive,
@@ -5032,6 +5068,59 @@ pub const IndexPublicationPolicy = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "progressive", .progressive },
             .{ "atomic", .atomic },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Stable machine-readable reason why an index is pending, partial, or failed.
+pub const IndexReadinessReason = enum {
+    load_failure,
+    enrichment_failure,
+    runtime_unavailable,
+    shard_observation_incomplete,
+    incarnation_pending,
+    source_publication,
+    repair,
+    backfill,
+    coverage,
+    replay,
+    publication,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .load_failure => "load_failure",
+            .enrichment_failure => "enrichment_failure",
+            .runtime_unavailable => "runtime_unavailable",
+            .shard_observation_incomplete => "shard_observation_incomplete",
+            .incarnation_pending => "incarnation_pending",
+            .source_publication => "source_publication",
+            .repair => "repair",
+            .backfill => "backfill",
+            .coverage => "coverage",
+            .replay => "replay",
+            .publication => "publication",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "load_failure", .load_failure },
+            .{ "enrichment_failure", .enrichment_failure },
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "shard_observation_incomplete", .shard_observation_incomplete },
+            .{ "incarnation_pending", .incarnation_pending },
+            .{ "source_publication", .source_publication },
+            .{ "repair", .repair },
+            .{ "backfill", .backfill },
+            .{ "coverage", .coverage },
+            .{ "replay", .replay },
+            .{ "publication", .publication },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -5077,9 +5166,9 @@ pub const IndexReadinessStatus = struct {
     complete: bool,
     /// Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
-    /// Stable, machine-readable blockers. Empty when state is ready.
-    pending_reasons: []const []const u8,
-    /// Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks, not a restatement of index configuration.
+    /// Stable, machine-readable blockers or failure reasons. Empty when state is ready.
+    pending_reasons: []const IndexReadinessReason,
+    /// Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order.
     sources: ?[]const IndexSourceReadinessStatus = null,
 };
 
@@ -5093,18 +5182,54 @@ pub const IndexRepairStatus = struct {
 
 /// Deployment-level index capabilities clients can inspect before submitting index mutations.
 pub const IndexRuntimeCapabilities = struct {
-    /// Whether full-text, embedding, and graph indexes may consume generated artifact streams through either single-source or multi-source request forms. False for serverless deployments and during distributed rolling upgrades until every live data store reports protocol support.
+    /// Whether full-text, embedding, and graph indexes may currently consume generated artifact streams through either single-source or multi-source request forms. Equivalent to artifact_sources_state=available.
     artifact_sources: bool,
+    artifact_sources_state: ArtifactSourcesCapabilityState,
+};
+
+/// Stable machine-readable reason why an artifact source is pending or failed.
+pub const IndexSourceReadinessReason = enum {
+    index_failed,
+    runtime_unavailable,
+    shard_observation_incomplete,
+    source_observation_incomplete,
+    publication,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .index_failed => "index_failed",
+            .runtime_unavailable => "runtime_unavailable",
+            .shard_observation_incomplete => "shard_observation_incomplete",
+            .source_observation_incomplete => "source_observation_incomplete",
+            .publication => "publication",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "index_failed", .index_failed },
+            .{ "runtime_unavailable", .runtime_unavailable },
+            .{ "shard_observation_incomplete", .shard_observation_incomplete },
+            .{ "source_observation_incomplete", .source_observation_incomplete },
+            .{ "publication", .publication },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const IndexSourceReadinessStatus = struct {
     /// Configured artifact stream identity.
     artifact: []const u8,
     state: []const u8,
-    /// Whether this source is published through its captured target revision on every expected shard.
+    /// Whether this source is fully observed and published on every expected shard.
     complete: bool,
-    /// Stable, machine-readable blockers for this source. Empty when state is ready.
-    pending_reasons: []const []const u8,
+    /// Stable, machine-readable blockers or failure reasons for this source. Empty when state is ready.
+    pending_reasons: []const IndexSourceReadinessReason,
 };
 
 /// Statistics for an index

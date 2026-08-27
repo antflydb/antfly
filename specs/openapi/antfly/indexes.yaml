@@ -692,6 +692,30 @@ components:
         - ready
         - failed
       description: "Authoritative query-readiness and completeness state for the desired index incarnation."
+    IndexReadinessReason:
+      type: string
+      enum:
+        - load_failure
+        - enrichment_failure
+        - runtime_unavailable
+        - shard_observation_incomplete
+        - incarnation_pending
+        - source_publication
+        - repair
+        - backfill
+        - coverage
+        - replay
+        - publication
+      description: "Stable machine-readable reason why an index is pending, partial, or failed."
+    IndexSourceReadinessReason:
+      type: string
+      enum:
+        - index_failed
+        - runtime_unavailable
+        - shard_observation_incomplete
+        - source_observation_incomplete
+        - publication
+      description: "Stable machine-readable reason why an artifact source is pending or failed."
     IndexReadinessStatus:
       type: object
       additionalProperties: false
@@ -715,11 +739,11 @@ components:
         pending_reasons:
           type: array
           items:
-            type: string
-          description: "Stable, machine-readable blockers. Empty when state is ready."
+            $ref: '#/components/schemas/IndexReadinessReason'
+          description: "Stable, machine-readable blockers or failure reasons. Empty when state is ready."
         sources:
           type: array
-          description: "Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order. These are captured and published watermarks, not a restatement of index configuration."
+          description: "Operational readiness for each configured artifact stream. Present only for artifact-backed indexes, in configuration order."
           items:
             $ref: '#/components/schemas/IndexSourceReadinessStatus'
     IndexSourceReadinessStatus:
@@ -742,12 +766,12 @@ components:
             - failed
         complete:
           type: boolean
-          description: "Whether this source is published through its captured target revision on every expected shard."
+          description: "Whether this source is fully observed and published on every expected shard."
         pending_reasons:
           type: array
           items:
-            type: string
-          description: "Stable, machine-readable blockers for this source. Empty when state is ready."
+            $ref: '#/components/schemas/IndexSourceReadinessReason'
+          description: "Stable, machine-readable blockers or failure reasons for this source. Empty when state is ready."
     IndexRepairStatus:
       type: object
       description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.

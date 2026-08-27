@@ -451,6 +451,43 @@ describe("CreateIndexDialog", () => {
     expect(screen.queryByRole("radio", { name: "Artifact streams" })).toBeNull();
   });
 
+  it("preserves artifact-source drafts while a rolling upgrade is pending", () => {
+    const commonProps = {
+      open: true,
+      onClose: () => undefined,
+      tableName: "docs",
+      onIndexCreated: () => undefined,
+      schema: null,
+    };
+    const { rerender } = render(
+      <CreateIndexDialog
+        {...commonProps}
+        artifactSourcesSupported
+        artifactSourcesState="available"
+      />
+    );
+
+    fireEvent.click(screen.getByRole("radio", { name: "Full-text" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Artifact streams" }));
+    fireEvent.change(screen.getByPlaceholderText("document_chunks_v1"), {
+      target: { value: "document_units_v1" },
+    });
+
+    rerender(
+      <CreateIndexDialog
+        {...commonProps}
+        artifactSourcesSupported={false}
+        artifactSourcesState="upgrade_pending"
+      />
+    );
+
+    expect(screen.getByPlaceholderText("document_chunks_v1").getAttribute("value")).toBe(
+      "document_units_v1"
+    );
+    expect(screen.getByText(/drafts remain editable/i)).toBeTruthy();
+    expect(screen.getByRole("radio", { name: "Artifact streams" })).toBeTruthy();
+  });
+
   it("keeps capability discovery failures distinct from unsupported deployments", async () => {
     const retry = vi.fn();
     mocks.createIndex.mockResolvedValue(undefined);

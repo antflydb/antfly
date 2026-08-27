@@ -44,6 +44,7 @@ from .api_key_with_secret import ApiKeyWithSecret
 from .artifact_index_source import ArtifactIndexSource
 from .artifact_repair_kind import ArtifactRepairKind
 from .artifact_repair_reason import ArtifactRepairReason
+from .artifact_sources_capability_state import ArtifactSourcesCapabilityState
 from .audio_chunk_options import AudioChunkOptions
 from .auth_subject import AuthSubject
 from .auth_subject_kind import AuthSubjectKind
@@ -380,12 +381,16 @@ from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
+from .index_mutation_service_unavailable_error import IndexMutationServiceUnavailableError
+from .index_mutation_service_unavailable_error_error import IndexMutationServiceUnavailableErrorError
 from .index_publication_policy import IndexPublicationPolicy
+from .index_readiness_reason import IndexReadinessReason
 from .index_readiness_state import IndexReadinessState
 from .index_readiness_status import IndexReadinessStatus
 from .index_repair_status import IndexRepairStatus
 from .index_repair_status_state import IndexRepairStatusState
 from .index_runtime_capabilities import IndexRuntimeCapabilities
+from .index_source_readiness_reason import IndexSourceReadinessReason
 from .index_source_readiness_status import IndexSourceReadinessStatus
 from .index_source_readiness_status_state import IndexSourceReadinessStatusState
 from .index_status import IndexStatus
@@ -901,6 +906,7 @@ __all__ = (
     "ArtifactIndexSource",
     "ArtifactRepairKind",
     "ArtifactRepairReason",
+    "ArtifactSourcesCapabilityState",
     "AudioChunkOptions",
     "AuthSubject",
     "AuthSubjectKind",
@@ -1235,12 +1241,16 @@ __all__ = (
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexExecutionConfig",
+    "IndexMutationServiceUnavailableError",
+    "IndexMutationServiceUnavailableErrorError",
     "IndexPublicationPolicy",
+    "IndexReadinessReason",
     "IndexReadinessState",
     "IndexReadinessStatus",
     "IndexRepairStatus",
     "IndexRepairStatusState",
     "IndexRuntimeCapabilities",
+    "IndexSourceReadinessReason",
     "IndexSourceReadinessStatus",
     "IndexSourceReadinessStatusState",
     "IndexStatus",
